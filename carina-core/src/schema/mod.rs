@@ -56,6 +56,11 @@
 //!
 //! ```compile_fail
 //! use carina_core::schema::{AttributeSchema, AttributeType};
+//! let _ = AttributeSchema::optional("value", AttributeType::string()).identity();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeSchema, AttributeType};
 //! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).identity();
 //! ```
 //!
@@ -116,12 +121,17 @@
 //!
 //! ```compile_fail
 //! use carina_core::schema::{AttributeType, StructField};
-//! let _ = StructField::optional("value", AttributeType::string()).create_only();
+//! let _ = StructField::optional("value", AttributeType::string()).identity();
 //! ```
 //!
 //! ```compile_fail
 //! use carina_core::schema::{AttributeType, StructField};
-//! let _ = StructField::optional("value", AttributeType::string()).identity();
+//! let _ = StructField::provider_populated("value", AttributeType::string()).create_only();
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::schema::{AttributeType, StructField};
+//! let _ = StructField::provider_populated("value", AttributeType::string()).identity();
 //! ```
 //!
 //! ```compile_fail
@@ -857,6 +867,8 @@ impl InputMode {
 ///     block_name,
 ///     deferred_populate,
 ///     write_only,
+///     create_only,
+///     identity,
 /// } = field.parts();
 /// let _ = (
 ///     name,
@@ -867,6 +879,8 @@ impl InputMode {
 ///     block_name,
 ///     deferred_populate,
 ///     write_only,
+///     create_only,
+///     identity,
 /// );
 /// ```
 #[derive(Debug, Clone)]
@@ -894,6 +908,10 @@ pub struct StructField {
     /// Whether this nested field is accepted on write but omitted from reads.
     /// This describes provider observability, not secrecy.
     pub(crate) write_only: bool,
+    /// Whether changing this user-input field requires replacement.
+    pub(crate) create_only: bool,
+    /// Whether this immutable user-input field contributes to anonymous identity.
+    pub(crate) identity: bool,
 }
 
 /// Exhaustive read-only view of a [`StructField`].
@@ -913,6 +931,8 @@ pub struct StructFieldParts<'a> {
     pub block_name: Option<&'a str>,
     pub deferred_populate: bool,
     pub write_only: bool,
+    pub create_only: bool,
+    pub identity: bool,
 }
 
 /// Builder for an optional user-input struct field.
@@ -922,6 +942,16 @@ pub struct OptionalStructFieldBuilder {
 
 /// Builder for a required user-input struct field.
 pub struct RequiredStructFieldBuilder {
+    field: StructField,
+}
+
+/// Builder for an optional create-only user-input struct field.
+pub struct CreateOnlyOptionalStructFieldBuilder {
+    field: StructField,
+}
+
+/// Builder for a required create-only user-input struct field.
+pub struct CreateOnlyRequiredStructFieldBuilder {
     field: StructField,
 }
 
@@ -945,6 +975,8 @@ impl StructField {
             block_name: None,
             deferred_populate: false,
             write_only: false,
+            create_only: false,
+            identity: false,
         }
     }
 
@@ -985,6 +1017,8 @@ impl StructField {
             block_name: self.block_name.as_deref(),
             deferred_populate: self.deferred_populate,
             write_only: self.write_only,
+            create_only: self.create_only,
+            identity: self.identity,
         }
     }
 
@@ -1088,6 +1122,36 @@ macro_rules! impl_user_input_struct_field_builder {
 
 impl_user_input_struct_field_builder!(OptionalStructFieldBuilder);
 impl_user_input_struct_field_builder!(RequiredStructFieldBuilder);
+impl_user_input_struct_field_builder!(CreateOnlyOptionalStructFieldBuilder);
+impl_user_input_struct_field_builder!(CreateOnlyRequiredStructFieldBuilder);
+
+impl OptionalStructFieldBuilder {
+    pub fn create_only(mut self) -> CreateOnlyOptionalStructFieldBuilder {
+        self.field.create_only = true;
+        CreateOnlyOptionalStructFieldBuilder { field: self.field }
+    }
+}
+
+impl RequiredStructFieldBuilder {
+    pub fn create_only(mut self) -> CreateOnlyRequiredStructFieldBuilder {
+        self.field.create_only = true;
+        CreateOnlyRequiredStructFieldBuilder { field: self.field }
+    }
+}
+
+macro_rules! impl_identity_struct_field_builder {
+    ($builder:ident) => {
+        impl $builder {
+            pub fn identity(mut self) -> Self {
+                self.field.identity = true;
+                self
+            }
+        }
+    };
+}
+
+impl_identity_struct_field_builder!(CreateOnlyOptionalStructFieldBuilder);
+impl_identity_struct_field_builder!(CreateOnlyRequiredStructFieldBuilder);
 
 impl ProviderPopulatedStructFieldBuilder {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
@@ -1144,6 +1208,74 @@ impl LeafPath {
     /// Borrow the typed steps from the containing attribute to this leaf.
     pub fn segments(&self) -> &[LeafPathSegment] {
         &self.0
+    }
+}
+
+/// One schema-level step in a resource identity path.
+///
+/// The top-level attribute is distinct from nested struct fields so callers
+/// never have to parse a dotted string to read an identity value.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IdentityPathSegment {
+    Attribute(String),
+    StructField(String),
+}
+
+/// A validated, singular path to one schema-declared identity value.
+///
+/// Paths can cross only top-level attributes and structs. Lists, maps, and
+/// unions do not identify one value, so schema admission rejects identity
+/// declarations below those shapes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IdentityPath(Vec<IdentityPathSegment>);
+
+impl IdentityPath {
+    pub(crate) fn attribute(name: impl Into<String>) -> Self {
+        Self(vec![IdentityPathSegment::Attribute(name.into())])
+    }
+
+    fn with_struct_field(&self, name: impl Into<String>) -> Self {
+        let mut path = self.clone();
+        path.0.push(IdentityPathSegment::StructField(name.into()));
+        path
+    }
+
+    pub fn segments(&self) -> &[IdentityPathSegment] {
+        &self.0
+    }
+
+    pub fn attribute_name(&self) -> &str {
+        match self.0.first() {
+            Some(IdentityPathSegment::Attribute(name)) => name,
+            Some(IdentityPathSegment::StructField(_)) | None => {
+                unreachable!("validated identity paths start with an attribute")
+            }
+        }
+    }
+
+    pub fn struct_fields(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().skip(1).map(|segment| match segment {
+            IdentityPathSegment::StructField(name) => name.as_str(),
+            IdentityPathSegment::Attribute(_) => {
+                unreachable!("validated identity paths contain one leading attribute")
+            }
+        })
+    }
+}
+
+impl fmt::Display for IdentityPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, segment) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(".")?;
+            }
+            match segment {
+                IdentityPathSegment::Attribute(name) | IdentityPathSegment::StructField(name) => {
+                    formatter.write_str(name)?
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -7262,12 +7394,9 @@ pub struct AttributeSchema {
     /// Key field for a list-of-structs whose provider API updates only the
     /// entries it receives and leaves omitted keys unchanged.
     pub(crate) keyed_partial_update: Option<KeyedPartialUpdate>,
-    /// Whether this attribute contributes to anonymous resource identity.
-    /// Identity attributes are included in the hash when computing anonymous resource
-    /// identifiers, alongside create-only attributes. Use this for attributes that
-    /// distinguish resources of the same type that share the same create-only values
-    /// (e.g., Route 53 RecordSet `type` differentiates A vs AAAA records with the
-    /// same name and hosted zone).
+    /// Whether this immutable attribute contributes to anonymous resource identity.
+    /// When any identity path is declared, only identity values enter the anonymous
+    /// address hash; other create-only values are deliberately excluded.
     pub(crate) identity: bool,
     /// Whether the value of this attribute is populated by the provider
     /// asynchronously *after* the Create call returns. Downstream
@@ -7317,6 +7446,16 @@ pub struct OptionalAttributeSchemaBuilder {
 
 /// Builder for a required user-input attribute.
 pub struct RequiredAttributeSchemaBuilder {
+    attribute: AttributeSchema,
+}
+
+/// Builder for an optional create-only user-input attribute.
+pub struct CreateOnlyOptionalAttributeSchemaBuilder {
+    attribute: AttributeSchema,
+}
+
+/// Builder for a required create-only user-input attribute.
+pub struct CreateOnlyRequiredAttributeSchemaBuilder {
     attribute: AttributeSchema,
 }
 
@@ -7478,16 +7617,6 @@ macro_rules! impl_user_input_attribute_builder {
                 self
             }
 
-            pub fn create_only(mut self) -> Self {
-                self.attribute.create_only = true;
-                self
-            }
-
-            pub fn identity(mut self) -> Self {
-                self.attribute.identity = true;
-                self
-            }
-
             pub fn with_description(mut self, description: impl Into<String>) -> Self {
                 self.attribute.description = Some(description.into());
                 self
@@ -7517,8 +7646,59 @@ macro_rules! impl_user_input_attribute_builder {
 
 impl_user_input_attribute_builder!(OptionalAttributeSchemaBuilder);
 impl_user_input_attribute_builder!(RequiredAttributeSchemaBuilder);
+impl_user_input_attribute_builder!(CreateOnlyOptionalAttributeSchemaBuilder);
+impl_user_input_attribute_builder!(CreateOnlyRequiredAttributeSchemaBuilder);
 
 impl OptionalAttributeSchemaBuilder {
+    pub fn create_only(mut self) -> CreateOnlyOptionalAttributeSchemaBuilder {
+        self.attribute.create_only = true;
+        CreateOnlyOptionalAttributeSchemaBuilder {
+            attribute: self.attribute,
+        }
+    }
+}
+
+impl RequiredAttributeSchemaBuilder {
+    pub fn create_only(mut self) -> CreateOnlyRequiredAttributeSchemaBuilder {
+        self.attribute.create_only = true;
+        CreateOnlyRequiredAttributeSchemaBuilder {
+            attribute: self.attribute,
+        }
+    }
+}
+
+macro_rules! impl_identity_attribute_builder {
+    ($builder:ident) => {
+        impl $builder {
+            pub fn identity(mut self) -> Self {
+                self.attribute.identity = true;
+                self
+            }
+        }
+    };
+}
+
+impl_identity_attribute_builder!(CreateOnlyOptionalAttributeSchemaBuilder);
+impl_identity_attribute_builder!(CreateOnlyRequiredAttributeSchemaBuilder);
+
+impl OptionalAttributeSchemaBuilder {
+    pub fn with_default(mut self, value: Value) -> Self {
+        self.attribute.default = Some(value);
+        self
+    }
+
+    pub fn removable(mut self) -> Self {
+        self.attribute.removable = Some(true);
+        self
+    }
+
+    pub fn non_removable(mut self) -> Self {
+        self.attribute.removable = Some(false);
+        self
+    }
+}
+
+impl CreateOnlyOptionalAttributeSchemaBuilder {
     pub fn with_default(mut self, value: Value) -> Self {
         self.attribute.default = Some(value);
         self
@@ -7974,6 +8154,10 @@ impl<'a> EffectiveAttribute<'a> {
         self.attribute.create_only
     }
 
+    pub fn is_identity(&self) -> bool {
+        self.attribute.identity
+    }
+
     pub fn value_type(&self) -> EffectiveType<'a> {
         EffectiveType {
             attr_type: &self.attribute.attr_type,
@@ -8065,6 +8249,14 @@ impl<'a> EffectiveField<'a> {
 
     pub fn is_write_only(&self) -> bool {
         self.field.write_only
+    }
+
+    pub fn is_create_only(&self) -> bool {
+        self.field.create_only
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.field.identity
     }
 
     pub fn is_deferred_populate(&self) -> bool {
@@ -8418,6 +8610,7 @@ impl<'a> EffectiveSchemaNode<'a> {
 #[derive(Debug, Clone)]
 pub struct ValidatedResourceSchema {
     schema: ResourceSchema,
+    identity_paths: Vec<IdentityPath>,
 }
 
 impl ValidatedResourceSchema {
@@ -8427,6 +8620,15 @@ impl ValidatedResourceSchema {
 
     pub fn parts(&self) -> ResourceSchemaParts<'_> {
         self.schema.parts()
+    }
+
+    /// Return every declared identity in deterministic schema-path order.
+    ///
+    /// The path type preserves the distinction between a top-level attribute
+    /// and each nested struct field. Callers must not reconstruct identity
+    /// paths from dotted strings.
+    pub fn identity_paths(&self) -> &[IdentityPath] {
+        &self.identity_paths
     }
 
     /// Iterate top-level attributes in canonical-name order.
@@ -9448,6 +9650,20 @@ fn validate_struct_field_mode(
     if let Some(provider_populated_ancestor) = provider_populated_ancestor {
         let effectively_provider_populated =
             provider_populated_ancestor || field.declared_input_mode.is_provider_populated();
+        if effectively_provider_populated && field.create_only {
+            push_schema_issue(
+                issues,
+                location,
+                "create-only field appears below a provider-populated ancestor",
+            );
+        }
+        if effectively_provider_populated && field.identity {
+            push_schema_issue(
+                issues,
+                location,
+                "identity field appears below a provider-populated ancestor",
+            );
+        }
         if field.deferred_populate && !effectively_provider_populated {
             push_schema_issue(
                 issues,
@@ -9644,6 +9860,106 @@ fn validate_type_definition(
                     provider_populated_ancestor,
                     visited_definitions,
                     issues,
+                );
+            }
+        }
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => {}
+    }
+}
+
+struct IdentityPathCollection<'a> {
+    ref_stack: Vec<String>,
+    paths: &'a mut Vec<IdentityPath>,
+    issues: &'a mut Vec<SchemaDefinitionIssue>,
+}
+
+fn collect_identity_paths_in_type(
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    path: &IdentityPath,
+    location: SchemaValidationIssueLocation,
+    singular: bool,
+    collection: &mut IdentityPathCollection<'_>,
+) {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            let Some(definition) = defs.get(name) else {
+                return;
+            };
+            if collection.ref_stack.iter().any(|entry| entry == name) {
+                return;
+            }
+            collection.ref_stack.push(name.clone());
+            collect_identity_paths_in_type(definition, defs, path, location, singular, collection);
+            collection.ref_stack.pop();
+        }
+        AttrTypeKind::List { element_type, .. } => collect_identity_paths_in_type(
+            element_type,
+            defs,
+            path,
+            location.with_suffix("[]"),
+            false,
+            collection,
+        ),
+        AttrTypeKind::Map { key, value } => {
+            collect_identity_paths_in_type(
+                key,
+                defs,
+                path,
+                location.with_suffix(".<key>"),
+                false,
+                collection,
+            );
+            collect_identity_paths_in_type(
+                value,
+                defs,
+                path,
+                location.with_suffix(".<value>"),
+                false,
+                collection,
+            );
+        }
+        AttrTypeKind::Union(members) => {
+            for (index, member) in members.as_raw_slice().iter().enumerate() {
+                collect_identity_paths_in_type(
+                    member,
+                    defs,
+                    path,
+                    location.with_suffix(format_args!(".<union:{index}>")),
+                    false,
+                    collection,
+                );
+            }
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            for field in fields {
+                let field_path = path.with_struct_field(field.name.clone());
+                let field_location = location.with_suffix(format_args!(".{}", field.name));
+                if field.identity {
+                    if singular {
+                        collection.paths.push(field_path.clone());
+                    } else {
+                        push_schema_issue(
+                            collection.issues,
+                            &field_location,
+                            "identity cannot be declared inside a list, map, or union element",
+                        );
+                    }
+                }
+                collect_identity_paths_in_type(
+                    &field.field_type,
+                    defs,
+                    &field_path,
+                    field_location,
+                    singular,
+                    collection,
                 );
             }
         }
@@ -10058,6 +10374,88 @@ fn project_write_only_leaves<'schema>(
     }
 }
 
+fn project_create_only_leaves<'schema>(
+    attr_type: &'schema AttributeType,
+    value: &Value,
+    defs: &'schema BTreeMap<String, AttributeType>,
+    path: &mut Vec<LeafPathSegment>,
+    ref_chain: &mut Vec<&'schema str>,
+    leaves: &mut Vec<(LeafPath, Value, &'schema AttributeType)>,
+) {
+    match &attr_type.kind {
+        AttrTypeKind::Ref(name) => {
+            if ref_chain.contains(&name.as_str()) {
+                return;
+            }
+            let Some(definition) = defs.get(name) else {
+                return;
+            };
+            ref_chain.push(name);
+            project_create_only_leaves(definition, value, defs, path, ref_chain, leaves);
+            ref_chain.pop();
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            let Value::Concrete(ConcreteValue::List(items)) = value else {
+                return;
+            };
+            for (index, item) in items.iter().enumerate() {
+                path.push(LeafPathSegment::ListIndex(index));
+                project_create_only_leaves(element_type, item, defs, path, &mut Vec::new(), leaves);
+                path.pop();
+            }
+        }
+        AttrTypeKind::Map {
+            value: value_type, ..
+        } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return;
+            };
+            for (key, entry) in entries {
+                path.push(LeafPathSegment::MapKey(key.clone()));
+                project_create_only_leaves(value_type, entry, defs, path, &mut Vec::new(), leaves);
+                path.pop();
+            }
+        }
+        AttrTypeKind::Struct { fields, .. } => {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                return;
+            };
+            for field in fields {
+                let Some(field_value) = entries.get(&field.name) else {
+                    continue;
+                };
+                path.push(LeafPathSegment::StructField(field.name.clone()));
+                if field.create_only {
+                    leaves.push((
+                        LeafPath::from_segments(path.iter().cloned()),
+                        field_value.clone(),
+                        &field.field_type,
+                    ));
+                } else {
+                    project_create_only_leaves(
+                        &field.field_type,
+                        field_value,
+                        defs,
+                        path,
+                        &mut Vec::new(),
+                        leaves,
+                    );
+                }
+                path.pop();
+            }
+        }
+        AttrTypeKind::Union(_)
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => {}
+    }
+}
+
 fn strip_write_only_leaves_from_value<'schema>(
     attr_type: &'schema AttributeType,
     value: &Value,
@@ -10237,6 +10635,7 @@ impl ResourceSchema {
         let mut issues = Vec::new();
         let mut visited_definitions = HashSet::new();
         let mut identified_kinds = HashMap::new();
+        let mut identity_paths = Vec::new();
 
         if self.kind == SchemaKind::DataSource && self.default_prevent_destroy {
             push_schema_issue(
@@ -10272,9 +10671,26 @@ impl ResourceSchema {
             );
             validate_identified_scalar_kind_consistency(
                 &attribute.attr_type,
-                location,
+                location.clone(),
                 &mut identified_kinds,
                 &mut issues,
+            );
+            let path = IdentityPath::attribute(name.clone());
+            if attribute.identity {
+                identity_paths.push(path.clone());
+            }
+            let mut identity_path_collection = IdentityPathCollection {
+                ref_stack: Vec::new(),
+                paths: &mut identity_paths,
+                issues: &mut issues,
+            };
+            collect_identity_paths_in_type(
+                &attribute.attr_type,
+                &self.defs,
+                &path,
+                location,
+                true,
+                &mut identity_path_collection,
             );
         }
 
@@ -10333,7 +10749,12 @@ impl ResourceSchema {
         normalize_issues(&mut issues);
         if issues.is_empty() {
             self.duplicate_attributes.clear();
-            Ok(ValidatedResourceSchema { schema: self })
+            identity_paths.sort();
+            identity_paths.dedup();
+            Ok(ValidatedResourceSchema {
+                schema: self,
+                identity_paths,
+            })
         } else {
             Err(ResourceSchemaValidationError {
                 resource_type: self.resource_type.clone(),
@@ -10476,6 +10897,32 @@ impl ResourceSchema {
             &mut Vec::new(),
             &mut Vec::new(),
             false,
+            &mut leaves,
+        );
+        leaves.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+        leaves
+    }
+
+    /// Project nested create-only fields from one concrete attribute value.
+    ///
+    /// Runtime list indices and map keys remain typed path segments so the
+    /// differ can compare only immutable leaves without treating a mutable
+    /// sibling change as a replacement.
+    pub(crate) fn create_only_leaf_projection<'schema>(
+        &'schema self,
+        key: &str,
+        value: &Value,
+    ) -> Vec<(LeafPath, Value, &'schema AttributeType)> {
+        let Some(attribute) = self.attributes.get(key) else {
+            return Vec::new();
+        };
+        let mut leaves = Vec::new();
+        project_create_only_leaves(
+            &attribute.attr_type,
+            value,
+            &self.defs,
+            &mut Vec::new(),
+            &mut Vec::new(),
             &mut leaves,
         );
         leaves.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
@@ -10733,15 +11180,6 @@ impl ResourceSchema {
         self.attributes
             .iter()
             .filter(|(_, schema)| schema.create_only)
-            .map(|(name, _)| name.as_str())
-            .collect()
-    }
-
-    /// Returns the names of identity attributes (contribute to anonymous resource hashing)
-    pub fn identity_attributes(&self) -> Vec<&str> {
-        self.attributes
-            .iter()
-            .filter(|(_, schema)| schema.identity)
             .map(|(name, _)| name.as_str())
             .collect()
     }

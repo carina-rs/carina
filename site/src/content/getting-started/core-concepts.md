@@ -74,6 +74,32 @@ Carina records managed resources in a JSON state file (`carina.state.json` by de
 
 On each run, Carina compares the desired configuration against the state to determine what needs to change. For team usage, configure an [S3 backend](/guides/state-management/#configuring-the-s3-backend) to share state.
 
+## Anonymous resource identity
+
+An anonymous resource has no `let` binding, so Carina derives its state address
+from values that identify the same real-world object across plans. Providers
+can mark top-level attributes or nested struct fields as identity. Identity is
+always create-only: if the value changes, the provider cannot update the same
+object in place.
+
+When a schema declares one or more identity paths, the address hash uses only
+those values. A different create-only setting can still force replacement, but
+the replacement stays at the same address. This matters for resources such as
+a budget whose nested budget name is its natural key while its notification
+list is also create-only. When a schema declares no identity paths, Carina uses
+configured top-level create-only values as the compatibility fallback.
+
+Two anonymous resources of the same type and provider route cannot have equal
+declared identity values; use `let` to name at least one of them. If a declared
+identity value is absent, Carina currently uses the existing
+attribute-derived fallback. Multiple such resources of the same kind remain
+ambiguous and are rejected.
+
+When a provider first adds identity declarations, an existing state row may
+still have the address produced by the older create-only rule. Carina matches
+that row by the identity values stored in state and plans a one-time `Move`.
+After apply, the next plan uses the new address and is clean.
+
 ## DSL syntax
 
 Carina uses `.crn` files with a purpose-built DSL. Key constructs:

@@ -1885,6 +1885,12 @@ pub struct StructField {
     /// Whether this nested field is accepted on write but omitted from reads.
     /// Required in protocol v13 so host/provider skew fails loudly.
     pub write_only: bool,
+    /// Whether changing this nested user-input field requires replacement.
+    /// Required in protocol v13 so host/provider skew fails loudly.
+    pub create_only: bool,
+    /// Whether this immutable nested field contributes to anonymous identity.
+    /// Required in protocol v13 so host/provider skew fails loudly.
+    pub identity: bool,
     /// Whether this nested field is populated asynchronously after Create returns.
     #[serde(default)]
     pub deferred_populate: bool,
@@ -2513,6 +2519,8 @@ mod tests {
                 provider_name: None,
                 read_only: false,
                 write_only: true,
+                create_only: true,
+                identity: true,
                 deferred_populate: false,
             }],
             field_groups: vec![],
@@ -2524,6 +2532,8 @@ mod tests {
             panic!("round-tripped attribute must remain a struct");
         };
         assert!(fields[0].write_only);
+        assert!(fields[0].create_only);
+        assert!(fields[0].identity);
         assert_eq!(json, serde_json::to_string(&back).unwrap());
     }
 
@@ -2539,6 +2549,41 @@ mod tests {
         .expect_err("protocol v13 requires write_only on every struct field");
 
         assert!(error.to_string().contains("missing field `write_only`"));
+    }
+
+    #[test]
+    fn protocol_v13_requires_nested_create_only_and_identity_flags() {
+        let missing_create_only = serde_json::from_str::<StructField>(
+            r#"{
+                "name":"budget_name",
+                "field_type":{"type":"String"},
+                "required":false,
+                "write_only":false,
+                "identity":true
+            }"#,
+        )
+        .expect_err("protocol v13 requires create_only on every struct field");
+        assert!(
+            missing_create_only
+                .to_string()
+                .contains("missing field `create_only`")
+        );
+
+        let missing_identity = serde_json::from_str::<StructField>(
+            r#"{
+                "name":"budget_name",
+                "field_type":{"type":"String"},
+                "required":false,
+                "write_only":false,
+                "create_only":true
+            }"#,
+        )
+        .expect_err("protocol v13 requires identity on every struct field");
+        assert!(
+            missing_identity
+                .to_string()
+                .contains("missing field `identity`")
+        );
     }
 
     #[test]
@@ -2946,6 +2991,8 @@ mod tests {
                         provider_name: None,
                         read_only: false,
                         write_only: false,
+                        create_only: false,
+                        identity: false,
                         deferred_populate: false,
                     }],
                     field_groups: vec![],
@@ -3044,6 +3091,8 @@ mod tests {
                         provider_name: None,
                         read_only: false,
                         write_only: false,
+                        create_only: false,
+                        identity: false,
                         deferred_populate: false,
                     }],
                     field_groups: vec![],

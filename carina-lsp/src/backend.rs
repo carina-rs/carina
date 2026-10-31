@@ -1076,6 +1076,63 @@ mock.test.Thing {
     }
 
     #[test]
+    fn equal_nested_identity_diagnostic_matches_validate_across_sibling_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let providers = "provider mock {}\n";
+        let budget = r#"mock.budgets.Budget {
+  budget = {
+    budget_name = "shared-budget"
+    budget_type = "COST"
+    time_unit = "MONTHLY"
+  }
+}
+"#;
+        std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
+        std::fs::write(temp.path().join("a.crn"), budget).unwrap();
+        std::fs::write(temp.path().join("b.crn"), budget).unwrap();
+
+        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let configs = discovered[temp.path()]
+            .iter()
+            .cloned()
+            .map(|config| (temp.path().to_path_buf(), config))
+            .collect();
+        let state = ProviderState::new(
+            vec![],
+            HashMap::new(),
+            configs,
+            None,
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
+        );
+        let path = temp.path().join("a.crn");
+        let document = Document::new_with_path(
+            budget.to_string(),
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+
+        let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("equal declared identity values")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(
+            matching[0].message,
+            "Anonymous resources of type 'mock.budgets.Budget' on the same provider route have \
+             equal declared identity values and produce address \
+             'mock_budgets_budget_2874da1a'. Give one of them a name with `let`."
+        );
+    }
+
+    #[test]
     fn ignore_changes_validation_matches_core_in_directory_scoped_diagnostics() {
         let temp = tempfile::tempdir().unwrap();
         let providers = "provider mock {}\n";

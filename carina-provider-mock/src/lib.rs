@@ -311,6 +311,84 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .build(),
             )
             .with_unique_name_attribute("name"),
+        ResourceSchema::new("test.nested_identity")
+            .attribute(
+                AttributeSchema::required(
+                    "identity",
+                    AttributeType::struct_(
+                        "NestedIdentity",
+                        vec![
+                            StructField::required("key", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("description", AttributeType::string()).build()),
+        ResourceSchema::new("budgets.Budget")
+            .attribute(
+                AttributeSchema::required(
+                    "budget",
+                    AttributeType::struct_(
+                        "BudgetData",
+                        vec![
+                            StructField::optional("budget_name", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                            StructField::required("budget_type", AttributeType::string()).build(),
+                            StructField::required("time_unit", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "notifications_with_subscribers",
+                    AttributeType::list(AttributeType::struct_(
+                        "NotificationWithSubscribers",
+                        vec![
+                            StructField::required("notification_type", AttributeType::string())
+                                .build(),
+                            StructField::required("threshold", AttributeType::float()).build(),
+                        ],
+                    )),
+                )
+                .create_only()
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("cost_filters", AttributeType::string()).build()),
+        ResourceSchema::new("route53.RecordSet")
+            .attribute(
+                AttributeSchema::required("hosted_zone_id", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::required("type", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "resource_records",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .create_only()
+                .build(),
+            ),
         ResourceSchema::new("compute.Instance")
             .attribute(
                 AttributeSchema::optional("name", AttributeType::string())
@@ -1740,6 +1818,46 @@ mod tests {
         let witness = builtin_schema_witness();
         assert_eq!(witness.resources().len(), schemas.len());
         assert!(witness.reference_forms().is_empty());
+    }
+
+    #[test]
+    fn builtin_mock_identity_schemas_include_nested_budget_and_full_record_set_key() {
+        use carina_core::schema::IdentityPathSegment;
+
+        let schemas = builtin_schemas();
+        let identity_paths = |resource_type: &str| {
+            schemas
+                .iter()
+                .find(|schema| schema.as_schema().resource_type() == resource_type)
+                .unwrap_or_else(|| panic!("missing built-in mock schema {resource_type}"))
+                .identity_paths()
+                .iter()
+                .map(|path| path.segments().to_vec())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            identity_paths("test.nested_identity"),
+            vec![vec![
+                IdentityPathSegment::Attribute("identity".to_string()),
+                IdentityPathSegment::StructField("key".to_string()),
+            ]]
+        );
+        assert_eq!(
+            identity_paths("budgets.Budget"),
+            vec![vec![
+                IdentityPathSegment::Attribute("budget".to_string()),
+                IdentityPathSegment::StructField("budget_name".to_string()),
+            ]]
+        );
+        assert_eq!(
+            identity_paths("route53.RecordSet"),
+            vec![
+                vec![IdentityPathSegment::Attribute("hosted_zone_id".to_string())],
+                vec![IdentityPathSegment::Attribute("name".to_string())],
+                vec![IdentityPathSegment::Attribute("type".to_string())],
+            ]
+        );
     }
 
     struct EnvGuard {

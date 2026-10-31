@@ -5,6 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use sha2::{Digest, Sha256};
+
 use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
 use crate::parser::ProviderConfig;
@@ -16,7 +18,8 @@ use crate::resource::{
     UnknownReason, Value, ValueString,
 };
 use crate::schema::{
-    AttributeType, ResourceSchema, SchemaRegistry, Shape, ValidatedResourceSchema,
+    AttributeType, IdentityPath, IdentityPathSegment, ResourceSchema, SchemaRegistry, Shape,
+    ValidatedResourceSchema,
 };
 use crate::validation::is_string_compatible_type;
 use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};
@@ -147,76 +150,219 @@ pub fn generate_random_suffix() -> String {
 /// fields that cannot change in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnonymousIdentityBasis {
-    /// At least one configured create-only or schema identity attribute is
-    /// set, so the normal identifier hash is based on immutable input.
+    /// Every declared identity path is set, or (when no identity is declared)
+    /// at least one configured create-only attribute is set, so the normal
+    /// identifier hash is based on immutable input.
     Stable,
     /// No stable schema attribute is set, so the identifier is derived from
     /// mutable user attributes.
     AttributeDerived,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StableAnonymousHashInputs {
+    /// The new rule: a schema with declared identity hashes only those paths.
+    DeclaredIdentity {
+        values: BTreeMap<IdentityPath, String>,
+        declared_path_count: usize,
+    },
+    /// The legacy rule, retained byte-for-byte for schemas without identity.
+    CreateOnly(BTreeMap<String, String>),
+}
+
+impl StableAnonymousHashInputs {
+    fn is_declared_identity(&self) -> bool {
+        matches!(self, Self::DeclaredIdentity { .. })
+    }
+}
+
+fn top_level_stable_hash_value<S>(resource: &Resource<S>, attribute: &str) -> Option<String> {
+    if let Some(prefix) = resource.prefixes.get(attribute) {
+        return Some(format!("Prefix({prefix:?})"));
+    }
+
+    let unresolved_prefix = format!("{attribute}_prefix");
+    resource
+        .attributes
+        .get(&unresolved_prefix)
+        .map(|value| match value {
+            Value::Concrete(ConcreteValue::String(prefix)) => {
+                format!("Prefix({:?})", prefix.expose_plaintext())
+            }
+            value => format!("Prefix({})", deterministic_value_string(value)),
+        })
+        .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
+}
+
+fn value_at_identity_path<'a, S>(
+    resource: &'a Resource<S>,
+    path: &IdentityPath,
+) -> Option<&'a Value> {
+    value_at_identity_path_root(resource.get_attr(path.attribute_name()), path)
+}
+
+fn value_at_identity_path_root<'a>(
+    root: Option<&'a Value>,
+    path: &IdentityPath,
+) -> Option<&'a Value> {
+    let mut value = root?;
+    for field in path.struct_fields() {
+        value = match value {
+            Value::Concrete(ConcreteValue::Map(fields)) => fields.get(field)?,
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Duration(_),
+            )
+            | Value::Deferred(_) => return None,
+        };
+    }
+    Some(value)
+}
+
 /// Return the immutable schema inputs that participate in an anonymous
 /// resource's standard identity hash.
 ///
-/// This is the single definition of both "stable identity basis" and the
-/// bytes hashed for that basis. An unresolved `<attribute>_prefix` is treated
+/// This is the single selection seam for the identity-only and legacy
+/// create-only rules. An unresolved top-level `<attribute>_prefix` is treated
 /// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
-/// [`Resource::prefixes`].
+/// [`Resource::prefixes`]. Nested identity paths read their value directly
+/// from the enclosing concrete struct.
 fn stable_anonymous_hash_inputs<S>(
     resource: &Resource<S>,
-    schema: &ResourceSchema,
-) -> BTreeMap<String, String> {
-    let mut inputs = BTreeMap::new();
-    for attribute in schema
-        .create_only_attributes()
-        .into_iter()
-        .chain(schema.identity_attributes())
-    {
-        if inputs.contains_key(attribute) {
-            continue;
+    schema: &ValidatedResourceSchema,
+) -> StableAnonymousHashInputs {
+    if !schema.identity_paths().is_empty() {
+        let values = schema
+            .identity_paths()
+            .iter()
+            .filter_map(|path| {
+                let value = if path.segments().len() == 1 {
+                    top_level_stable_hash_value(resource, path.attribute_name())
+                } else {
+                    value_at_identity_path(resource, path).map(deterministic_value_string)
+                }?;
+                Some((path.clone(), value))
+            })
+            .collect();
+        StableAnonymousHashInputs::DeclaredIdentity {
+            values,
+            declared_path_count: schema.identity_paths().len(),
         }
-
-        let hash_value = if let Some(prefix) = resource.prefixes.get(attribute) {
-            Some(format!("Prefix({prefix:?})"))
-        } else {
-            let unresolved_prefix = format!("{attribute}_prefix");
-            resource
-                .attributes
-                .get(&unresolved_prefix)
-                .map(|value| match value {
-                    Value::Concrete(ConcreteValue::String(prefix)) => {
-                        format!("Prefix({:?})", prefix.expose_plaintext())
-                    }
-                    value => format!("Prefix({})", deterministic_value_string(value)),
-                })
-                .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
-        };
-
-        if let Some(hash_value) = hash_value {
-            inputs.insert(attribute.to_string(), hash_value);
-        }
+    } else {
+        let values = schema
+            .as_schema()
+            .create_only_attributes()
+            .into_iter()
+            .filter_map(|attribute| {
+                top_level_stable_hash_value(resource, attribute)
+                    .map(|value| (attribute.to_string(), value))
+            })
+            .collect();
+        StableAnonymousHashInputs::CreateOnly(values)
     }
-    inputs
+}
+
+/// Central policy seam for the pending missing-declared-identity decision.
+///
+/// For now, exactly as with today's empty stable inputs, a declared identity
+/// with any missing path is attribute-derived. If the policy changes,
+/// hashing, classification, and migration must continue to call this one
+/// function.
+fn declared_identity_basis(all_paths_present: bool) -> AnonymousIdentityBasis {
+    if all_paths_present {
+        AnonymousIdentityBasis::Stable
+    } else {
+        AnonymousIdentityBasis::AttributeDerived
+    }
+}
+
+fn anonymous_identity_basis(inputs: &StableAnonymousHashInputs) -> AnonymousIdentityBasis {
+    match inputs {
+        StableAnonymousHashInputs::DeclaredIdentity {
+            values,
+            declared_path_count,
+        } => declared_identity_basis(
+            *declared_path_count > 0 && values.len() == *declared_path_count,
+        ),
+        StableAnonymousHashInputs::CreateOnly(values) if !values.is_empty() => {
+            AnonymousIdentityBasis::Stable
+        }
+        StableAnonymousHashInputs::CreateOnly(_) => AnonymousIdentityBasis::AttributeDerived,
+    }
+}
+
+fn encode_count(hasher: &mut Sha256, count: usize) {
+    let count = u64::try_from(count).expect("identity encoding count fits in u64");
+    hasher.update(count.to_le_bytes());
+}
+
+fn encode_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    encode_count(hasher, value.len());
+    hasher.update(value);
+}
+
+/// Hash schema-declared identity with a versioned canonical byte encoding.
+///
+/// Encoding `v1` is: domain string; provider-entry count followed by sorted
+/// `key,value` UTF-8 strings; identity-path count followed by each path's
+/// segment count, a segment tag (`0` attribute, `1` struct field), its UTF-8
+/// name, and the deterministic value spelling. Counts and every string's byte
+/// length are unsigned 64-bit little-endian integers. SHA-256 is truncated to
+/// its first 32 bits for the existing eight-hex-character address suffix.
+fn hash_declared_identity_inputs(
+    provider_identity: &BTreeMap<String, String>,
+    identity: &BTreeMap<IdentityPath, String>,
+) -> u32 {
+    let mut hasher = Sha256::new();
+    encode_length_prefixed(&mut hasher, b"carina-anonymous-identity-v1");
+    encode_count(&mut hasher, provider_identity.len());
+    for (key, value) in provider_identity {
+        encode_length_prefixed(&mut hasher, key.as_bytes());
+        encode_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    encode_count(&mut hasher, identity.len());
+    for (path, value) in identity {
+        encode_count(&mut hasher, path.segments().len());
+        for segment in path.segments() {
+            match segment {
+                IdentityPathSegment::Attribute(name) => {
+                    hasher.update([0]);
+                    encode_length_prefixed(&mut hasher, name.as_bytes());
+                }
+                IdentityPathSegment::StructField(name) => {
+                    hasher.update([1]);
+                    encode_length_prefixed(&mut hasher, name.as_bytes());
+                }
+            }
+        }
+        encode_length_prefixed(&mut hasher, value.as_bytes());
+    }
+    let digest = hasher.finalize();
+    u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 has four bytes"))
 }
 
 /// Classify the identity basis for an anonymous resource.
 ///
 /// Returns `None` when the resource has no schema, so its identity basis is
-/// unknown. Otherwise, presence is what matters here, not whether a value is
-/// concrete yet. A deferred create-only or identity value will become
-/// concrete later but is still an immutable identity input.
+/// unknown. Otherwise, the selected policy input values determine whether the
+/// basis is stable. A selected deferred value still has a deterministic value
+/// spelling and therefore remains a stable immutable input.
 pub fn classify_anonymous_identity_basis<S>(
     resource: &Resource<S>,
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
-    let schema = schema.as_schema();
-
-    if stable_anonymous_hash_inputs(resource, schema).is_empty() {
-        Some(AnonymousIdentityBasis::AttributeDerived)
-    } else {
-        Some(AnonymousIdentityBasis::Stable)
-    }
+    Some(anonymous_identity_basis(&stable_anonymous_hash_inputs(
+        resource,
+        schema.schema(),
+    )))
 }
 
 #[derive(Debug, Clone)]
@@ -415,17 +561,20 @@ impl std::fmt::Display for LoopAnonymousIdentityConflict {
 
 impl std::error::Error for LoopAnonymousIdentityConflict {}
 
-/// A generated anonymous identifier shared by declarations that cannot be
-/// repaired as one authored loop rewrite.
+/// Anonymous declarations that either share one generated address or declare
+/// the same complete natural key on one provider route.
 #[derive(Debug, Clone)]
 pub struct AnonymousResourceIdentifierCollision {
     first_type: String,
     second_type: String,
     identifier: String,
+    equal_declared_identity: bool,
+    same_identifier: bool,
 }
 
 impl AnonymousResourceIdentifierCollision {
-    /// Generated identity shared by the conflicting declarations.
+    /// The shared address, or the first declaration's address when equal
+    /// natural keys occur below different module prefixes.
     pub fn identifier(&self) -> &str {
         &self.identifier
     }
@@ -433,6 +582,23 @@ impl AnonymousResourceIdentifierCollision {
 
 impl std::fmt::Display for AnonymousResourceIdentifierCollision {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.equal_declared_identity {
+            if !self.same_identifier {
+                return write!(
+                    formatter,
+                    "Anonymous resources of type '{}' on the same provider route have equal \
+                     declared identity values even though their module-scoped addresses differ. \
+                     Give one of them a name with `let`.",
+                    self.first_type,
+                );
+            }
+            return write!(
+                formatter,
+                "Anonymous resources of type '{}' on the same provider route have equal declared \
+                 identity values and produce address '{}'. Give one of them a name with `let`.",
+                self.first_type, self.identifier,
+            );
+        }
         write!(
             formatter,
             "Anonymous resource identifier collision: '{}' and '{}' produce the same identifier \
@@ -1653,6 +1819,8 @@ fn discover_loop_module_prefix_collisions<S>(
                     first_type: first.id.display_type(),
                     second_type: second.id.display_type(),
                     identifier: current_prefix.clone(),
+                    equal_declared_identity: false,
+                    same_identifier: true,
                 }
                 .into(),
             );
@@ -1805,8 +1973,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
         }
     }
 
-    // First pass: compute identifiers and detect collisions
-    let mut computed: Vec<(usize, String, BTreeMap<String, String>)> = Vec::new();
+    // First pass: compute identifiers and detect collisions.
+    let mut computed: Vec<(usize, String, StableAnonymousHashInputs)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
         if resource.id.identity_str().is_some() {
@@ -1822,7 +1990,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
-        let schema = schema.as_schema();
 
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
@@ -1839,8 +2006,9 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
             }
         }
 
-        let hash_values = stable_anonymous_hash_inputs(resource, schema);
-        let use_simhash = hash_values.is_empty();
+        let hash_values = stable_anonymous_hash_inputs(resource, schema.schema());
+        let use_simhash =
+            anonymous_identity_basis(&hash_values) == AnonymousIdentityBasis::AttributeDerived;
 
         let hash_suffix = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce
@@ -1848,17 +2016,26 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
             let simhash = simhash_from_identity_and_resource(&identity_values, resource);
             AnonymousHashSuffix::SimHash(simhash)
         } else {
-            // Use standard hash for create-only properties
-            let mut hasher = std::hash::DefaultHasher::new();
-            for (k, v) in &identity_values {
-                k.hash(&mut hasher);
-                v.hash(&mut hasher);
-            }
-            for (k, v) in &hash_values {
-                k.hash(&mut hasher);
-                v.hash(&mut hasher);
-            }
-            AnonymousHashSuffix::Standard((hasher.finish() & 0xFFFFFFFF) as u32)
+            let hash = match &hash_values {
+                StableAnonymousHashInputs::DeclaredIdentity { values, .. } => {
+                    hash_declared_identity_inputs(&identity_values, values)
+                }
+                StableAnonymousHashInputs::CreateOnly(values) => {
+                    // Preserve the legacy create-only encoding exactly for
+                    // resource types that declare no identity paths.
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    for (key, value) in &identity_values {
+                        key.hash(&mut hasher);
+                        value.hash(&mut hasher);
+                    }
+                    for (key, value) in values {
+                        key.hash(&mut hasher);
+                        value.hash(&mut hasher);
+                    }
+                    (hasher.finish() & 0xFFFFFFFF) as u32
+                }
+            };
+            AnonymousHashSuffix::Standard(hash)
         };
         let hash_str = hash_suffix.discriminator();
 
@@ -1907,15 +2084,95 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
         .map(|(index, identity, _)| (*index, identity.clone()))
         .collect::<HashMap<_, _>>();
 
-    // Detect collisions among identities generated in this pass.
-    let mut collisions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (computed_index, (_, identifier, _)) in computed.iter().enumerate() {
-        collisions
-            .entry(identifier.clone())
+    // A module-instance prefix is an ownership scope, not part of the
+    // provider's natural key. Detect equal complete declared identities by
+    // type and provider route before grouping ordinary address collisions so
+    // different module-scoped addresses cannot hide the same real-world key.
+    let mut declared_identity_groups = BTreeMap::<
+        (
+            String,
+            String,
+            Option<String>,
+            BTreeMap<IdentityPath, String>,
+        ),
+        Vec<usize>,
+    >::new();
+    for (computed_index, (resource_index, _, inputs)) in computed.iter().enumerate() {
+        let StableAnonymousHashInputs::DeclaredIdentity { values, .. } = inputs else {
+            continue;
+        };
+        if anonymous_identity_basis(inputs) != AnonymousIdentityBasis::Stable {
+            continue;
+        }
+        let resource = &resources[*resource_index];
+        declared_identity_groups
+            .entry((
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+                resource.id.provider_instance.clone(),
+                values.clone(),
+            ))
             .or_default()
             .push(computed_index);
     }
-    for (identifier, collision_members) in collisions {
+    for (_, collision_members) in declared_identity_groups {
+        if collision_members.len() < 2 {
+            continue;
+        }
+        let resource_indices = collision_members
+            .iter()
+            .map(|&computed_index| computed[computed_index].0)
+            .collect::<Vec<_>>();
+        let mut has_direct_member = false;
+        for origin in resource_indices
+            .iter()
+            .filter_map(|&index| resources[index].loop_provenance.direct_origin().cloned())
+        {
+            has_direct_member = true;
+            record_direct_loop_conflict(
+                &mut direct_conflict_sources,
+                LoopConflictReason::IdenticalIdentityInputs,
+                &origin,
+            );
+        }
+        let has_plain_member = resource_indices
+            .iter()
+            .any(|&index| resources[index].loop_provenance.direct_origin().is_none());
+        if has_direct_member && !has_plain_member {
+            continue;
+        }
+        let first_identifier = &computed[collision_members[0]].1;
+        let same_identifier = collision_members
+            .iter()
+            .all(|&computed_index| &computed[computed_index].1 == first_identifier);
+        identity_errors.push(
+            AnonymousResourceIdentifierCollision {
+                first_type: resources[resource_indices[0]].id.display_type(),
+                second_type: resources[resource_indices[1]].id.display_type(),
+                identifier: first_identifier.clone(),
+                equal_declared_identity: true,
+                same_identifier,
+            }
+            .into(),
+        );
+    }
+
+    // Detect collisions among identities generated in this pass.
+    let mut collisions: BTreeMap<(String, String, Option<String>, String), Vec<usize>> =
+        BTreeMap::new();
+    for (computed_index, (_, identifier, _)) in computed.iter().enumerate() {
+        let resource = &resources[computed[computed_index].0];
+        collisions
+            .entry((
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+                resource.id.provider_instance.clone(),
+                identifier.clone(),
+            ))
+            .or_default()
+            .push(computed_index);
+    }
+    for ((_, _, _, identifier), collision_members) in collisions {
         if collision_members.len() < 2 {
             continue;
         }
@@ -1931,10 +2188,19 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
             continue;
         }
         let first_inputs = &computed[collision_members[0]].2;
-        let identical_stable_inputs = !first_inputs.is_empty()
+        let identical_stable_inputs = anonymous_identity_basis(first_inputs)
+            == AnonymousIdentityBasis::Stable
             && collision_members
                 .iter()
                 .all(|&computed_index| &computed[computed_index].2 == first_inputs);
+        let equal_declared_identity =
+            identical_stable_inputs && first_inputs.is_declared_identity();
+        if equal_declared_identity {
+            // Complete declared-identity equality was handled above using the
+            // natural key rather than the rendered (possibly module-prefixed)
+            // address.
+            continue;
+        }
         if identical_stable_inputs {
             let mut has_direct_member = false;
             for origin in resource_indices
@@ -1960,6 +2226,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
                 first_type: resources[resource_indices[0]].id.display_type(),
                 second_type: resources[resource_indices[1]].id.display_type(),
                 identifier,
+                equal_declared_identity,
+                same_identifier: true,
             }
             .into(),
         );
@@ -1999,6 +2267,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
                 first_type: resources[resource_indices[0]].id.display_type(),
                 second_type: resources[resource_indices[1]].id.display_type(),
                 identifier: identity,
+                equal_declared_identity: false,
+                same_identifier: true,
             }
             .into(),
         );
@@ -2154,12 +2424,15 @@ impl AnonymousIdStateInfo {
     }
 }
 
-/// Canonical state-side values for schema identity attributes that are not
-/// also create-only. Attributes in both sets are owned exclusively by the
-/// create-only seam.
+/// Canonical state-side values for every schema-declared identity path.
+///
+/// Identity is necessarily create-only, but this projection remains separate
+/// from top-level create-only reconciliation: identity-declared address
+/// migrations must match the real-world key and must not be redirected by a
+/// different mutable create-only collection from the legacy hash rule.
 #[derive(Clone, Default)]
 struct StateIdentityValues {
-    values: HashMap<String, ResolvedCreateOnlyValue>,
+    values: BTreeMap<IdentityPath, ResolvedCreateOnlyValue>,
 }
 
 impl StateIdentityValues {
@@ -2169,66 +2442,90 @@ impl StateIdentityValues {
     ) -> Self {
         let mut canonical = observed_attributes.clone();
         crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
-        let resource_schema = schema.as_schema();
-        let create_only = resource_schema
-            .create_only_attributes()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
-        let values = resource_schema
-            .identity_attributes()
-            .into_iter()
-            .filter(|attribute| !create_only.contains(*attribute))
-            .filter_map(|attribute| {
-                canonical
-                    .get(attribute)
+        let values = schema
+            .identity_paths()
+            .iter()
+            .filter_map(|path| {
+                value_at_identity_path_root(canonical.get(path.attribute_name()), path)
                     .cloned()
                     .and_then(ResolvedCreateOnlyValue::from_value)
-                    .map(|value| (attribute.to_string(), value))
+                    .map(|value| (path.clone(), value))
             })
             .collect();
         Self { values }
     }
 }
 
-/// Desired schema identity values used only to disambiguate legacy loop
-/// owners. Create-only attributes, including overlaps, are represented by
-/// [`DesiredCreateOnlyValues`] instead.
+/// Desired values for every schema-declared identity path.
 struct DesiredIdentityValues {
-    values: HashMap<String, DesiredCreateOnlyValue>,
+    values: BTreeMap<IdentityPath, DesiredCreateOnlyValue>,
 }
 
 impl DesiredIdentityValues {
     fn from_resource(
         resource: &Resource,
-        schema: &ResourceSchema,
+        schema: &ValidatedResourceSchema,
         find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     ) -> Self {
-        let create_only = schema
-            .create_only_attributes()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
-        let values = desired_comparable_values(
-            resource,
-            schema,
-            schema
-                .identity_attributes()
-                .into_iter()
-                .filter(|attribute| !create_only.contains(*attribute)),
-            find_state_by_binding,
-            true,
-        );
+        let values = schema
+            .identity_paths()
+            .iter()
+            .filter_map(|path| {
+                if path.segments().len() == 1 {
+                    if let Some(prefix) = resource.prefixes.get(path.attribute_name()) {
+                        return Some((
+                            path.clone(),
+                            DesiredCreateOnlyValue::Prefix(prefix.clone()),
+                        ));
+                    }
+                    return resource.get_attr(path.attribute_name()).map(|value| {
+                        let value = canonical_or_resolved_create_only_value(
+                            value,
+                            schema.as_schema(),
+                            path.attribute_name(),
+                            find_state_by_binding,
+                        )
+                        .map(DesiredCreateOnlyValue::Resolved)
+                        .unwrap_or(DesiredCreateOnlyValue::Unresolved);
+                        (path.clone(), value)
+                    });
+                }
+
+                value_at_identity_path(resource, path).map(|value| {
+                    let value = ResolvedCreateOnlyValue::from_value(value.clone())
+                        .map(DesiredCreateOnlyValue::Resolved)
+                        .unwrap_or(DesiredCreateOnlyValue::Unresolved);
+                    (path.clone(), value)
+                })
+            })
+            .collect();
         Self { values }
     }
 
-    fn resolved_subset_match(
+    fn is_complete(&self, schema: &ValidatedResourceSchema) -> bool {
+        self.values.len() == schema.identity_paths().len()
+            && self.values.values().all(|value| {
+                matches!(
+                    value,
+                    DesiredCreateOnlyValue::Resolved(_) | DesiredCreateOnlyValue::Prefix(_)
+                )
+            })
+    }
+
+    fn all_match(
         &self,
         state_values: &StateIdentityValues,
-        schema: &ResourceSchema,
+        schema: &ValidatedResourceSchema,
         context: &ComparisonContext<'_>,
-    ) -> (usize, bool) {
-        resolved_subset_match(&self.values, &state_values.values, schema, context)
+    ) -> bool {
+        self.values.iter().all(|(path, desired)| {
+            let Some(state) = state_values.values.get(path) else {
+                return false;
+            };
+            desired
+                .matches_identity_state(state, schema, path, context)
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -2243,26 +2540,37 @@ fn legacy_row_stable_identity_matches(
         return Ok(None);
     };
     let comparison = comparison_provider.comparison_for(registry, &candidate.resource.id)?;
-    let schema = schema.as_schema();
-    let desired_create_only =
-        DesiredCreateOnlyValues::from_resource(candidate.resource, schema, find_state_by_binding);
-    let desired_identity =
-        DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
-    if state_entry.create_only_values.is_empty() && state_entry.identity_values.values.is_empty() {
+    let schema = schema.schema();
+    if !schema.identity_paths().is_empty() {
+        let desired_identity =
+            DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
+        if declared_identity_basis(desired_identity.is_complete(schema))
+            != AnonymousIdentityBasis::Stable
+            || state_entry.identity_values.values.is_empty()
+        {
+            return Ok(None);
+        }
+        return Ok(Some(desired_identity.all_match(
+            &state_entry.identity_values,
+            schema,
+            comparison.context(),
+        )));
+    }
+
+    let desired_create_only = DesiredCreateOnlyValues::from_resource(
+        candidate.resource,
+        schema.as_schema(),
+        find_state_by_binding,
+    );
+    if state_entry.create_only_values.is_empty() {
         return Ok(None);
     }
     let (create_only_count, create_only_matches) = desired_create_only.resolved_subset_match(
         state_entry.create_only_values(),
-        schema,
+        schema.as_schema(),
         comparison.context(),
     );
-    let (identity_count, identity_matches) = desired_identity.resolved_subset_match(
-        &state_entry.identity_values,
-        schema,
-        comparison.context(),
-    );
-    Ok(((create_only_count + identity_count) > 0)
-        .then_some(create_only_matches && identity_matches))
+    Ok((create_only_count > 0).then_some(create_only_matches))
 }
 
 type LegacyLoopAddressKey = (String, String, String, Option<String>);
@@ -2543,6 +2851,67 @@ impl ResolvedCreateOnlyValue {
             .zip(prefix_key)
             .is_some_and(|(state, prefix)| state.starts_with(&prefix))
     }
+
+    fn semantically_equal_at_identity_path(
+        &self,
+        other: &Self,
+        schema: &ValidatedResourceSchema,
+        path: &IdentityPath,
+        context: &ComparisonContext<'_>,
+    ) -> bool {
+        let names =
+            path.segments()
+                .iter()
+                .map(|segment| match segment {
+                    IdentityPathSegment::Attribute(name)
+                    | IdentityPathSegment::StructField(name) => name.clone(),
+                })
+                .collect::<Vec<_>>();
+        schema.effective_node_at_path(&names).is_some_and(|node| {
+            crate::differ::type_aware_equal(
+                &self.value,
+                &other.value,
+                Some(node.field_type()),
+                schema.as_schema().defs(),
+                context,
+            )
+        })
+    }
+
+    fn starts_with_at_identity_path(
+        &self,
+        prefix: &str,
+        schema: &ValidatedResourceSchema,
+        path: &IdentityPath,
+        context: &ComparisonContext<'_>,
+    ) -> bool {
+        let names =
+            path.segments()
+                .iter()
+                .map(|segment| match segment {
+                    IdentityPathSegment::Attribute(name)
+                    | IdentityPathSegment::StructField(name) => name.clone(),
+                })
+                .collect::<Vec<_>>();
+        let Some(node) = schema.effective_node_at_path(&names) else {
+            return false;
+        };
+        let state_key = canonical_create_only_value_string(
+            &self.value,
+            Some(node.field_type()),
+            schema.as_schema().defs(),
+            context,
+        );
+        let prefix_key = canonical_create_only_value_string(
+            &Value::Concrete(ConcreteValue::String(prefix.into())),
+            Some(node.field_type()),
+            schema.as_schema().defs(),
+            context,
+        );
+        state_key
+            .zip(prefix_key)
+            .is_some_and(|(state, prefix)| state.starts_with(&prefix))
+    }
 }
 
 /// Whether one configured desired create-only value can be compared yet.
@@ -2565,6 +2934,24 @@ impl DesiredCreateOnlyValue {
                 Some(desired.semantically_equal(state, schema, attribute, context))
             }
             Self::Prefix(prefix) => Some(state.starts_with(prefix, schema, attribute, context)),
+            Self::Unresolved => None,
+        }
+    }
+
+    fn matches_identity_state(
+        &self,
+        state: &ResolvedCreateOnlyValue,
+        schema: &ValidatedResourceSchema,
+        path: &IdentityPath,
+        context: &ComparisonContext<'_>,
+    ) -> Option<bool> {
+        match self {
+            Self::Resolved(desired) => {
+                Some(desired.semantically_equal_at_identity_path(state, schema, path, context))
+            }
+            Self::Prefix(prefix) => {
+                Some(state.starts_with_at_identity_path(prefix, schema, path, context))
+            }
             Self::Unresolved => None,
         }
     }
@@ -2802,18 +3189,17 @@ impl StateCreateOnlyValues {
 
 /// Reconcile anonymous resource identifiers with existing state.
 ///
-/// When a create-only property changes on an anonymous resource, the computed
-/// hash-based identifier changes. This function detects such cases by comparing
-/// create-only property values and returns a resolved move from the old state
-/// row to the resource's freshly computed identifier when at least one
-/// create-only property matches (partial match). The desired resource identity
-/// is immutable at this boundary, so every match preserves the invariant that
-/// an anonymous identity is derived from its current identity inputs.
+/// For schemas with declared identity, this function matches a legacy state
+/// row only when every typed identity-path value recorded in state equals the
+/// desired value. Other create-only values are ignored. For schemas without
+/// identity, it retains the historical full/partial create-only matching and
+/// SimHash fallback. Every accepted match returns a resolved move from the old
+/// row to the resource's freshly computed identifier.
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns screened
-/// state entries for that resource type with their create-only attribute
-/// values. Existence checks inspect every entry, while heuristic matching only
-/// inspects unclaimed candidates.
+/// state entries for that resource type with their identity-path and
+/// create-only values. Existence checks inspect every entry, while heuristic
+/// matching only inspects unclaimed candidates.
 /// `find_state_by_binding` takes a binding name and returns state entries
 /// carrying that binding across resource types, for resolving single-hop
 /// deferred create-only refs of the exact form `binding.attr`. Binding
@@ -2893,7 +3279,8 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         };
         let comparison = comparison_provider.comparison_for(registry, &resource.id)?;
-        let schema = schema.as_schema();
+        let validated_schema = schema.schema();
+        let schema = validated_schema.as_schema();
 
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
         let key = (
@@ -2906,6 +3293,80 @@ pub fn reconcile_anonymous_identifiers(
             .all()
             .any(|entry| entry.name() == resource_identity)
         {
+            continue;
+        }
+
+        if !validated_schema.identity_paths().is_empty() {
+            let desired_identity = DesiredIdentityValues::from_resource(
+                resource,
+                validated_schema,
+                find_state_by_binding,
+            );
+
+            if declared_identity_basis(desired_identity.is_complete(validated_schema))
+                == AnonymousIdentityBasis::Stable
+            {
+                let matches = state_entries
+                    .candidates()
+                    .filter(|entry| entry.name() != resource_identity)
+                    .filter(|entry| {
+                        !used_names
+                            .get(&key)
+                            .is_some_and(|names| names.contains(entry.name()))
+                            && !claimed_names
+                                .get(&key)
+                                .is_some_and(|names| names.contains(entry.name()))
+                    })
+                    .filter(|entry| {
+                        desired_identity.all_match(
+                            &entry.identity_values,
+                            validated_schema,
+                            comparison.context(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let [matched_entry] = matches.as_slice() {
+                    moves.push(matched_entry.move_to(resolved_resource_id));
+                    claimed_names
+                        .entry(key)
+                        .or_default()
+                        .insert(matched_entry.name().to_string());
+                }
+                continue;
+            }
+
+            // The pending missing-identity policy classifies this resource as
+            // attribute-derived, so retain the existing SimHash migration
+            // behavior instead of consulting create-only values.
+            let Some(AnonymousHashSuffix::SimHash(resource_hash)) =
+                extract_hash_from_identifier(&resource_identity)
+            else {
+                continue;
+            };
+            let candidates = state_entries
+                .candidates()
+                .filter(|entry| entry.name() != resource_identity)
+                .filter(|entry| {
+                    !used_names
+                        .get(&key)
+                        .is_some_and(|names| names.contains(entry.name()))
+                        && !claimed_names
+                            .get(&key)
+                            .is_some_and(|names| names.contains(entry.name()))
+                })
+                .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
+                    Some(AnonymousHashSuffix::SimHash(hash)) => Some((entry, hash)),
+                    _ => None,
+                });
+            if let Some((state_entry, _)) =
+                closest_unique_simhash_match(resource_hash, candidates, |(_, hash)| hash)
+            {
+                moves.push(state_entry.move_to(resolved_resource_id));
+                claimed_names
+                    .entry(key)
+                    .or_default()
+                    .insert(state_entry.name().to_string());
+            }
             continue;
         }
 

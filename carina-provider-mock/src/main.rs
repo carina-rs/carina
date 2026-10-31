@@ -5,7 +5,8 @@ use carina_core::resource::{
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
-    ResourceSchema as CoreResourceSchema, ValidatedConfigSchema as CoreValidatedConfigSchema,
+    ResourceSchema as CoreResourceSchema, StructField as CoreStructField,
+    ValidatedConfigSchema as CoreValidatedConfigSchema,
     ValidatedResourceSchema as CoreValidatedResourceSchema, legacy_validator,
 };
 use carina_plugin_sdk::types::*;
@@ -115,6 +116,7 @@ impl MockProcessProvider {
     fn optional_string_attribute(name: &str) -> CoreAttributeSchema {
         CoreAttributeSchema::optional(name, CoreAttributeType::string())
             .with_description("Mock create/resume test control")
+            .create_only()
             .identity()
             .build()
     }
@@ -533,6 +535,104 @@ impl CarinaProvider for MockProcessProvider {
                 .with_description("Mock desired-normalization three-way attribute probe")
                 .validate()
                 .expect("normalization probe schema must be valid"),
+            CoreResourceSchema::new("test.nested_identity")
+                .attribute(
+                    CoreAttributeSchema::required(
+                        "identity",
+                        CoreAttributeType::struct_(
+                            "NestedIdentity",
+                            vec![
+                                CoreStructField::required("key", CoreAttributeType::string())
+                                    .create_only()
+                                    .identity()
+                                    .build(),
+                            ],
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional("description", CoreAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .expect("nested identity mock schema must be valid"),
+            CoreResourceSchema::new("budgets.Budget")
+                .attribute(
+                    CoreAttributeSchema::required(
+                        "budget",
+                        CoreAttributeType::struct_(
+                            "BudgetData",
+                            vec![
+                                CoreStructField::optional(
+                                    "budget_name",
+                                    CoreAttributeType::string(),
+                                )
+                                .create_only()
+                                .identity()
+                                .build(),
+                                CoreStructField::required(
+                                    "budget_type",
+                                    CoreAttributeType::string(),
+                                )
+                                .build(),
+                                CoreStructField::required("time_unit", CoreAttributeType::string())
+                                    .build(),
+                            ],
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        "notifications_with_subscribers",
+                        CoreAttributeType::list(CoreAttributeType::struct_(
+                            "NotificationWithSubscribers",
+                            vec![
+                                CoreStructField::required(
+                                    "notification_type",
+                                    CoreAttributeType::string(),
+                                )
+                                .build(),
+                                CoreStructField::required("threshold", CoreAttributeType::float())
+                                    .build(),
+                            ],
+                        )),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .expect("Budget-shaped mock schema must be valid"),
+            CoreResourceSchema::new("route53.RecordSet")
+                .attribute(
+                    CoreAttributeSchema::required("hosted_zone_id", CoreAttributeType::string())
+                        .create_only()
+                        .identity()
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::required("name", CoreAttributeType::string())
+                        .create_only()
+                        .identity()
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::required("type", CoreAttributeType::string())
+                        .create_only()
+                        .identity()
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        "resource_records",
+                        CoreAttributeType::list(CoreAttributeType::string()),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .expect("RecordSet-shaped mock schema must be valid"),
         ]
     }
 

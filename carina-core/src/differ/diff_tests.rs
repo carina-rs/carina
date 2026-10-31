@@ -684,6 +684,96 @@ fn replace_when_create_only_attr_changed() {
     );
 }
 
+fn nested_create_only_plan(immutable: &str, mutable: &str) -> (Plan, ResourceId) {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let id = ResourceId::with_identity("test.NestedReplacement", "example");
+    let nested_value = |immutable: &str, mutable: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "immutable".to_string(),
+                Value::Concrete(ConcreteValue::String(immutable.into())),
+            ),
+            (
+                "mutable".to_string(),
+                Value::Concrete(ConcreteValue::String(mutable.into())),
+            ),
+        ])))
+    };
+    let desired = Resource::new("test.NestedReplacement", "example")
+        .with_attribute("settings", nested_value(immutable, mutable));
+    let current = existing_state(
+        id.clone(),
+        HashMap::from([("settings".to_string(), nested_value("old-key", "old-value"))]),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        crate::schema::ResourceSchema::new("test.NestedReplacement")
+            .attribute(
+                AttributeSchema::required(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::required("immutable", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("mutable", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current_states = HashMap::from([(id.clone(), current)]);
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    (plan, id)
+}
+
+#[test]
+fn replace_when_nested_create_only_field_changes() {
+    let (plan, id) = nested_create_only_plan("new-key", "old-value");
+
+    let metadata = replacement_metadata(&plan, &id);
+    assert_eq!(&metadata.changed_create_only[..], &["settings".to_string()]);
+}
+
+#[test]
+fn update_when_only_mutable_sibling_of_nested_create_only_field_changes() {
+    let (plan, id) = nested_create_only_plan("old-key", "new-value");
+
+    assert_eq!(plan.effects().len(), 1);
+    assert!(matches!(
+        &plan.effects()[0],
+        Effect::Update {
+            changed_attributes,
+            ..
+        } if changed_attributes == &["settings".to_string()]
+    ));
+    assert!(
+        plan.replace_display.is_empty(),
+        "unexpected replacement for {id}"
+    );
+}
+
 fn create_only_nested_write_only_fixture(
     password: &str,
 ) -> (Resource, State, crate::schema::ResourceSchema) {

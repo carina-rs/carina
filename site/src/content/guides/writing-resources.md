@@ -36,7 +36,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-The resource type follows the pattern `<provider>.<service>.<resource_type>`. Anonymous resources need their provider declared and loaded so its schema is available. Carina derives identity from configured create-only or provider identity attributes. When the schema is available but none of those attributes is set, identity is derived from the declaration's attributes; only one such anonymous declaration of the same resource kind and provider instance is allowed in a scope. Use `let` bindings to disambiguate additional declarations.
+The resource type follows the pattern `<provider>.<service>.<resource_type>`. Anonymous resources need their provider declared and loaded so its schema is available. If the schema declares identity paths, Carina derives the address only from their configured values; a path may point to a top-level attribute or a nested struct field. Without declared identity, Carina falls back to configured top-level create-only attributes. When the selected values are absent, identity is derived from the declaration's attributes; only one such anonymous declaration of the same resource kind and provider instance is allowed in a scope. Use `let` bindings to disambiguate additional declarations.
 
 ## Named resources with `let`
 
@@ -56,7 +56,7 @@ awscc.ec2.Subnet {
 
 The `let` binding gives the resource a name (`vpc`) so you can reference its attributes (like `vpc.vpc_id`) from other resources. Carina automatically determines the dependency order -- the subnet will be created after the VPC.
 
-Use anonymous resources when the binding is unused. Unnecessary `let` bindings add noise. However, two or more anonymous resources of the same type in one scope must each set a create-only or identity attribute; otherwise, give them `let` bindings so their identities stay stable.
+Use anonymous resources when the binding is unused. Unnecessary `let` bindings add noise. However, two anonymous resources of the same type and provider route cannot have equal declared identity values. If their schema has no declared identity, each must have distinct configured create-only values. Otherwise, give them `let` bindings so their identities stay stable.
 
 ## Attribute types
 

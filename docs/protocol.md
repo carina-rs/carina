@@ -37,7 +37,25 @@ witness. Every form identity must be declared by that provider as a refined
 String; duplicate records, dangling identities, Int identities, and Enum
 identities are rejected while decoding. The registry retains one table per
 schema owner rather than one global identity table. Owner forms also contribute
-to semantic schema fingerprint encoding v5.
+to semantic schema fingerprint encoding v6.
+
+Every nested `StructField` schema JSON record carries required `create_only`
+and `identity` booleans. Neither field has a serde default: a provider built
+against an older JSON record fails to load instead of silently changing
+replacement or anonymous-address semantics. The host rebuilds decoded fields
+through the same input-mode and create-only builders used by native schemas.
+It rejects `identity: true` unless `create_only` is also true, rejects both
+flags on provider-populated fields, and rejects identity below a list, map, or
+union because that location does not identify one singular value. Both flags
+participate in semantic schema fingerprint encoding v6, so a saved plan is
+invalidated when either declaration changes.
+
+This is a schema-JSON-only extension. The WIT world and protocol version remain
+13. For anonymous resources, one or more declared identity paths select the
+identity-only address encoding; when no identity path is declared, the host
+retains the create-only fallback. Nested paths are represented as typed
+attribute/struct-field segments in the host and are never transported as a
+dotted string.
 
 Every resource schema JSON record also carries the required boolean
 `default_prevent_destroy`. Providers use it for resource kinds whose deletion

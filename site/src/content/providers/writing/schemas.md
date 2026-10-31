@@ -116,7 +116,7 @@ equal to a bare name.
 What the attributes declare:
 
 - `create_only` means the API cannot change the value in place, so a change replaces the resource.
-- `identity` adds the value to the address of an anonymous resource (one written without `let`), so two anonymous widgets with different names get different addresses.
+- `identity` marks an immutable value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
 - `with_default` gives the value the host assumes when the configuration leaves the attribute out.
 - `with_description` shows up in the editor and in the generated docs.
 
@@ -130,13 +130,20 @@ Every attribute and every struct field has one input mode, and the constructor p
 | `AttributeSchema::required` | `InputMode::Required` | must set the value |
 | `AttributeSchema::provider_populated` | `InputMode::ProviderPopulated` | cannot set the value; the provider returns it |
 
-The mode is chosen once, when the builder is created, and each constructor returns a different builder type that has only the methods that make sense for its mode. A provider-populated builder has no `create_only`, `identity`, `write_only` or `with_default`, because none of them mean anything for a value the user never writes. Only the optional builder has `with_default`, `removable` and `non_removable`. A combination such as "required and provider-populated" therefore does not compile, instead of failing at load time:
+The mode is chosen once, when the builder is created, and each constructor returns a different builder type that has only the methods that make sense for its mode. A provider-populated builder has no `create_only`, `identity`, `write_only` or `with_default`, because none of them mean anything for a value the user never writes. A user-input builder exposes `identity` only after `create_only`; this makes the rule that identity cannot change in place a compile-time invariant. Only the optional builder has `with_default`, `removable` and `non_removable`. Invalid combinations therefore do not compile instead of failing at provider load time:
 
 ```rust compile_fail
 use carina_plugin_sdk::core::schema::{AttributeSchema, AttributeType};
 
 // A provider-populated attribute cannot be write-only.
 let _ = AttributeSchema::provider_populated("token", AttributeType::string()).write_only();
+```
+
+```rust compile_fail
+use carina_plugin_sdk::core::schema::{AttributeSchema, AttributeType};
+
+// Identity is unavailable until the field is known to be create-only.
+let _ = AttributeSchema::required("name", AttributeType::string()).identity();
 ```
 
 Provider-populated attributes can still be marked `deferred_populate` when the API fills them in some time after create returns, such as a certificate's status. A downstream resource that reads such a value must then wait for it with a [wait expression](/reference/dsl/expressions/#wait-expression).
@@ -195,6 +202,56 @@ let tier = settings
     .unwrap();
 assert!(tier.is_required());
 ```
+
+`StructField` has the same `create_only` then `identity` typestate sequence as
+a top-level attribute. This is useful when the API's natural key lives inside
+a request object:
+
+```rust
+use carina_plugin_sdk::core::schema::{
+    AttributeSchema, AttributeType, IdentityPathSegment, ResourceSchema, StructField,
+};
+
+let schema = ResourceSchema::new("budget")
+    .attribute(
+        AttributeSchema::required(
+            "budget",
+            AttributeType::struct_(
+                "BudgetData",
+                vec![
+                    StructField::optional("budget_name", AttributeType::string())
+                        .create_only()
+                        .identity()
+                        .build(),
+                    StructField::required("time_unit", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    )
+    .validate()
+    .expect("the schema is valid");
+
+assert_eq!(
+    schema.identity_paths()[0].segments(),
+    &[
+        IdentityPathSegment::Attribute("budget".to_string()),
+        IdentityPathSegment::StructField("budget_name".to_string()),
+    ],
+);
+```
+
+An identity path may cross structs and schema references, but not a list or
+map element or a union member: those shapes do not select one singular value.
+Schema admission rejects such a declaration, including one received through
+WASM schema JSON. A provider-populated `StructField` exposes neither
+`create_only` nor `identity`.
+
+Every identity component must be declared. For example, a DNS record key needs
+the hosted zone, record name, and record type; marking only the name can make
+two different real-world records collide. Two anonymous resources on the same
+provider route with equal complete identity values are rejected. Give one a
+stable name with `let` when both objects are intentional.
 
 Enum values in the DSL follow the snake_case convention. When the API spells a value differently, map it with `dsl_aliases` (pairs of API value and DSL spelling) or with a `DslTransform` in `to_dsl`, such as `DslTransform::HyphenToUnderscore` for values like `us-east-1`.
 

@@ -2649,6 +2649,8 @@ mod tests {
             provider_name: None,
             read_only: true,
             write_only: false,
+            create_only: false,
+            identity: false,
             deferred_populate: false,
         };
 
@@ -2675,6 +2677,8 @@ mod tests {
             provider_name: None,
             read_only: true,
             write_only: true,
+            create_only: false,
+            identity: false,
             deferred_populate: false,
         };
 
@@ -2737,6 +2741,8 @@ mod tests {
                     provider_name: Some("Key".to_string()),
                     read_only: false,
                     write_only: false,
+                    create_only: false,
+                    identity: false,
                     deferred_populate: false,
                 }],
             },
@@ -2780,6 +2786,8 @@ mod tests {
                     provider_name: None,
                     read_only: false,
                     write_only: true,
+                    create_only: false,
+                    identity: false,
                     deferred_populate: false,
                 }],
             },
@@ -2847,6 +2855,8 @@ mod tests {
             provider_name: None,
             read_only: true,
             write_only: false,
+            create_only: false,
+            identity: false,
             deferred_populate: false,
         };
         let destination = proto::StructField {
@@ -2862,6 +2872,8 @@ mod tests {
             provider_name: None,
             read_only: false,
             write_only: false,
+            create_only: false,
+            identity: false,
             deferred_populate: false,
         };
         let metadata = proto_attr(
@@ -2903,6 +2915,8 @@ mod tests {
                     provider_name: None,
                     read_only: false,
                     write_only: true,
+                    create_only: false,
+                    identity: false,
                     deferred_populate: false,
                 }],
             },
@@ -2946,6 +2960,8 @@ mod tests {
                         provider_name: None,
                         read_only: false,
                         write_only: true,
+                        create_only: false,
+                        identity: false,
                         deferred_populate: false,
                     }],
                 },
@@ -3010,6 +3026,8 @@ mod tests {
                             provider_name: None,
                             read_only: false,
                             write_only: true,
+                            create_only: false,
+                            identity: false,
                             deferred_populate: false,
                         }],
                     },
@@ -3062,6 +3080,8 @@ mod tests {
             block_name,
             deferred_populate,
             write_only,
+            create_only,
+            identity,
         } = round_tripped_field.parts();
         assert_eq!(name, "provider_id");
         assert!(matches!(
@@ -3076,6 +3096,8 @@ mod tests {
         assert_eq!(block_name, None);
         assert!(deferred_populate);
         assert!(!write_only);
+        assert!(!create_only);
+        assert!(!identity);
 
         let write_only_field =
             CoreStructField::optional("client_secret", CoreAttributeType::string())
@@ -3095,6 +3117,17 @@ mod tests {
             proto_struct_field_to_core(&serde_json::from_str::<proto::StructField>(&json).unwrap())
                 .unwrap();
         assert!(round_tripped.parts().write_only);
+
+        let identity_field = CoreStructField::required("budget_name", CoreAttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+        let wire = core_struct_field_to_proto_for_schema_round_trip(&identity_field);
+        assert!(wire.create_only);
+        assert!(wire.identity);
+        let round_tripped = proto_struct_field_to_core(&wire).unwrap();
+        assert!(round_tripped.parts().create_only);
+        assert!(round_tripped.parts().identity);
 
         let required_field = CoreStructField::required("name", CoreAttributeType::string()).build();
         let proto_required = core_struct_field_to_proto_for_schema_round_trip(&required_field);
@@ -4627,7 +4660,7 @@ mod tests {
     }
 
     #[test]
-    fn released_protocol_v12_schema_fixtures_require_keyed_metadata_before_core_decode() {
+    fn released_protocol_v12_schema_fixtures_require_current_metadata_before_core_decode() {
         fn upgrade_v12_fixture_in_memory(value: &mut serde_json::Value) {
             match value {
                 serde_json::Value::Array(values) => {
@@ -4660,6 +4693,10 @@ mod tests {
                     }
                     if object.contains_key("attr_type") {
                         object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
+                    }
+                    if object.contains_key("field_type") {
+                        object.insert("create_only".to_string(), serde_json::Value::Bool(false));
+                        object.insert("identity".to_string(), serde_json::Value::Bool(false));
                     }
                     if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
                         object.insert(
@@ -4700,14 +4737,17 @@ mod tests {
             let rendered = render_error_chain(&error);
             assert!(
                 rendered.contains("missing field `keyed_partial_update`")
-                    || rendered.contains("missing field `field_groups`"),
+                    || rendered.contains("missing field `field_groups`")
+                    || rendered.contains("missing field `create_only`")
+                    || rendered.contains("missing field `identity`"),
                 "released fixture {expected_resource_type} crossed the required-field gate: {rendered}",
             );
 
             // The protocol constant deliberately remains unchanged on this
-            // branch, while both new fields are deliberately required. Add
-            // them only in-memory so these immutable v12 bytes still exercise
-            // every older conversion rule after the required-field gate.
+            // branch, while the newer metadata fields are deliberately
+            // required. Add them only in-memory so these immutable v12 bytes
+            // still exercise every older conversion rule after the
+            // required-field gate.
             let mut upgraded: serde_json::Value =
                 serde_json::from_str(json).expect("released fixture is valid JSON");
             upgrade_v12_fixture_in_memory(&mut upgraded);
@@ -4775,6 +4815,8 @@ mod tests {
                                     "required":true,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":false,
                                     "deferred_populate":false,
                                     "provider_name":"DomainName"
                                 },{
@@ -4789,6 +4831,8 @@ mod tests {
                                             "required":false,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":false,
                                             "deferred_populate":false,
                                             "provider_name":"RedirectFrom"
                                         },{
@@ -4797,6 +4841,8 @@ mod tests {
                                             "required":false,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":false,
                                             "deferred_populate":false,
                                             "provider_name":"RedirectTo"
                                         }]
@@ -4804,6 +4850,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":false,
                                     "deferred_populate":false,
                                     "provider_name":"HttpRedirect"
                                 },{
@@ -4818,6 +4866,8 @@ mod tests {
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":false,
                                             "deferred_populate":false,
                                             "provider_name":"Name"
                                         },{
@@ -4832,6 +4882,8 @@ mod tests {
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":false,
                                             "deferred_populate":false,
                                             "provider_name":"Type"
                                         },{
@@ -4840,6 +4892,8 @@ mod tests {
                                             "required":true,
                                             "read_only":false,
                                             "write_only":false,
+                                            "create_only":false,
+                                            "identity":false,
                                             "deferred_populate":false,
                                             "provider_name":"Value"
                                         }]
@@ -4847,6 +4901,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":false,
                                     "deferred_populate":true,
                                     "provider_name":"ResourceRecord"
                                 },{
@@ -4855,6 +4911,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":false,
                                     "deferred_populate":false,
                                     "provider_name":"ValidationDomain"
                                 },{
@@ -4867,6 +4925,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":false,
                                     "deferred_populate":false,
                                     "provider_name":"ValidationEmails"
                                 },{
@@ -4885,6 +4945,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":false,
                                     "deferred_populate":false,
                                     "provider_name":"ValidationMethod"
                                 },{
@@ -4903,6 +4965,8 @@ mod tests {
                                     "required":false,
                                     "read_only":false,
                                     "write_only":false,
+                                    "create_only":false,
+                                    "identity":false,
                                     "deferred_populate":false,
                                     "provider_name":"ValidationStatus"
                                 }]
@@ -5106,6 +5170,8 @@ mod tests {
                             "field_type": { "type": "Int" },
                             "required": true,
                             "write_only": false,
+                            "create_only": false,
+                            "identity": false,
                             "description": "Start of port range",
                             "block_name": "from_port_block",
                             "provider_name": "FromPort"
@@ -5115,6 +5181,8 @@ mod tests {
                             "field_type": { "type": "String" },
                             "required": true,
                             "write_only": false,
+                            "create_only": false,
+                            "identity": false,
                             "description": null,
                             "block_name": null,
                             "provider_name": null
@@ -5464,6 +5532,8 @@ mod tests {
                     provider_name: None,
                     read_only: false,
                     write_only: false,
+                    create_only: false,
+                    identity: false,
                     deferred_populate: false,
                 }],
             },

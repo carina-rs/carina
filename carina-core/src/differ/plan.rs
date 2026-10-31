@@ -25,7 +25,10 @@ use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
 use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
-use super::{PlanPriorStates, PlannedListKeyRelease, PresentDiff, diff_present_with_releases};
+use super::{
+    ComparisonContext, PlanPriorStates, PlannedListKeyRelease, PresentDiff,
+    diff_present_with_releases, type_aware_equal,
+};
 
 fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {
     for release in releases {
@@ -55,11 +58,57 @@ struct RefAttr {
 }
 
 /// Check which changed attributes are create-only according to the schema
-fn find_changed_create_only(changed_attributes: &[String], schema: &ResourceSchema) -> Vec<String> {
+fn find_top_level_changed_create_only(
+    changed_attributes: &[String],
+    schema: &ResourceSchema,
+) -> Vec<String> {
     let create_only_attrs = schema.create_only_attributes();
     changed_attributes
         .iter()
         .filter(|attr| create_only_attrs.contains(&attr.as_str()))
+        .cloned()
+        .collect()
+}
+
+pub(super) fn find_changed_create_only(
+    changed_attributes: &[String],
+    from: &State,
+    to: &Resource,
+    schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
+) -> Vec<String> {
+    let top_level = schema.create_only_attributes();
+    changed_attributes
+        .iter()
+        .filter(|attribute| {
+            if top_level.contains(&attribute.as_str()) {
+                return true;
+            }
+
+            let from_leaves = from
+                .attributes
+                .get(attribute.as_str())
+                .map(|value| schema.create_only_leaf_projection(attribute, value))
+                .unwrap_or_default();
+            let to_leaves = to
+                .attributes
+                .get(attribute.as_str())
+                .map(|value| schema.create_only_leaf_projection(attribute, value))
+                .unwrap_or_default();
+            from_leaves.len() != to_leaves.len()
+                || from_leaves.iter().zip(&to_leaves).any(
+                    |((from_path, from_value, field_type), (to_path, to_value, _))| {
+                        from_path != to_path
+                            || !type_aware_equal(
+                                from_value,
+                                to_value,
+                                Some(field_type),
+                                &schema.defs,
+                                context,
+                            )
+                    },
+                )
+        })
         .cloned()
         .collect()
 }
@@ -564,8 +613,13 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
-                        let changed_create_only =
-                            find_changed_create_only(&changed_attributes, schema);
+                        let changed_create_only = find_changed_create_only(
+                            &changed_attributes,
+                            &from,
+                            &to,
+                            schema,
+                            context,
+                        );
 
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
@@ -1206,8 +1260,10 @@ fn promote_pending_replaces_for_dependents(
             ) else {
                 continue;
             };
-            let create_only_refs =
-                find_changed_create_only(&ref_attr_names, owner_schema.schema().as_schema());
+            let create_only_refs = find_top_level_changed_create_only(
+                &ref_attr_names,
+                owner_schema.schema().as_schema(),
+            );
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
                 let ref_hints: Vec<(String, String)> = ref_attrs

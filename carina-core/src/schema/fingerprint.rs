@@ -16,7 +16,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v5";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v6";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -398,6 +398,8 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
         block_name,
         deferred_populate,
         write_only,
+        create_only,
+        identity,
     } = field;
     encoder.string(name);
     encode_attribute_type(encoder, field_type);
@@ -406,6 +408,8 @@ fn encode_struct_field(encoder: &mut CanonicalEncoder, field: &StructField) {
     encoder.option(block_name.as_deref(), CanonicalEncoder::string);
     encoder.bool(*deferred_populate);
     encoder.bool(*write_only);
+    encoder.bool(*create_only);
+    encoder.bool(*identity);
 }
 
 fn encode_schema_kind(encoder: &mut CanonicalEncoder, kind: SchemaKind) {

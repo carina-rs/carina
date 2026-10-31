@@ -318,6 +318,17 @@ impl SchemaDecodeError {
         ))
     }
 
+    fn incompatible_struct_field_modifier(mode: InputMode, modifier: &str) -> Self {
+        Self::new(format!(
+            "{modifier} is not valid for {} struct-field input mode",
+            input_mode_name(mode)
+        ))
+    }
+
+    fn identity_requires_create_only() -> Self {
+        Self::new("identity requires create_only")
+    }
+
     fn empty_custom_enum_namespace(name: &str) -> Self {
         Self::InvalidSchema {
             detail: "custom enum namespace is invalid".to_string(),
@@ -828,6 +839,8 @@ pub fn struct_field_to_protocol(
         block_name,
         deferred_populate,
         write_only,
+        create_only,
+        identity,
     } = field.parts();
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
     Ok(protocol::StructField {
@@ -839,6 +852,8 @@ pub fn struct_field_to_protocol(
         provider_name: provider_name.map(str::to_owned),
         read_only,
         write_only,
+        create_only,
+        identity,
         deferred_populate,
     })
 }
@@ -983,6 +998,10 @@ pub fn protocol_to_attribute_schema(
         .map_err(SchemaDecodeError::from_default)
         .map_err(|error| error.prepend_attribute(name))?;
 
+    if *identity && !*create_only {
+        return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
+    }
+
     match input_mode {
         InputMode::Optional => {
             if *deferred_populate {
@@ -1002,9 +1021,6 @@ pub fn protocol_to_attribute_schema(
             if let Some(provider_name) = provider_name {
                 builder = builder.with_provider_name(provider_name.clone());
             }
-            if *create_only {
-                builder = builder.create_only();
-            }
             builder = match removable {
                 Some(true) => builder.removable(),
                 Some(false) => builder.non_removable(),
@@ -1016,13 +1032,18 @@ pub fn protocol_to_attribute_schema(
             if *write_only {
                 builder = builder.write_only();
             }
-            if *identity {
-                builder = builder.identity();
-            }
             if let Some(key_field) = keyed_partial_update {
                 builder = builder.keyed_partial_update(key_field.clone());
             }
-            Ok(builder.build())
+            if *create_only {
+                let mut builder = builder.create_only();
+                if *identity {
+                    builder = builder.identity();
+                }
+                Ok(builder.build())
+            } else {
+                Ok(builder.build())
+            }
         }
         InputMode::Required => {
             if default.is_some() {
@@ -1052,22 +1073,24 @@ pub fn protocol_to_attribute_schema(
             if let Some(provider_name) = provider_name {
                 builder = builder.with_provider_name(provider_name.clone());
             }
-            if *create_only {
-                builder = builder.create_only();
-            }
             if let Some(block_name) = block_name {
                 builder = builder.with_block_name(block_name.clone());
             }
             if *write_only {
                 builder = builder.write_only();
             }
-            if *identity {
-                builder = builder.identity();
-            }
             if let Some(key_field) = keyed_partial_update {
                 builder = builder.keyed_partial_update(key_field.clone());
             }
-            Ok(builder.build())
+            if *create_only {
+                let mut builder = builder.create_only();
+                if *identity {
+                    builder = builder.identity();
+                }
+                Ok(builder.build())
+            } else {
+                Ok(builder.build())
+            }
         }
         InputMode::ProviderPopulated => {
             for (present, modifier) in [
@@ -1514,12 +1537,27 @@ pub fn protocol_to_struct_field(
         provider_name,
         read_only,
         write_only,
+        create_only,
+        identity,
         deferred_populate,
     } = field;
     let input_mode = protocol_to_input_mode(*required, *read_only)
         .map_err(|error| error.prepend_attribute(name))?;
     if input_mode == InputMode::ProviderPopulated && *write_only {
         return Err(SchemaDecodeError::conflicting_write_only_mode().prepend_attribute(name));
+    }
+    if *identity && !*create_only {
+        return Err(SchemaDecodeError::identity_requires_create_only().prepend_attribute(name));
+    }
+    if input_mode == InputMode::ProviderPopulated {
+        for (present, modifier) in [(*create_only, "create_only"), (*identity, "identity")] {
+            if present {
+                return Err(SchemaDecodeError::incompatible_struct_field_modifier(
+                    input_mode, modifier,
+                )
+                .prepend_attribute(name));
+            }
+        }
     }
     let field_type =
         protocol_to_attribute_type(field_type).map_err(|error| error.prepend_attribute(name))?;
@@ -1542,7 +1580,15 @@ pub fn protocol_to_struct_field(
             if *deferred_populate {
                 builder = builder.deferred_populate();
             }
-            Ok(builder.build())
+            if *create_only {
+                let mut builder = builder.create_only();
+                if *identity {
+                    builder = builder.identity();
+                }
+                Ok(builder.build())
+            } else {
+                Ok(builder.build())
+            }
         }
         InputMode::Required => {
             let mut builder = StructField::required(name.clone(), field_type);
@@ -1561,7 +1607,15 @@ pub fn protocol_to_struct_field(
             if *deferred_populate {
                 builder = builder.deferred_populate();
             }
-            Ok(builder.build())
+            if *create_only {
+                let mut builder = builder.create_only();
+                if *identity {
+                    builder = builder.identity();
+                }
+                Ok(builder.build())
+            } else {
+                Ok(builder.build())
+            }
         }
         InputMode::ProviderPopulated => {
             let mut builder = StructField::provider_populated(name.clone(), field_type);
@@ -3267,6 +3321,8 @@ mod tests {
                 provider_name: None,
                 read_only: false,
                 write_only: false,
+                create_only: false,
+                identity: false,
                 deferred_populate: false,
             }],
             field_groups: vec![protocol::FieldGroup {
@@ -3287,6 +3343,138 @@ mod tests {
                 .to_string()
                 .contains("at least two fields")
         );
+    }
+
+    #[test]
+    fn nested_identity_round_trips_only_with_create_only_witness() {
+        let field = StructField::required("budget_name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build();
+
+        let wire = struct_field_to_protocol(&field).unwrap();
+        assert!(wire.create_only);
+        assert!(wire.identity);
+
+        let decoded = protocol_to_struct_field(&wire).unwrap();
+        let parts = decoded.parts();
+        assert!(parts.create_only);
+        assert!(parts.identity);
+    }
+
+    #[test]
+    fn protocol_decode_rejects_nested_identity_without_create_only() {
+        let wire = protocol::StructField {
+            name: "budget_name".to_string(),
+            field_type: protocol::AttributeType::String {
+                pattern: None,
+                length: None,
+                validate: None,
+                to_dsl: None,
+                identity: None,
+            },
+            required: false,
+            description: None,
+            block_name: None,
+            provider_name: None,
+            read_only: false,
+            write_only: false,
+            create_only: false,
+            identity: true,
+            deferred_populate: false,
+        };
+
+        let error = protocol_to_struct_field(&wire)
+            .expect_err("identity must be decoded through a create-only builder");
+        assert!(matches!(error, SchemaDecodeError::InvalidSchema { .. }));
+        assert_eq!(
+            error.to_string(),
+            "attribute 'budget_name': identity requires create_only"
+        );
+    }
+
+    #[test]
+    fn protocol_decode_rejects_identity_inside_list_map_and_union_elements() {
+        let identity_struct = || protocol::AttributeType::Struct {
+            name: "Element".to_string(),
+            fields: vec![protocol::StructField {
+                name: "key".to_string(),
+                field_type: protocol::AttributeType::String {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: None,
+                },
+                required: true,
+                description: None,
+                block_name: None,
+                provider_name: None,
+                read_only: false,
+                write_only: false,
+                create_only: true,
+                identity: true,
+                deferred_populate: false,
+            }],
+            field_groups: vec![],
+        };
+        let cases = [
+            (
+                "list",
+                protocol::AttributeType::List {
+                    element_type: Box::new(identity_struct()),
+                    ordered: true,
+                    length: None,
+                    validate: None,
+                },
+            ),
+            (
+                "map",
+                protocol::AttributeType::Map {
+                    inner: Box::new(identity_struct()),
+                    key: Box::new(protocol::AttributeType::String {
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                        identity: None,
+                    }),
+                },
+            ),
+            (
+                "union",
+                protocol::AttributeType::Union {
+                    members: vec![identity_struct()],
+                },
+            ),
+        ];
+
+        for (shape, attr_type) in cases {
+            let schema = ResourceSchema::new(format!("test.Invalid{shape}"))
+                .attribute(AttributeSchema::required("container", AttributeType::string()).build())
+                .validate()
+                .unwrap();
+            let mut wire = resource_schema_to_protocol(&schema).unwrap();
+            wire.attributes.get_mut("container").unwrap().attr_type = attr_type;
+
+            let error = protocol_to_resource_schema(&wire)
+                .expect_err("non-singular identity path must fail wire admission");
+            assert!(matches!(
+                &error,
+                SchemaDecodeError::InvalidSchema {
+                    schema_issue_location: Some(_),
+                    source: Some(_),
+                    ..
+                }
+            ));
+            let source = std::error::Error::source(&error)
+                .expect("schema admission error must retain its typed source")
+                .to_string();
+            assert!(
+                source.contains("identity cannot be declared inside a list, map, or union element"),
+                "{shape}: {error}; source: {source}",
+            );
+        }
     }
 
     #[test]

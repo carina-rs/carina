@@ -55,7 +55,7 @@ pub fn managed_binding_stability(
         let owner_schema = resolved_comparison.owner_schema();
         let context = resolved_comparison.context();
         let schema = owner_schema.schema();
-        let changed_attributes = match diff_present_with_releases(
+        let (changed_attributes, from, to) = match diff_present_with_releases(
             resource,
             present,
             saved_attrs.get(&resource.id),
@@ -74,8 +74,11 @@ pub fn managed_binding_stability(
                 continue;
             }
             PresentDiff::Update {
-                changed_attributes, ..
-            } => changed_attributes,
+                changed_attributes,
+                from,
+                to,
+                ..
+            } => (changed_attributes, from, to),
         };
         let changed_attributes = plan::filter_non_removable_removals(
             &resource.id.provider,
@@ -91,10 +94,14 @@ pub fn managed_binding_stability(
             );
             continue;
         }
-        let create_only = schema.as_schema().create_only_attributes();
-        if changed_attributes
-            .iter()
-            .any(|attribute| create_only.contains(&attribute.as_str()))
+        if !plan::find_changed_create_only(
+            &changed_attributes,
+            &from,
+            &to,
+            schema.as_schema(),
+            context,
+        )
+        .is_empty()
         {
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;

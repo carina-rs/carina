@@ -7,7 +7,7 @@ use crate::resource::{
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
-    ResourceSchema, SchemaRegistry, TypeIdentity, ValidatedConfigSchema,
+    ResourceSchema, SchemaRegistry, StructField, TypeIdentity, ValidatedConfigSchema,
     ValidatedProviderSchemaWitness, enum_identity,
 };
 use indexmap::IndexMap;
@@ -143,6 +143,7 @@ fn loop_identity_only_registry() -> SchemaRegistry {
         ResourceSchema::new("ec2.Vpc")
             .attribute(
                 AttributeSchema::optional("identity_input", AttributeType::string())
+                    .create_only()
                     .identity()
                     .build(),
             )
@@ -445,6 +446,7 @@ fn route53_record_set_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::optional("type", AttributeType::string())
+                .create_only()
                 .identity()
                 .build(),
         )
@@ -486,6 +488,7 @@ fn route53_state_entry(registry: &SchemaRegistry, name: &str) -> AnonymousIdStat
         [
             ("name", concrete_string("carina-rs.dev")),
             ("hosted_zone_id", concrete_string("Z123")),
+            ("type", concrete_string("A")),
         ],
     )
 }
@@ -519,6 +522,79 @@ fn simhash_suffix_for_test(identifier: &str) -> SimHash {
         AnonymousHashSuffix::SimHash(hash) => hash,
         AnonymousHashSuffix::Standard(_) => panic!("expected SimHash suffix: {identifier}"),
     }
+}
+
+fn budget_identity_schema() -> ResourceSchema {
+    ResourceSchema::new("budgets.Budget")
+        .attribute(
+            AttributeSchema::required(
+                "budget",
+                AttributeType::struct_(
+                    "BudgetData",
+                    vec![
+                        StructField::optional("budget_name", AttributeType::string())
+                            .create_only()
+                            .identity()
+                            .build(),
+                        StructField::required("budget_type", AttributeType::string()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "notifications_with_subscribers",
+                AttributeType::list(AttributeType::string()),
+            )
+            .create_only()
+            .build(),
+        )
+}
+
+fn budget_resource(name: Option<&str>, notification: &str) -> Resource {
+    let mut resource = Resource::pending_with_provider("mock", "budgets.Budget", None);
+    let mut budget = IndexMap::new();
+    if let Some(name) = name {
+        budget.insert("budget_name".to_string(), concrete_string(name));
+    }
+    budget.insert("budget_type".to_string(), concrete_string("COST"));
+    resource.set_attr(
+        "budget".to_string(),
+        Value::Concrete(ConcreteValue::Map(budget)),
+    );
+    resource.set_attr(
+        "notifications_with_subscribers".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![concrete_string(notification)])),
+    );
+    resource
+}
+
+fn record_set_identity_schema() -> ResourceSchema {
+    ResourceSchema::new("route53.RecordSet")
+        .attribute(
+            AttributeSchema::required("hosted_zone_id", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required("type", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("aliases", AttributeType::list(AttributeType::string()))
+                .create_only()
+                .build(),
+        )
 }
 
 #[test]
@@ -572,6 +648,174 @@ fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set
 }
 
 #[test]
+fn pending_decision_missing_declared_identity_is_attribute_derived() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let resource = budget_resource(None, "actual");
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        Some(AnonymousIdentityBasis::AttributeDerived),
+    );
+}
+
+#[test]
+fn pending_decision_incomplete_composite_identity_is_attribute_derived() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema fixture must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "route53.RecordSet", None);
+    resource.set_attr("hosted_zone_id".to_string(), concrete_string("Z1"));
+    resource.set_attr("name".to_string(), concrete_string("www.example.com"));
+    // `type`, the third component of the natural key, is intentionally absent.
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        Some(AnonymousIdentityBasis::AttributeDerived),
+    );
+}
+
+#[test]
+fn declared_nested_identity_excludes_mutable_create_only_values_from_address() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+
+    let mut before = vec![budget_resource(Some("monthly"), "actual")];
+    let mut after = vec![budget_resource(Some("monthly"), "forecasted")];
+    compute_anonymous_identifiers_for_test(&mut before, &[], &registry, &|_| Vec::new())
+        .expect("first budget identity");
+    compute_anonymous_identifiers_for_test(&mut after, &[], &registry, &|_| Vec::new())
+        .expect("second budget identity");
+
+    assert_eq!(before[0].id, after[0].id);
+}
+
+#[test]
+fn different_nested_identity_values_produce_different_addresses() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resources = vec![
+        budget_resource(Some("monthly"), "actual"),
+        budget_resource(Some("annual"), "actual"),
+    ];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("different nested identity values must not collide");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn equal_declared_identity_values_are_a_typed_error_suggesting_let() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resources = vec![
+        budget_resource(Some("monthly"), "actual"),
+        budget_resource(Some("monthly"), "forecasted"),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("equal declared identity must be rejected");
+
+    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    assert!(
+        error.to_string().contains("equal declared identity values"),
+        "{error}",
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("Give one of them a name with `let`"),
+        "{error}",
+    );
+}
+
+#[test]
+fn equal_declared_identity_values_are_rejected_across_module_scopes() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resources = vec![
+        budget_resource(Some("monthly"), "actual")
+            .with_module_source(live_module_source("budget", "module_one")),
+        budget_resource(Some("monthly"), "forecasted")
+            .with_module_source(live_module_source("budget", "module_two")),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("module address prefixes must not hide equal real-world identities");
+
+    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    assert!(
+        error.to_string().contains("equal declared identity values"),
+        "{error}",
+    );
+}
+
+#[test]
+fn composite_identity_hashes_every_record_set_key_component() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema"),
+    );
+    let record = |zone: &str, name: &str, record_type: &str| {
+        let mut resource = Resource::pending_with_provider("mock", "route53.RecordSet", None);
+        resource.set_attr("hosted_zone_id".to_string(), concrete_string(zone));
+        resource.set_attr("name".to_string(), concrete_string(name));
+        resource.set_attr("type".to_string(), concrete_string(record_type));
+        resource
+    };
+    let mut resources = vec![
+        record("Z1", "www.example.com", "A"),
+        record("Z2", "www.example.com", "A"),
+        record("Z1", "api.example.com", "A"),
+        record("Z1", "www.example.com", "AAAA"),
+    ];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("each complete composite key is distinct");
+
+    let identities = resources
+        .iter()
+        .map(|resource| resource.id.identity_str().unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(identities.len(), resources.len());
+}
+
+#[test]
 fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
     use crate::resource::AccessPath;
 
@@ -603,6 +847,7 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
 fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -650,6 +895,7 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
 fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -678,6 +924,7 @@ fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
 fn unresolved_identity_prefix_values_produce_distinct_stable_identifiers() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -855,6 +1102,7 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
 fn unresolved_and_resolved_prefix_forms_hash_to_the_same_identity() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -2458,6 +2706,7 @@ fn test_identity_attribute_prevents_collision() {
         )
         .attribute(
             AttributeSchema::optional("type", AttributeType::string())
+                .create_only()
                 .identity()
                 .build(),
         )
@@ -2538,6 +2787,54 @@ fn test_identity_attribute_prevents_collision() {
         resources[0].id.identity_str().expect("resolved identity"),
         resources[1].id.identity_str().expect("resolved identity"),
         "different identity attr values should produce different identifiers"
+    );
+}
+
+#[test]
+fn reconcile_identity_declared_address_migration_matches_nested_state_identity() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut desired = vec![budget_resource(Some("monthly"), "forecasted")];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("desired budget identity");
+    let destination = desired[0].id.identity_str().unwrap().to_string();
+    let old_address = "mock_budgets_budget_0ddc0ffe";
+    assert_ne!(old_address, destination);
+
+    let mut budget = IndexMap::new();
+    budget.insert("budget_name".to_string(), concrete_string("monthly"));
+    budget.insert("budget_type".to_string(), concrete_string("COST"));
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "budgets.Budget",
+        old_address,
+        None,
+        None,
+        [
+            ("budget", Value::Concrete(ConcreteValue::Map(budget))),
+            (
+                "notifications_with_subscribers",
+                Value::Concrete(ConcreteValue::List(vec![concrete_string("actual")])),
+            ),
+        ],
+    )];
+
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(old_address.to_string(), destination)],
     );
 }
 
