@@ -2742,8 +2742,7 @@ fn test_substitute_arguments_unavailable_builtin_call() {
             Value::Deferred(DeferredValue::Placeholder(
                 ParserPlaceholder::ModuleArgument {
                     name: "source".to_string(),
-                    source_line: (0).into(),
-                    diagnostic_name: None,
+                    diagnostic: Default::default(),
                 },
             ))
             .into(),
@@ -4835,8 +4834,7 @@ fn module_argument_postfix_access_preserves_deferred_caller_value() {
         Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument {
                 name: "items".to_string(),
-                source_line: (0).into(),
-                diagnostic_name: None,
+                diagnostic: Default::default(),
             },
         )),
         PathSegment::Subscript {

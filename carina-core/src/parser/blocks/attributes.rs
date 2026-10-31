@@ -173,8 +173,7 @@ fn register_argument_binding(
         Value::Deferred(DeferredValue::Placeholder(
             crate::resource::ParserPlaceholder::ModuleArgument {
                 name: name.to_string(),
-                source_line: (0).into(),
-                diagnostic_name: None,
+                diagnostic: Default::default(),
             },
         )),
         Some(type_expr.clone()),

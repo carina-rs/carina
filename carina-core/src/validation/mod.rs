@@ -2476,16 +2476,6 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
             check_function_calls(id, None, None, bindings, unknown_policy, &mut errors);
         }
     }
-    for wait in &parsed.wait_bindings {
-        check_function_calls(
-            &wait.until_predicate.rhs,
-            None,
-            None,
-            bindings,
-            unknown_policy,
-            &mut errors,
-        );
-    }
     for value in parsed.variables.values() {
         check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
     }

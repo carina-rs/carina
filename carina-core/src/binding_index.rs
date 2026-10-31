@@ -1298,8 +1298,8 @@ pub struct WaitAliasSpec {
     pub target: BindingName,
 }
 
-impl<P: PlaceholderKind> From<&crate::parser::WaitBinding<P>> for WaitAliasSpec {
-    fn from(wb: &crate::parser::WaitBinding<P>) -> Self {
+impl From<&crate::parser::WaitBinding> for WaitAliasSpec {
+    fn from(wb: &crate::parser::WaitBinding) -> Self {
         Self {
             binding: wb.binding.clone(),
             target: wb.target.clone(),

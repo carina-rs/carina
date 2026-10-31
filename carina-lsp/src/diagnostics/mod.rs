@@ -422,7 +422,27 @@ impl DiagnosticEngine {
                 } else {
                     carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
                 };
-            diagnostics.extend(self.check_expansion_boundary(doc, boundary_file, boundary));
+            if let Some(merged) = merged {
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    merged,
+                    boundary,
+                    checks::ExpansionBoundaryScope::Authored,
+                ));
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    boundary_file,
+                    boundary,
+                    checks::ExpansionBoundaryScope::Unlocated,
+                ));
+            } else {
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    boundary_file,
+                    boundary,
+                    checks::ExpansionBoundaryScope::All,
+                ));
+            }
         }
         if let Some(current_file) = current_parsed {
             diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(

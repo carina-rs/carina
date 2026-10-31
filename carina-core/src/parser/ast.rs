@@ -2845,10 +2845,24 @@ pub struct UpstreamState {
 /// `Value` so namespaced enums (`aws.acm.Certificate.Status.Issued`),
 /// string literals, integers, booleans, and durations all flow into
 /// the same predicate type.
+///
+/// The RHS cannot carry a parser placeholder:
+///
+/// ```compile_fail
+/// use carina_core::parser::UntilPredicateAst;
+/// use carina_core::resource::{DeferredValue, ParserPlaceholder, Value};
+///
+/// let _: UntilPredicateAst = UntilPredicateAst {
+///     lhs_segments: vec!["target".into(), "status".into()],
+///     rhs: Value::<ParserPlaceholder>::Deferred(DeferredValue::Placeholder(
+///         ParserPlaceholder::FnParam { name: "status".into() },
+///     )),
+/// };
+/// ```
 #[derive(Debug, Clone)]
-pub struct UntilPredicateAst<P: PlaceholderKind = NoPlaceholder> {
+pub struct UntilPredicateAst {
     pub lhs_segments: Vec<String>,
-    pub rhs: crate::resource::Value<P>,
+    pub rhs: crate::resource::Value,
 }
 
 /// A binding identifier (a `let`/`wait`/`depends_on` name such as
@@ -2956,7 +2970,7 @@ impl PartialEq<BindingName> for String {
 ///
 /// See `notes/specs/2026-05-09-wait-construct-design.md`.
 #[derive(Debug, Clone)]
-pub struct WaitBinding<P: PlaceholderKind = NoPlaceholder> {
+pub struct WaitBinding {
     /// The wait's binding name (e.g. `cert_issued`).
     pub binding: BindingName,
     /// Identifier of the target resource binding (e.g. `cert`).
@@ -2965,7 +2979,7 @@ pub struct WaitBinding<P: PlaceholderKind = NoPlaceholder> {
     /// (e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`).
     pub until_raw: String,
     /// Structured predicate for the differ / executor to consume.
-    pub until_predicate: UntilPredicateAst<P>,
+    pub until_predicate: UntilPredicateAst,
     /// Optional user override of the wait timeout, in whole seconds. When
     /// `None` the differ falls back to the target schema's default.
     pub timeout_secs: Option<u64>,
@@ -2975,23 +2989,6 @@ pub struct WaitBinding<P: PlaceholderKind = NoPlaceholder> {
     pub depends_on: Vec<BindingName>,
     /// Source line of the `wait` keyword. Used by diagnostics.
     pub line: usize,
-}
-
-impl WaitBinding<ParserPlaceholder> {
-    fn into_expanded(self) -> Result<WaitBinding, crate::resource::LeftoverPlaceholder> {
-        Ok(WaitBinding {
-            binding: self.binding,
-            target: self.target,
-            until_raw: self.until_raw,
-            until_predicate: UntilPredicateAst {
-                lhs_segments: self.until_predicate.lhs_segments,
-                rhs: self.until_predicate.rhs.into_expanded()?,
-            },
-            timeout_secs: self.timeout_secs,
-            depends_on: self.depends_on,
-            line: self.line,
-        })
-    }
 }
 
 /// An export parameter as seen post-inference (#2360 stage 2).
@@ -3118,7 +3115,7 @@ pub struct File<E, P: PlaceholderKind = ParserPlaceholder, T: PlaceholderKind = 
     /// Upstream state references (read-only views of other Carina configurations)
     pub upstream_states: Vec<UpstreamState>,
     /// `wait` bindings declared via `let <name> = wait <target> { ... }`.
-    pub wait_bindings: Vec<WaitBinding<P>>,
+    pub wait_bindings: Vec<WaitBinding>,
     /// Require blocks (cross-argument constraints)
     pub requires: Vec<RequireBlock<P>>,
     /// Binding names that are structurally required (if/for/read expressions)
@@ -3603,6 +3600,7 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
             uses,
             user_functions,
             upstream_states,
+            wait_bindings,
             structural_bindings,
             parser_binding_metadata,
             parsed_binding_uses,
@@ -3862,34 +3860,6 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
             }
         }
 
-        for wait in wait_bindings {
-            let WaitBinding {
-                binding,
-                target,
-                until_raw,
-                until_predicate,
-                timeout_secs,
-                depends_on,
-                line,
-            } = wait;
-            let UntilPredicateAst { lhs_segments, rhs } = until_predicate;
-            let _wait_metadata = (
-                target,
-                until_raw,
-                lhs_segments,
-                timeout_secs,
-                depends_on,
-                line,
-            );
-            rhs.collect_leftover_placeholders(
-                LeftoverPlaceholderContext::WaitBinding {
-                    binding: binding.as_str().to_string(),
-                },
-                reject_all,
-                &mut errors,
-            );
-        }
-
         for (index, require) in requires.iter().enumerate() {
             let RequireBlock {
                 condition,
@@ -4051,10 +4021,7 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
                 .collect::<Result<_, _>>()?,
             user_functions,
             upstream_states,
-            wait_bindings: wait_bindings
-                .into_iter()
-                .map(WaitBinding::into_expanded)
-                .collect::<Result<_, _>>()?,
+            wait_bindings,
             requires: requires
                 .into_iter()
                 .map(RequireBlock::into_expanded)

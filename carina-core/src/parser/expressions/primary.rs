@@ -305,7 +305,9 @@ fn parse_namespaced_id_value(
             // access, not a resource path. Apply every `.field` and trailing
             // subscript through the same postfix primitive used by
             // `postfix_expr`.
-            let mut value = bound.clone();
+            let mut value = bound
+                .clone()
+                .with_reference_source(ctx.diagnostic_source_span(&pair));
             for field in &parts[1..] {
                 value = apply_postfix_path_segment(
                     value,
@@ -677,9 +679,9 @@ pub(crate) fn parse_primary_eval_with_mode(
                 // above — we only reach the `None` branch when the parser
                 // has no in-scope variable / let-binding for this name.
                 match ctx.lookup_binding(first_ident) {
-                    ParseBindingRef::Value { value, .. } => {
-                        Ok(value.clone().with_reference_source_line(line))
-                    }
+                    ParseBindingRef::Value { value, .. } => Ok(value
+                        .clone()
+                        .with_reference_source(ctx.diagnostic_source_span(&first_ident_pair))),
                     ParseBindingRef::Structural(handle) => {
                         Ok(EvalValue::structural_handle(handle.clone()))
                     }
@@ -691,7 +693,9 @@ pub(crate) fn parse_primary_eval_with_mode(
                 match ctx.lookup_binding(first_ident) {
                     ParseBindingRef::Value { value: bound, .. } => {
                         return apply_postfix_steps(
-                            bound.clone().with_reference_source_line(line),
+                            bound.clone().with_reference_source(
+                                ctx.diagnostic_source_span(&first_ident_pair),
+                            ),
                             access_steps,
                             ctx,
                         );

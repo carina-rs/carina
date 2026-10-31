@@ -136,7 +136,7 @@ fn validate_and_plan_reject_unused_empty_interpolation_let_with_same_location() 
     let plan = scenario.carina(&["plan", "--refresh=false", "."]);
     let plan_text = assert_failure("carina plan", &plan);
 
-    let expected = format!("let `greeting`: {EMPTY_INTERPOLATION}");
+    let expected = format!("locals.crn:1:17: let `greeting`: {EMPTY_INTERPOLATION}");
     assert!(
         validate_text.contains(&expected),
         "validate did not locate the leftover at `greeting`:\n{validate_text}",
@@ -145,8 +145,11 @@ fn validate_and_plan_reject_unused_empty_interpolation_let_with_same_location() 
         plan_text.contains(&expected),
         "plan did not locate the leftover at `greeting`:\n{plan_text}",
     );
-    assert_eq!(placeholder_messages(&validate), vec![expected.clone()]);
-    assert_eq!(placeholder_messages(&plan), vec![expected]);
+    let validate_messages = placeholder_messages(&validate);
+    let plan_messages = placeholder_messages(&plan);
+    assert_eq!(validate_messages.len(), 1, "{validate_messages:#?}");
+    assert!(validate_messages[0].ends_with(&expected));
+    assert_eq!(validate_messages, plan_messages);
 }
 
 #[test]
@@ -176,15 +179,15 @@ fn validate_and_plan_report_every_located_empty_interpolation() {
     let plan_messages = placeholder_messages(&plan);
     assert_eq!(validate_messages.len(), 2, "{validate_messages:#?}");
     assert!(
-        validate_messages
-            .iter()
-            .any(|message| message.contains("attribute `name`:")),
+        validate_messages.iter().any(|message| {
+            message.contains("main.crn:2:11:") && message.contains("attribute `name`:")
+        }),
         "resource attribute error has no location: {validate_messages:#?}",
     );
     assert!(
         validate_messages
             .iter()
-            .any(|message| message.starts_with("exports `broken`:")),
+            .any(|message| message.contains("exports.crn:2:21: exports `broken`:")),
         "export error has no location: {validate_messages:#?}",
     );
     assert_eq!(validate_messages, plan_messages);
@@ -217,7 +220,9 @@ fn destroy_rejects_located_empty_interpolation_without_modifying_state() {
     let destroy_text = assert_failure("carina destroy", &destroy);
 
     assert!(
-        destroy_text.contains(&format!("let `greeting`: {EMPTY_INTERPOLATION}")),
+        destroy_text.contains(&format!(
+            "locals.crn:1:17: let `greeting`: {EMPTY_INTERPOLATION}"
+        )),
         "destroy did not report the located parser placeholder:\n{destroy_text}",
     );
     assert_eq!(
@@ -239,8 +244,34 @@ fn module_definition_rejects_empty_interpolation_in_resource_with_location() {
     let text = assert_failure("carina validate module", &output);
 
     assert!(
-        text.contains("attribute `name`: empty interpolation `${}`"),
+        text.contains(
+            "resources.crn:2:11: mock.test.resource.<pending>: attribute `name`: empty interpolation `${}`"
+        ),
         "the module resource leftover must retain its attribute location:\n{text}",
+    );
+}
+
+#[test]
+fn module_definition_reports_argument_reference_at_authored_file_and_span() {
+    let source = "arguments { r: String }\n\nlet reg = r\nprovider mock { region = reg }\n";
+    let parsed = carina_core::parser::parse_file(
+        source,
+        Path::new("module/locals.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("parse module-shaped CLI fixture");
+    let leftovers = parsed
+        .validate_expansion_boundary(
+            carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition,
+        )
+        .expect_err("a provider attribute cannot retain a module argument");
+    let text = carina_cli::error::AppError::from(leftovers).to_string();
+
+    assert!(
+        text.contains(
+            "module/locals.crn:3:11: provider `mock` attribute `region`: unresolved module argument: r"
+        ),
+        "the CLI error must retain the authored module-argument reference: {text}",
     );
 }
 

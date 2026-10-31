@@ -1931,7 +1931,7 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -2004,7 +2004,7 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -2227,7 +2227,7 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -5164,7 +5164,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -6452,7 +6452,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
+            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),

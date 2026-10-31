@@ -46,6 +46,23 @@ pub(super) enum MergedModuleResolution {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ExpansionBoundaryScope {
+    All,
+    Authored,
+    Unlocated,
+}
+
+impl ExpansionBoundaryScope {
+    fn includes(self, placeholder: &ParserPlaceholder) -> bool {
+        match self {
+            Self::All => true,
+            Self::Authored => placeholder.authored_location().is_some(),
+            Self::Unlocated => placeholder.authored_location().is_none(),
+        }
+    }
+}
+
 fn source_span_position(span: SourceSpan) -> (u32, u32) {
     (
         span.start_line().saturating_sub(1) as u32,
@@ -2923,20 +2940,27 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         boundary: ParserPlaceholderBoundary,
+        scope: ExpansionBoundaryScope,
     ) -> Vec<Diagnostic> {
         let Err(leftovers) = parsed.validate_expansion_boundary(boundary) else {
             return Vec::new();
         };
-        let text = doc.text();
-
         leftovers
             .into_errors()
             .into_iter()
             .filter_map(|error| {
+                if !scope.includes(error.placeholder()) {
+                    return None;
+                }
                 let message = error.to_string();
                 match error.placeholder() {
-                    ParserPlaceholder::EmptyInterpolation { source } => {
-                        let Some((source_file, range)) = source.authored_location() else {
+                    placeholder @ (ParserPlaceholder::EmptyInterpolation { .. }
+                    | ParserPlaceholder::ModuleArgument { .. }) => {
+                        let Some((source_file, range)) = placeholder.authored_location() else {
+                            // Parser-created placeholders always carry an
+                            // authored span. Serde deliberately drops that
+                            // diagnostic-only metadata, so keep a deserialized
+                            // value visible if one ever reaches the LSP.
                             return Some(carina_diagnostic(
                                 0,
                                 0,
@@ -2959,21 +2983,6 @@ impl DiagnosticEngine {
                                     character: range.end_column().saturating_sub(1) as u32,
                                 },
                             },
-                            DiagnosticSeverity::ERROR,
-                            message,
-                        ))
-                    }
-                    ParserPlaceholder::ModuleArgument { source_line, .. } => {
-                        let line = source_line.get().unwrap_or(1).saturating_sub(1) as u32;
-                        let end_col = text
-                            .lines()
-                            .nth(line as usize)
-                            .map(|line| line.chars().count() as u32)
-                            .unwrap_or(0);
-                        Some(carina_diagnostic(
-                            line,
-                            0,
-                            end_col,
                             DiagnosticSeverity::ERROR,
                             message,
                         ))

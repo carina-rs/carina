@@ -535,7 +535,9 @@ mod tests {
             until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             until_predicate: crate::parser::UntilPredicateAst {
                 lhs_segments: vec!["cert".to_string(), "status".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                rhs: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "ISSUED".into(),
+                )),
             },
             timeout_secs: None,
             depends_on: vec![],

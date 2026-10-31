@@ -546,7 +546,7 @@ pub(crate) fn resolve_snapshot_function_calls_with_config(
         }
     }
 
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     // This snapshot preserves authored references for identity/dependency
@@ -601,7 +601,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<(), ParseError> {
-    let pending_ctx = super::ParseContext::new(config);
+    let pending_ctx = super::ParseContext::for_evaluation(config);
     for check in parsed
         .parser_binding_metadata
         .pending_function_type_checks()
@@ -685,7 +685,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // `&mut parsed` borrow to avoid the clone is hairy on the error
     // path (would need to restore on every `?` exit), so we accept a
     // single map clone per call.
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     let resource_source_files: HashMap<crate::resource::ResourceId, std::path::PathBuf> = parsed
@@ -1327,7 +1327,7 @@ fn accumulate_deferred_iterable_errors(
 fn resolve_value_with_config(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-    fn_ctx: &super::ParseContext<'_>,
+    fn_ctx: &super::ParseContext<'_, super::context::EvaluationOnly>,
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
@@ -1635,7 +1635,7 @@ fn reject_required_interpolation_unavailable(
 fn resolve_function_calls_only(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-    fn_ctx: &super::ParseContext<'_>,
+    fn_ctx: &super::ParseContext<'_, super::context::EvaluationOnly>,
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
@@ -1769,7 +1769,7 @@ pub fn resolve_provider_unresolved_attributes<E>(
             .entry(wb.binding.as_str().to_string())
             .or_default();
     }
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     for provider in &mut parsed.providers {
@@ -1856,7 +1856,7 @@ pub fn resolve_provider_attributes_with_remote<E>(
     for upstream in &parsed.upstream_states {
         binding_map.entry(upstream.binding.clone()).or_default();
     }
-    let mut fn_ctx = super::ParseContext::new(config);
+    let mut fn_ctx = super::ParseContext::for_evaluation(config);
     fn_ctx.replace_user_functions(parsed.user_functions.clone());
 
     let mut providers = Vec::with_capacity(parsed.providers.len());

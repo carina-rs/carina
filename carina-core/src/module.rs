@@ -1806,8 +1806,7 @@ mod tests {
                 Value::Deferred(DeferredValue::Placeholder(
                     crate::resource::ParserPlaceholder::ModuleArgument {
                         name: "vpc".to_string(),
-                        source_line: 1.into(),
-                        diagnostic_name: None,
+                        diagnostic: Default::default(),
                     },
                 )),
             ),

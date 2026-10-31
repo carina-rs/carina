@@ -22,7 +22,8 @@
 
 use crate::parser::{PendingValueSlot, ResourceTypePath};
 use crate::resource::{
-    LoopSlot, NoPlaceholder, ParserPlaceholder, PathSegment, Subscript, Value as GenericValue,
+    DiagnosticSourceSpan, LoopSlot, NoPlaceholder, ParserPlaceholder, PathSegment, Subscript,
+    Value as GenericValue,
 };
 use indexmap::IndexMap;
 
@@ -217,8 +218,7 @@ impl StructuralHandle {
             StructuralHandleKind::ModuleParameter => Value::Deferred(
                 crate::resource::DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
                     name: binding.to_string(),
-                    source_line: (0).into(),
-                    diagnostic_name: None,
+                    diagnostic: Default::default(),
                 }),
             ),
             StructuralHandleKind::FunctionParameter => Value::Deferred(
@@ -394,12 +394,12 @@ impl EvalValue {
 
     /// Stamp a neutral module-parameter placeholder with the authored use
     /// site. Other evaluator values pass through unchanged.
-    pub(crate) fn with_reference_source_line(mut self, line: usize) -> Self {
+    pub(crate) fn with_reference_source(mut self, source: DiagnosticSourceSpan) -> Self {
         if let Self::User(Value::Deferred(crate::resource::DeferredValue::Placeholder(
-            ParserPlaceholder::ModuleArgument { source_line, .. },
+            ParserPlaceholder::ModuleArgument { diagnostic, .. },
         ))) = &mut self
         {
-            *source_line = line.into();
+            diagnostic.stamp_authored_source(source);
         }
         self
     }

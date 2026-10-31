@@ -13,6 +13,23 @@ type ParserDeferredValue = super::DeferredValue<ParserPlaceholder>;
 type LoopValue = super::Value<LoopSlot>;
 type LoopDeferredValue = super::DeferredValue<LoopSlot>;
 
+fn module_argument_diagnostic_at(
+    file: &str,
+    line: usize,
+    start_column: usize,
+    end_column: usize,
+) -> Box<ModuleArgumentDiagnostic> {
+    let mut diagnostic = Box::<ModuleArgumentDiagnostic>::default();
+    diagnostic.stamp_authored_source(DiagnosticSourceSpan::authored(
+        file.into(),
+        line,
+        start_column,
+        line,
+        end_column,
+    ));
+    diagnostic
+}
+
 #[test]
 fn into_expanded_rejects_leftover_function_parameter() {
     let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
@@ -54,8 +71,7 @@ fn into_expanded_rejects_leftover_module_argument() {
     let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
         ParserPlaceholder::ModuleArgument {
             name: "region".to_string(),
-            source_line: (17).into(),
-            diagnostic_name: Some("forwarded_region".to_string()),
+            diagnostic: module_argument_diagnostic_at("module.crn", 17, 3, 9),
         },
     ));
 
@@ -63,6 +79,10 @@ fn into_expanded_rejects_leftover_module_argument() {
         .into_expanded()
         .expect_err("a module argument must be substituted before expansion completes");
 
+    assert_eq!(
+        error.to_string(),
+        "module.crn:17:3: unresolved module argument: region"
+    );
     assert!(matches!(
         error.placeholder(),
         ParserPlaceholder::ModuleArgument { name, .. } if name == "region"
@@ -73,7 +93,7 @@ fn into_expanded_rejects_leftover_module_argument() {
 fn into_expanded_rejects_empty_interpolation_with_existing_wording() {
     let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
         ParserPlaceholder::EmptyInterpolation {
-            source: Default::default(),
+            source: DiagnosticSourceSpan::authored("test.crn".into(), 1, 1, 1, 4),
         },
     ));
 
@@ -83,7 +103,7 @@ fn into_expanded_rejects_empty_interpolation_with_existing_wording() {
 
     assert_eq!(
         error.to_string(),
-        "empty interpolation `${}` — fill in the expression or remove it"
+        "test.crn:1:1: empty interpolation `${}` — fill in the expression or remove it"
     );
 }
 
@@ -227,27 +247,57 @@ fn merge_lists(
 
 #[test]
 fn module_argument_source_location_is_not_value_data() {
+    let diagnostic_at = |file: &str, line: usize, name: &str| {
+        let authored = module_argument_diagnostic_at(file, line, 3, 4);
+        let mut forwarded = Box::<ModuleArgumentDiagnostic>::default();
+        forwarded.forward_from(&authored, name);
+        forwarded
+    };
     let located = ParserValue::Deferred(ParserDeferredValue::Placeholder(
         ParserPlaceholder::ModuleArgument {
             name: "r".to_string(),
-            source_line: (17).into(),
-            diagnostic_name: None,
+            diagnostic: diagnostic_at("inner.crn", 17, "inner_r"),
         },
     ));
     let same_operand_other_line = ParserValue::Deferred(ParserDeferredValue::Placeholder(
         ParserPlaceholder::ModuleArgument {
             name: "r".to_string(),
-            source_line: (23).into(),
-            diagnostic_name: None,
+            diagnostic: diagnostic_at("outer.crn", 23, "outer_r"),
         },
     ));
 
     assert_eq!(located, same_operand_other_line);
+    let placeholder_hash = |value: &ParserValue| {
+        let ParserValue::Deferred(ParserDeferredValue::Placeholder(placeholder)) = value else {
+            unreachable!("fixture is a parser placeholder")
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        placeholder.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(
+        placeholder_hash(&located),
+        placeholder_hash(&same_operand_other_line),
+        "diagnostic source and forwarded name must not affect placeholder hashing",
+    );
     let encoded = serde_json::to_string(&located).expect("serialize parser placeholder");
     assert!(
-        !encoded.contains("source_line") && !encoded.contains("17"),
-        "diagnostic location leaked into Value serialization: {encoded}",
+        !encoded.contains("source_line")
+            && !encoded.contains("17")
+            && !encoded.contains("diagnostic_name")
+            && !encoded.contains("inner_r"),
+        "diagnostic metadata leaked into Value serialization: {encoded}",
     );
+    let decoded: ParserValue =
+        serde_json::from_str(&encoded).expect("deserialize parser placeholder");
+    let ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::ModuleArgument { diagnostic, .. },
+    )) = decoded
+    else {
+        panic!("expected a module-argument placeholder")
+    };
+    assert!(diagnostic.authored_location().is_none());
+    assert_eq!(diagnostic.diagnostic_name(), None);
 }
 
 #[test]

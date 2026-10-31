@@ -55,8 +55,7 @@ pub(super) fn parse_fn_def(
                         }
                         _ => {
                             // This is the default expression
-                            let mut default_ctx = ParseContext::new(ctx.config);
-                            default_ctx.inherit_diagnostic_source(ctx);
+                            let mut default_ctx = ctx.isolated();
                             default_ctx
                                 .replace_shared_user_functions(Arc::clone(&ctx.user_functions));
                             default_ctx
@@ -99,8 +98,7 @@ pub(super) fn parse_fn_def(
 
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
-    let mut body_ctx = ParseContext::new(ctx.config);
-    body_ctx.inherit_diagnostic_source(ctx);
+    let mut body_ctx = ctx.isolated();
     body_ctx.replace_shared_user_functions(Arc::clone(&ctx.user_functions));
     body_ctx
         .seeded_user_functions
@@ -164,9 +162,9 @@ pub(super) fn parse_fn_def(
     })
 }
 
-enum PreparedUserFunctionCall<'cfg> {
+enum PreparedUserFunctionCall<'cfg, Source = super::context::AuthoredDiagnosticSource> {
     Ready {
-        child_ctx: Box<ParseContext<'cfg>>,
+        child_ctx: Box<ParseContext<'cfg, Source>>,
         substitutions: HashMap<String, FunctionArgument>,
     },
     Deferred(Vec<FunctionArgument>),
@@ -180,12 +178,12 @@ enum FunctionArgumentTypeCheck {
 
 /// Prepare a user-defined function call: validate args, build substitutions, and return
 /// the child context with all parameters and local lets resolved.
-fn prepare_user_function_call<'cfg>(
+fn prepare_user_function_call<'cfg, Source: Clone>(
     func: &UserFunction,
     args: &[FunctionArgument],
-    ctx: &ParseContext<'cfg>,
+    ctx: &ParseContext<'cfg, Source>,
     call_line: usize,
-) -> Result<PreparedUserFunctionCall<'cfg>, ParseError> {
+) -> Result<PreparedUserFunctionCall<'cfg, Source>, ParseError> {
     let fn_name = &func.name;
 
     // Check recursion
@@ -651,12 +649,12 @@ pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind>(
 }
 
 /// Check that a function argument matches the declared parameter type.
-fn check_fn_arg_type(
+fn check_fn_arg_type<Source: Clone>(
     fn_name: &str,
     param_name: &str,
     type_expr: &TypeExpr,
     argument: &FunctionArgument,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     call_line: usize,
 ) -> Result<FunctionArgumentTypeCheck, ParseError> {
     if argument.pending_parameter().is_some() {
@@ -721,10 +719,10 @@ pub(crate) fn lower_function_arguments(
         .collect()
 }
 
-pub(super) fn record_deferred_function_type_check(
+pub(super) fn record_deferred_function_type_check<Source: Clone>(
     function: &UserFunction,
     arguments: &[FunctionArgument],
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     source_line: usize,
 ) {
     if function
@@ -757,10 +755,10 @@ pub(crate) fn reject_builtin_handle_arguments(
     Ok(())
 }
 
-pub(crate) fn evaluate_user_function_eval(
+pub(crate) fn evaluate_user_function_eval<Source: Clone>(
     func: &UserFunction,
     args: Vec<EvalValue>,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     line: usize,
 ) -> Result<Value, ParseError> {
     let arguments = lower_function_arguments(args, line)?;
@@ -777,10 +775,10 @@ fn function_argument_type_error(
     ))
 }
 
-pub(crate) fn validate_pending_function_type_check(
+pub(crate) fn validate_pending_function_type_check<Source: Clone>(
     check: &PendingFunctionTypeCheck,
     functions: &HashMap<String, UserFunction>,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
 ) -> Result<(), ParseError> {
     let Some(function) = functions.get(&check.function_name) else {
         return Ok(());
@@ -848,10 +846,10 @@ fn function_return_type_error(
 }
 
 /// Evaluate a user-defined function call by substituting arguments into the body
-pub(crate) fn evaluate_user_function(
+pub(crate) fn evaluate_user_function<Source: Clone>(
     func: &UserFunction,
     args: &[FunctionArgument],
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     call_line: usize,
 ) -> Result<Value, ParseError> {
     let prepared =
@@ -903,7 +901,7 @@ pub(crate) fn evaluate_resolved_user_function(
     config: &ProviderContext,
     call_line: usize,
 ) -> Result<Value, ParseError> {
-    let mut context = ParseContext::new(config);
+    let mut context = ParseContext::for_evaluation(config);
     context.replace_shared_user_functions(Arc::clone(functions));
     if !context.user_functions.contains_key(&function.name) {
         context.insert_user_function(function.name.clone(), function.clone());
@@ -1291,9 +1289,9 @@ pub(crate) fn apply_parser_closure(
     )))
 }
 
-pub(super) fn try_evaluate_fn_value(
+pub(super) fn try_evaluate_fn_value<Source: Clone>(
     value: Value,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_, Source>,
     containing_line: usize,
 ) -> Result<Value, ParseError> {
     match value {

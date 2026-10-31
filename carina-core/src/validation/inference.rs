@@ -1653,7 +1653,13 @@ mod tests {
         let value = apply_postfix_access(
             ParserValue::Deferred(ParserDeferredValue::Placeholder(
                 crate::resource::ParserPlaceholder::EmptyInterpolation {
-                    source: Default::default(),
+                    source: crate::resource::DiagnosticSourceSpan::authored(
+                        "test.crn".into(),
+                        1,
+                        1,
+                        1,
+                        4,
+                    ),
                 },
             )),
             PathSegment::Subscript {

@@ -2066,7 +2066,13 @@ mod provider_config_tests {
             "region".to_string(),
             Value::Deferred(DeferredValue::Placeholder(
                 ParserPlaceholder::EmptyInterpolation {
-                    source: Default::default(),
+                    source: crate::resource::DiagnosticSourceSpan::authored(
+                        "test.crn".into(),
+                        1,
+                        1,
+                        1,
+                        4,
+                    ),
                 },
             )),
         )]);

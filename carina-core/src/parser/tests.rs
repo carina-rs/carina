@@ -2,8 +2,8 @@ use super::*;
 use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, ResolvedBindings};
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
-    ConcreteValue, DeferredValue, ForLoopElement, InterpolationPart, LoopKind, LoopOriginKind,
-    ModuleSource, NoPlaceholder, ParserPlaceholder, Resource, Value,
+    ConcreteValue, DeferredValue, DiagnosticSourceSpan, ForLoopElement, InterpolationPart,
+    LoopKind, LoopOriginKind, ModuleSource, NoPlaceholder, ParserPlaceholder, Resource, Value,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -26,6 +26,14 @@ fn expanded_value(value: &Value<ParserPlaceholder>) -> Value<NoPlaceholder> {
         .clone()
         .into_expanded()
         .expect("test value must contain no parser placeholder")
+}
+
+fn empty_interpolation_placeholder() -> Value<ParserPlaceholder> {
+    Value::Deferred(DeferredValue::Placeholder(
+        ParserPlaceholder::EmptyInterpolation {
+            source: DiagnosticSourceSpan::authored("test.crn".into(), 1, 1, 1, 4),
+        },
+    ))
 }
 
 #[test]
@@ -67,13 +75,7 @@ fn file_into_expanded_collects_every_leftover_with_locations() {
 
 #[test]
 fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
-    let empty = || {
-        Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::EmptyInterpolation {
-                source: Default::default(),
-            },
-        ))
-    };
+    let empty = empty_interpolation_placeholder;
     let mut file = ParsedFile::default();
     file.variables.insert(
         "greeting".to_string(),
@@ -96,13 +98,7 @@ fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
 
 #[test]
 fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
-    let empty = || {
-        Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::EmptyInterpolation {
-                source: Default::default(),
-            },
-        ))
-    };
+    let empty = empty_interpolation_placeholder;
     let mut file = ParsedFile::default();
 
     file.providers.push(ProviderConfig {
@@ -167,10 +163,10 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     file.wait_bindings.push(WaitBinding {
         binding: BindingName::new("ready"),
         target: BindingName::new("resource"),
-        until_raw: "resource.status == \"${}\"".to_string(),
+        until_raw: "resource.status == \"ready\"".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["resource".to_string(), "status".to_string()],
-            rhs: empty(),
+            rhs: Value::<NoPlaceholder>::Concrete(ConcreteValue::String("ready".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -219,7 +215,6 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         "attributes `output` default:",
         "exports `published`:",
         "import `mock.test.resource.existing` id:",
-        "wait binding `ready`:",
         "require `1`:",
         "deferred `for item in pending.items` iterable:",
         "deferred `for item in pending.items` attribute `name`:",
@@ -229,7 +224,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
             "missing context {expected:?} from:\n{rendered}",
         );
     }
-    assert_eq!(rendered.matches("empty interpolation `${}`").count(), 14);
+    assert_eq!(rendered.matches("empty interpolation `${}`").count(), 13);
 }
 
 #[test]
@@ -240,8 +235,7 @@ fn module_argument_in_variable_is_allowed_only_at_module_definition_boundary() {
         Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument {
                 name: "environment".to_string(),
-                source_line: 1.into(),
-                diagnostic_name: None,
+                diagnostic: Default::default(),
             },
         )),
     );
@@ -262,14 +256,9 @@ fn module_argument_in_variable_is_allowed_only_at_module_definition_boundary() {
 fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
     let mut template_resource =
         Resource::<ModuleSource, ParserPlaceholder>::pending("mock.test.resource");
-    template_resource.attributes.insert(
-        "name".to_string(),
-        Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::EmptyInterpolation {
-                source: Default::default(),
-            },
-        )),
-    );
+    template_resource
+        .attributes
+        .insert("name".to_string(), empty_interpolation_placeholder());
     let mut file = ParsedFile::default();
     file.deferred_for_expressions.push(DeferredForExpression {
         file: Some("loops.crn".to_string()),
@@ -1252,8 +1241,7 @@ fn parse_directory_module() {
         Some(&Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument {
                 name: "vpc_id".to_string(),
-                source_line: (13).into(),
-                diagnostic_name: None,
+                diagnostic: Default::default(),
             },
         )))
     );

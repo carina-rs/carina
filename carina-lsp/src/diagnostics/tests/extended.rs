@@ -10778,6 +10778,49 @@ fn module_definition_boundary_allows_derived_argument_variable_used_in_sibling_r
 }
 
 #[test]
+fn module_argument_leftover_is_reported_only_in_its_authored_sibling_file() {
+    let temp = tempfile::tempdir().expect("create multi-file module fixture");
+    std::fs::write(
+        temp.path().join("arguments.crn"),
+        "arguments {\n  r: String\n}\n",
+    )
+    .expect("write module arguments");
+    let locals_source = "\n\nlet reg = r\n";
+    let locals_path = temp.path().join("locals.crn");
+    std::fs::write(&locals_path, locals_source).expect("write module local");
+    let providers_source = "provider mock {\n\n  region = reg\n}\n";
+    let providers_path = temp.path().join("providers.crn");
+    std::fs::write(&providers_path, providers_source).expect("write provider");
+
+    let engine = test_engine();
+    let provider_diagnostics = engine.analyze(
+        &create_document_at(providers_source, providers_path.clone()),
+        Some(providers_path.as_path()),
+    );
+    assert!(
+        provider_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("unresolved module argument: r")),
+        "a sibling-authored module argument must not be anchored in providers.crn: {provider_diagnostics:#?}",
+    );
+
+    let locals_diagnostics = engine.analyze(
+        &create_document_at(locals_source, locals_path.clone()),
+        Some(locals_path.as_path()),
+    );
+    let authored = locals_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("unresolved module argument: r"))
+        .unwrap_or_else(|| {
+            panic!("the authored sibling must retain its diagnostic: {locals_diagnostics:#?}")
+        });
+    assert_eq!(authored.range.start.line, 2, "{authored:#?}");
+    assert_eq!(authored.range.start.character, 10, "{authored:#?}");
+    assert_eq!(authored.range.end.line, 2, "{authored:#?}");
+    assert_eq!(authored.range.end.character, 11, "{authored:#?}");
+}
+
+#[test]
 fn spaced_interpolation_expression_has_no_error_diagnostic() {
     let engine = test_engine();
     let buffer = "let value = \"x-${join('-', ['a'])}\"\n";

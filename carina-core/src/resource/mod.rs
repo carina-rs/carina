@@ -2781,11 +2781,37 @@ struct AuthoredDiagnosticSourceSpan {
 
 /// Diagnostic-only source identity and range.
 ///
-/// `None` represents a synthetic or deserialized node. As with
-/// [`DiagnosticSourceLine`], every instance compares equal and hashes to the
-/// same value because authored location is not semantic value data.
-#[derive(Debug, Clone, Default)]
-pub struct DiagnosticSourceSpan(Option<AuthoredDiagnosticSourceSpan>);
+/// Parser construction always produces the authored variant. The private
+/// deserialized variant exists only because source metadata is deliberately
+/// skipped on the wire. As with [`DiagnosticSourceLine`], every instance
+/// compares equal and hashes to the same value because authored location is
+/// not semantic value data.
+///
+/// Parser code must attach an authored source rather than manufacturing an
+/// unlocated span:
+///
+/// ```compile_fail,E0624
+/// use carina_core::resource::DiagnosticSourceSpan;
+///
+/// let _ = DiagnosticSourceSpan::synthetic();
+/// ```
+///
+/// An unlocated span is reserved for deserialization, not ordinary
+/// construction:
+///
+/// ```compile_fail,E0277
+/// use carina_core::resource::DiagnosticSourceSpan;
+///
+/// let _: DiagnosticSourceSpan = Default::default();
+/// ```
+#[derive(Debug, Clone)]
+pub struct DiagnosticSourceSpan(DiagnosticSourceSpanState);
+
+#[derive(Debug, Clone)]
+enum DiagnosticSourceSpanState {
+    Authored(AuthoredDiagnosticSourceSpan),
+    Deserialized,
+}
 
 impl DiagnosticSourceSpan {
     pub(crate) fn authored(
@@ -2802,17 +2828,22 @@ impl DiagnosticSourceSpan {
             end_line: NonZeroUsize::new(end_line).expect("parser source lines are one-based"),
             end_column: NonZeroUsize::new(end_column).expect("parser source columns are one-based"),
         };
-        Self(Some(AuthoredDiagnosticSourceSpan { source_file, range }))
+        Self(DiagnosticSourceSpanState::Authored(
+            AuthoredDiagnosticSourceSpan { source_file, range },
+        ))
     }
 
-    pub const fn synthetic() -> Self {
-        Self(None)
+    fn deserialized() -> Self {
+        Self(DiagnosticSourceSpanState::Deserialized)
     }
 
     pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
-        self.0
-            .as_ref()
-            .map(|source| (source.source_file.as_path(), source.range))
+        match &self.0 {
+            DiagnosticSourceSpanState::Authored(source) => {
+                Some((source.source_file.as_path(), source.range))
+            }
+            DiagnosticSourceSpanState::Deserialized => None,
+        }
     }
 }
 
@@ -2825,6 +2856,61 @@ impl PartialEq for DiagnosticSourceSpan {
 impl Eq for DiagnosticSourceSpan {}
 
 impl Hash for DiagnosticSourceSpan {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
+/// Module-argument diagnostics that travel with a parser placeholder without
+/// becoming value identity or serialized data.
+///
+/// A neutral module-argument seed has neither field. The first authored
+/// reference attaches `source`; nested forwarding may additionally retain the
+/// caller-facing `name`. Keeping both fields behind this one wrapper gives all
+/// diagnostic-only metadata the same equality, hashing, and serde rule.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleArgumentDiagnostic {
+    source: Option<DiagnosticSourceSpan>,
+    name: Option<String>,
+}
+
+impl ModuleArgumentDiagnostic {
+    pub(crate) fn stamp_authored_source(&mut self, source: DiagnosticSourceSpan) {
+        if self.source.is_none() {
+            self.source = Some(source);
+        }
+    }
+
+    pub(crate) fn forward_from(&mut self, source: &Self, fallback_name: &str) {
+        if let Some(authored) = &source.source {
+            self.source = Some(authored.clone());
+        }
+        self.name = Some(source.name.as_deref().unwrap_or(fallback_name).to_string());
+    }
+
+    pub(crate) fn diagnostic_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub(crate) fn source_line(&self) -> Option<usize> {
+        self.authored_location()
+            .map(|(_, range)| range.start_line())
+    }
+
+    pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
+        self.source
+            .as_ref()
+            .and_then(DiagnosticSourceSpan::authored_location)
+    }
+}
+
+impl PartialEq for ModuleArgumentDiagnostic {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ModuleArgumentDiagnostic {}
+
+impl Hash for ModuleArgumentDiagnostic {
     fn hash<H: Hasher>(&self, _state: &mut H) {}
 }
 
@@ -4629,21 +4715,18 @@ pub enum NoPlaceholder {}
 
 /// Parser-stage slots consumed by function evaluation, module expansion, or
 /// deferred-loop template construction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ParserPlaceholder {
     FnParam {
         name: String,
     },
     ModuleArgument {
         name: String,
-        /// One-based line of this reference, absent on a neutral declaration
-        /// or seed placeholder. This parser metadata is never value data.
+        /// Authored reference span and forwarded display name. A declaration
+        /// or seed placeholder remains neutral until its first authored use.
+        /// This parser metadata is never value data.
         #[serde(skip, default)]
-        source_line: DiagnosticSourceLine,
-        /// Authored inner parameter name retained while a nested module
-        /// forwards this placeholder to an outer parameter.
-        #[serde(skip, default)]
-        diagnostic_name: Option<String>,
+        diagnostic: Box<ModuleArgumentDiagnostic>,
     },
     FnLocal {
         name: String,
@@ -4657,9 +4740,20 @@ pub enum ParserPlaceholder {
     EmptyInterpolation {
         /// Authored file and interpolation range. This metadata follows
         /// inlined values but is never serialized as value data.
-        #[serde(skip, default)]
+        #[serde(skip, default = "DiagnosticSourceSpan::deserialized")]
         source: DiagnosticSourceSpan,
     },
+}
+
+impl ParserPlaceholder {
+    /// Authored location for diagnostics, independent of placeholder kind.
+    pub fn authored_location(&self) -> Option<(&Path, DiagnosticSourceRange)> {
+        match self {
+            Self::ModuleArgument { diagnostic, .. } => diagnostic.authored_location(),
+            Self::EmptyInterpolation { source } => source.authored_location(),
+            Self::FnParam { .. } | Self::FnLocal { .. } | Self::Loop(_) => None,
+        }
+    }
 }
 
 /// Placeholder available only inside a deferred for-loop template.
@@ -4701,12 +4795,28 @@ pub enum ApplyTimeUnknown {
 
 /// A parser slot survived the only fallible parser-to-expanded value
 /// transition.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{context}{placeholder}")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeftoverPlaceholder {
     placeholder: ParserPlaceholder,
     context: LeftoverPlaceholderContext,
 }
+
+impl fmt::Display for LeftoverPlaceholder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some((source_file, range)) = self.placeholder.authored_location() {
+            write!(
+                formatter,
+                "{}:{}:{}: ",
+                source_file.display(),
+                range.start_line(),
+                range.start_column(),
+            )?;
+        }
+        write!(formatter, "{}{}", self.context, self.placeholder)
+    }
+}
+
+impl std::error::Error for LeftoverPlaceholder {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LeftoverPlaceholderContext {
@@ -4744,9 +4854,6 @@ pub(crate) enum LeftoverPlaceholderContext {
     },
     StateImport {
         target: String,
-    },
-    WaitBinding {
-        binding: String,
     },
     Require {
         label: String,
@@ -4841,7 +4948,6 @@ impl fmt::Display for LeftoverPlaceholderContext {
                 write!(formatter, "attributes `{name}` default: ")
             }
             Self::StateImport { target } => write!(formatter, "import `{target}` id: "),
-            Self::WaitBinding { binding } => write!(formatter, "wait binding `{binding}`: "),
             Self::Require { label } => write!(formatter, "require `{label}`: "),
             Self::DeferredForIterable { header } => {
                 write!(formatter, "deferred `{header}` iterable: ")

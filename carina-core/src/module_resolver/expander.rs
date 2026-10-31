@@ -39,7 +39,7 @@ type PendingModuleConstraint = GenericPendingModuleConstraint<ParserPlaceholder>
 type StructuralOperandRef<'a> = GenericStructuralOperandRef<'a, ParserPlaceholder>;
 type InterpolationPart = GenericInterpolationPart<ParserPlaceholder>;
 type ValidateExpr = GenericValidateExpr<ParserPlaceholder>;
-type WaitBinding = GenericWaitBinding<ParserPlaceholder>;
+type WaitBinding = GenericWaitBinding;
 type ResolvedBindings = GenericResolvedBindings<ParserPlaceholder>;
 
 use super::error::ModuleError;
@@ -2044,28 +2044,27 @@ fn substitute_arguments_with_position(
 ) -> Result<Value, ArgumentSubstitutionError> {
     let substituted = match value {
         Value::Deferred(DeferredValue::Placeholder(
-            crate::resource::ParserPlaceholder::ModuleArgument {
-                name,
-                source_line,
-                diagnostic_name,
-            },
+            crate::resource::ParserPlaceholder::ModuleArgument { name, diagnostic },
         )) => {
             let Some(argument) = arguments.arguments.get(name) else {
                 return Ok(value.clone());
             };
-            let line = source_line
-                .get()
+            let line = diagnostic
+                .source_line()
                 .unwrap_or_else(|| argument.source_line(arguments.default_line));
+            let source_file = diagnostic
+                .authored_location()
+                .map(|(source_file, _)| source_file.to_path_buf());
             match argument.value_ref() {
                 StructuralOperandRef::Value(value) => value.clone(),
                 StructuralOperandRef::Handle { .. }
                     if matches!(position, ArgumentSubstitutionPosition::Value) =>
                 {
                     return Err(ArgumentSubstitutionError {
-                        source_file: None,
+                        source_file,
                         line,
                         message: BareStructuralHandle {
-                            binding: diagnostic_name.as_deref().unwrap_or(name).to_string(),
+                            binding: diagnostic.diagnostic_name().unwrap_or(name).to_string(),
                             kind: StructuralHandleKind::ModuleParameter,
                         }
                         .to_string(),
@@ -2077,15 +2076,12 @@ fn substitute_arguments_with_position(
                     let mut forwarded_value = access_base.clone();
                     if let Value::Deferred(DeferredValue::Placeholder(
                         crate::resource::ParserPlaceholder::ModuleArgument {
-                            source_line: forwarded_line,
-                            diagnostic_name: forwarded_diagnostic,
+                            diagnostic: forwarded_diagnostic,
                             ..
                         },
                     )) = &mut forwarded_value
                     {
-                        *forwarded_line = line.into();
-                        *forwarded_diagnostic =
-                            Some(diagnostic_name.as_deref().unwrap_or(name).to_string());
+                        forwarded_diagnostic.forward_from(diagnostic, name);
                     }
                     forwarded_value
                 }
@@ -2290,15 +2286,20 @@ fn substitute_arguments_with_position(
         && let RefType::UnknownAttribute(error @ RefTypeError::InvalidAccess { .. }) =
             binding_index.postfix_ref_type(path)
     {
-        let line = match value {
-            Value::Deferred(DeferredValue::Access(access)) => access.source_line(),
+        let (source_file, line) = match value {
+            Value::Deferred(DeferredValue::Access(access)) => (None, access.source_line()),
             Value::Deferred(DeferredValue::Placeholder(
-                crate::resource::ParserPlaceholder::ModuleArgument { source_line, .. },
-            )) => source_line.get().unwrap_or(arguments.default_line),
-            _ => arguments.default_line,
+                crate::resource::ParserPlaceholder::ModuleArgument { diagnostic, .. },
+            )) => (
+                diagnostic
+                    .authored_location()
+                    .map(|(source_file, _)| source_file.to_path_buf()),
+                diagnostic.source_line().unwrap_or(arguments.default_line),
+            ),
+            _ => (None, arguments.default_line),
         };
         return Err(ArgumentSubstitutionError {
-            source_file: None,
+            source_file,
             line,
             message: error.to_string(),
             parse_error: None,
