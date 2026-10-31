@@ -44,7 +44,7 @@
 //! use carina_cli::wiring::ProviderLoad;
 //!
 //! fn record_raw_load(contents: PlanFileContents, providers: ProviderLoad) {
-//!     let _ = contents.record(&providers);
+//!     let _ = contents.record(&providers, Vec::new());
 //! }
 //! ```
 //!
@@ -55,7 +55,7 @@
 //! use carina_cli::wiring::WiringContext;
 //!
 //! fn record_raw_context(contents: PlanFileContents, context: WiringContext) {
-//!     let _ = contents.record(&context);
+//!     let _ = contents.record(&context, Vec::new());
 //! }
 //! ```
 //!
@@ -628,7 +628,7 @@ impl<R> std::ops::Deref for ValidationReady<R> {
 ///     contents: PlanFileContents,
 ///     resources: CanonicalResourcePair<InferredExportParam>,
 /// ) {
-///     let _ = contents.record(&resources);
+///     let _ = contents.record(&resources, Vec::new());
 /// }
 /// ```
 ///

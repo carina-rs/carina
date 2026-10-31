@@ -295,9 +295,22 @@ pub(crate) fn format_persisted_directive_changes(
         if index > 0 {
             writeln!(out).unwrap();
         }
-        writeln!(out, "  {} {}", "~".yellow(), change.address.cyan().bold()).unwrap();
+        writeln!(
+            out,
+            "  {} {}",
+            "~".yellow(),
+            change.resource_id.to_string().cyan().bold()
+        )
+        .unwrap();
         for field in &change.fields {
-            writeln!(out, "    {}: {} -> {}", field.name, field.from, field.to).unwrap();
+            writeln!(
+                out,
+                "    {}: {} -> {}",
+                field.name(),
+                field.rendered_from(),
+                field.rendered_to()
+            )
+            .unwrap();
         }
     }
     out

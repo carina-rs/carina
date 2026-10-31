@@ -41,9 +41,8 @@ use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_fo
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
-use crate::commands::shared::state_writeback::{
-    PersistedDirectiveChange, persisted_directive_changes,
-};
+pub use crate::commands::shared::state_writeback::PersistedDirectiveChange;
+use crate::commands::shared::state_writeback::persisted_directive_changes;
 use crate::display::{format_persisted_directive_changes, print_plan};
 use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
@@ -509,7 +508,7 @@ mod provider_scope_evidence_tests {
         );
 
         let plan = empty_contents(SavedProviderConfigs::from(&resolved))
-            .record_for_test_with_provider(&wiring, &provider)
+            .record_for_test_with_provider(&wiring, &provider, Vec::new())
             .expect("provider scopes form valid evidence");
         let json = serde_json::to_value(&plan).expect("saved plan serializes");
         assert_eq!(
@@ -1416,8 +1415,13 @@ impl PlanFileContents {
     pub fn record<E>(
         self,
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context(), &validated.resources().provider)
+        self.record_with_context(
+            validated.context(),
+            &validated.resources().provider,
+            persisted_directive_changes,
+        )
     }
 
     /// Record hand-built plan contents in unit and integration fixtures.
@@ -1425,6 +1429,7 @@ impl PlanFileContents {
     pub fn record_for_test<R>(
         self,
         validated: &ValidatedConfig<R>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let available_providers = validated
             .context()
@@ -1434,7 +1439,7 @@ impl PlanFileContents {
             .collect();
         let provider =
             test_provider_router(&self.expected_provider_instances(&available_providers));
-        self.record_with_context(validated.context(), &provider)
+        self.record_with_context(validated.context(), &provider, persisted_directive_changes)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1442,14 +1447,16 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<R>,
         provider: &ProviderRouter,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context(), provider)
+        self.record_with_context(validated.context(), provider, persisted_directive_changes)
     }
 
     fn record_with_context(
         self,
         ctx: &WiringContext,
         provider: &ProviderRouter,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let available_providers = ctx.provider_artifacts().keys().cloned().collect();
@@ -1465,7 +1472,7 @@ impl PlanFileContents {
         Ok(PlanFile {
             contents: saved.into(),
             evidence,
-            persisted_directive_changes: Vec::new(),
+            persisted_directive_changes,
         })
     }
 }
@@ -1475,6 +1482,7 @@ impl UnresolvedPlanFileContents {
     fn record_for_test<R>(
         self,
         validated: &ValidatedConfig<R>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let available_providers = validated
@@ -1495,7 +1503,7 @@ impl UnresolvedPlanFileContents {
         Ok(PlanFile {
             contents: self,
             evidence,
-            persisted_directive_changes: Vec::new(),
+            persisted_directive_changes,
         })
     }
 }
@@ -1878,11 +1886,6 @@ impl UnresolvedPlanFileContents {
 
 impl PlanFile {
     pub const CURRENT_VERSION: u32 = 36;
-
-    fn with_persisted_directive_changes(mut self, changes: Vec<PersistedDirectiveChange>) -> Self {
-        self.persisted_directive_changes = changes;
-        self
-    }
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -3591,11 +3594,10 @@ mod managed_current_serde_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-            (),
+        .record_for_test(
+            &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
             Vec::new(),
-            &[],
-        ))
+        )
         .expect("test plan provider evidence must be valid")
     }
 
@@ -3878,11 +3880,10 @@ mod managed_current_serde_tests {
             origin: None,
         });
         let plan = contents
-            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-                (),
+            .record_for_test(
+                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
                 Vec::new(),
-                &[],
-            ))
+            )
             .expect("test plan provider evidence must be valid");
 
         let plan = plan
@@ -3937,11 +3938,10 @@ mod managed_current_serde_tests {
             origin: None,
         });
         let plan = contents
-            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-                (),
+            .record_for_test(
+                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
                 Vec::new(),
-                &[],
-            ))
+            )
             .expect("test plan provider evidence must be valid");
 
         let reloaded = plan
@@ -4020,12 +4020,12 @@ fn build_plan_file<E>(
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
+    directive_changes: Vec<PersistedDirectiveChange>,
     validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
 ) -> Result<PlanFile, PlanSaveError> {
     let ctx = validated_plan.resources();
     let parsed = ctx.parsed();
-    let directive_changes = persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources);
-    let plan_file = build_plan_file_contents(
+    build_plan_file_contents(
         path,
         parsed,
         provider_configs,
@@ -4033,9 +4033,8 @@ fn build_plan_file<E>(
         state_file,
         ctx,
     )?
-    .record(validated_plan)
-    .map_err(PlanSaveError::from)?;
-    Ok(plan_file.with_persisted_directive_changes(directive_changes))
+    .record(validated_plan, directive_changes)
+    .map_err(PlanSaveError::from)
 }
 
 #[cfg(test)]
@@ -4049,8 +4048,9 @@ fn build_plan_file_from_parts<E, R>(
     ctx: &crate::wiring::PlanContext,
     validated_config: &ValidatedConfig<R>,
 ) -> Result<PlanFile, PlanSaveError> {
-    let directive_changes = persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources);
-    let plan_file = build_plan_file_contents(
+    let directive_changes =
+        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
+    build_plan_file_contents(
         path,
         parsed,
         provider_configs,
@@ -4058,9 +4058,8 @@ fn build_plan_file_from_parts<E, R>(
         state_file,
         ctx,
     )?
-    .record_for_test(validated_config)
-    .map_err(PlanSaveError::from)?;
-    Ok(plan_file.with_persisted_directive_changes(directive_changes))
+    .record_for_test(validated_config, directive_changes)
+    .map_err(PlanSaveError::from)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4838,7 +4837,8 @@ pub async fn run_plan(
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&checked_exports, &current_exports);
-    let directive_changes = persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources);
+    let directive_changes =
+        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
     let summary = PlanChangeSummary::new(&ctx.plan, &export_changes, &ctx.residual_deferred_for)
         .with_persisted_directive_changes(directive_changes.clone());
     // Preserve the CLI contract from before plan-image summaries existed:
@@ -4864,6 +4864,7 @@ pub async fn run_plan(
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
+            directive_changes.clone(),
             &validated_plan,
         )
         .map_err(|error| map_plan_save_error(error, "--json"))?;
@@ -4935,6 +4936,7 @@ pub async fn run_plan(
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
+            directive_changes.clone(),
             &validated_plan,
         )
         .map_err(|error| map_plan_save_error(error, "--out"))?;

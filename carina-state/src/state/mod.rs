@@ -23,7 +23,8 @@ pub use carina_core::resource::DeposedKey;
 use carina_core::resource::Resource;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
+    PersistedDirectives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, State,
+    Value,
 };
 use carina_core::schema::{
     FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
@@ -1025,24 +1026,18 @@ impl StateFile {
         })
     }
 
-    /// Replace only the persisted directives on the routing-agnostic row
-    /// identified by `id`.
-    ///
-    /// Provider-instance routing is row metadata and may itself be changing,
-    /// so lookup intentionally uses only provider kind, resource type, and
-    /// identity. No other row field is reconstructed or rewritten.
+    /// Replace only the persisted directives on the exactly routed row
+    /// identified by `id`. No other row field is reconstructed or rewritten.
     pub fn update_resource_directives(
         &mut self,
-        id: &ResourceId,
+        id: &ResolvedResourceId,
         directives: PersistedDirectives,
     ) -> bool {
-        let Some(identity) = id.identity_str() else {
-            return false;
-        };
         let Some(row) = self.resources.iter_mut().find(|row| {
             row.provider == id.provider
                 && row.resource_type == id.resource_type
-                && row.identity.as_str() == identity
+                && row.identity.as_str() == id.identity_str()
+                && row.directives.provider_instance == id.provider_instance
         }) else {
             return false;
         };

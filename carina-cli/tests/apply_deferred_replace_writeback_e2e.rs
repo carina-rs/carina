@@ -59,7 +59,7 @@ fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
     }];
     let providers = ValidatedConfig::for_test((), Vec::<LoadedProviderFactory>::new(), &configs);
     contents
-        .record_for_test(&providers)
+        .record_for_test(&providers, Vec::new())
         .expect("mock plan provider evidence must be valid")
 }
 

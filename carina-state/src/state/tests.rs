@@ -3983,6 +3983,41 @@ fn state_block_address_lookup_ignores_provider_instance() {
 }
 
 #[test]
+fn directive_only_update_requires_the_exact_provider_route() {
+    let mut state = StateFile::new();
+    let mut resource = ResourceState::new("test.Resource", "target", "mock");
+    resource.directives.provider_instance = Some("secondary".to_string());
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
+
+    let default_id =
+        ResolvedResourceId::with_provider_identity("mock", "test.Resource", "target", None);
+    let mut desired = PersistedDirectives::default();
+    desired.force_delete = true;
+    assert!(
+        !state.update_resource_directives(&default_id, desired.clone()),
+        "a display-equal address on another route must not be rewritten"
+    );
+
+    let secondary_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.Resource",
+        "target",
+        Some("secondary".to_string()),
+    );
+    desired.provider_instance = Some("secondary".to_string());
+    assert!(state.update_resource_directives(&secondary_id, desired));
+    assert!(
+        state
+            .find_resource_for_id(&secondary_id)
+            .expect("secondary row")
+            .directives
+            .force_delete
+    );
+}
+
+#[test]
 fn test_build_directives_provider_scoped() {
     use carina_core::resource::ResourceId;
 

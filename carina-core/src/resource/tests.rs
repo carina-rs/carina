@@ -780,6 +780,35 @@ fn prevent_destroy_setting_round_trips_explicit_false() {
 }
 
 #[test]
+fn persisted_directive_changes_compare_typed_values_not_rendered_labels() {
+    let current = PersistedDirectives::default();
+    let desired = PersistedDirectives {
+        provider_instance: Some("unspecified".to_string()),
+        ..PersistedDirectives::default()
+    };
+
+    let changes = current.field_changes_to(&desired);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].name(), PersistedDirectiveField::ProviderInstance);
+    assert_eq!(changes[0].rendered_from(), "unspecified");
+    assert_eq!(changes[0].rendered_to(), "unspecified");
+
+    let encoded = serde_json::to_value(&changes).expect("typed changes serialize");
+    assert_eq!(
+        encoded,
+        serde_json::json!([{
+            "name": "provider_instance",
+            "from": null,
+            "to": "unspecified"
+        }]),
+        "machine-readable equality must retain values that share a display label"
+    );
+    let decoded: Vec<PersistedDirectiveFieldChange> =
+        serde_json::from_value(encoded).expect("typed changes deserialize");
+    assert_eq!(decoded, changes);
+}
+
+#[test]
 fn prevent_destroy_resolution_reports_source_and_fails_safe_for_expressions() {
     let ordinary = ResourceSchema::new("test.Ordinary");
     let protected = ResourceSchema::new("test.Protected").default_prevent_destroy();

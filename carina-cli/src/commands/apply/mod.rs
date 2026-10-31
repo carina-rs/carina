@@ -2194,7 +2194,7 @@ async fn run_apply_locked_owned(
                     current_exports,
                 );
                 let directive_changes =
-                    persisted_directive_changes(state_file.as_ref(), &resolved_resources);
+                    persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
                 let directive_change_count = directive_changes.len();
 
                 if export_changes.is_empty() && directive_change_count == 0 {
@@ -2310,7 +2310,7 @@ async fn run_apply_locked_owned(
                 &current_exports,
             );
             let directive_changes =
-                persisted_directive_changes(state_file.as_ref(), &resolved_resources);
+                persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
             let summary = PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for)
                 .with_persisted_directive_changes(directive_changes);
             print_plan(
@@ -3538,7 +3538,7 @@ async fn run_apply_from_plan_locked_owned(
                 .into_executable()
                 .map_err(|error| AppError::Config(error.to_string()))?;
             let directive_changes =
-                persisted_directive_changes(state_file.as_ref(), &resolved_sorted_resources);
+                persisted_directive_changes(state_file.as_ref(), &resolved_sorted_resources, plan);
             let recorded_directive_changes = rehydrated_plan_file
                 .reloaded_plan_file()
                 .persisted_directive_changes();

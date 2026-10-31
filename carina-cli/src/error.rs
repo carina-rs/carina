@@ -327,12 +327,14 @@ fn write_directive_changes(
         return formatter.write_str(" none");
     }
     for change in changes {
-        write!(formatter, "\n  - {}", change.address)?;
+        write!(formatter, "\n  - {}", change.resource_id)?;
         for field in &change.fields {
             write!(
                 formatter,
                 "\n      {}: {} -> {}",
-                field.name, field.from, field.to
+                field.name(),
+                field.rendered_from(),
+                field.rendered_to()
             )?;
         }
     }
@@ -805,6 +807,20 @@ pub enum AppError {
     /// A provider or desired value could not be encoded into one resource row.
     #[error(transparent)]
     ResourceStateEncoding(Box<LocatedResourceStateEncodingError>),
+
+    /// A recorded state-only directive target no longer exists in the
+    /// resolved desired-resource set supplied to writeback.
+    #[error("directive change target '{resource_id}' is absent from desired resources")]
+    PersistedDirectiveTargetMissingFromDesired {
+        resource_id: Box<ResolvedResourceId>,
+    },
+
+    /// A recorded state-only directive target no longer exists at its exact
+    /// provider route in locked state.
+    #[error("directive change target '{resource_id}' is absent from locked state")]
+    PersistedDirectiveTargetMissingFromLockedState {
+        resource_id: Box<ResolvedResourceId>,
+    },
 
     /// A state backend error with a project-scoped recovery command.
     #[error(transparent)]

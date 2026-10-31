@@ -62,6 +62,34 @@ impl Scenario {
         .expect("write resource configuration with peer");
     }
 
+    fn write_resources_with_tagged_peer(&self, name: &str, setting: Option<bool>, peer_tag: &str) {
+        let directives = setting.map_or_else(String::new, |value| {
+            format!("  directives {{ prevent_destroy = {value} }}\n")
+        });
+        fs::write(
+            self.project.join("resources.crn"),
+            format!(
+                "let account = mock.test.default_prevent_destroy {{\n  name = \"{name}\"\n{directives}}}\n\nlet peer = mock.test.resource {{\n  name = \"peer\"\n  tags = {{ revision = \"{peer_tag}\" }}\n}}\n"
+            ),
+        )
+        .expect("write resource configuration with tagged peer");
+    }
+
+    fn write_tagged_peer(&self, tag: &str, force_delete: bool) {
+        let directives = if force_delete {
+            "  directives { force_delete = true }\n"
+        } else {
+            ""
+        };
+        fs::write(
+            self.project.join("resources.crn"),
+            format!(
+                "let peer = mock.test.resource {{\n  name = \"peer\"\n  tags = {{ revision = \"{tag}\" }}\n{directives}}}\n"
+            ),
+        )
+        .expect("write tagged peer resource");
+    }
+
     fn remove_resource(&self) {
         fs::write(self.project.join("resources.crn"), "").expect("remove resource configuration");
     }
@@ -164,6 +192,21 @@ fn assert_persisted_prevent_destroy(state: &Value, value: bool) {
     );
 }
 
+fn prevent_destroy_change_json() -> Value {
+    json!([{
+        "resource_id": {
+            "provider": "mock",
+            "resource_type": "test.default_prevent_destroy",
+            "identity": "account"
+        },
+        "fields": [{
+            "name": "prevent_destroy",
+            "from": { "kind": "unspecified" },
+            "to": { "kind": "explicit", "value": false }
+        }]
+    }])
+}
+
 #[test]
 fn schema_default_protects_remove_replace_and_destroy_until_explicit_opt_out() {
     let scenario = Scenario::new();
@@ -256,14 +299,7 @@ fn directive_only_false_is_persisted_before_removed_resource_delete() {
         .expect("JSON plan stdout must remain valid");
     assert_eq!(
         json_plan_value["persisted_directive_changes"],
-        json!([{
-            "address": "mock.test.default_prevent_destroy.account",
-            "fields": [{
-                "name": "prevent_destroy",
-                "from": "unspecified",
-                "to": "false"
-            }]
-        }]),
+        prevent_destroy_change_json(),
         "JSON plan output must expose the state-only directive change set"
     );
     let json_stderr = String::from_utf8_lossy(&json_plan.stderr);
@@ -332,14 +368,7 @@ fn saved_plan_apply_persists_directive_only_false() {
     .expect("parse directive-only saved plan");
     assert_eq!(
         saved_plan_json["persisted_directive_changes"],
-        json!([{
-            "address": "mock.test.default_prevent_destroy.account",
-            "fields": [{
-                "name": "prevent_destroy",
-                "from": "unspecified",
-                "to": "false"
-            }]
-        }]),
+        prevent_destroy_change_json(),
         "saved plan must record the exact directive change set it displayed"
     );
     assert_success(
@@ -379,9 +408,19 @@ fn stale_saved_plan_refuses_a_different_directive_change_set() {
         &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
     );
 
+    scenario.write_resource_with_prevent_destroy("account-v1", Some(false));
     assert_success(
-        "unchanged saved plan",
+        "directive-changing saved plan",
         &scenario.run(&["plan", "--out", "stale.plan.json", "."]),
+    );
+    let recorded_plan: Value = serde_json::from_slice(
+        &fs::read(scenario.project.join("stale.plan.json")).expect("read stale saved plan"),
+    )
+    .expect("parse stale saved plan");
+    assert_eq!(
+        recorded_plan["persisted_directive_changes"],
+        prevent_destroy_change_json(),
+        "the recorded side of the stale-plan comparison must be non-empty"
     );
 
     scenario.write_resource_with_prevent_destroy("account-v1", Some(true));
@@ -399,10 +438,119 @@ fn stale_saved_plan_refuses_a_different_directive_change_set() {
     );
     assert!(
         rendered.contains("saved plan's resource directive changes no longer match")
+            && rendered.contains("Recorded by the plan:")
+            && rendered.contains("Recomputed from locked state:")
+            && rendered.contains("true -> false")
             && rendered.contains("Re-run `carina plan --out"),
         "the typed refusal must explain the mismatch and tell the user to re-run plan:\n{rendered}"
     );
     assert_persisted_prevent_destroy(&scenario.state_json(), true);
+}
+
+#[test]
+fn mixed_update_and_directive_change_appears_only_in_execution_plan() {
+    let scenario = Scenario::new();
+    scenario.write_tagged_peer("v1", false);
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    scenario.write_tagged_peer("v2", true);
+    let plan = scenario.run(&["plan", "."]);
+    assert_success("mixed update plan", &plan);
+    let rendered = output_text(&plan);
+    assert!(
+        rendered.contains("mock.test.resource peer")
+            && !rendered.contains("State-only directive updates:"),
+        "the updated resource must not be rendered a second time as state-only:\n{rendered}"
+    );
+
+    let json_plan = scenario.run(&["plan", "--json", "."]);
+    assert_success("mixed update JSON plan", &json_plan);
+    let json_plan: Value =
+        serde_json::from_slice(&json_plan.stdout).expect("parse mixed update JSON plan");
+    assert!(
+        json_plan["plan"]["effects"]
+            .as_array()
+            .expect("saved plan effects")
+            .iter()
+            .any(|effect| effect.get("Update").is_some()),
+        "the fixture must contain a provider Update effect"
+    );
+    assert_eq!(
+        json_plan["persisted_directive_changes"],
+        json!([]),
+        "the same resource must not be duplicated in the state-only change set"
+    );
+
+    assert_success(
+        "mixed update apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+    let state = scenario.state_json();
+    let peer = state["resources"]
+        .as_array()
+        .expect("state resources")
+        .iter()
+        .find(|row| row["identity"] == "peer")
+        .expect("peer state row");
+    assert_eq!(peer["directives"]["force_delete"], json!(true));
+    assert_eq!(
+        peer["current"]["attributes"]["tags"]["revision"],
+        json!("v2")
+    );
+}
+
+#[test]
+fn saved_plan_with_provider_effect_and_directive_change_persists_both() {
+    let scenario = Scenario::new();
+    scenario.write_resources_with_tagged_peer("account-v1", None, "v1");
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    scenario.write_resources_with_tagged_peer("account-v1", Some(false), "v2");
+    assert_success(
+        "mixed saved plan",
+        &scenario.run(&["plan", "--out", "mixed.plan.json", "."]),
+    );
+    let saved_plan: Value = serde_json::from_slice(
+        &fs::read(scenario.project.join("mixed.plan.json")).expect("read mixed saved plan"),
+    )
+    .expect("parse mixed saved plan");
+    assert_eq!(
+        saved_plan["persisted_directive_changes"],
+        prevent_destroy_change_json(),
+        "the saved plan must retain the directive-only resource beside provider effects"
+    );
+    assert!(
+        saved_plan["plan"]["effects"]
+            .as_array()
+            .expect("saved plan effects")
+            .iter()
+            .any(|effect| effect.get("Update").is_some()),
+        "the fixture must retain its provider effect"
+    );
+
+    let apply = scenario.run(&["apply", "--auto-approve", "--lock=false", "mixed.plan.json"]);
+    assert_success("mixed saved-plan apply", &apply);
+    let state = scenario.state_json();
+    assert_persisted_prevent_destroy(&state, false);
+    let peer = state["resources"]
+        .as_array()
+        .expect("state resources")
+        .iter()
+        .find(|row| row["identity"] == "peer")
+        .expect("peer state row");
+    assert_eq!(
+        peer["current"]["attributes"]["tags"]["revision"],
+        json!("v2"),
+        "the provider effect must complete before final metadata writeback"
+    );
 }
 
 #[test]

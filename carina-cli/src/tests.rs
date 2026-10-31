@@ -211,7 +211,7 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
         contents.provider_configs.as_provider_configs(),
     );
     contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect("test plan provider evidence must be valid")
 }
 
@@ -4338,7 +4338,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_36_top_level_keys() {
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents
-        .record_for_test(&builtin_mock_recording_context())
+        .record_for_test(&builtin_mock_recording_context(), Vec::new())
         .expect("built-in provider evidence must record");
     assert_eq!(
         recorded.provider_artifacts().get("mock"),
@@ -4451,11 +4451,10 @@ fn zero_referenced_provider_plan_round_trips() {
     contents.current_states.clear();
 
     let recorded = contents
-        .record_for_test(&ValidatedConfig::from_factories_for_test(
-            (),
+        .record_for_test(
+            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
             Vec::new(),
-            &[],
-        ))
+        )
         .expect("providerless evidence must record the built-in mock");
     assert!(recorded.schema_fingerprints().providers.is_empty());
     assert_eq!(
@@ -4496,7 +4495,7 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
 
     let ctx = ValidatedConfig::from_factories_for_test((), Vec::new(), &[]);
     let recorded = contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect("a state-only type from an unloaded provider must record");
 
     assert_eq!(
@@ -4547,7 +4546,7 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
 
     let ctx = ValidatedConfig::from_factories_for_test((), Vec::new(), &[configured]);
     let error = contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect_err("a configured provider without a loaded artifact must be rejected");
     assert_eq!(
         error,

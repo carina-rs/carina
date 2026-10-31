@@ -296,8 +296,11 @@ pub fn build_fixture_plan_change_summary(fixture: &FixturePlan) -> PlanChangeSum
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&fixture.resolved_export_params, &current_exports);
-    let directive_changes =
-        persisted_directive_changes(fixture.state_file.as_ref(), &fixture.desired_resources);
+    let directive_changes = persisted_directive_changes(
+        fixture.state_file.as_ref(),
+        &fixture.desired_resources,
+        &fixture.plan,
+    );
     PlanChangeSummary::new(
         &fixture.plan,
         &export_changes,

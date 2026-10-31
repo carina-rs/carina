@@ -6141,15 +6141,84 @@ pub struct PersistedDirectives {
     pub provider_instance: Option<String>,
 }
 
-/// One persisted directive field whose authored value changed.
+/// A persisted directive field recorded in a state-only change set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedDirectiveField {
+    ForceDelete,
+    CreateBeforeDestroy,
+    PreventDestroy,
+    DependsOn,
+    ProviderInstance,
+}
+
+impl PersistedDirectiveField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ForceDelete => "force_delete",
+            Self::CreateBeforeDestroy => "create_before_destroy",
+            Self::PreventDestroy => "prevent_destroy",
+            Self::DependsOn => "depends_on",
+            Self::ProviderInstance => "provider_instance",
+        }
+    }
+}
+
+impl Display for PersistedDirectiveField {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Typed value carried by one side of a persisted directive field change.
 ///
-/// String values keep the saved-plan representation stable and directly
-/// usable by machine-readable plan consumers.
+/// The untagged representation keeps machine-readable plan JSON natural:
+/// booleans remain booleans, dependency sets are arrays, provider instances
+/// are strings or null, and [`PreventDestroy`] retains its tagged tri-state
+/// shape. Equality therefore compares semantic values rather than labels
+/// produced for terminal rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedDirectiveFieldValue {
+    Boolean(bool),
+    PreventDestroy(PreventDestroy),
+    DependsOn(BTreeSet<String>),
+    ProviderInstance(Option<String>),
+}
+
+impl PersistedDirectiveFieldValue {
+    fn render(&self) -> String {
+        match self {
+            Self::Boolean(value) => value.to_string(),
+            Self::PreventDestroy(value) => prevent_destroy_label(*value).to_string(),
+            Self::DependsOn(bindings) => bindings_label(bindings),
+            Self::ProviderInstance(provider_instance) => {
+                provider_instance_label(provider_instance.as_deref())
+            }
+        }
+    }
+}
+
+/// One persisted directive field whose authored value changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedDirectiveFieldChange {
-    pub name: String,
-    pub from: String,
-    pub to: String,
+    name: PersistedDirectiveField,
+    from: PersistedDirectiveFieldValue,
+    to: PersistedDirectiveFieldValue,
+}
+
+impl PersistedDirectiveFieldChange {
+    pub fn name(&self) -> PersistedDirectiveField {
+        self.name
+    }
+
+    pub fn rendered_from(&self) -> String {
+        self.from.render()
+    }
+
+    pub fn rendered_to(&self) -> String {
+        self.to.render()
+    }
 }
 
 impl Directives {
@@ -6230,46 +6299,44 @@ impl PersistedDirectives {
         let mut fields = Vec::new();
         if current_force_delete != desired_force_delete {
             fields.push(PersistedDirectiveFieldChange {
-                name: "force_delete".to_string(),
-                from: current_force_delete.to_string(),
-                to: desired_force_delete.to_string(),
+                name: PersistedDirectiveField::ForceDelete,
+                from: PersistedDirectiveFieldValue::Boolean(*current_force_delete),
+                to: PersistedDirectiveFieldValue::Boolean(*desired_force_delete),
             });
         }
         if current_create_before_destroy != desired_create_before_destroy {
             fields.push(PersistedDirectiveFieldChange {
-                name: "create_before_destroy".to_string(),
-                from: current_create_before_destroy.to_string(),
-                to: desired_create_before_destroy.to_string(),
+                name: PersistedDirectiveField::CreateBeforeDestroy,
+                from: PersistedDirectiveFieldValue::Boolean(*current_create_before_destroy),
+                to: PersistedDirectiveFieldValue::Boolean(*desired_create_before_destroy),
             });
         }
         if current_prevent_destroy != desired_prevent_destroy {
             fields.push(PersistedDirectiveFieldChange {
-                name: "prevent_destroy".to_string(),
-                from: prevent_destroy_label(*current_prevent_destroy).to_string(),
-                to: prevent_destroy_label(*desired_prevent_destroy).to_string(),
+                name: PersistedDirectiveField::PreventDestroy,
+                from: PersistedDirectiveFieldValue::PreventDestroy(*current_prevent_destroy),
+                to: PersistedDirectiveFieldValue::PreventDestroy(*desired_prevent_destroy),
             });
         }
 
-        let current_depends_on = current_depends_on
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        let desired_depends_on = desired_depends_on
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
+        let current_depends_on = current_depends_on.iter().cloned().collect::<BTreeSet<_>>();
+        let desired_depends_on = desired_depends_on.iter().cloned().collect::<BTreeSet<_>>();
         if current_depends_on != desired_depends_on {
             fields.push(PersistedDirectiveFieldChange {
-                name: "depends_on".to_string(),
-                from: bindings_label(&current_depends_on),
-                to: bindings_label(&desired_depends_on),
+                name: PersistedDirectiveField::DependsOn,
+                from: PersistedDirectiveFieldValue::DependsOn(current_depends_on),
+                to: PersistedDirectiveFieldValue::DependsOn(desired_depends_on),
             });
         }
         if current_provider_instance != desired_provider_instance {
             fields.push(PersistedDirectiveFieldChange {
-                name: "provider".to_string(),
-                from: provider_instance_label(current_provider_instance.as_deref()),
-                to: provider_instance_label(desired_provider_instance.as_deref()),
+                name: PersistedDirectiveField::ProviderInstance,
+                from: PersistedDirectiveFieldValue::ProviderInstance(
+                    current_provider_instance.clone(),
+                ),
+                to: PersistedDirectiveFieldValue::ProviderInstance(
+                    desired_provider_instance.clone(),
+                ),
             });
         }
         fields
@@ -6305,10 +6372,14 @@ fn prevent_destroy_label(value: PreventDestroy) -> &'static str {
     }
 }
 
-fn bindings_label(bindings: &BTreeSet<&str>) -> String {
+fn bindings_label(bindings: &BTreeSet<String>) -> String {
     format!(
         "[{}]",
-        bindings.iter().copied().collect::<Vec<_>>().join(", ")
+        bindings
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
