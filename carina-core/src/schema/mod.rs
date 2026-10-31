@@ -4611,6 +4611,46 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
         ));
     }
 
+    if matches!(value, Value::Deferred(DeferredValue::IntegerArithmetic(_))) {
+        return match &attr.kind {
+            AT::Int { .. } => Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred)),
+            AT::Float { .. } => Some(Fit::with_kind(
+                FitExactness::COERCIBLE,
+                attr,
+                FitKind::Deferred,
+            )),
+            AT::Union(members) => {
+                let selected = fit_union_members_on_path(
+                    members.as_raw_slice(),
+                    value,
+                    defs,
+                    ancestry,
+                    purpose,
+                    visited_refs,
+                )?;
+                let exactness = selected.fit.exactness;
+                Some(Fit::with_kind(
+                    exactness,
+                    attr,
+                    FitKind::Union {
+                        member: selected.member,
+                        fit: Box::new(selected.fit),
+                    },
+                ))
+            }
+            AT::Ref(_) => unreachable!("fit dispatch received an unresolved Ref"),
+            AT::String { .. }
+            | AT::ResourceHandle { .. }
+            | AT::StringLiteralSet { .. }
+            | AT::Bool
+            | AT::Duration
+            | AT::Enum { .. }
+            | AT::List { .. }
+            | AT::Map { .. }
+            | AT::Struct { .. } => None,
+        };
+    }
+
     let Some(concrete) = value.as_concrete() else {
         return Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred));
     };
@@ -6984,6 +7024,7 @@ impl Value {
                 format!("BindingRef({})", binding)
             }
             Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce".to_string(),
+            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
             Value::Deferred(
                 DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
@@ -12538,6 +12579,7 @@ pub struct SchemaRegistry {
     data_sources: HashMap<(String, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
+    identified_scalar_kinds: BTreeMap<(String, TypeIdentity), RefinedScalarKind>,
 }
 
 /// Failure to combine owner-bound schema registry declarations.
@@ -12578,6 +12620,15 @@ impl SchemaRegistry {
     #[doc(hidden)]
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
+        for (identity, declaration) in identified_declarations_from_witnesses(
+            std::slice::from_ref(&schema),
+            &ValidatedConfigSchema::default(),
+        ) {
+            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
+                self.identified_scalar_kinds
+                    .insert((provider.clone(), identity), kind);
+            }
+        }
         self.reference_forms.entry(provider.clone()).or_default();
         let key = (provider, schema.as_schema().resource_type.clone());
         match schema.as_schema().kind {
@@ -12612,6 +12663,12 @@ impl SchemaRegistry {
         self.reference_forms
             .insert(provider.clone(), incoming.clone());
         self.witness_backed_reference_forms.insert(provider.clone());
+        for (identity, declaration) in witness.identified_declarations() {
+            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
+                self.identified_scalar_kinds
+                    .insert((provider.clone(), identity), kind);
+            }
+        }
         for schema in witness.resources() {
             let key = (provider.clone(), schema.as_schema().resource_type.clone());
             match schema.as_schema().kind {
@@ -12635,6 +12692,7 @@ impl SchemaRegistry {
             data_sources,
             reference_forms,
             witness_backed_reference_forms,
+            identified_scalar_kinds,
         } = other;
         for (owner, incoming) in &reference_forms {
             if witness_backed_reference_forms.contains(owner)
@@ -12659,7 +12717,18 @@ impl SchemaRegistry {
                 self.reference_forms.entry(owner).or_insert(forms);
             }
         }
+        self.identified_scalar_kinds.extend(identified_scalar_kinds);
         Ok(())
+    }
+
+    pub(crate) fn identified_scalar_kind(
+        &self,
+        owner: &str,
+        identity: &TypeIdentity,
+    ) -> Option<RefinedScalarKind> {
+        self.identified_scalar_kinds
+            .get(&(owner.to_string(), identity.clone()))
+            .copied()
     }
 
     /// Look up a schema by explicit `(provider, resource_type, kind)`.

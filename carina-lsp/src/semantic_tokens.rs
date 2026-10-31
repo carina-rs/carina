@@ -15,7 +15,7 @@ pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::PROPERTY, // 3: attribute names (name, region, etc.)
     SemanticTokenType::STRING,   // 4: string literals
     SemanticTokenType::NUMBER,   // 5: number literals
-    SemanticTokenType::OPERATOR, // 6: =
+    SemanticTokenType::OPERATOR, // 6: assignment, logical, comparison, and expression operators
     SemanticTokenType::COMMENT,  // 7: comments
     SemanticTokenType::FUNCTION, // 8: function names
     SemanticTokenType::MACRO,    // 9: ${...} interpolation spans inside double-quoted strings
@@ -233,18 +233,17 @@ impl SemanticTokensProvider {
                     3,
                 )); // PROPERTY
             }
-            // Operator =
-            tokens.push((
-                position::byte_offset_to_char_offset(line, eq_byte_pos),
-                1,
-                6,
-            )); // OPERATOR
             if prop_name == "ignore_changes" {
                 let rhs_start =
                     position::byte_offset_to_char_offset(line, eq_byte_pos) as usize + 1;
                 Self::find_ignore_change_path_identifiers(masked, rhs_start, &mut tokens);
             }
         }
+
+        // Scan the already-masked code so operator-looking text inside strings
+        // and comments never becomes a semantic token. Multi-character forms
+        // are matched first to keep `>=`, `??`, `|>`, and `>>` indivisible.
+        Self::find_operators(masked, &mut tokens);
 
         // Number literals - use character-level operations for correct UTF-8 handling
         let chars: Vec<char> = line.chars().collect();
@@ -357,6 +356,37 @@ impl SemanticTokensProvider {
                 index += 1;
             }
             tokens.push((start as u32, (index - start) as u32, 3)); // PROPERTY
+        }
+    }
+
+    fn find_operators(masked: &MaskedCode, tokens: &mut Vec<(u32, u32, u32)>) {
+        const OPERATORS: &[&str] = &[
+            "==", "!=", ">=", "<=", "&&", "||", "??", "|>", ">>", "=", ">", "<", "!", "+", "-",
+            "*", "/", "%",
+        ];
+
+        let line = masked.as_str();
+        let bytes = line.as_bytes();
+        let mut byte_index = 0;
+        while byte_index < bytes.len() {
+            let rest = &line[byte_index..];
+            let Some(operator) = OPERATORS
+                .iter()
+                .find(|operator| rest.starts_with(**operator))
+            else {
+                byte_index += line[byte_index..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+                continue;
+            };
+            tokens.push((
+                position::byte_offset_to_char_offset(line, byte_index),
+                operator.len() as u32,
+                6,
+            ));
+            byte_index += operator.len();
         }
     }
 
@@ -528,6 +558,89 @@ fn push_with_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_scanner_uses_longest_matches_and_covers_arithmetic() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let source = "x = a + b - c * d / e % f ?? g |> h >> i == j != k >= l <= m && n || !o";
+        let operators = provider
+            .tokenize_line(source)
+            .into_iter()
+            .filter(|(_, _, token_type)| *token_type == 6)
+            .map(|(start, length, _)| {
+                source
+                    .chars()
+                    .skip(start as usize)
+                    .take(length as usize)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operators,
+            [
+                "=", "+", "-", "*", "/", "%", "??", "|>", ">>", "==", "!=", ">=", "<=", "&&", "||",
+                "!",
+            ]
+        );
+    }
+
+    #[test]
+    fn operator_scanner_uses_masked_code_and_handles_signed_literals() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let source = "value = -1 + 2 # + / %\ntext = \"a + b\" // * -";
+        let tokens = provider.tokenize(source);
+        let operator_lengths = tokens
+            .iter()
+            .filter(|token| token.token_type == 6)
+            .map(|token| token.length)
+            .collect::<Vec<_>>();
+        assert_eq!(operator_lengths, [1, 1, 1, 1]);
+        assert!(tokens.iter().any(|token| token.token_type == 7));
+        assert!(tokens.iter().any(|token| token.token_type == 4));
+    }
+
+    #[test]
+    fn interpolation_macro_does_not_overlap_inner_semantic_tokens() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let source = "value = \"${aws.s3.Bucket + 1}\"";
+        let tokens = absolute_tokens(&provider.tokenize(source));
+        let macro_token = tokens
+            .iter()
+            .find(|(_, _, _, token_type)| *token_type == 9)
+            .copied()
+            .expect("interpolation must emit a MACRO token");
+        let (_, macro_start, macro_len, _) = macro_token;
+        let macro_end = macro_start + macro_len;
+
+        assert!(
+            tokens.iter().all(|(_, start, len, token_type)| {
+                *token_type == 9 || *start + *len <= macro_start || *start >= macro_end
+            }),
+            "no semantic token may overlap the MACRO-owned interpolation range: {tokens:?}",
+        );
+    }
+
+    #[test]
+    fn heredoc_opener_does_not_emit_operator_tokens() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let source = "x = <<-EOT\nbody\nEOT";
+        let tokens = absolute_tokens(&provider.tokenize(source));
+        let line_zero_operators = tokens
+            .iter()
+            .filter(|(line, _, _, token_type)| *line == 0 && *token_type == 6)
+            .map(|(_, start, len, _)| {
+                source
+                    .lines()
+                    .next()
+                    .expect("first line")
+                    .chars()
+                    .skip(*start as usize)
+                    .take(*len as usize)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(line_zero_operators, ["="]);
+    }
 
     #[test]
     fn test_resource_type_at_line_start() {
@@ -1966,12 +2079,8 @@ mod tests {
     }
 
     #[test]
-    fn type_walker_fires_inside_interpolation_expression() {
-        // Inside `${...}` the walker MUST run because that is an
-        // expression position, not a string body.
+    fn macro_token_owns_interpolation_resource_type_range() {
         let provider = SemanticTokensProvider::new(&[]);
-        // `msg = "see ${aws.ec2.Vpc} here"` — the `aws.ec2.Vpc` inside
-        // ${...} should be tagged as TYPE.
         let line = "msg = \"see ${aws.ec2.Vpc} here\"";
         let tokens = provider.tokenize_line(line);
         let byte_pos = line.find("aws.ec2.Vpc").expect("needle not in line");
@@ -1980,14 +2089,14 @@ mod tests {
             .iter()
             .any(|(start, _, kind)| *kind == 1 && *start == needle_start);
         assert!(
-            has_type_at_needle,
-            "TYPE token must fire inside `${{...}}` expression position; \
+            !has_type_at_needle,
+            "the MACRO token must own the `${{...}}` range without an overlapping TYPE token; \
              tokens: {tokens:?}"
         );
     }
 
     #[test]
-    fn region_walker_fires_inside_interpolation_expression() {
+    fn macro_token_owns_interpolation_region_range() {
         use carina_core::schema::CompletionValue;
         let regions = vec![CompletionValue::new(
             "aws.Region.us_east_1",
@@ -2004,9 +2113,9 @@ mod tests {
             .iter()
             .any(|(start, _, kind)| *kind == 1 && *start == needle_start);
         assert!(
-            has_type_at_needle,
-            "region TYPE token must fire inside `${{...}}` expression \
-             position; tokens: {tokens:?}"
+            !has_type_at_needle,
+            "the MACRO token must own the `${{...}}` range without an overlapping region TYPE \
+             token; tokens: {tokens:?}"
         );
     }
 
@@ -2061,11 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn type_walker_fires_inside_unclosed_interpolation() {
-        // `x = "foo ${aws.ec2.Vpc` — line ends inside `${...`. The
-        // expression body still contains a resource type and must be
-        // tagged as TYPE; the trailing chars of the unclosed
-        // interpolation must not be masked out of the walker text.
+    fn macro_token_owns_unclosed_interpolation_range() {
         let provider = SemanticTokensProvider::new(&[]);
         let line = "x = \"foo ${aws.ec2.Vpc";
         let tokens = provider.tokenize_line(line);
@@ -2075,8 +2180,8 @@ mod tests {
             .iter()
             .any(|(start, len, kind)| *kind == 1 && *start == needle_start && *len == 11);
         assert!(
-            has_type_at_needle,
-            "TYPE must fire on full identifier inside unclosed `${{`; \
+            !has_type_at_needle,
+            "the MACRO token must own an unclosed `${{` range without an overlapping TYPE token; \
              tokens: {tokens:?}"
         );
     }

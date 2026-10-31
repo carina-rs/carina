@@ -181,6 +181,7 @@ fn format_value(value: &Value) -> String {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             format!("{} ?? {}", format_value(value), format_value(default))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => crate::value::format_value(value),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let inner: String = parts
@@ -549,6 +550,22 @@ impl RootConfigSignature {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 Self::collect_typed_dependencies(from, attr_key, value, graph, binding_types);
                 Self::collect_typed_dependencies(from, attr_key, default, graph, binding_types);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.lhs(),
+                    graph,
+                    binding_types,
+                );
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.rhs(),
+                    graph,
+                    binding_types,
+                );
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -1127,6 +1144,24 @@ impl ModuleSignature {
                     from,
                     attr_key,
                     default,
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.lhs(),
+                    graph,
+                    binding_types,
+                    argument_types,
+                );
+                Self::collect_typed_dependencies(
+                    from,
+                    attr_key,
+                    expression.rhs(),
                     graph,
                     binding_types,
                     argument_types,

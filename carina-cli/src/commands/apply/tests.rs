@@ -9598,41 +9598,48 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn previous_plan_version_is_rejected_before_payload_decoding() {
+    async fn format_34_and_older_are_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("previous-plan.json");
-        let previous = crate::commands::plan::PlanFile::CURRENT_VERSION - 1;
-        let old_plan = serde_json::json!({
-            "version": previous,
-            "timestamp": "2026-10-29T00:00:00Z",
-            "source_path": "infra",
-            "compositions": "intentionally invalid payload",
-        });
-        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
-            .expect("write previous plan");
+        assert_eq!(
+            crate::commands::plan::PlanFile::CURRENT_VERSION,
+            35,
+            "carina#4150 uses saved-plan format 35",
+        );
 
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::default(),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("the previous format must be rejected before decoding its payload");
+        for older_version in [34, 33, 32] {
+            let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
+            let old_plan = serde_json::json!({
+                "version": older_version,
+                "timestamp": "2026-10-29T00:00:00Z",
+                "source_path": "infra",
+                "compositions": "intentionally invalid payload",
+            });
+            std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
+                .expect("write older plan");
 
-        let crate::error::AppError::UnsupportedPlanVersion {
-            found, expected, ..
-        } = error
-        else {
-            panic!("expected typed unsupported plan version error")
-        };
-        assert_eq!(found, previous);
-        assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+            let error = crate::commands::apply::run_apply_from_plan(
+                &user_dirs,
+                &plan_path,
+                true,
+                false,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                false,
+                &carina_core::parser::ProviderContext::default(),
+                carina_core::shutdown::ShutdownToken::running(),
+            )
+            .await
+            .expect_err("an older format must be rejected before decoding its payload");
+
+            let crate::error::AppError::UnsupportedPlanVersion {
+                found, expected, ..
+            } = error
+            else {
+                panic!("expected typed unsupported plan version error")
+            };
+            assert_eq!(found, older_version);
+            assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        }
     }
 
     #[tokio::test]

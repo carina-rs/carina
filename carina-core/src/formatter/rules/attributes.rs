@@ -269,6 +269,15 @@ impl Formatter {
         node: &CstNode,
         align_to: usize,
     ) {
+        if node
+            .children
+            .iter()
+            .any(|child| matches!(child, CstChild::Token(token) if token.text == "validation"))
+        {
+            self.format_validation_block(node);
+            return;
+        }
+
         self.write_indent();
 
         let mut key_len: usize = 0;
@@ -303,6 +312,57 @@ impl Formatter {
             }
         }
 
+        self.write_newline();
+    }
+
+    fn format_validation_block(&mut self, node: &CstNode) {
+        self.write_indent();
+        self.write("validation {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        self.format_block_attributes(node);
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.write_newline();
+    }
+
+    fn format_validation_block_attr(
+        &mut self,
+        node: &CstNode,
+        align_to: usize,
+        inline_comment: Option<&Trivia>,
+    ) {
+        self.write_indent();
+        let mut key_len = 0;
+        let mut wrote_key = false;
+        let mut wrote_equals = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) if !wrote_key && self.is_identifier(&token.text) => {
+                    key_len = token.text.len();
+                    self.write_token(&token.text);
+                    wrote_key = true;
+                }
+                CstChild::Token(token) if token.text == "=" && !wrote_equals => {
+                    if align_to > key_len {
+                        self.write(&" ".repeat(align_to - key_len));
+                    }
+                    self.write(" = ");
+                    wrote_equals = true;
+                }
+                CstChild::Token(token) if wrote_equals => self.write_token(&token.text),
+                CstChild::Token(_) => {}
+                CstChild::Node(value) if wrote_equals => self.format_node(value),
+                CstChild::Node(_) => {}
+                CstChild::Trivia(trivia) if wrote_equals => self.format_expression_trivia(trivia),
+                CstChild::Trivia(_) => {}
+            }
+        }
+        self.write_inline_comment(inline_comment);
         self.write_newline();
     }
 
@@ -449,7 +509,8 @@ impl Formatter {
                 CstChild::Node(n)
                     if n.kind == NodeKind::Attribute
                         || n.kind == NodeKind::NestedBlock
-                        || n.kind == NodeKind::LocalBinding =>
+                        || n.kind == NodeKind::LocalBinding
+                        || n.kind == NodeKind::ValidationBlockAttr =>
                 {
                     // Attach pending comments to this attribute
                     if !pending_comments.is_empty() {
@@ -508,9 +569,10 @@ impl Formatter {
             let max_key_len = if self.config.align_attributes {
                 group
                     .iter()
-                    .filter(|attr| {
-                        attr.kind == NodeKind::Attribute
-                            && self.should_convert_to_blocks(attr).is_none()
+                    .filter(|attr| match attr.kind {
+                        NodeKind::Attribute => self.should_convert_to_blocks(attr).is_none(),
+                        NodeKind::ValidationBlockAttr => true,
+                        _ => false,
                     })
                     .filter_map(|attr| self.get_attribute_key(attr))
                     .map(|k| k.len())
@@ -534,6 +596,9 @@ impl Formatter {
                     self.format_let_binding(attr);
                 } else if attr.kind == NodeKind::NestedBlock {
                     self.format_nested_block(attr);
+                } else if attr.kind == NodeKind::ValidationBlockAttr {
+                    let inline_comment = inline_comments.get(&global_attr_index);
+                    self.format_validation_block_attr(attr, max_key_len, inline_comment.copied());
                 } else if let Some(block_name) = self.should_convert_to_blocks(attr) {
                     self.emit_list_as_blocks(attr, &block_name);
                 } else {
@@ -877,12 +942,15 @@ impl Formatter {
             self.attr_stack.pop();
         }
 
-        // Write inline comment if present
+        self.write_inline_comment(inline_comment);
+
+        self.write_newline();
+    }
+
+    fn write_inline_comment(&mut self, inline_comment: Option<&Trivia>) {
         if let Some(comment) = inline_comment {
             self.write("  ");
             self.write_trivia(comment);
         }
-
-        self.write_newline();
     }
 }

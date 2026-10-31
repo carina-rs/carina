@@ -117,7 +117,7 @@ its tagged tri-state object:
 }
 ```
 
-The array is required in saved-plan format 36, even when it is empty. Applying
+The array is required in saved-plan format 35, even when it is empty. Applying
 a saved plan recomputes it against locked state and refuses the plan if the
 typed IDs or values differ.
 

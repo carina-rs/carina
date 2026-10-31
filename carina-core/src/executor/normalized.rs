@@ -201,6 +201,7 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             DeferredValue::ResourceRef { .. } => false,
             DeferredValue::BindingRef { .. } => false,
             DeferredValue::Coalesce { .. } => false,
+            DeferredValue::IntegerArithmetic(_) => false,
             DeferredValue::Interpolation(_) => false,
             DeferredValue::FunctionCall { .. } => false,
             DeferredValue::Unavailable { .. } => false,

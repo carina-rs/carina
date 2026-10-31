@@ -5002,6 +5002,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
+        | Value::Deferred(DeferredValue::IntegerArithmetic(_))
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
         | Value::Deferred(DeferredValue::Unavailable { .. })
@@ -5062,6 +5063,7 @@ pub fn merge_default_tags<S>(
                 error @ (SerializationError::UnknownNotAllowed { .. }
                 | SerializationError::UnresolvedResourceRef { .. }
                 | SerializationError::UnresolvedCoalesce { .. }
+                | SerializationError::UnresolvedIntegerArithmetic { .. }
                 | SerializationError::UnresolvedInterpolation { .. }
                 | SerializationError::UnresolvedFunctionCall { .. }
                 | SerializationError::UnresolvedAccess { .. }
@@ -8545,6 +8547,16 @@ mod tests {
                     "Owner".to_string(),
                     Value::resource_ref("management", "owner", Vec::new()),
                 ),
+                (
+                    "Count".to_string(),
+                    crate::integer_arithmetic::evaluate_integer_values(
+                        Value::resource_ref("management", "count", Vec::new()),
+                        crate::integer_arithmetic::IntegerOp::Add,
+                        Value::Concrete(ConcreteValue::Int(1)),
+                        crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+                    )
+                    .expect("deferred integer fixture must be structurally valid"),
+                ),
             ]),
             source: None,
             version: None,
@@ -8583,6 +8595,7 @@ mod tests {
         );
         assert!(resources[0].default_tag_keys.contains("ManagedBy"));
         assert!(!resources[0].default_tag_keys.contains("Owner"));
+        assert!(!resources[0].default_tag_keys.contains("Count"));
         assert!(
             resources[0]
                 .attributes

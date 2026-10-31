@@ -66,8 +66,8 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
-fn saved_plan_version_is_36_for_tri_state_directives() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 36);
+fn saved_plan_version_is_35_for_tri_state_directives() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 35);
 }
 
 #[test]
@@ -3649,13 +3649,25 @@ fn plan_file_serialization_redacts_secrets() {
     let secret_password = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("super-secret-pw".into()),
     ))));
+    let secret_arithmetic = Value::Deferred(DeferredValue::IntegerArithmetic(
+        carina_core::integer_arithmetic::ValidatedIntegerExpr::new(
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Int(42),
+            )))),
+            carina_core::integer_arithmetic::IntegerOp::Add,
+            Value::Concrete(ConcreteValue::Int(1)),
+            carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("a secret Int is a valid arithmetic operand"),
+    ));
 
     let resource_with_secret = Resource::with_provider("awscc", "rds.db_instance", "my-db", None)
         .with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("my-db".into())),
         )
-        .with_attribute("master_password", secret_password.clone());
+        .with_attribute("master_password", secret_password.clone())
+        .with_attribute("secret_number", secret_arithmetic.clone());
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(resource_with_secret.clone())));
@@ -3666,6 +3678,7 @@ fn plan_file_serialization_redacts_secrets() {
         Value::Concrete(ConcreteValue::String("my-db".into())),
     );
     state_attrs.insert("master_password".to_string(), secret_password.clone());
+    state_attrs.insert("secret_number".to_string(), secret_arithmetic);
     let state_with_secret = State::existing(
         ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
         state_attrs,
@@ -3708,6 +3721,11 @@ fn plan_file_serialization_redacts_secrets() {
     assert!(
         !json.contains("super-secret-pw"),
         "Plan file JSON must not contain plaintext secret value.\nJSON:\n{}",
+        json
+    );
+    assert!(
+        !json.contains("\"Int\": 42"),
+        "Plan file JSON must not contain a secret arithmetic operand.\nJSON:\n{}",
         json
     );
 
@@ -4334,7 +4352,7 @@ fn builtin_mock_recording_context() -> ValidatedConfig<()> {
 }
 
 #[test]
-fn recorded_builtin_only_plan_round_trips_with_format_36_top_level_keys() {
+fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents

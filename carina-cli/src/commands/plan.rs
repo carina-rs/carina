@@ -469,7 +469,7 @@ mod provider_scope_evidence_tests {
     }
 
     #[test]
-    fn current_saved_plan_round_trips_provider_scopes() {
+    fn format_35_saved_plan_round_trips_provider_scopes_and_integer_arithmetic() {
         let mut default_config = provider_config("unused");
         default_config.binding = None;
         default_config.source = Some("file:///test-provider.wasm".parse().unwrap());
@@ -507,7 +507,47 @@ mod provider_scope_evidence_tests {
             ),
         );
 
-        let plan = empty_contents(SavedProviderConfigs::from(&resolved))
+        let mut contents = empty_contents(SavedProviderConfigs::from(&resolved));
+        let arithmetic = carina_core::integer_arithmetic::evaluate_integer_values(
+            Value::resource_ref("source", "seconds", Vec::new()),
+            carina_core::integer_arithmetic::IntegerOp::Divide,
+            Value::Concrete(ConcreteValue::Int(60)),
+            carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("typed deferred arithmetic is valid");
+        let Value::Deferred(DeferredValue::IntegerArithmetic(expression)) = arithmetic else {
+            panic!("resource arithmetic must remain deferred");
+        };
+        let stamped_unknown = expression
+            .evaluate_with_operands(
+                Value::Deferred(DeferredValue::Unknown(
+                    carina_core::resource::UnknownReason::UpstreamExport {
+                        path: carina_core::resource::AccessPath::new("source", "seconds"),
+                    },
+                )),
+                Value::Concrete(ConcreteValue::Int(60)),
+            )
+            .expect("the validated Int slot admits an unresolved upstream marker");
+        let stamped_redacted = expression
+            .evaluate_with_operands(
+                Value::Deferred(DeferredValue::RedactedSecret {
+                    hash: carina_core::resource::RedactedSecretHash::from_encoded_digest(&format!(
+                        "argon2-legacy:73616c74:{}",
+                        "ab".repeat(32)
+                    ))
+                    .expect("fixture digest is valid"),
+                }),
+                Value::Concrete(ConcreteValue::Int(60)),
+            )
+            .expect("the validated Int slot admits a saved-plan secret marker");
+        contents.upstream_snapshot.insert(
+            "upstream".to_string(),
+            HashMap::from([
+                ("minutes".to_string(), stamped_unknown),
+                ("secret_minutes".to_string(), stamped_redacted),
+            ]),
+        );
+        let plan = contents
             .record_for_test_with_provider(&wiring, &provider, Vec::new())
             .expect("provider scopes form valid evidence");
         let json = serde_json::to_value(&plan).expect("saved plan serializes");
@@ -532,6 +572,14 @@ mod provider_scope_evidence_tests {
 
         let decoded: PlanFile = serde_json::from_value(json).expect("saved plan round-trips");
         assert_eq!(decoded.provider_scopes(), &provider.provider_scopes());
+        assert_eq!(
+            carina_core::value::format_value(&decoded.upstream_snapshot["upstream"]["minutes"]),
+            "(known after upstream apply: source.seconds) / 60",
+        );
+        assert!(matches!(
+            &decoded.upstream_snapshot["upstream"]["secret_minutes"],
+            Value::Deferred(DeferredValue::IntegerArithmetic(_))
+        ));
     }
 
     #[test]
@@ -599,10 +647,13 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 36 stores the tri-state `prevent_destroy` directive so an
+    /// Plan format 35 stores the tri-state `prevent_destroy` directive so an
     /// explicit `false` remains distinct from an unspecified value, and
     /// records the exact state-only directive change set approved by the
     /// operator.
+    ///
+    /// Plan format 34 adds typed deferred integer arithmetic expressions.
+    ///
     /// Plan format 33 adds the typed keyed-list release effect.
     ///
     /// Plan format 32 records provider-instance reference-scope evidence and
@@ -870,9 +921,11 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// Format 36 stores the tri-state `prevent_destroy` directive so an explicit
+/// Format 35 stores the tri-state `prevent_destroy` directive so an explicit
 /// `false` remains distinct from an unspecified value, and records the exact
 /// state-only directive change set approved at plan time.
+///
+/// Format 34 adds typed deferred integer arithmetic expressions.
 ///
 /// Format 33 adds typed keyed-list release effects.
 ///
@@ -892,10 +945,10 @@ pub struct PlanFile {
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
-/// Private format-36 wire representation.
+/// Private format-35 wire representation.
 ///
 /// Existing field order remains identical to the historical `PlanFile`
-/// serialization order. Format-36 directive changes and provider evidence are
+/// serialization order. Format-35 directive changes and provider evidence are
 /// mandatory and are never defaulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
@@ -1885,7 +1938,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 36;
+    pub const CURRENT_VERSION: u32 = 35;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -4201,9 +4254,11 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
-        // carina#4150: bumped 33→36 — Directives now retain whether
+        // carina#4150: bumped 34→35 — Directives now retain whether
         // prevent_destroy was unspecified or explicitly false, and saved
         // plans bind apply to the exact state-only directive change set.
+        // carina#4142: bumped 33→34 — saved plans can retain typed deferred
+        // integer arithmetic until apply-time reference resolution.
         // carina#4118: bumped 32→33 — keyed partial-update releases add a
         // serialized state-only Effect variant.
         // carina#4067: bumped 29→31 — saved plans retain authored
@@ -4872,7 +4927,7 @@ pub async fn run_plan(
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
         // JSON stdout is the versioned saved-plan document and now carries the
-        // exact directive change set as machine-readable format-36 data. Keep
+        // exact directive change set as machine-readable format-35 data. Keep
         // the human-readable rendering on stderr as well.
         if !directive_changes.is_empty() {
             eprint!("{}", format_persisted_directive_changes(&directive_changes));

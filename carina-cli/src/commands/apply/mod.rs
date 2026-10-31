@@ -3053,9 +3053,10 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 36
-    // stores tri-state prevent_destroy directives, so format 33 plans must be
-    // regenerated. Format 33 adds the typed keyed-list release effect. Format
+    // Validate version compatibility before decoding the payload. Format 35
+    // stores tri-state prevent_destroy directives, so format 34 plans must be
+    // regenerated. Format 34 adds typed deferred integer arithmetic
+    // expressions. Format 33 adds the typed keyed-list release effect. Format
     // 32 records provider
     // instance reference scopes and create-outcome-unknown markers for
     // protocol v13. Format 31 persists authored ignore paths; format 30 was

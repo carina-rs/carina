@@ -74,7 +74,13 @@ and its `started_at` timestamp, never an identifier or continuation token.
 Apply reloads that marker under the state lock and rejects any lifecycle or
 timestamp change before provider effects run.
 
-Saved-plan format 36 stores the same tri-state directive shape and the exact
+Saved-plan format 33 adds typed keyed-list release effects. Saved-plan format
+34 adds the structural `IntegerArithmetic` deferred value so an Int expression
+whose operands become known during apply is preserved without lowering to a
+builtin or string. Older plans are rejected with the standard replan guidance;
+the state format is unchanged.
+
+Saved-plan format 35 stores the same tri-state directive shape and the exact
 state-only directive change set shown during planning. The set contains only
 desired resources that have no managed mutation in the execution plan; a
 resource handled by create, update, replace, move, or another mutating effect
@@ -82,7 +88,7 @@ persists its directives through normal state writeback instead. Each entry
 carries the full routed resource ID and typed per-field `from`/`to` values.
 Saved-plan apply recomputes the set against locked state and compares those
 typed identities and values, refusing a mismatch with re-plan guidance before
-provider effects run. Format 33 plans cannot distinguish explicit false from
+provider effects run. Format 34 plans cannot distinguish explicit false from
 an unspecified value and must be regenerated.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new

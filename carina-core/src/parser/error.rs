@@ -90,6 +90,16 @@ pub enum ParseError {
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
 
+    /// Operator-local arithmetic diagnostic. Columns are one-based and the
+    /// end column is exclusive so LSP can highlight the authored operator.
+    #[error("Invalid integer arithmetic at line {line}, column {column}: {message}")]
+    IntegerArithmetic {
+        line: usize,
+        column: usize,
+        end_column: usize,
+        message: String,
+    },
+
     #[error(
         "Invalid {kind} expression at line {line}: an unbound {kind} cannot contain `read`; bind the {kind} expression with `let` so the data source has an address"
     )]
@@ -354,6 +364,20 @@ impl ParseError {
     pub(crate) fn from_eval_value(error: EvalValueError, line: usize) -> Self {
         ParseError::InvalidExpression {
             line,
+            message: error.to_string(),
+        }
+    }
+
+    pub(crate) fn integer_arithmetic(
+        span: crate::integer_arithmetic::IntegerOperatorSpan,
+        fallback_line: usize,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        let column = span.column().unwrap_or(1);
+        Self::IntegerArithmetic {
+            line: span.line().unwrap_or(fallback_line),
+            column,
+            end_column: column + 1,
             message: error.to_string(),
         }
     }
