@@ -394,6 +394,11 @@ impl<'a> DependencyAnalyzer<'a> {
                         analysis.add_edge(self_idx, parent, ReadsSet::unknown());
                     }
                 }
+                ScheduleEdge::ResolvedDependsOn(target) => {
+                    if let Some(parent) = self.lookup_by_identity(target.identity()) {
+                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                    }
+                }
                 ScheduleEdge::RequiredDependsOn(identity) => {
                     if let Some(parent) = self.lookup_by_identity(&identity) {
                         analysis.add_edge(self_idx, parent, ReadsSet::unknown());
@@ -461,9 +466,17 @@ impl<'a> DependencyAnalyzer<'a> {
                 self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
             }
         }
-        if let Some(directives) = resource.directives() {
-            for binding in &directives.depends_on {
-                self.record_binding_edge(binding, ReadsSet::unknown(), analysis, child);
+    }
+
+    fn collect_from_resolved_dependencies(
+        &self,
+        dependencies: &crate::dependency::ResolvedDependencies,
+        analysis: &mut DependencyAnalysis,
+        child: usize,
+    ) {
+        for dependency in dependencies.iter() {
+            if let Some(parent) = self.lookup_by_identity(dependency.identity()) {
+                analysis.add_edge(child, parent, ReadsSet::unknown());
             }
         }
     }
@@ -687,6 +700,9 @@ where
                         analyzer.collect_from_resource_ref(resource, &mut analysis, idx);
                     }
                 }
+                if let Some(dependencies) = effect.resolved_explicit_dependencies() {
+                    analyzer.collect_from_resolved_dependencies(dependencies, &mut analysis, idx);
+                }
                 analyzer.collect_from_schedule_edges(
                     effects,
                     effect.apply_edges(),
@@ -798,6 +814,36 @@ mod tests {
         let mut resource = Resource::new("test", binding);
         resource.binding = Some(binding.to_string());
         Effect::Create(ResolvedResource::new(resource))
+    }
+
+    #[test]
+    fn resolver_produced_resource_dependency_creates_scheduler_edge() {
+        let mut parent = Resource::new("test", "parent");
+        parent.binding = Some("parent".to_string());
+        let mut child = Resource::new("test", "child");
+        child.binding = Some("child".to_string());
+        child.directives.depends_on.push("parent".to_string());
+        let raw = vec![parent.clone(), child.clone()];
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            &raw,
+            &[] as &[crate::resource::DataSource],
+            std::iter::empty(),
+        )
+        .unwrap();
+        let effects = vec![
+            Effect::Create(ResolvedResource::new(parent)),
+            Effect::Create(ResolvedResource::new_with_dependencies(
+                child.clone(),
+                scope.resolve_resource(&child).unwrap(),
+            )),
+        ];
+
+        let analysis =
+            build_effect_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
+                .unwrap()
+                .into_deps_of();
+
+        assert_eq!(analysis[&1], HashSet::from([0]));
     }
 
     fn delete_effect(

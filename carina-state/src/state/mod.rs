@@ -2697,7 +2697,7 @@ fn resource_with_secret_shape_union<S: Clone>(
             (key.clone(), protected)
         })
         .collect();
-    ResolvedResource::new(resolved)
+    ResolvedResource::new_with_dependencies(resolved, resource.explicit_dependencies().clone())
 }
 
 impl ResourceState {

@@ -213,6 +213,7 @@ pub(super) async fn refresh_pending_states<S: Clone>(
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource<S: Clone>(
     input: Result<CheckInput<Resource<S>>, String>,
+    explicit_dependencies: crate::dependency::ResolvedDependencies,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<(ProviderReadyResource, SecretPreservingAttributes), String> {
     let bindings = context.bindings();
@@ -268,9 +269,10 @@ pub(super) async fn resolve_resource<S: Clone>(
         }
     };
     let resolved_secret_shapes = checked.value().resolved_attributes();
-    let provider_ready = prepare_provider_ready_resource_after_resolution(checked, context)
-        .await
-        .map_err(|err| err.to_string())?;
+    let provider_ready =
+        prepare_provider_ready_resource_after_resolution(checked, explicit_dependencies, context)
+            .await
+            .map_err(|err| err.to_string())?;
     let provider_values = provider_ready.as_resource().resolved_attributes();
     let resolved_desired_attributes =
         SecretPreservingAttributes::from_provider_values(&resolved_secret_shapes, &provider_values);
@@ -817,7 +819,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+            let (resolved, resolved_attrs) = match resolve_resource(
+                check_input,
+                resource.explicit_dependencies().clone(),
+                preparation,
+            )
+            .await
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -909,7 +916,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+            let (resolved, resolved_attrs) = match resolve_resource(
+                check_input,
+                resource.explicit_dependencies().clone(),
+                preparation,
+            )
+            .await
             {
                 Ok(resolved) => resolved,
                 Err(error) => {
@@ -1050,20 +1062,25 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
                 })
                 .unwrap_or_else(|| to.as_inner().clone());
-            let (resolved_to, resolved_desired_attributes) =
-                match resolve_resource(check_input, preparation).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return StartedBasicEffectResult::new(
-                            started_effect,
-                            started,
-                            BasicEffectResult::Failure {
-                                error: e,
-                                refresh: None,
-                            },
-                        );
-                    }
-                };
+            let (resolved_to, resolved_desired_attributes) = match resolve_resource(
+                check_input,
+                to.explicit_dependencies().clone(),
+                preparation,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error: e,
+                            refresh: None,
+                        },
+                    );
+                }
+            };
             // Augment plan-time `changed_attributes` with any
             // ResourceRef-derived attributes whose resolved value at
             // apply time differs from `from`. This catches the case

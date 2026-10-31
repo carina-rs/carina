@@ -745,10 +745,20 @@ mod tests {
         let role = Resource::new("iam.Role", "role").with_binding("role".to_string());
         let mut bucket = Resource::new("s3.Bucket", "bucket").with_binding("bucket".to_string());
         bucket.directives.depends_on = vec!["role".to_string()];
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            &[role.clone(), bucket.clone()],
+            &[] as &[crate::resource::DataSource],
+            std::iter::empty(),
+        )
+        .unwrap();
+        let bucket_dependencies = scope.resolve_resource(&bucket).unwrap();
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(role)));
-        plan.add(Effect::Create(resolved(bucket)));
+        plan.add(Effect::Create(ResolvedResource::new_with_dependencies(
+            bucket,
+            bucket_dependencies,
+        )));
         let graph = build_dependency_graph(&plan);
 
         let bucket_idx = *graph
@@ -1025,7 +1035,7 @@ mod tests {
             until_surface: "status == 'ready'".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(1),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         });
 
         let graph = build_dependency_graph(&plan);

@@ -44,13 +44,13 @@ use crate::wiring::{
     CanonicalResourcePair, NonEmptyValidationErrors, WiringContext,
     compute_anonymous_identifiers_with_policy_with_ctx,
     compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
-    validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
-    validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
-    validate_no_backend_in_modules, validate_no_empty_interpolations,
-    validate_no_exports_in_modules, validate_no_provider_in_modules,
-    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
-    validate_provider_region_with_ctx, validate_resources_with_ctx,
-    validate_wait_bindings_with_ctx,
+    validate_deferred_populate_refs_with_ctx, validate_depends_on_in_modules,
+    validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
+    validate_module_internal_ref_types, validate_no_backend_in_modules,
+    validate_no_empty_interpolations, validate_no_exports_in_modules,
+    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
+    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
+    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -698,6 +698,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.extend(validate_no_backend_in_modules(&module_walk));
         errors.extend(validate_no_upstream_states_in_modules(&module_walk));
         errors.extend(validate_no_exports_in_modules(&module_walk));
+        errors.extend(validate_depends_on_in_modules(&module_walk));
     }
 
     // Non-module-call failures do not have a sound expansion path. Authored

@@ -655,6 +655,7 @@ pub async fn prepare_provider_ready_resource(
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(
         ResolvedCheckInput::authored(resource),
+        crate::dependency::ResolvedDependencies::empty(),
         context,
     )
     .await
@@ -670,9 +671,10 @@ pub async fn prepare_provider_ready_resource(
 /// validators when at least one input became known now.
 pub(super) async fn prepare_provider_ready_resource_after_resolution<S: Clone>(
     input: ResolvedCheckInput<Resource<S>>,
+    explicit_dependencies: crate::dependency::ResolvedDependencies,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
-    prepare_provider_ready_resource_with_value_check(input, context).await
+    prepare_provider_ready_resource_with_value_check(input, explicit_dependencies, context).await
 }
 
 enum ResourceValueCheck {
@@ -685,6 +687,7 @@ enum ResourceValueCheck {
 
 async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
     input: ResolvedCheckInput<Resource<S>>,
+    explicit_dependencies: crate::dependency::ResolvedDependencies,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -726,8 +729,11 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
     .await?;
     let resource = normalized.into_resource();
     crate::resource::assert_resource_fully_resolved(&resource)?;
-    let resource =
-        ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
+    let resource = ResolvedResource::resolve_with_schemas_and_dependencies(
+        resource.into_provider_resource(),
+        context.schemas,
+        explicit_dependencies,
+    )?;
     Ok(ProviderReady(resource))
 }
 

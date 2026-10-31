@@ -95,7 +95,11 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
     let resources_have_no_depends_on = parsed
         .iter_all_resources()
         .all(|rref| depends_on_of(rref).is_empty());
-    if resources_have_no_depends_on {
+    let waits_have_no_depends_on = parsed
+        .wait_bindings
+        .iter()
+        .all(|wait| wait.depends_on.is_empty());
+    if resources_have_no_depends_on && waits_have_no_depends_on {
         return Vec::new();
     }
 
@@ -208,6 +212,20 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                 continue;
             }
 
+            if !matches!(
+                target,
+                ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
+            ) {
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "directives.depends_on on '{}': binding '{}' is not declared in this scope",
+                        self_name, dep_name
+                    ))
+                    .at_element(self_name, dep_name),
+                );
+                continue;
+            }
+
             if value_ref_deps.contains(dep_name.as_str()) {
                 diags.push(
                     DependsOnDiagnostic::warning(format!(
@@ -231,10 +249,104 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
         );
     }
 
-    // Cycle detection over the unioned graph (value-refs ∪ depends_on).
-    // We only reach here if at least one resource declares depends_on
-    // (early-return at top), so a cycle here is at least *touched* by
-    // depends_on — but the cycle itself may go through value refs only.
+    for wait in &parsed.wait_bindings {
+        if wait.depends_on.is_empty() {
+            continue;
+        }
+
+        let wait_name = wait.binding.as_str();
+        let target_name = wait.target.as_str();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut duplicate_warned: HashSet<&str> = HashSet::new();
+
+        for dependency in &wait.depends_on {
+            let dep_name = dependency.as_str();
+            if !seen.insert(dep_name) {
+                if duplicate_warned.insert(dep_name) {
+                    diags.push(
+                        DependsOnDiagnostic::warning(format!(
+                            "wait '{wait_name}' depends_on: binding '{dep_name}' is listed multiple times"
+                        ))
+                        .at_element(wait_name, dep_name),
+                    );
+                }
+                continue;
+            }
+
+            if dep_name == wait_name {
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "wait '{wait_name}' depends_on: self-reference is not allowed \
+                         (binding '{dep_name}' depends on itself)"
+                    ))
+                    .at_element(wait_name, dep_name),
+                );
+                continue;
+            }
+
+            if upstream_names.contains(dep_name) {
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "wait '{wait_name}' depends_on: upstream_state binding '{dep_name}' \
+                         is not a valid depends_on target"
+                    ))
+                    .at_element(wait_name, dep_name),
+                );
+                continue;
+            }
+
+            let Some(target) = bindings_by_name.get(dep_name) else {
+                if module_parameter_names.contains(dep_name) {
+                    continue;
+                }
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "wait '{wait_name}' depends_on: binding '{dep_name}' is not declared in this scope"
+                    ))
+                    .at_element(wait_name, dep_name),
+                );
+                continue;
+            };
+
+            if matches!(target, ResourceRef::DataSource(_)) {
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "wait '{wait_name}' depends_on: data sources cannot be depends_on targets \
+                         (binding '{dep_name}')"
+                    ))
+                    .at_element(wait_name, dep_name),
+                );
+                continue;
+            }
+
+            if !matches!(
+                target,
+                ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
+            ) {
+                diags.push(
+                    DependsOnDiagnostic::error(format!(
+                        "wait '{wait_name}' depends_on: binding '{dep_name}' is not declared in this scope"
+                    ))
+                    .at_element(wait_name, dep_name),
+                );
+                continue;
+            }
+
+            if dep_name == target_name {
+                diags.push(
+                    DependsOnDiagnostic::warning(format!(
+                        "wait '{wait_name}' depends_on: edge to '{dep_name}' is redundant; \
+                         '{dep_name}' is already the wait target"
+                    ))
+                    .at_element(wait_name, dep_name),
+                );
+            }
+        }
+    }
+
+    // Cycle detection over the resource graph (value-refs ∪ depends_on).
+    // A wait-only dependency does not alter this graph, so preserve the
+    // existing cycle-check boundary when no resource declares depends_on.
     // Don't claim attribution; just report the cycle.
     //
     // carina#3181: only managed resources can participate in a cycle —
@@ -243,7 +355,9 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
     // composition resources are post-apply synthetic nodes with no
     // directives. A cycle therefore lives entirely within the managed
     // slice.
-    if let Err(msg) = sort_resources_by_dependencies(&parsed.resources) {
+    if !resources_have_no_depends_on
+        && let Err(msg) = sort_resources_by_dependencies(&parsed.resources)
+    {
         diags.push(DependsOnDiagnostic::error(msg));
     }
 
@@ -280,6 +394,181 @@ mod tests {
                 .any(|m| m.contains("non_existent") && m.contains("not declared")),
             "expected 'not declared' error mentioning non_existent, got {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn wait_unknown_binding_is_diagnosed_as_error() {
+        let parsed = parse_and_resolve(
+            r#"
+                let d = mock.test.resource { name = "d" }
+                let w = wait d {
+                    until = d.comment == "x"
+                    depends_on = [nope]
+                }
+            "#,
+        )
+        .unwrap();
+
+        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        assert_eq!(
+            errors,
+            ["wait 'w' depends_on: binding 'nope' is not declared in this scope"]
+        );
+    }
+
+    #[test]
+    fn wait_self_reference_is_diagnosed_as_error() {
+        let parsed = parse_and_resolve(
+            r#"
+                let d = mock.test.resource { name = "d" }
+                let w = wait d {
+                    until = d.comment == "x"
+                    depends_on = [w]
+                }
+            "#,
+        )
+        .unwrap();
+
+        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        assert!(
+            errors.iter().any(|message| {
+                message.starts_with("wait 'w' depends_on:")
+                    && message.contains("self-reference")
+                    && message.contains("'w'")
+            }),
+            "expected wait self-reference error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn wait_duplicate_dependency_is_diagnosed_once_as_warning() {
+        let parsed = parse_and_resolve(
+            r#"
+                let gate = mock.test.resource { name = "gate" }
+                let d = mock.test.resource { name = "d" }
+                let w = wait d {
+                    until = d.comment == "x"
+                    depends_on = [gate, gate, gate]
+                }
+            "#,
+        )
+        .unwrap();
+
+        let warnings = diag_messages(&validate_depends_on(&parsed), Severity::Warning);
+        assert_eq!(
+            warnings,
+            ["wait 'w' depends_on: binding 'gate' is listed multiple times"]
+        );
+    }
+
+    #[test]
+    fn wait_target_dependency_is_diagnosed_as_redundant() {
+        let parsed = parse_and_resolve(
+            r#"
+                let d = mock.test.resource { name = "d" }
+                let w = wait d {
+                    until = d.comment == "x"
+                    depends_on = [d]
+                }
+            "#,
+        )
+        .unwrap();
+
+        let warnings = diag_messages(&validate_depends_on(&parsed), Severity::Warning);
+        assert_eq!(
+            warnings,
+            ["wait 'w' depends_on: edge to 'd' is redundant; 'd' is already the wait target"]
+        );
+    }
+
+    #[test]
+    fn wait_data_source_dependency_is_diagnosed_as_error() {
+        let parsed = parse_and_resolve(
+            r#"
+                let lookup = read mock.test.resource { name = "lookup" }
+                let d = mock.test.resource { name = "d" }
+                let w = wait d {
+                    until = d.comment == "x"
+                    depends_on = [lookup]
+                }
+            "#,
+        )
+        .unwrap();
+
+        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        assert_eq!(
+            errors,
+            ["wait 'w' depends_on: data sources cannot be depends_on targets (binding 'lookup')"]
+        );
+    }
+
+    #[test]
+    fn wait_upstream_state_dependency_is_diagnosed_as_error() {
+        let parsed = parse(
+            r#"
+                let remote = upstream_state { source = "../remote" }
+                let d = mock.test.resource { name = "d" }
+                let w = wait d {
+                    until = d.comment == "x"
+                    depends_on = [remote]
+                }
+            "#,
+            &ProviderContext::default(),
+        )
+        .unwrap();
+
+        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        assert_eq!(
+            errors,
+            [
+                "wait 'w' depends_on: upstream_state binding 'remote' is not a valid depends_on target"
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_accepts_managed_resource_and_module_parameter_dependencies() {
+        let parsed = parse_and_resolve(
+            r#"
+                arguments { gate: mock.test.resource }
+                let local = mock.test.resource { name = "local" }
+                let d = mock.test.resource { name = "d" }
+                let w = wait d {
+                    until = d.comment == "x"
+                    depends_on = [local, gate]
+                }
+            "#,
+        )
+        .unwrap();
+
+        assert!(
+            validate_depends_on(&parsed).is_empty(),
+            "managed resources and module parameters are valid wait dependencies"
+        );
+    }
+
+    #[test]
+    fn wait_binding_is_not_a_dependency_target() {
+        let parsed = parse_and_resolve(
+            r#"
+                let first_target = mock.test.resource { name = "first" }
+                let second_target = mock.test.resource { name = "second" }
+                let first = wait first_target {
+                    until = first_target.comment == "x"
+                }
+                let second = wait second_target {
+                    until = second_target.comment == "x"
+                    depends_on = [first]
+                }
+            "#,
+        )
+        .unwrap();
+
+        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        assert_eq!(
+            errors,
+            ["wait 'second' depends_on: binding 'first' is not declared in this scope"]
         );
     }
 

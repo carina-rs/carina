@@ -11185,6 +11185,44 @@ let waited = wait nonexistent {
 }
 
 #[test]
+fn lsp_flags_unknown_wait_dependency_across_sibling_files_at_dependency_anchor() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("providers.crn"),
+        "backend local { path = \"carina.state.json\" }\nprovider mock {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("resource.crn"),
+        "let d = mock.test.resource { name = \"d\" }\n",
+    )
+    .unwrap();
+    let source = r#"let w = wait d {
+  until = d.comment == "x"
+  depends_on = [nope]
+}
+"#;
+    let path = fixture.path().join("wait.crn");
+    std::fs::write(&path, source).unwrap();
+
+    let diagnostics =
+        coalesce_resource_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.message
+                == "wait 'w' depends_on: binding 'nope' is not declared in this scope"
+        })
+        .unwrap_or_else(|| panic!("missing wait depends_on diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(2, 16), Position::new(2, 20))
+    );
+}
+
+#[test]
 fn lsp_rejects_sibling_data_source_wait_target_at_target_anchor() {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("providers.crn"), "provider aws {}\n").unwrap();

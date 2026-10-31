@@ -266,13 +266,17 @@ impl<S> DataSource<S> {
     deserialize = "S: Deserialize<'de>"
 ))]
 #[serde(try_from = "DataSource<S>", into = "DataSource<S>")]
-pub struct ResolvedDataSource<S = ModuleSource>(DataSource<S>);
+pub struct ResolvedDataSource<S = ModuleSource> {
+    inner: DataSource<S>,
+    explicit_dependencies: crate::dependency::ResolvedDependencies,
+}
 
 pub type SavedResolvedDataSource = ResolvedDataSource<SavedModuleSource>;
 
 impl From<ResolvedDataSource> for SavedResolvedDataSource {
     fn from(resource: ResolvedDataSource) -> Self {
-        Self::new(resource.into_inner().into())
+        let (resource, explicit_dependencies) = resource.into_parts();
+        Self::from_resolved_parts(resource.into(), explicit_dependencies)
     }
 }
 
@@ -286,29 +290,91 @@ impl<S> ResolvedDataSource<S> {
             ),
             "ResolvedDataSource requires identity"
         );
-        Self(resource)
+        assert!(
+            resource.directives.depends_on.is_empty(),
+            "ResolvedDataSource with depends_on requires dependency resolution"
+        );
+        Self::from_resolved_parts(resource, crate::dependency::ResolvedDependencies::empty())
+    }
+
+    fn from_resolved_parts(
+        resource: DataSource<S>,
+        explicit_dependencies: crate::dependency::ResolvedDependencies,
+    ) -> Self {
+        Self {
+            inner: resource,
+            explicit_dependencies,
+        }
+    }
+
+    pub fn new_with_dependencies(
+        resource: DataSource<S>,
+        explicit_dependencies: crate::dependency::ResolvedDependencies,
+    ) -> Result<Self, crate::dependency::DependencyResolutionError> {
+        let owner = format!(
+            "directives.depends_on on '{}'",
+            resource.binding.as_deref().unwrap_or("(anonymous)")
+        );
+        let authored = resource
+            .directives
+            .depends_on
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if authored != explicit_dependencies.names() {
+            return Err(crate::dependency::DependencyResolutionError::MetadataMismatch { owner });
+        }
+        if matches!(
+            resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) {
+            return Err(
+                crate::dependency::DependencyResolutionError::PendingTargetIdentity {
+                    binding: resource
+                        .binding
+                        .clone()
+                        .unwrap_or_else(|| resource.id.to_string()),
+                },
+            );
+        }
+        Ok(Self::from_resolved_parts(resource, explicit_dependencies))
     }
 
     /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(resource: DataSource<S>) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
-            ResourceIdentityState::Resolved(_) => Some(Self(resource)),
+            ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
         }
     }
 
     /// Borrow the inner [`DataSource`].
     pub fn as_inner(&self) -> &DataSource<S> {
-        &self.0
+        &self.inner
     }
 
     /// Consume and return the inner [`DataSource`].
     pub fn into_inner(self) -> DataSource<S> {
-        self.0
+        self.inner
+    }
+
+    pub fn into_parts(self) -> (DataSource<S>, crate::dependency::ResolvedDependencies) {
+        (self.inner, self.explicit_dependencies)
+    }
+
+    pub fn explicit_dependencies(&self) -> &crate::dependency::ResolvedDependencies {
+        &self.explicit_dependencies
+    }
+
+    /// Rewrap an attribute-transformed data source without discarding the
+    /// resolver evidence carried by this value.
+    pub(crate) fn with_transformed_inner(&self, resource: DataSource<S>) -> Self {
+        Self::new_with_dependencies(resource, self.explicit_dependencies.clone())
+            .expect("a transformed resolved data source must preserve identity and depends_on")
     }
 
     pub fn identity(&self) -> &ResourceIdentity {
-        match self.0.id.identity_state() {
+        match self.inner.id.identity_state() {
             ResourceIdentityState::Pending(_) => {
                 unreachable!("ResolvedDataSource requires identity")
             }
@@ -325,13 +391,13 @@ impl<S> Deref for ResolvedDataSource<S> {
     type Target = DataSource<S>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl<S> From<ResolvedDataSource<S>> for DataSource<S> {
     fn from(resource: ResolvedDataSource<S>) -> Self {
-        resource.0
+        resource.inner
     }
 }
 
@@ -339,6 +405,9 @@ impl<S> TryFrom<DataSource<S>> for ResolvedDataSource<S> {
     type Error = String;
 
     fn try_from(resource: DataSource<S>) -> Result<Self, Self::Error> {
+        if !resource.directives.depends_on.is_empty() {
+            return Err("depends_on requires dependency resolution".to_string());
+        }
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
     }
 }

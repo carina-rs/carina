@@ -9,8 +9,8 @@ use carina_core::provider::{
     AppliedIdentifier, PersistedAttributes, Provider, ProviderRouter, ReadRequest,
 };
 use carina_core::resource::{
-    Current, DataSource, ResolvedResourceId, Resource, ResourceId, SavedComposition,
-    SavedDataSource, SavedResource, State, Value,
+    Current, DataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+    SavedComposition, SavedDataSource, SavedModuleSource, SavedResource, State, Value,
 };
 use carina_state::{ResourceState, StateFile};
 
@@ -714,8 +714,13 @@ impl ValidatedDesiredPlan {
         self.plan.provider_configs()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
-        self.plan.sorted_resources()
+    pub(super) fn resolved_sorted_resources(
+        &self,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<Vec<ResolvedResource<SavedModuleSource>>, AppError> {
+        self.plan
+            .resolved_sorted_resources(schemas)
+            .map_err(Into::into)
     }
 
     pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
@@ -776,8 +781,11 @@ impl ScopeCheckedDesiredPlan {
         self.plan.context()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
-        self.plan.sorted_resources()
+    pub(super) fn resolved_sorted_resources(
+        &self,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<Vec<ResolvedResource<SavedModuleSource>>, AppError> {
+        self.plan.resolved_sorted_resources(schemas)
     }
 
     pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {
@@ -861,10 +869,18 @@ impl DesiredPlanFile {
         }
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+    fn resolved_sorted_resources(
+        &self,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<
+        Vec<ResolvedResource<SavedModuleSource>>,
+        carina_core::resource::ResolvedResourceError,
+    > {
         match self {
-            Self::Verified(plan) => plan.sorted_resources(),
-            Self::NeedsHistoricalVerification(plan) => plan.sorted_resources(),
+            Self::Verified(plan) => plan.plan_file.resolved_sorted_resources(schemas),
+            Self::NeedsHistoricalVerification(plan) => {
+                plan.plan_file.resolved_sorted_resources(schemas)
+            }
         }
     }
 
@@ -924,10 +940,6 @@ pub(super) struct DesiredVerifiedPlanFile {
 impl DesiredVerifiedPlanFile {
     pub(super) fn provider_configs(&self) -> &SavedProviderConfigs {
         self.plan_file.provider_configs()
-    }
-
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
-        self.plan_file.sorted_resources()
     }
 
     pub(super) fn current_states(&self) -> &[ReloadedCurrentStateEntry] {

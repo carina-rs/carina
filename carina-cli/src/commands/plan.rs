@@ -3100,6 +3100,7 @@ pub(crate) struct ReloadedPlanFile {
     contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    sorted_resource_dependencies: Vec<carina_core::dependency::ResolvedDependencies>,
 }
 
 #[derive(Debug)]
@@ -3159,15 +3160,36 @@ impl UnresolvedReloadedPlanFile {
             upstream_sources,
             wait_bindings,
         } = contents;
+        let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+            &sorted_resources,
+            &data_sources,
+            upstream_sources
+                .iter()
+                .map(|upstream| upstream.binding.clone()),
+        )?;
         let resolve_resources = |resources: Vec<SavedResource>| {
-            resources
-                .into_iter()
-                .map(|resource| {
-                    carina_core::resource::ResolvedResource::resolve_with_schemas(resource, schemas)
-                        .map(carina_core::resource::ResolvedResource::into_inner)
-                })
-                .collect::<Result<Vec<_>, _>>()
+            let mut resolved_resources = Vec::with_capacity(resources.len());
+            let mut resolved_dependencies = Vec::with_capacity(resources.len());
+            for resource in resources {
+                let dependencies = dependency_scope.resolve_resource(&resource)?;
+                let resource =
+                    carina_core::resource::ResolvedResource::resolve_with_schemas_and_dependencies(
+                        resource,
+                        schemas,
+                        dependencies.clone(),
+                    )?
+                    .into_inner();
+                resolved_resources.push(resource);
+                resolved_dependencies.push(dependencies);
+            }
+            Ok::<_, carina_core::resource::ResolvedResourceError>((
+                resolved_resources,
+                resolved_dependencies,
+            ))
         };
+        let (sorted_resources, sorted_resource_dependencies) = resolve_resources(sorted_resources)?;
+        let (unresolved_resources, _unresolved_resource_dependencies) =
+            resolve_resources(unresolved_resources)?;
         let contents = PlanFileContents {
             version,
             carina_version,
@@ -3177,9 +3199,9 @@ impl UnresolvedReloadedPlanFile {
             state_serial,
             provider_configs,
             backend_config,
-            plan: plan.resolve_with_schemas(schemas)?,
-            sorted_resources: resolve_resources(sorted_resources)?,
-            unresolved_resources: resolve_resources(unresolved_resources)?,
+            plan: plan.resolve_with_schemas_and_dependencies(schemas, &dependency_scope)?,
+            sorted_resources,
+            unresolved_resources,
             compositions,
             data_sources,
             data_source_origins,
@@ -3193,6 +3215,7 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            sorted_resource_dependencies,
         })
     }
 }
@@ -3231,6 +3254,20 @@ impl ReloadedPlanFile {
 
     pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<SavedResource> {
         &mut self.contents.sorted_resources
+    }
+
+    pub(crate) fn resolved_sorted_resources(
+        &self,
+        schemas: &carina_core::schema::SchemaRegistry,
+    ) -> Result<
+        Vec<carina_core::resource::ResolvedResource<SavedModuleSource>>,
+        carina_core::resource::ResolvedResourceError,
+    > {
+        carina_core::resource::ResolvedResource::collect_resolved_with_schemas_and_dependencies(
+            self.contents.sorted_resources.iter().cloned(),
+            self.sorted_resource_dependencies.iter().cloned(),
+            schemas,
+        )
     }
 
     pub(crate) fn unresolved_resources(&self) -> &[SavedResource] {

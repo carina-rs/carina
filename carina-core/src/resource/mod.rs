@@ -795,13 +795,17 @@ impl Borrow<ResourceId> for ResolvedResourceId {
     deserialize = "S: Deserialize<'de>"
 ))]
 #[serde(try_from = "Resource<S>", into = "Resource<S>")]
-pub struct ResolvedResource<S = ModuleSource>(Resource<S>);
+pub struct ResolvedResource<S = ModuleSource> {
+    inner: Resource<S>,
+    explicit_dependencies: crate::dependency::ResolvedDependencies,
+}
 
 pub type SavedResolvedResource = ResolvedResource<SavedModuleSource>;
 
 impl From<ResolvedResource> for SavedResolvedResource {
     fn from(resource: ResolvedResource) -> Self {
-        Self::new(resource.into_inner().into())
+        let (resource, explicit_dependencies) = resource.into_parts();
+        Self::from_resolved_parts(resource.into(), explicit_dependencies)
     }
 }
 
@@ -817,6 +821,7 @@ pub struct PendingResourceIdentityError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedResourceError {
     PendingIdentity(PendingResourceIdentityError),
+    Dependency(crate::dependency::DependencyResolutionError),
     MissingSchema {
         id: ResourceId,
     },
@@ -824,12 +829,19 @@ pub enum ResolvedResourceError {
         id: ResourceId,
         errors: Vec<IgnoreChangeError>,
     },
+    UnresolvedDependencies {
+        id: ResourceId,
+    },
+    DependencyMetadataMismatch {
+        id: ResourceId,
+    },
 }
 
 impl Display for ResolvedResourceError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::PendingIdentity(error) => Display::fmt(error, formatter),
+            Self::Dependency(error) => Display::fmt(error, formatter),
             Self::MissingSchema { id } => write!(
                 formatter,
                 "resource '{id}' has ignore_changes paths but no managed resource schema"
@@ -844,6 +856,14 @@ impl Display for ResolvedResourceError {
                 }
                 Ok(())
             }
+            Self::UnresolvedDependencies { id } => write!(
+                formatter,
+                "resource '{id}' has explicit dependency names that have not been resolved"
+            ),
+            Self::DependencyMetadataMismatch { id } => write!(
+                formatter,
+                "resource '{id}' has resolved dependencies that do not match its authored depends_on"
+            ),
         }
     }
 }
@@ -852,7 +872,11 @@ impl std::error::Error for ResolvedResourceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PendingIdentity(error) => Some(error),
-            Self::MissingSchema { .. } | Self::InvalidIgnoreChanges { .. } => None,
+            Self::Dependency(error) => Some(error),
+            Self::MissingSchema { .. }
+            | Self::InvalidIgnoreChanges { .. }
+            | Self::UnresolvedDependencies { .. }
+            | Self::DependencyMetadataMismatch { .. } => None,
         }
     }
 }
@@ -860,6 +884,12 @@ impl std::error::Error for ResolvedResourceError {
 impl From<PendingResourceIdentityError> for ResolvedResourceError {
     fn from(error: PendingResourceIdentityError) -> Self {
         Self::PendingIdentity(error)
+    }
+}
+
+impl From<crate::dependency::DependencyResolutionError> for ResolvedResourceError {
+    fn from(error: crate::dependency::DependencyResolutionError) -> Self {
+        Self::Dependency(error)
     }
 }
 
@@ -897,7 +927,10 @@ pub(crate) fn resolve_resource_ignore_changes<S>(
 impl ResolvedResource {
     /// Construct a resource from an already-resolved id.
     pub fn from_id(id: ResolvedResourceId) -> Self {
-        Self(Resource::from_id(id.into_inner()))
+        Self::from_resolved_parts(
+            Resource::from_id(id.into_inner()),
+            crate::dependency::ResolvedDependencies::empty(),
+        )
     }
 }
 
@@ -919,7 +952,52 @@ impl<S> ResolvedResource<S> {
             resolved_ignore_changes_match(&resource),
             "ResolvedResource with ignore_changes requires schema resolution"
         );
-        Self(resource)
+        assert!(
+            resource.directives.depends_on.is_empty(),
+            "ResolvedResource with depends_on requires dependency resolution"
+        );
+        Self::from_resolved_parts(resource, crate::dependency::ResolvedDependencies::empty())
+    }
+
+    /// Rewrap an already schema-resolved resource while preserving dependency
+    /// evidence obtained from the resolver.
+    pub fn new_with_dependencies(
+        resource: Resource<S>,
+        explicit_dependencies: crate::dependency::ResolvedDependencies,
+    ) -> Self {
+        assert!(
+            matches!(
+                resource.id.identity_state(),
+                ResourceIdentityState::Resolved(_)
+            ),
+            "ResolvedResource requires identity"
+        );
+        assert!(
+            resolved_ignore_changes_match(&resource),
+            "ResolvedResource with ignore_changes requires schema resolution"
+        );
+        let authored = resource
+            .directives
+            .depends_on
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            authored,
+            explicit_dependencies.names(),
+            "ResolvedResource dependency metadata must match depends_on"
+        );
+        Self::from_resolved_parts(resource, explicit_dependencies)
+    }
+
+    fn from_resolved_parts(
+        resource: Resource<S>,
+        explicit_dependencies: crate::dependency::ResolvedDependencies,
+    ) -> Self {
+        Self {
+            inner: resource,
+            explicit_dependencies,
+        }
     }
 
     /// Try to construct; returns `None` if identity is pending.
@@ -958,6 +1036,31 @@ impl<S> ResolvedResource<S> {
             .collect()
     }
 
+    /// Convert resources after explicit dependency names have been resolved
+    /// against the exact planning scope.
+    pub fn collect_resolved_with_schemas_and_dependencies(
+        resources: impl IntoIterator<Item = Resource<S>>,
+        dependencies: impl IntoIterator<Item = crate::dependency::ResolvedDependencies>,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<Vec<Self>, ResolvedResourceError> {
+        let resources = resources.into_iter().collect::<Vec<_>>();
+        let dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        if resources.len() != dependencies.len() {
+            let id = resources
+                .first()
+                .map(|resource| resource.id.clone())
+                .unwrap_or_else(|| ResourceId::pending("dependency-metadata"));
+            return Err(ResolvedResourceError::DependencyMetadataMismatch { id });
+        }
+        resources
+            .into_iter()
+            .zip(dependencies)
+            .map(|(resource, dependencies)| {
+                Self::resolve_with_schemas_and_dependencies(resource, registry, dependencies)
+            })
+            .collect()
+    }
+
     pub fn resolve_with_schemas(
         mut resource: Resource<S>,
         registry: &crate::schema::SchemaRegistry,
@@ -971,13 +1074,50 @@ impl<S> ResolvedResource<S> {
             }
             .into());
         }
+        if !resource.directives.depends_on.is_empty() {
+            return Err(ResolvedResourceError::UnresolvedDependencies {
+                id: resource.id.clone(),
+            });
+        }
         resolve_resource_ignore_changes(&mut resource, registry)?;
-        Ok(Self(resource))
+        Ok(Self::from_resolved_parts(
+            resource,
+            crate::dependency::ResolvedDependencies::empty(),
+        ))
+    }
+
+    pub fn resolve_with_schemas_and_dependencies(
+        mut resource: Resource<S>,
+        registry: &crate::schema::SchemaRegistry,
+        explicit_dependencies: crate::dependency::ResolvedDependencies,
+    ) -> Result<Self, ResolvedResourceError> {
+        if matches!(
+            resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) {
+            return Err(PendingResourceIdentityError {
+                id: resource.id.clone(),
+            }
+            .into());
+        }
+        let authored = resource
+            .directives
+            .depends_on
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if authored != explicit_dependencies.names() {
+            return Err(ResolvedResourceError::DependencyMetadataMismatch {
+                id: resource.id.clone(),
+            });
+        }
+        resolve_resource_ignore_changes(&mut resource, registry)?;
+        Ok(Self::from_resolved_parts(resource, explicit_dependencies))
     }
 
     /// Borrow the inner [`Resource`].
     pub fn as_inner(&self) -> &Resource<S> {
-        &self.0
+        &self.inner
     }
 
     /// Borrow the underlying resource for provider-boundary consumers.
@@ -987,11 +1127,25 @@ impl<S> ResolvedResource<S> {
 
     /// Consume and return the inner [`Resource`].
     pub fn into_inner(self) -> Resource<S> {
-        self.0
+        self.inner
+    }
+
+    pub fn into_parts(self) -> (Resource<S>, crate::dependency::ResolvedDependencies) {
+        (self.inner, self.explicit_dependencies)
+    }
+
+    pub fn explicit_dependencies(&self) -> &crate::dependency::ResolvedDependencies {
+        &self.explicit_dependencies
+    }
+
+    /// Rewrap an attribute-transformed resource without discarding the
+    /// resolver evidence carried by this value.
+    pub(crate) fn with_transformed_inner(&self, resource: Resource<S>) -> Self {
+        Self::new_with_dependencies(resource, self.explicit_dependencies.clone())
     }
 
     pub fn identity(&self) -> &ResourceIdentity {
-        match self.0.id.identity_state() {
+        match self.inner.id.identity_state() {
             ResourceIdentityState::Pending(_) => {
                 unreachable!("ResolvedResource requires identity")
             }
@@ -1004,16 +1158,16 @@ impl<S> ResolvedResource<S> {
     }
 
     pub fn resolved_id(&self) -> ResolvedResourceId {
-        ResolvedResourceId(self.0.id.clone())
+        ResolvedResourceId(self.inner.id.clone())
     }
 
     pub fn ignore_changes(&self) -> &ResolvedIgnoreChanges {
-        &self.0.resolved_ignore_changes
+        &self.inner.resolved_ignore_changes
     }
 
     /// Set an attribute without weakening the resolved-identity invariant.
     pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
-        self.0.attributes.insert(key.into(), value);
+        self.inner.attributes.insert(key.into(), value);
     }
 }
 
@@ -1021,13 +1175,13 @@ impl<S> Deref for ResolvedResource<S> {
     type Target = Resource<S>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl<S> From<ResolvedResource<S>> for Resource<S> {
     fn from(resource: ResolvedResource<S>) -> Self {
-        resource.0
+        resource.inner
     }
 }
 
@@ -1037,6 +1191,9 @@ impl<S> TryFrom<Resource<S>> for ResolvedResource<S> {
     fn try_from(resource: Resource<S>) -> Result<Self, Self::Error> {
         if !resolved_ignore_changes_match(&resource) {
             return Err("ignore_changes requires schema resolution".to_string());
+        }
+        if !resource.directives.depends_on.is_empty() {
+            return Err("depends_on requires dependency resolution".to_string());
         }
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
     }

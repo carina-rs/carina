@@ -2783,7 +2783,10 @@ fn snapshot_deferred_for_with_dependent_wait() {
                     .directives
                     .depends_on
                     .push("validation_records".to_string());
-                Effect::Create(resolved(resource))
+                Effect::Create(ResolvedResource::new_with_dependencies(
+                    resource,
+                    ["validation_records".to_string()].into_iter().collect(),
+                ))
             }
             effect => effect,
         };

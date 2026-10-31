@@ -352,6 +352,51 @@ pub(super) async fn execute_effects_sequential<
         .provider_check_inputs
         .resource_origins()
         .unwrap_or(&empty_resource_origins);
+    let mut dependency_resources = resource_origins
+        .values()
+        .map(|resource| resource.as_resource().clone())
+        .map(|resource| (resource.id.clone(), resource))
+        .collect::<HashMap<_, _>>();
+    let mut dependency_data_sources = input
+        .provider_check_inputs
+        .data_source_origins()
+        .unwrap_or_default()
+        .iter()
+        .cloned()
+        .map(|resource| (resource.id.clone(), resource))
+        .collect::<HashMap<_, _>>();
+    for effect in &effects {
+        match effect {
+            Effect::Read { resource } => {
+                dependency_data_sources
+                    .entry(resource.id.clone())
+                    .or_insert_with(|| resource.as_inner().clone());
+            }
+            Effect::Create(resource)
+            | Effect::ResumeCreate { resource, .. }
+            | Effect::Update { to: resource, .. } => {
+                dependency_resources
+                    .entry(resource.id.clone())
+                    .or_insert_with(|| resource.as_inner().clone());
+            }
+            Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => {}
+        }
+    }
+    let dependency_resources = dependency_resources.into_values().collect::<Vec<_>>();
+    let dependency_data_sources = dependency_data_sources.into_values().collect::<Vec<_>>();
+    let dependency_scope = crate::dependency::ResolvedDependencyScope::from_resources(
+        &dependency_resources,
+        &dependency_data_sources,
+        std::iter::empty(),
+    )
+    .expect("planned dependency targets must retain resolved identities");
     let mut desired_ids = resource_origins.keys().cloned().collect::<HashSet<_>>();
     for effect in &effects {
         if matches!(
@@ -559,6 +604,7 @@ pub(super) async fn execute_effects_sequential<
                     provider_configs: input.provider_configs,
                     factories: input.factories,
                     schemas: input.schemas,
+                    dependency_scope: &dependency_scope,
                 },
             };
             match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
@@ -1477,7 +1523,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         });
         plan.add(Effect::Create(resolved(alb.clone())));
 
@@ -1588,7 +1634,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_millis(1),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         });
         plan.add(Effect::Create(resolved(alb.clone())));
         plan.add(Effect::Create(resolved(listener.clone())));
@@ -1747,15 +1793,26 @@ mod tests {
     #[test]
     fn keep_update_update_edge_when_known_read_also_has_depends_on_unknown() {
         let parent = update_effect("parent", &[], &["tags"]);
+        let parent_resource = match &parent {
+            Effect::Update { to, .. } => to.as_inner().clone(),
+            _ => unreachable!(),
+        };
         let mut child = match update_effect("child", &[("parent", "id")], &["name"]) {
             Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
         child.directives.depends_on.push("parent".to_string());
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            &[parent_resource, child.clone()],
+            &[] as &[crate::resource::DataSource],
+            std::iter::empty(),
+        )
+        .unwrap();
+        let dependencies = scope.resolve_resource(&child).unwrap();
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),
             from: Box::new(state_for(&child.id)),
-            to: resolved(child),
+            to: ResolvedResource::new_with_dependencies(child, dependencies),
             changed_attributes: vec!["name".to_string()],
         };
 

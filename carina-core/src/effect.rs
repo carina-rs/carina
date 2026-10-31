@@ -16,15 +16,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::dependency::{ResolvedDependencies, ResolvedDependencyScope, ResolvedDependencyTarget};
 use crate::non_empty::NonEmptyVec;
 use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
 #[cfg(test)]
-use crate::resource::{DataSource, DeferredValue};
+use crate::resource::DeferredValue;
 use crate::resource::{
-    DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, SavedModuleSource, State, Value,
-    resolve_resource_ignore_changes,
+    DataSource, DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
+    SavedModuleSource, State, Value, resolve_resource_ignore_changes,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -50,6 +51,9 @@ pub enum PlanOp {
 pub enum ScheduleEdge {
     /// This effect must wait for the resource identity to complete.
     DependsOn(ResourceIdentity),
+    /// This optional edge came from a dependency name that was already
+    /// resolved against the managed binding scope.
+    ResolvedDependsOn(ResolvedDependencyTarget),
     /// This effect must wait for the resource identity to complete, and the
     /// plan is invalid if no current effect owns that identity.
     RequiredDependsOn(ResourceIdentity),
@@ -766,7 +770,7 @@ pub enum EffectWithSource<S> {
         /// resource — extra ordering edges that aren't expressed via
         /// value references.
         #[serde(default)]
-        explicit_dependencies: HashSet<String>,
+        explicit_dependencies: ResolvedDependencies,
     },
 
     /// Re-expand a `for opt in <upstream>.<collection> { ... }`
@@ -796,7 +800,7 @@ pub type SavedEffect = EffectWithSource<SavedModuleSource>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UnresolvedSavedEffect {
     Read {
-        resource: ResolvedDataSource<SavedModuleSource>,
+        resource: DataSource<SavedModuleSource>,
     },
     Create(Resource<SavedModuleSource>),
     ResumeCreate {
@@ -866,7 +870,9 @@ pub enum UnresolvedSavedEffect {
 impl From<SavedEffect> for UnresolvedSavedEffect {
     fn from(effect: SavedEffect) -> Self {
         match effect {
-            Effect::Read { resource } => Self::Read { resource },
+            Effect::Read { resource } => Self::Read {
+                resource: resource.into_inner(),
+            },
             Effect::Create(resource) => Self::Create(resource.into_inner()),
             Effect::ResumeCreate {
                 resource,
@@ -934,7 +940,7 @@ impl From<SavedEffect> for UnresolvedSavedEffect {
                 until_surface,
                 timeout,
                 interval,
-                explicit_dependencies,
+                explicit_dependencies: explicit_dependencies.names(),
             },
             Effect::DeferredCreate { id, template } => Self::DeferredCreate { id, template },
             Effect::DeferredReplace(payload) => Self::DeferredReplace(payload),
@@ -997,16 +1003,46 @@ impl UnresolvedSavedEffect {
         self,
         schemas: &crate::schema::SchemaRegistry,
     ) -> Result<SavedEffect, crate::resource::ResolvedResourceError> {
+        let scope = ResolvedDependencyScope::from_resources(
+            &[] as &[Resource<SavedModuleSource>],
+            &[] as &[DataSource<SavedModuleSource>],
+            std::iter::empty(),
+        )?;
+        self.resolve_with_schemas_and_dependencies(schemas, &scope)
+    }
+
+    pub fn resolve_with_schemas_and_dependencies(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+        dependency_scope: &ResolvedDependencyScope,
+    ) -> Result<SavedEffect, crate::resource::ResolvedResourceError> {
         Ok(match self {
-            Self::Read { resource } => Effect::Read { resource },
+            Self::Read { resource } => {
+                let dependencies = dependency_scope.resolve_data_source(&resource)?;
+                Effect::Read {
+                    resource: ResolvedDataSource::new_with_dependencies(resource, dependencies)?,
+                }
+            }
             Self::Create(resource) => {
-                Effect::Create(ResolvedResource::resolve_with_schemas(resource, schemas)?)
+                let dependencies = dependency_scope.resolve_resource(&resource)?;
+                Effect::Create(ResolvedResource::resolve_with_schemas_and_dependencies(
+                    resource,
+                    schemas,
+                    dependencies,
+                )?)
             }
             Self::ResumeCreate {
                 resource,
                 started_at,
             } => Effect::ResumeCreate {
-                resource: ResolvedResource::resolve_with_schemas(resource, schemas)?,
+                resource: {
+                    let dependencies = dependency_scope.resolve_resource(&resource)?;
+                    ResolvedResource::resolve_with_schemas_and_dependencies(
+                        resource,
+                        schemas,
+                        dependencies,
+                    )?
+                },
                 started_at,
             },
             Self::Update {
@@ -1017,7 +1053,14 @@ impl UnresolvedSavedEffect {
             } => Effect::Update {
                 from,
                 identifier,
-                to: ResolvedResource::resolve_with_schemas(to, schemas)?,
+                to: {
+                    let dependencies = dependency_scope.resolve_resource(&to)?;
+                    ResolvedResource::resolve_with_schemas_and_dependencies(
+                        to,
+                        schemas,
+                        dependencies,
+                    )?
+                },
                 changed_attributes,
             },
             Self::Delete {
@@ -1061,15 +1104,22 @@ impl UnresolvedSavedEffect {
                 timeout,
                 interval,
                 explicit_dependencies,
-            } => Effect::Wait {
-                identity,
-                target_id,
-                until,
-                until_surface,
-                timeout,
-                interval,
-                explicit_dependencies,
-            },
+            } => {
+                let explicit_dependencies = dependency_scope.resolve_persisted_wait(
+                    &identity,
+                    target_id.id().identity(),
+                    explicit_dependencies,
+                )?;
+                Effect::Wait {
+                    identity,
+                    target_id,
+                    until,
+                    until_surface,
+                    timeout,
+                    interval,
+                    explicit_dependencies,
+                }
+            }
             Self::DeferredCreate { id, mut template } => {
                 resolve_resource_ignore_changes(&mut template.template_resource, schemas)?;
                 Effect::DeferredCreate { id, template }
@@ -1490,7 +1540,7 @@ impl EffectWithSource<ModuleSource> {
                     until_surface: "status == 'ready'".to_string(),
                     timeout: Duration::from_secs(60),
                     interval: Duration::from_secs(1),
-                    explicit_dependencies: HashSet::new(),
+                    explicit_dependencies: Default::default(),
                 },
                 Effect::Wait { .. }
             ),
@@ -1964,12 +2014,10 @@ impl<S> EffectWithSource<S> {
     /// they are scheduling primitives, not resource-state operations.
     pub fn explicit_dependencies(&self) -> HashSet<String> {
         match self {
-            Effect::Read { resource } => resource.directives.depends_on.iter().cloned().collect(),
-            Effect::Create(resource) => resource.directives.depends_on.iter().cloned().collect(),
-            Effect::ResumeCreate { resource, .. } => {
-                resource.directives.depends_on.iter().cloned().collect()
-            }
-            Effect::Update { to, .. } => to.directives.depends_on.iter().cloned().collect(),
+            Effect::Read { resource } => resource.explicit_dependencies().names(),
+            Effect::Create(resource) => resource.explicit_dependencies().names(),
+            Effect::ResumeCreate { resource, .. } => resource.explicit_dependencies().names(),
+            Effect::Update { to, .. } => to.explicit_dependencies().names(),
             Effect::Delete {
                 explicit_dependencies,
                 ..
@@ -1981,11 +2029,35 @@ impl<S> EffectWithSource<S> {
             Effect::Wait {
                 explicit_dependencies,
                 ..
-            } => explicit_dependencies.clone(),
+            } => explicit_dependencies.names(),
             Effect::DeferredCreate { .. } => HashSet::new(),
             Effect::DeferredReplace(payload) => {
                 deferred_replace_delete_explicit_dependencies(&payload.deletes)
             }
+        }
+    }
+
+    /// Resolved live explicit dependencies, if this effect carries them.
+    /// Historical delete metadata is intentionally excluded: it remains a
+    /// separately named best-effort path because its declaring configuration
+    /// no longer exists.
+    pub fn resolved_explicit_dependencies(&self) -> Option<&ResolvedDependencies> {
+        match self {
+            Effect::Read { resource } => Some(resource.explicit_dependencies()),
+            Effect::Create(resource) => Some(resource.explicit_dependencies()),
+            Effect::ResumeCreate { resource, .. } => Some(resource.explicit_dependencies()),
+            Effect::Update { to, .. } => Some(to.explicit_dependencies()),
+            Effect::Wait {
+                explicit_dependencies,
+                ..
+            } => Some(explicit_dependencies),
+            Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         }
     }
 
@@ -2013,7 +2085,7 @@ impl<S> EffectWithSource<S> {
                     explicit_dependencies
                         .iter()
                         .filter(|dep| dep.as_str() != target_binding)
-                        .cloned()
+                        .map(|dep| dep.as_str().to_string())
                         .collect::<BTreeSet<_>>(),
                 );
                 out
@@ -2071,13 +2143,26 @@ impl<S> EffectWithSource<S> {
                 );
                 edges
             }
-            Effect::Wait { .. } | Effect::DeferredCreate { .. } | Effect::DeferredReplace(_) => {
-                self.blocking_bindings()
-                    .into_iter()
-                    .map(ResourceIdentity::new)
-                    .map(ScheduleEdge::DependsOn)
-                    .collect()
+            Effect::Wait {
+                target_id,
+                explicit_dependencies,
+                ..
+            } => {
+                let mut edges = vec![ScheduleEdge::DependsOn(target_id.id().identity().clone())];
+                edges.extend(
+                    explicit_dependencies
+                        .iter()
+                        .cloned()
+                        .map(ScheduleEdge::ResolvedDependsOn),
+                );
+                edges
             }
+            Effect::DeferredCreate { .. } | Effect::DeferredReplace(_) => self
+                .blocking_bindings()
+                .into_iter()
+                .map(ResourceIdentity::new)
+                .map(ScheduleEdge::DependsOn)
+                .collect(),
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -2401,7 +2486,7 @@ mod tests {
                     until_surface: "status == 'ready'".to_string(),
                     timeout: Duration::from_secs(60),
                     interval: Duration::from_secs(1),
-                    explicit_dependencies: HashSet::new(),
+                    explicit_dependencies: Default::default(),
                 },
             ),
             ("DeferredCreate", deferred_create_effect()),
@@ -2878,11 +2963,26 @@ mod tests {
     fn explicit_dependencies_derived_from_resource_directives() {
         use crate::resource::Directives;
         let mut bucket = Resource::new("s3.Bucket", "b");
+        bucket.binding = Some("bucket".to_string());
         bucket.directives = Directives {
             depends_on: vec!["role".to_string(), "kms".to_string()],
             ..Directives::default()
         };
-        let create = Effect::Create(ResolvedResource::new(bucket.clone()));
+        let resources = vec![
+            bucket.clone(),
+            Resource::new("iam.Role", "role").with_binding("role"),
+            Resource::new("kms.Key", "kms").with_binding("kms"),
+        ];
+        let scope = ResolvedDependencyScope::from_resources(
+            &resources,
+            &[] as &[DataSource],
+            std::iter::empty(),
+        )
+        .unwrap();
+        let create = Effect::Create(ResolvedResource::new_with_dependencies(
+            bucket.clone(),
+            scope.resolve_resource(&bucket).unwrap(),
+        ));
         let got = create.explicit_dependencies();
         assert!(got.contains("role") && got.contains("kms"), "got {:?}", got);
     }
@@ -2993,7 +3093,7 @@ mod tests {
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
             interval: Duration::from_secs(5),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
     }
 
@@ -3017,7 +3117,7 @@ mod tests {
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
         assert_eq!(e.binding_name(), Some("cert_issued".to_string()));
     }
@@ -3042,7 +3142,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
         assert!(!e.is_mutating());
         assert_eq!(e.kind(), "wait");
@@ -3067,7 +3167,7 @@ mod tests {
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(4500),
             interval: Duration::from_secs(5),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         // Duration must round-trip as plain integer seconds (matches the
@@ -3170,7 +3270,7 @@ mod tests {
             until_surface: "status == 'ready'".to_string(),
             timeout: std::time::Duration::from_secs(60),
             interval: std::time::Duration::from_secs(1),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
         for (label, e) in [
             ("Read", read),
@@ -3184,5 +3284,46 @@ mod tests {
                 "{label} must not narrow to BasicEffect"
             );
         }
+    }
+
+    #[test]
+    fn saved_wait_dependency_names_keep_the_wire_shape_and_resolve_on_load() {
+        let mut target = Resource::new("mock.test.Resource", "target");
+        target.binding = Some("target".to_string());
+        let target_id = fixture_managed_wait_target(target.id.clone());
+        let unresolved = UnresolvedSavedEffect::Wait {
+            identity: ResourceIdentity::new("w"),
+            target_id,
+            until: WaitPredicate::equals(
+                crate::wait::predicate::AttrPath::single("status"),
+                Value::Concrete(ConcreteValue::String("ready".into())),
+            )
+            .unwrap(),
+            until_surface: "target.status == ready".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_secs(5),
+            explicit_dependencies: HashSet::from(["nope".to_string()]),
+        };
+        let json = serde_json::to_value(&unresolved).unwrap();
+        assert_eq!(
+            json["Wait"]["explicit_dependencies"],
+            serde_json::json!(["nope"])
+        );
+        let decoded: UnresolvedSavedEffect = serde_json::from_value(json).unwrap();
+        let scope = ResolvedDependencyScope::from_resources(
+            &[target],
+            &[] as &[DataSource],
+            std::iter::empty(),
+        )
+        .unwrap();
+
+        let error = decoded
+            .resolve_with_schemas_and_dependencies(&crate::schema::SchemaRegistry::new(), &scope)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "wait 'w' depends_on: binding 'nope' is not declared in this scope"
+        );
     }
 }

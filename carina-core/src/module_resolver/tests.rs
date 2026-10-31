@@ -6200,6 +6200,54 @@ let child = imported { peer = source }
 }
 
 #[test]
+fn module_parameter_handle_rewrites_wait_depends_on_to_the_caller_binding() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/consumer");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { peer: mock.test.Thing }
+let target = mock.test.Thing { name = "target" }
+let ready = wait target {
+  until = target.name == "target"
+  depends_on = [peer]
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let source = mock.test.Thing { name = "peer" }
+let imported = use { source = "../modules/consumer" }
+let child = imported { peer = source }
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let mut context = ProviderContext::default();
+    context
+        .resource_types
+        .insert(("mock".to_string(), "test.Thing".to_string()));
+    let parsed = crate::parser::parse(root_body, &context).unwrap();
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root_dir,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("a module handle in wait depends_on must expand to the caller binding");
+
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding == "child.ready")
+        .expect("expanded wait binding");
+    assert_eq!(wait.depends_on, vec!["source"]);
+}
+
+#[test]
 fn module_dependency_substitution_error_reports_the_call_argument_line() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let module_dir = tmp.path().join("modules/consumer");

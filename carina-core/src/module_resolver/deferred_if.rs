@@ -36,6 +36,10 @@ pub(super) struct SelectedDeferredIfs {
     /// The expander needs the complete set to distinguish module-local names
     /// from caller names before it rewrites references.
     pub(super) conditional_bindings: HashSet<String>,
+    /// Managed-resource bindings declared by any branch. Dependency metadata
+    /// uses this narrower set so dropped resource targets are still prefixed
+    /// for the dedicated diagnostic without admitting other structural kinds.
+    pub(super) conditional_resource_bindings: HashSet<String>,
     /// Structural conditionals whose condition has already crossed this
     /// module boundary's argument-substitution seam. Keeping these separate
     /// from parser-authored [`DeferredStructuralIf`] nodes prevents a later
@@ -158,6 +162,11 @@ pub(super) fn select_deferred_module_ifs(
 ) -> Result<SelectedDeferredIfs, ModuleError> {
     let mut origins = HashMap::new();
     collect_conditional_bindings(&module.deferred_module_ifs, &mut origins);
+    let mut conditional_resource_bindings = HashSet::new();
+    collect_conditional_resource_bindings(
+        &module.deferred_module_ifs,
+        &mut conditional_resource_bindings,
+    );
 
     let mut contribution = ParsedFile::default();
     let mut forwarded = Vec::new();
@@ -187,6 +196,7 @@ pub(super) fn select_deferred_module_ifs(
     Ok(SelectedDeferredIfs {
         contribution,
         conditional_bindings: origins.into_keys().collect(),
+        conditional_resource_bindings,
         forwarded,
         dropped,
     })
@@ -270,6 +280,35 @@ fn collect_conditional_bindings(
             for name in names {
                 origins.insert(name, origin.clone());
             }
+        }
+    }
+}
+
+fn collect_conditional_resource_bindings(
+    deferred_ifs: &[DeferredStructuralIf],
+    names: &mut HashSet<String>,
+) {
+    for deferred in deferred_ifs {
+        for branch in deferred.branches() {
+            collect_branch_resource_binding_names(branch, names);
+        }
+    }
+}
+
+fn collect_branch_resource_binding_names(body: &DeferredIfBody, names: &mut HashSet<String>) {
+    match body {
+        DeferredIfBody::Resource(resource) => {
+            names.extend(resource.binding.iter().cloned());
+        }
+        DeferredIfBody::DataSource(_) | DeferredIfBody::ModuleCall(_) => {}
+        DeferredIfBody::ExpandedModuleCall(contribution) => {
+            names.extend(
+                contribution
+                    .resources
+                    .iter()
+                    .filter_map(|resource| resource.binding.clone()),
+            );
+            collect_conditional_resource_bindings(&contribution.deferred_module_ifs, names);
         }
     }
 }
@@ -1020,12 +1059,32 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
         &mut metadata,
         contextualize,
     )?;
+    let dependency_target_bindings = contribution
+        .resources
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .chain(
+            selected
+                .resources
+                .iter()
+                .filter_map(|resource| resource.binding.clone()),
+        )
+        .chain(selected_ifs.conditional_resource_bindings.iter().cloned())
+        .collect();
     let wait_bindings = contribution
         .wait_bindings
         .iter()
         .chain(&selected.wait_bindings)
-        .map(|wait| prefix_wait_binding(wait, instance_prefix))
-        .collect();
+        .map(|wait| {
+            prefix_wait_binding(
+                wait,
+                instance_prefix,
+                &dependency_target_bindings,
+                arguments,
+            )
+            .map_err(contextualize)
+        })
+        .collect::<Result<Vec<_>, ModuleError>>()?;
     let mut inner_trace = contribution.expansion_trace.clone();
     for (leaf, call_sites) in selected.expansion_trace.iter() {
         inner_trace.record(leaf.clone(), call_sites.clone());

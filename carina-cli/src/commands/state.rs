@@ -1742,8 +1742,21 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
+    let (_, managed_dependencies, _, _) =
+        carina_core::dependency::ResolvedPlanningDependencies::resolve(
+            &sorted_resources,
+            &parsed.data_sources,
+            &parsed.wait_bindings,
+            parsed
+                .upstream_binding_names()
+                .into_iter()
+                .map(str::to_string),
+        )
+        .map_err(|error| AppError::Validation(error.to_string()))?
+        .into_parts();
+    let resolved_resources = ResolvedResource::collect_resolved_with_schemas_and_dependencies(
         sorted_resources.iter().cloned(),
+        managed_dependencies,
         ctx.schemas(),
     )?;
 

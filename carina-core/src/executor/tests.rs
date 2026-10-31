@@ -197,6 +197,7 @@ fn anonymous_deferred_collision_fixture() -> (
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
+            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         },
     )
     .expect("fixture child materializes");
@@ -354,7 +355,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                 until_surface: "wait_target.status == ready".to_string(),
                 timeout: std::time::Duration::from_secs(60),
                 interval: std::time::Duration::from_secs(1),
-                explicit_dependencies: HashSet::new(),
+                explicit_dependencies: Default::default(),
             },
             create_effect(wait_consumer.clone()),
         ],
@@ -4883,7 +4884,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         until_surface: "wait-target.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     let observer = MockObserver::new();
     let input = ExecutionInput {
@@ -5117,7 +5118,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_secs(60),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     plan.add(create_effect(dist));
 
@@ -5184,7 +5185,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_secs(60),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     plan.add(create_effect(dist));
 
@@ -7817,6 +7818,12 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     parent.binding = Some("vpc".to_string());
     child.binding = Some("child".to_string());
     let resources = vec![parent, child];
+    let dependency_scope = crate::dependency::ResolvedDependencyScope::from_resources(
+        &resources,
+        &[] as &[DataSource],
+        std::iter::empty(),
+    )
+    .unwrap();
 
     let mut current_states = HashMap::new();
     let mut plan = Plan::new();
@@ -7829,7 +7836,10 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
                 from.id.identity_display().to_string(),
             ),
             from: Box::new(from),
-            to: resolved(resource.clone()),
+            to: ResolvedResource::new_with_dependencies(
+                resource.clone(),
+                dependency_scope.resolve_resource(resource).unwrap(),
+            ),
             changed_attributes: vec!["tags".to_string()],
         });
     }
@@ -8856,7 +8866,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     plan.add(create_effect(dist));
 
@@ -9012,7 +9022,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     plan.add(create_effect(dist));
 
@@ -9119,7 +9129,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
         interval: std::time::Duration::from_millis(1),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
 
     let mut issued = HashMap::new();
@@ -9747,7 +9757,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         until_surface: "cert.status == \"issued\"".to_string(),
         timeout: std::time::Duration::from_secs(5),
         interval: std::time::Duration::from_millis(10),
-        explicit_dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
 
     let input = ExecutionInput {

@@ -853,7 +853,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout,
             interval,
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         }
     }
 
@@ -1611,7 +1611,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_millis(100),
             interval: Duration::from_millis(1),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         };
 
         let result = execute_wait_effect_with_heartbeat_cadence(

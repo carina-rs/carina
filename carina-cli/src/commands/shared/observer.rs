@@ -301,7 +301,7 @@ mod tests {
             until_surface: "demo.status == issued".to_string(),
             timeout: Duration::from_secs(300),
             interval: Duration::from_secs(5),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         }
     }
 

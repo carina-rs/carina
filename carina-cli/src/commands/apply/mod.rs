@@ -24,12 +24,12 @@ use carina_core::executor::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
-#[cfg(test)]
-use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
-    CompositionSourceIdentityResolver, Current, DataSource, ModuleSource, ResolvedResource,
-    Resource, ResourceId, SavedDataSource, SavedModuleSource, State, Value,
+    CompositionSourceIdentityResolver, Current, DataSource, ModuleSource, Resource, ResourceId,
+    SavedDataSource, SavedModuleSource, State, Value,
 };
+#[cfg(test)]
+use carina_core::resource::{ConcreteValue, ResolvedResource};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
@@ -1198,7 +1198,7 @@ impl DriftCheckResult {
 /// verification pass for the saved-plan gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn detect_drift<S: Clone>(
-    sorted_resources: &[carina_core::resource::Resource<S>],
+    sorted_resources: &[carina_core::resource::ResolvedResource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
     operation_provider: &dyn Provider,
@@ -1221,7 +1221,6 @@ pub(crate) async fn detect_drift<S: Clone>(
         .collect();
 
     for resource in sorted_resources {
-        let resolved_resource = ResolvedResource::resolve_with_schemas(resource.clone(), schemas)?;
         // carina#3181: `sorted_resources` is managed-only — drift
         // detection only operates over provider-backed managed
         // resources.
@@ -1299,12 +1298,10 @@ pub(crate) async fn detect_drift<S: Clone>(
                         })?;
                 let secret_drift = verification.drifted_attributes();
                 let mut verified_planned = verification.state().clone();
-                resolved_resource
-                    .ignore_changes()
-                    .mask_observed_readable_leaves(
-                        &mut verified_planned.attributes,
-                        &actual_state.attributes,
-                    );
+                resource.ignore_changes().mask_observed_readable_leaves(
+                    &mut verified_planned.attributes,
+                    &actual_state.attributes,
+                );
                 verified_planned_states.insert(resource.id.clone(), verified_planned.clone());
                 // Compare attributes for existing resources
                 let mut attr_diffs: Vec<String> = Vec::new();
@@ -1412,12 +1409,28 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
     schemas: &carina_core::schema::SchemaRegistry,
     apply_target: ApplyTarget<'_>,
 ) -> Result<DriftCheckResult, AppError> {
+    let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        sorted_resources,
+        &[],
+        std::iter::empty(),
+    )
+    .map_err(|error| AppError::Validation(error.to_string()))?;
+    let sorted_resources = sorted_resources
+        .iter()
+        .cloned()
+        .map(|resource| {
+            let dependencies = dependency_scope
+                .resolve_resource(&resource)
+                .map_err(carina_core::resource::ResolvedResourceError::from)?;
+            ResolvedResource::resolve_with_schemas_and_dependencies(resource, schemas, dependencies)
+        })
+        .collect::<Result<Vec<_>, carina_core::resource::ResolvedResourceError>>()?;
     let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
         schemas,
         sorted_resources.iter().map(|resource| &resource.id),
     );
     detect_drift(
-        sorted_resources,
+        &sorted_resources,
         planned_state_entries,
         historical_addresses,
         operation_provider,
@@ -3382,8 +3395,10 @@ async fn run_apply_from_plan_locked_owned(
             // Drift detection: re-read actual infrastructure state and compare against planned states
             println!("{}", "Checking for infrastructure drift...".cyan());
             let historical_addresses = validated_plan.historical_resource_addresses();
+            let resolved_sorted_resources =
+                validated_plan.resolved_sorted_resources(wiring.schemas())?;
             let drift_check = detect_drift(
-                validated_plan.sorted_resources(),
+                &resolved_sorted_resources,
                 validated_plan.current_states(),
                 &historical_addresses,
                 validated_plan.provider(),
@@ -3430,10 +3445,9 @@ async fn run_apply_from_plan_locked_owned(
 
             let plan = rehydrated_plan_file.plan();
             let sorted_resources = rehydrated_plan_file.sorted_resources();
-            let resolved_sorted_resources = ResolvedResource::collect_resolved_with_schemas(
-                sorted_resources.iter().cloned(),
-                wiring.schemas(),
-            )?;
+            let resolved_sorted_resources = rehydrated_plan_file
+                .reloaded_plan_file()
+                .resolved_sorted_resources(wiring.schemas())?;
             let plan_compositions = rehydrated_plan_file.compositions();
             let plan_data_sources = rehydrated_plan_file.data_sources();
             let plan_data_source_origins: &[SavedDataSource] =

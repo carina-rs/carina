@@ -1287,7 +1287,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: Duration::from_secs(60),
         interval: Duration::from_secs(5),
-        explicit_dependencies: HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
 
     let has_changes = plan.mutation_count() > 0;
@@ -1928,6 +1928,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         ),
     );
 
+    let resource = ResolvedResource::resolve_with_schemas(resource, &schemas).unwrap();
     let result = crate::commands::apply::detect_drift(
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id, planned)],
@@ -3999,7 +4000,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         until_surface: "managed.status == \"ready\"".to_string(),
         timeout: Duration::from_secs(60),
         interval: Duration::from_secs(5),
-        explicit_dependencies: HashSet::new(),
+        explicit_dependencies: Default::default(),
     });
     PlanFileContents {
         version: PlanFile::CURRENT_VERSION,

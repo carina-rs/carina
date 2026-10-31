@@ -20,6 +20,7 @@ use carina_core::schema::{
 };
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::process::{Command, Output};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -229,7 +230,11 @@ fn factories() -> Vec<carina_cli::wiring::LoadedProviderFactory> {
 fn write_fixture(files: &[(&str, &str)]) -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     for (name, content) in files {
-        std::fs::write(dir.path().join(name), content).expect("write fixture");
+        let path = dir.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture directory");
+        }
+        std::fs::write(path, content).expect("write fixture");
     }
     dir
 }
@@ -238,9 +243,118 @@ fn cli_validate(fixture: &TempDir) -> Vec<String> {
     carina_cli::commands::validate::validate_with_factories(fixture.path(), factories())
 }
 
+fn carina_validate(fixture: &TempDir) -> Output {
+    let home = tempfile::tempdir().expect("isolated carina home");
+    Command::new(env!("CARGO_BIN_EXE_carina"))
+        .args(["validate", "."])
+        .current_dir(fixture.path())
+        .env("NO_COLOR", "1")
+        .env("HOME", home.path())
+        .env("CARINA_TEST_HOME", home.path())
+        .env("CARINA_TRUST_RECORD_DIR", home.path().join("trust"))
+        .env("CARINA_PLUGIN_CACHE_DIR", home.path().join("plugins"))
+        .output()
+        .expect("run carina validate")
+}
+
+fn rendered_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn validate_rejects_unknown_wait_dependency_across_sibling_files() {
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+        ),
+        (
+            "resource.crn",
+            r#"let d = mock.test.resource {
+    name = "d"
+}
+"#,
+        ),
+        (
+            "wait.crn",
+            r#"let w = wait d {
+    until = d.comment == "x"
+    depends_on = [nope]
+}
+"#,
+        ),
+    ]);
+
+    let output = carina_validate(&fixture);
+    let rendered = rendered_output(&output);
+    assert!(
+        !output.status.success(),
+        "unknown wait dependency must fail carina validate: {rendered}"
+    );
+    assert!(
+        rendered.contains("wait 'w' depends_on: binding 'nope' is not declared in this scope"),
+        "carina validate must name the unknown wait dependency: {rendered}"
+    );
+}
+
+#[test]
+fn validate_module_wait_dependency_keeps_the_authored_unknown_name() {
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+        ),
+        (
+            "main.crn",
+            r#"let reusable = use { source = "./module" }
+let instance = reusable { label = "caller" }
+"#,
+        ),
+        ("module/arguments.crn", "arguments { label: String }\n"),
+        (
+            "module/resource.crn",
+            r#"let d = mock.test.resource {
+    name = "d"
+}
+"#,
+        ),
+        (
+            "module/wait.crn",
+            r#"let w = wait d {
+    until = d.comment == "x"
+    depends_on = [nope]
+}
+"#,
+        ),
+    ]);
+
+    let output = carina_validate(&fixture);
+    let rendered = rendered_output(&output);
+    assert!(
+        !output.status.success(),
+        "unknown module wait dependency must fail carina validate: {rendered}"
+    );
+    assert!(
+        rendered.contains("wait 'w' depends_on: binding 'nope' is not declared in this scope"),
+        "module diagnostic must preserve the authored name: {rendered}"
+    );
+    assert!(
+        !rendered.contains("instance.nope"),
+        "module expansion must not invent a prefixed unknown binding: {rendered}"
+    );
+}
 
 #[test]
 fn validate_accepts_well_formed_wait_multi_file_fixture() {

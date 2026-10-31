@@ -18,6 +18,47 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+#[test]
+fn unresolved_resource_views_follow_dependency_sorted_order() {
+    let resource = |binding: &str| {
+        let identity = ResourceIdentity::try_from(binding.to_string()).expect("valid identity");
+        let mut resource = Resource::new("test.resource", identity);
+        resource.binding = Some(binding.to_string());
+        resource
+    };
+    let producer = resource("producer");
+    let consumer = resource("consumer");
+    let sorted = vec![
+        ResolvedResource::new(producer.clone()),
+        ResolvedResource::new(consumer.clone()),
+    ];
+    let declaration_order = vec![consumer, producer];
+    let resolved_declaration_order = declaration_order
+        .iter()
+        .cloned()
+        .map(ResolvedResource::new)
+        .collect();
+
+    let (unresolved, resolved_unresolved) =
+        align_unresolved_resource_views(&sorted, declaration_order, resolved_declaration_order)
+            .expect("resource views should align by resolved ID");
+
+    assert_eq!(
+        unresolved
+            .iter()
+            .map(|resource| resource.id.identity_str().expect("resolved identity"))
+            .collect::<Vec<_>>(),
+        ["producer", "consumer"],
+    );
+    assert_eq!(
+        resolved_unresolved
+            .iter()
+            .map(|resource| resource.id.identity_str().expect("resolved identity"))
+            .collect::<Vec<_>>(),
+        ["producer", "consumer"],
+    );
+}
+
 fn comparison_provider_for_resources(
     schemas: &SchemaRegistry,
     resources: &[Resource],
@@ -5502,8 +5543,7 @@ fn bucket_resource(name: &str) -> Resource {
 }
 
 fn resolved_desired_ids(resources: &[Resource]) -> ResolvedDesiredIds {
-    ResolvedDesiredIds::from_resources(resources, &SchemaRegistry::new())
-        .expect("test desired identities must be resolved")
+    ResolvedDesiredIds::from_resources(resources).expect("test desired identities must be resolved")
 }
 
 fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {

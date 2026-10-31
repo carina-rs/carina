@@ -515,6 +515,28 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             )
             .chain(selected_module_ifs.conditional_bindings.iter().cloned())
             .collect();
+        // `depends_on` has a deliberately narrower target set than ordinary
+        // value references: only managed resource bindings (plus typed module
+        // parameters handled by `prefix_directive_dependency`) are valid.
+        // Keep that scope separate so an unknown name, data source, wait, or
+        // composition cannot be made to look local merely by prefixing it.
+        let dependency_target_bindings: HashSet<String> = module
+            .resources
+            .iter()
+            .filter_map(|resource| resource.binding.clone())
+            .chain(
+                selected
+                    .resources
+                    .iter()
+                    .filter_map(|resource| resource.binding.clone()),
+            )
+            .chain(
+                selected_module_ifs
+                    .conditional_resource_bindings
+                    .iter()
+                    .cloned(),
+            )
+            .collect();
         let module_source = self.module_paths.get(&call.module_name).cloned();
         let module_directory = module_source.as_deref().map(|source| {
             let source = std::path::Path::new(source);
@@ -766,8 +788,16 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .wait_bindings
             .iter()
             .chain(&selected.wait_bindings)
-            .map(|wb| prefix_wait_binding(wb, instance_prefix))
-            .collect();
+            .map(|wb| {
+                prefix_wait_binding(
+                    wb,
+                    instance_prefix,
+                    &dependency_target_bindings,
+                    argument_substitutions,
+                )
+            })
+            .collect::<Result<_, _>>()
+            .map_err(contextualize_access_error)?;
 
         // carina#3126: propagate the module's deferred for-expressions
         // (previously dropped at this boundary). Each entry is
@@ -1114,7 +1144,12 @@ fn prefix_binding_name(instance_prefix: &str, name: &BindingName) -> BindingName
 /// `until_raw` (verbatim user surface text), `until_predicate.rhs` (a
 /// comparison value), `timeout_secs`, and `line` are not binding names
 /// and pass through unchanged.
-pub(super) fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
+pub(super) fn prefix_wait_binding(
+    wb: &WaitBinding,
+    instance_prefix: &str,
+    dependency_target_bindings: &HashSet<String>,
+    arguments: ArgumentSubstitutions<'_>,
+) -> Result<WaitBinding, ArgumentSubstitutionError> {
     let WaitBinding {
         binding,
         target,
@@ -1135,15 +1170,26 @@ pub(super) fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> Wa
         *root = apply_instance_prefix(instance_prefix, root);
     }
 
-    WaitBinding {
+    Ok(WaitBinding {
         binding: prefixed_name(binding),
         target: prefixed_name(target),
         until_raw: until_raw.clone(),
         until_predicate,
         timeout_secs: *timeout_secs,
-        depends_on: depends_on.iter().map(prefixed_name).collect(),
+        depends_on: depends_on
+            .iter()
+            .map(|dependency| {
+                prefix_directive_dependency(
+                    dependency.as_str(),
+                    instance_prefix,
+                    dependency_target_bindings,
+                    arguments,
+                )
+                .map(BindingName::new)
+            })
+            .collect::<Result<_, _>>()?,
         line: *line,
-    }
+    })
 }
 
 #[derive(Clone)]

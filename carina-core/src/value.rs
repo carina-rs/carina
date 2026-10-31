@@ -4140,18 +4140,18 @@ pub fn redact_secrets_in_effect(
     use crate::effect::{DeferredReplacePayload, Effect};
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
-            resource: crate::resource::ResolvedDataSource::new(redact_secrets_in_data_source(
-                resource,
-            )?),
+            resource: resource
+                .with_transformed_inner(redact_secrets_in_data_source(resource.as_inner())?),
         },
-        Effect::Create(resource) => Effect::Create(crate::resource::ResolvedResource::new(
-            redact_secrets_in_resource(resource)?,
-        )),
+        Effect::Create(resource) => Effect::Create(
+            resource.with_transformed_inner(redact_secrets_in_resource(resource.as_inner())?),
+        ),
         Effect::ResumeCreate {
             resource,
             started_at,
         } => Effect::ResumeCreate {
-            resource: crate::resource::ResolvedResource::new(redact_secrets_in_resource(resource)?),
+            resource: resource
+                .with_transformed_inner(redact_secrets_in_resource(resource.as_inner())?),
             started_at: started_at.clone(),
         },
         Effect::Update {
@@ -4162,7 +4162,7 @@ pub fn redact_secrets_in_effect(
         } => Effect::Update {
             from: Box::new(redact_secrets_in_state(from)?),
             identifier: identifier.clone(),
-            to: crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?),
+            to: to.with_transformed_inner(redact_secrets_in_resource(to.as_inner())?),
             changed_attributes: changed_attributes.clone(),
         },
         Effect::Delete {
@@ -4277,8 +4277,8 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
             let mut effect = match effect {
                 crate::effect::Effect::Create(resource) => match reusable_resource(&resource.id) {
                     Some(planned) => {
-                        crate::effect::Effect::Create(crate::resource::ResolvedResource::new(
-                            redact_resource_using_redacted_shape(resource, planned)?,
+                        crate::effect::Effect::Create(resource.with_transformed_inner(
+                            redact_resource_using_redacted_shape(resource.as_inner(), planned)?,
                         ))
                     }
                     None => redact_secrets_in_effect(effect)?,
@@ -4291,14 +4291,12 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                 } => crate::effect::Effect::Update {
                     from: Box::new(redact_secrets_in_state(from)?),
                     identifier: identifier.clone(),
-                    to: match reusable_resource(&to.id) {
-                        Some(planned) => crate::resource::ResolvedResource::new(
-                            redact_resource_using_redacted_shape(to, planned)?,
-                        ),
-                        None => {
-                            crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?)
+                    to: to.with_transformed_inner(match reusable_resource(&to.id) {
+                        Some(planned) => {
+                            redact_resource_using_redacted_shape(to.as_inner(), planned)?
                         }
-                    },
+                        None => redact_secrets_in_resource(to.as_inner())?,
+                    }),
                     changed_attributes: changed_attributes.clone(),
                 },
                 crate::effect::Effect::Read { .. }
@@ -10139,6 +10137,32 @@ mod tests {
             resource_comment_placeholder_hash(&second),
             "equal secrets must not reveal equality in a saved plan",
         );
+    }
+
+    #[test]
+    fn effect_redaction_preserves_resolved_dependency_evidence() {
+        let parent =
+            crate::resource::Resource::new("mock.test.resource", "parent").with_binding("parent");
+        let mut child = resource_with_comment_secret("child", "PLAIN").with_binding("child");
+        child.directives.depends_on.push("parent".to_string());
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            &[parent, child.clone()],
+            &[] as &[crate::resource::DataSource],
+            std::iter::empty(),
+        )
+        .unwrap();
+        let dependencies = scope.resolve_resource(&child).unwrap();
+        let effect = crate::effect::Effect::Create(
+            crate::resource::ResolvedResource::new_with_dependencies(child, dependencies),
+        );
+
+        let redacted = redact_secrets_in_effect(&effect).expect("redact typed effect");
+        let crate::effect::Effect::Create(resource) = redacted else {
+            panic!("expected create effect")
+        };
+
+        assert!(resource.explicit_dependencies().contains("parent"));
+        let _ = resource_comment_placeholder_hash(resource.as_inner());
     }
 
     #[test]

@@ -706,6 +706,55 @@ impl UnresolvedSavedPlan {
         self,
         schemas: &crate::schema::SchemaRegistry,
     ) -> Result<SavedPlan, crate::resource::ResolvedResourceError> {
+        let managed = self
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                UnresolvedSavedEffect::Create(resource)
+                | UnresolvedSavedEffect::ResumeCreate { resource, .. } => Some(resource.clone()),
+                UnresolvedSavedEffect::Update { to, .. } => Some(to.clone()),
+                UnresolvedSavedEffect::Read { .. }
+                | UnresolvedSavedEffect::Delete { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::Move { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. }
+                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredReplace(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let data_sources = self
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                UnresolvedSavedEffect::Read { resource } => Some(resource.clone()),
+                UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::ResumeCreate { .. }
+                | UnresolvedSavedEffect::Update { .. }
+                | UnresolvedSavedEffect::Delete { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::Move { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. }
+                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredReplace(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            &managed,
+            &data_sources,
+            std::iter::empty(),
+        )?;
+        self.resolve_with_schemas_and_dependencies(schemas, &scope)
+    }
+
+    pub fn resolve_with_schemas_and_dependencies(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+        dependency_scope: &crate::dependency::ResolvedDependencyScope,
+    ) -> Result<SavedPlan, crate::resource::ResolvedResourceError> {
         let Self {
             effects,
             ignored_change_summaries,
@@ -717,7 +766,9 @@ impl UnresolvedSavedPlan {
         Ok(Plan {
             effects: effects
                 .into_iter()
-                .map(|effect| effect.resolve_with_schemas(schemas))
+                .map(|effect| {
+                    effect.resolve_with_schemas_and_dependencies(schemas, dependency_scope)
+                })
                 .collect::<Result<Vec<_>, _>>()?,
             ignored_change_summaries,
             replace_display,
@@ -1400,7 +1451,7 @@ mod tests {
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
             interval: Duration::from_secs(5),
-            explicit_dependencies: std::collections::HashSet::new(),
+            explicit_dependencies: Default::default(),
         });
         let summary = plan.summary();
         assert_eq!(summary.create, 1);

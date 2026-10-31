@@ -10,7 +10,7 @@ pub use predicate::{AttrPath, AttrPathError, WaitPredicate};
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{DataSource, ResolvedResource, ResolvedResourceId};
+use crate::resource::{ResolvedDataSource, ResolvedResource, ResolvedResourceId};
 
 /// A managed resource that can be polled by an [`crate::effect::Effect::Wait`].
 ///
@@ -64,7 +64,7 @@ pub(crate) enum WaitTargetLookup {
 pub(crate) fn resolve_wait_target(
     target: &str,
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
 ) -> WaitTargetLookup {
     if let Some(resource) = managed
         .iter()

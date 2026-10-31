@@ -584,7 +584,10 @@ fn dependency_only_create(resource: &ResolvedResource) -> Effect {
     shell.dependency_bindings = carina_core::deps::get_resource_dependencies(resource.as_inner())
         .into_iter()
         .collect();
-    Effect::Create(ResolvedResource::new(shell))
+    Effect::Create(ResolvedResource::new_with_dependencies(
+        shell,
+        resource.explicit_dependencies().clone(),
+    ))
 }
 
 fn effect_module_source(effect: &Effect) -> Option<&ModuleSource> {
@@ -1162,13 +1165,18 @@ mod tests {
     }
 
     #[test]
-    fn dependency_only_create_preserves_resolved_ignore_changes() {
+    fn dependency_only_create_preserves_resolved_metadata() {
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
         let mut resource = Resource::new("test.Widget", "example").with_attribute(
             "comment",
             Value::Concrete(ConcreteValue::String("configured".into())),
         );
+        resource.binding = Some("example".to_string());
+        resource
+            .directives
+            .depends_on
+            .push("dependency".to_string());
         resource.directives.ignore_changes = vec![
             serde_json::from_value(serde_json::json!({
                 "segments": [{ "kind": "attribute", "value": "comment" }]
@@ -1183,8 +1191,23 @@ mod tests {
                 .validate()
                 .expect("valid graph-model schema"),
         );
-        let resource = ResolvedResource::resolve_with_schemas(resource, &schemas)
-            .expect("ignore_changes path resolves");
+        let mut dependency = Resource::new("test.Widget", "dependency");
+        dependency.binding = Some("dependency".to_string());
+        let scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+            &[dependency, resource.clone()],
+            &[] as &[carina_core::resource::DataSource],
+            std::iter::empty(),
+        )
+        .expect("dependency scope resolves");
+        let dependencies = scope
+            .resolve_resource(&resource)
+            .expect("explicit dependency resolves");
+        let resource = ResolvedResource::resolve_with_schemas_and_dependencies(
+            resource,
+            &schemas,
+            dependencies,
+        )
+        .expect("resource metadata resolves");
 
         let effect = dependency_only_create(&resource);
         let Effect::Create(shell) = effect else {
@@ -1192,6 +1215,10 @@ mod tests {
         };
 
         assert_eq!(shell.ignore_changes(), resource.ignore_changes());
+        assert_eq!(
+            shell.explicit_dependencies(),
+            resource.explicit_dependencies()
+        );
         assert!(shell.attributes.is_empty());
     }
 

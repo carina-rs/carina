@@ -17,6 +17,7 @@ pub(super) struct DeferredIdentityInputs<'a> {
     pub(super) provider_configs: &'a [crate::parser::ProviderConfig],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
+    pub(super) dependency_scope: &'a crate::dependency::ResolvedDependencyScope,
 }
 
 /// Failure while expanding a deferred-for create half against apply-time
@@ -301,9 +302,18 @@ pub(super) fn materialize_deferred_create<
                     .is_subset(&resource.dependency_bindings),
                 "apply-time deferred-for child must retain iterable dependencies"
             );
-            ResolvedResource::resolve_with_schemas(resource, identity_inputs.schemas)
-                .map(Effect::Create)
-                .map_err(|error| DeferredCreateFailure::ResolveResource { error })
+            let dependencies = identity_inputs
+                .dependency_scope
+                .resolve_resource(&resource)
+                .map_err(ResolvedResourceError::from)
+                .map_err(|error| DeferredCreateFailure::ResolveResource { error })?;
+            ResolvedResource::resolve_with_schemas_and_dependencies(
+                resource,
+                identity_inputs.schemas,
+                dependencies,
+            )
+            .map(Effect::Create)
+            .map_err(|error| DeferredCreateFailure::ResolveResource { error })
         })
         .collect::<Result<Vec<_>, _>>()
 }
@@ -418,6 +428,7 @@ mod tests {
                 provider_configs: &[],
                 factories: &[],
                 schemas: &schemas,
+                dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
             },
         )
     }
@@ -479,6 +490,7 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
+            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
         let children = materialize_deferred_create(&template, &bindings, &identity_inputs)
             .expect("deferred children must resolve authored ignore paths");
@@ -532,6 +544,7 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
+            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
 
         let children = materialize_deferred_create(template, &bindings, &identity_inputs)
@@ -596,6 +609,7 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
+            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
 
         let runtime_children = materialize_deferred_create(template, &bindings, &identity_inputs)
@@ -677,6 +691,7 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
+            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
 
         let error = materialize_deferred_create(template, &bindings, &identity_inputs)
