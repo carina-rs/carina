@@ -439,12 +439,12 @@ mod tests {
     fn deferred_create_resolves_authored_ignore_changes() {
         let mut template = coalesced_template();
         let comment = Value::Concrete(ConcreteValue::String("managed-elsewhere".into()));
-        template.template_resource.with_resource_mut(|resource| {
-            resource.set_attr("comment", comment);
-            resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
-                ParsedIgnorePathSegment::Attribute("comment".to_string()),
-            ])];
-        });
+        template
+            .template_attributes_mut()
+            .insert("comment".to_string(), comment);
+        template.template_directives_mut().ignore_changes = vec![ParsedIgnorePath::new(vec![
+            ParsedIgnorePathSegment::Attribute("comment".to_string()),
+        ])];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
             "up",

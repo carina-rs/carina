@@ -11631,10 +11631,17 @@ fn resolve_file_block_names<
                     registry,
                 ));
             }
-            crate::parser::ResourceMut::Deferred { resource } => {
-                conflicts.extend(resource.with_resource_mut(|resource| {
-                    resolve_block_names_detailed(std::slice::from_mut(resource), registry)
-                }));
+            crate::parser::ResourceMut::Deferred { id, attributes } => {
+                if let Some(schema) =
+                    registry.get(&id.provider, &id.resource_type, SchemaKind::Resource)
+                {
+                    conflicts.extend(resolve_attribute_block_names(
+                        id,
+                        attributes,
+                        None,
+                        schema.as_schema(),
+                    ));
+                }
             }
             crate::parser::ResourceMut::DataSource(data_source) => {
                 if let Some(schema) = registry.get_for_data_source(data_source) {
@@ -11699,17 +11706,19 @@ where
                     registry,
                 ));
             }
-            crate::parser::ResourceMut::Deferred { resource } => {
-                let authored_resources = managed_resource_by_id(authored, resource.id())
-                    .map(std::slice::from_ref)
-                    .unwrap_or_default();
-                conflicts.extend(resource.with_resource_mut(|resource| {
-                    resolve_block_names_detailed_with_authored(
-                        std::slice::from_mut(resource),
-                        authored_resources,
-                        registry,
-                    )
-                }));
+            crate::parser::ResourceMut::Deferred { id, attributes } => {
+                if let Some(schema) =
+                    registry.get(&id.provider, &id.resource_type, SchemaKind::Resource)
+                {
+                    let authored_attributes =
+                        managed_resource_by_id(authored, id).map(|resource| &resource.attributes);
+                    conflicts.extend(resolve_attribute_block_names(
+                        id,
+                        attributes,
+                        authored_attributes,
+                        schema.as_schema(),
+                    ));
+                }
             }
             crate::parser::ResourceMut::DataSource(data_source) => {
                 if let Some(schema) = registry.get_for_data_source(data_source) {

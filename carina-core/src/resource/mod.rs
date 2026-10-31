@@ -317,10 +317,7 @@ impl<'de> Deserialize<'de> for ResourceIdentity {
 /// hashing while the resource remains in memory.
 #[derive(Debug)]
 struct PendingTokenMarker {
-    // Historical deferred-template payloads encode an unbound template
-    // identity as JSON null. Ordinary pending identities remain
-    // non-serializable; only a short-lived wire clone sets this bit.
-    serializable_as_null: bool,
+    _value: u8,
 }
 
 #[derive(Clone)]
@@ -328,19 +325,7 @@ pub struct PendingToken(Arc<PendingTokenMarker>);
 
 impl PendingToken {
     fn new() -> Self {
-        Self(Arc::new(PendingTokenMarker {
-            serializable_as_null: false,
-        }))
-    }
-
-    fn serializable_as_null() -> Self {
-        Self(Arc::new(PendingTokenMarker {
-            serializable_as_null: true,
-        }))
-    }
-
-    fn can_serialize_as_null(&self) -> bool {
-        self.0.serializable_as_null
+        Self(Arc::new(PendingTokenMarker { _value: 0 }))
     }
 }
 
@@ -376,10 +361,6 @@ impl ResourceIdentityState {
     fn pending() -> Self {
         Self::Pending(PendingToken::new())
     }
-
-    fn pending_deferred_template_wire() -> Self {
-        Self::Pending(PendingToken::serializable_as_null())
-    }
 }
 
 impl Default for ResourceIdentityState {
@@ -391,7 +372,6 @@ impl Default for ResourceIdentityState {
 impl Serialize for ResourceIdentityState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Self::Pending(token) if token.can_serialize_as_null() => serializer.serialize_none(),
             Self::Pending(_) => Err(serde::ser::Error::custom(
                 "pending resource identity cannot be serialized",
             )),
@@ -487,19 +467,6 @@ impl ResourceId {
             provider: provider.into(),
             resource_type: resource_type.into(),
             identity: ResourceIdentityState::pending(),
-            provider_instance,
-        }
-    }
-
-    pub(crate) fn pending_deferred_template_wire(
-        provider: impl Into<String>,
-        resource_type: impl Into<String>,
-        provider_instance: Option<String>,
-    ) -> Self {
-        Self {
-            provider: provider.into(),
-            resource_type: resource_type.into(),
-            identity: ResourceIdentityState::pending_deferred_template_wire(),
             provider_instance,
         }
     }

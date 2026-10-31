@@ -25,7 +25,6 @@ use crate::resource::{DataSource, DeferredValue};
 use crate::resource::{
     DeposedKey, Directives, LoopElementOrigin, ModuleSource, ResolvedDataSource, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, SavedModuleSource, State, Value,
-    resolve_resource_ignore_changes,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -1182,21 +1181,11 @@ impl UnresolvedSavedEffect {
                 explicit_dependencies,
             },
             Self::DeferredCreate(mut payload) => {
-                payload
-                    .template
-                    .template_resource
-                    .with_resource_mut(|resource| {
-                        resolve_resource_ignore_changes(resource, schemas)
-                    })?;
+                payload.template.resolve_template_ignore_changes(schemas)?;
                 Effect::DeferredCreate(payload)
             }
             Self::DeferredReplace(mut payload) => {
-                payload
-                    .template
-                    .template_resource
-                    .with_resource_mut(|resource| {
-                        resolve_resource_ignore_changes(resource, schemas)
-                    })?;
+                payload.template.resolve_template_ignore_changes(schemas)?;
                 Effect::DeferredReplace(payload)
             }
         })
@@ -2758,14 +2747,10 @@ mod tests {
         let Effect::DeferredCreate(payload) = &mut effect else {
             unreachable!("fixture constructs DeferredCreate")
         };
-        payload
-            .template
-            .template_resource
-            .with_resource_mut(|resource| {
-                resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
-                    ParsedIgnorePathSegment::Attribute("missing".to_string()),
-                ])];
-            });
+        payload.template.template_directives_mut().ignore_changes =
+            vec![ParsedIgnorePath::new(vec![
+                ParsedIgnorePathSegment::Attribute("missing".to_string()),
+            ])];
 
         let json = serde_json::to_string(&effect).expect("serialize");
         let saved = serde_json::from_str::<UnresolvedSavedEffect>(&json)

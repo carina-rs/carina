@@ -147,7 +147,7 @@ enum ValidatedEntry<'a> {
     /// `header` alone are identical for `for _, opt in cert.dvo { … }`
     /// repeated twice).
     DeferredLoop {
-        resource_type: String,
+        resource_type: &'a str,
         target: &'a carina_core::parser::DeferredForTarget,
         header: &'a str,
         file: Option<&'a str>,

@@ -1659,7 +1659,7 @@ impl<S> PlanFileContents<S> {
                 Effect::DeferredReplace(payload) => {
                     insert(
                         &mut references,
-                        &payload.template.template_resource.id,
+                        payload.template.template_resource_id(),
                         SchemaKind::Resource,
                     );
                     for delete in &payload.deletes {
@@ -1732,7 +1732,7 @@ impl<S> PlanFileContents<S> {
                     insert(&mut instances, target_id.id().as_inner());
                 }
                 Effect::DeferredReplace(payload) => {
-                    insert(&mut instances, &payload.template.template_resource.id);
+                    insert(&mut instances, payload.template.template_resource_id());
                     for delete in &payload.deletes {
                         insert(&mut instances, &delete.id);
                     }
@@ -1839,7 +1839,7 @@ impl UnresolvedPlanFileContents {
                 UnresolvedSavedEffect::DeferredReplace(payload) => {
                     insert(
                         &mut references,
-                        &payload.template.template_resource.id,
+                        payload.template.template_resource_id(),
                         SchemaKind::Resource,
                     );
                     for delete in &payload.deletes {
@@ -1909,7 +1909,7 @@ impl UnresolvedPlanFileContents {
                     insert(&mut instances, target_id.id().as_inner());
                 }
                 UnresolvedSavedEffect::DeferredReplace(payload) => {
-                    insert(&mut instances, &payload.template.template_resource.id);
+                    insert(&mut instances, payload.template.template_resource_id());
                     for delete in &payload.deletes {
                         insert(&mut instances, &delete.id);
                     }
@@ -2235,37 +2235,6 @@ impl PlanFile {
             Ok(())
         }
 
-        fn validate_deferred_template(
-            template: &carina_core::parser::SavedDeferredForExpression,
-            location: &str,
-        ) -> Result<(), String> {
-            match template.target() {
-                carina_core::parser::DeferredForTarget::Bound(target) => {
-                    require_identity(template.template_resource_id(), location)?;
-                    let expected = target.template_address().to_string();
-                    if template.template_resource_id().identity_str() != Some(expected.as_str()) {
-                        return Err(format!(
-                            "Invalid saved plan: {location} identity does not match bound deferred target `{}`",
-                            target.binding()
-                        ));
-                    }
-                    Ok(())
-                }
-                carina_core::parser::DeferredForTarget::Unbound { .. } => {
-                    if matches!(
-                        template.template_resource_id().identity_state(),
-                        carina_core::resource::ResourceIdentityState::Pending(_)
-                    ) {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "Invalid saved plan: {location} for an unbound deferred target must have a pending resource identity"
-                        ))
-                    }
-                }
-            }
-        }
-
         for (index, resource) in self.sorted_resources.iter().enumerate() {
             require_identity(&resource.id, &format!("sorted_resources[{index}]"))?;
         }
@@ -2393,17 +2362,9 @@ impl PlanFile {
                 }
                 UnresolvedSavedEffect::DeferredCreate(payload) => {
                     require_identity(payload.id(), &location)?;
-                    validate_deferred_template(
-                        &payload.template,
-                        &format!("{location}.template_resource"),
-                    )?;
                 }
                 UnresolvedSavedEffect::DeferredReplace(payload) => {
                     require_identity(payload.id(), &location)?;
-                    validate_deferred_template(
-                        &payload.template,
-                        &format!("{location}.template_resource"),
-                    )?;
                     for (delete_index, delete) in payload.deletes.iter().enumerate() {
                         require_identity(
                             &delete.id,

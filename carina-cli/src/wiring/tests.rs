@@ -9139,12 +9139,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
             .contains_key("rule")
     );
     let evaluated_deferred = &canonical_unresolved.parsed().deferred_for_expressions()[0];
-    assert!(
-        evaluated_deferred
-            .template_resource
-            .attributes
-            .contains_key("rules")
-    );
+    assert!(evaluated_deferred.attributes().contains_key("rules"));
 
     let unresolved_resources = canonical_unresolved.unresolved();
     assert!(unresolved_resources[0].attributes.contains_key("rules"));

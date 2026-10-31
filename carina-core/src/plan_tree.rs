@@ -112,7 +112,7 @@ pub fn deferred_for_detail_rows<S>(
     let mut rows = vec![DetailRow::Text {
         text: format!("<- {}", template.header),
     }];
-    let mut attrs: Vec<_> = template.template_resource.attributes.iter().collect();
+    let mut attrs: Vec<_> = template.attributes().iter().collect();
     attrs.sort_by_key(|(name, _)| *name);
     rows.extend(attrs.into_iter().map(|(key, value)| DetailRow::Attribute {
         key: key.clone(),

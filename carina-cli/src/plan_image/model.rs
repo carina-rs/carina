@@ -600,10 +600,8 @@ fn effect_module_source(effect: &Effect) -> Option<&ModuleSource> {
             resource.module_source.as_ref()
         }
         Effect::Update { to, .. } => to.module_source.as_ref(),
-        Effect::DeferredCreate(payload) => payload.template.template_resource.module_source(),
-        Effect::DeferredReplace(payload) => {
-            payload.template.template_resource.module_source.as_ref()
-        }
+        Effect::DeferredCreate(payload) => payload.template.template_resource().module_source(),
+        Effect::DeferredReplace(payload) => payload.template.template_resource().module_source(),
         Effect::Delete { .. }
         | Effect::Import { .. }
         | Effect::Remove { .. }

@@ -999,7 +999,7 @@ fn effect_to_node_with_rows(
                     template.resource_type(),
                     deferred_for_display_name(template, verb)
                 ),
-                resource_type: template.resource_type(),
+                resource_type: template.resource_type().to_string(),
                 name_part: deferred_for_display_name(template, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Create,
@@ -1019,7 +1019,7 @@ fn effect_to_node_with_rows(
                     payload.template.resource_type(),
                     deferred_for_display_name(&payload.template, verb)
                 ),
-                resource_type: payload.template.resource_type(),
+                resource_type: payload.template.resource_type().to_string(),
                 name_part: deferred_for_display_name(&payload.template, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Replace,

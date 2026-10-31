@@ -112,9 +112,9 @@ pub(super) fn apply_deferred_replace_delete_deps<S>(
             if matches!(
                 template.target(),
                 crate::parser::DeferredForTarget::Unbound { .. }
-            ) && template.template_resource.id.provider == id.provider
-                && template.template_resource.id.resource_type == id.resource_type
-                && template.template_resource.id.provider_instance == id.provider_instance
+            ) && template.template_resource_id().provider == id.provider
+                && template.template_resource_id().resource_type == id.resource_type
+                && template.template_resource_id().provider_instance == id.provider_instance
             {
                 deps_of.entry(gate_idx).or_default().insert(delete_idx);
             }

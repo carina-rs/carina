@@ -243,7 +243,7 @@ fn writeback_comparison_ids<'a, S>(
                 ids.push(payload.template.template_resource_id());
             }
             Effect::DeferredReplace(payload) => {
-                ids.push(&payload.template.template_resource.id);
+                ids.push(payload.template.template_resource_id());
             }
             Effect::Read { .. }
             | Effect::Create(_)

@@ -2216,7 +2216,7 @@ fn check_composition_argument_type(
 pub(super) fn parsed_deferred_for_body_id(
     deferred: &ParsedDeferredForExpression,
 ) -> Option<&ResourceId> {
-    match &deferred.body {
+    match deferred.body() {
         DeferredForBody::Resource(resource) => Some(resource.id()),
         DeferredForBody::Read(data_source) => Some(&data_source.id),
         DeferredForBody::ModuleCall(_) => None,
@@ -2287,26 +2287,20 @@ pub(super) fn prefix_parsed_deferred_for_expression(
         )
     };
 
-    match &deferred.body {
-        DeferredForBody::Resource(resource) => {
-            let mut resource = resource.clone();
-            resource
-                .with_resource_mut(|resource| {
-                    prefix_module_resource_with_identity(
-                        TemplateValueCarrier::new(resource, template_dependency_values),
-                        instance_prefix,
-                        &instance_identity,
-                        module_name,
-                        module_instance_scope,
-                        module_call,
-                        intra_module_bindings,
-                        arguments,
-                    )
-                })
-                .map(|expanded| {
-                    expanded.map(|resource| rebuild(DeferredForBody::resource(&target, resource)))
-                })
-        }
+    match deferred.body() {
+        DeferredForBody::Resource(resource) => prefix_module_resource_with_identity(
+            TemplateValueCarrier::new(resource.as_resource(), template_dependency_values),
+            instance_prefix,
+            &instance_identity,
+            module_name,
+            module_instance_scope,
+            module_call,
+            intra_module_bindings,
+            arguments,
+        )
+        .map(|expanded| {
+            expanded.map(|resource| rebuild(DeferredForBody::resource(&target, resource)))
+        }),
         DeferredForBody::Read(data_source) => prefix_module_data_source(
             TemplateValueCarrier::new(data_source, template_dependency_values),
             instance_prefix,

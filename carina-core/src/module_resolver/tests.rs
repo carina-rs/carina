@@ -86,7 +86,7 @@ fn parsed_deferred_resource(
         expression.iterable.clone(),
         crate::parser::ParsedDeferredForIterableState::Deferred,
         expression.binding.clone(),
-        DeferredForBody::Resource(Box::new(expression.template_resource.clone())),
+        DeferredForBody::Resource(Box::new(expression.template_resource().clone())),
     )
 }
 
@@ -6623,7 +6623,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // intra-module ref must be prefixed, and module_source stamped, so
     // the generated RecordSet wires to the prefixed module certificate.
     // Round-3 review found this load-bearing path had zero coverage.
-    let DeferredForBody::Resource(template_resource) = &d.body else {
+    let DeferredForBody::Resource(template_resource) = d.body() else {
         panic!("deferred test body must remain a resource")
     };
     let validated_cert = template_resource
@@ -6684,7 +6684,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
         .into_iter()
         .next()
         .unwrap();
-    let DeferredForBody::Resource(first) = first.body else {
+    let DeferredForBody::Resource(first) = first.into_body() else {
         panic!("deferred test body must remain a resource")
     };
     let second_expanded = resolver.expand_module_call(&call, "second").unwrap();
@@ -6693,7 +6693,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
         .into_iter()
         .next()
         .unwrap();
-    let DeferredForBody::Resource(second) = second.body else {
+    let DeferredForBody::Resource(second) = second.into_body() else {
         panic!("deferred test body must remain a resource")
     };
 
@@ -6913,7 +6913,7 @@ let second = for item in source.second {
     let comments = parsed
         .deferred_for_expressions()
         .iter()
-        .map(|deferred| deferred.template_resource.get_attr("comment"))
+        .map(|deferred| deferred.template_resource().get_attr("comment"))
         .collect::<Vec<_>>();
     assert_eq!(
         comments,

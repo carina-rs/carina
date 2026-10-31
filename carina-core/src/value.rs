@@ -4169,7 +4169,7 @@ fn redact_deferred_template(
 ) -> Result<crate::parser::DeferredForExpression, SerializationError> {
     let mut redacted = template.clone();
     redacted.iterable = redact_secrets_only(&template.iterable)?;
-    *redacted.template_resource.attributes_mut() = template
+    *redacted.template_attributes_mut() = template
         .attributes()
         .iter()
         .map(|(key, value)| redact_secrets_only(value).map(|value| (key.clone(), value)))
@@ -4552,7 +4552,7 @@ fn rehydrate_deferred_template<S: Clone, T>(
         out.iterable = value;
     }
 
-    for (key, saved_value) in out.template_resource.attributes_mut() {
+    for (key, saved_value) in out.template_attributes_mut() {
         if let Some(value) = rehydrate_secret_entry(
             saved_value,
             candidate.attributes().get(key),
@@ -13464,10 +13464,7 @@ mod tests {
         };
         let redacted_template = &redacted_payload.template;
         assert!(matches!(
-            redacted_template
-                .template_resource
-                .attributes
-                .get("comment"),
+            redacted_template.attributes().get("comment"),
             Some(LoopValue::Deferred(
                 LoopDeferredValue::RedactedSecret { .. }
             ))
@@ -13493,16 +13490,10 @@ mod tests {
         };
         let template = &payload.template;
         assert!(matches!(
-            template.template_resource.attributes.get("comment"),
+            template.attributes().get("comment"),
             Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
         ));
-        assert!(
-            !template
-                .template_resource
-                .attributes
-                .values()
-                .any(contains_redacted_secret)
-        );
+        assert!(!template.attributes().values().any(contains_redacted_secret));
     }
 
     #[test]
@@ -13539,8 +13530,7 @@ mod tests {
         };
         let template = payload.template;
         let canonical = template
-            .template_resource
-            .attributes
+            .attributes()
             .get("comment")
             .expect("template resource comment");
 
@@ -13604,10 +13594,7 @@ mod tests {
         };
         let output = &payload.template;
         assert_eq!(output.as_ref(), &template);
-        assert_eq!(
-            output.template_resource.attributes.get("identifier"),
-            Some(&display_only),
-        );
+        assert_eq!(output.attributes().get("identifier"), Some(&display_only),);
     }
 
     fn replacement_plan_with_previous_attributes(
