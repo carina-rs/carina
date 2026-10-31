@@ -66,6 +66,11 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
+fn saved_plan_version_is_36_for_deferred_value_stages() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 36);
+}
+
+#[test]
 fn skip_resource_validation_cannot_bypass_pending_bare_binding_uses() {
     let fixture = tempfile::tempdir().expect("pending binding fixture");
     std::fs::write(
@@ -206,7 +211,7 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
         contents.provider_configs.as_provider_configs(),
     );
     contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect("test plan provider evidence must be valid")
 }
 
@@ -238,8 +243,9 @@ fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
 }
 
 fn checked_exports(
-    params: &[carina_core::parser::InferredExportParam],
-) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam> {
+    params: &[carina_core::parser::ExpandedInferredExportParam],
+) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::ExpandedInferredExportParam>
+{
     carina_core::validation::check_export_values_pre_apply(
         params,
         &carina_core::binding_index::ResolvedBindings::default(),
@@ -263,7 +269,7 @@ fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportSta
 fn saved_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
@@ -2832,7 +2838,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
 
 #[tokio::test]
 async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -2923,7 +2929,7 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         &carina_core::parser::ProviderContext::default(),
     )
     .unwrap();
-    let ctx = WiringContext::new_for_test(vec![], &parsed.providers);
+    let ctx = WiringContext::new_for_test_with_placeholders(vec![], &parsed.providers);
 
     assert!(
         ctx.factories().is_empty(),
@@ -3836,11 +3842,9 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("bound deferred loop parses");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
-        std::path::Path::new("."),
-    )
-    .expect("cross the deferred-body resolution seam");
+    let parsed = parsed
+        .into_expanded()
+        .expect("bound deferred loop must contain only loop slots");
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
@@ -3911,11 +3915,9 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
-        std::path::Path::new("."),
-    )
-    .expect("cross the deferred-body resolution seam");
+    let parsed = parsed
+        .into_expanded()
+        .expect("unbound deferred loop must contain only loop slots");
     let mut template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
@@ -4229,6 +4231,23 @@ fn plan_file_decode_accepts_base_mock_provider_evidence() {
 }
 
 #[test]
+fn plan_file_decode_rejects_loop_placeholder_outside_template() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["sorted_resources"][0]["attributes"]["leaked"] =
+        serde_json::json!({ "Unknown": "ForValue" });
+
+    let error = serde_json::from_value::<PlanFile>(encoded)
+        .expect_err("a loop placeholder outside a deferred template must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("for-loop placeholder is not allowed outside a deferred for-loop template"),
+        "unexpected plan decode error: {error}"
+    );
+}
+
+#[test]
 fn plan_file_decode_rejects_empty_schema_fingerprints_for_referenced_provider() {
     let mut encoded = encoded_plan_with_mock_provider_evidence();
     encoded["schema_fingerprints"]["providers"] = serde_json::json!({});
@@ -4348,11 +4367,11 @@ fn builtin_mock_recording_context() -> ValidatedConfig<()> {
 }
 
 #[test]
-fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
+fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents
-        .record_for_test(&builtin_mock_recording_context())
+        .record_for_test(&builtin_mock_recording_context(), Vec::new())
         .expect("built-in provider evidence must record");
     assert_eq!(
         recorded.provider_artifacts().get("mock"),
@@ -4375,6 +4394,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
         "data_source_values",
         "data_sources",
         "plan",
+        "persisted_directive_changes",
         "provider_artifacts",
         "provider_configs",
         "provider_scopes",
@@ -4440,6 +4460,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
             "upstream_snapshot",
             "upstream_sources",
             "wait_bindings",
+            "persisted_directive_changes",
             "schema_fingerprints",
             "provider_artifacts",
             "provider_scopes",
@@ -4463,11 +4484,10 @@ fn zero_referenced_provider_plan_round_trips() {
     contents.current_states.clear();
 
     let recorded = contents
-        .record_for_test(&ValidatedConfig::from_factories_for_test(
-            (),
+        .record_for_test(
+            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
             Vec::new(),
-            &[],
-        ))
+        )
         .expect("providerless evidence must record the built-in mock");
     assert!(recorded.schema_fingerprints().providers.is_empty());
     assert_eq!(
@@ -4508,7 +4528,7 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
 
     let ctx = ValidatedConfig::from_factories_for_test((), Vec::new(), &[]);
     let recorded = contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect("a state-only type from an unloaded provider must record");
 
     assert_eq!(
@@ -4559,7 +4579,7 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
 
     let ctx = ValidatedConfig::from_factories_for_test((), Vec::new(), &[configured]);
     let error = contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect_err("a configured provider without a loaded artifact must be rejected");
     assert_eq!(
         error,
@@ -4664,7 +4684,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
 #[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::{ConcreteValue, Value};
 
     let captured = Arc::new(Mutex::new(None));
@@ -4712,7 +4732,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
 #[tokio::test]
 async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -4908,7 +4928,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
 
 #[tokio::test]
 async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved() {
-    use carina_core::parser::InferredExportParam;
+    use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
     let captured = Arc::new(Mutex::new(None));
@@ -5032,7 +5052,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
 
 #[tokio::test]
 async fn finalize_apply_persists_resource_state_before_reporting_export_error() {
-    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::parser::{ExpandedInferredExportParam as InferredExportParam, TypeExpr};
 
     let captured = Arc::new(Mutex::new(None));
     let backend = CapturingBackend {

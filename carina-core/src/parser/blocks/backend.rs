@@ -3,8 +3,9 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use crate::parser::ParserBackendConfig as BackendConfig;
 use crate::parser::Rule;
-use crate::parser::ast::{BackendConfig, SourceSpan, UpstreamState};
+use crate::parser::ast::{SourceSpan, UpstreamState};
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_literal;

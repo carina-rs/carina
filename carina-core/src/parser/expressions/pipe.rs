@@ -7,6 +7,7 @@
 //! final `EvalValue` to a `Value` at the type boundary.
 
 use crate::eval_value::EvalValue;
+use crate::parser::ParsedValue as Value;
 use crate::parser::context::ExpressionMode;
 use crate::parser::expressions::integer_arithmetic::parse_additive_expr_with_mode;
 use crate::parser::functions::{
@@ -17,7 +18,7 @@ use crate::parser::{
     ParseContext, ParseError, Rule, eval_type_name, is_static_eval, next_pair,
     parse_expression_eval,
 };
-use crate::resource::{DeferredValue, Value};
+use crate::resource::DeferredValue;
 
 /// Apply one `|> function(extra_args...)` step.
 ///

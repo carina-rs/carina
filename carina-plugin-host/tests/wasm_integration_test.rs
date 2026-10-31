@@ -12,15 +12,15 @@ use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateObservation,
     CreateOutcome, CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Provider,
-    ProviderError, ProviderErrorKind, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
-    ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
-    ResumeOutcomeKind, SavedAttrs, Sent, SentRecord, UnobservedReason, UpdateRequest,
-    hydrate_provider_states, normalize_provider_states,
+    ProviderDirectiveSchema, ProviderError, ProviderErrorKind, ProviderFactory,
+    ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest, ResumeFailure,
+    ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind, SavedAttrs, Sent, SentRecord,
+    UnobservedReason, UpdateRequest, hydrate_provider_states, normalize_provider_states,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, EnumValueResolver, ProviderResource,
-    RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource, ResourceId, State,
-    UnknownReason, Value,
+    ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue, EnumValueResolver,
+    ProviderResource, RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
@@ -44,6 +44,13 @@ fn mock_http_load(bytes: &[u8]) -> VerifiedLoad {
 
 fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
+}
+
+fn delete_request_without_schema() -> DeleteRequest {
+    DeleteRequest::resolve(
+        &carina_core::resource::Directives::default(),
+        ProviderDirectiveSchema::Unavailable,
+    )
 }
 
 fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
@@ -629,7 +636,7 @@ fn resolved_provider_config(
     name: &str,
     attributes: indexmap::IndexMap<String, Value>,
 ) -> carina_core::parser::ResolvedProviderConfig {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = vec![carina_core::parser::ProviderConfig {
         name: name.to_string(),
         attributes,
@@ -737,7 +744,7 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
         .expect("mock SDK validator schema must cross the host boundary");
     let custom_types =
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
-    let attributes = HashMap::from([(
+    let attributes: HashMap<String, Value> = HashMap::from([(
         "guarded".to_string(),
         Value::Concrete(ConcreteValue::String("rejected".into())),
     )]);
@@ -1299,7 +1306,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
     let delete_started = Instant::now();
     provider
         .provider()
-        .delete(&id, &mock_identifier(), DeleteRequest::default())
+        .delete(&id, &mock_identifier(), delete_request_without_schema())
         .await
         .expect("pending delete should settle");
     assert!(
@@ -2668,7 +2675,7 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
     schema
         .validate_with_resolver(
-            &HashMap::from([(
+            &HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String("clean".into())),
             )]),
@@ -2700,7 +2707,7 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
     let validate = |value: &str| {
         schema.validate_with_resolver(
-            &HashMap::from([(
+            &HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String(value.to_string().into())),
             )]),
@@ -3054,7 +3061,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     // Delete
     provider
         .provider()
-        .delete(&id, &mock_identifier(), DeleteRequest::default())
+        .delete(&id, &mock_identifier(), delete_request_without_schema())
         .await
         .expect("delete should succeed");
 
@@ -3413,7 +3420,9 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
     resource.set_attr(
         "pending",
         Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-            DeferredValue::Unknown(UnknownReason::ForValue),
+            DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
+                binding: "pending".to_string(),
+            }),
         )])),
     );
     let mut resources = provider_resources(vec![resource]);
@@ -3433,7 +3442,9 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
         Some(Value::Concrete(ConcreteValue::List(values)))
             if matches!(
                 values.as_slice(),
-                [Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))]
+                [Value::Deferred(DeferredValue::Unknown(
+                    ApplyTimeUnknown::UpstreamAllExports { binding }
+                ))] if binding == "pending"
             )
     ));
     assert_eq!(

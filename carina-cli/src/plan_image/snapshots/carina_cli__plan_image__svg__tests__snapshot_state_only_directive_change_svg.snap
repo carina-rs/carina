@@ -1,0 +1,19 @@
+---
+source: carina-cli/src/plan_image/svg.rs
+expression: svg
+---
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="228" viewBox="0 0 900 228" role="img" aria-labelledby="title desc">
+  <rect id="background" fill="#ffffff" x="0" y="0" width="900" height="228"/>
+  <title id="title">carina plan</title>
+  <desc id="desc">Apply-order dependency graph with destructive-change blast radii.</desc>
+  <defs>
+    <marker id="arrow-default" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8c959f"/></marker>
+    <marker id="arrow-replace" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#8250df"/></marker>
+    <marker id="arrow-delete" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L8,4 L0,8 z" fill="#cf222e"/></marker>
+  </defs>
+  <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
+    <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
+    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#57606a" font-weight="600">1 resource directive change</tspan></text>
+    <text x="28" y="90" font-size="10.5" fill="#6e7781">state test-lineage-state-only-directive · serial 1</text>
+  </g>
+</svg>

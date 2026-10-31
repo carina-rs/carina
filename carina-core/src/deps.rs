@@ -14,7 +14,9 @@ use crate::resource::{ResolvedDataSource, ResolvedResource, Resource, Value};
 ///
 /// Both sources are always merged because partial resolution can cause
 /// ResourceRef bindings to differ from the original direct dependencies.
-pub fn get_resource_dependencies<S>(resource: &Resource<S>) -> HashSet<String> {
+pub fn get_resource_dependencies<S, P: crate::resource::PlaceholderKind>(
+    resource: &Resource<S, P>,
+) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
@@ -83,8 +85,8 @@ pub(crate) fn get_composition_runtime_dependencies(
 /// `dependency_bindings` ∪ `directives.depends_on`" — structurally the
 /// same union [`get_resource_dependencies`] computes for a managed
 /// resource.
-pub fn get_data_source_dependencies<S>(
-    data_source: &crate::resource::DataSource<S>,
+pub fn get_data_source_dependencies<S, P: crate::resource::PlaceholderKind>(
+    data_source: &crate::resource::DataSource<S, P>,
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in data_source.attributes.values() {
@@ -122,7 +124,10 @@ pub fn get_resolved_data_source_dependencies<S>(
 /// resource depends on the named binding. The two parse to different
 /// `Value` variants since #2847 (`ResourceRef` vs. `BindingRef`), so
 /// the walker visits both forms here.
-pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
+pub(crate) fn collect_dependencies<P: crate::resource::PlaceholderKind>(
+    value: &Value<P>,
+    deps: &mut HashSet<String>,
+) {
     value.visit_resource_refs(&mut |path| {
         deps.insert(path.binding().to_string());
     });
@@ -142,8 +147,8 @@ pub(crate) fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 /// can compute the snapshot for any node kind ([`Resource`],
 /// [`DataSource`], [`LiveComposition`](crate::resource::LiveComposition))
 /// uniformly (carina#3181 / #3308).
-pub fn get_resource_value_ref_dependencies<S>(
-    resource: crate::parser::ResourceRef<'_, S>,
+pub fn get_resource_value_ref_dependencies<S, P: crate::resource::PlaceholderKind>(
+    resource: crate::parser::ResourceRef<'_, S, P>,
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
     let attrs = resource.attributes();
@@ -164,7 +169,9 @@ pub fn get_resource_value_ref_dependencies<S>(
 ///
 /// Returns an error if a circular dependency is detected, with a message
 /// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
-pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Resource>, String> {
+pub fn sort_resources_by_dependencies<S: Clone, P: crate::resource::PlaceholderKind>(
+    resources: &[Resource<S, P>],
+) -> Result<Vec<Resource<S, P>>, String> {
     topological_sort(resources)
 }
 
@@ -283,7 +290,9 @@ pub fn sort_resolved_resources_by_dependencies<S: Clone>(
 }
 
 /// Internal topological sort for creation ordering.
-fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
+fn topological_sort<S: Clone, P: crate::resource::PlaceholderKind>(
+    resources: &[Resource<S, P>],
+) -> Result<Vec<Resource<S, P>>, String> {
     // Build binding name to input index mapping. Graph membership is indexed
     // by declaration position so two anonymous resources cannot collapse.
     let mut binding_to_index: HashMap<String, usize> = HashMap::new();
@@ -298,20 +307,20 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
     let mut visited: HashSet<usize> = HashSet::new();
     let mut visiting: Vec<usize> = Vec::new();
 
-    fn label(resource: &Resource) -> String {
+    fn label<S, P: crate::resource::PlaceholderKind>(resource: &Resource<S, P>) -> String {
         resource
             .binding
             .clone()
             .unwrap_or_else(|| resource.id.to_string())
     }
 
-    fn visit(
+    fn visit<S: Clone, P: crate::resource::PlaceholderKind>(
         index: usize,
-        resources: &[Resource],
+        resources: &[Resource<S, P>],
         binding_to_index: &HashMap<String, usize>,
         visited: &mut HashSet<usize>,
         visiting: &mut Vec<usize>,
-        sorted: &mut Vec<Resource>,
+        sorted: &mut Vec<Resource<S, P>>,
     ) -> Result<(), String> {
         if visited.contains(&index) {
             return Ok(());
@@ -373,10 +382,14 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
+    type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
+    type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
+    type Resource =
+        crate::resource::Resource<crate::resource::ModuleSource, crate::resource::NoPlaceholder>;
     use crate::effect::Effect;
-    use crate::resource::{
-        ConcreteValue, DeferredValue, Resource, ResourceId, ResourceIdentity, Value,
-    };
+    use crate::resource::{ResourceId, ResourceIdentity};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {

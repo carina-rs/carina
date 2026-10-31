@@ -1555,7 +1555,6 @@ impl EffectWithSource<ModuleSource> {
                         line: 12,
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
                         target: crate::parser::DeferredForTarget::Bound {
                             binding: "validation_records".to_string(),
                         },
@@ -1594,7 +1593,6 @@ impl EffectWithSource<ModuleSource> {
                         line: 12,
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
                         target: crate::parser::DeferredForTarget::Bound {
                             binding: "validation_records".to_string(),
                         },
@@ -2342,7 +2340,6 @@ mod tests {
             line: 12,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "route53.Record".to_string(),
-            attributes: vec![],
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "validation_records".to_string(),
             },
@@ -2520,11 +2517,11 @@ mod tests {
         // would wrap the nested value as a DSL string literal with
         // surrounding `"…"` quotes and `${…}` syntax).
         use crate::resource::{
-            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+            ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
         let inner = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamAllExports {
+                ApplyTimeUnknown::UpstreamAllExports {
                     binding: "u".into(),
                 },
             ))),
@@ -2567,11 +2564,11 @@ mod tests {
         // interpolation; the helper now gates that path through the
         // `Value` type.
         use crate::resource::{
-            ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value,
+            ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Value,
         };
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                UnknownReason::UpstreamAllExports {
+                ApplyTimeUnknown::UpstreamAllExports {
                     binding: "upstream".into(),
                 },
             ))),
@@ -2964,10 +2961,8 @@ mod tests {
         use crate::resource::Directives;
         let mut bucket = Resource::new("s3.Bucket", "b");
         bucket.binding = Some("bucket".to_string());
-        bucket.directives = Directives {
-            depends_on: vec!["role".to_string(), "kms".to_string()],
-            ..Directives::default()
-        };
+        bucket.directives =
+            Directives::default().with_depends_on(vec!["role".to_string(), "kms".to_string()]);
         let resources = vec![
             bucket.clone(),
             Resource::new("iam.Role", "role").with_binding("role"),

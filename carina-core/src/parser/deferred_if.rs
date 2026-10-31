@@ -8,36 +8,40 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::resource::{DataSource, Resource, Value};
+use crate::resource::{
+    DataSource, ModuleSource, ParserPlaceholder, PlaceholderKind, Resource, Value,
+};
 
-use super::{ModuleCall, ParsedFile};
+use super::{File, ModuleCall, ParsedDeferredForPhase, ParsedExportParam};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredIfCondition {
-    pub(crate) value: Value,
+pub struct DeferredIfCondition<P: PlaceholderKind = ParserPlaceholder> {
+    pub(crate) value: Value<P>,
     pub(crate) source_file: PathBuf,
     pub(crate) source_line: usize,
     pub(crate) source_expression: String,
 }
 
-impl DeferredIfCondition {
+impl DeferredIfCondition<ParserPlaceholder> {
     #[cfg(test)]
-    pub(crate) fn new(value: Value, source_file: PathBuf, source_line: usize) -> Self {
+    pub(crate) fn new(
+        value: Value<ParserPlaceholder>,
+        source_file: PathBuf,
+        source_line: usize,
+    ) -> Self {
         let source_expression = match &value {
-            Value::Deferred(crate::resource::DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument {
-                    name,
-                    diagnostic_name,
-                    ..
-                },
-            )) => diagnostic_name.as_deref().unwrap_or(name).to_string(),
+            Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                ParserPlaceholder::ModuleArgument { name, diagnostic },
+            )) => diagnostic.diagnostic_name().unwrap_or(name).to_string(),
             _ => crate::value::format_value(&value),
         };
         Self::new_with_source_expression(value, source_file, source_line, source_expression)
     }
+}
 
+impl<P: PlaceholderKind> DeferredIfCondition<P> {
     pub(crate) fn new_with_source_expression(
-        value: Value,
+        value: Value<P>,
         source_file: PathBuf,
         source_line: usize,
         source_expression: String,
@@ -50,7 +54,7 @@ impl DeferredIfCondition {
         }
     }
 
-    pub fn value(&self) -> &Value {
+    pub fn value(&self) -> &Value<P> {
         &self.value
     }
 
@@ -68,17 +72,17 @@ impl DeferredIfCondition {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct DeferredValueIf {
-    pub(crate) condition: DeferredIfCondition,
-    pub(crate) then_value: Value,
-    pub(crate) else_value: Value,
+pub struct DeferredValueIf<P: PlaceholderKind = ParserPlaceholder> {
+    pub(crate) condition: DeferredIfCondition<P>,
+    pub(crate) then_value: Value<P>,
+    pub(crate) else_value: Value<P>,
 }
 
-impl DeferredValueIf {
+impl<P: PlaceholderKind> DeferredValueIf<P> {
     pub(crate) fn new(
-        condition: DeferredIfCondition,
-        then_value: Value,
-        else_value: Value,
+        condition: DeferredIfCondition<P>,
+        then_value: Value<P>,
+        else_value: Value<P>,
     ) -> Self {
         Self {
             condition,
@@ -87,30 +91,30 @@ impl DeferredValueIf {
         }
     }
 
-    pub fn condition(&self) -> &DeferredIfCondition {
+    pub fn condition(&self) -> &DeferredIfCondition<P> {
         &self.condition
     }
 
-    pub fn then_value(&self) -> &Value {
+    pub fn then_value(&self) -> &Value<P> {
         &self.then_value
     }
 
-    pub fn else_value(&self) -> &Value {
+    pub fn else_value(&self) -> &Value<P> {
         &self.else_value
     }
 
-    pub fn values(&self) -> [&Value; 3] {
+    pub fn values(&self) -> [&Value<P>; 3] {
         [self.condition.value(), &self.then_value, &self.else_value]
     }
 
-    pub(crate) fn map(&self, mut map: impl FnMut(&Value) -> Value) -> Self {
+    pub(crate) fn map(&self, mut map: impl FnMut(&Value<P>) -> Value<P>) -> Self {
         self.try_map::<std::convert::Infallible>(|value| Ok(map(value)))
             .expect("an infallible deferred-if map cannot fail")
     }
 
     pub(crate) fn try_map<E>(
         &self,
-        mut map: impl FnMut(&Value) -> Result<Value, E>,
+        mut map: impl FnMut(&Value<P>) -> Result<Value<P>, E>,
     ) -> Result<Self, E> {
         Ok(Self::new(
             DeferredIfCondition::new_with_source_expression(
@@ -123,20 +127,36 @@ impl DeferredValueIf {
             map(&self.else_value)?,
         ))
     }
+
+    pub(crate) fn try_map_stage<Q: PlaceholderKind, E>(
+        self,
+        mut map: impl FnMut(Value<P>) -> Result<Value<Q>, E>,
+    ) -> Result<DeferredValueIf<Q>, E> {
+        Ok(DeferredValueIf::new(
+            DeferredIfCondition::new_with_source_expression(
+                map(self.condition.value)?,
+                self.condition.source_file,
+                self.condition.source_line,
+                self.condition.source_expression,
+            ),
+            map(self.then_value)?,
+            map(self.else_value)?,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct DeferredStructuralIf {
-    pub(crate) condition: DeferredIfCondition,
-    pub(crate) then_branch: DeferredIfBody,
-    pub(crate) else_branch: Option<DeferredIfBody>,
+pub struct DeferredStructuralIf<P: PlaceholderKind = ParserPlaceholder> {
+    pub(crate) condition: DeferredIfCondition<P>,
+    pub(crate) then_branch: DeferredIfBody<P>,
+    pub(crate) else_branch: Option<DeferredIfBody<P>>,
 }
 
-impl DeferredStructuralIf {
+impl<P: PlaceholderKind> DeferredStructuralIf<P> {
     pub(crate) fn new(
-        condition: DeferredIfCondition,
-        then_branch: DeferredIfBody,
-        else_branch: Option<DeferredIfBody>,
+        condition: DeferredIfCondition<P>,
+        then_branch: DeferredIfBody<P>,
+        else_branch: Option<DeferredIfBody<P>>,
     ) -> Self {
         Self {
             condition,
@@ -145,39 +165,39 @@ impl DeferredStructuralIf {
         }
     }
 
-    pub fn condition(&self) -> &DeferredIfCondition {
+    pub fn condition(&self) -> &DeferredIfCondition<P> {
         &self.condition
     }
 
-    pub fn then_branch(&self) -> &DeferredIfBody {
+    pub fn then_branch(&self) -> &DeferredIfBody<P> {
         &self.then_branch
     }
 
-    pub fn else_branch(&self) -> Option<&DeferredIfBody> {
+    pub fn else_branch(&self) -> Option<&DeferredIfBody<P>> {
         self.else_branch.as_ref()
     }
 
-    pub(crate) fn branches(&self) -> impl Iterator<Item = &DeferredIfBody> {
+    pub(crate) fn branches(&self) -> impl Iterator<Item = &DeferredIfBody<P>> {
         std::iter::once(&self.then_branch).chain(self.else_branch.iter())
     }
 
-    pub(crate) fn branches_mut(&mut self) -> impl Iterator<Item = &mut DeferredIfBody> {
+    pub(crate) fn branches_mut(&mut self) -> impl Iterator<Item = &mut DeferredIfBody<P>> {
         std::iter::once(&mut self.then_branch).chain(self.else_branch.iter_mut())
     }
 }
 
 #[derive(Debug, Clone)]
-pub enum DeferredIfBody {
-    Resource(Box<Resource>),
-    DataSource(Box<DataSource>),
-    ModuleCall(ModuleCall),
+pub enum DeferredIfBody<P: PlaceholderKind = ParserPlaceholder> {
+    Resource(Box<Resource<ModuleSource, P>>),
+    DataSource(Box<DataSource<ModuleSource, P>>),
+    ModuleCall(ModuleCall<P>),
     /// Resolver-prepared nested call contribution. Parsing only constructs
     /// `ModuleCall`; nested-module resolution replaces it with this form
     /// while the callee's binding/type scope is still available.
-    ExpandedModuleCall(Arc<ParsedFile>),
+    ExpandedModuleCall(Arc<File<ParsedExportParam<P>, P, P, ParsedDeferredForPhase<P>>>),
 }
 
-impl DeferredIfBody {
+impl<P: PlaceholderKind> DeferredIfBody<P> {
     pub(crate) fn binding(&self) -> Option<&str> {
         match self {
             Self::Resource(resource) => resource.binding.as_deref(),

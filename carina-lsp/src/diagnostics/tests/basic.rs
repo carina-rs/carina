@@ -84,6 +84,23 @@ fn provider_config_enum_accepts_identity_or_configured_provider_namespace_only()
 }
 
 #[test]
+fn provider_placeholder_attribute_does_not_hide_invalid_region() {
+    let engine = test_engine_with_region_config_provider("awscc");
+    let doc = create_document(
+        "provider awscc {\n  profile = \"${}\"\n  region = \"invalid-region\"\n}\n",
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("provider awscc: region:")
+                && diagnostic.message.contains("invalid-region")
+        }),
+        "the placeholder in profile must not suppress validation of region: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn reserved_resource_attribute_surfaces_parser_diagnostic() {
     let engine = test_engine();
     let doc = create_document("let bucket = aws.s3.Bucket {\n  \"_x\" = 1\n}\n");
@@ -925,6 +942,44 @@ for name, account_id in things {
     assert_eq!(d.source, Some("carina".to_string()));
     // Diagnostic should sit on the `for` line (1-indexed line 3 in source = 0-indexed 2)
     assert_eq!(d.range.start.line, 2);
+}
+
+#[test]
+fn unused_for_bindings_on_different_lines_emit_distinct_lsp_diagnostics() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"for x in [1, 2] {
+  awscc.ec2.Vpc { cidr_block = "10.0.0.0/16" }
+}
+
+for x in [3, 4] {
+  awscc.ec2.Vpc { cidr_block = "10.0.1.0/24" }
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let unused: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("for-loop binding 'x' is unused")
+        })
+        .collect();
+
+    assert_eq!(
+        unused.len(),
+        2,
+        "each authored loop must emit its own LSP diagnostic: {diagnostics:#?}"
+    );
+    assert_eq!(
+        unused
+            .iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>(),
+        vec![0, 4]
+    );
 }
 
 #[test]

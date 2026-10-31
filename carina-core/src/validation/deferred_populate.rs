@@ -34,10 +34,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::parser::File;
-use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Value,
-};
+use crate::parser::{File, ParsedValue as Value};
+use crate::resource::{AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment};
 use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 
 /// One diagnostic for a deferred-populate-bound chained reference
@@ -66,7 +64,7 @@ pub struct DeferredPopulateDiagnostic {
 /// Run the deferred-populate diagnostic against a parsed file +
 /// schema registry.
 pub fn validate_deferred_populate_refs<E, D: crate::parser::DeferredForPhaseTraversal>(
-    parsed: &File<E, D>,
+    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
     schemas: &SchemaRegistry,
 ) -> Vec<DeferredPopulateDiagnostic> {
     // binding name → (provider, resource_type) for schema lookup.
@@ -284,6 +282,7 @@ fn collect_unsynchronized_refs(
         }
         Value::Deferred(
             DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_)
             | DeferredValue::BindingRef { .. }
             | DeferredValue::RedactedSecret { .. },
         ) => {
@@ -407,12 +406,18 @@ mod tests {
         SourceSpan, WaitBinding,
     };
     use crate::resource::{
-        AccessPath, ConcreteValue, DeferredValue, PathSegment, Resource, ResourceId, Subscript,
-        Value,
+        AccessPath, ConcreteValue as StagedConcreteValue, DeferredValue as StagedDeferredValue,
+        PathSegment, Resource as StagedResource, ResourceId, Subscript,
     };
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
     };
+
+    type Value = crate::resource::Value<crate::resource::ParserPlaceholder>;
+    type ConcreteValue = StagedConcreteValue<crate::resource::ParserPlaceholder>;
+    type DeferredValue = StagedDeferredValue<crate::resource::ParserPlaceholder>;
+    type Resource =
+        StagedResource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
 
     fn cert_schema_with_dvo_inner_field_deferred() -> ResourceSchema {
         ResourceSchema::new("acm.Certificate").attribute(
@@ -591,7 +596,9 @@ mod tests {
             until_raw: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             until_predicate: crate::parser::UntilPredicateAst {
                 lhs_segments: vec!["cert".to_string(), "status".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
+                rhs: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    "ISSUED".into(),
+                )),
             },
             timeout_secs: None,
             depends_on: vec![],

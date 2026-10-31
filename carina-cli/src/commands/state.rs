@@ -497,8 +497,12 @@ pub async fn run_state_forget(
         &carina_core::schema::SchemaRegistry::new(),
     )?
     .parsed;
+    let backend_config = parsed
+        .backend
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
     let verified_backend =
-        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::ForgetState)?;
+        verify_for_mutation(path, backend_config.as_ref(), DriftCommand::ForgetState)?;
     let backend = verified_backend
         .resolve()
         .await
@@ -587,13 +591,18 @@ pub async fn run_force_unlock(
     )?
     .parsed;
     let base_dir = get_base_dir(path);
+    let backend_config = parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
 
     // Administrative lock recovery uses the shared old-backend-on-drift
     // selector without emitting the read-command warning.
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
 
-    match BackendSelection::force_unlock(base_dir, parsed.backend.as_ref(), lock_id).await {
+    match BackendSelection::force_unlock(base_dir, backend_config.as_ref(), lock_id).await {
         Ok(()) => {
             println!("{}", "State has been successfully unlocked.".green().bold());
             Ok(())
@@ -639,12 +648,17 @@ async fn load_state_file(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let parsed = loaded.parsed;
+    let backend_config = parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
 
     let base_dir = get_base_dir(path);
     let backend = resolve_backend_for_read(
         base_dir,
         path,
-        parsed.backend.as_ref(),
+        backend_config.as_ref(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
     )
@@ -1309,13 +1323,11 @@ async fn run_state_bucket_delete(
     })?;
     let bucket_id =
         ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
+    let delete_request =
+        state_bucket_delete_request(validated_config.context().schemas(), &bucket_id)?;
     match bucket_provider
         .provider()
-        .delete(
-            &bucket_id,
-            &bucket_identifier,
-            carina_core::provider::DeleteRequest::default(),
-        )
+        .delete(&bucket_id, &bucket_identifier, delete_request)
         .await
     {
         Ok(()) => {
@@ -1331,8 +1343,31 @@ async fn run_state_bucket_delete(
     }
 }
 
+fn state_bucket_delete_request(
+    schemas: &carina_core::schema::SchemaRegistry,
+    resource_id: &ResourceId,
+) -> Result<carina_core::provider::DeleteRequest, AppError> {
+    let directives = carina_core::resource::Directives::default();
+    let resolved = schemas
+        .try_resolve_directives(
+            resource_id,
+            carina_core::schema::SchemaKind::Resource,
+            &directives,
+        )
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "No managed resource schema registered for state bucket type \
+                 '{}.{}'",
+                resource_id.provider, resource_id.resource_type
+            ))
+        })?;
+    Ok(carina_core::provider::DeleteRequest::from_resolved(
+        resolved,
+    ))
+}
+
 async fn load_state_bucket_delete_provider_inputs<E>(
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -1436,7 +1471,7 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
-    mut validated_config: ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile>,
+    mut validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     base_dir: &std::path::Path,
@@ -1839,9 +1874,24 @@ pub(crate) async fn run_state_refresh_locked(
                 &data_source_values,
                 &state,
             );
+        let plan_input_current = carina_core::resource::into_plan_input_current_map(
+            managed_current.clone(),
+            ctx.schemas(),
+            &sorted_resources,
+        );
+        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
+                managed: &sorted_resources,
+                compositions: &parsed.compositions,
+                managed_current: &plan_input_current,
+                data_source_values: &data_source_values,
+                remote_bindings: &empty_remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
-            &carina_core::binding_index::ResolvedBindings::for_validation(parsed),
+            &export_bindings,
             ctx.provider_context(),
         )
         .map_err(AppError::Validation)?;
@@ -2671,17 +2721,11 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
-    fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
-        parsed: carina_core::parser::File<E>,
-        base_dir: &Path,
-    ) -> carina_core::parser::ModuleResolvedFile<E> {
-        carina_core::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
-            base_dir,
-            &ProviderContext::default(),
-            &SchemaRegistry::new(),
-        )
-        .expect("test fixture crosses module resolution")
+    fn resolve_file_for_test<E>(
+        parsed: carina_core::parser::ExpandedFile<E>,
+        _base_dir: &Path,
+    ) -> carina_core::parser::ExpandedFile<E> {
+        parsed
     }
 
     fn saved_composition_argument(value: Value) -> LiveCompositionArgument {
@@ -2885,7 +2929,9 @@ mod tests {
     #[tokio::test]
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = resolve_file_for_test(parsed, &downstream);
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -2932,7 +2978,9 @@ mod tests {
                 binding: "unrelated".to_string(),
                 source: PathBuf::from("../unrelated"),
             });
-        let parsed = resolve_file_for_test(parsed, &downstream);
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -2964,7 +3012,9 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
-        let parsed = resolve_file_for_test(parsed, &downstream);
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -3083,7 +3133,9 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_prepares_resolved_upstream_provider_config() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = resolve_file_for_test(parsed, &downstream);
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &downstream,
@@ -3111,6 +3163,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn state_bucket_delete_request_resolves_the_bucket_schema() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("s3.Bucket")
+                .default_prevent_destroy()
+                .validate()
+                .expect("bucket schema must validate"),
+        );
+
+        let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "state", None);
+        let request = state_bucket_delete_request(&schemas, &id)
+            .expect("the registered bucket schema must resolve");
+
+        assert!(request.directives().prevent_destroy());
+    }
+
     #[tokio::test]
     async fn state_bucket_delete_reports_provider_attribute_for_missing_upstream_state() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
@@ -3122,7 +3192,9 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
-        let parsed = resolve_file_for_test(parsed, &downstream);
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
 
         let error = match load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3147,7 +3219,9 @@ mod tests {
     async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         parsed.providers[0].name = "test".to_string();
-        let parsed = resolve_file_for_test(parsed, &base_dir);
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider default-tags fixture has no parser placeholders");
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &base_dir,
@@ -3202,7 +3276,9 @@ mod tests {
                 .contains_key("default_tags"),
             "the fixture must exercise the parser shape used by bucket delete"
         );
-        let parsed = resolve_file_for_test(parsed, temp.path());
+        let parsed = parsed
+            .into_expanded()
+            .expect("bucket-delete fixture has no leftover parser placeholders");
 
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3538,7 +3614,7 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed
             .data_sources
@@ -3627,7 +3703,7 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
@@ -3697,7 +3773,7 @@ mod tests {
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(carina_core::parser::ProviderConfig {
             name: "test".to_string(),
             attributes: IndexMap::new(),
@@ -4312,12 +4388,10 @@ mod tests {
             &ProviderContext::default(),
         )
         .expect("test config should parse");
-        let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
-            std::path::Path::new("."),
-        )
-        .expect("state-refresh fixture crosses module resolution");
-        assert_eq!(parsed.deferred_for_expressions().len(), 1);
+        assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+        let parsed = parsed
+            .into_expanded()
+            .expect("state-refresh fixture must contain only loop slots");
 
         let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let source = parsed
@@ -5662,15 +5736,13 @@ mod tests {
         let mut row = ResourceState::try_applied("ec2.Subnet", "main", "awscc", "subnet-current")
             .expect("fixture identifier is non-empty")
             .with_attribute("token", json!("old-token"));
-        row.directives = carina_core::resource::Directives {
-            force_delete: true,
-            create_before_destroy: true,
-            prevent_destroy: true,
-            depends_on: vec!["security_group".to_string()],
-            provider_instance: Some("west".to_string()),
-            ignore_changes: Vec::new(),
-        }
-        .into();
+        row.directives = carina_core::resource::Directives::default()
+            .with_force_delete(true)
+            .with_create_before_destroy(true)
+            .with_depends_on(vec!["security_group".to_string()])
+            .with_provider_instance("west")
+            .with_prevent_destroy(true)
+            .into();
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -5743,14 +5815,12 @@ mod tests {
         );
         assert_eq!(
             refreshed.directives,
-            carina_core::resource::Directives {
-                force_delete: true,
-                create_before_destroy: true,
-                prevent_destroy: true,
-                depends_on: vec!["security_group".to_string()],
-                provider_instance: Some("west".to_string()),
-                ignore_changes: Vec::new(),
-            }
+            carina_core::resource::Directives::default()
+                .with_force_delete(true)
+                .with_create_before_destroy(true)
+                .with_depends_on(vec!["security_group".to_string()])
+                .with_provider_instance("west")
+                .with_prevent_destroy(true)
         );
         assert_eq!(
             refreshed.prefixes,
@@ -5800,7 +5870,8 @@ mod tests {
         assert!(matches!(
             &plan.errors()[0].kind,
             carina_core::plan::PlanErrorKind::PreventDestroy {
-                action: carina_core::plan::PreventDestroyAction::DeleteRemovedFromConfiguration
+                action: carina_core::plan::PreventDestroyAction::DeleteRemovedFromConfiguration,
+                source: carina_core::plan::PreventDestroySource::ExplicitDirective,
             }
         ));
     }

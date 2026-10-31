@@ -118,6 +118,13 @@ fn parse_resolve_yields_canonical_interpolations() {
 
     let parsed = parse_file_and_resolve(src, std::path::Path::new("canonicalize.crn"))
         .expect("parse should succeed");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )
+    .expect("module-resolution boundary should succeed")
+    .into_expanded()
+    .expect("canonicalization fixture contains no parser placeholders");
 
     for resource in &parsed.resources {
         for (k, v) in &resource.attributes {
@@ -159,6 +166,13 @@ fn double_quoted_literal_is_canonical_string() {
     "#;
     let parsed = parse_file_and_resolve(src, std::path::Path::new("canonicalize.crn"))
         .expect("parse should succeed");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )
+    .expect("module-resolution boundary should succeed")
+    .into_expanded()
+    .expect("canonicalization fixture contains no parser placeholders");
     let resource = &parsed.resources[0];
     let value = resource.attributes.get("name").expect("name attribute");
     assert!(

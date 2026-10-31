@@ -1555,6 +1555,9 @@ pub struct ResourceSchema {
     /// Protocol-v13 cardinality constraints over sibling attributes.
     /// Required even when empty so version skew fails during JSON loading.
     pub field_groups: Vec<FieldGroup>,
+    /// Whether the resource type is protected from destruction unless the
+    /// user explicitly opts out. Required so version skew fails closed.
+    pub default_prevent_destroy: bool,
     /// Named definitions reachable via [`AttributeType::Ref`] from
     /// this resource's attribute types. Empty for resources whose
     /// attribute graph contains no cycles (the common case). Mirror
@@ -1895,7 +1898,8 @@ mod tests {
     fn protocol_v13_requires_field_groups_on_resources_and_structs() {
         let resource_error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
             "resource_type": "test.Widget",
-            "attributes": {}
+            "attributes": {},
+            "default_prevent_destroy": false
         }))
         .expect_err("protocol v13 resource field_groups must not default")
         .to_string();
@@ -1909,6 +1913,19 @@ mod tests {
         .expect_err("protocol v13 struct field_groups must not default")
         .to_string();
         assert!(struct_error.contains("field_groups"), "{struct_error}");
+    }
+
+    #[test]
+    fn protocol_v13_requires_default_prevent_destroy_on_resources() {
+        let error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
+            "resource_type": "test.Resource",
+            "attributes": {},
+            "field_groups": []
+        }))
+        .expect_err("protocol v13 default_prevent_destroy must not default")
+        .to_string();
+
+        assert!(error.contains("default_prevent_destroy"), "{error}");
     }
 
     #[test]
@@ -2725,6 +2742,7 @@ mod tests {
                 "resource_type":"ec2.SecurityGroup",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":"group_name"
             }"#,
         )
@@ -2739,6 +2757,7 @@ mod tests {
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":null
             }"#,
         )
@@ -2749,7 +2768,8 @@ mod tests {
             r#"{
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
-                "field_groups":[]
+                "field_groups":[],
+                "default_prevent_destroy":false
             }"#,
         )
         .unwrap();
@@ -2760,6 +2780,7 @@ mod tests {
                 "resource_type":"logs.LogGroup",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "name_attribute":"log_group_name"
             }"#,
         )
@@ -2777,6 +2798,7 @@ mod tests {
                 "resource_type":"s3.Bucket",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"attribute","value":"bucket_name"}
             }"#,
         )
@@ -2791,6 +2813,7 @@ mod tests {
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"coexisting"}
             }"#,
         )
@@ -2802,6 +2825,7 @@ mod tests {
                 "resource_type":"organizations.Organization",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"conflicting"}
             }"#,
         )
@@ -2833,6 +2857,7 @@ mod tests {
                 operation_config: None,
                 validators: vec![],
                 field_groups: vec![],
+                default_prevent_destroy: false,
                 defs: std::collections::BTreeMap::new(),
             };
 
@@ -2848,6 +2873,7 @@ mod tests {
                 "resource_type":"s3.Bucket",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"attribute"}
             }"#,
         )
@@ -2871,6 +2897,7 @@ mod tests {
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"coexists"}
             }"#,
         )
@@ -2898,6 +2925,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: std::collections::BTreeMap::from([(
                 "Statement".to_string(),
                 AttributeType::Struct {
@@ -3078,7 +3106,7 @@ mod tests {
 
     #[test]
     fn test_resource_schema_with_operation_config() {
-        let json = r#"{"resource_type":"ec2.tgw","attributes":{},"field_groups":[],"operation_config":{"delete_timeout_secs":1800}}"#;
+        let json = r#"{"resource_type":"ec2.tgw","attributes":{},"field_groups":[],"default_prevent_destroy":false,"operation_config":{"delete_timeout_secs":1800}}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert_eq!(
             schema.operation_config.unwrap().delete_timeout_secs,
@@ -3088,7 +3116,7 @@ mod tests {
 
     #[test]
     fn test_resource_schema_without_operation_config() {
-        let json = r#"{"resource_type":"ec2.Vpc","attributes":{},"field_groups":[]}"#;
+        let json = r#"{"resource_type":"ec2.Vpc","attributes":{},"field_groups":[],"default_prevent_destroy":false}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert!(schema.operation_config.is_none());
     }
@@ -3330,5 +3358,14 @@ mod tests {
             "do-not-log-this",
             "the raw value is available only at the explicit provider-call seam"
         );
+    }
+
+    #[test]
+    fn delete_request_retains_default_for_provider_compatibility() {
+        let request = DeleteRequest::default();
+
+        assert!(!request.directives.force_delete);
+        assert!(!request.directives.create_before_destroy);
+        assert!(!request.directives.prevent_destroy);
     }
 }

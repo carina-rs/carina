@@ -22,7 +22,7 @@ use carina_core::provider::{
     ResumeOutcomeKind,
 };
 use carina_core::resource::{
-    ConcreteValue, Resource, ResourceId, State, Value, legacy_secret_migration,
+    ConcreteValue, PlaceholderKind, Resource, ResourceId, State, Value, legacy_secret_migration,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
@@ -92,8 +92,8 @@ impl std::error::Error for MockStateValueDecodeError {
 /// `provider mock {}` whose provider factory was not loaded. A sourced mock
 /// always belongs to the plugin path, including when that plugin failed to
 /// load.
-pub fn uses_builtin_provider<'a>(
-    provider_configs: impl IntoIterator<Item = &'a ProviderConfig>,
+pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a>(
+    provider_configs: impl IntoIterator<Item = &'a ProviderConfig<P>>,
     provider_is_loaded: impl FnOnce(&str) -> bool,
 ) -> bool {
     let mut provider_configs = provider_configs.into_iter().peekable();
@@ -233,6 +233,14 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
             .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent_name", AttributeType::string()).build())
             .with_unique_name_attribute("name"),
+        ResourceSchema::new("test.default_prevent_destroy")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("name")
+            .default_prevent_destroy(),
         ResourceSchema::new(SERVER_ADDED_LIST_RESOURCE_TYPE)
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -1707,11 +1715,19 @@ impl Provider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::NoPlaceholder;
     use std::ffi::{OsStr, OsString};
     use std::sync::Mutex;
     use std::time::Instant;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn delete_request_without_schema() -> DeleteRequest {
+        DeleteRequest::resolve(
+            &carina_core::resource::Directives::default(),
+            carina_core::provider::ProviderDirectiveSchema::Unavailable,
+        )
+    }
 
     #[test]
     fn builtin_schemas_are_all_valid() {
@@ -2056,6 +2072,8 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()
+        .into_expanded()
+        .expect("mock provider fixture must not retain parser placeholders")
         .providers
         .into_iter()
         .next()
@@ -2064,7 +2082,7 @@ mod tests {
 
     #[test]
     fn builtin_provider_selection_is_shared_by_implicit_and_explicit_mock_paths() {
-        assert!(uses_builtin_provider(&[], |_| {
+        assert!(uses_builtin_provider::<NoPlaceholder>(&[], |_| {
             panic!("the implicit fallback does not depend on loaded factories")
         }));
 
@@ -2550,7 +2568,7 @@ mod tests {
                 .expect("update should succeed");
 
             provider
-                .delete(&id, &identifier, DeleteRequest::default())
+                .delete(&id, &identifier, delete_request_without_schema())
                 .await
                 .expect("delete should succeed");
         });
@@ -2698,7 +2716,7 @@ mod tests {
         let identifier =
             AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
         runtime
-            .block_on(provider.delete(&id, &identifier, DeleteRequest::default()))
+            .block_on(provider.delete(&id, &identifier, delete_request_without_schema()))
             .unwrap();
         let elapsed = started.elapsed();
 

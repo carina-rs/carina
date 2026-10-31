@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::detail_rows::DetailRow;
 use crate::effect::Effect;
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, ReplaceDisplayInfo};
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, LoopSlot, Value};
 use crate::value::{
     RenderedValue, is_upstream_deferred_marker_value, render_value_with_upstream_deferred_label,
 };
@@ -112,8 +112,8 @@ pub fn deferred_for_detail_rows<S>(
     let mut rows = vec![DetailRow::Text {
         text: format!("<- {}", template.header),
     }];
-    let mut attrs: Vec<_> = template.attributes.iter().collect();
-    attrs.sort_by_key(|(key, _)| key.clone());
+    let mut attrs: Vec<_> = template.template_resource.attributes.iter().collect();
+    attrs.sort_by_key(|(name, _)| *name);
     rows.extend(attrs.into_iter().map(|(key, value)| DetailRow::Attribute {
         key: key.clone(),
         value: render_deferred_for_template_value(value, upstream_binding, verb),
@@ -124,7 +124,7 @@ pub fn deferred_for_detail_rows<S>(
 }
 
 pub fn render_deferred_for_template_value(
-    value: &Value,
+    value: &Value<LoopSlot>,
     upstream_binding: &str,
     verb: &str,
 ) -> RenderedValue {
@@ -592,7 +592,7 @@ mod tests {
     use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
         ConcreteValue, DeferredValue, Directives, InterpolationPart, PathSegment, ResolvedResource,
-        Resource, ResourceId, ResourceIdentity, State, Subscript, UnknownReason, Value,
+        Resource, ResourceId, ResourceIdentity, State, Subscript, Value,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
@@ -609,7 +609,6 @@ mod tests {
             line: 1,
             header: "for x in (up.items ?? fallback.items)".to_string(),
             resource_type: "test.Child".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -626,7 +625,7 @@ mod tests {
 
     #[test]
     fn deferred_for_display_hides_direct_placeholder_access_but_keeps_expressions() {
-        let placeholder = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+        let placeholder = Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value));
         let direct_access = crate::resource::apply_postfix_access(
             crate::resource::apply_postfix_access(
                 placeholder.clone(),
@@ -696,7 +695,7 @@ mod tests {
     fn deferred_for_display_does_not_rewrite_marker_text_inside_map_keys() {
         let value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
             "(known after upstream apply: x)".to_string(),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         )])));
 
         assert_eq!(
@@ -708,7 +707,7 @@ mod tests {
     #[test]
     fn deferred_for_display_rewrites_access_inside_interpolation() {
         let access = crate::resource::apply_postfix_access(
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
             PathSegment::Field {
                 name: "resource_record_name".to_string(),
             },
@@ -913,7 +912,6 @@ mod tests {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "validation_records".to_string(),
             },
@@ -989,7 +987,6 @@ mod tests {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "validation_records".to_string(),
             },

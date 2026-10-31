@@ -8,7 +8,7 @@ use crate::provider::{
     BoxFuture, NoopNormalizer, ProviderError, ProviderNormalizer, ProviderResult, ready_noop,
 };
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, Resource, UnknownReason, Value,
+    ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, Resource, Value,
 };
 use crate::schema::SchemaRegistry;
 
@@ -439,9 +439,9 @@ async fn desired_normalization_runs_stages_in_order() {
         calls.lock().unwrap().clone(),
         vec![format!(
             "normalize_desired:{:?}",
-            Some(Value::Concrete(ConcreteValue::StringList(vec![
-                "one".into()
-            ])))
+            Some(Value::<crate::resource::NoPlaceholder>::Concrete(
+                ConcreteValue::StringList(vec!["one".into()])
+            ))
         )],
         "canonicalization must run before normalize_desired"
     );
@@ -862,7 +862,11 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
     resource.set_attr("role_arn", deferred.clone());
     resource.set_attr(
         "pending",
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "upstream".to_string(),
+            },
+        )),
     );
 
     let normalized =
@@ -878,7 +882,7 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
     assert!(matches!(
         normalized.as_resource().get_attr("pending"),
         Some(Value::Deferred(DeferredValue::Unknown(
-            UnknownReason::ForValue
+            ApplyTimeUnknown::UpstreamAllExports { .. }
         )))
     ));
     assert_eq!(

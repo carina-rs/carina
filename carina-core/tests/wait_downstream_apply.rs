@@ -282,7 +282,11 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
 
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
+
     let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
     // expansion, instance-prefixed with the module-call binding (`r`).
@@ -472,7 +476,11 @@ async fn nested_module_wait_binding_survives_two_expansions() {
 
     let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
+
     let parsed = resolve_modules(parsed, &root).expect("nested module resolution should succeed");
+    let parsed = parsed
+        .into_expanded()
+        .expect("expanded nested module fixture contains no parser placeholders");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
     // (outer call binding `o`, inner call binding `c`).
@@ -649,6 +657,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
     let parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
+    let parsed = parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders");
 
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).expect("topological sort");

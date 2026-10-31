@@ -21,6 +21,7 @@ use crate::resolver::resolve_ref_value;
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
+use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
 
 use super::wait::{InFlightStart, StartedEffect};
@@ -308,6 +309,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         ) => false,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -406,6 +408,7 @@ fn assert_fully_resolved(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             assert_fully_resolved(inner, attribute_key, bindings)
         }
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Deferred(DeferredValue::ModuleIf(_)) => Err(format!(
             "Attribute '{}' contains an unresolved module-template conditional",
             attribute_key
@@ -594,6 +597,7 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
             collect_unresolved_bindings(expression.rhs(), out);
         }
         Value::Deferred(DeferredValue::Unknown(_)) => {}
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(ConcreteValue::List(items)) => {
             for v in items {
                 collect_unresolved_bindings(v, out);
@@ -1236,16 +1240,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             directives,
             ..
         } => {
-            match provider
-                .delete(
-                    id,
-                    identifier,
-                    DeleteRequest {
-                        directives: directives.clone(),
-                    },
-                )
-                .await
-            {
+            let resolved_directives =
+                preparation
+                    .schemas()
+                    .resolve_directives(id, SchemaKind::Resource, directives);
+            let request = DeleteRequest::from_resolved(resolved_directives);
+            match provider.delete(id, identifier, request).await {
                 Ok(()) => BasicEffectResult::Deleted {
                     instance_key: DeletedInstanceKey::new(
                         id.clone(),
@@ -1344,7 +1344,7 @@ mod process_basic_result_tests {
 
     #[test]
     fn partial_success_records_state_and_diagnostic() {
-        let resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
         let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
@@ -1428,8 +1428,8 @@ mod assert_fully_resolved_tests {
     use super::*;
     use crate::binding_index::{BindingValueSource, ResolvedBindings};
     use crate::resource::{
-        AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Subscript,
-        UnknownReason, Value,
+        AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, PathSegment,
+        Subscript, Value,
     };
 
     fn dvo_chained_ref() -> Value {
@@ -1472,7 +1472,11 @@ mod assert_fully_resolved_tests {
 
     #[test]
     fn unknown_is_rejected_at_apply_seam() {
-        let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+        let v = Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "upstream".to_string(),
+            },
+        ));
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("Unknown must be rejected at apply seam");
         assert!(err.contains("value is not yet known"), "got: {err}");

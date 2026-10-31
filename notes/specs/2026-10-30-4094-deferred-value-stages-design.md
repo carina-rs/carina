@@ -40,7 +40,7 @@ pub enum DeferredValue<P> {
 }
 
 pub enum NoPlaceholder {}                       // 値を持たない型
-pub enum ParserPlaceholder { FnParam { .. }, FnLocal { .. }, ModuleArgument { .. }, EmptyInterpolation }
+pub enum ParserPlaceholder { FnParam { .. }, FnLocal { .. }, ModuleArgument { .. }, EmptyInterpolation { .. }, Loop(LoopSlot) }
 pub enum LoopSlot { Key, Index, Value }
 pub enum ApplyTimeUnknown { UpstreamExport { .. }, UpstreamAllExports { .. }, PendingReRead(..) }
 ```
@@ -51,23 +51,32 @@ pub enum ApplyTimeUnknown { UpstreamExport { .. }, UpstreamAllExports { .. }, Pe
 
 | 段階 | 値の型 | 持てる仮置き |
 | --- | --- | --- |
-| パーサーの出力、関数の本体、moduleの定義 | `Value<ParserPlaceholder>` | 関数の引数、関数内のlet、moduleの引数、空の`${}` |
+| パーサーの出力、関数の本体、moduleの定義 | `Value<ParserPlaceholder>` | 関数の引数、関数内のlet、moduleの引数、空の`${}`、for-loopの本体の中のloopの仮置き |
 | for-loopのテンプレート（`DeferredForExpression`） | `Value<LoopSlot>` | for-loopのキー、番号、値 |
 | 展開と検証が終わった後（資源、データソース、plan、state、provider） | `Value`（`Value<NoPlaceholder>`） | なし |
 
 ### 段階の境目
 
-パーサーの段階から展開後の段階への変換は、失敗しうる関数1つにまとめます。
+パーサーの段階から展開後の段階へは、ディレクトリの設定全体（`File`）を単位に、失敗しうる変換を1つだけ通します。
 
 ```rust
-impl Value<ParserPlaceholder> {
-    fn into_expanded(self) -> Result<Value, LeftoverPlaceholder>;
+impl File<E, ParserPlaceholder, ParserPlaceholder> {
+    fn validate_expansion_boundary(&self, boundary: ParserPlaceholderBoundary)
+        -> Result<(), LeftoverPlaceholders>;
+    fn into_expanded(self)
+        -> Result<File<E::Expanded, NoPlaceholder, LoopSlot>, LeftoverPlaceholders>;
 }
 ```
 
-moduleの展開と関数の呼び出しで仮置きを置き換えたあと、ディレクトリの設定を検証済みにするところ（今の`ResolvedFile`を作るところ）で、この変換を通します。残っていた仮置きは`LeftoverPlaceholder`という型付きのエラーになります。空の`${}`は置き換わることがないので、今の`validate_no_empty_interpolations`の役目もこの変換が引き継ぎ、同じ文言のエラーを出します。
+moduleの展開と関数の呼び出しで仮置きを置き換えたあと、ディレクトリの設定を検証済みにするところ（今の`ResolvedFile`を作るところ）で、この変換を通します。残っていた仮置きは、1つ目で止めずにすべて集め、どの資源のどの属性か、どのexportかといった場所の情報を付けた`LeftoverPlaceholders`という型付きのエラーにします。空の`${}`とmoduleの引数の仮置きは、書かれたファイルと位置も持っています（値の比較やハッシュ、保存には含めません）。そのため、CLIはファイルと行を示せ、エディタはそのファイルの正しい位置に印を付けられます。空の`${}`は置き換わることがないので、今の`validate_no_empty_interpolations`の役目もこの境目が引き継ぎ、同じ文言のエラーを出します。
 
-for-loopの子を作る`expand_deferred_children`は、`Value<LoopSlot>`のテンプレートを受け取り、仮置きを置き換えた`Value`を返す変換になります。テンプレートの外の値は、最初から`Value`です。
+検査は、`carina validate`、`plan`、`destroy`、`state`の各コマンドと、エディタ（LSP）の診断がすべて同じこの境目を通ります。mainでは`destroy`と`state`が書きかけの`${}`を見逃していましたが、見逃すには展開できない値を黙って捨てる経路が要るので、ここでは場所つきのエラーで止めます。エディタでも、空の`${}`は警告ではなくエラーとして出します。
+
+集める処理は`File`とその中の構造体のフィールドをすべて書き出して分解するので、新しいフィールドを足すとコンパイルで止まります。moduleの定義そのもの（呼び出し側がまだ引数を渡していないもの）は`ParserPlaceholderBoundary::ModuleDefinition`で検査し、moduleの展開が実際に置き換えるフィールド（資源、データソース、composition、入れ子のmodule呼び出しの引数、引数の既定値と検証、`let`の値、requires、for-loop）でだけmoduleの引数の仮置きを許します。providerやbackend、stateのimport、exportは、展開で置き換わらないので、moduleの定義の中でもエラーにします。waitの比べる値は文法上リテラルしか書けないので、仮置きを持てない型（`Value<NoPlaceholder>`）にしてあり、ここでは検査しません。moduleの引数は`arguments`にだけ置き、`let`の変数としては複製しません。
+
+moduleの引数の仮置きが持つ位置は、引数を最初に参照した箇所です。たとえば`let reg = r`をproviderの属性で使うと、エラーの位置は`let`の行になり、文言のほうで「どのproviderのどの属性か」を示します。使った側の位置も持たせるには、属性ごとに位置を持たせる必要があり、この変更では入れていません。
+
+for-loopの子を作る`expand_deferred_children`は、`Value<LoopSlot>`のテンプレートを受け取り、仮置きを置き換えた`Value`を返す変換になります。テンプレートの属性は、子を作るときに実際に使う`template_resource`の1か所にだけ置きます（以前は同じ属性を2か所に持っていました）。テンプレートの外の値は、最初から`Value`です。
 
 ### for-loopの理由をどこに置くか
 
@@ -79,6 +88,8 @@ for-loopの子を作る`expand_deferred_children`は、`Value<LoopSlot>`のテ�
 - 参照と式（`ReferenceExpr`）に入れる。設計文書の§6.4の考えに近いのですが、保存したテンプレートの中でだけ許す、という条件を別に持たせる必要があります。
 
 テンプレート専用の型を選びます。長い目で見ても、型の安全性でも、根本原因の場所でも、この案だけが「ふつうの値はfor-loopの仮置きを持たない」を型で保証するからです。§6.4は、置き換えを参照の解決の一部と見ていました。しかし今のコードでは、置き換えはテンプレートから子を作る処理です（更新のあとのplanとapplyの途中の両方で使います）。§6.4はこの点で古くなっています。
+
+パーサーは、for-loopの本体を読む時点で、loopのキー・番号・値を`ParserPlaceholder::Loop(LoopSlot)`として作ります。本体にはmoduleの引数などほかの仮置きも入りうるので、パーサーの段階ではこれらを同じ型に置きます。テンプレートを作る変換が`Loop`を`LoopSlot`に移し、テンプレートの外に`Loop`が残っていれば`into_expanded`が型付きのエラーにします。loopの変数をふつうの束縛への参照として作り、テンプレートにするときに名前で見分ける方法は採りません。名前を識別子に使うことになり、`item[0]`のように正規化で綴りが変わった参照を取りこぼすうえ、参照を扱う検査のすべてに「loopの変数の名前は除く」という絞り込みが要るからです（最初の実装はこの形になっていて、レビューで差し戻しました）。
 
 ### 保存したplanの形式
 

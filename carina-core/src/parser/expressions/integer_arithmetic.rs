@@ -5,7 +5,9 @@ use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer
 use crate::parser::context::ExpressionMode;
 use crate::parser::expressions::primary::parse_postfix_eval_with_mode;
 use crate::parser::{ParseContext, ParseError, Rule, next_pair};
-use crate::resource::{DeferredValue, Value};
+use crate::resource::{DeferredValue, ParserPlaceholder, Value as GenericValue};
+
+type Value = GenericValue<ParserPlaceholder>;
 
 pub(crate) fn parse_additive_expr_with_mode(
     pair: pest::iterators::Pair<Rule>,

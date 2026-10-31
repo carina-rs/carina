@@ -29,7 +29,7 @@ fn resolved(resource: Resource) -> ResolvedResource {
 }
 
 fn mock_saved_provider_configs() -> SavedProviderConfigs {
-    let mut parsed = carina_core::parser::InferredFile::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = vec![ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
@@ -62,7 +62,7 @@ fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
     }];
     let providers = ValidatedConfig::for_test((), Vec::<LoadedProviderFactory>::new(), &configs);
     contents
-        .record_for_test(&providers)
+        .record_for_test(&providers, Vec::new())
         .expect("mock plan provider evidence must be valid")
 }
 
@@ -252,13 +252,22 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         .insert("validation_records[0]".to_string());
     let consumer_from = consumer_current_state(&consumer.id);
 
-    let template_resource = mock_resource("validation_records", "validation_records");
+    let template_resource: carina_core::resource::Resource<
+        carina_core::resource::ModuleSource,
+        carina_core::resource::LoopSlot,
+    > = carina_core::resource::Resource::with_provider(
+        "mock",
+        "test.resource",
+        carina_core::resource::ResourceIdentity::try_from("validation_records".to_string())
+            .unwrap(),
+        None,
+    )
+    .with_binding("validation_records");
     let template = DeferredForExpression {
         file: Some("main.crn".to_string()),
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "mock.test.resource".to_string(),
-        attributes: vec![],
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
