@@ -21,7 +21,9 @@
 //! See #2230 for the design discussion.
 
 use crate::parser::{PendingValueSlot, ResourceTypePath};
-use crate::resource::{ParserPlaceholder, PathSegment, Subscript, Value as GenericValue};
+use crate::resource::{
+    LoopSlot, NoPlaceholder, ParserPlaceholder, PathSegment, Subscript, Value as GenericValue,
+};
 use indexmap::IndexMap;
 
 type Value = GenericValue<ParserPlaceholder>;
@@ -296,7 +298,7 @@ pub(crate) enum EvalValue {
     /// authored binding name on the evaluator axis lets a postfix chain retain
     /// `item.missing` for plan display without resurrecting the removed
     /// path-carrying `ApplyTimeUnknown` variant.
-    DeferredForValue { binding: String },
+    DeferredForValue { binding: String, slot: LoopSlot },
 
     /// A partially applied function. Lives strictly inside the evaluator.
     /// Constructed when `evaluate_builtin` or a user-function call sees
@@ -359,6 +361,10 @@ impl EvalValue {
         Self::User(value)
     }
 
+    pub(crate) fn from_expanded_value(value: GenericValue<NoPlaceholder>) -> Self {
+        Self::User(value.into_placeholder_type())
+    }
+
     /// Build a closure value from its parts.
     pub(crate) fn closure(
         name: impl Into<String>,
@@ -405,9 +411,10 @@ impl EvalValue {
         }
     }
 
-    pub(crate) fn deferred_for_value(binding: impl Into<String>) -> Self {
+    pub(crate) fn deferred_for_value(binding: impl Into<String>, slot: LoopSlot) -> Self {
         Self::DeferredForValue {
             binding: binding.into(),
+            slot,
         }
     }
 
@@ -465,8 +472,10 @@ impl EvalValue {
                 ))
             }
             Self::ComputedWithStructuralHandles { value, metadata } => Ok((value, Some(metadata))),
-            Self::DeferredForValue { binding } => Ok((
-                Value::Deferred(crate::resource::DeferredValue::BindingRef { binding }),
+            Self::DeferredForValue { slot, .. } => Ok((
+                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                    ParserPlaceholder::Loop(slot),
+                )),
                 None,
             )),
             Self::Closure {
@@ -537,8 +546,8 @@ impl EvalValue {
                 crate::resource::DeferredValue::BindingRef { binding },
             )),
             Self::ComputedWithStructuralHandles { value, .. } => Ok(value),
-            Self::DeferredForValue { binding } => Ok(Value::Deferred(
-                crate::resource::DeferredValue::BindingRef { binding },
+            Self::DeferredForValue { slot, .. } => Ok(Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::Loop(slot)),
             )),
             Self::Closure {
                 name,
@@ -549,6 +558,13 @@ impl EvalValue {
                 remaining_arity,
             })),
         }
+    }
+
+    pub(crate) fn into_expanded_value(self) -> Result<GenericValue<NoPlaceholder>, String> {
+        self.into_value()
+            .map_err(|error| error.to_string())?
+            .into_expanded()
+            .map_err(|error| error.to_string())
     }
 }
 

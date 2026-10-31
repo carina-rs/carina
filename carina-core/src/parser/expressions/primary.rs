@@ -166,9 +166,9 @@ pub(crate) fn apply_postfix_path_segment(
                     message: error.to_string(),
                 });
         }
-        EvalValue::DeferredForValue { binding } => {
+        EvalValue::DeferredForValue { binding, slot } => {
             return Ok(EvalValue::from_value(
-                crate::resource::parser_deferred_for_access(binding, step, line),
+                crate::resource::parser_deferred_for_access(binding, slot, step, line),
             ));
         }
         EvalValue::Closure {

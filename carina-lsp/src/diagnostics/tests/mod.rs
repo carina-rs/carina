@@ -59,16 +59,26 @@ impl ProviderFactory for RegionConfigFactory {
     }
 
     fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
-            "region".to_string(),
-            carina_core::schema::AttributeType::enum_(
-                carina_core::schema::TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
-                Some(vec!["ap-northeast-1".to_string()]),
-                vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
-                None,
-                None,
+        carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::from([
+            (
+                "region".to_string(),
+                carina_core::schema::AttributeType::enum_(
+                    carina_core::schema::TypeIdentity::new(
+                        Some("aws"),
+                        Vec::<String>::new(),
+                        "Region",
+                    ),
+                    Some(vec!["ap-northeast-1".to_string()]),
+                    vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
+                    None,
+                    None,
+                ),
             ),
-        )]))
+            (
+                "profile".to_string(),
+                carina_core::schema::AttributeType::string(),
+            ),
+        ]))
         .expect("test provider config schema must be valid")
     }
 

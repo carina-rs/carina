@@ -38,10 +38,7 @@ impl DiagnosticEngine {
         effective_type: &EffectiveType<'_>,
         value_range: Option<Range>,
     ) -> Vec<Diagnostic> {
-        let Ok(value) = value.clone().into_expanded() else {
-            return Vec::new();
-        };
-        let errors = effective_type.validate_collect(&value);
+        let errors = effective_type.validate_collect(value);
         let mut diagnostics = Vec::new();
         for (path, err) in errors {
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {

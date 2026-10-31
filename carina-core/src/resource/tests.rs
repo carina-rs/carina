@@ -3668,6 +3668,25 @@ fn deserializing_reference_rooted_access_canonicalizes_the_reference() {
 }
 
 #[test]
+fn deserializing_access_that_resolves_to_concrete_is_rejected() {
+    let encoded = serde_json::json!({
+        "Access": {
+            "base": { "Map": { "a": { "String": "x" } } },
+            "step": { "kind": "field", "name": "a" }
+        }
+    });
+
+    let error = serde_json::from_value::<Value>(encoded)
+        .expect_err("a serialized deferred access must remain deferred");
+    assert!(
+        error
+            .to_string()
+            .contains("serialized deferred access resolved to a concrete value"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
 fn upstream_unknown_wire_tags_remain_stable() {
     let path = AccessPath::new("network", "vpc_id");
     let export = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {

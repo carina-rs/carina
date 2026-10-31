@@ -846,17 +846,12 @@ fn resolve_pair_binding_uses<E: IntoExpandedExportParam>(
     AppError,
 > {
     let (parsed, unresolved) = pair.into_parts();
-    let provider_context = context.provider_context();
-    let module_signatures =
-        module_resolver::load_resolved_module_signatures(&parsed, base_dir, provider_context);
-    carina_core::validation::resolve_bare_binding_uses_with_unresolved_resources(
-        parsed,
-        unresolved,
-        context.schemas(),
-        provider_context,
-        &module_signatures,
-    )
-    .map_err(resolve_file_error)
+    let parsed = resolve_file_binding_uses(parsed, base_dir, context)?;
+    let unresolved = unresolved
+        .into_iter()
+        .map(Resource::into_expanded)
+        .collect::<Result<_, _>>()?;
+    Ok((parsed, unresolved))
 }
 
 impl ProviderLoad {

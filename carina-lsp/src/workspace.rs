@@ -58,14 +58,25 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
                     .map(ProviderInstanceKey::from)
                     .collect();
                 for provider in parsed.providers {
+                    let expanded_values = |values: indexmap::IndexMap<
+                        String,
+                        carina_core::resource::Value<carina_core::resource::ParserPlaceholder>,
+                    >| {
+                        values
+                            .into_iter()
+                            .filter_map(|(name, value)| {
+                                value.into_expanded().ok().map(|value| (name, value))
+                            })
+                            .collect()
+                    };
                     let provider = ProviderConfig {
                         name: provider.name,
-                        attributes: Default::default(),
-                        default_tags: Default::default(),
+                        attributes: expanded_values(provider.attributes),
+                        default_tags: expanded_values(provider.default_tags),
                         source: provider.source,
                         version: provider.version,
                         revision: provider.revision,
-                        unresolved_attributes: Default::default(),
+                        unresolved_attributes: expanded_values(provider.unresolved_attributes),
                         binding: provider.binding,
                     };
                     if seen.insert(ProviderInstanceKey::from(&provider)) {

@@ -1175,25 +1175,11 @@ impl DiagnosticEngine {
                 continue;
             };
 
-            let Ok(attributes) = provider
-                .attributes
-                .iter()
-                .map(|(name, value)| {
-                    value
-                        .clone()
-                        .into_expanded()
-                        .map(|value| (name.clone(), value))
-                })
-                .collect::<Result<indexmap::IndexMap<_, _>, _>>()
-            else {
-                continue;
-            };
-            let validation =
-                carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
-                    factory.as_ref(),
-                    &provider.name,
-                    &attributes,
-                );
+            let validation = carina_core::executor::provider_ready::validate_parser_provider_config(
+                factory.as_ref(),
+                &provider.name,
+                &provider.attributes,
+            );
             if let Err(error) = validation {
                 if error.provider_error().is_some_and(|provider_error| {
                     !deduplicator.should_emit(&provider.name, provider_error)

@@ -340,19 +340,17 @@ macro_rules! register_builtins {
                             .iter()
                             .cloned()
                             .map(|arg| {
-                                arg.into_value()
-                                    .map_err(|error| format!("{name}: {error}"))?
-                                    .into_expanded()
+                                arg.into_expanded_value()
                                     .map_err(|error| format!("{name}: {error}"))
                             })
                             .collect();
                         let (lowered, contained_secret) = peel_secret_arguments(lowered?);
                         $handler(&lowered)
                             .map(|value| {
-                                EvalValue::from_value(
-                                    propagate_secret(value, contained_secret)
-                                        .into_placeholder_type(),
-                                )
+                                EvalValue::from_expanded_value(propagate_secret(
+                                    value,
+                                    contained_secret,
+                                ))
                             })
                     }
                 )*
@@ -371,14 +369,10 @@ macro_rules! register_builtins {
             let eval_args: Vec<EvalValue> = args
                 .iter()
                 .cloned()
-                .map(|value| EvalValue::from_value(value.into_placeholder_type()))
+                .map(EvalValue::from_expanded_value)
                 .collect();
             let result = evaluate_builtin(name, &eval_args)?;
-            result
-                .into_value()
-                .map_err(|error| error.to_string())?
-                .into_expanded()
-                .map_err(|error| error.to_string())
+            result.into_expanded_value()
         }
     };
 }
@@ -567,17 +561,13 @@ pub(crate) fn evaluate_builtin_with_config(
                 .iter()
                 .cloned()
                 .map(|arg| {
-                    arg.into_value()
-                        .map_err(|error| format!("decrypt: {error}"))?
-                        .into_expanded()
+                    arg.into_expanded_value()
                         .map_err(|error| format!("decrypt: {error}"))
                 })
                 .collect();
             let (lowered, contained_secret) = peel_secret_arguments(lowered?);
             decrypt::builtin_decrypt_with_config(&lowered, config).map(|value| {
-                EvalValue::from_value(
-                    propagate_secret(value, contained_secret).into_placeholder_type(),
-                )
+                EvalValue::from_expanded_value(propagate_secret(value, contained_secret))
             })
         }
         _ => evaluate_builtin(name, args),
@@ -599,7 +589,7 @@ pub(crate) fn evaluate_builtin_for_tests(name: &str, args: &[Value]) -> Result<E
     let eval_args: Vec<EvalValue> = args
         .iter()
         .cloned()
-        .map(|value| EvalValue::from_value(value.into_placeholder_type()))
+        .map(EvalValue::from_expanded_value)
         .collect();
     evaluate_builtin(name, &eval_args)
 }
@@ -617,14 +607,10 @@ pub(crate) fn evaluate_builtin_with_config_to_value(
     let eval_args: Vec<EvalValue> = args
         .iter()
         .cloned()
-        .map(|value| EvalValue::from_value(value.into_placeholder_type()))
+        .map(EvalValue::from_expanded_value)
         .collect();
     let result = evaluate_builtin_with_config(name, &eval_args, config)?;
-    result
-        .into_value()
-        .map_err(|error| error.to_string())?
-        .into_expanded()
-        .map_err(|error| error.to_string())
+    result.into_expanded_value()
 }
 
 /// Return a human-readable type name for a Value

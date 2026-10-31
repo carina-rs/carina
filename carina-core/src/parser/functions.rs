@@ -377,6 +377,7 @@ fn contains_module_argument(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::FnParam { .. }
             | ParserPlaceholder::FnLocal { .. }
+            | ParserPlaceholder::Loop(_)
             | ParserPlaceholder::EmptyInterpolation,
         )) => false,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_module_argument),
@@ -1167,7 +1168,9 @@ fn substitute_fn_params_with_position(
         }
         Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::ModuleArgument { .. } | ParserPlaceholder::EmptyInterpolation,
+            ParserPlaceholder::ModuleArgument { .. }
+            | ParserPlaceholder::Loop(_)
+            | ParserPlaceholder::EmptyInterpolation,
         ))
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })

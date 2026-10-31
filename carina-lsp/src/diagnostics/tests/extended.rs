@@ -1343,6 +1343,63 @@ outer {
 }
 
 #[test]
+fn module_placeholder_leaf_does_not_hide_invalid_struct_sibling() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let tags = AttributeType::struct_(
+        "Tags".to_string(),
+        vec![
+            StructField::optional("Name", AttributeType::string()).build(),
+            StructField::optional("Count", AttributeType::int()).build(),
+        ],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::optional("tags", tags).build())
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let source = r#"arguments { var_name: String }
+mock.test.Thing {
+  tags = {
+    Name = var_name
+    Count = "not-an-int"
+  }
+}
+"#;
+
+    let parsed = carina_core::parser::parse_file(
+        source,
+        std::path::Path::new("module.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("module source parses");
+    let core_error = carina_core::validation::validate_resources(
+        &parsed,
+        &schemas,
+        &std::collections::HashSet::from(["mock".to_string()]),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect_err("core validation rejects Count");
+    assert!(
+        core_error.contains("Count") && core_error.contains("Int"),
+        "unexpected core diagnostic: {core_error}",
+    );
+
+    let diagnostics = custom_engine(schemas).analyze(&create_document(source), None);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Type mismatch")
+                && diagnostic.message.contains("Int")
+                && diagnostic.range.start.line == 4
+        }),
+        "LSP must retain validate parity for the concrete sibling: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn valid_nested_struct_no_diagnostics() {
     let engine = test_engine_with_nested_structs();
     let doc = create_document(

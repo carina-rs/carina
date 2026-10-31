@@ -18,7 +18,7 @@
 //! binding LHS) is enforced upstream by `parse_wait_expr`; the parse
 //! error surfaces via the regular parser diagnostic path.
 
-use crate::parser::{File, ResourceRef};
+use crate::parser::{File, TopLevelResourceRef};
 use crate::schema::{SchemaKind, SchemaRegistry};
 use crate::wait::predicate::validate_wait_predicate;
 
@@ -65,12 +65,12 @@ pub fn validate_wait_bindings<E>(
         if let Some(b) = rref.binding() {
             let id = rref.id();
             let target = match rref {
-                ResourceRef::Resource(_) | ResourceRef::Deferred { .. } => WaitTarget::Pollable {
+                TopLevelResourceRef::Resource(_) => WaitTarget::Pollable {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
                 },
-                ResourceRef::DataSource(_) => WaitTarget::DataSource,
-                ResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
+                TopLevelResourceRef::DataSource(_) => WaitTarget::DataSource,
+                TopLevelResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
             };
             by_binding.insert(b.to_string(), target);
         }

@@ -673,6 +673,49 @@ fn resolve_required_value_status<P: PlaceholderKind>(
     }
 }
 
+fn parser_stage_function_arguments<P: PlaceholderKind>(
+    args: &[crate::resource::FunctionArgument<P>],
+) -> Option<Vec<crate::resource::FunctionArgument<crate::resource::ParserPlaceholder>>> {
+    let expanded = args
+        .iter()
+        .cloned()
+        .map(crate::resource::FunctionArgument::try_into_expanded)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(
+        expanded
+            .into_iter()
+            .map(crate::resource::FunctionArgument::into_placeholder_type)
+            .collect(),
+    )
+}
+
+enum FunctionArgumentResolution<P: PlaceholderKind> {
+    Deferred(Vec<crate::resource::FunctionArgument<P>>),
+    FullyResolved(Vec<crate::resource::FunctionArgument<P>>),
+}
+
+fn resolve_function_arguments<P: PlaceholderKind>(
+    args: &[crate::resource::FunctionArgument<P>],
+    bindings: &ResolvedBindings<P>,
+    config: Option<&crate::parser::ProviderContext>,
+) -> Result<FunctionArgumentResolution<P>, String> {
+    let args = args
+        .iter()
+        .map(|argument| {
+            argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if args.iter().all(|argument| {
+        argument.handle().is_some() || argument.value().is_some_and(Value::is_fully_resolved)
+    }) {
+        Ok(FunctionArgumentResolution::FullyResolved(args))
+    } else {
+        Ok(FunctionArgumentResolution::Deferred(args))
+    }
+}
+
 fn resolve_ref_value_inner<P: PlaceholderKind>(
     value: &Value<P>,
     bindings: &ResolvedBindings<P>,
@@ -749,74 +792,50 @@ fn resolve_ref_value_inner<P: PlaceholderKind>(
             args,
             source_line,
         }) => {
-            // First, resolve all arguments
-            let resolved_args: Result<Vec<crate::resource::FunctionArgument<P>>, String> = args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
-                })
-                .collect();
-            let resolved_args = resolved_args?;
-
-            // Check if all args are fully resolved (no remaining refs)
-            let all_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some()
-                    || argument.value().is_some_and(Value::is_fully_resolved)
-            });
-
-            if all_resolved {
-                // Evaluate the built-in function; propagate errors since args are resolved.
-                // The evaluator boundary is `EvalValue::into_value` — a closure
-                // returned here would mean `evaluate_builtin` saw fewer args
-                // than the function's arity, which can only happen if a
-                // partial application leaked through parsing. The parser is
-                // supposed to surface that as a parse error, so treat any
-                // closure here as a resolver-level invariant break.
-                use crate::eval_value::EvalValue;
-                let Ok(expanded_args) = resolved_args
-                    .iter()
-                    .cloned()
-                    .map(crate::resource::FunctionArgument::try_into_expanded)
-                    .collect::<Result<Vec<_>, _>>()
-                else {
+            let resolved_args = match resolve_function_arguments(args, bindings, config)? {
+                FunctionArgumentResolution::FullyResolved(args) => args,
+                FunctionArgumentResolution::Deferred(args) => {
                     return Ok(Value::Deferred(DeferredValue::FunctionCall {
                         name: *name,
-                        args: resolved_args,
+                        args,
                         source_line: *source_line,
                     }));
-                };
-                let parser_args = expanded_args
-                    .into_iter()
-                    .map(crate::resource::FunctionArgument::into_placeholder_type)
-                    .collect::<Vec<crate::resource::FunctionArgument<
-                        crate::resource::ParserPlaceholder,
-                    >>>();
-                let eval_args: Vec<EvalValue> = parser_args
-                    .iter()
-                    .map(crate::parser::function_argument_as_eval)
-                    .collect();
-                let evaluated = match config {
-                    Some(config) => {
-                        crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
-                    }
-                    None => crate::builtins::evaluate_builtin(name, &eval_args),
-                };
-                match evaluated {
-                    Ok(result) => result
-                        .into_value()
-                        .map_err(|error| format!("{name}(): {error}"))?
-                        .into_expanded()
-                        .map(Value::into_placeholder_type)
-                        .map_err(|error| format!("{name}(): {error}")),
-                    Err(e) => Err(format!("{}(): {}", name, e)),
                 }
-            } else {
-                // Keep as FunctionCall with partially resolved args
-                Ok(Value::Deferred(DeferredValue::FunctionCall {
+            };
+
+            // Evaluate the built-in function; propagate errors since args are resolved.
+            // The evaluator boundary is `EvalValue::into_value` — a closure
+            // returned here would mean `evaluate_builtin` saw fewer args
+            // than the function's arity, which can only happen if a
+            // partial application leaked through parsing. The parser is
+            // supposed to surface that as a parse error, so treat any
+            // closure here as a resolver-level invariant break.
+            use crate::eval_value::EvalValue;
+            let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
+                return Ok(Value::Deferred(DeferredValue::FunctionCall {
                     name: *name,
                     args: resolved_args,
                     source_line: *source_line,
-                }))
+                }));
+            };
+            let eval_args: Vec<EvalValue> = parser_args
+                .iter()
+                .map(crate::parser::function_argument_as_eval)
+                .collect();
+            let evaluated = match config {
+                Some(config) => {
+                    crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
+                }
+                None => crate::builtins::evaluate_builtin(name, &eval_args),
+            };
+            match evaluated {
+                Ok(result) => result
+                    .into_value()
+                    .map_err(|error| format!("{name}(): {error}"))?
+                    .into_expanded()
+                    .map(Value::into_placeholder_type)
+                    .map_err(|error| format!("{name}(): {error}")),
+                Err(e) => Err(format!("{}(): {}", name, e)),
             }
         }
         Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
@@ -828,33 +847,21 @@ fn resolve_ref_value_inner<P: PlaceholderKind>(
             args,
             source_line,
         }) => {
-            let resolved_args = args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let all_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some()
-                    || argument.value().is_some_and(Value::is_fully_resolved)
-            });
-            if !all_resolved {
-                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                    function: function.clone(),
-                    functions: functions.clone(),
-                    args: resolved_args,
-                    source_line: *source_line,
-                }));
-            }
+            let resolved_args = match resolve_function_arguments(args, bindings, config)? {
+                FunctionArgumentResolution::FullyResolved(args) => args,
+                FunctionArgumentResolution::Deferred(args) => {
+                    return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                        function: function.clone(),
+                        functions: functions.clone(),
+                        args,
+                        source_line: *source_line,
+                    }));
+                }
+            };
 
             let default_config = crate::parser::ProviderContext::default();
             let config = config.unwrap_or(&default_config);
-            let Ok(expanded_args) = resolved_args
-                .iter()
-                .cloned()
-                .map(crate::resource::FunctionArgument::try_into_expanded)
-                .collect::<Result<Vec<_>, _>>()
-            else {
+            let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
                 return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
                     function: function.clone(),
                     functions: functions.clone(),
@@ -862,12 +869,6 @@ fn resolve_ref_value_inner<P: PlaceholderKind>(
                     source_line: *source_line,
                 }));
             };
-            let parser_args = expanded_args
-                .into_iter()
-                .map(crate::resource::FunctionArgument::into_placeholder_type)
-                .collect::<Vec<crate::resource::FunctionArgument<
-                    crate::resource::ParserPlaceholder,
-                >>>();
             crate::parser::evaluate_resolved_user_function(
                 function,
                 functions,

@@ -15786,6 +15786,111 @@ mod loop_var_field_access_matrix {
     }
 
     #[test]
+    fn deferred_template_subscript_roots_are_typed_before_stage_conversion() {
+        fn access_root(mut value: &Value<ParserPlaceholder>) -> &Value<ParserPlaceholder> {
+            while let Value::Deferred(DeferredValue::Access(access)) = value {
+                value = access.base();
+            }
+            value
+        }
+
+        fn loop_access_root(
+            mut value: &Value<crate::resource::LoopSlot>,
+        ) -> &Value<crate::resource::LoopSlot> {
+            while let Value::Deferred(DeferredValue::Access(access)) = value {
+                value = access.base();
+            }
+            value
+        }
+
+        let source = r#"
+            let up = upstream_state { source = "../x" }
+            let list_children = for item in up.list_items {
+                mock.test.Thing { name = item[0].nested.value }
+            }
+            let map_children = for item in up.map_items {
+                mock.test.Thing { name = item["k"].nested.value }
+            }
+        "#;
+        let parsed = parse(source, &ProviderContext::default()).expect("parse deferred loops");
+        assert_eq!(parsed.deferred_for_expressions.len(), 2);
+
+        for deferred in &parsed.deferred_for_expressions {
+            let name = deferred
+                .template_resource
+                .get_attr("name")
+                .expect("template name");
+            assert!(
+                matches!(
+                    access_root(name),
+                    Value::Deferred(DeferredValue::Placeholder(_))
+                ),
+                "the parser-stage access root must already be a typed loop placeholder: {name:?}",
+            );
+        }
+
+        let nested = |value: &str| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "value".to_string(),
+                    Value::Concrete(ConcreteValue::String(value.into())),
+                )]))),
+            )])))
+        };
+        let list_item = Value::Concrete(ConcreteValue::List(vec![nested("from-list")]));
+        let map_item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "k".to_string(),
+            nested("from-map"),
+        )])));
+        let mut up = HashMap::new();
+        up.insert(
+            "list_items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![list_item])),
+        );
+        up.insert(
+            "map_items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![map_item])),
+        );
+        let mut remote = HashMap::new();
+        remote.insert("up".to_string(), up);
+
+        let mut expanded = parsed.into_expanded().expect("cross expansion boundary");
+        for deferred in &expanded.deferred_for_expressions {
+            let root = loop_access_root(
+                deferred
+                    .template_resource
+                    .get_attr("name")
+                    .expect("expanded template name"),
+            );
+            assert!(matches!(
+                root,
+                Value::Deferred(DeferredValue::Placeholder(crate::resource::LoopSlot::Value))
+            ));
+        }
+        expanded
+            .expand_deferred_for_expressions(&IterableBindings::from_upstream_only(remote))
+            .expect("subscripts and nested fields substitute");
+
+        let resolved = |binding: &str| {
+            expanded
+                .resources
+                .iter()
+                .find(|resource| resource.binding.as_deref() == Some(binding))
+                .and_then(|resource| resource.get_attr("name"))
+                .cloned()
+        };
+        assert_eq!(
+            resolved("list_children[0]"),
+            Some(Value::Concrete(ConcreteValue::String("from-list".into())))
+        );
+        assert_eq!(
+            resolved("map_children[0]"),
+            Some(Value::Concrete(ConcreteValue::String("from-map".into())))
+        );
+    }
+
+    #[test]
     fn deferred_template_reports_missing_key_when_placeholder_becomes_concrete() {
         let src = r#"
             let up = upstream_state { source = "../x" }

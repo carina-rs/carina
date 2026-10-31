@@ -136,12 +136,11 @@ pub fn run_lint(
     // have no schema, so `get_for` returns `None` for them.
     for rref in parsed.iter_top_level_resources() {
         let schema = match rref {
-            carina_core::parser::ResourceRef::Resource(m) => schemas.get_for(m),
-            carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
-            carina_core::parser::ResourceRef::LiveComposition(_) => None,
-            carina_core::parser::ResourceRef::Deferred { resource, .. } => {
-                schemas.get_for(resource)
+            carina_core::parser::TopLevelResourceRef::Resource(m) => schemas.get_for(m),
+            carina_core::parser::TopLevelResourceRef::DataSource(d) => {
+                schemas.get_for_data_source(d)
             }
+            carina_core::parser::TopLevelResourceRef::LiveComposition(_) => None,
         };
         if let Some(schema) = schema {
             let schema = schema.as_schema();

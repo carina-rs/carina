@@ -229,6 +229,43 @@ fn empty_parsed() -> ParsedFile {
     }
 }
 
+#[test]
+fn anonymous_schema_error_groups_plain_and_deferred_template_resources() {
+    let parsed = crate::parser::parse(
+        r#"
+mock.test.Thing { name = "one" }
+mock.test.Thing { name = "two" }
+
+let upstream = upstream_state { source = "../upstream" }
+for item in upstream.items {
+    mock.test.Thing { name = item.name }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture parses");
+    assert_eq!(parsed.iter_top_level_resources().count(), 2);
+    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+    let error = validate_resources(
+        &parsed,
+        &SchemaRegistry::new(),
+        &HashSet::new(),
+        &ProviderContext::default(),
+    )
+    .expect_err("an unloaded provider cannot derive anonymous identities");
+
+    assert_eq!(
+        error
+            .lines()
+            .filter(|line| line.contains("anonymous mock.test.Thing"))
+            .collect::<Vec<_>>(),
+        vec![
+            "3 anonymous mock.test.Thing resources need provider 'mock', which is not declared or could not be loaded; declare provider 'mock' so its schema is available"
+        ],
+    );
+}
+
 fn module_call_findings_for_test(
     parsed: &ParsedFile,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,

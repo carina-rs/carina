@@ -40,7 +40,7 @@ pub enum DeferredValue<P> {
 }
 
 pub enum NoPlaceholder {}                       // 値を持たない型
-pub enum ParserPlaceholder { FnParam { .. }, FnLocal { .. }, ModuleArgument { .. }, EmptyInterpolation }
+pub enum ParserPlaceholder { FnParam { .. }, FnLocal { .. }, ModuleArgument { .. }, EmptyInterpolation, Loop(LoopSlot) }
 pub enum LoopSlot { Key, Index, Value }
 pub enum ApplyTimeUnknown { UpstreamExport { .. }, UpstreamAllExports { .. }, PendingReRead(..) }
 ```
@@ -51,7 +51,7 @@ pub enum ApplyTimeUnknown { UpstreamExport { .. }, UpstreamAllExports { .. }, Pe
 
 | 段階 | 値の型 | 持てる仮置き |
 | --- | --- | --- |
-| パーサーの出力、関数の本体、moduleの定義 | `Value<ParserPlaceholder>` | 関数の引数、関数内のlet、moduleの引数、空の`${}` |
+| パーサーの出力、関数の本体、moduleの定義 | `Value<ParserPlaceholder>` | 関数の引数、関数内のlet、moduleの引数、空の`${}`、for-loopの本体の中のloopの仮置き |
 | for-loopのテンプレート（`DeferredForExpression`） | `Value<LoopSlot>` | for-loopのキー、番号、値 |
 | 展開と検証が終わった後（資源、データソース、plan、state、provider） | `Value`（`Value<NoPlaceholder>`） | なし |
 
@@ -79,6 +79,8 @@ for-loopの子を作る`expand_deferred_children`は、`Value<LoopSlot>`のテ�
 - 参照と式（`ReferenceExpr`）に入れる。設計文書の§6.4の考えに近いのですが、保存したテンプレートの中でだけ許す、という条件を別に持たせる必要があります。
 
 テンプレート専用の型を選びます。長い目で見ても、型の安全性でも、根本原因の場所でも、この案だけが「ふつうの値はfor-loopの仮置きを持たない」を型で保証するからです。§6.4は、置き換えを参照の解決の一部と見ていました。しかし今のコードでは、置き換えはテンプレートから子を作る処理です（更新のあとのplanとapplyの途中の両方で使います）。§6.4はこの点で古くなっています。
+
+パーサーは、for-loopの本体を読む時点で、loopのキー・番号・値を`ParserPlaceholder::Loop(LoopSlot)`として作ります。本体にはmoduleの引数などほかの仮置きも入りうるので、パーサーの段階ではこれらを同じ型に置きます。テンプレートを作る変換が`Loop`を`LoopSlot`に移し、テンプレートの外に`Loop`が残っていれば`into_expanded`が型付きのエラーにします。loopの変数をふつうの束縛への参照として作り、テンプレートにするときに名前で見分ける方法は採りません。名前を識別子に使うことになり、`item[0]`のように正規化で綴りが変わった参照を取りこぼすうえ、参照を扱う検査のすべてに「loopの変数の名前は除く」という絞り込みが要るからです（最初の実装はこの形になっていて、レビューで差し戻しました）。
 
 ### 保存したplanの形式
 

@@ -1550,6 +1550,33 @@ mod reload_skip_tests {
     }
 
     #[test]
+    fn discovered_configs_match_detects_region_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let provider_file = fixture.path().join("provider.crn");
+        std::fs::write(&provider_file, "provider awscc { region = 'us-east-1' }\n").unwrap();
+        let first = workspace::discover_providers_by_dir(fixture.path())
+            .remove(fixture.path())
+            .unwrap()
+            .into_iter()
+            .map(|config| (fixture.path().to_path_buf(), config))
+            .collect::<Vec<_>>();
+
+        std::fs::write(
+            &provider_file,
+            "provider awscc { region = 'ap-northeast-1' }\n",
+        )
+        .unwrap();
+        let second = workspace::discover_providers_by_dir(fixture.path())
+            .remove(fixture.path())
+            .unwrap()
+            .into_iter()
+            .map(|config| (fixture.path().to_path_buf(), config))
+            .collect::<Vec<_>>();
+
+        assert!(!configs_match(&first, &second));
+    }
+
+    #[test]
     fn configs_match_true_regardless_of_attribute_insertion_order() {
         // HashMap iteration order is unspecified; configs_match must not
         // depend on the order in which attributes were inserted.

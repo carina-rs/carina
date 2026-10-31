@@ -213,12 +213,17 @@ fn format_value(value: &Value) -> String {
             format!("{}({})", function.name, arg_strs.join(", "))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            if access.display_root().is_some() {
+            if access.has_authored_loop_path() {
                 crate::value::format_value(value)
-            } else if let Some(reason) = crate::value::access_chain_unknown_root(access.base()) {
-                crate::value::render_unknown(reason)
             } else {
-                format!("{}{}", format_value(access.base()), access.step())
+                match crate::value::access_chain_root(access.base()) {
+                    Some(crate::value::AccessChainRoot::Unknown(reason)) => {
+                        crate::value::render_unknown(reason)
+                    }
+                    Some(crate::value::AccessChainRoot::LoopSlot(_)) | None => {
+                        format!("{}{}", format_value(access.base()), access.step())
+                    }
+                }
             }
         }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
@@ -1177,6 +1182,7 @@ impl ModuleSignature {
             Value::Deferred(DeferredValue::Placeholder(
                 crate::resource::ParserPlaceholder::FnParam { .. }
                 | crate::resource::ParserPlaceholder::FnLocal { .. }
+                | crate::resource::ParserPlaceholder::Loop(_)
                 | crate::resource::ParserPlaceholder::EmptyInterpolation,
             )) => {}
             Value::Deferred(DeferredValue::Unknown(_)) => {

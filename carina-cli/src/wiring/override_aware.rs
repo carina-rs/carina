@@ -79,9 +79,7 @@ pub(crate) type ParserCanonicalResourcePair<E> =
     CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>;
 
 #[cfg(test)]
-impl<E: carina_core::parser::IntoExpandedExportParam>
-    CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>
-{
+impl<E: carina_core::parser::IntoExpandedExportParam> ParserCanonicalResourcePair<E> {
     pub(crate) fn into_expanded_for_test(
         self,
     ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::LeftoverPlaceholder>
@@ -91,17 +89,13 @@ impl<E: carina_core::parser::IntoExpandedExportParam>
             unresolved,
             prefix_fallbacks,
         } = self;
-        let mut unresolved_file = carina_core::parser::ParsedFile::default();
-        unresolved_file.resources = unresolved;
-        let unresolved = unresolved_file.into_expanded()?.resources;
+        let unresolved = unresolved
+            .into_iter()
+            .map(Resource::into_expanded)
+            .collect::<Result<_, _>>()?;
         let prefix_fallbacks = prefix_fallbacks
             .into_iter()
-            .map(|attributes| {
-                attributes
-                    .into_iter()
-                    .map(|(name, value)| value.into_expanded().map(|value| (name, value)))
-                    .collect::<Result<_, _>>()
-            })
+            .map(|attributes| carina_core::resource::into_expanded_value_map(attributes, None))
             .collect::<Result<_, _>>()?;
         Ok(CanonicalResourcePair {
             parsed: parsed.into_expanded()?,

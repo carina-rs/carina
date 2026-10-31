@@ -1305,29 +1305,6 @@ pub fn resolve_bare_binding_uses<E: crate::parser::IntoExpandedExportParam>(
     })
 }
 
-/// Cross the parser-placeholder boundary for an evaluated file and its
-/// canonical authored-resource snapshot as one validation transition.
-pub type ResolvedFileWithUnresolvedResources<E> = (
-    ResolvedFile<E>,
-    Vec<crate::resource::Resource<crate::resource::ModuleSource>>,
-);
-
-pub fn resolve_bare_binding_uses_with_unresolved_resources<
-    E: crate::parser::IntoExpandedExportParam,
->(
-    file: crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
-    unresolved: Vec<crate::resource::Resource<crate::resource::ModuleSource, ParserPlaceholder>>,
-    schemas: &SchemaRegistry,
-    provider_context: &LoadedProviderContext,
-    module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
-) -> Result<ResolvedFileWithUnresolvedResources<E::Expanded>, ResolveFileError> {
-    let resolved = resolve_bare_binding_uses(file, schemas, provider_context, module_signatures)?;
-    let unresolved = unresolved
-        .into_iter()
-        .map(crate::resource::Resource::into_expanded)
-        .collect::<Result<_, _>>()?;
-    Ok((resolved, unresolved))
-}
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
     let value = values.next()?;
     values.next().is_none().then_some(value)
@@ -2773,18 +2750,34 @@ pub fn validate_anonymous_resource_schemas<'a, P: PlaceholderKind + 'a>(
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
 ) -> Vec<AnonymousResourceSchemaError> {
+    group_anonymous_resource_schema_errors(
+        resources.into_iter().filter_map(|resource| {
+            anonymous_resource_schema_key(resource, registry, known_providers)
+        }),
+    )
+}
+
+fn anonymous_resource_schema_key<P: PlaceholderKind>(
+    resource: &GenericResource<ModuleSource, P>,
+    registry: &SchemaRegistry,
+    known_providers: &HashSet<String>,
+) -> Option<AnonymousResourceSchemaKey> {
+    (resource.binding.is_none()
+        && resource.id.identity_str().is_none()
+        && registry.get_for(resource).is_none()
+        && !known_providers.contains(&resource.id.provider))
+    .then(|| AnonymousResourceSchemaKey {
+        provider: resource.id.provider.clone(),
+        resource_type: resource.id.resource_type.clone(),
+        provider_instance: resource.id.provider_instance.clone(),
+    })
+}
+
+fn group_anonymous_resource_schema_errors(
+    keys: impl IntoIterator<Item = AnonymousResourceSchemaKey>,
+) -> Vec<AnonymousResourceSchemaError> {
     let mut grouped = IndexMap::<AnonymousResourceSchemaKey, usize>::new();
-    for resource in resources.into_iter().filter(|resource| {
-        resource.binding.is_none()
-            && resource.id.identity_str().is_none()
-            && registry.get_for(resource).is_none()
-            && !known_providers.contains(&resource.id.provider)
-    }) {
-        let key = AnonymousResourceSchemaKey {
-            provider: resource.id.provider.clone(),
-            resource_type: resource.id.resource_type.clone(),
-            provider_instance: resource.id.provider_instance.clone(),
-        };
+    for key in keys {
         *grouped.entry(key).or_default() += 1;
     }
 
@@ -2893,34 +2886,17 @@ pub fn validate_resources<
     // modules; only defer this provider-availability diagnostic.
     if !is_module_definition(parsed) {
         all_errors.extend(
-            validate_anonymous_resource_schemas(
-                parsed
-                    .iter_all_resources()
-                    .filter_map(|resource| match resource {
-                        ResourceRef::Resource(resource) => Some(resource),
-                        ResourceRef::LiveComposition(_)
-                        | ResourceRef::DataSource(_)
-                        | ResourceRef::Deferred { .. } => None,
-                    }),
-                registry,
-                known_providers,
-            )
-            .into_iter()
-            .map(|error| error.to_string()),
-        );
-        all_errors.extend(
-            validate_anonymous_resource_schemas(
-                parsed
-                    .iter_all_resources()
-                    .filter_map(|resource| match resource {
-                        ResourceRef::Deferred { resource, .. } => Some(resource),
-                        ResourceRef::Resource(_)
-                        | ResourceRef::LiveComposition(_)
-                        | ResourceRef::DataSource(_) => None,
-                    }),
-                registry,
-                known_providers,
-            )
+            group_anonymous_resource_schema_errors(parsed.iter_all_resources().filter_map(
+                |resource| match resource {
+                    ResourceRef::Resource(resource) => {
+                        anonymous_resource_schema_key(resource, registry, known_providers)
+                    }
+                    ResourceRef::Deferred { resource, .. } => {
+                        anonymous_resource_schema_key(resource, registry, known_providers)
+                    }
+                    ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
+                },
+            ))
             .into_iter()
             .map(|error| error.to_string()),
         );
@@ -3028,12 +3004,6 @@ fn validate_resource_ref_types_inner<E>(
     let inference_bindings = inference::bindings_from_parsed(parsed);
 
     for rref in parsed.iter_all_resources() {
-        let deferred_binding = match rref {
-            ResourceRef::Deferred { deferred, .. } => Some(&deferred.binding),
-            ResourceRef::Resource(_)
-            | ResourceRef::LiveComposition(_)
-            | ResourceRef::DataSource(_) => None,
-        };
         // A deferred for-expression template body is always managed.
         let schema = match rref {
             ResourceRef::LiveComposition(_) => continue,
@@ -3063,14 +3033,6 @@ fn validate_resource_ref_types_inner<E>(
                 attr_value,
                 sink,
                 &mut |reference, sink, usage, _candidate_value| {
-                    if deferred_binding.is_some_and(|binding| {
-                        binding
-                            .names()
-                            .into_iter()
-                            .any(|name| name == reference.binding())
-                    }) {
-                        return;
-                    }
                     let Some(source) = resolve_resource_reference(
                         resource_id,
                         reference,

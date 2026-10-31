@@ -343,15 +343,6 @@ impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
     fn into_expanded(
         self,
     ) -> Result<DeferredForExpression<S>, crate::resource::LeftoverPlaceholder> {
-        let template_binding = self.binding.clone();
-        let slot_for_binding = |name: &str| match &template_binding {
-            ForBinding::Simple(value) if name == value => Some(LoopSlot::Value),
-            ForBinding::Indexed(index, _) if name == index => Some(LoopSlot::Index),
-            ForBinding::Indexed(_, value) if name == value => Some(LoopSlot::Value),
-            ForBinding::Map(key, _) if name == key => Some(LoopSlot::Key),
-            ForBinding::Map(_, value) if name == value => Some(LoopSlot::Value),
-            ForBinding::Simple(_) | ForBinding::Indexed(_, _) | ForBinding::Map(_, _) => None,
-        };
         Ok(DeferredForExpression {
             file: self.file,
             line: self.line,
@@ -360,19 +351,12 @@ impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
             attributes: self
                 .attributes
                 .into_iter()
-                .map(|(name, value)| {
-                    value
-                        .into_expanded()
-                        .map(|value| (name, value.into_loop_template(&slot_for_binding)))
-                })
+                .map(|(name, value)| value.into_loop_template().map(|value| (name, value)))
                 .collect::<Result<_, _>>()?,
             target: self.target,
             iterable: self.iterable.into_expanded()?,
             binding: self.binding,
-            template_resource: self
-                .template_resource
-                .into_expanded()?
-                .into_loop_template(&slot_for_binding),
+            template_resource: self.template_resource.into_loop_template()?,
         })
     }
 }
@@ -486,6 +470,77 @@ pub enum ResourceRef<
         resource: &'a Resource<S, T>,
         deferred: &'a DeferredForExpression<S, P, T>,
     },
+}
+
+/// A concrete top-level declaration. Unlike [`ResourceRef`], this type has no
+/// deferred-template arm, so consumers of [`File::iter_top_level_resources`]
+/// cannot encode an impossible fallback or panic.
+#[derive(Debug, Clone, Copy)]
+pub enum TopLevelResourceRef<'a, S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
+    Resource(&'a Resource<S, P>),
+    LiveComposition(&'a LiveComposition<P>),
+    DataSource(&'a DataSource<S, P>),
+}
+
+impl<'a, S, P: PlaceholderKind> TopLevelResourceRef<'a, S, P> {
+    pub fn id(&self) -> &'a ResourceId {
+        match self {
+            Self::Resource(resource) => &resource.id,
+            Self::LiveComposition(composition) => &composition.id,
+            Self::DataSource(data_source) => &data_source.id,
+        }
+    }
+
+    pub fn binding(&self) -> Option<&'a str> {
+        match self {
+            Self::Resource(resource) => resource.binding.as_deref(),
+            Self::LiveComposition(composition) => composition.binding.as_deref(),
+            Self::DataSource(data_source) => data_source.binding.as_deref(),
+        }
+    }
+
+    pub fn dependency_bindings(&self) -> &'a std::collections::BTreeSet<String> {
+        match self {
+            Self::Resource(resource) => &resource.dependency_bindings,
+            Self::LiveComposition(composition) => &composition.dependency_bindings,
+            Self::DataSource(data_source) => &data_source.dependency_bindings,
+        }
+    }
+
+    pub fn directives(&self) -> Option<&'a Directives> {
+        match self {
+            Self::Resource(resource) => Some(&resource.directives),
+            Self::LiveComposition(_) => None,
+            Self::DataSource(data_source) => Some(&data_source.directives),
+        }
+    }
+
+    pub fn quoted_string_attrs(&self) -> &'a HashSet<String> {
+        match self {
+            Self::Resource(resource) => &resource.quoted_string_attrs,
+            Self::LiveComposition(composition) => &composition.quoted_string_attrs,
+            Self::DataSource(data_source) => &data_source.quoted_string_attrs,
+        }
+    }
+
+    pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value<P>>> {
+        match self {
+            Self::Resource(resource) => std::borrow::Cow::Borrowed(&resource.attributes),
+            Self::LiveComposition(composition) => std::borrow::Cow::Owned(
+                composition
+                    .signature
+                    .attributes
+                    .iter()
+                    .map(|(name, attribute)| (name.clone(), attribute.to_value()))
+                    .collect(),
+            ),
+            Self::DataSource(data_source) => std::borrow::Cow::Borrowed(&data_source.attributes),
+        }
+    }
+
+    pub fn resolved_attributes(&self) -> HashMap<String, Value<P>> {
+        crate::resource::attrs_to_hashmap(&self.attributes())
+    }
 }
 
 impl<S, P: PlaceholderKind, T: PlaceholderKind> Copy for ResourceContext<'_, S, P, T> {}
@@ -1072,10 +1127,15 @@ impl<T> AttributeParameter<T, ParserPlaceholder> {
     fn into_expanded(
         self,
     ) -> Result<AttributeParameter<T, NoPlaceholder>, crate::resource::LeftoverPlaceholder> {
+        let name = self.name;
         Ok(AttributeParameter {
-            name: self.name,
+            name: name.clone(),
             static_type: self.static_type,
-            value: self.value.map(Value::into_expanded).transpose()?,
+            value: self
+                .value
+                .map(Value::into_expanded)
+                .transpose()
+                .map_err(|error| error.in_attribute_default(name))?,
             source: self.source,
         })
     }
@@ -1212,10 +1272,15 @@ impl IntoExpandedExportParam for ParsedExportParam<ParserPlaceholder> {
     type Expanded = ParsedExportParam<NoPlaceholder>;
 
     fn into_expanded(self) -> Result<Self::Expanded, crate::resource::LeftoverPlaceholder> {
+        let name = self.name;
         Ok(ParsedExportParam {
-            name: self.name,
+            name: name.clone(),
             static_type: self.static_type,
-            value: self.value.map(Value::into_expanded).transpose()?,
+            value: self
+                .value
+                .map(Value::into_expanded)
+                .transpose()
+                .map_err(|error| error.in_export(name))?,
             source: self.source,
         })
     }
@@ -2605,20 +2670,17 @@ impl<P: PlaceholderKind> ProviderConfig<P> {
 
 impl ProviderConfig<ParserPlaceholder> {
     fn into_expanded(self) -> Result<ProviderConfig, crate::resource::LeftoverPlaceholder> {
-        let map_values = |values: IndexMap<String, Value<ParserPlaceholder>>| {
-            values
-                .into_iter()
-                .map(|(name, value)| value.into_expanded().map(|value| (name, value)))
-                .collect::<Result<_, _>>()
-        };
         Ok(ProviderConfig {
             name: self.name,
-            attributes: map_values(self.attributes)?,
-            default_tags: map_values(self.default_tags)?,
+            attributes: crate::resource::into_expanded_value_map(self.attributes, None)?,
+            default_tags: crate::resource::into_expanded_value_map(self.default_tags, None)?,
             source: self.source,
             version: self.version,
             revision: self.revision,
-            unresolved_attributes: map_values(self.unresolved_attributes)?,
+            unresolved_attributes: crate::resource::into_expanded_value_map(
+                self.unresolved_attributes,
+                None,
+            )?,
             binding: self.binding,
         })
     }
@@ -2641,11 +2703,7 @@ impl BackendConfig<ParserPlaceholder> {
     pub fn into_expanded(self) -> Result<BackendConfig, crate::resource::LeftoverPlaceholder> {
         Ok(BackendConfig {
             backend_type: self.backend_type,
-            attributes: self
-                .attributes
-                .into_iter()
-                .map(|(name, value)| value.into_expanded().map(|value| (name, value)))
-                .collect::<Result<_, _>>()?,
+            attributes: crate::resource::into_expanded_value_map(self.attributes, None)?,
             attribute_spans: self.attribute_spans,
         })
     }
@@ -2885,10 +2943,15 @@ impl IntoExpandedExportParam for InferredExportParam<ParserPlaceholder> {
     type Expanded = InferredExportParam<NoPlaceholder>;
 
     fn into_expanded(self) -> Result<Self::Expanded, crate::resource::LeftoverPlaceholder> {
+        let name = self.name;
         Ok(InferredExportParam {
-            name: self.name,
+            name: name.clone(),
             static_type: self.static_type,
-            value: self.value.map(Value::into_expanded).transpose()?,
+            value: self
+                .value
+                .map(Value::into_expanded)
+                .transpose()
+                .map_err(|error| error.in_export(name))?,
         })
     }
 }
@@ -3223,12 +3286,20 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
     /// template would be a spurious entry.
     pub fn iter_top_level_resources(
         &self,
-    ) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, P, T>> {
+    ) -> impl Iterator<Item = TopLevelResourceRef<'_, ModuleSource, P>> {
         self.resources
             .iter()
-            .map(ResourceRef::Resource)
-            .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
-            .chain(self.data_sources.iter().map(ResourceRef::DataSource))
+            .map(TopLevelResourceRef::Resource)
+            .chain(
+                self.compositions
+                    .iter()
+                    .map(TopLevelResourceRef::LiveComposition),
+            )
+            .chain(
+                self.data_sources
+                    .iter()
+                    .map(TopLevelResourceRef::DataSource),
+            )
     }
 
     /// Names declared by `upstream_state`, independent of whether loading a
@@ -3416,10 +3487,7 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
                 .into_iter()
                 .map(LiveComposition::into_expanded)
                 .collect::<Result<_, _>>()?,
-            variables: variables
-                .into_iter()
-                .map(|(name, value)| value.into_expanded().map(|value| (name, value)))
-                .collect::<Result<_, _>>()?,
+            variables: crate::resource::into_expanded_value_map(variables, None)?,
             uses,
             module_calls: module_calls
                 .into_iter()
@@ -3900,7 +3968,9 @@ fn normalize_substituted_value(
             match access.rebuild_result(base, access.step().clone(), miss_policy) {
                 Ok(crate::resource::ValuePathSegmentResult::Resolved(value))
                 | Ok(crate::resource::ValuePathSegmentResult::Deferred(value)) => *v = value,
-                Ok(crate::resource::ValuePathSegmentResult::DeferredMiss(_)) => *v = original,
+                Ok(crate::resource::ValuePathSegmentResult::DeferredMiss(_)) => {
+                    *v = original.retain_deferred_miss_display_root();
+                }
                 Err(error) => {
                     let coalesce_absence = matches!(
                         error,
@@ -3947,9 +4017,9 @@ fn normalize_substituted_value(
     Ok(())
 }
 
-/// Substitute loop placeholders without evaluating any surrounding access or
-/// function. Used only for an unselected `??` fallback: the loop item must be
-/// captured now, but errors remain lazy until the fallback is selected.
+/// Normalize an already-substituted unselected `??` fallback. Concrete
+/// accesses may collapse, while missing accesses and surrounding functions
+/// remain lazy until the fallback is selected.
 fn normalize_substituted_lazily(value: &mut Value) {
     match value {
         Value::Concrete(ConcreteValue::List(values)) => {

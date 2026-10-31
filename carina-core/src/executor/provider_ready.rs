@@ -21,10 +21,12 @@ use crate::module_resolver::{
 };
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
+#[cfg(test)]
+use crate::resource::NoPlaceholder;
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, LiveComposition, NoPlaceholder, ParserPlaceholder,
-    PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
-    ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedComposition, Value,
+    ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder, PlaceholderKind,
+    ProviderDataSource, ProviderModuleSource, ProviderResource, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
@@ -548,7 +550,7 @@ pub fn validate_and_canonicalize_provider_config(
     Ok(canonical)
 }
 
-pub(crate) fn validate_parser_provider_config(
+pub fn validate_parser_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
     attributes: &IndexMap<String, Value<ParserPlaceholder>>,
@@ -556,13 +558,11 @@ pub(crate) fn validate_parser_provider_config(
     let config_schema = factory.provider_config_attribute_types();
     let serializable = attributes
         .iter()
-        .filter(|(_, value)| !crate::validation::value_contains_unresolved_ref(value))
-        .map(|(name, value)| {
-            let value = value
-                .clone()
-                .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
-                .expect("a provider value classified as resolved cannot contain a placeholder");
-            (name.clone(), value)
+        .filter_map(|(name, value)| {
+            if crate::validation::value_contains_unresolved_ref(value) {
+                return None;
+            }
+            value.to_expanded().map(|value| (name.clone(), value))
         })
         .collect();
     let canonical =
@@ -2056,6 +2056,23 @@ mod provider_config_tests {
             .expect("valid provider config must be prepared");
 
         assert_eq!(ready.attributes(), &attributes);
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parser_provider_config_skips_unexpandable_placeholder_without_panicking() {
+        let factory = ConfigFactory::successful();
+        let attributes = IndexMap::from([(
+            "region".to_string(),
+            Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::EmptyInterpolation,
+            )),
+        )]);
+
+        let canonical = validate_parser_provider_config(&factory, "test", &attributes)
+            .expect("placeholder leaves are unknown during parser-stage validation");
+
+        assert!(canonical.attributes().is_empty());
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
     }
 

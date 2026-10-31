@@ -193,8 +193,8 @@ use crate::config_loader::UnresolvedConfigSnapshot;
 use crate::parser::display_string_literal;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver,
-    ModuleSource, NoPlaceholder, ParserPlaceholder, PlaceholderKind, RawEnumIdentifier, Resource,
-    ResourceId, Value, ValueString,
+    ModuleSource, ParserPlaceholder, PlaceholderKind, RawEnumIdentifier, Resource, ResourceId,
+    Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::{CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value};
@@ -417,19 +417,12 @@ pub(crate) fn no_lookup() -> CustomTypeLookup<'static> {
     &|_declared_type, _value| Ok(())
 }
 
-fn value_without_placeholders<P: PlaceholderKind>(value: &Value<P>) -> Option<Value> {
-    value
-        .clone()
-        .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
-        .ok()
-}
-
 fn attributes_without_placeholders<P: PlaceholderKind>(
     attributes: &HashMap<String, Value<P>>,
 ) -> Option<HashMap<String, Value>> {
     attributes
         .iter()
-        .map(|(name, value)| Some((name.clone(), value_without_placeholders(value)?)))
+        .map(|(name, value)| Some((name.clone(), value.to_expanded()?)))
         .collect()
 }
 
@@ -680,7 +673,7 @@ fn run_identified_lookup<P: PlaceholderKind>(
     lookup: CustomTypeLookup<'_>,
     errors: &mut Vec<TypeError>,
 ) {
-    let Some(value) = value_without_placeholders(value) else {
+    let Some(value) = value.to_expanded() else {
         return;
     };
     if identity.is_some()
@@ -1735,7 +1728,10 @@ impl RootlessType {
         }
     }
 
-    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+    pub fn validate_collect<P: PlaceholderKind>(
+        &self,
+        value: &Value<P>,
+    ) -> Vec<(FieldPath, TypeError)> {
         self.schema.validate_collect(value)
     }
 
@@ -1928,7 +1924,10 @@ impl Schema {
     /// Returns `(FieldPath, TypeError)` pairs anchored at each
     /// offending location, mirroring the non-Schema-aware variant for
     /// downstream consumers like the LSP range mapper.
-    pub(crate) fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+    pub(crate) fn validate_collect<P: PlaceholderKind>(
+        &self,
+        value: &Value<P>,
+    ) -> Vec<(FieldPath, TypeError)> {
         let mut out = Vec::new();
         Self::collect_attr_into(
             &self.root,
@@ -1941,11 +1940,11 @@ impl Schema {
         out
     }
 
-    fn collect_attr_into(
+    fn collect_attr_into<P: PlaceholderKind>(
         attr: &AttributeType,
         defs: &BTreeMap<String, AttributeType>,
         path: &FieldPath,
-        value: &Value,
+        value: &Value<P>,
         ancestry: FieldAncestry,
         out: &mut Vec<(FieldPath, TypeError)>,
     ) {
@@ -1972,11 +1971,11 @@ impl Schema {
         }
     }
 
-    fn collect_attr_into_on_path<'a>(
+    fn collect_attr_into_on_path<'a, P: PlaceholderKind>(
         attr: &'a AttributeType,
         defs: &'a BTreeMap<String, AttributeType>,
         path: &FieldPath,
-        value: &Value,
+        value: &Value<P>,
         ancestry: FieldAncestry,
         out: &mut Vec<(FieldPath, TypeError)>,
         visited_refs: &mut Vec<&'a str>,
@@ -7957,7 +7956,10 @@ impl<'a> EffectiveAttribute<'a> {
     }
 
     /// Validate an authored value and retain paths for every diagnostic.
-    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+    pub fn validate_collect<P: PlaceholderKind>(
+        &self,
+        value: &Value<P>,
+    ) -> Vec<(FieldPath, TypeError)> {
         self.value_type().validate_collect(value)
     }
 
@@ -8099,7 +8101,10 @@ impl<'a> EffectiveType<'a> {
     }
 
     /// Validate an authored value and retain paths for every diagnostic.
-    pub fn validate_collect(&self, value: &Value) -> Vec<(FieldPath, TypeError)> {
+    pub fn validate_collect<P: PlaceholderKind>(
+        &self,
+        value: &Value<P>,
+    ) -> Vec<(FieldPath, TypeError)> {
         let mut out = Vec::new();
         Schema::collect_attr_into(
             self.attr_type,

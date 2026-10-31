@@ -428,6 +428,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multi_file_empty_interpolations_report_each_site_with_context() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        std::fs::write(
+            fixture.path().join("resource.crn"),
+            "let broken = mock.test.Thing {\n  value = \"${}\"\n}\n",
+        )
+        .expect("write resource fixture");
+        std::fs::write(
+            fixture.path().join("exports.crn"),
+            "exports {\n  broken: String = \"${}\"\n}\n",
+        )
+        .expect("write export fixture");
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let empty_interpolations = errors
+            .iter()
+            .filter(|error| error.contains("empty interpolation `${}`"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            empty_interpolations.len(),
+            2,
+            "one error must be retained for each offending site: {errors:#?}",
+        );
+        assert!(
+            empty_interpolations.iter().any(|error| {
+                error.contains("mock.test.Thing.broken: attribute `value`: empty interpolation `${}` — fill in the expression or remove it")
+            }),
+            "resource context is missing: {empty_interpolations:#?}",
+        );
+        assert!(
+            empty_interpolations.iter().any(|error| {
+                error.contains("exports `broken`: empty interpolation `${}` — fill in the expression or remove it")
+            }),
+            "export context is missing: {empty_interpolations:#?}",
+        );
+    }
+
+    #[test]
     fn hard_provider_load_error_keeps_unrelated_static_validation_error() {
         let user_dirs = carina_core::TestUserDirs::new();
         let fixture = tempfile::tempdir().unwrap();

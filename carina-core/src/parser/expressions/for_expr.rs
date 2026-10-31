@@ -20,7 +20,7 @@ use crate::parser::{
 };
 use crate::resource::{
     ConcreteValue, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin, LoopKind,
-    LoopSource, UnboundLoopTemplate,
+    LoopSlot, LoopSource, UnboundLoopTemplate,
 };
 
 /// Binding pattern for a for expression
@@ -94,23 +94,23 @@ fn parse_deferred_resource_template(
     source_file: &std::path::Path,
 ) -> Result<Option<Box<Resource>>, ParseError> {
     let mut template_ctx = ctx.child_scope();
-    let bind_value = |ctx: &mut ParseContext, name: &str| {
+    let bind_value = |ctx: &mut ParseContext, name: &str, slot: LoopSlot| {
         if name != "_" {
             ctx.set_variable(
                 name.to_string(),
-                EvalValue::deferred_for_value(name.to_string()),
+                EvalValue::deferred_for_value(name.to_string(), slot),
             );
         }
     };
     match binding {
-        ForBinding::Simple(value) => bind_value(&mut template_ctx, value),
+        ForBinding::Simple(value) => bind_value(&mut template_ctx, value, LoopSlot::Value),
         ForBinding::Indexed(index, value) => {
-            bind_value(&mut template_ctx, index);
-            bind_value(&mut template_ctx, value);
+            bind_value(&mut template_ctx, index, LoopSlot::Index);
+            bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
         ForBinding::Map(key, value) => {
-            bind_value(&mut template_ctx, key);
-            bind_value(&mut template_ctx, value);
+            bind_value(&mut template_ctx, key, LoopSlot::Key);
+            bind_value(&mut template_ctx, value, LoopSlot::Value);
         }
     }
 

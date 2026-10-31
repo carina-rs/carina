@@ -1122,128 +1122,6 @@ fn bind_module_constraints(
     Ok(constraints)
 }
 
-fn resolve_parser_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<Value, String> {
-    match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            let Some(attribute) = bindings
-                .get(path.binding())
-                .and_then(|attributes| attributes.get(path.attribute()))
-            else {
-                return Ok(value.clone());
-            };
-            let mut resolved = resolve_parser_ref_value(attribute, bindings)?;
-            for segment in path.segments() {
-                resolved =
-                    apply_value_path_segment(resolved, segment.clone(), 0, AccessMissPolicy::Defer)
-                        .and_then(ValuePathSegmentResult::into_value)
-                        .map_err(|error| error.to_string())?;
-            }
-            Ok(resolved)
-        }
-        Value::Concrete(ConcreteValue::List(items)) => Ok(Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(|item| resolve_parser_ref_value(item, bindings))
-                .collect::<Result<_, _>>()?,
-        ))),
-        Value::Concrete(ConcreteValue::Map(entries)) => Ok(Value::Concrete(ConcreteValue::Map(
-            entries
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), resolve_parser_ref_value(value, bindings)?)))
-                .collect::<Result<_, String>>()?,
-        ))),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            Ok(Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .iter()
-                    .map(|part| match part {
-                        InterpolationPart::Literal(literal) => {
-                            Ok(InterpolationPart::Literal(literal.clone()))
-                        }
-                        InterpolationPart::Expr(value) => {
-                            resolve_parser_ref_value(value, bindings).map(InterpolationPart::Expr)
-                        }
-                    })
-                    .collect::<Result<_, _>>()?,
-            ))
-            .canonicalize())
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Ok(Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| resolve_parser_ref_value(value, bindings))
-                })
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        })),
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            args,
-            reason,
-            source_line,
-        }) => Ok(Value::Deferred(DeferredValue::Unavailable {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| resolve_parser_ref_value(value, bindings))
-                })
-                .collect::<Result<_, _>>()?,
-            reason: reason.clone(),
-            source_line: *source_line,
-        })),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: function.clone(),
-            functions: functions.clone(),
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| resolve_parser_ref_value(value, bindings))
-                })
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        })),
-        Value::Deferred(DeferredValue::Access(access)) => access
-            .rebuild_with_base(
-                resolve_parser_ref_value(access.base(), bindings)?,
-                AccessMissPolicy::Defer,
-            )
-            .map_err(|error| error.to_string()),
-        Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
-            DeferredValue::Secret(Box::new(resolve_parser_ref_value(inner, bindings)?)),
-        )),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            let value = resolve_parser_ref_value(value, bindings)?;
-            if matches!(value, Value::Concrete(_)) {
-                Ok(value)
-            } else {
-                Ok(Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(value),
-                    default: Box::new(resolve_parser_ref_value(default, bindings)?),
-                }))
-            }
-        }
-        Value::Concrete(_)
-        | Value::Deferred(
-            DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_)
-            | DeferredValue::Placeholder(_),
-        ) => Ok(value.clone()),
-    }
-}
-
 fn bind_constraint_expression(
     expression: &ValidateExpr,
     arguments: ArgumentSubstitutions<'_>,
@@ -1279,7 +1157,7 @@ fn bind_constraint_expression(
                 })?;
         }
         if let Some(bindings) = resolved_bindings
-            && let Ok(resolved) = resolve_parser_ref_value(&value, bindings)
+            && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
         {
             value = resolved;
         }
@@ -1404,7 +1282,7 @@ fn prefix_constraint_expression(
             let mut value =
                 prefix_attr_value(value, instance_prefix, intra_module_bindings, arguments)?;
             if let Some(bindings) = resolved_bindings
-                && let Ok(resolved) = resolve_parser_ref_value(&value, bindings)
+                && let Ok(resolved) = crate::resolver::resolve_ref_value(&value, bindings)
             {
                 value = resolved;
             }
@@ -2229,6 +2107,7 @@ fn substitute_arguments_with_position(
         Value::Deferred(DeferredValue::Placeholder(
             crate::resource::ParserPlaceholder::FnParam { .. }
             | crate::resource::ParserPlaceholder::FnLocal { .. }
+            | crate::resource::ParserPlaceholder::Loop(_)
             | crate::resource::ParserPlaceholder::EmptyInterpolation,
         )) => value.clone(),
         Value::Deferred(DeferredValue::BindingRef { binding }) => {

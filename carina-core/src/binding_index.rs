@@ -43,7 +43,7 @@
 //! ```
 
 use crate::data_source_value::{DataSourceValue, DataSourceValues};
-use crate::parser::{BindingName, ResourceRef};
+use crate::parser::{BindingName, TopLevelResourceRef};
 use crate::resource::composition::CompositionRuntimeRef;
 use crate::resource::{
     AccessPath, LiveComposition, ParserPlaceholder, PathSegment, PlaceholderKind, PlanInputCurrent,
@@ -529,7 +529,7 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             known_names.insert(binding_name.to_string());
-            if !matches!(rref, ResourceRef::LiveComposition(_)) {
+            if !matches!(rref, TopLevelResourceRef::LiveComposition(_)) {
                 let id = rref.id();
                 resource_handles.insert(
                     binding_name.to_string(),
@@ -540,13 +540,13 @@ impl<'a> BindingIndex<'a> {
             // via `get_for`, data sources via `get_for_data_source`.
             // Compositions carry their own statically known attribute map.
             let target = match rref {
-                ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => registry
+                TopLevelResourceRef::Resource(m) => registry
                     .get_for(m)
                     .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
-                ResourceRef::DataSource(d) => registry
+                TopLevelResourceRef::DataSource(d) => registry
                     .get_for_data_source(d)
                     .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
-                ResourceRef::LiveComposition(c) => Some(BindingTarget::LiveComposition(c)),
+                TopLevelResourceRef::LiveComposition(c) => Some(BindingTarget::LiveComposition(c)),
             };
             let Some(target) = target else {
                 continue;

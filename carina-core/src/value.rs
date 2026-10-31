@@ -884,12 +884,9 @@ pub(crate) fn canonical_secret_hash_material<P: PlaceholderKind>(
     // Secret hash material predates the structural persisted encoding. Keep
     // these bytes stable even though state now carries digests in `$secret`
     // tags; identifiers and saved hashes depend on this representation.
-    let runtime_value = value
-        .clone()
-        .try_map_placeholder::<crate::resource::NoPlaceholder, ()>(&mut |_placeholder| Err(()));
-    let canonical = match runtime_value {
-        Err(()) => canonical_secret_template(value)?,
-        Ok(runtime_value) => match value_to_json_inner(
+    let canonical = match value.to_expanded() {
+        None => canonical_secret_template(value)?,
+        Some(runtime_value) => match value_to_json_inner(
             &runtime_value,
             None,
             false,
@@ -1705,17 +1702,21 @@ fn format_value_into_context<P: PlaceholderKind>(
                     sink.write_token(ValueSpanKind::Other, &path)?;
                     sink.write_token(ValueSpanKind::Other, ")")
                 }
-            } else if let Some(slot) = access_chain_loop_slot_root(access.base()) {
-                if let Some((upstream_binding, verb)) = context.upstream_deferred_label {
-                    write_upstream_deferred_label(sink, upstream_binding, verb)
-                } else {
-                    sink.write_token(ValueSpanKind::Other, &slot.to_string())
-                }
-            } else if let Some(reason) = access_chain_unknown_root(access.base()) {
-                write_unknown(reason, sink, context)
             } else {
-                format_value_into_context(access.base(), sink, context)?;
-                sink.write_token(ValueSpanKind::Reference, &access.step().to_dot_string())
+                match access_chain_root(access.base()) {
+                    Some(AccessChainRoot::LoopSlot(slot)) => {
+                        if let Some((upstream_binding, verb)) = context.upstream_deferred_label {
+                            write_upstream_deferred_label(sink, upstream_binding, verb)
+                        } else {
+                            sink.write_token(ValueSpanKind::Other, &slot.to_string())
+                        }
+                    }
+                    Some(AccessChainRoot::Unknown(reason)) => write_unknown(reason, sink, context),
+                    None => {
+                        format_value_into_context(access.base(), sink, context)?;
+                        sink.write_token(ValueSpanKind::Reference, &access.step().to_dot_string())
+                    }
+                }
             }
         }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
@@ -1728,7 +1729,7 @@ fn format_value_into_context<P: PlaceholderKind>(
             {
                 write_upstream_deferred_label(sink, upstream_binding, verb)
             } else {
-                sink.write_token(ValueSpanKind::Other, &placeholder.to_string())
+                sink.write_token(ValueSpanKind::Other, &placeholder.render())
             }
         }
     }
@@ -1831,9 +1832,15 @@ pub(crate) fn is_upstream_deferred_marker_value<P: PlaceholderKind>(value: &Valu
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => is_upstream_deferred_reason(reason),
         Value::Deferred(DeferredValue::Access(access)) => {
-            deferred_for_access_display_path(access).is_some()
-                || access_chain_loop_slot_root(access.base()).is_some()
-                || access_chain_unknown_root(access.base()).is_some_and(is_upstream_deferred_reason)
+            if access.has_authored_loop_path() {
+                deferred_for_access_display_path(access).is_some()
+            } else {
+                match access_chain_root(access.base()) {
+                    Some(AccessChainRoot::LoopSlot(_)) => true,
+                    Some(AccessChainRoot::Unknown(reason)) => is_upstream_deferred_reason(reason),
+                    None => false,
+                }
+            }
         }
         _ => false,
     }
@@ -1846,41 +1853,61 @@ pub(crate) fn is_upstream_deferred_marker_value<P: PlaceholderKind>(value: &Valu
 fn deferred_for_access_display_path<P: PlaceholderKind>(
     access: &crate::resource::AccessExpr<P>,
 ) -> Option<String> {
-    fn append_steps<P: PlaceholderKind>(
+    fn append_all_steps<P: PlaceholderKind>(
         access: &crate::resource::AccessExpr<P>,
         output: &mut String,
     ) {
         if let Value::Deferred(DeferredValue::Access(inner)) = access.base() {
-            append_steps(inner, output);
+            append_all_steps(inner, output);
         }
         output.push_str(&access.step().to_dot_string());
     }
 
-    let mut path = access.display_root()?.to_string();
-    append_steps(access, &mut path);
-    Some(path)
-}
-
-fn access_chain_loop_slot_root<P: PlaceholderKind>(value: &Value<P>) -> Option<LoopSlot> {
-    match value {
-        Value::Deferred(DeferredValue::Access(access)) => {
-            access_chain_loop_slot_root(access.base())
+    fn append_steps<P: PlaceholderKind>(
+        access: &crate::resource::AccessExpr<P>,
+        output: &mut String,
+    ) -> bool {
+        let rooted_at_loop_slot = match access.base() {
+            Value::Deferred(DeferredValue::Access(inner)) => append_steps(inner, output),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+                placeholder.loop_slot().is_some()
+            }
+            _ => false,
+        };
+        if rooted_at_loop_slot {
+            output.push_str(&access.step().to_dot_string());
         }
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.loop_slot(),
-        _ => None,
+        rooted_at_loop_slot
     }
+
+    if let Some(root) = access.deferred_miss_display_root() {
+        let mut path = root.to_string();
+        append_all_steps(access, &mut path);
+        return Some(path);
+    }
+
+    let mut path = access.display_root()?.to_string();
+    append_steps(access, &mut path).then_some(path)
 }
 
-/// Return the root `Unknown` reason of a direct postfix-access chain.
+pub(crate) enum AccessChainRoot<'a> {
+    LoopSlot(LoopSlot),
+    Unknown(&'a ApplyTimeUnknown),
+}
+
+/// Return the typed root of a direct postfix-access chain.
 /// Function calls and all other expression nodes intentionally stop the
 /// search: `unknown.field` is still unknown, while `split(unknown)[0]`
 /// remains a useful expression in diagnostics and plans.
-pub(crate) fn access_chain_unknown_root<P: PlaceholderKind>(
+pub(crate) fn access_chain_root<P: PlaceholderKind>(
     value: &Value<P>,
-) -> Option<&ApplyTimeUnknown> {
+) -> Option<AccessChainRoot<'_>> {
     match value {
-        Value::Deferred(DeferredValue::Access(access)) => access_chain_unknown_root(access.base()),
-        Value::Deferred(DeferredValue::Unknown(reason)) => Some(reason),
+        Value::Deferred(DeferredValue::Access(access)) => access_chain_root(access.base()),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            placeholder.loop_slot().map(AccessChainRoot::LoopSlot)
+        }
+        Value::Deferred(DeferredValue::Unknown(reason)) => Some(AccessChainRoot::Unknown(reason)),
         _ => None,
     }
 }
@@ -2522,9 +2549,14 @@ fn canonical_secret_template<P: PlaceholderKind>(
             "unknown",
             serde_json::to_value(reason).expect("ApplyTimeUnknown is serializable"),
         ),
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            tagged("placeholder", JsonValue::String(placeholder.to_string()))
-        }
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => tagged(
+            "placeholder",
+            serde_json::to_value(placeholder).map_err(|_| {
+                SerializationError::SecretNotAllowed {
+                    context: SerializationContext::SecretRedaction,
+                }
+            })?,
+        ),
     })
 }
 
@@ -6500,6 +6532,56 @@ mod tests {
     type LoopValue = crate::resource::Value<LoopSlot>;
     type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
 
+    #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+    struct DisplayMutablePlaceholder {
+        identity: String,
+        #[serde(skip)]
+        wording: String,
+    }
+
+    impl std::fmt::Display for DisplayMutablePlaceholder {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.wording)
+        }
+    }
+
+    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {}
+
+    #[test]
+    fn placeholder_secret_material_uses_structured_serde_not_display_wording() {
+        let value = |wording: &str| {
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                DisplayMutablePlaceholder {
+                    identity: "stable-slot".to_string(),
+                    wording: wording.to_string(),
+                },
+            ))
+        };
+
+        let before = canonical_secret_hash_material(&value("old wording"))
+            .expect("canonical material for placeholder");
+        let after = canonical_secret_hash_material(&value("new wording"))
+            .expect("canonical material for placeholder");
+        assert_eq!(
+            before, after,
+            "display wording must not affect secret hashes"
+        );
+    }
+
+    #[test]
+    fn parser_placeholder_display_keeps_render_unknown_parentheses() {
+        let value = crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            crate::resource::ParserPlaceholder::FnParam {
+                name: "input".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            format_value(&value),
+            "(unresolved function parameter: input)"
+        );
+    }
+
     #[test]
     fn state_canonicalization_fits_provider_output_with_missing_declared_required_field() {
         use crate::resource::ValueString;
@@ -9070,6 +9152,55 @@ mod tests {
             format_value(&value),
             "split('/', (known after upstream apply))[1]"
         );
+    }
+
+    #[test]
+    fn stale_loop_display_root_does_not_hide_the_substituted_access_cause() {
+        use crate::resource::{
+            AccessMissPolicy, AccessPath, ApplyTimeUnknown, PathSegment, Subscript,
+            apply_postfix_access,
+        };
+
+        let upstream = apply_postfix_access(
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
+                path: AccessPath::new("up", "value"),
+            })),
+            PathSegment::Field {
+                name: "nested".to_string(),
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("unknown access remains deferred")
+        .with_access_display_root("item");
+        assert_eq!(
+            format_value(&upstream),
+            "(known after upstream apply: up.value)"
+        );
+        assert!(
+            !is_upstream_deferred_marker_value(&upstream),
+            "a substituted access is an expression, not the original loop marker",
+        );
+
+        let function = apply_postfix_access(
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::split,
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("/".into())).into(),
+                    Value::Concrete(ConcreteValue::String("a/b".into())).into(),
+                ],
+                source_line: (0).into(),
+            }),
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 0 },
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .expect("computed access remains deferred")
+        .with_access_display_root("item");
+        assert_eq!(format_value(&function), "split('/', 'a/b')[0]");
+        assert!(!is_upstream_deferred_marker_value(&function));
     }
 
     /// `Value::Deferred(DeferredValue::Unknown(UpstreamExport))` renders unquoted as

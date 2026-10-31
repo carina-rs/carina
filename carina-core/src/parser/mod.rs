@@ -45,9 +45,9 @@ pub use ast::{
     ModuleCallDiagnosticSource, ModuleCallId, MovedAddresses, ParsedBindingUses, ParsedExportParam,
     ParsedFile, ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock,
     ResourceAddress, ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression,
-    ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr,
-    UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr,
-    ValidationBlock, WaitBinding, expand_deferred_children,
+    ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TopLevelResourceRef,
+    TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody,
+    ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};
 pub(crate) use config::ProviderCustomTypeSource;

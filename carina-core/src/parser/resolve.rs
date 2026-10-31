@@ -1829,19 +1829,16 @@ pub fn resolve_provider_attributes_with_remote<E>(
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
             let attributes = match rref {
-                super::ResourceRef::Resource(resource) => resource.resolved_attributes(),
-                super::ResourceRef::DataSource(data_source) => {
+                super::TopLevelResourceRef::Resource(resource) => resource.resolved_attributes(),
+                super::TopLevelResourceRef::DataSource(data_source) => {
                     crate::resource::attrs_to_hashmap(&data_source.attributes)
                 }
-                super::ResourceRef::LiveComposition(composition) => composition
+                super::TopLevelResourceRef::LiveComposition(composition) => composition
                     .signature
                     .attributes
                     .iter()
                     .map(|(name, attribute)| (name.clone(), attribute.to_value()))
                     .collect(),
-                super::ResourceRef::Deferred { .. } => {
-                    unreachable!("top-level resource iteration cannot yield a deferred template")
-                }
             };
             binding_map.insert(
                 binding_name.to_string(),

@@ -213,12 +213,10 @@ impl<S> DataSource<S, ParserPlaceholder> {
             module_source,
             quoted_string_attrs,
         } = self;
+        let attributes = super::into_expanded_value_map(attributes, Some(&id))?;
         Ok(DataSource {
             id,
-            attributes: attributes
-                .into_iter()
-                .map(|(name, value)| value.into_expanded().map(|value| (name, value)))
-                .collect::<Result<_, _>>()?,
+            attributes,
             directives,
             binding,
             dependency_bindings,

@@ -5398,10 +5398,10 @@ fn provider_referenced_upstream_states<E>(
             continue;
         };
         let attributes = match resource {
-            carina_core::parser::ResourceRef::Resource(resource) => {
+            carina_core::parser::TopLevelResourceRef::Resource(resource) => {
                 std::borrow::Cow::Borrowed(&resource.attributes)
             }
-            carina_core::parser::ResourceRef::LiveComposition(composition) => {
+            carina_core::parser::TopLevelResourceRef::LiveComposition(composition) => {
                 std::borrow::Cow::Owned(
                     composition
                         .signature
@@ -5411,11 +5411,8 @@ fn provider_referenced_upstream_states<E>(
                         .collect(),
                 )
             }
-            carina_core::parser::ResourceRef::DataSource(data_source) => {
+            carina_core::parser::TopLevelResourceRef::DataSource(data_source) => {
                 std::borrow::Cow::Borrowed(&data_source.attributes)
-            }
-            carina_core::parser::ResourceRef::Deferred { .. } => {
-                unreachable!("top-level resource iteration cannot yield a deferred template")
             }
         };
         if let Some(attribute) = attribute {

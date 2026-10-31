@@ -1825,7 +1825,15 @@ fn deferred_access<P: PlaceholderKind>(
     source_line: usize,
 ) -> Value<P> {
     let display_root = match &base {
-        Value::Deferred(DeferredValue::Access(access)) => access.display_root.clone(),
+        Value::Deferred(DeferredValue::Access(access)) => match &access.display_root {
+            Some(LoopAccessDisplayRoot::Rooted(binding)) if access.is_rooted_at_loop_slot() => {
+                Some(LoopAccessDisplayRoot::Rooted(binding.clone()))
+            }
+            Some(LoopAccessDisplayRoot::DeferredMiss(binding)) => {
+                Some(LoopAccessDisplayRoot::DeferredMiss(binding.clone()))
+            }
+            Some(LoopAccessDisplayRoot::Rooted(_)) | None => None,
+        },
         _ => None,
     };
     Value::Deferred(DeferredValue::Access(AccessExpr {
@@ -2012,16 +2020,17 @@ pub fn apply_postfix_access<P: PlaceholderKind>(
 /// deferred template crosses [`Value::into_expanded`].
 pub(crate) fn parser_deferred_for_access(
     binding: String,
+    slot: LoopSlot,
     step: PathSegment,
     source_line: usize,
 ) -> Value<ParserPlaceholder> {
     Value::Deferred(DeferredValue::Access(AccessExpr {
-        base: Box::new(Value::Deferred(DeferredValue::BindingRef {
-            binding: binding.clone(),
-        })),
+        base: Box::new(Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::Loop(slot),
+        ))),
         step,
         source_line,
-        display_root: Some(binding),
+        display_root: Some(LoopAccessDisplayRoot::Rooted(binding)),
     }))
 }
 
@@ -2586,25 +2595,9 @@ impl<P: PlaceholderKind> FunctionArgument<P> {
 
     pub(crate) fn try_into_expanded(self) -> Result<FunctionArgument<NoPlaceholder>, P> {
         let mut reject = |placeholder| Err(placeholder);
-        let operand = match self.operand {
-            StructuralOperand::Value { value, access_base } => StructuralOperand::Value {
-                value: value.try_map_placeholder(&mut reject)?,
-                access_base: access_base
-                    .map(|value| value.try_map_placeholder(&mut reject))
-                    .transpose()?,
-            },
-            StructuralOperand::Handle {
-                handle,
-                access_base,
-            } => StructuralOperand::Handle {
-                handle,
-                access_base: access_base.try_map_placeholder(&mut reject)?,
-            },
-            StructuralOperand::Parameter { name, access_base } => StructuralOperand::Parameter {
-                name,
-                access_base: access_base.try_map_placeholder(&mut reject)?,
-            },
-        };
+        let operand = self
+            .operand
+            .try_map_stage(&mut |value| value.try_map_placeholder(&mut reject))?;
         Ok(FunctionArgument { operand })
     }
 }
@@ -2619,23 +2612,15 @@ impl FunctionArgument<ParserPlaceholder> {
 
 impl FunctionArgument<NoPlaceholder> {
     pub(crate) fn into_placeholder_type<P: PlaceholderKind>(self) -> FunctionArgument<P> {
-        let operand = match self.operand {
-            StructuralOperand::Value { value, access_base } => StructuralOperand::Value {
-                value: value.into_placeholder_type(),
-                access_base: access_base.map(Value::into_placeholder_type),
-            },
-            StructuralOperand::Handle {
-                handle,
-                access_base,
-            } => StructuralOperand::Handle {
-                handle,
-                access_base: access_base.into_placeholder_type(),
-            },
-            StructuralOperand::Parameter { name, access_base } => StructuralOperand::Parameter {
-                name,
-                access_base: access_base.into_placeholder_type(),
-            },
-        };
+        let operand =
+            match self
+                .operand
+                .try_map_stage::<P, std::convert::Infallible>(&mut |value| {
+                    Ok(value.into_placeholder_type())
+                }) {
+                Ok(operand) => operand,
+                Err(never) => match never {},
+            };
         FunctionArgument { operand }
     }
 }
@@ -2864,9 +2849,19 @@ impl<P: PlaceholderKind> DeferredValue<P> {
     }
 }
 
-/// A sealed postfix-access node.  Its fields are read-only outside this
-/// module, so every rebuild must pass through [`apply_value_path_segment`]
-/// and cannot leave an Access wrapped around a concrete or reference root.
+/// A sealed postfix-access node. Its fields are read-only outside this
+/// module, so every rebuild must pass through [`apply_value_path_segment`].
+/// A concrete root is retained only in the typed [`LoopAccessDisplayRoot::DeferredMiss`]
+/// state used for an incomplete local desired-side view.
+#[derive(Clone)]
+enum LoopAccessDisplayRoot {
+    /// The access chain is still semantically rooted at a typed loop slot.
+    Rooted(String),
+    /// A local desired-side view missed this authored loop path and may gain
+    /// the field at apply time, so the original path is retained deliberately.
+    DeferredMiss(String),
+}
+
 #[derive(Clone)]
 pub struct AccessExpr<P: PlaceholderKind = NoPlaceholder> {
     base: Box<Value<P>>,
@@ -2875,7 +2870,7 @@ pub struct AccessExpr<P: PlaceholderKind = NoPlaceholder> {
     /// Parser-only authored root for deferred-for diagnostics (`item` in
     /// `item.missing`). It is display metadata, like `source_line`, and is
     /// intentionally omitted from the serialized Value representation.
-    display_root: Option<String>,
+    display_root: Option<LoopAccessDisplayRoot>,
 }
 
 impl<P: PlaceholderKind> AccessExpr<P> {
@@ -2892,7 +2887,31 @@ impl<P: PlaceholderKind> AccessExpr<P> {
     }
 
     pub fn display_root(&self) -> Option<&str> {
-        self.display_root.as_deref()
+        match &self.display_root {
+            Some(LoopAccessDisplayRoot::Rooted(binding)) => Some(binding),
+            Some(LoopAccessDisplayRoot::DeferredMiss(_)) | None => None,
+        }
+    }
+
+    pub(crate) fn deferred_miss_display_root(&self) -> Option<&str> {
+        match &self.display_root {
+            Some(LoopAccessDisplayRoot::DeferredMiss(binding)) => Some(binding),
+            Some(LoopAccessDisplayRoot::Rooted(_)) | None => None,
+        }
+    }
+
+    pub(crate) fn has_authored_loop_path(&self) -> bool {
+        self.display_root.is_some()
+    }
+
+    fn is_rooted_at_loop_slot(&self) -> bool {
+        match self.base() {
+            Value::Deferred(DeferredValue::Access(access)) => access.is_rooted_at_loop_slot(),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+                placeholder.loop_slot().is_some()
+            }
+            _ => false,
+        }
     }
 
     /// Rebuild this access after a value-tree transform. The operands still
@@ -2906,8 +2925,19 @@ impl<P: PlaceholderKind> AccessExpr<P> {
     ) -> Result<ValuePathSegmentResult<P>, ValueAccessError> {
         apply_value_path_segment(base, step, self.source_line, miss_policy).map(|result| {
             let restore_display_root = |value: Value<P>| match &self.display_root {
-                Some(root) => value.with_access_display_root(root.clone()),
-                None => value,
+                Some(LoopAccessDisplayRoot::Rooted(root))
+                    if matches!(
+                        &value,
+                        Value::Deferred(DeferredValue::Access(access))
+                            if access.is_rooted_at_loop_slot()
+                    ) =>
+                {
+                    value.with_access_display_root(root.clone())
+                }
+                Some(LoopAccessDisplayRoot::DeferredMiss(root)) => {
+                    value.with_deferred_miss_display_root(root.clone())
+                }
+                Some(LoopAccessDisplayRoot::Rooted(_)) | None => value,
             };
             match result {
                 ValuePathSegmentResult::Resolved(value) => {
@@ -2952,7 +2982,12 @@ impl<P: PlaceholderKind> AccessExpr<P> {
             base: Box::new(base),
             step: self.step.clone(),
             source_line: self.source_line,
-            display_root: self.display_root.clone(),
+            display_root: self.display_root.as_ref().map(|root| match root {
+                LoopAccessDisplayRoot::Rooted(binding)
+                | LoopAccessDisplayRoot::DeferredMiss(binding) => {
+                    LoopAccessDisplayRoot::DeferredMiss(binding.clone())
+                }
+            }),
         }))
     }
 }
@@ -3043,7 +3078,28 @@ impl<P: PlaceholderKind> Value<P> {
     /// still go through [`apply_value_path_segment`].
     pub(crate) fn with_access_display_root(mut self, root: impl Into<String>) -> Self {
         if let Value::Deferred(DeferredValue::Access(access)) = &mut self {
-            access.display_root = Some(root.into());
+            access.display_root = Some(LoopAccessDisplayRoot::Rooted(root.into()));
+        }
+        self
+    }
+
+    pub(crate) fn with_deferred_miss_display_root(mut self, root: impl Into<String>) -> Self {
+        if let Value::Deferred(DeferredValue::Access(access)) = &mut self {
+            access.display_root = Some(LoopAccessDisplayRoot::DeferredMiss(root.into()));
+        }
+        self
+    }
+
+    pub(crate) fn retain_deferred_miss_display_root(mut self) -> Self {
+        if let Value::Deferred(DeferredValue::Access(access)) = &mut self
+            && let Some(root) = &mut access.display_root
+        {
+            *root = match root {
+                LoopAccessDisplayRoot::Rooted(binding)
+                | LoopAccessDisplayRoot::DeferredMiss(binding) => {
+                    LoopAccessDisplayRoot::DeferredMiss(binding.clone())
+                }
+            };
         }
         self
     }
@@ -3331,8 +3387,14 @@ where
                 })
             }
             DeserializableValue::Access { base, step } => {
-                apply_postfix_access(*base, step, 0, AccessMissPolicy::Error)
-                    .map_err(serde::de::Error::custom)?
+                let value = apply_postfix_access(*base, step, 0, AccessMissPolicy::Error)
+                    .map_err(serde::de::Error::custom)?;
+                if matches!(value, Value::Concrete(_)) {
+                    return Err(serde::de::Error::custom(
+                        "serialized deferred access resolved to a concrete value",
+                    ));
+                }
+                value
             }
             DeserializableValue::Secret(value) => Value::Deferred(DeferredValue::Secret(value)),
             DeserializableValue::RedactedSecret { hash } => {
@@ -4463,7 +4525,8 @@ pub enum ReReadReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NoPlaceholder {}
 
-/// Parser-stage slots consumed by function evaluation or module expansion.
+/// Parser-stage slots consumed by function evaluation, module expansion, or
+/// deferred-loop template construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParserPlaceholder {
     FnParam {
@@ -4483,6 +4546,11 @@ pub enum ParserPlaceholder {
     FnLocal {
         name: String,
     },
+    /// A typed loop slot emitted while parsing a deferred for-body. The slot
+    /// is transferred to the template-only [`LoopSlot`] stage at the
+    /// expansion boundary; its authored binding name is display metadata on
+    /// access nodes, never identity.
+    Loop(LoopSlot),
     /// Mid-edit empty `${}` interpolation.
     EmptyInterpolation,
 }
@@ -4527,14 +4595,61 @@ pub enum ApplyTimeUnknown {
 /// A parser slot survived the only fallible parser-to-expanded value
 /// transition.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{placeholder}")]
+#[error("{context}{placeholder}")]
 pub struct LeftoverPlaceholder {
     placeholder: ParserPlaceholder,
+    context: LeftoverPlaceholderContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeftoverPlaceholderContext {
+    Value,
+    ResourceAttribute { resource: String, attribute: String },
+    Export { name: String },
+    AttributeDefault { name: String },
+}
+
+impl fmt::Display for LeftoverPlaceholderContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value => Ok(()),
+            Self::ResourceAttribute {
+                resource,
+                attribute,
+            } => write!(formatter, "{resource}: attribute `{attribute}`: "),
+            Self::Export { name } => write!(formatter, "exports `{name}`: "),
+            Self::AttributeDefault { name } => {
+                write!(formatter, "attributes `{name}` default: ")
+            }
+        }
+    }
 }
 
 impl LeftoverPlaceholder {
     pub fn placeholder(&self) -> &ParserPlaceholder {
         &self.placeholder
+    }
+
+    pub(crate) fn in_resource_attribute(
+        mut self,
+        resource: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        self.context = LeftoverPlaceholderContext::ResourceAttribute {
+            resource: resource.into(),
+            attribute: attribute.into(),
+        };
+        self
+    }
+
+    pub(crate) fn in_export(mut self, name: impl Into<String>) -> Self {
+        self.context = LeftoverPlaceholderContext::Export { name: name.into() };
+        self
+    }
+
+    pub(crate) fn in_attribute_default(mut self, name: impl Into<String>) -> Self {
+        self.context = LeftoverPlaceholderContext::AttributeDefault { name: name.into() };
+        self
     }
 }
 
@@ -4566,6 +4681,7 @@ impl std::fmt::Display for ParserPlaceholder {
             Self::ModuleArgument { name, .. } => {
                 write!(formatter, "unresolved module argument: {name}")
             }
+            Self::Loop(slot) => slot.fmt(formatter),
             Self::EmptyInterpolation => formatter
                 .write_str("empty interpolation `${}` — fill in the expression or remove it"),
         }
@@ -4574,7 +4690,9 @@ impl std::fmt::Display for ParserPlaceholder {
 
 /// Internal behavior shared by the three stage marker types.
 #[doc(hidden)]
-pub trait PlaceholderKind: Clone + PartialEq + fmt::Debug + fmt::Display {
+pub trait PlaceholderKind:
+    Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize
+{
     fn module_argument_name(&self) -> Option<&str> {
         None
     }
@@ -4588,6 +4706,12 @@ pub trait PlaceholderKind: Clone + PartialEq + fmt::Debug + fmt::Display {
         Self: Sized,
     {
         Err(PlaceholderOutsideTemplate { slot })
+    }
+
+    /// Render the placeholder as a value. This is distinct from [`Display`],
+    /// which is also used for typed expansion errors.
+    fn render(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -4623,12 +4747,110 @@ impl PlaceholderKind for ParserPlaceholder {
     fn module_argument_name(&self) -> Option<&str> {
         match self {
             Self::ModuleArgument { name, .. } => Some(name),
-            Self::FnParam { .. } | Self::FnLocal { .. } | Self::EmptyInterpolation => None,
+            Self::FnParam { .. }
+            | Self::FnLocal { .. }
+            | Self::Loop(_)
+            | Self::EmptyInterpolation => None,
+        }
+    }
+
+    fn loop_slot(&self) -> Option<LoopSlot> {
+        match self {
+            Self::Loop(slot) => Some(*slot),
+            Self::FnParam { .. }
+            | Self::ModuleArgument { .. }
+            | Self::FnLocal { .. }
+            | Self::EmptyInterpolation => None,
+        }
+    }
+
+    fn from_loop_slot(slot: LoopSlot) -> Result<Self, PlaceholderOutsideTemplate> {
+        Ok(Self::Loop(slot))
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::FnParam { name } => format!("(unresolved function parameter: {name})"),
+            Self::FnLocal { name } => format!("(unresolved function local: {name})"),
+            Self::ModuleArgument { name, .. } => {
+                format!("(unresolved module argument: {name})")
+            }
+            Self::Loop(slot) => slot.to_string(),
+            Self::EmptyInterpolation => "(empty interpolation)".to_string(),
         }
     }
 }
 
 impl<P: PlaceholderKind> Value<P> {
+    /// Clone this value into the placeholder-free stage, returning `None` if
+    /// any placeholder remains anywhere in the tree.
+    pub fn to_expanded(&self) -> Option<Value> {
+        self.clone()
+            .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
+            .ok()
+    }
+
+    /// Return whether any parser/runtime placeholder in this value tree
+    /// matches `predicate`.
+    pub fn contains_placeholder_matching(&self, predicate: &impl Fn(&P) -> bool) -> bool {
+        let argument_matches = |argument: &FunctionArgument<P>| match &argument.operand {
+            StructuralOperand::Value { value, access_base } => {
+                value.contains_placeholder_matching(predicate)
+                    || access_base
+                        .as_ref()
+                        .is_some_and(|value| value.contains_placeholder_matching(predicate))
+            }
+            StructuralOperand::Handle { access_base, .. }
+            | StructuralOperand::Parameter { access_base, .. } => {
+                access_base.contains_placeholder_matching(predicate)
+            }
+        };
+
+        match self {
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => predicate(placeholder),
+            Value::Concrete(ConcreteValue::List(values)) => values
+                .iter()
+                .any(|value| value.contains_placeholder_matching(predicate)),
+            Value::Concrete(ConcreteValue::Map(values)) => values
+                .values()
+                .any(|value| value.contains_placeholder_matching(predicate)),
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                value.contains_placeholder_matching(predicate)
+                    || default.contains_placeholder_matching(predicate)
+            }
+            Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+                matches!(part, InterpolationPart::Expr(value) if value.contains_placeholder_matching(predicate))
+            }),
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => args.iter().any(argument_matches),
+            Value::Deferred(DeferredValue::Access(access)) => {
+                access.base().contains_placeholder_matching(predicate)
+            }
+            Value::Deferred(DeferredValue::Secret(value)) => {
+                value.contains_placeholder_matching(predicate)
+            }
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::RedactedSecret { .. }
+                | DeferredValue::Unknown(_),
+            ) => false,
+        }
+    }
+
     pub(crate) fn try_map_placeholder<Q: PlaceholderKind, E>(
         self,
         map: &mut dyn FnMut(P) -> Result<Value<Q>, E>,
@@ -4636,27 +4858,9 @@ impl<P: PlaceholderKind> Value<P> {
         let map_argument = |argument: FunctionArgument<P>,
                             map: &mut dyn FnMut(P) -> Result<Value<Q>, E>|
          -> Result<FunctionArgument<Q>, E> {
-            let operand = match argument.operand {
-                StructuralOperand::Value { value, access_base } => StructuralOperand::Value {
-                    value: value.try_map_placeholder(map)?,
-                    access_base: access_base
-                        .map(|value| value.try_map_placeholder(map))
-                        .transpose()?,
-                },
-                StructuralOperand::Handle {
-                    handle,
-                    access_base,
-                } => StructuralOperand::Handle {
-                    handle,
-                    access_base: access_base.try_map_placeholder(map)?,
-                },
-                StructuralOperand::Parameter { name, access_base } => {
-                    StructuralOperand::Parameter {
-                        name,
-                        access_base: access_base.try_map_placeholder(map)?,
-                    }
-                }
-            };
+            let operand = argument
+                .operand
+                .try_map_stage(&mut |value| value.try_map_placeholder(map))?;
             Ok(FunctionArgument { operand })
         };
 
@@ -4791,99 +4995,50 @@ impl Value<NoPlaceholder> {
             Err(never) => match never {},
         }
     }
-
-    pub(crate) fn into_loop_template(
-        self,
-        slot_for_binding: &impl Fn(&str) -> Option<LoopSlot>,
-    ) -> Value<LoopSlot> {
-        fn replace_binding_refs(
-            value: &mut Value<LoopSlot>,
-            slot_for_binding: &impl Fn(&str) -> Option<LoopSlot>,
-        ) {
-            match value {
-                Value::Concrete(ConcreteValue::List(values)) => {
-                    for value in values {
-                        replace_binding_refs(value, slot_for_binding);
-                    }
-                }
-                Value::Concrete(ConcreteValue::Map(values)) => {
-                    for value in values.values_mut() {
-                        replace_binding_refs(value, slot_for_binding);
-                    }
-                }
-                Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                    if let Some(slot) = slot_for_binding(binding) {
-                        *value = Value::Deferred(DeferredValue::Placeholder(slot));
-                    }
-                }
-                Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                    if let Some(slot) = slot_for_binding(path.binding()) {
-                        let display_root = path.binding().to_string();
-                        let steps = std::iter::once(PathSegment::Field {
-                            name: path.attribute().to_string(),
-                        })
-                        .chain(path.segments().iter().cloned());
-                        let mut replacement = Value::Deferred(DeferredValue::Placeholder(slot));
-                        for step in steps {
-                            replacement =
-                                apply_postfix_access(replacement, step, 0, AccessMissPolicy::Error)
-                                    .expect("a loop-slot access remains deferred");
-                        }
-                        *value = replacement.with_access_display_root(display_root);
-                    }
-                }
-                Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                    replace_binding_refs(value, slot_for_binding);
-                    replace_binding_refs(default, slot_for_binding);
-                }
-                Value::Deferred(DeferredValue::Interpolation(parts)) => {
-                    for part in parts {
-                        if let InterpolationPart::Expr(value) = part {
-                            replace_binding_refs(value, slot_for_binding);
-                        }
-                    }
-                }
-                Value::Deferred(
-                    DeferredValue::FunctionCall { args, .. }
-                    | DeferredValue::Unavailable { args, .. }
-                    | DeferredValue::ResolvedFunctionCall { args, .. },
-                ) => {
-                    for argument in args {
-                        replace_binding_refs(argument.walker_value_mut(), slot_for_binding);
-                    }
-                }
-                Value::Deferred(DeferredValue::Access(access)) => {
-                    replace_binding_refs(&mut access.base, slot_for_binding);
-                }
-                Value::Deferred(DeferredValue::Secret(value)) => {
-                    replace_binding_refs(value, slot_for_binding);
-                }
-                Value::Concrete(
-                    ConcreteValue::String(_)
-                    | ConcreteValue::EnumIdentifier(_)
-                    | ConcreteValue::CanonicalEnum(_)
-                    | ConcreteValue::Int(_)
-                    | ConcreteValue::Float(_)
-                    | ConcreteValue::Bool(_)
-                    | ConcreteValue::Duration(_)
-                    | ConcreteValue::StringList(_),
-                )
-                | Value::Deferred(DeferredValue::RedactedSecret { .. })
-                | Value::Deferred(DeferredValue::Unknown(_))
-                | Value::Deferred(DeferredValue::Placeholder(_)) => {}
-            }
-        }
-
-        let mut value = self.into_placeholder_type();
-        replace_binding_refs(&mut value, slot_for_binding);
-        value
-    }
 }
 
 impl Value<ParserPlaceholder> {
     pub fn into_expanded(self) -> Result<Value, LeftoverPlaceholder> {
-        self.try_map_placeholder(&mut |placeholder| Err(LeftoverPlaceholder { placeholder }))
+        self.try_map_placeholder(&mut |placeholder| {
+            Err(LeftoverPlaceholder {
+                placeholder,
+                context: LeftoverPlaceholderContext::Value,
+            })
+        })
     }
+
+    pub(crate) fn into_loop_template(self) -> Result<Value<LoopSlot>, LeftoverPlaceholder> {
+        self.try_map_placeholder(&mut |placeholder| match placeholder {
+            ParserPlaceholder::Loop(slot) => Ok(Value::Deferred(DeferredValue::Placeholder(slot))),
+            placeholder => Err(LeftoverPlaceholder {
+                placeholder,
+                context: LeftoverPlaceholderContext::Value,
+            }),
+        })
+    }
+}
+
+/// Cross a string-keyed value map into the expanded stage. Resource owners
+/// may supply their id so leftover placeholders retain attribute context.
+pub fn into_expanded_value_map<C>(
+    values: impl IntoIterator<Item = (String, Value<ParserPlaceholder>)>,
+    resource: Option<&ResourceId>,
+) -> Result<C, LeftoverPlaceholder>
+where
+    C: FromIterator<(String, Value)>,
+{
+    values
+        .into_iter()
+        .map(|(name, value)| {
+            value
+                .into_expanded()
+                .map(|value| (name.clone(), value))
+                .map_err(|error| match resource {
+                    Some(resource) => error.in_resource_attribute(resource.to_string(), name),
+                    None => error,
+                })
+        })
+        .collect()
 }
 
 /// A part of a string interpolation expression
@@ -7259,7 +7414,7 @@ impl<P: PlaceholderKind> From<Resource<ModuleSource, P>> for Resource<SavedModul
 }
 
 impl<S> Resource<S, ParserPlaceholder> {
-    pub(crate) fn into_expanded(self) -> Result<Resource<S>, LeftoverPlaceholder> {
+    pub fn into_expanded(self) -> Result<Resource<S>, LeftoverPlaceholder> {
         let Resource {
             id,
             attributes,
@@ -7273,12 +7428,10 @@ impl<S> Resource<S, ParserPlaceholder> {
             loop_provenance,
             quoted_string_attrs,
         } = self;
+        let attributes = into_expanded_value_map(attributes, Some(&id))?;
         Ok(Resource {
             id,
-            attributes: attributes
-                .into_iter()
-                .map(|(name, value)| value.into_expanded().map(|value| (name, value)))
-                .collect::<Result<_, _>>()?,
+            attributes,
             directives,
             resolved_ignore_changes,
             prefixes,
@@ -7292,11 +7445,8 @@ impl<S> Resource<S, ParserPlaceholder> {
     }
 }
 
-impl<S> Resource<S> {
-    pub(crate) fn into_loop_template(
-        self,
-        slot_for_binding: &impl Fn(&str) -> Option<LoopSlot>,
-    ) -> Resource<S, LoopSlot> {
+impl<S> Resource<S, ParserPlaceholder> {
+    pub(crate) fn into_loop_template(self) -> Result<Resource<S, LoopSlot>, LeftoverPlaceholder> {
         let Resource {
             id,
             attributes,
@@ -7310,12 +7460,18 @@ impl<S> Resource<S> {
             loop_provenance,
             quoted_string_attrs,
         } = self;
-        Resource {
+        let resource_id = id.to_string();
+        Ok(Resource {
             id,
             attributes: attributes
                 .into_iter()
-                .map(|(name, value)| (name, value.into_loop_template(slot_for_binding)))
-                .collect(),
+                .map(|(name, value)| {
+                    value
+                        .into_loop_template()
+                        .map(|value| (name.clone(), value))
+                        .map_err(|error| error.in_resource_attribute(resource_id.clone(), name))
+                })
+                .collect::<Result<_, _>>()?,
             directives,
             resolved_ignore_changes,
             prefixes,
@@ -7325,7 +7481,7 @@ impl<S> Resource<S> {
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
-        }
+        })
     }
 }
 
