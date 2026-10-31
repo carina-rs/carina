@@ -179,7 +179,7 @@ fn current_saved_plan_apply_moves_legacy_loop_row_without_provider_mutation() {
     let saved_plan = read_json(&scenario.project.join("migration.plan.json"));
     assert_eq!(
         saved_plan["version"],
-        Value::from(PlanFile::CURRENT_VERSION),
+        Value::from(PlanFile::CURRENT_VERSION)
     );
     let move_payload = saved_plan["plan"]["effects"]
         .as_array()

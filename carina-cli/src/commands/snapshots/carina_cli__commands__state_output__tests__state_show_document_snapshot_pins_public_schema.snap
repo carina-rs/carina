@@ -1,6 +1,5 @@
 ---
 source: carina-cli/src/commands/state_output.rs
-assertion_line: 409
 expression: "serde_json::to_string_pretty(&document).expect(\"document must serialize\")"
 ---
 {
@@ -58,6 +57,19 @@ expression: "serde_json::to_string_pretty(&document).expect(\"document must seri
       "current": {
         "kind": "create_in_flight",
         "identifier": "mock-pending-id",
+        "attributes": {}
+      },
+      "deposed": []
+    },
+    {
+      "binding": "unknown",
+      "identity": "unknown-resource",
+      "provider": "mock",
+      "resource_type": "test.resource",
+      "protected": false,
+      "current": {
+        "kind": "create_outcome_unknown",
+        "identifier": null,
         "attributes": {}
       },
       "deposed": []

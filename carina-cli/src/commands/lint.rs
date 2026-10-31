@@ -41,13 +41,62 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
         .collect()
 }
 
-fn mixed_tag_key_style_warnings_for_population<E>(
+fn mixed_tag_key_style_warnings_for_population<E, D>(
     root_inputs: &[(PathBuf, String)],
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::File<E, D>,
     base_dir: &Path,
 ) -> Vec<LintWarning> {
     let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
     mixed_tag_key_style_warnings(&tag_keys)
+}
+
+enum LintFile {
+    Blocked(carina_core::parser::InferredFile),
+    Resolved(carina_core::parser::ModuleResolvedInferredFile),
+}
+
+impl LintFile {
+    fn resolve_type_exprs_best_effort(&mut self, config: &ProviderContext) {
+        match self {
+            Self::Blocked(parsed) => {
+                carina_core::validation::resolve_file_type_exprs_best_effort(parsed, config);
+            }
+            Self::Resolved(parsed) => {
+                carina_core::validation::resolve_file_type_exprs_best_effort(parsed, config);
+            }
+        }
+    }
+
+    fn export_params(&self) -> &[carina_core::parser::InferredExportParam] {
+        match self {
+            Self::Blocked(parsed) => &parsed.export_params,
+            Self::Resolved(parsed) => &parsed.export_params,
+        }
+    }
+
+    fn iter_top_level_resources(
+        &self,
+    ) -> Box<dyn Iterator<Item = carina_core::parser::ResourceRef<'_>> + '_> {
+        match self {
+            Self::Blocked(parsed) => Box::new(parsed.iter_top_level_resources()),
+            Self::Resolved(parsed) => Box::new(parsed.iter_top_level_resources()),
+        }
+    }
+
+    fn mixed_tag_key_style_warnings(
+        &self,
+        root_inputs: &[(PathBuf, String)],
+        base_dir: &Path,
+    ) -> Vec<LintWarning> {
+        match self {
+            Self::Blocked(parsed) => {
+                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+            }
+            Self::Resolved(parsed) => {
+                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+            }
+        }
+    }
 }
 
 pub fn run_lint(
@@ -61,7 +110,7 @@ pub fn run_lint(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
-    let mut parsed = loaded.parsed;
+    let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
     let module_walk = ModuleWalk::load(&parsed, base_dir);
@@ -91,38 +140,37 @@ pub fn run_lint(
     // blocked; retaining these findings and the schema-independent text scans
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
-    if module_boundary_findings.is_empty() {
+    let mut parsed = if module_boundary_findings.is_empty() {
         let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
             module_resolver::resolve_modules_with_config(
-                &mut parsed,
+                parsed,
                 base_dir,
                 loaded_provider_context,
                 schemas,
             )
         } else {
             module_resolver::resolve_modules_with_providerless_config(
-                &mut parsed,
+                parsed,
                 base_dir,
                 provider_context,
                 schemas,
             )
         };
-        resolution.map_err(|e| {
+        LintFile::Resolved(resolution.map_err(|e| {
             format!(
                 "Module resolution error: {}",
                 e.display_relative_to(base_dir)
             )
-        })?;
-    }
+        })?)
+    } else {
+        LintFile::Blocked(parsed)
+    };
 
     if let Some(loaded_provider_context) = loaded_provider_context {
-        carina_core::validation::resolve_file_type_exprs_best_effort(
-            &mut parsed,
-            loaded_provider_context,
-        );
+        parsed.resolve_type_exprs_best_effort(loaded_provider_context);
     }
     let export_handle_errors =
-        carina_core::validation::validate_export_handle_boundaries(&parsed.export_params).err();
+        carina_core::validation::validate_export_handle_boundaries(parsed.export_params()).err();
 
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = {
@@ -148,9 +196,10 @@ pub fn run_lint(
             carina_core::parser::ResourceRef::Resource(m) => schemas.get_for(m),
             carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
             carina_core::parser::ResourceRef::LiveComposition(_) => None,
-            carina_core::parser::ResourceRef::Deferred { resource, .. } => {
-                schemas.get_for(resource)
-            }
+            carina_core::parser::ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => schemas.get_for(resource),
         };
         if let Some(schema) = schema {
             let schema = schema.as_schema();
@@ -274,11 +323,7 @@ pub fn run_lint(
         }
     }
 
-    warnings.extend(mixed_tag_key_style_warnings_for_population(
-        &source_texts,
-        &parsed,
-        base_dir,
-    ));
+    warnings.extend(parsed.mixed_tag_key_style_warnings(&source_texts, base_dir));
 
     if warnings.is_empty() {
         println!("{}", "No lint warnings found.".green().bold());

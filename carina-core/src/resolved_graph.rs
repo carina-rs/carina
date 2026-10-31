@@ -765,8 +765,8 @@ fn resolve_composition_dependencies(
 
 /// Resolve all module handle outputs and build the address index used by every
 /// subsequent resource, data-source, and wait transition.
-pub fn resolve_expanded_graph<E>(
-    parsed: &mut File<E>,
+pub fn resolve_expanded_graph<E, D>(
+    parsed: &mut File<E, D>,
     managed: &[Resource],
     data_sources: &[DataSource],
 ) -> Result<ExpandedBindingIndex, ExpandedGraphResolutionError> {

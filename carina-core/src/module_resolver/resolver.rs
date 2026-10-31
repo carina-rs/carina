@@ -7,8 +7,8 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{
-    LoadedProviderContext, ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext,
-    UseStatement,
+    LoadedProviderContext, ModuleCallDiagnosticSource, ModuleResolvedFile,
+    ModuleResolvedParsedFile, ParseError, ParsedFile, ProviderContext, UseStatement,
 };
 use crate::resource::ModuleConstraintId;
 use crate::schema::SchemaRegistry;
@@ -74,7 +74,7 @@ pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 /// scratch graph that produced them.
 pub enum ModuleResolutionDiagnosticResult<E> {
     Expanded {
-        graph: Box<crate::parser::File<E>>,
+        graph: Box<ModuleResolvedFile<E>>,
     },
     ConstraintFailed {
         findings: Vec<crate::validation::ModuleCallFinding>,
@@ -92,10 +92,18 @@ pub struct ResidualModuleResolutionError(Box<ModuleError>);
 /// Source-routing shape of a residual resolver error. Core classifies every
 /// [`ModuleError`] variant; editor adapters only map the resulting location.
 pub enum ResidualModuleResolutionDiagnostic<'a> {
-    Constraint { origin: &'a ConstraintOrigin },
-    ArgumentValueAccess { source_path: &'a str, line: usize },
+    Constraint {
+        origin: &'a ConstraintOrigin,
+    },
+    ArgumentValueAccess {
+        source_path: &'a str,
+        line: usize,
+    },
     ModuleCall,
-    Parse,
+    Parse {
+        source_path: Option<&'a Path>,
+        error: &'a ParseError,
+    },
 }
 
 impl ResidualModuleResolutionError {
@@ -123,6 +131,7 @@ impl ResidualModuleResolutionError {
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
         match self.0.root_cause() {
+            ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::Constraint(diagnostic) => {
                 Some(ResidualModuleResolutionDiagnostic::Constraint {
                     origin: &diagnostic.origin,
@@ -137,13 +146,26 @@ impl ResidualModuleResolutionError {
                 source_path,
                 line: *line,
             }),
-            ModuleError::Parse(_error) => Some(ResidualModuleResolutionDiagnostic::Parse),
-            ModuleError::ParseInFile {
-                path: _path,
-                error: _error,
-            } => Some(ResidualModuleResolutionDiagnostic::Parse),
+            ModuleError::Parse(error) => match error {
+                ParseError::Located { path, error } => {
+                    Some(ResidualModuleResolutionDiagnostic::Parse {
+                        source_path: Some(path),
+                        error,
+                    })
+                }
+                error => Some(ResidualModuleResolutionDiagnostic::Parse {
+                    source_path: None,
+                    error,
+                }),
+            },
+            ModuleError::ParseInFile { path, error } => {
+                Some(ResidualModuleResolutionDiagnostic::Parse {
+                    source_path: Some(path),
+                    error,
+                })
+            }
             ModuleError::TypeResolution(_diagnostic) => {
-                Some(ResidualModuleResolutionDiagnostic::Parse)
+                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
             ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::CircularImport(_module) => None,
@@ -208,6 +230,7 @@ impl ResidualModuleResolutionError {
     ) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
+            ModuleError::Multiple(_errors) => false,
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
                 self.finding_owns_error(finding)
                     && finding.message().covers_missing_argument(module, argument)
@@ -268,6 +291,13 @@ impl ResidualModuleResolutionError {
                     line: _,
                     span: _,
                 }
+                | ParseError::DeferredForBodyUnsupported(_)
+                | ParseError::DeferredForBodyTemplate {
+                    line: _,
+                    header: _,
+                    span: _,
+                    error: _,
+                }
                 | ParseError::UnresolvedDeclarationType {
                     token: _,
                     line: _,
@@ -301,6 +331,14 @@ impl ResidualModuleResolutionError {
                 | ParseError::UndefinedIdentifier {
                     name: _,
                     line: _,
+                    span: _,
+                    suggestion: _,
+                    in_scope: _,
+                }
+                | ParseError::UndefinedDeferredIterable {
+                    name: _,
+                    line: _,
+                    span: _,
                     suggestion: _,
                     in_scope: _,
                 }
@@ -360,6 +398,13 @@ fn without_covered_reference_type_members(
     findings: &[crate::validation::ModuleCallFinding],
 ) -> Option<ModuleError> {
     match error {
+        ModuleError::Multiple(errors) => ModuleError::from_errors(
+            errors
+                .into_vec()
+                .into_iter()
+                .filter_map(|error| without_covered_reference_type_members(error, findings))
+                .collect(),
+        ),
         ModuleError::OwnedByCalls { calls, error } => {
             without_covered_reference_type_members(*error, findings).map(|error| {
                 ModuleError::OwnedByCalls {
@@ -1179,16 +1224,23 @@ fn lift_module_attribute_handles<E>(
         })
         .collect::<HashMap<_, _>>();
     let local_resources = parsed
-        .resources
-        .iter()
-        .chain(
-            parsed
-                .deferred_for_expressions
-                .iter()
-                .map(|deferred| &deferred.template_resource),
-        )
-        .filter_map(|resource| {
-            resource.binding.as_ref().map(|binding| {
+        .iter_all_resources()
+        .filter_map(|resource| match resource {
+            crate::parser::ResourceRef::Resource(resource) => {
+                resource.binding.as_ref().map(|binding| {
+                    (
+                        binding.clone(),
+                        crate::parser::ResourceTypePath::new(
+                            resource.id.provider.clone(),
+                            resource.id.resource_type.clone(),
+                        ),
+                    )
+                })
+            }
+            crate::parser::ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => resource.binding.as_ref().map(|binding| {
                 (
                     binding.clone(),
                     crate::parser::ResourceTypePath::new(
@@ -1196,7 +1248,9 @@ fn lift_module_attribute_handles<E>(
                         resource.id.resource_type.clone(),
                     ),
                 )
-            })
+            }),
+            crate::parser::ResourceRef::LiveComposition(_composition) => None,
+            crate::parser::ResourceRef::DataSource(_data_source) => None,
         })
         .collect::<HashMap<_, _>>();
 
@@ -1299,19 +1353,27 @@ fn lift_module_attribute_handles<E>(
         }
     };
 
-    for resource in &mut parsed.resources {
-        for operand in resource.directives.depends_on.iter_mut() {
-            lift_dependency(operand);
-        }
-    }
-    for data_source in &mut parsed.data_sources {
-        for operand in data_source.directives.depends_on.iter_mut() {
-            lift_dependency(operand);
-        }
-    }
-    for deferred in &mut parsed.deferred_for_expressions {
-        for operand in deferred.template_resource.directives.depends_on.iter_mut() {
-            lift_dependency(operand);
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource) => {
+                for operand in resource.directives.depends_on.iter_mut() {
+                    lift_dependency(operand);
+                }
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                for operand in data_source.directives.depends_on.iter_mut() {
+                    lift_dependency(operand);
+                }
+            }
+            crate::parser::ResourceMut::Deferred {
+                resource,
+                attributes: (),
+            } => {
+                for operand in resource.directives.depends_on.iter_mut() {
+                    lift_dependency(operand);
+                }
+            }
+            crate::parser::ResourceMut::LiveComposition(_composition) => {}
         }
     }
     for wait in &mut parsed.wait_bindings {
@@ -1415,9 +1477,9 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike>
 
 /// Resolve all modules without a loaded provider catalog.
 pub fn resolve_modules_providerless(
-    parsed: &mut crate::parser::ParsedFile,
+    parsed: crate::parser::ParsedFile,
     base_dir: &Path,
-) -> Result<(), ModuleError> {
+) -> Result<ModuleResolvedParsedFile, ModuleError> {
     resolve_modules_with_providerless_config(
         parsed,
         base_dir,
@@ -1432,23 +1494,25 @@ pub fn resolve_modules_providerless(
 /// `ParsedFile` (parser phase) or `InferredFile` (post-loader phase) —
 /// the resolver only touches `uses`, `module_calls`, and `resources`.
 pub fn resolve_modules_with_config<E: crate::parser::ExportParamLike>(
-    parsed: &mut crate::parser::File<E>,
+    mut parsed: crate::parser::File<E>,
     base_dir: &Path,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<(), ModuleError> {
-    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+) -> Result<ModuleResolvedFile<E>, ModuleError> {
+    RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(parsed)
 }
 
 /// Resolve modules in a bootstrap/editor context. Every value check is
 /// classified first, and provider-owned schema types are left unchecked.
 pub fn resolve_modules_with_providerless_config<E: crate::parser::ExportParamLike>(
-    parsed: &mut crate::parser::File<E>,
+    mut parsed: crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<(), ModuleError> {
-    RefCheckedModuleGraph::check_providerless(parsed, base_dir, config, schemas)?.expand()
+) -> Result<ModuleResolvedFile<E>, ModuleError> {
+    RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(parsed)
 }
 
 /// Expand an upstream project's modules using the consumer's necessarily
@@ -1458,21 +1522,24 @@ pub fn resolve_modules_with_providerless_config<E: crate::parser::ExportParamLik
 pub(crate) fn resolve_upstream_modules_with_providerless_config<
     E: crate::parser::ExportParamLike,
 >(
-    parsed: &mut crate::parser::File<E>,
+    mut parsed: crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<(), ModuleError> {
-    UpstreamRefCheckedModuleGraph::check_providerless(parsed, base_dir, config, schemas)?.expand()
+) -> Result<ModuleResolvedFile<E>, ModuleError> {
+    UpstreamRefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
+        .expand()?;
+    finalize_deferred_for_bodies(parsed)
 }
 
 pub(crate) fn resolve_upstream_modules_with_config<E: crate::parser::ExportParamLike>(
-    parsed: &mut crate::parser::File<E>,
+    mut parsed: crate::parser::File<E>,
     base_dir: &Path,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<(), ModuleError> {
-    UpstreamRefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+) -> Result<ModuleResolvedFile<E>, ModuleError> {
+    UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(parsed)
 }
 
 /// Resolve modules while retaining the expander's own per-call constraint
@@ -1526,6 +1593,8 @@ fn resolve_modules_with_diagnostics_and_resolver<E: crate::parser::ExportParamLi
         )),
         Err(error) => errors.push(error),
     }
+    let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
+    errors.extend(deferred_for_errors);
     let constraint_reports = resolver
         .constraint_reports
         .into_inner()
@@ -1550,6 +1619,95 @@ fn resolve_modules_with_diagnostics_and_resolver<E: crate::parser::ExportParamLi
     } else {
         ModuleResolutionDiagnosticResult::Unowned { errors }
     }
+}
+
+/// Convert parser-side deferred-loop bodies into the resource-only typestate
+/// consumed by every post-resolution subsystem.
+///
+/// This runs only after root and module-expanded loops have crossed argument
+/// substitution. A read or module-call template therefore reaches exactly one
+/// typed rejection seam, with enough information to distinguish a genuinely
+/// residual iterable from one that became concrete during module expansion.
+fn finalize_deferred_for_bodies<E>(
+    parsed: crate::parser::File<E>,
+) -> Result<ModuleResolvedFile<E>, ModuleError> {
+    let (resolved, errors) = finalize_deferred_for_bodies_collecting(parsed);
+    match ModuleError::from_errors(errors) {
+        Some(error) => Err(error),
+        None => Ok(resolved),
+    }
+}
+
+fn finalize_deferred_for_bodies_collecting<E>(
+    parsed: crate::parser::File<E>,
+) -> (ModuleResolvedFile<E>, Vec<ModuleError>) {
+    let known_bindings = deferred_for_known_bindings(&parsed);
+    parsed.map_deferred_for_phase(|pending| {
+        let mut resolved = Vec::with_capacity(pending.len());
+        let mut errors = Vec::new();
+        for expression in pending {
+            match expression.into_resource_expression(&known_bindings) {
+                Ok(expression) => resolved.push(expression),
+                Err(error) => {
+                    errors.push(deferred_for_resource_expression_error(error));
+                }
+            }
+        }
+        (resolved, errors)
+    })
+}
+
+fn deferred_for_resource_expression_error(
+    error: crate::parser::DeferredForResourceExpressionError,
+) -> ModuleError {
+    match error {
+        crate::parser::DeferredForResourceExpressionError::UndefinedIterable(error) => {
+            parse_error_to_module_error(error)
+        }
+        crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
+            let error = ParseError::DeferredForBodyUnsupported(error);
+            match file {
+                Some(path) => ModuleError::ParseInFile {
+                    path: std::path::PathBuf::from(path),
+                    error: Box::new(error),
+                },
+                None => ModuleError::Parse(error),
+            }
+        }
+    }
+}
+
+fn parse_error_to_module_error(error: ParseError) -> ModuleError {
+    match error {
+        ParseError::Located { path, error } => ModuleError::ParseInFile { path, error },
+        error => ModuleError::Parse(error),
+    }
+}
+
+fn deferred_for_known_bindings<E>(parsed: &crate::parser::File<E>) -> Vec<String> {
+    let mut known = parsed
+        .structural_binding_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    known.extend(parsed.variables.keys().cloned());
+    known.sort_unstable();
+    known.dedup();
+    known
+}
+
+pub(super) fn deferred_for_body_errors<E>(parsed: &crate::parser::File<E>) -> Vec<ModuleError> {
+    let known_bindings = deferred_for_known_bindings(parsed);
+    parsed
+        .parsed_deferred_for_expressions()
+        .iter()
+        .filter_map(|expression| {
+            match expression.clone().into_resource_expression(&known_bindings) {
+                Ok(_) => None,
+                Err(error) => Some(deferred_for_resource_expression_error(error)),
+            }
+        })
+        .collect()
 }
 
 fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
@@ -1577,7 +1735,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
             continue;
         }
         let instance_prefix = instance_prefix_for_call(call);
-        match resolver.expand_module_call_checked(
+        match resolver.expand_module_call_checked_collecting(
             call,
             &instance_prefix,
             ref_check,
@@ -1587,7 +1745,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
             Ok(expanded) => {
                 expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
             }
-            Err(error) => errors.push(error),
+            Err(call_errors) => errors.extend(call_errors),
         }
     }
     drop(binding_index);

@@ -18,21 +18,28 @@ mod types;
 mod util;
 
 pub use crate::eval_value::{UnexpandedResourceHandle, UnexpandedStructuralHandleKind};
+pub(crate) use ast::UnexpandedCompositionAttribute;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingName,
     BindingScopeId, BindingUseOwner, BoundaryExpression, CallExpansion, ConsumerArgumentParameter,
-    ConsumerAttributeParameter, DeferredForExpansionError, DeferredForExpression,
-    DeferredForTarget, ExpansionKey, ExportParamLike, ExportParameter, File, FnParam,
-    InferredExportParam, InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource,
-    ModuleCallId, MovedAddresses, ParsedBindingUses, ParsedExportParam, ParsedFile,
-    ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock, ResourceAddress,
-    ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch,
-    SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UnexpandedDependencies,
-    UnexpandedDependencyOperand, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
-    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
+    ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
+    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, ExpansionKey, ExportParamLike,
+    ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleArgument, ModuleCall,
+    ModuleCallDiagnosticSource, ModuleCallId, ModuleResolvedFile, ModuleResolvedInferredFile,
+    ModuleResolvedParsedFile, MovedAddresses, ParsedBindingUses, ParsedDeferredForExpression,
+    ParsedDeferredForPhase, ParsedExportParam, ParsedFile, ParserBindingMetadata, PendingValueSlot,
+    ProviderConfig, RequireBlock, ResolvedDeferredForExpressions, ResolvedDeferredForPhase,
+    ResourceAddress, ResourceContext, ResourceMut, ResourceRef, ResourceTypePath,
+    SavedDeferredForExpression, ShapeMismatch, SourceFileId, SourceSpan, StateBlock,
+    StateBlockAddress, TypeExpr, UnexpandedDependencies, UnexpandedDependencyOperand,
+    UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr,
+    ValidationBlock, WaitBinding, expand_deferred_children,
 };
-pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse, UnexpandedCompositionAttribute};
+pub(crate) use ast::{
+    BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
+    ParsedDeferredForIterableState,
+};
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
@@ -58,6 +65,7 @@ pub(crate) use entry::{
     parse_expression_in_sink,
 };
 pub use error::{
+    DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     UnresolvedTypeToken, WarningKind,
 };

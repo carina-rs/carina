@@ -1,5 +1,517 @@
 use super::*;
 
+#[test]
+fn field_group_members_require_two_distinct_field_names() {
+    assert_eq!(
+        FieldGroup::exactly_one(Vec::<String>::new()),
+        Err(FieldGroupError::TooFewFields { actual: 0 })
+    );
+    assert_eq!(
+        FieldGroup::exactly_one(["only"]),
+        Err(FieldGroupError::TooFewFields { actual: 1 })
+    );
+    assert_eq!(
+        FieldGroup::at_least_one(["same", "same"]),
+        Err(FieldGroupError::DuplicateField {
+            name: "same".to_string(),
+        })
+    );
+
+    let group = FieldGroup::at_most_one(["first", "second"])
+        .expect("two distinct names form a valid field group");
+    assert_eq!(group.kind(), FieldGroupKind::AtMostOne);
+    assert_eq!(group.fields(), ["first", "second"]);
+}
+
+#[test]
+fn schema_validation_checks_field_group_members_at_their_own_scope() {
+    let top_level = ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::optional("known", AttributeType::string()).build())
+        .attribute(AttributeSchema::provider_populated("output", AttributeType::string()).build())
+        .field_group(FieldGroup::exactly_one(["known", "missing"]).unwrap())
+        .field_group(FieldGroup::at_most_one(["known", "output"]).unwrap())
+        .validate()
+        .expect_err("top-level groups must use known writable attributes")
+        .to_string();
+    assert!(top_level.contains("field_groups[0]"));
+    assert!(top_level.contains("unknown attribute `missing`"));
+    assert!(top_level.contains("field_groups[1]"));
+    assert!(top_level.contains("provider-populated attribute `output`"));
+
+    let nested_type = AttributeType::struct_with_field_groups(
+        "Nested",
+        vec![
+            StructField::optional("known", AttributeType::string()).build(),
+            StructField::provider_populated("output", AttributeType::string()).build(),
+        ],
+        vec![
+            FieldGroup::at_least_one(["known", "missing"]).unwrap(),
+            FieldGroup::at_most_one(["known", "output"]).unwrap(),
+        ],
+    );
+    let nested = ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::optional("nested", nested_type).build())
+        .validate()
+        .expect_err("struct groups must use fields from that struct")
+        .to_string();
+    assert!(nested.contains("nested.field_groups[0]"), "{nested}");
+    assert!(nested.contains("unknown field `missing`"), "{nested}");
+    assert!(nested.contains("nested.field_groups[1]"), "{nested}");
+    assert!(
+        nested.contains("provider-populated field `output`"),
+        "{nested}"
+    );
+}
+
+#[test]
+fn shared_struct_field_groups_are_admitted_at_writable_and_output_sites() {
+    let shared = AttributeType::struct_with_field_groups(
+        "Shared",
+        vec![
+            StructField::optional("first", AttributeType::string()).build(),
+            StructField::optional("second", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::exactly_one(["first", "second"]).unwrap()],
+    );
+
+    ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::optional("input", AttributeType::ref_("Shared")).build())
+        .attribute(
+            AttributeSchema::provider_populated("output", AttributeType::ref_("Shared")).build(),
+        )
+        .with_def("Shared", shared)
+        .validate()
+        .expect("inherited output-only status must not invalidate a shared Struct field group");
+}
+
+#[test]
+fn output_only_ancestors_do_not_hide_structural_field_group_errors() {
+    let output = AttributeType::struct_with_field_groups(
+        "Output",
+        vec![
+            StructField::optional("known", AttributeType::string()).build(),
+            StructField::optional("other", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::at_least_one(["known", "missing"]).unwrap()],
+    );
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::provider_populated("output", output).build())
+        .validate()
+        .expect_err("unknown group members remain invalid below output-only attributes")
+        .to_string();
+
+    assert!(error.contains("output.field_groups[0]"), "{error}");
+    assert!(error.contains("unknown field `missing`"), "{error}");
+}
+
+#[test]
+fn config_schema_validation_rejects_invalid_struct_field_groups() {
+    let grouped = AttributeType::struct_with_field_groups(
+        "Config",
+        vec![
+            StructField::optional("known", AttributeType::string()).build(),
+            StructField::optional("other", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::at_most_one(["known", "missing"]).unwrap()],
+    );
+    let error = ValidatedConfigSchema::validate(BTreeMap::from([("config".to_string(), grouped)]))
+        .expect_err("provider config Struct groups must pass admission")
+        .to_string();
+
+    assert!(error.contains("config.field_groups[0]"), "{error}");
+    assert!(error.contains("unknown field `missing`"), "{error}");
+}
+
+#[test]
+fn resource_field_groups_reject_required_members() {
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::required("required_choice", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("optional_choice", AttributeType::string()).build())
+        .field_group(FieldGroup::exactly_one(["required_choice", "optional_choice"]).unwrap())
+        .validate()
+        .expect_err("a required member makes a field group meaningless")
+        .to_string();
+
+    assert!(error.contains("field_groups[0]"), "{error}");
+    assert!(
+        error.contains("required attribute `required_choice`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn struct_field_groups_reject_required_members() {
+    let nested = AttributeType::struct_with_field_groups(
+        "Nested",
+        vec![
+            StructField::required("required_choice", AttributeType::string()).build(),
+            StructField::optional("optional_choice", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::exactly_one(["required_choice", "optional_choice"]).unwrap()],
+    );
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::optional("nested", nested).build())
+        .validate()
+        .expect_err("a required struct member makes a field group meaningless")
+        .to_string();
+
+    assert!(error.contains("nested.field_groups[0]"), "{error}");
+    assert!(
+        error.contains("required field `required_choice`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resource_field_groups_reject_defaulted_members() {
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional("defaulted_choice", AttributeType::string())
+                .with_default(string_value("default"))
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("optional_choice", AttributeType::string()).build())
+        .field_group(FieldGroup::exactly_one(["defaulted_choice", "optional_choice"]).unwrap())
+        .validate()
+        .expect_err("a defaulted member makes authored-presence counting unsound")
+        .to_string();
+
+    assert!(error.contains("field_groups[0]"), "{error}");
+    assert!(
+        error.contains("defaulted attribute `defaulted_choice`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resource_field_groups_reject_duplicate_member_sets_in_any_order() {
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::optional("first", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("second", AttributeType::string()).build())
+        .field_group(FieldGroup::exactly_one(["first", "second"]).unwrap())
+        .field_group(FieldGroup::exactly_one(["second", "first"]).unwrap())
+        .validate()
+        .expect_err("member order must not distinguish otherwise duplicate groups")
+        .to_string();
+
+    assert!(error.contains("field_groups[1]"), "{error}");
+    assert!(
+        error.contains("duplicate exactly one field group"),
+        "{error}"
+    );
+    assert!(error.contains("[first, second]"), "{error}");
+}
+
+#[test]
+fn struct_field_groups_reject_duplicate_member_sets_in_any_order() {
+    let nested = AttributeType::struct_with_field_groups(
+        "Nested",
+        vec![
+            StructField::optional("first", AttributeType::string()).build(),
+            StructField::optional("second", AttributeType::string()).build(),
+        ],
+        vec![
+            FieldGroup::at_least_one(["first", "second"]).unwrap(),
+            FieldGroup::at_least_one(["second", "first"]).unwrap(),
+        ],
+    );
+    let error = ResourceSchema::new("test.Widget")
+        .attribute(AttributeSchema::optional("nested", nested).build())
+        .validate()
+        .expect_err("struct group member order must not distinguish duplicate groups")
+        .to_string();
+
+    assert!(error.contains("nested.field_groups[1]"), "{error}");
+    assert!(
+        error.contains("duplicate at least one field group"),
+        "{error}"
+    );
+    assert!(error.contains("[first, second]"), "{error}");
+}
+
+fn choice_struct(kind: FieldGroupKind) -> AttributeType {
+    AttributeType::struct_with_field_groups(
+        "EvaluationWindow",
+        vec![
+            StructField::optional("sliding_window", AttributeType::string()).build(),
+            StructField::optional("wall_clock_window", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::new(kind, ["sliding_window", "wall_clock_window"]).unwrap()],
+    )
+}
+
+fn string_value(value: &str) -> Value {
+    Value::Concrete(ConcreteValue::String(value.to_string().into()))
+}
+
+#[test]
+fn struct_field_groups_enforce_all_cardinality_kinds() {
+    let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let both = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("sliding_window".to_string(), string_value("5m")),
+        ("wall_clock_window".to_string(), string_value("hour")),
+    ])));
+
+    assert_eq!(
+        choice_struct(FieldGroupKind::ExactlyOne)
+            .validate(&empty)
+            .unwrap_err()
+            .to_string(),
+        "exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert_eq!(
+        choice_struct(FieldGroupKind::AtLeastOne)
+            .validate(&empty)
+            .unwrap_err()
+            .to_string(),
+        "at least one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert_eq!(
+        choice_struct(FieldGroupKind::AtMostOne)
+            .validate(&both)
+            .unwrap_err()
+            .to_string(),
+        "at most one of [sliding_window, wall_clock_window] must be set"
+    );
+}
+
+#[test]
+fn group_presence_counts_unknown_and_reference_values() {
+    for deferred in [
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::UnknownReason::ForValue,
+        )),
+        Value::Deferred(DeferredValue::BindingRef {
+            binding: "computed_after_apply".to_string(),
+        }),
+    ] {
+        let written = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "sliding_window".to_string(),
+            deferred,
+        )])));
+        assert!(
+            choice_struct(FieldGroupKind::ExactlyOne)
+                .validate(&written)
+                .is_ok(),
+            "a written unknown or reference member counts as present"
+        );
+    }
+}
+
+#[test]
+fn explicit_json_null_is_absent_for_groups_and_required_fields() {
+    let decoded = crate::value::json_to_dsl_value(&serde_json::json!({
+        "sliding_window": null
+    }))
+    .expect("an object remains a map when its null member is omitted");
+    assert_eq!(
+        choice_struct(FieldGroupKind::ExactlyOne)
+            .validate(&decoded)
+            .unwrap_err()
+            .to_string(),
+        "exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+
+    let required = AttributeType::struct_(
+        "RequiredWindow",
+        vec![StructField::required("sliding_window", AttributeType::string()).build()],
+    );
+    assert!(matches!(
+        required.validate(&decoded),
+        Err(TypeError::MissingRequired { name }) if name == "sliding_window"
+    ));
+}
+
+#[test]
+fn write_only_secret_group_errors_never_render_values() {
+    let write_only_choice = AttributeType::struct_with_field_groups(
+        "Credentials",
+        vec![
+            StructField::optional("access_token", AttributeType::string())
+                .write_only()
+                .build(),
+            StructField::optional("password", AttributeType::string())
+                .write_only()
+                .build(),
+        ],
+        vec![FieldGroup::at_most_one(["access_token", "password"]).unwrap()],
+    );
+    let plaintext = "must-never-appear-in-group-errors";
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value(plaintext))));
+    let both_secret = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("access_token".to_string(), secret.clone()),
+        ("password".to_string(), secret),
+    ])));
+    let rendered = write_only_choice
+        .validate(&both_secret)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        rendered,
+        "at most one of [access_token, password] must be set"
+    );
+    assert!(!rendered.contains(plaintext));
+}
+
+#[test]
+fn secret_map_of_grouped_structs_masks_the_map_key_in_group_errors() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([(
+            "leaky-key".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        )])),
+    ))));
+    let error = RootlessType::new(AttributeType::map(choice_struct(
+        FieldGroupKind::ExactlyOne,
+    )))
+    .validate(&secret)
+    .expect_err("the grouped map entry is missing both choices");
+
+    assert_eq!(
+        error.to_string(),
+        "(secret): exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert!(!error.to_string().contains("leaky-key"));
+}
+
+#[test]
+fn secret_struct_masks_nested_struct_paths_in_group_errors() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([(
+            "leaky_field".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        )])),
+    ))));
+    let envelope = AttributeType::struct_(
+        "SecretEnvelope",
+        vec![
+            StructField::optional("leaky_field", choice_struct(FieldGroupKind::ExactlyOne)).build(),
+        ],
+    );
+    let error = envelope
+        .validate(&secret)
+        .expect_err("the nested grouped struct is missing both choices");
+
+    assert_eq!(
+        error.to_string(),
+        "(secret): exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert!(!error.to_string().contains("leaky_field"));
+}
+
+#[test]
+fn union_surfaces_the_only_group_only_struct_arm_failure() {
+    let grouped = choice_struct(FieldGroupKind::ExactlyOne);
+    let other = AttributeType::struct_(
+        "NamedWindow",
+        vec![StructField::required("name", AttributeType::string()).build()],
+    );
+    let union = RootlessType::new(AttributeType::union(vec![grouped, other]));
+    let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+
+    let error = union
+        .validate(&empty)
+        .expect_err("neither struct arm accepts an empty value");
+    assert_eq!(
+        error.to_string(),
+        "exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert!(matches!(error, TypeError::FieldGroupViolation { .. }));
+}
+
+#[test]
+fn struct_field_groups_validate_through_lists_maps_unions_and_refs() {
+    let invalid = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let list = RootlessType::new(AttributeType::list(choice_struct(
+        FieldGroupKind::ExactlyOne,
+    )));
+    let list_error = list
+        .validate(&Value::Concrete(ConcreteValue::List(vec![invalid.clone()])))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        list_error,
+        "[0]: exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+
+    let map = RootlessType::new(AttributeType::map(choice_struct(
+        FieldGroupKind::ExactlyOne,
+    )));
+    let map_error = map
+        .validate(&Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "primary".to_string(),
+            invalid.clone(),
+        )]))))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        map_error,
+        "primary: exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+
+    let union = RootlessType::new(AttributeType::union(vec![
+        choice_struct(FieldGroupKind::ExactlyOne),
+        AttributeType::string(),
+    ]));
+    assert_eq!(
+        union.validate(&invalid).unwrap_err().to_string(),
+        "exactly one of [sliding_window, wall_clock_window] must be set",
+        "a union struct arm cannot bypass or obscure its field group"
+    );
+
+    let r#ref = RootlessType::with_defs(
+        AttributeType::ref_("EvaluationWindow"),
+        BTreeMap::from([(
+            "EvaluationWindow".to_string(),
+            choice_struct(FieldGroupKind::ExactlyOne),
+        )]),
+    );
+    assert_eq!(
+        r#ref.validate(&invalid).unwrap_err().to_string(),
+        "exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+
+    let union_ref = RootlessType::with_defs(
+        AttributeType::union(vec![
+            AttributeType::ref_("EvaluationWindow"),
+            AttributeType::string(),
+        ]),
+        BTreeMap::from([(
+            "EvaluationWindow".to_string(),
+            choice_struct(FieldGroupKind::ExactlyOne),
+        )]),
+    );
+    assert_eq!(
+        union_ref.validate(&invalid).unwrap_err().to_string(),
+        "exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+}
+
+#[test]
+fn resource_validation_prefixes_nested_group_errors_with_the_struct_path() {
+    let schema = ResourceSchema::new("test.Metric")
+        .attribute(
+            AttributeSchema::optional(
+                "evaluation_window",
+                choice_struct(FieldGroupKind::ExactlyOne),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let errors = schema
+        .validate(&HashMap::from([(
+            "evaluation_window".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        )]))
+        .unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        "evaluation_window: exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+}
+
 fn attributed_validation_failure(attribute: &str, message: &str) -> TypeError {
     TypeError::ResourceValidationFailed {
         message: message.to_string(),
@@ -83,6 +595,172 @@ fn schema_registry_lookup_binds_owner_to_the_validated_schema() {
         .expect("registered schema");
     assert_eq!(bound.owner(), "actual-owner");
     assert_eq!(bound.schema().parts().resource_type, "test.Widget");
+}
+
+#[test]
+fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let forms = ReferenceForms::from([(
+        identity.clone(),
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .unwrap(),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .unwrap();
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("first witness table must be admitted");
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("registered schema");
+    assert_eq!(bound.reference_forms(), &forms);
+    assert_eq!(bound.reference_forms().get(&identity), forms.get(&identity));
+}
+
+#[test]
+fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_last() {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let owned_schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("owned schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:service:{region}:{account}:widget/{name}",
+            )
+            .expect("reference template must validate"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![owned_schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .expect("provider witness must validate");
+    let additional_schema = ResourceSchema::new("test.Additional")
+        .validate()
+        .expect("additional schema must validate");
+
+    let mut registry = SchemaRegistry::new();
+    registry
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("witness table must be admitted");
+    let mut additional = SchemaRegistry::new();
+    additional.insert("actual-owner", additional_schema);
+    registry
+        .extend(additional)
+        .expect("plain resource insertion carries no competing forms");
+
+    let bound = registry
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("witness-backed schema must remain registered");
+    assert_eq!(bound.reference_forms(), &forms);
+}
+
+fn reference_form_witness(template: &str) -> (ValidatedProviderSchemaWitness, ReferenceForms) {
+    let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+    let schema = ResourceSchema::new("test.Widget")
+        .attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("fixture schema must validate");
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(template).expect("fixture template must validate"),
+        },
+    )]);
+    let witness = ValidatedProviderSchemaWitness::new(
+        vec![schema],
+        ValidatedConfigSchema::default(),
+        forms.clone(),
+    )
+    .expect("fixture witness must validate");
+    (witness, forms)
+}
+
+#[test]
+fn schema_registry_extend_accepts_identical_witness_forms() {
+    let (witness, forms) =
+        reference_form_witness("arn:{partition}:service:{region}:{account}:widget/{name}");
+    let mut first = SchemaRegistry::new();
+    first
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("first witness table must be admitted");
+    let mut second = SchemaRegistry::new();
+    second
+        .insert_provider_witness("actual-owner", &witness)
+        .expect("second witness table must be admitted");
+
+    first
+        .extend(second)
+        .expect("identical witness tables must merge");
+
+    let bound = first
+        .get("actual-owner", "test.Widget", SchemaKind::Resource)
+        .expect("merged schema must remain registered");
+    assert_eq!(bound.reference_forms(), &forms);
+}
+
+#[test]
+fn schema_registry_extend_rejects_conflicting_witness_forms() {
+    let (first_witness, first_forms) =
+        reference_form_witness("arn:{partition}:service:{region}:{account}:widget/{name}");
+    let (second_witness, second_forms) =
+        reference_form_witness("arn:{partition}:other:{region}:{account}:widget/{name}");
+    let mut first = SchemaRegistry::new();
+    first
+        .insert_provider_witness("actual-owner", &first_witness)
+        .expect("first witness table must be admitted");
+    let mut second = SchemaRegistry::new();
+    second
+        .insert_provider_witness("actual-owner", &second_witness)
+        .expect("second witness table must be admitted");
+
+    let error = first
+        .extend(second)
+        .expect_err("conflicting witness tables must not use last-writer-wins");
+    let SchemaRegistryError::ConflictingReferenceForms {
+        owner,
+        existing,
+        incoming,
+    } = error;
+    assert_eq!(owner, "actual-owner");
+    assert_eq!(existing, first_forms);
+    assert_eq!(incoming, second_forms);
 }
 
 #[test]
@@ -341,26 +1019,27 @@ fn schema_admission_rejects_duplicate_struct_fields_in_defs() {
 }
 
 #[test]
-fn schema_admission_rejects_unknown_exclusive_required_names() {
+fn schema_admission_rejects_unknown_field_group_names() {
     let error = admission_error(
         ResourceSchema::new("test.Widget")
             .attribute(AttributeSchema::optional("left", AttributeType::string()).build())
-            .exclusive_required(&["left", "missing"]),
+            .field_group(FieldGroup::exactly_one(["left", "missing"]).unwrap()),
     );
 
-    assert!(error.contains("exclusive_required"), "{error}");
+    assert!(error.contains("field_groups"), "{error}");
     assert!(error.contains("missing"), "{error}");
 }
 
 #[test]
-fn schema_admission_rejects_provider_populated_exclusive_required_names() {
+fn schema_admission_rejects_provider_populated_field_group_names() {
     let error = admission_error(
         ResourceSchema::new("test.Widget")
             .attribute(AttributeSchema::provider_populated("arn", AttributeType::string()).build())
-            .exclusive_required(&["arn"]),
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .field_group(FieldGroup::at_most_one(["arn", "name"]).unwrap()),
     );
 
-    assert!(error.contains("exclusive_required"), "{error}");
+    assert!(error.contains("field_groups"), "{error}");
     assert!(error.contains("arn"), "{error}");
     assert!(error.contains("provider-populated"), "{error}");
 }
@@ -968,7 +1647,7 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 }
 
 #[test]
-fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
         ResourceSchema::new("test.Widget").attribute(
@@ -987,12 +1666,12 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v12() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v12"), "{error}");
+    assert!(error.contains("protocol v13"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
 #[test]
-fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
+fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
@@ -1020,7 +1699,7 @@ fn config_schema_admission_enforces_scalar_and_v12_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v12"), "{rendered}");
+    assert!(rendered.contains("protocol v13"), "{rendered}");
 }
 
 #[test]
@@ -3738,7 +4417,7 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
         .attribute(
             AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
         )
-        .exclusive_required(&["choice_a", "choice_b"])
+        .field_group(FieldGroup::exactly_one(["choice_a", "choice_b"]).unwrap())
         .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
         .validate()
         .expect("known-values schema must be valid");
@@ -3760,7 +4439,7 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
             no_lookup(),
         ),
         Ok(()),
-        "missing, unknown, read-only, and exclusive-required checks belong to structural validation"
+        "missing, unknown, read-only, and field-group checks belong to structural validation"
     );
 
     let malformed_tags = HashMap::from([(
@@ -3787,68 +4466,13 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
 }
 
 #[test]
-fn validate_exclusive_required_helper() {
-    use validators::validate_exclusive_required;
-
-    // Valid: exactly one field present
-    let mut attrs = HashMap::new();
-    attrs.insert(
-        "option_a".to_string(),
-        Value::Concrete(ConcreteValue::String("value".into())),
-    );
-    assert!(validate_exclusive_required(&attrs, &["option_a", "option_b"]).is_ok());
-
-    let mut attrs2 = HashMap::new();
-    attrs2.insert(
-        "option_b".to_string(),
-        Value::Concrete(ConcreteValue::String("value".into())),
-    );
-    assert!(validate_exclusive_required(&attrs2, &["option_a", "option_b"]).is_ok());
-
-    // Invalid: neither field present
-    let empty = HashMap::new();
-    let result = validate_exclusive_required(&empty, &["option_a", "option_b"]);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
-    assert_eq!(errors.len(), 1);
-    assert!(
-        errors[0]
-            .to_string()
-            .contains("Exactly one of [option_a, option_b] must be specified")
-    );
-
-    // Invalid: both fields present
-    let mut both = HashMap::new();
-    both.insert(
-        "option_a".to_string(),
-        Value::Concrete(ConcreteValue::String("a".into())),
-    );
-    both.insert(
-        "option_b".to_string(),
-        Value::Concrete(ConcreteValue::String("b".into())),
-    );
-    let result = validate_exclusive_required(&both, &["option_a", "option_b"]);
-    assert!(result.is_err());
-    let errors = result.unwrap_err();
-    assert_eq!(errors.len(), 1);
-    assert!(
-        errors[0]
-            .to_string()
-            .contains("Only one of [option_a, option_b] can be specified")
-    );
-    assert!(errors[0].to_string().contains("option_a, option_b"));
-}
-
-#[test]
-fn exclusive_required_declarative() {
-    // Same semantics as the closure-based form above, but declared as data
-    // so it can cross the WASM plugin boundary.
+fn top_level_exactly_one_field_group_is_declarative() {
     let schema = ResourceSchema::new("vpc")
         .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("ipv4_ipam_pool_id", AttributeType::string()).build())
-        .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"])
+        .field_group(FieldGroup::exactly_one(["cidr_block", "ipv4_ipam_pool_id"]).unwrap())
         .validate()
-        .expect("exclusive-required schema must be valid");
+        .expect("field-group schema must be valid");
 
     // Valid: exactly one present
     let mut one = HashMap::new();
@@ -3864,7 +4488,7 @@ fn exclusive_required_declarative() {
     assert!(
         err.iter().any(|e| e
             .to_string()
-            .contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified")),
+            .contains("exactly one of [cidr_block, ipv4_ipam_pool_id] must be set")),
         "missing expected error, got: {:?}",
         err
     );
@@ -3883,29 +4507,29 @@ fn exclusive_required_declarative() {
     assert!(
         err.iter().any(|e| e
             .to_string()
-            .contains("Only one of [cidr_block, ipv4_ipam_pool_id] can be specified")),
+            .contains("exactly one of [cidr_block, ipv4_ipam_pool_id] must be set")),
         "missing expected error, got: {:?}",
         err
     );
 }
 
 #[test]
-fn exclusive_required_multiple_groups() {
+fn multiple_top_level_field_groups_are_independent() {
     let schema = ResourceSchema::new("multi")
         .attribute(AttributeSchema::optional("a", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("b", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("x", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("y", AttributeType::string()).build())
-        .exclusive_required(&["a", "b"])
-        .exclusive_required(&["x", "y"])
+        .field_group(FieldGroup::exactly_one(["a", "b"]).unwrap())
+        .field_group(FieldGroup::exactly_one(["x", "y"]).unwrap())
         .validate()
-        .expect("exclusive-required schema must be valid");
+        .expect("field-group schema must be valid");
 
     // Neither group satisfied → two errors
     let err = schema.validate(&HashMap::new()).unwrap_err();
     assert_eq!(
         err.iter()
-            .filter(|e| e.to_string().contains("Exactly one of"))
+            .filter(|e| e.to_string().contains("exactly one of"))
             .count(),
         2,
         "expected two missing-group errors, got: {:?}",
@@ -8431,6 +9055,67 @@ mod validate_collect_tests {
     }
 
     #[test]
+    fn collect_descends_into_map_struct_field_group_with_entry_path() {
+        let choice = AttributeType::struct_with_field_groups(
+            "Choice",
+            vec![
+                StructField::optional("first", AttributeType::string()).build(),
+                StructField::optional("second", AttributeType::string()).build(),
+            ],
+            vec![FieldGroup::exactly_one(["first", "second"]).unwrap()],
+        );
+        let value = map_value(vec![("primary", map_value(vec![]))]);
+
+        let errors = Schema::flat(AttributeType::map(choice)).validate_collect(&value);
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert_eq!(errors[0].0.to_string(), "primary");
+        assert!(matches!(errors[0].1, TypeError::FieldGroupViolation { .. }));
+    }
+
+    #[test]
+    fn collect_map_value_falls_back_to_the_collected_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let validator_calls = Arc::clone(&calls);
+        let unstable = AttributeType::refined_string_with_validator(
+            TypeIdentity::bare("Unstable"),
+            None,
+            None,
+            validator(move |_value| {
+                if validator_calls.fetch_add(1, Ordering::SeqCst) < 4 {
+                    Err(TypeError::ValidationFailed {
+                        message: "rejected while collecting diagnostics".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }),
+            None,
+        );
+        let value = map_value(vec![(
+            "primary",
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )]);
+
+        let errors = Schema::flat(AttributeType::map(unstable)).validate_collect(&value);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(errors.len(), 1, "errors: {errors:#?}");
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::MapValueError { key, inner }
+                if key == "primary"
+                    && matches!(
+                        inner.as_ref(),
+                        TypeError::ValidationFailed { message }
+                            if message == "rejected while collecting diagnostics"
+                    )
+        ));
+    }
+
+    #[test]
     fn collect_reports_read_only_struct_field_at_written_path() {
         let ty = struct_type(
             "Config",
@@ -12307,7 +12992,7 @@ enum FingerprintChange {
     SchemaKind,
     UniqueName,
     OperationConfig,
-    ExclusiveRequired,
+    FieldGroup,
     WaitTimeout,
     WaitInterval,
     Definition,
@@ -12428,14 +13113,14 @@ fn schema_fingerprint_fixture_with(
             AttributeType::string()
         },
     )
-    .exclusive_required(&["first", "second"]);
+    .field_group(FieldGroup::exactly_one(["first", "second"]).unwrap());
     schema = if change == Some(FingerprintChange::UniqueName) {
         schema.with_coexisting_replacement()
     } else {
         schema.with_unique_name_attribute("first")
     };
-    if change == Some(FingerprintChange::ExclusiveRequired) {
-        schema = schema.exclusive_required(&["first"]);
+    if change == Some(FingerprintChange::FieldGroup) {
+        schema = schema.field_group(FieldGroup::at_least_one(["first", "second"]).unwrap());
     }
     if change == Some(FingerprintChange::SchemaKind) {
         schema = schema.as_data_source();
@@ -12459,7 +13144,7 @@ fn schema_fingerprint_fixture_with(
             | FingerprintChange::SchemaKind
             | FingerprintChange::UniqueName
             | FingerprintChange::OperationConfig
-            | FingerprintChange::ExclusiveRequired
+            | FingerprintChange::FieldGroup
             | FingerprintChange::WaitTimeout
             | FingerprintChange::WaitInterval
             | FingerprintChange::Definition,
@@ -12488,6 +13173,69 @@ fn resource_schema_semantic_fingerprint_is_order_independent() {
         forward.semantic_fingerprint(),
         reverse.semantic_fingerprint(),
         "hash-map and nested map insertion order must not affect a schema fingerprint",
+    );
+}
+
+fn fingerprint_group_fixture(
+    top_groups: Vec<FieldGroup>,
+    nested_groups: Vec<FieldGroup>,
+) -> ResourceSchema {
+    let nested = AttributeType::struct_with_field_groups(
+        "Nested",
+        vec![
+            StructField::optional("a", AttributeType::string()).build(),
+            StructField::optional("b", AttributeType::string()).build(),
+            StructField::optional("c", AttributeType::string()).build(),
+        ],
+        nested_groups,
+    );
+    top_groups.into_iter().fold(
+        ResourceSchema::new("test.Groups")
+            .attribute(AttributeSchema::optional("a", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("b", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("c", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("nested", nested).build()),
+        ResourceSchema::field_group,
+    )
+}
+
+#[test]
+fn semantic_fingerprint_sorts_field_group_members_and_groups() {
+    let forward = fingerprint_group_fixture(
+        vec![
+            FieldGroup::exactly_one(["a", "b"]).unwrap(),
+            FieldGroup::at_most_one(["b", "c"]).unwrap(),
+        ],
+        vec![FieldGroup::at_least_one(["a", "c"]).unwrap()],
+    );
+    let reordered = fingerprint_group_fixture(
+        vec![
+            FieldGroup::at_most_one(["c", "b"]).unwrap(),
+            FieldGroup::exactly_one(["b", "a"]).unwrap(),
+        ],
+        vec![FieldGroup::at_least_one(["c", "a"]).unwrap()],
+    );
+    assert_eq!(
+        forward.semantic_fingerprint(),
+        reordered.semantic_fingerprint()
+    );
+}
+
+#[test]
+fn semantic_fingerprint_encodes_field_group_kind_and_placement() {
+    let exactly =
+        fingerprint_group_fixture(vec![FieldGroup::exactly_one(["a", "b"]).unwrap()], vec![]);
+    let at_least =
+        fingerprint_group_fixture(vec![FieldGroup::at_least_one(["a", "b"]).unwrap()], vec![]);
+    let nested =
+        fingerprint_group_fixture(vec![], vec![FieldGroup::exactly_one(["a", "b"]).unwrap()]);
+    assert_ne!(
+        exactly.semantic_fingerprint(),
+        at_least.semantic_fingerprint()
+    );
+    assert_ne!(
+        exactly.semantic_fingerprint(),
+        nested.semantic_fingerprint()
     );
 }
 
@@ -12556,7 +13304,7 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
         ("schema kind", FingerprintChange::SchemaKind),
         ("unique name", FingerprintChange::UniqueName),
         ("operation config", FingerprintChange::OperationConfig),
-        ("exclusive required", FingerprintChange::ExclusiveRequired),
+        ("field group", FingerprintChange::FieldGroup),
         ("wait timeout", FingerprintChange::WaitTimeout),
         ("wait interval", FingerprintChange::WaitInterval),
         ("definition", FingerprintChange::Definition),
@@ -12574,4 +13322,137 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
             "changing semantic field {field} must change the fingerprint",
         );
     }
+}
+
+#[test]
+fn resource_schema_semantic_fingerprint_covers_keyed_partial_update() {
+    let element = || {
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![
+                StructField::required("key", AttributeType::string()).build(),
+                StructField::required("value", AttributeType::string()).build(),
+            ],
+        ))
+    };
+    let ordinary = ResourceSchema::new("test.Settings")
+        .attribute(AttributeSchema::optional("settings", element()).build());
+    let keyed = ResourceSchema::new("test.Settings").attribute(
+        AttributeSchema::optional("settings", element())
+            .keyed_partial_update("key")
+            .build(),
+    );
+
+    assert_ne!(
+        ordinary.semantic_fingerprint(),
+        keyed.semantic_fingerprint(),
+        "keyed partial-update semantics affect saved-plan compatibility"
+    );
+}
+
+fn keyed_partial_update_schema(
+    attr_type: AttributeType,
+    key_field: &str,
+) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
+    ResourceSchema::new("test.KeyedPartialUpdate")
+        .attribute(
+            AttributeSchema::optional("settings", attr_type)
+                .keyed_partial_update(key_field)
+                .build(),
+        )
+        .validate()
+}
+
+#[test]
+fn keyed_partial_update_validation_accepts_a_string_key_field() {
+    let schema = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![
+                StructField::required("key", AttributeType::string()).build(),
+                StructField::required("value", AttributeType::string()).build(),
+            ],
+        )),
+        "key",
+    )
+    .expect("a list-of-structs string key is valid");
+
+    let keyed = schema
+        .effective_attribute("settings")
+        .expect("settings attribute")
+        .keyed_partial_update()
+        .expect("validated keyed partial-update property");
+    assert_eq!(keyed.key_field().as_str(), "key");
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_an_unknown_key_field() {
+    let error = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![StructField::required("value", AttributeType::string()).build()],
+        )),
+        "key",
+    )
+    .expect_err("the declared key must name a real element field");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update key `key` is not a field of list element struct `Setting`"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_struct_list_shape() {
+    let error = keyed_partial_update_schema(AttributeType::list(AttributeType::string()), "key")
+        .expect_err("the attribute must be a list of structs");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update attribute must be a list of structs"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_list_shape() {
+    let error = keyed_partial_update_schema(AttributeType::string(), "key")
+        .expect_err("the attribute must be a list of structs");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update attribute must be a list of structs"
+        )]
+    );
+}
+
+#[test]
+fn keyed_partial_update_validation_rejects_a_non_string_key_field() {
+    let error = keyed_partial_update_schema(
+        AttributeType::list(AttributeType::struct_(
+            "Setting",
+            vec![StructField::required("key", AttributeType::int()).build()],
+        )),
+        "key",
+    )
+    .expect_err("the key field must be a scalar string");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::Attribute("settings".to_string()),
+            "keyed partial-update key field `key` must be a scalar string"
+        )]
+    );
 }

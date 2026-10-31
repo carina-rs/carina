@@ -29,6 +29,95 @@ fn resolved_dependency_reads_use_typed_json_entries_and_round_trip() {
     );
 }
 
+fn merge_with_saved(
+    desired: &Value,
+    saved: SavedValueViews<'_>,
+    prior_explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Value {
+    super::merge_with_saved(
+        desired,
+        saved,
+        prior_explicit,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn pair_list_elements<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Vec<Option<usize>>
+where
+    D: std::borrow::Borrow<Value>,
+    S: std::borrow::Borrow<Value>,
+{
+    super::pair_list_elements(
+        desired,
+        saved,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn pair_list_elements_with_uniqueness<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Vec<ListElementPairing>
+where
+    D: std::borrow::Borrow<Value>,
+    S: std::borrow::Borrow<Value>,
+{
+    super::pair_list_elements_with_uniqueness(
+        desired,
+        saved,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn similarity_score(
+    a: &Value,
+    b: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> usize {
+    super::similarity_score(
+        a,
+        b,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
+fn merge_lists(
+    desired: &[Value],
+    projected_saved: &[Value],
+    raw_saved: &[Value],
+    prior_explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Vec<Value> {
+    super::merge_lists(
+        desired,
+        projected_saved,
+        raw_saved,
+        prior_explicit,
+        attr_type,
+        defs,
+        &crate::differ::exact_comparison_context_for_tests(),
+    )
+}
+
 #[test]
 fn module_argument_source_location_is_not_value_data() {
     let located = Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
@@ -2039,6 +2128,57 @@ fn union_typed_string_or_list_pairing_uses_the_list_element_schema() {
 }
 
 #[test]
+fn reference_form_pairing_is_identical_on_both_sides_of_hash_threshold() {
+    use crate::provider::ReferenceScope;
+    use crate::schema::{ReferenceForm, ReferenceForms, ReferenceTemplate};
+
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let attr_type = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+    let forms = ReferenceForms::from([(
+        identity,
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("valid reference template"),
+        },
+    )]);
+    let scope = ReferenceScope::available("aws", "us-east-1", "123456789012")
+        .expect("fixture scope is valid");
+    let context = crate::differ::ComparisonContext::for_test(&scope, &forms);
+
+    for len in [HASH_THRESHOLD - 1, HASH_THRESHOLD] {
+        let desired = (0..len)
+            .map(|index| Value::Concrete(ConcreteValue::String(format!("function-{index}").into())))
+            .collect::<Vec<_>>();
+        let saved = (0..len)
+            .rev()
+            .map(|index| {
+                Value::Concrete(ConcreteValue::String(
+                    format!("arn:aws:lambda:us-east-1:123456789012:function:function-{index}")
+                        .into(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let expected = (0..len)
+            .map(|index| Some(len - index - 1))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            super::pair_list_elements(
+                &desired,
+                &saved,
+                Some(&attr_type),
+                crate::schema::empty_defs_for_schema_walks(),
+                &context,
+            ),
+            expected,
+            "list pairing changed at length {len}"
+        );
+    }
+}
+
+#[test]
 fn enum_pairing_hashes_keep_dotted_strings_literal() {
     let attr_type = AttributeType::enum_(
         TypeIdentity::bare("Format"),
@@ -2050,8 +2190,9 @@ fn enum_pairing_hashes_keep_dotted_strings_literal() {
     let dotted = Value::Concrete(ConcreteValue::String("A.json".into()));
     let api = Value::Concrete(ConcreteValue::String("json".into()));
     let defs = crate::schema::empty_defs_for_schema_walks();
-    let dotted_hashes = pairing_hashes(&dotted, Some(&attr_type), defs);
-    let api_hashes = pairing_hashes(&api, Some(&attr_type), defs);
+    let context = crate::differ::exact_comparison_context_for_tests();
+    let dotted_hashes = pairing_hashes(&dotted, Some(&attr_type), defs, &context);
+    let api_hashes = pairing_hashes(&api, Some(&attr_type), defs, &context);
 
     assert!(
         dotted_hashes.iter().all(|hash| !api_hashes.contains(hash)),
@@ -2660,8 +2801,11 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
         &crate::parser::ProviderContext::default(),
     )
     .expect("deferred loop parses");
+    let parsed =
+        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+            .expect("deferred fixture crosses the module-resolution seam");
     let crate::parser::DeferredForTarget::Unbound { template } =
-        &parsed.deferred_for_expressions[0].target
+        &parsed.deferred_for_expressions()[0].target
     else {
         panic!("fixture must produce an unbound target")
     };

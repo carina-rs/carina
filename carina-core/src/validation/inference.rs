@@ -92,7 +92,7 @@ pub type InferenceBindings = HashMap<String, InferenceBinding>;
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
-pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBindings {
+pub fn bindings_from_parsed<E, D>(parsed: &crate::parser::File<E, D>) -> InferenceBindings {
     // carina#3181: pass the typed top-level slices directly so
     // `bindings_from_parts` classifies managed resources, data sources,
     // and (post-expansion) composition rows from their own kinds.
@@ -938,10 +938,10 @@ fn infer_function_call(
 
 /// Phase transition (#2360 stage 2): attach declared/inferred origin and any
 /// typed unchecked reason to every export.
-pub fn apply_inference(
-    parsed: crate::parser::ParsedFile,
+pub fn apply_inference<D>(
+    parsed: crate::parser::File<crate::parser::ParsedExportParam, D>,
     schemas: &SchemaRegistry,
-) -> crate::parser::InferredFile {
+) -> crate::parser::File<crate::parser::InferredExportParam, D> {
     let inferred_exports = infer_export_params(&parsed, schemas).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
@@ -972,8 +972,8 @@ impl SchemaCheckedExportParams {
 /// non-export field; consumers that only need the export-side typecheck
 /// (LSP diagnostics, in particular) should use this instead to avoid
 /// the per-keystroke deep-clone.
-pub fn infer_export_params(
-    parsed: &crate::parser::ParsedFile,
+pub fn infer_export_params<D>(
+    parsed: &crate::parser::File<crate::parser::ParsedExportParam, D>,
     schemas: &SchemaRegistry,
 ) -> SchemaCheckedExportParams {
     let bindings = bindings_from_parsed(parsed);
@@ -1049,8 +1049,8 @@ impl ExportParamsInferredWithLoadedProviderSchemas {
 }
 
 /// Infer export parameters using schemas proven to come from provider loading.
-pub fn infer_export_params_with_loaded_provider_schemas(
-    parsed: &crate::parser::ParsedFile,
+pub fn infer_export_params_with_loaded_provider_schemas<D>(
+    parsed: &crate::parser::File<crate::parser::ParsedExportParam, D>,
     schemas: &ProviderLoadedSchemaRegistry,
 ) -> ExportParamsInferredWithLoadedProviderSchemas {
     ExportParamsInferredWithLoadedProviderSchemas {
@@ -1094,8 +1094,8 @@ pub fn attached_inference_failures<'a>(
 /// Retry inferred exports whose original reason was not having enough schema
 /// authority. A newly reportable failure replaces that reason; successful or
 /// still-deferred probes retain the original provenance.
-pub fn retry_unchecked_export_inference<'a>(
-    parsed: &'a mut crate::parser::InferredFile,
+pub fn retry_unchecked_export_inference<'a, D>(
+    parsed: &'a mut crate::parser::File<crate::parser::InferredExportParam, D>,
     schemas: &ProviderLoadedSchemaRegistry,
 ) -> ExportsInferredWithLoadedProviderSchemas<'a> {
     let bindings = bindings_from_parsed(parsed);

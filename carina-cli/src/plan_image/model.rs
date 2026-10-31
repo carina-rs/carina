@@ -61,6 +61,7 @@ pub(crate) enum EffectKind {
     Import,
     Remove,
     Move,
+    Release,
     Wait,
     DeferredCreate,
     DeferredReplace,
@@ -564,6 +565,7 @@ fn effect_owned_resource_id(effect: &Effect) -> Option<&ResourceId> {
         Effect::Import { id, .. } => Some(id.as_inner()),
         Effect::Remove { id } => Some(id.as_inner()),
         Effect::Move { to, .. } => Some(to.as_inner()),
+        Effect::ReleaseListKeys { id, .. } => Some(id.as_inner()),
         Effect::Wait { .. } => None,
         Effect::DeferredCreate { .. } => None,
         Effect::DeferredReplace(_) => None,
@@ -599,6 +601,7 @@ fn effect_module_source(effect: &Effect) -> Option<&ModuleSource> {
         | Effect::Import { .. }
         | Effect::Remove { .. }
         | Effect::Move { .. }
+        | Effect::ReleaseListKeys { .. }
         | Effect::Wait { .. } => None,
     }
 }
@@ -699,6 +702,22 @@ fn node_from_effect(
             Vec::new(),
             Some(format!("from {from}")),
         ),
+        Effect::ReleaseListKeys {
+            id,
+            attribute,
+            key_field: _,
+            keys,
+        } => (
+            id.identity_str().to_string(),
+            id.display_type(),
+            EffectKind::Release,
+            vec![attribute.clone()],
+            Some(format!(
+                "release {} key{} from authored state",
+                keys.len(),
+                if keys.len() == 1 { "" } else { "s" }
+            )),
+        ),
         Effect::Wait {
             id,
             target_id,
@@ -772,7 +791,13 @@ fn effect_anonymous_discriminator(effect: &Effect) -> Option<String> {
         }
         Effect::Update { to, .. } => (to.binding.as_deref(), &to.id),
         Effect::Delete { binding, id, .. } => (binding.as_deref(), id.as_inner()),
-        _ => return None,
+        Effect::ReleaseListKeys { id, .. } => (None, id.as_inner()),
+        Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. }
+        | Effect::DeferredCreate { .. }
+        | Effect::DeferredReplace(_) => return None,
     };
     resource_anonymous_discriminator(binding, id)
 }
@@ -990,6 +1015,7 @@ fn attach_blast_radius(
                 | EffectKind::Import
                 | EffectKind::Remove
                 | EffectKind::Move
+                | EffectKind::Release
                 | EffectKind::Wait
                 | EffectKind::DeferredCreate
                 | EffectKind::Unchanged => return None,
@@ -1246,7 +1272,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
 
         assert_eq!(model.nodes.len(), 2);
@@ -1271,7 +1301,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1298,7 +1332,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1345,13 +1383,16 @@ mod tests {
              }\n",
         )
         .expect("write deferred loop fixture");
-        let mut parsed = carina_core::config_loader::parse_directory(
+        let parsed = carina_core::config_loader::parse_directory(
             fixture.path(),
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("parse deferred loop fixture");
+        let mut parsed =
+            carina_core::module_resolver::resolve_modules_providerless(parsed, fixture.path())
+                .expect("cross the deferred-body resolution seam");
         let template = parsed
-            .deferred_for_expressions
+            .deferred_for_expressions_mut()
             .pop()
             .expect("fixture contains one deferred loop");
         assert_eq!(template.target.display_name(), "main.crn:2");
@@ -1431,7 +1472,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
@@ -1451,7 +1496,11 @@ mod tests {
             &plan,
             &[],
             &[],
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let leaf = model.node(&GraphNodeId::Effect(2)).unwrap();
         let affected_by: HashSet<_> = leaf
@@ -1482,7 +1531,11 @@ mod tests {
             &plan,
             &desired,
             &unresolved,
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let connector_id = GraphNodeId::Unchanged(ResolvedResourceId::new(connector.id));
         let unrelated_id = GraphNodeId::Unchanged(ResolvedResourceId::new(unrelated.id));
@@ -1501,7 +1554,7 @@ mod tests {
             compositions: &[],
             expansion_trace: None,
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &[]),
+            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
         });
 
         let replacements: Vec<_> = model
@@ -1540,7 +1593,11 @@ mod tests {
             &plan,
             &[],
             &[],
-            &PlanChangeSummary::new(&plan, &[], &[]),
+            &PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+            ),
         ));
         let source = model
             .nodes
@@ -1587,7 +1644,11 @@ mod tests {
                 &plan,
                 &desired,
                 &unresolved,
-                &PlanChangeSummary::new(&plan, &[], &[]),
+                &PlanChangeSummary::new(
+                    &plan,
+                    &[],
+                    &crate::plan_summary::resolved_deferred_for_for_test([]),
+                ),
             )
         });
 
@@ -1639,7 +1700,11 @@ mod tests {
                 &plan,
                 &desired,
                 &unresolved,
-                &PlanChangeSummary::new(&plan, &[], &[]),
+                &PlanChangeSummary::new(
+                    &plan,
+                    &[],
+                    &crate::plan_summary::resolved_deferred_for_for_test([]),
+                ),
             )
         });
         let deleted = model.node(&GraphNodeId::Effect(0)).expect("delete node");
@@ -1665,7 +1730,7 @@ mod tests {
             compositions: &fixture.compositions,
             expansion_trace: Some(&fixture.expansion_trace),
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &[]),
+            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
         });
 
         let replacements: Vec<_> = model

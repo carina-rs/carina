@@ -882,7 +882,7 @@ fn saved_plan_apply_refills_ignored_readable_leaf_from_apply_time_read() {
     .expect("parse saved plan");
     assert_eq!(
         saved["version"],
-        serde_json::json!(PlanFile::CURRENT_VERSION),
+        serde_json::json!(PlanFile::CURRENT_VERSION)
     );
     assert!(
         !saved.to_string().contains("resolved_ignore_changes"),
@@ -953,7 +953,7 @@ fn saved_plan_apply_re_resolves_tampered_authored_ignore_paths() {
 }
 
 #[test]
-fn v30_saved_plan_is_rejected_after_ignore_changes_format_bump() {
+fn v32_saved_plan_is_rejected_after_keyed_release_format_bump() {
     let scenario = Scenario::new();
     scenario.write_readable_ignore_config("configured", None);
     assert_success("carina init", &scenario.init());
@@ -966,7 +966,7 @@ fn v30_saved_plan_is_rejected_after_ignore_changes_format_bump() {
     let mut saved: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("read current saved plan"))
             .expect("parse current saved plan");
-    saved["version"] = serde_json::json!(30);
+    saved["version"] = serde_json::json!(32);
     fs::write(
         &path,
         serde_json::to_vec_pretty(&saved).expect("serialize old saved plan"),
@@ -977,10 +977,10 @@ fn v30_saved_plan_is_rejected_after_ignore_changes_format_bump() {
     let rendered = output_text(&apply);
     assert!(
         !apply.status.success(),
-        "v30 saved plan applied:\n{rendered}"
+        "v32 saved plan applied:\n{rendered}"
     );
     assert!(
-        rendered.contains("Unsupported plan file version: 30") && rendered.contains("plan --out"),
+        rendered.contains("Unsupported plan file version: 32") && rendered.contains("plan --out"),
         "old plan must fail with replan guidance:\n{rendered}"
     );
 }

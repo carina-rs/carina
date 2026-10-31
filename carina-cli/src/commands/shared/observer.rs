@@ -1,5 +1,6 @@
 //! CLI observer that formats execution events for the shared progress backend.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
@@ -34,29 +35,32 @@ pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [
 /// CLI observer that prints colored progress output.
 pub(crate) struct CliObserver<S = ModuleSource> {
     progress: ProgressBackend<EffectProgressKey<S>>,
+    project_dir: PathBuf,
 }
 
 impl<S> CliObserver<S> {
     /// Create a new observer using stderr's terminal state.
-    pub(crate) fn new(_plan: &Plan<S>) -> Self
+    pub(crate) fn new(_plan: &Plan<S>, project_dir: &Path) -> Self
     where
         S: 'static,
     {
         Self {
             progress: ProgressBackend::new(ProgressSink::Human),
+            project_dir: project_dir.to_path_buf(),
         }
     }
 }
 
 impl<S> ExecutionObserver<S> for CliObserver<S> {
     fn on_event(&self, event: &ExecutionEvent<S>) {
-        handle_event(&self.progress, event);
+        handle_event(&self.progress, event, &self.project_dir);
     }
 }
 
 fn handle_event<S>(
     progress_backend: &ProgressBackend<EffectProgressKey<S>>,
     event: &ExecutionEvent<S>,
+    project_dir: &Path,
 ) {
     match event {
         ExecutionEvent::Waiting { .. } => {
@@ -113,15 +117,20 @@ fn handle_event<S>(
         ExecutionEvent::EffectFailed {
             effect,
             error,
+            recovery,
             duration,
             progress,
         } => {
             let key = EffectProgressKey::new(effect);
             let timing = format!("took {}", format_duration(*duration)).dimmed();
             let counter = format_progress(progress).dimmed();
+            let mut details = vec![error.to_string()];
+            if let Some(recovery) = recovery {
+                details.push(recovery.display_with_project_dir(project_dir).to_string());
+            }
             let outcome = FailedOutcome::new(
                 format!("{} {} {}", format_effect(effect), timing, counter),
-                [error.to_string()],
+                details,
             );
             progress_backend.finish_failed(key, outcome);
         }
@@ -247,9 +256,13 @@ mod tests {
     }
 
     fn plain_output(event: &ExecutionEvent) -> String {
+        plain_output_at(event, Path::new("test-project"))
+    }
+
+    fn plain_output_at(event: &ExecutionEvent, project_dir: &Path) -> String {
         let output = SharedWriter::default();
         let backend = ProgressBackend::plain(output.clone());
-        handle_event(&backend, event);
+        handle_event(&backend, event, project_dir);
         strip_ansi(&String::from_utf8(output.0.lock().unwrap().clone()).unwrap())
     }
 
@@ -455,7 +468,11 @@ mod tests {
         let effect = dummy_create_effect();
         let label = format_effect(&effect);
 
-        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&effect));
+        handle_event(
+            &backend,
+            &ExecutionEvent::effect_started_for_test(&effect),
+            Path::new("test-project"),
+        );
         wait_for_output_contains(&output.0, &format!("Still running: {label}"));
 
         handle_event(
@@ -469,6 +486,7 @@ mod tests {
                     total: 1,
                 },
             },
+            Path::new("test-project"),
         );
 
         drop(backend);
@@ -487,7 +505,11 @@ mod tests {
         let backend = ProgressBackend::plain(output.clone());
         let effect = dummy_create_effect();
 
-        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&effect));
+        handle_event(
+            &backend,
+            &ExecutionEvent::effect_started_for_test(&effect),
+            Path::new("test-project"),
+        );
         handle_event(
             &backend,
             &ExecutionEvent::EffectInterrupted {
@@ -497,6 +519,7 @@ mod tests {
                     total: 3,
                 },
             },
+            Path::new("test-project"),
         );
 
         assert_eq!(backend.active_count(), 0);
@@ -525,7 +548,11 @@ mod tests {
         )]);
         let observation = wait_observation(&target_id, &predicate, &attrs);
 
-        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&effect));
+        handle_event(
+            &backend,
+            &ExecutionEvent::effect_started_for_test(&effect),
+            Path::new("test-project"),
+        );
         handle_event(
             &backend,
             &ExecutionEvent::WaitPolling {
@@ -533,6 +560,7 @@ mod tests {
                 observation,
                 elapsed: Duration::from_secs(30),
             },
+            Path::new("test-project"),
         );
         let before_generic_heartbeat = output.0.lock().unwrap().clone();
         let last_reported = backend.plain_last_reported(&key).unwrap();
@@ -629,6 +657,7 @@ mod tests {
         let output = plain_output(&ExecutionEvent::EffectFailed {
             effect: &effect,
             error: "boom",
+            recovery: None,
             duration: Duration::from_millis(50),
             progress: ProgressInfo {
                 completed: 2,
@@ -644,6 +673,31 @@ mod tests {
             lines[0]
         );
         assert!(lines[1].contains("boom"));
+    }
+
+    #[test]
+    fn outcome_unknown_failure_uses_project_scoped_plan_recovery() {
+        let effect = dummy_create_effect();
+        let recovery =
+            carina_core::plan::PlanError::create_outcome_unknown(effect.resource_id().clone());
+        let output = plain_output_at(
+            &ExecutionEvent::EffectFailed {
+                effect: &effect,
+                error: "guest call timed out",
+                recovery: Some(&recovery),
+                duration: Duration::from_millis(50),
+                progress: ProgressInfo {
+                    completed: 1,
+                    total: 1,
+                },
+            },
+            Path::new("infra/production project"),
+        );
+
+        assert!(output.contains("if it exists: import { to = aws.s3.Bucket \"demo\" id = \"…\" }"));
+        assert!(output.contains(
+            "if it doesn't: carina state forget aws.s3.Bucket demo 'infra/production project'"
+        ));
     }
 
     #[test]
@@ -669,8 +723,16 @@ mod tests {
             std::io::sink(),
             std::io::sink(),
         );
-        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&first));
-        handle_event(&backend, &ExecutionEvent::effect_started_for_test(&second));
+        handle_event(
+            &backend,
+            &ExecutionEvent::effect_started_for_test(&first),
+            Path::new("test-project"),
+        );
+        handle_event(
+            &backend,
+            &ExecutionEvent::effect_started_for_test(&second),
+            Path::new("test-project"),
+        );
 
         assert_eq!(
             backend.active_count(),
@@ -689,6 +751,7 @@ mod tests {
                     total: 2,
                 },
             },
+            Path::new("test-project"),
         );
         assert_eq!(
             backend.active_count(),
@@ -707,6 +770,7 @@ mod tests {
                     total: 2,
                 },
             },
+            Path::new("test-project"),
         );
         assert_eq!(backend.active_count(), 0);
     }

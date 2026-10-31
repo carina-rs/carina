@@ -181,17 +181,17 @@ impl ApplyCancellationFixture {
 
     pub(super) fn observer_factory<S: Send + Sync + 'static>(
         &self,
-    ) -> impl Fn(&Plan<S>) -> Box<dyn ExecutionObserver<S>> + '_ {
-        move |plan| {
+    ) -> impl Fn(&Plan<S>, &std::path::Path) -> Box<dyn ExecutionObserver<S>> + '_ {
+        move |plan, project_dir| {
             if let Some(threshold) = self.cancel_after_successes {
                 Box::new(CancellingObserver {
-                    inner: CliObserver::new(plan),
+                    inner: CliObserver::new(plan, project_dir),
                     success_count: Arc::clone(&self.success_count),
                     threshold,
                     shutdown_trigger: self.base.shutdown_trigger(),
                 })
             } else {
-                Box::new(CliObserver::new(plan))
+                Box::new(CliObserver::new(plan, project_dir))
             }
         }
     }

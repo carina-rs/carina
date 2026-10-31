@@ -532,11 +532,30 @@ where
     };
     for (idx, effect) in effects.iter().enumerate() {
         let effect = effect.as_ref();
-        let targets = instance_to_idx.entry(effect.instance_key()).or_default();
-        if matches!(effect, Effect::Delete { .. }) {
-            targets.insert_delete(idx);
-        } else {
-            targets.insert_preferred(idx);
+        match effect {
+            Effect::Delete { .. } => instance_to_idx
+                .entry(effect.instance_key())
+                .or_default()
+                .insert_delete(idx),
+            // A release changes only the authoring record in locked state. It
+            // neither produces provider-visible values nor represents a
+            // provider operation that consumers should wait for. When the
+            // same resource also updates, that Update remains the scheduling
+            // target regardless of effect order.
+            Effect::ReleaseListKeys { .. } => {}
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => instance_to_idx
+                .entry(effect.instance_key())
+                .or_default()
+                .insert_preferred(idx),
         }
     }
     let alias_offset = effects.len();
@@ -1306,6 +1325,63 @@ mod tests {
         assert!(
             !deps[&1].contains(&0),
             "current create must not be ordered after deposed delete as a replacement"
+        );
+    }
+
+    #[test]
+    fn release_is_never_the_dependency_target_for_a_same_resource_update() {
+        let release = Effect::ReleaseListKeys {
+            id: ResolvedResourceId::new(ResourceId::with_identity("test", "parent")),
+            attribute: "settings".to_string(),
+            key_field: crate::schema::FieldName::declared("key"),
+            keys: crate::effect::ReleasedListKeys::try_new(vec![
+                crate::effect::ReleasedListKey::new(
+                    "b",
+                    Value::Concrete(crate::resource::ConcreteValue::String(
+                        "2".to_string().into(),
+                    )),
+                ),
+            ])
+            .expect("test release contains one key"),
+        };
+        let effects = vec![
+            release,
+            update_effect("parent", &[], &["settings"]),
+            update_effect("child", &[("parent", "id")], &["name"]),
+        ];
+        let unresolved: HashMap<ResourceId, UnresolvedResource> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Update { to, .. } => Some((
+                    effect.resource_id().clone(),
+                    UnresolvedResource::from_pre_resolve(to.as_inner().clone()),
+                )),
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
+            })
+            .collect();
+
+        let deps =
+            build_effect_dependency_analysis(&effects, &unresolved, &[], ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve")
+                .into_deps_of();
+
+        assert!(
+            deps[&2].contains(&1),
+            "consumer must wait for the provider Update"
+        );
+        assert!(
+            !deps[&2].contains(&0),
+            "consumer must never wait for the state-only release"
         );
     }
 

@@ -56,7 +56,16 @@ pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
                 verb: deferred_for_verb(plan, &payload.template).to_string(),
                 action: DeferredSummaryAction::Replace,
             }),
-            _ => None,
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. } => None,
         })
         .collect();
 
@@ -244,6 +253,13 @@ where
                 id_to_effect.entry(to.clone()).or_insert(idx);
                 effect_bindings.insert(idx, fallback);
                 effect_types.insert(idx, to.resource_type.clone());
+                effect_deps.insert(idx, ResolvedDependencies::default());
+                continue;
+            }
+            Effect::ReleaseListKeys { id, .. } => {
+                let fallback = id.to_string();
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, id.resource_type.clone());
                 effect_deps.insert(idx, ResolvedDependencies::default());
                 continue;
             }

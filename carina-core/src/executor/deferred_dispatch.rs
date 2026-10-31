@@ -345,6 +345,7 @@ pub(super) fn report_deferred_create_failure<S>(
     ctx.observer.on_event(&ExecutionEvent::EffectFailed {
         effect,
         error: &message,
+        recovery: None,
         duration: Duration::ZERO,
         progress: ProgressInfo {
             completed: ctx.completed.load(Ordering::Relaxed),
@@ -515,7 +516,10 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let template = &parsed.deferred_for_expressions[0];
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
             "upstream",
@@ -579,7 +583,10 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound enum loop parses");
-        let template = &parsed.deferred_for_expressions[0];
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        let template = &parsed.deferred_for_expressions()[0];
         let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::enum_identifier("foo"),
         )]));
@@ -663,7 +670,10 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let template = &parsed.deferred_for_expressions[0];
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
             "upstream",

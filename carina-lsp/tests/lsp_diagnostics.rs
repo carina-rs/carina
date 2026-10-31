@@ -57,7 +57,7 @@ awscc.ec2.SecurityGroup {
 
 #[ignore = "requires provider schemas"]
 #[tokio::test]
-async fn test_diagnostics_for_exclusive_required_attrs() {
+async fn test_diagnostics_for_exactly_one_field_group() {
     let mut client = TestClient::new().await;
     client.initialize().await;
 
@@ -83,15 +83,15 @@ awscc.ec2.vpc_gateway_attachment {
         .as_array()
         .expect("diagnostics should be an array");
 
-    let has_exclusive_error = diagnostics.iter().any(|d| {
+    let has_field_group_error = diagnostics.iter().any(|d| {
         d["message"]
             .as_str()
-            .is_some_and(|m| m.contains("Exactly one of"))
+            .is_some_and(|m| m.contains("exactly one of"))
     });
 
     assert!(
-        has_exclusive_error,
-        "Should have diagnostic about exclusive required attrs. Got: {:?}",
+        has_field_group_error,
+        "Should have diagnostic about an exactly-one field group. Got: {:?}",
         diagnostics
             .iter()
             .filter_map(|d| d["message"].as_str())

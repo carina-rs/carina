@@ -12,6 +12,32 @@ use carina_core::resource::{
 };
 use carina_core::value::{PrettyLayout, PrettyValue, render_value};
 
+#[allow(clippy::too_many_arguments)]
+fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
+    plan: &Plan<S>,
+    summary: &PlanChangeSummary,
+    detail: DetailLevel,
+    historical_display: &D,
+    schemas: Option<&SchemaRegistry>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+    prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
+    expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
+) -> String {
+    let provider = crate::fixture_plan::provider_router_for_plan(plan);
+    format_plan_with_delete_instances(
+        plan,
+        summary,
+        detail,
+        historical_display,
+        schemas,
+        moved_origins,
+        prev_explicit,
+        expansion_trace,
+        &provider,
+    )
+    .expect("display fixture must have an initialized provider route")
+}
+
 fn for_value_access(fields: &[&str]) -> Value {
     fields.iter().fold(
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
@@ -85,18 +111,25 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     let b = make_resource("test.resource", "b", "b", &[&a]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(b)));
+    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
 
     // Should not panic
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
         None,
         None,
-    );
+        &provider,
+    )
+    .expect("display fixture must have an initialized provider route");
 }
 
 /// Test that print_plan handles the dependency graph correctly when
@@ -108,18 +141,25 @@ fn test_print_plan_with_internal_dependency_does_not_panic() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(a)));
     plan.add(Effect::Create(resolved(b)));
+    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
 
     // Should not panic
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
         &HashMap::new(),
         None,
         None,
-    );
+        &provider,
+    )
+    .expect("display fixture must have an initialized provider route");
 }
 
 /// Helper: compute root indices using the same algorithm as print_plan.
@@ -652,18 +692,25 @@ fn test_print_plan_compact_does_not_panic() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
     plan.add(Effect::Create(resolved(rt)));
+    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
 
     // Should not panic
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         None,
         &HashMap::new(),
         None,
         None,
-    );
+        &provider,
+    )
+    .expect("display fixture must have an initialized provider route");
 }
 
 /// Test compact mode hides provider attributes for anonymous resources.
@@ -681,18 +728,25 @@ fn test_print_plan_compact_with_anonymous_resources() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(anon)));
+    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
 
     // Should not panic; anonymous resources should show hints
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         None,
         &HashMap::new(),
         None,
         None,
-    );
+        &provider,
+    )
+    .expect("display fixture must have an initialized provider route");
 }
 
 /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
@@ -819,9 +873,13 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
         template: Box::new(deferred),
     });
 
-    let output = strip_ansi(&format_plan_with_delete_instances(
+    let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -940,9 +998,13 @@ fn test_deferred_replace_renders_top_level() {
     let mut plan = Plan::new();
     plan.add(deferred_replace_validation_records_effect());
 
-    let output = strip_ansi(&format_plan_with_delete_instances(
+    let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -987,9 +1049,13 @@ fn test_deferred_replace_renders_dependent_children() {
         ResolvedDependencies::default(),
     )));
 
-    let output = strip_ansi(&format_plan_with_delete_instances(
+    let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -1022,9 +1088,13 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     plan.add(delete_record_effect("old_record"));
     plan.add(deferred_replace_validation_records_effect());
 
-    let output = strip_ansi(&format_plan_with_delete_instances(
+    let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -1618,8 +1688,12 @@ fn plan_summary_carries_the_exact_export_changes_rendered_by_text_output() {
         type_expr: None,
         new_value: Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     }];
-    let summary = PlanChangeSummary::new(&plan, &export_changes, &[]);
-    let output = strip_ansi(&format_plan_with_delete_instances(
+    let summary = PlanChangeSummary::new(
+        &plan,
+        &export_changes,
+        &crate::plan_summary::resolved_deferred_for_for_test([]),
+    );
+    let output = strip_ansi(&format_plan_for_test(
         &plan,
         &summary,
         DetailLevel::None,
@@ -2022,9 +2096,13 @@ fn module_children_render_with_tree_connectors() {
     trace.record(PersistentId::new(inner_id), vec![cluster_site.clone()]);
     trace.record(PersistentId::new(role_id), vec![cluster_site]);
 
-    let output = strip_ansi(&format_plan_with_delete_instances(
+    let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         Some(&SchemaRegistry::new()),
@@ -2072,9 +2150,13 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     trace.record(PersistentId::new(cluster_id), vec![cluster_site.clone()]);
     trace.record(PersistentId::new(bucket_id), vec![cluster_site]);
 
-    let output = strip_ansi(&format_plan_with_delete_instances(
+    let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         Some(&SchemaRegistry::new()),
@@ -2113,6 +2195,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
 
     let moved_origins = HashMap::new();
     let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
     let mut ctx = TreeRenderContext {
         out: format!(
             "{}\n",
@@ -2132,19 +2215,22 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
         moved_origins: &moved_origins,
         prev_explicit: None,
         update_or_replace_targets: [to_id].into_iter().collect(),
+        provider: &provider,
     };
 
-    let rendered_attrs = ctx.render_children(
-        &[ChildRenderItem::Normal(0)],
-        ChildRenderOptions {
-            parent_indent: 0,
-            parent_is_last: true,
-            parent_prefix: "",
-            parent_binding: None,
-            parent_displayed_attrs: false,
-            child_prefix_override: Some(module_child_prefix()),
-        },
-    );
+    let rendered_attrs = ctx
+        .render_children(
+            &[ChildRenderItem::Normal(0)],
+            ChildRenderOptions {
+                parent_indent: 0,
+                parent_is_last: true,
+                parent_prefix: "",
+                parent_binding: None,
+                parent_displayed_attrs: false,
+                child_prefix_override: Some(module_child_prefix()),
+            },
+        )
+        .expect("display fixture must have an initialized provider route");
 
     assert!(
         !rendered_attrs,
@@ -2191,6 +2277,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
 
     let moved_origins = HashMap::new();
     let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
@@ -2204,9 +2291,12 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
         moved_origins: &moved_origins,
         prev_explicit: None,
         update_or_replace_targets: [to_id].into_iter().collect(),
+        provider: &provider,
     };
 
-    let rendered_attrs = ctx.format_render_item(&ChildRenderItem::Normal(0), 0, true, "", None);
+    let rendered_attrs = ctx
+        .format_render_item(&ChildRenderItem::Normal(0), 0, true, "", None)
+        .expect("display fixture must have an initialized provider route");
     let output = strip_ansi(&ctx.out);
 
     assert!(rendered_attrs, "parent create should display attributes");

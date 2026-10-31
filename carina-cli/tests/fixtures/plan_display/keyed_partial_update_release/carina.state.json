@@ -1,0 +1,56 @@
+{
+  "version": 10,
+  "serial": 1,
+  "lineage": "keyed-partial-update-release",
+  "carina_version": "0.4.0",
+  "resources": [
+    {
+      "resource_type": "test.keyed_partial_update_list",
+      "identity": "mock_test_keyed_partial_update_list_e646b73c",
+      "provider": "mock",
+      "identifier": "mock-id",
+      "attributes": {
+        "name": "target",
+        "target_group_attributes": [
+          { "key": "a", "value": "1" },
+          { "key": "b", "value": "2" },
+          { "key": "stickiness.type", "value": "lb_cookie" },
+          { "key": "load_balancing.algorithm.type", "value": "round_robin" }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": null,
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": { "kind": "leaf" },
+          "target_group_attributes": {
+            "kind": "list-elements",
+            "elements": [
+              {
+                "kind": "struct",
+                "children": {
+                  "key": { "kind": "leaf" },
+                  "value": { "kind": "leaf" }
+                }
+              },
+              {
+                "kind": "struct",
+                "children": {
+                  "key": { "kind": "leaf" },
+                  "value": { "kind": "leaf" }
+                }
+              },
+              { "kind": "unrecorded" },
+              { "kind": "unrecorded" }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

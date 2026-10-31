@@ -10,7 +10,7 @@ use carina_core::effect::deps::UnresolvedResource;
 use carina_core::name_override::{
     ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
 };
-use carina_core::parser::File;
+use carina_core::parser::ModuleResolvedFile;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, Value};
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
@@ -59,7 +59,7 @@ use super::ProjectedStateRead;
 /// ```
 #[derive(Debug, Clone)]
 pub struct CanonicalResourcePair<E> {
-    parsed: File<E>,
+    parsed: ModuleResolvedFile<E>,
     unresolved: Vec<Resource>,
     /// Generated prefix values captured before persisted state can replace
     /// them with a pending re-read unknown. A post-refresh reconciliation
@@ -92,7 +92,7 @@ pub enum CanonicalResourceIdentityError {
 }
 
 impl<E> CanonicalResourcePair<E> {
-    fn new(parsed: File<E>, unresolved: Vec<Resource>) -> Self {
+    fn new(parsed: ModuleResolvedFile<E>, unresolved: Vec<Resource>) -> Self {
         Self {
             parsed,
             unresolved,
@@ -107,13 +107,13 @@ impl<E> CanonicalResourcePair<E> {
         Self::new(parsed.into_file(), unresolved)
     }
 
-    pub(super) fn into_parts(self) -> (File<E>, Vec<Resource>) {
+    pub(super) fn into_parts(self) -> (ModuleResolvedFile<E>, Vec<Resource>) {
         (self.parsed, self.unresolved)
     }
 
     pub(super) fn resolve_block_names(
         _access: &super::ValidationPipelineAccess,
-        parsed: File<E>,
+        parsed: ModuleResolvedFile<E>,
         unresolved: UnresolvedConfigSnapshot,
         registry: &SchemaRegistry,
     ) -> Result<Self, Vec<BlockNameConflict>> {
@@ -125,7 +125,7 @@ impl<E> CanonicalResourcePair<E> {
     /// The canonical evaluated configuration. Callers borrow every non-resource
     /// input from this file so it cannot drift from the resources consumed by
     /// [`OverrideAwareResources`].
-    pub fn parsed(&self) -> &File<E> {
+    pub fn parsed(&self) -> &ModuleResolvedFile<E> {
         &self.parsed
     }
 
@@ -265,26 +265,28 @@ impl<E> CanonicalResourcePair<E> {
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         mut classify: F,
     ) -> Result<
-        Vec<carina_core::parser::DeferredForExpression>,
+        carina_core::parser::ResolvedDeferredForExpressions,
         carina_core::parser::DeferredForExpansionError,
     >
     where
         F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
     {
-        let (selected, retained): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.parsed.deferred_for_expressions)
-                .into_iter()
-                .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        let (selected, retained) = self
+            .parsed
+            .take_deferred_for_expressions()
+            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.parsed.warnings.retain(|warning| {
             warning.kind != carina_core::parser::WarningKind::DeferredFor
                 || !retained
                     .iter()
                     .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
         });
-        self.parsed.deferred_for_expressions = selected;
+        self.parsed.replace_deferred_for_expressions(selected);
         self.parsed.expand_deferred_for_expressions(bindings)?;
-        let residual = self.parsed.deferred_for_expressions.clone();
-        self.parsed.deferred_for_expressions.extend(retained);
+        let residual = self.parsed.deferred_for_expressions().clone();
+        self.parsed
+            .deferred_for_expressions_mut()
+            .append_finalized(retained);
         Ok(residual)
     }
 
@@ -771,6 +773,11 @@ mod tests {
 
         let mut parsed = carina_core::parser::ParsedFile::default();
         parsed.resources = resources.clone();
+        let parsed = carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            std::path::Path::new("."),
+        )
+        .expect("test fixture crosses module resolution");
         let canonical = CanonicalResourcePair::new(parsed, resources);
         let state = ProjectedStateRead::for_test_name_overrides(overrides);
         OverrideAwareResources::build_pair_with_stability(

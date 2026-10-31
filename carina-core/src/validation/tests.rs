@@ -219,7 +219,7 @@ fn empty_parsed() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: Vec::new(),
-        deferred_for_expressions: Vec::new(),
+        deferred_for_phase: crate::parser::ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -319,6 +319,32 @@ mock.test.resource { name = f(r.name) }
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
         .expect_err("String resource attribute passed to Int must be rejected");
+    assert!(
+        error.contains("expected Int") && error.contains("got String"),
+        "{error}"
+    );
+}
+
+#[test]
+fn function_call_reference_in_parser_side_deferred_body_is_checked() {
+    let parsed = crate::parser::parse(
+        r#"
+let pending = upstream_state { source = "../pending" }
+let r = mock.test.resource { name = "r" }
+fn f(x: Int) { "fixed" }
+let generated = for item in pending.items {
+    mock.test.resource { name = f(r.name) }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    let schemas = function_ref_schema();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+        .expect_err("deferred body function argument mismatch must be rejected");
     assert!(
         error.contains("expected Int") && error.contains("got String"),
         "{error}"
@@ -883,7 +909,7 @@ fn binding_referenced_only_by_deferred_for_iterable_is_not_unused() {
     "#;
     let parsed = crate::parser::parse(src, &crate::parser::ProviderContext::default()).unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     assert!(check_unused_bindings(&authored_binding_view(src)).is_empty());
 }
 
@@ -974,6 +1000,40 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     assert!(
         source.source().is_none(),
         "a terminal resolution diagnostic must not repeat its own Display",
+    );
+}
+
+#[test]
+fn parser_side_deferred_resource_keeps_bare_binding_sink_type() {
+    let parsed = crate::parser::parse(
+        r#"
+arguments {
+    items: list(String)
+    value: Int
+}
+let generated = for item in items {
+    mock.test.resource { name = value }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+    let schemas = function_ref_schema();
+    let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+    let provider_context = LoadedProviderContext::empty_for_test();
+    let context =
+        ValidationTypeContext::new(&parsed, &schemas, &provider_context, &module_signatures);
+
+    let report = check_bare_binding_uses(&parsed, &context);
+    assert!(
+        !report.is_ready(),
+        "expected typed sink mismatch: {report:#?}"
+    );
+    let rendered = format!("{:#?}", report.findings());
+    assert!(
+        rendered.contains("String") && rendered.contains("Int"),
+        "{rendered}"
     );
 }
 
@@ -1281,10 +1341,10 @@ mock.test.Consumer { name = shared }
 
     let config = ProviderContext::default();
     let schemas = SchemaRegistry::new();
-    let mut parsed = crate::config_loader::parse_directory(fixture.path(), &config)
+    let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
         .expect("load module fixture");
-    crate::module_resolver::resolve_modules_with_providerless_config(
-        &mut parsed,
+    let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
         fixture.path(),
         &config,
         &schemas,
@@ -1292,7 +1352,7 @@ mock.test.Consumer { name = shared }
     .expect("expand nested module");
 
     assert_eq!(
-        check_unused_bindings_in_file(&parsed),
+        check_unused_bindings_in_resolved_file(&parsed),
         vec!["shared"],
         "module-local provenance must not count as a use of the root binding",
     );
@@ -6695,10 +6755,10 @@ fn validate_resources_checks_secret_literals_without_revealing_them() {
 }
 
 /// `validate_resources` must reject a resource whose schema declares an
-/// `exclusive_required` group that is not satisfied — mirrors
+/// `ExactlyOne` field group that is not satisfied — mirrors
 /// `awscc.ec2.Vpc {}` with no cidr_block / ipam pool.
 #[test]
-fn validate_resources_rejects_missing_exclusive_required() {
+fn validate_resources_rejects_missing_exactly_one_field_group() {
     let schema = make_schema(
         "ec2.Vpc",
         vec![
@@ -6706,7 +6766,9 @@ fn validate_resources_rejects_missing_exclusive_required() {
             ("ipv4_ipam_pool_id", AttributeType::string()),
         ],
     )
-    .exclusive_required(&["cidr_block", "ipv4_ipam_pool_id"]);
+    .field_group(
+        crate::schema::FieldGroup::exactly_one(["cidr_block", "ipv4_ipam_pool_id"]).unwrap(),
+    );
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -6724,8 +6786,8 @@ fn validate_resources_rejects_missing_exclusive_required() {
     let err =
         validate_resources(&parsed, &schemas, &known, &ProviderContext::default()).unwrap_err();
     assert!(
-        err.contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified"),
-        "expected exclusive_required error, got: {err}"
+        err.contains("exactly one of [cidr_block, ipv4_ipam_pool_id] must be set"),
+        "expected field-group error, got: {err}"
     );
 }
 
@@ -7294,11 +7356,21 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         &self,
         _binding: Option<&str>,
         _config: &crate::provider::ProviderReadyConfig,
+        _initialize_outcome: crate::provider::InitializeOutcomeMint,
     ) -> futures::future::BoxFuture<
         '_,
-        crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+        crate::provider::ProviderResult<crate::provider::ProviderInitialization>,
     > {
         unimplemented!("RecordingFactory::create_provider is not used in these tests")
+    }
+
+    fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+        crate::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -7421,11 +7493,21 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             &self,
             _binding: Option<&str>,
             _config: &crate::provider::ProviderReadyConfig,
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
         ) -> futures::future::BoxFuture<
             '_,
-            crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,
+            crate::provider::ProviderResult<crate::provider::ProviderInitialization>,
         > {
             unimplemented!("EnumRecordingFactory::create_provider is not used in this test")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {

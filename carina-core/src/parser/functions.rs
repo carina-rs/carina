@@ -370,7 +370,7 @@ fn function_argument_awaits_module_substitution(argument: &FunctionArgument) -> 
         || argument.value().is_some_and(contains_module_argument)
 }
 
-fn contains_module_argument(value: &Value) -> bool {
+pub(super) fn contains_module_argument(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_module_argument),

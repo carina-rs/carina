@@ -40,14 +40,17 @@ use carina_core::module_resolver::resolve_modules_providerless as resolve_module
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
-    NoopNormalizer, Provider, ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome,
-    UpdateRequest,
+    InitializedProvider, NoopNormalizer, Provider, ProviderInstanceKey, ProviderResult,
+    ProviderRouter, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
     ConcreteValue, Current, PlanInputCurrent, ResolvedResource, Resource, ResourceId, State, Value,
 };
-use carina_core::schema::SchemaRegistry;
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, ValidatedConfigSchema,
+    ValidatedProviderSchemaWitness,
+};
 
 fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
@@ -79,7 +82,7 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
 }
 
 fn resolve_plan_graph(
-    parsed: &mut carina_core::parser::ParsedFile,
+    parsed: &mut carina_core::parser::ModuleResolvedParsedFile,
     resources: &[Resource],
     registry: &SchemaRegistry,
 ) -> (
@@ -106,6 +109,57 @@ fn resolve_plan_graph(
 /// cert read returns ISSUED (+ certificate_arn) immediately; other
 /// resources create/read trivially. Keeps a correct wait fast.
 struct MockProvider;
+
+fn fixture_schemas(resources: &[Resource]) -> SchemaRegistry {
+    let mut schemas = SchemaRegistry::new();
+    let owners = resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for (provider, resource_type) in owners {
+        let mut schema = ResourceSchema::new(resource_type.clone());
+        if resource_type == "acm.Certificate" {
+            schema = schema
+                .attribute(
+                    AttributeSchema::provider_populated("status", AttributeType::string()).build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated("certificate_arn", AttributeType::string())
+                        .build(),
+                );
+        }
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema.validate().expect("fixture schema is valid")],
+            ValidatedConfigSchema::default(),
+            Default::default(),
+        )
+        .expect("fixture provider witness is valid");
+        schemas
+            .insert_provider_witness(provider, &witness)
+            .expect("fixture provider witness is consistent");
+    }
+    schemas
+}
+
+fn fixture_provider(resources: &[Resource]) -> ProviderRouter {
+    let routes = resources
+        .iter()
+        .map(|resource| ProviderInstanceKey::from(&resource.id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut provider = ProviderRouter::new();
+    for route in routes {
+        provider.add_provider_instance(
+            route,
+            InitializedProvider::unavailable(Box::new(MockProvider)),
+        );
+    }
+    provider
+}
 
 impl Provider for MockProvider {
     fn name(&self) -> &str {
@@ -251,10 +305,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed for the caller fixture");
-
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let mut parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
     // expansion, instance-prefixed with the module-call binding (`r`).
@@ -346,13 +399,14 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     }
     .expect("resolve_refs should succeed");
 
-    let registry = SchemaRegistry::new();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider = fixture_provider(&resources_for_plan);
     let (resolved_resources_for_plan, resolved_waits) =
         resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
-        &MockProvider,
+        &provider,
         carina_core::differ::PlanPriorStates::new(
             &plan_input_current(
                 current_states.clone(),
@@ -387,11 +441,9 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         })
         .collect();
 
-    let provider = MockProvider;
     let observer = CollectingObserver {
         failures: Mutex::new(Vec::new()),
     };
-    let schemas = carina_core::schema::SchemaRegistry::new();
     let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -405,7 +457,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &schemas,
+        schemas: &registry,
         parallelism: carina_core::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::new(drop),
@@ -446,10 +498,10 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     root.push("tests/fixtures/wait/module_wait_nested/root");
 
-    let mut parsed = parse_directory(&root, &ProviderContext::default())
+    let parsed = parse_directory(&root, &ProviderContext::default())
         .expect("parse_directory should succeed for the nested root fixture");
-
-    resolve_modules(&mut parsed, &root).expect("nested module resolution should succeed");
+    let mut parsed =
+        resolve_modules(parsed, &root).expect("nested module resolution should succeed");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
     // (outer call binding `o`, inner call binding `c`).
@@ -522,13 +574,14 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     }
     .expect("resolve_refs should succeed");
 
-    let registry = SchemaRegistry::new();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider = fixture_provider(&resources_for_plan);
     let (resolved_resources_for_plan, resolved_waits) =
         resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
-        &MockProvider,
+        &provider,
         carina_core::differ::PlanPriorStates::new(
             &plan_input_current(
                 current_states.clone(),
@@ -562,11 +615,9 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         })
         .collect();
 
-    let provider = MockProvider;
     let observer = CollectingObserver {
         failures: Mutex::new(Vec::new()),
     };
-    let schemas = carina_core::schema::SchemaRegistry::new();
     let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -580,7 +631,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &schemas,
+        schemas: &registry,
         parallelism: carina_core::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::new(drop),
@@ -624,9 +675,9 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let mut caller = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     caller.push("tests/fixtures/wait/module_wait_downstream/caller");
 
-    let mut parsed = parse_directory(&caller, &ProviderContext::default())
+    let parsed = parse_directory(&caller, &ProviderContext::default())
         .expect("parse_directory should succeed");
-    resolve_modules(&mut parsed, &caller).expect("module resolution should succeed");
+    let mut parsed = resolve_modules(parsed, &caller).expect("module resolution should succeed");
 
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).expect("topological sort");
@@ -706,13 +757,14 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     );
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
-    let registry = SchemaRegistry::new();
+    let registry = fixture_schemas(&resources_for_plan);
+    let provider = fixture_provider(&resources_for_plan);
     let (resolved_resources_for_plan, resolved_waits) =
         resolve_plan_graph(&mut parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
-        &MockProvider,
+        &provider,
         carina_core::differ::PlanPriorStates::new(
             &plan_input_current(
                 current_states.clone(),

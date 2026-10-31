@@ -4,14 +4,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
 
-use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
+use crate::effect::{ChangedCreateOnly, Effect, OutcomeUnknownImportReplacement, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult};
+use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
 use crate::resource::{
     ConcreteValue, Current, Directives, PersistedDirectives, PlanInputCurrent, ResolvedDataSource,
     ResolvedDependencies, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
@@ -24,7 +24,18 @@ use crate::wait::ResolvedWaitBinding;
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
 
-use super::{PlanPriorStates, PresentDiff, diff_present};
+use super::{PlanPriorStates, PlannedListKeyRelease, PresentDiff, diff_present_with_releases};
+
+fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {
+    for release in releases {
+        plan.add(Effect::ReleaseListKeys {
+            id: ResolvedResourceId::new(id.clone()),
+            attribute: release.attribute,
+            key_field: release.key_field,
+            keys: release.keys,
+        });
+    }
+}
 
 pub(crate) struct PendingReplace {
     pub create: ResolvedResource,
@@ -308,7 +319,68 @@ pub fn generate_temporary_name(
 pub fn create_plan(
     managed: &[ResolvedResource],
     data_sources: &[ResolvedDataSource],
+    provider: &ProviderRouter,
+    prior_states: PlanPriorStates<'_>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    wait_bindings: &[ResolvedWaitBinding],
+) -> ProviderResult<Plan> {
+    create_plan_with_provider(
+        managed,
+        data_sources,
+        provider,
+        provider,
+        prior_states,
+        directives_map,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        wait_bindings,
+    )
+}
+
+/// Test-only entry point for focused provider fixtures that do not model an
+/// initialized provider instance. Comparisons use an unavailable scope.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn create_plan_for_test(
+    managed: &[ResolvedResource],
+    data_sources: &[ResolvedDataSource],
+    provider: &dyn crate::provider::Provider,
+    prior_states: PlanPriorStates<'_>,
+    directives_map: &HashMap<ResourceId, PersistedDirectives>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    wait_bindings: &[ResolvedWaitBinding],
+) -> ProviderResult<Plan> {
+    let (registry, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        registry,
+        managed.iter().map(|resource| &resource.id),
+    );
+    create_plan_with_provider(
+        managed,
+        data_sources,
+        provider,
+        &comparison_provider,
+        prior_states,
+        directives_map,
+        &registry,
+        saved_attrs,
+        prev_explicit,
+        wait_bindings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_plan_with_provider(
+    managed: &[ResolvedResource],
+    data_sources: &[ResolvedDataSource],
     provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
@@ -321,12 +393,14 @@ pub fn create_plan(
         managed,
         data_sources,
         provider,
+        comparison_provider,
         &managed_current,
         registry,
         saved_attrs,
         prev_explicit,
         prior_states.orphans(),
         wait_bindings,
+        &HashSet::new(),
     )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
@@ -338,18 +412,20 @@ pub fn create_plan_with_cascades(
     managed: &[ResolvedResource],
     unresolved_managed: &[ResolvedResource],
     data_sources: &[ResolvedDataSource],
-    provider: &dyn Provider,
+    provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[ResolvedWaitBinding],
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> ProviderResult<Plan> {
     let managed_current = prior_states.materialize_current_states(managed, registry);
     let mut build = create_plan_parts(
         managed,
         data_sources,
+        provider,
         provider,
         &managed_current,
         registry,
@@ -357,6 +433,7 @@ pub fn create_plan_with_cascades(
         prev_explicit,
         prior_states.orphans(),
         wait_bindings,
+        outcome_unknown_import_replacements,
     )?;
     cascade_dependent_updates(
         &mut build.plan,
@@ -364,6 +441,7 @@ pub fn create_plan_with_cascades(
         unresolved_managed,
         &managed_current,
         registry,
+        outcome_unknown_import_replacements,
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
@@ -380,12 +458,14 @@ fn create_plan_parts(
     managed: &[ResolvedResource],
     data_sources: &[ResolvedDataSource],
     provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &super::Orphans,
     wait_bindings: &[ResolvedWaitBinding],
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
@@ -408,13 +488,6 @@ fn create_plan_parts(
             .unwrap_or_else(|| PlanInputCurrent::absent(resource.id.clone()));
         let saved = saved_attrs.get(&resource.id);
         let prev_explicit_for_resource = prev_explicit.get(&resource.id);
-        let schema = registry
-            .get(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                SchemaKind::Resource,
-            )
-            .map(|schema| schema.schema().as_schema());
         match current.current() {
             Current::Absent(_absent) => plan.add(Effect::Create(resource.clone())),
             Current::CreateInFlight(pending) => {
@@ -429,6 +502,13 @@ fn create_plan_parts(
                     ));
                 }
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                add_outcome_unknown_error(
+                    &mut plan,
+                    unknown.id(),
+                    outcome_unknown_import_replacements,
+                );
+            }
             Current::MissingIdentifier(_unidentified) => {
                 plan.add_error(PlanError::new(
                     resource.id.clone(),
@@ -436,14 +516,22 @@ fn create_plan_parts(
                 ));
             }
             Current::Present(present) => {
-                match diff_present(
+                let resolved_comparison =
+                    comparison_provider.comparison_for(registry, &resource.id)?;
+                let owner_schema = resolved_comparison.owner_schema();
+                let context = resolved_comparison.context();
+                let validated_schema = owner_schema.schema();
+                let schema = validated_schema.as_schema();
+                let result = diff_present_with_releases(
                     resource,
                     present,
                     saved,
                     saved_attrs.nested_write_only(&resource.id),
                     prev_explicit_for_resource,
-                    schema,
-                ) {
+                    validated_schema,
+                    context,
+                );
+                match result.diff {
                     PresentDiff::Update {
                         id,
                         from,
@@ -468,24 +556,20 @@ fn create_plan_parts(
                         );
 
                         if changed_attributes.is_empty() {
+                            add_key_releases(&mut plan, &resource.id, result.releases);
                             continue;
                         }
 
-                        if !resource.ignore_changes().is_empty() {
-                            let schema = schema.unwrap_or_else(|| {
-                                unreachable!(
-                                    "schema-resolved ignore_changes requires a managed schema"
-                                )
-                            });
-                            if let Err(error) = crate::provider::plan_update_patch(
+                        if !resource.ignore_changes().is_empty()
+                            && let Err(error) = crate::provider::plan_update_patch(
                                 &changed_attributes,
                                 resource,
                                 &from,
                                 schema,
-                            ) {
-                                plan.add_error(PlanError::new(id, error.into()));
-                                continue;
-                            }
+                            )
+                        {
+                            plan.add_error(PlanError::new(id, error.into()));
+                            continue;
                         }
 
                         let identifier = present.identifier().clone();
@@ -528,14 +612,18 @@ fn create_plan_parts(
                                 to: resource.replace_inner(to),
                                 changed_attributes,
                             });
+                            add_key_releases(&mut plan, &resource.id, result.releases);
                         }
                     }
                     PresentDiff::NoChange {
                         ignored_readable_differences,
-                    } => plan.record_ignored_readable_differences(
-                        resource.id.clone(),
-                        ignored_readable_differences,
-                    ),
+                    } => {
+                        plan.record_ignored_readable_differences(
+                            resource.id.clone(),
+                            ignored_readable_differences,
+                        );
+                        add_key_releases(&mut plan, &resource.id, result.releases);
+                    }
                 }
             }
         }
@@ -558,6 +646,14 @@ fn create_plan_parts(
                     id.clone(),
                     PlanErrorKind::CreateInFlightOrphan,
                 ));
+                continue;
+            }
+            Current::CreateOutcomeUnknown(unknown) => {
+                add_outcome_unknown_error(
+                    &mut plan,
+                    unknown.id(),
+                    outcome_unknown_import_replacements,
+                );
                 continue;
             }
             Current::MissingIdentifier(_state) => {
@@ -694,6 +790,7 @@ fn create_plan_parts(
                     Current::Absent(_absent) => None,
                     Current::Present(present) => Some(present.state()),
                     Current::CreateInFlight(_pending) => None,
+                    Current::CreateOutcomeUnknown(_unknown) => None,
                     Current::MissingIdentifier(unidentified) => Some(unidentified.state()),
                 });
         let wait_has_work = cached_state
@@ -781,7 +878,17 @@ pub fn block_deletes_on_prior_consumer_updates(
                     to.all_dependencies().cloned().collect(),
                 ))
             }
-            _ => None,
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect();
 
@@ -946,6 +1053,7 @@ fn cascade_dependent_updates(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) {
     loop {
         promote_referenced_replaces_to_cbd(plan, pending_replaces, unresolved_managed, registry);
@@ -960,6 +1068,7 @@ fn cascade_dependent_updates(
             unresolved_managed,
             current_states,
             registry,
+            outcome_unknown_import_replacements,
         );
 
         if !promoted {
@@ -1044,6 +1153,7 @@ fn promote_pending_replaces_for_dependents(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
     let ref_targets = pending_reference_targets(pending_replaces, true);
     let mut promoted = false;
@@ -1102,6 +1212,7 @@ fn promote_pending_replaces_for_dependents(
                     ref_hints,
                     current_states,
                     registry,
+                    outcome_unknown_import_replacements,
                 ) {
                     pending_replaces.insert(consumer_identity.clone(), pending);
                     promoted = true;
@@ -1113,7 +1224,13 @@ fn promote_pending_replaces_for_dependents(
                     replaced.consumer_updates.insert(consumer_identity.clone());
                 }
             } else if !pending_replaces.contains_key(&consumer_identity)
-                && ensure_consumer_update(plan, resource, &ref_attr_names, current_states)
+                && ensure_consumer_update(
+                    plan,
+                    resource,
+                    &ref_attr_names,
+                    current_states,
+                    outcome_unknown_import_replacements,
+                )
                 && let Some(replaced) = pending_replaces.get_mut(&replaced_identity)
             {
                 replaced.consumer_updates.insert(consumer_identity.clone());
@@ -1165,6 +1282,7 @@ fn promote_resource_to_pending_replace(
     ref_hints: Vec<(String, String)>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> Option<PendingReplace> {
     let (from, identifier) = if let Some(update) = take_update_from_plan(plan, &resource.id) {
         update
@@ -1176,6 +1294,10 @@ fn promote_resource_to_pending_replace(
                 present.identifier().clone(),
             ),
             Current::CreateInFlight(_pending) => return None,
+            Current::CreateOutcomeUnknown(unknown) => {
+                add_outcome_unknown_error(plan, unknown.id(), outcome_unknown_import_replacements);
+                return None;
+            }
             Current::MissingIdentifier(_state) => {
                 plan.add_error(PlanError::new(
                     resource.id.clone(),
@@ -1213,12 +1335,13 @@ fn take_update_from_plan(
         .iter()
         .position(|effect| matches!(effect, Effect::Update { to, .. } if to.id == *resource_id))?;
     let effect = plan.effects_mut().remove(index);
-    match effect {
-        Effect::Update {
-            from, identifier, ..
-        } => Some((from, identifier)),
-        _ => None,
-    }
+    let Effect::Update {
+        from, identifier, ..
+    } = effect
+    else {
+        unreachable!("index selected by the Update variant")
+    };
+    Some((from, identifier))
 }
 
 fn ensure_consumer_update(
@@ -1226,6 +1349,7 @@ fn ensure_consumer_update(
     resource: &ResolvedResource,
     changed_attributes: &[String],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
     if let Some(effect) = plan
         .effects_mut()
@@ -1263,6 +1387,10 @@ fn ensure_consumer_update(
         Current::Absent(_state) => return false,
         Current::Present(present) => (present.state().clone(), present.identifier().clone()),
         Current::CreateInFlight(_pending) => return false,
+        Current::CreateOutcomeUnknown(unknown) => {
+            add_outcome_unknown_error(plan, unknown.id(), outcome_unknown_import_replacements);
+            return false;
+        }
         Current::MissingIdentifier(_state) => {
             plan.add_error(PlanError::new(
                 resource.id.clone(),
@@ -1279,6 +1407,19 @@ fn ensure_consumer_update(
         changed_attributes: changed_attributes.to_vec(),
     });
     true
+}
+
+fn add_outcome_unknown_error(
+    plan: &mut Plan,
+    resource: &ResourceId,
+    outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
+) {
+    if !outcome_unknown_import_replacements
+        .iter()
+        .any(|replacement| replacement.resource_id() == resource)
+    {
+        plan.add_error(PlanError::create_outcome_unknown(resource.clone()));
+    }
 }
 
 #[cfg(test)]
@@ -1312,6 +1453,7 @@ mod typed_current_identifier_tests {
             &resolved,
             &["input".to_string()],
             &current,
+            &HashSet::new(),
         ));
         let [
             Effect::Update {
@@ -1344,6 +1486,7 @@ mod typed_current_identifier_tests {
             Vec::new(),
             &current,
             &SchemaRegistry::new(),
+            &HashSet::new(),
         )
         .expect("present current state can be promoted");
 

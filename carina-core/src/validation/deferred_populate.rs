@@ -65,8 +65,8 @@ pub struct DeferredPopulateDiagnostic {
 
 /// Run the deferred-populate diagnostic against a parsed file +
 /// schema registry.
-pub fn validate_deferred_populate_refs<E>(
-    parsed: &File<E>,
+pub fn validate_deferred_populate_refs<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &File<E, D>,
     schemas: &SchemaRegistry,
 ) -> Vec<DeferredPopulateDiagnostic> {
     // binding name → (provider, resource_type) for schema lookup.
@@ -369,7 +369,10 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{ParsedFile, WaitBinding};
+    use crate::parser::{
+        DeferredForBody, DeferredForTarget, ForBinding, ParsedDeferredForExpression, ParsedFile,
+        SourceSpan, WaitBinding,
+    };
     use crate::resource::{
         AccessPath, ConcreteValue, DeferredValue, PathSegment, Resource, ResourceId, Subscript,
         Value,
@@ -517,6 +520,31 @@ mod tests {
             d.unresolved_path
         );
         assert!(d.message.contains("wait cert"), "got: {}", d.message);
+    }
+
+    #[test]
+    fn parser_side_deferred_resource_body_is_checked() {
+        let mut parsed = parsed_with_unsynchronized_chained_ref();
+        let record = parsed.resources.pop().expect("record resource"); // allow: direct — fixture test inspection
+        parsed
+            .parsed_deferred_for_expressions_mut()
+            .push(ParsedDeferredForExpression {
+                file: None,
+                line: 1,
+                span: SourceSpan::dummy(),
+                header: "for item in pending.items".to_string(),
+                target: DeferredForTarget::Bound {
+                    binding: "records".to_string(),
+                },
+                iterable: Value::Concrete(ConcreteValue::List(Vec::new())),
+                iterable_state: crate::parser::ParsedDeferredForIterableState::Deferred,
+                binding: ForBinding::Simple("item".to_string()),
+                body: DeferredForBody::Resource(Box::new(record)),
+            });
+
+        let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert_eq!(diags[0].target_binding, "cert");
     }
 
     #[test]
