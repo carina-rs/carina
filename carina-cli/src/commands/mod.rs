@@ -57,6 +57,7 @@ pub enum DriftCommand {
     Apply,
     Destroy,
     RefreshState,
+    ForgetState,
 }
 
 impl DriftCommand {
@@ -65,6 +66,7 @@ impl DriftCommand {
             Self::Apply => "Cannot apply",
             Self::Destroy => "Cannot destroy",
             Self::RefreshState => "Cannot refresh state",
+            Self::ForgetState => "Cannot forget state",
         }
     }
 }
@@ -1601,13 +1603,14 @@ child { values = [source] }
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> carina_core::provider::BoxFuture<
             '_,
-            carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+            carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
         > {
             Box::pin(async {
-                Ok(Box::new(carina_provider_mock::MockProvider::new())
-                    as Box<dyn carina_core::provider::Provider>)
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
             })
         }
 
@@ -1625,6 +1628,15 @@ child { values = [source] }
                 Ok(Box::new(carina_core::provider::NoopNormalizer)
                     as Box<dyn carina_core::provider::ProviderNormalizer>)
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

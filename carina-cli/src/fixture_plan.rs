@@ -5,7 +5,7 @@
 //! performing live provider reads, so rendering works without installed
 //! providers.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
@@ -13,7 +13,10 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::UnresolvedResource;
 use carina_core::plan::Plan;
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
+use carina_core::provider::{
+    BoxFuture, InitializedProvider, ProviderFactory, ProviderInitialization, ProviderInstanceKey,
+    ProviderResult, ProviderRouter,
+};
 use carina_core::resource::{Current, ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
@@ -247,6 +250,23 @@ pub struct FixturePlan {
     pub expansion_trace: carina_core::resource::ExpansionTrace,
 }
 
+/// Build an explicitly scoped provider router for rendering a hand-built plan.
+pub fn provider_router_for_plan<S>(plan: &Plan<S>) -> ProviderRouter {
+    let instances = plan
+        .effects()
+        .iter()
+        .map(|effect| ProviderInstanceKey::from(effect.resource_id()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut provider = ProviderRouter::new();
+    for instance in instances {
+        provider.add_provider_instance(
+            instance,
+            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
+        );
+    }
+    provider
+}
+
 /// Build a plan from a fixture directory name (e.g. "all_create"). Resolves
 /// the fixture under `CARGO_MANIFEST_DIR/tests/fixtures/plan_display/<name>`.
 #[cfg(test)]
@@ -414,9 +434,66 @@ where
     )
     .expect("fixture provider configs must resolve");
     let raw_provider_configs = resolved_provider_configs.as_provider_configs();
+    // Fixture planning still follows the production comparison path: every
+    // resource route has an initialized provider and an explicit scope.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime for fixture providers");
+    let mut provider_router = ProviderRouter::new();
+    for factory in wiring.factories() {
+        let resolved_config = resolved_provider_configs.provider_or_implicit(factory.name());
+        let config = rt
+            .block_on(async {
+                carina_core::executor::prepare_provider_ready_config(
+                    factory.as_ref(),
+                    resolved_config.as_ref(),
+                )
+            })
+            .expect("fixture provider config unexpectedly failed validation");
+        provider_router.add_normalizer(
+            factory.name(),
+            rt.block_on(factory.create_normalizer(None, &config))
+                .expect("fixture normalizer creation unexpectedly failed"),
+        );
+        provider_router.add_provider(
+            factory.name().to_string(),
+            carina_core::provider::InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new(),
+            )),
+        );
+    }
+    // Built-in fixture providers (notably `mock`) do not have a loaded
+    // factory, so the loop above cannot register their routes. Register every
+    // exact route named by provider configuration or fixture resources; this
+    // also keeps named instances aligned with the ResourceId used later by
+    // comparison resolution.
+    let fixture_routes = raw_provider_configs
+        .iter()
+        .map(ProviderInstanceKey::from)
+        .chain(
+            parsed
+                .resources
+                .iter()
+                .map(|resource| ProviderInstanceKey::from(&resource.id)),
+        )
+        .chain(
+            data_sources
+                .iter()
+                .map(|resource| ProviderInstanceKey::from(&resource.id)),
+        )
+        .collect::<BTreeSet<_>>();
+    for route in fixture_routes {
+        provider_router.add_provider_instance(
+            route,
+            InitializedProvider::unavailable(Box::new(carina_provider_mock::MockProvider::new())),
+        );
+    }
     let expansion_prelude = expansion_prelude
         .detect_moves(
             wiring,
+            &provider_router,
             &data_sources,
             raw_provider_configs,
             &state_block_claims,
@@ -462,38 +539,6 @@ where
         )
     });
 
-    let mut provider_router = ProviderRouter::new();
-    {
-        // Provider config validation may use `block_in_place` to bridge a
-        // synchronous factory hook to async WASM calls. Build fixture
-        // normalizers inside a compatible runtime; the shared post-expansion
-        // seam invokes them later.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime for fixture normalizers");
-        for factory in wiring.factories() {
-            let resolved_config = resolved_provider_configs.provider_or_implicit(factory.name());
-            let config = rt
-                .block_on(async {
-                    carina_core::executor::prepare_provider_ready_config(
-                        factory.as_ref(),
-                        resolved_config.as_ref(),
-                    )
-                })
-                .expect("fixture provider config unexpectedly failed validation");
-            provider_router.add_normalizer(
-                factory.name(),
-                rt.block_on(factory.create_normalizer(None, &config))
-                    .expect("fixture normalizer creation unexpectedly failed"),
-            );
-            provider_router.add_provider(
-                factory.name().to_string(),
-                Box::new(carina_provider_mock::MockProvider::new()),
-            );
-        }
-    }
     // Fixtures have no provider/upstream I/O phase. Only loops rooted in the
     // loaded managed-state view can materialize here; keep every other loop as
     // a display residual instead of turning it into an executable deferred
@@ -519,13 +564,13 @@ where
         .bind_projected_phase1_state(managed_current, orphans, HashSet::new())
         .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)
         .expect("fixture move routes must match their loaded current states");
-
     let prepared_expansion = reconciled_expansion.seal(data_source_values);
     let mut validated_expansion = validated_config
         .expand_deferred_for_plan(
             prepared_expansion,
             &remote_bindings,
             crate::wiring::DeferredForWarningPolicy::Print,
+            &provider_router,
         )
         .expect("fixture deferred-for expansion failed");
     validated_expansion.retain_fixture_deferred_for(&managed_bindings, non_managed_deferred_for);
@@ -584,7 +629,9 @@ where
                 prev_explicit,
                 wait_aliases: _,
             } = diagnostics.into_artifacts();
-            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            let moved_hints =
+                detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
+                    .expect("fixture moved-hint comparisons must resolve");
             FixturePlan {
                 plan,
                 moved_hints,
@@ -629,7 +676,9 @@ where
                 prev_explicit,
                 wait_aliases: _,
             } = artifacts;
-            let moved_hints = detect_moved_block_hints(&plan, &managed_current, &schemas);
+            let moved_hints =
+                detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
+                    .expect("fixture moved-hint comparisons must resolve");
             let resources_for_exports = resolved_resources
                 .iter()
                 .map(|resource| resource.as_inner().clone())
@@ -848,8 +897,18 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -895,8 +954,18 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -951,8 +1020,18 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1024,8 +1103,18 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1090,8 +1179,18 @@ impl ProviderFactory for PlanImageFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1146,8 +1245,18 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1201,8 +1310,18 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1264,8 +1383,18 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1315,8 +1444,18 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

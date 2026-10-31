@@ -17,6 +17,7 @@ use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
 use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
+use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
 use carina_core::provider_source::ProviderSource;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
@@ -41,7 +42,7 @@ use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
 use crate::display::print_plan;
-use crate::error::AppError;
+use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
 #[cfg(test)]
@@ -127,6 +128,84 @@ pub struct SavedDataSourceValue {
 }
 
 pub type PlanProviderArtifacts = BTreeMap<String, RecordedProviderArtifact>;
+
+pub type PlanProviderScopes = BTreeMap<ProviderInstanceKey, ReferenceScope>;
+
+/// One initialized provider instance and the scope returned by that exact
+/// instance. The wire uses a sorted list because JSON object keys cannot
+/// faithfully encode the structured provider route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedProviderScope {
+    pub instance: ProviderInstanceKey,
+    pub scope: ReferenceScope,
+}
+
+/// The first deterministic difference between saved and initialized provider
+/// instance scopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderScopeMismatch {
+    pub(crate) instance: ProviderInstanceKey,
+    pub(crate) recorded: ReferenceScope,
+    pub(crate) initialized: Option<ReferenceScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordedProviderScopes(PlanProviderScopes);
+
+impl RecordedProviderScopes {
+    #[cfg(test)]
+    pub(crate) fn from_router(provider: &ProviderRouter) -> Self {
+        Self(provider.provider_scopes())
+    }
+
+    fn from_router_for_instances(
+        provider: &ProviderRouter,
+        instances: &BTreeSet<ProviderInstanceKey>,
+    ) -> Self {
+        let mut scopes = provider.provider_scopes();
+        scopes.retain(|instance, _scope| instances.contains(instance));
+        Self(scopes)
+    }
+
+    pub(crate) fn verify(
+        &self,
+        provider: &ProviderRouter,
+    ) -> Result<(), Box<ProviderScopeMismatch>> {
+        let initialized = provider.provider_scopes();
+        for instance in self.0.keys() {
+            let recorded = self
+                .0
+                .get(instance)
+                .expect("an iterated recorded provider scope must exist");
+            let current = initialized.get(instance);
+            if Some(recorded) != current {
+                return Err(Box::new(ProviderScopeMismatch {
+                    instance: instance.clone(),
+                    recorded: recorded.clone(),
+                    initialized: current.cloned(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn into_wire(self) -> Vec<RecordedProviderScope> {
+        self.0
+            .into_iter()
+            .map(|(instance, scope)| RecordedProviderScope { instance, scope })
+            .collect()
+    }
+
+    fn try_from_wire(records: Vec<RecordedProviderScope>) -> Result<Self, ProviderEvidenceError> {
+        let mut scopes = BTreeMap::new();
+        for RecordedProviderScope { instance, scope } in records {
+            if scopes.insert(instance.clone(), scope).is_some() {
+                return Err(ProviderEvidenceError::DuplicateProviderScope { instance });
+            }
+        }
+        Ok(Self(scopes))
+    }
+}
 
 /// Provider artifact identity persisted in a saved plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +403,169 @@ mod recorded_provider_artifact_tests {
     }
 }
 
+#[cfg(test)]
+mod provider_scope_evidence_tests {
+    use super::*;
+    use carina_core::provider::{
+        InitializedProvider, ProviderInstanceKey, ProviderRouter, ReferenceScope,
+    };
+    use indexmap::IndexMap;
+
+    fn provider_config(binding: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: Some(binding.to_string()),
+        }
+    }
+
+    fn available(region: &str) -> ReferenceScope {
+        ReferenceScope::available("aws", region, "123456789012").expect("fixture scope is valid")
+    }
+
+    fn router(scopes: [(&str, ReferenceScope); 2]) -> ProviderRouter {
+        let mut router = ProviderRouter::new();
+        for (binding, scope) in scopes {
+            router.add_provider_instance(
+                ProviderInstanceKey::new("test", Some(binding.to_string())),
+                InitializedProvider::for_test(
+                    Box::new(carina_provider_mock::MockProvider::new()),
+                    scope,
+                ),
+            );
+        }
+        router
+    }
+
+    fn empty_contents(provider_configs: SavedProviderConfigs) -> PlanFileContents {
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-30T00:00:00Z".to_string(),
+            source_path: "test.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs,
+            backend_config: None,
+            plan: Plan::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn current_saved_plan_round_trips_provider_scopes() {
+        let mut default_config = provider_config("unused");
+        default_config.binding = None;
+        default_config.source = Some("file:///test-provider.wasm".parse().unwrap());
+        let configs = vec![
+            default_config,
+            provider_config("east"),
+            provider_config("west"),
+        ];
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.providers = configs.clone();
+        let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &ProviderContext::default(),
+        )
+        .expect("provider configs resolve");
+        let wiring = ValidatedConfig::from_factories_for_test(
+            (),
+            vec![Box::new(
+                crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
+                    received_role_arn: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                },
+            )],
+            &configs,
+        );
+        let mut provider = router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("us-west-2")),
+        ]);
+        provider.add_provider_instance(
+            ProviderInstanceKey::new("test", None),
+            InitializedProvider::for_test(
+                Box::new(carina_provider_mock::MockProvider::new()),
+                available("ap-northeast-1"),
+            ),
+        );
+
+        let plan = empty_contents(SavedProviderConfigs::from(&resolved))
+            .record_for_test_with_provider(&wiring, &provider)
+            .expect("provider scopes form valid evidence");
+        let json = serde_json::to_value(&plan).expect("saved plan serializes");
+        assert_eq!(
+            json["version"],
+            serde_json::json!(PlanFile::CURRENT_VERSION)
+        );
+        let scopes = json["provider_scopes"].as_array().unwrap();
+        assert_eq!(scopes.len(), 3);
+        assert_eq!(
+            scopes[0]["instance"]["provider_instance"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            scopes[1]["instance"]["provider_instance"],
+            serde_json::json!("east")
+        );
+        assert_eq!(
+            scopes[2]["instance"]["provider_instance"],
+            serde_json::json!("west")
+        );
+
+        let decoded: PlanFile = serde_json::from_value(json).expect("saved plan round-trips");
+        assert_eq!(decoded.provider_scopes(), &provider.provider_scopes());
+    }
+
+    #[test]
+    fn named_instance_scope_mismatch_identifies_the_changed_region() {
+        let recorded = RecordedProviderScopes::from_router(&router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("us-west-2")),
+        ]));
+        let initialized = router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("eu-west-1")),
+        ]);
+
+        let mismatch = recorded
+            .verify(&initialized)
+            .expect_err("one named instance changed scope");
+        assert_eq!(mismatch.instance.provider(), "test");
+        assert_eq!(mismatch.instance.provider_instance(), Some("west"));
+        assert_eq!(mismatch.recorded, available("us-west-2"));
+        assert_eq!(mismatch.initialized, Some(available("eu-west-1")));
+    }
+
+    #[test]
+    fn apply_scope_verification_ignores_initialized_instances_unused_by_the_plan() {
+        let recorded = RecordedProviderScopes(BTreeMap::new());
+        let initialized = router([
+            ("east", available("ap-northeast-1")),
+            ("west", available("us-west-2")),
+        ]);
+
+        recorded
+            .verify(&initialized)
+            .expect("unrecorded provider instances are unrelated to the saved plan");
+    }
+}
+
 /// Contents of a saved plan before provider evidence has been recorded.
 ///
 /// This type is intentionally not a saved-plan wire type. Constructing these
@@ -355,12 +597,19 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 32 separates parser and deferred-loop placeholders from
-    /// post-expansion values. Plan format 31 persists authored `ignore_changes`
-    /// paths for schema-time re-resolution. Plan format 30 was reserved for provider protocol v13 and
-    /// was never emitted. Plan format 29 persists anonymous-loop provenance,
-    /// typed deferred-loop targets, and Move origins. Plan format 28 added
-    /// typed pending re-read reasons.
+    /// Plan format 34 separates parser and deferred-loop placeholders from
+    /// post-expansion values.
+    ///
+    /// Plan format 33 adds the typed keyed-list release effect.
+    ///
+    /// Plan format 32 records provider-instance reference-scope evidence and
+    /// the create-outcome-unknown marker for provider protocol v13.
+    ///
+    /// Plan format 31 persists authored `ignore_changes` paths for schema-time
+    /// re-resolution. Plan format 30 was never emitted; provider protocol v13
+    /// uses format 32. Plan format 29 persists anonymous-loop provenance, typed
+    /// deferred-loop targets, and Move origins. Plan format 28 added typed
+    /// pending re-read reasons.
     /// Plan format 27 adds a mandatory normalized module-call origin path to
     /// every saved composition. Plan format 26 adds mandatory identities for
     /// every loaded provider artifact. Plan format 25 adds the mandatory typed
@@ -606,6 +855,8 @@ struct ProviderEvidence {
     /// Exact provider-kind artifacts loaded while this plan was computed.
     /// This field is mandatory since plan format 26.
     provider_artifacts: PlanProviderArtifacts,
+    /// Exact scope of every initialized provider instance used by planning.
+    provider_scopes: RecordedProviderScopes,
 }
 
 /// Saved plan file for `plan --out` / `apply <plan-file>`.
@@ -616,12 +867,19 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// Format 32 separates parser and deferred-loop placeholders from
-/// post-expansion values. Format 31 persists authored `ignore_changes` paths
-/// for schema-time re-resolution. Format 30 was reserved for provider protocol v13 and was
-/// never emitted. Format 29 persists anonymous-loop provenance, typed
-/// deferred-loop targets, and Move origins. Provider evidence is also
-/// validated both when recording and when decoding a saved plan.
+/// Format 34 separates parser and deferred-loop placeholders from
+/// post-expansion values.
+///
+/// Format 33 adds typed keyed-list release effects.
+///
+/// Format 32 records provider-instance reference-scope evidence and the
+/// create-outcome-unknown marker for provider protocol v13.
+///
+/// Format 31 persists authored `ignore_changes` paths for schema-time
+/// re-resolution. Format 30 was never emitted; provider protocol v13 uses
+/// format 32. Format 29 persists anonymous-loop provenance, typed deferred-loop
+/// targets, and Move origins. Provider evidence is validated both when
+/// recording and when decoding a saved plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(into = "PlanFileWire", try_from = "PlanFileWire")]
 pub struct PlanFile {
@@ -629,7 +887,7 @@ pub struct PlanFile {
     evidence: ProviderEvidence,
 }
 
-/// Private saved-plan wire representation.
+/// Private format-34 wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -659,6 +917,7 @@ struct PlanFileWire {
     wait_bindings: Vec<PlanWaitBinding>,
     schema_fingerprints: PlanSchemaFingerprints,
     provider_artifacts: PlanProviderArtifacts,
+    provider_scopes: Vec<RecordedProviderScope>,
 }
 
 /// A saved plan's provider evidence is incomplete or inconsistent.
@@ -697,6 +956,14 @@ pub enum ProviderEvidenceError {
         provider: String,
         expected: ExpectedRecordedArtifactOrigin,
         recorded: RecordedArtifactOrigin,
+    },
+    DuplicateProviderScope {
+        instance: ProviderInstanceKey,
+    },
+    ProviderScopeMismatch {
+        instance: ProviderInstanceKey,
+        recorded: Option<()>,
+        initialized: Option<()>,
     },
 }
 
@@ -759,7 +1026,37 @@ impl std::fmt::Display for ProviderEvidenceError {
                 formatter,
                 "provider_artifacts records provider `{provider}` with origin {recorded}, expected {expected}"
             ),
+            Self::DuplicateProviderScope { instance } => write!(
+                formatter,
+                "provider_scopes contains duplicate instance `{}`",
+                display_provider_instance(instance)
+            ),
+            Self::ProviderScopeMismatch {
+                instance,
+                recorded,
+                initialized,
+            } => write!(
+                formatter,
+                "provider_scopes differs for instance `{}`: recorded {}, initialized {}",
+                display_provider_instance(instance),
+                display_scope_presence(*recorded),
+                display_scope_presence(*initialized)
+            ),
         }
+    }
+}
+
+fn display_scope_presence(scope: Option<()>) -> &'static str {
+    match scope {
+        Some(()) => "present",
+        None => "missing",
+    }
+}
+
+fn display_provider_instance(instance: &ProviderInstanceKey) -> String {
+    match instance.provider_instance() {
+        Some(binding) => format!("{}.{binding}", instance.provider()),
+        None => format!("{} (default)", instance.provider()),
     }
 }
 
@@ -816,26 +1113,33 @@ impl ProviderEvidence {
         references: &PlanSchemaReferences,
         provider_configs: &SavedProviderConfigs,
         ctx: &WiringContext,
+        provider: &ProviderRouter,
+        expected_instances: &BTreeSet<ProviderInstanceKey>,
     ) -> Result<Self, ProviderEvidenceError> {
         Self::new(
             PlanSchemaFingerprints::capture(references, ctx.schemas()),
             recorded_provider_artifacts(ctx),
+            RecordedProviderScopes::from_router_for_instances(provider, expected_instances),
             references,
             provider_configs,
+            expected_instances,
         )
     }
 
     fn new(
         schema_fingerprints: PlanSchemaFingerprints,
         provider_artifacts: PlanProviderArtifacts,
+        provider_scopes: RecordedProviderScopes,
         references: &PlanSchemaReferences,
         provider_configs: &SavedProviderConfigs,
+        expected_instances: &BTreeSet<ProviderInstanceKey>,
     ) -> Result<Self, ProviderEvidenceError> {
         let evidence = Self {
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes,
         };
-        evidence.validate(references, provider_configs)?;
+        evidence.validate(references, provider_configs, expected_instances)?;
         Ok(evidence)
     }
 
@@ -843,6 +1147,7 @@ impl ProviderEvidence {
         &self,
         references: &PlanSchemaReferences,
         provider_configs: &SavedProviderConfigs,
+        expected_instances: &BTreeSet<ProviderInstanceKey>,
     ) -> Result<(), ProviderEvidenceError> {
         let mut recorded = BTreeSet::new();
         for (provider, fingerprint) in &self.schema_fingerprints.providers {
@@ -939,6 +1244,22 @@ impl ProviderEvidence {
                 }
             }
         }
+        let instances = expected_instances
+            .iter()
+            .chain(self.provider_scopes.0.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for instance in instances {
+            let recorded = self.provider_scopes.0.contains_key(&instance).then_some(());
+            let initialized = expected_instances.contains(&instance).then_some(());
+            if recorded != initialized {
+                return Err(ProviderEvidenceError::ProviderScopeMismatch {
+                    instance,
+                    recorded,
+                    initialized,
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -970,6 +1291,7 @@ impl From<PlanFile> for PlanFileWire {
         let ProviderEvidence {
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes,
         } = evidence;
         Self {
             version,
@@ -993,6 +1315,7 @@ impl From<PlanFile> for PlanFileWire {
             wait_bindings,
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes: provider_scopes.into_wire(),
         }
     }
 }
@@ -1023,6 +1346,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             wait_bindings,
             schema_fingerprints,
             provider_artifacts,
+            provider_scopes,
         } = wire;
         let contents = PlanFileContents {
             version,
@@ -1046,11 +1370,15 @@ impl TryFrom<PlanFileWire> for PlanFile {
             wait_bindings,
         };
         let references = contents.referenced_schema_types();
+        let available_providers = provider_artifacts.keys().cloned().collect();
+        let expected_instances = contents.expected_provider_instances(&available_providers);
         let evidence = ProviderEvidence::new(
             schema_fingerprints,
             provider_artifacts,
+            RecordedProviderScopes::try_from_wire(provider_scopes)?,
             &references,
             &contents.provider_configs,
+            &expected_instances,
         )?;
         Ok(Self { contents, evidence })
     }
@@ -1071,7 +1399,7 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context())
+        self.record_with_context(validated.context(), &validated.resources().provider)
     }
 
     /// Record hand-built plan contents in unit and integration fixtures.
@@ -1080,12 +1408,41 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<R>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context())
+        let available_providers = validated
+            .context()
+            .provider_artifacts()
+            .keys()
+            .cloned()
+            .collect();
+        let provider =
+            test_provider_router(&self.expected_provider_instances(&available_providers));
+        self.record_with_context(validated.context(), &provider)
     }
 
-    fn record_with_context(self, ctx: &WiringContext) -> Result<PlanFile, ProviderEvidenceError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_for_test_with_provider<R>(
+        self,
+        validated: &ValidatedConfig<R>,
+        provider: &ProviderRouter,
+    ) -> Result<PlanFile, ProviderEvidenceError> {
+        self.record_with_context(validated.context(), provider)
+    }
+
+    fn record_with_context(
+        self,
+        ctx: &WiringContext,
+        provider: &ProviderRouter,
+    ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
-        let evidence = ProviderEvidence::capture(&references, &self.provider_configs, ctx)?;
+        let available_providers = ctx.provider_artifacts().keys().cloned().collect();
+        let expected_instances = self.expected_provider_instances(&available_providers);
+        let evidence = ProviderEvidence::capture(
+            &references,
+            &self.provider_configs,
+            ctx,
+            provider,
+            &expected_instances,
+        )?;
         let saved: PlanFileContents<SavedModuleSource> = self.into();
         Ok(PlanFile {
             contents: saved.into(),
@@ -1101,8 +1458,21 @@ impl UnresolvedPlanFileContents {
         validated: &ValidatedConfig<R>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
-        let evidence =
-            ProviderEvidence::capture(&references, &self.provider_configs, validated.context())?;
+        let available_providers = validated
+            .context()
+            .provider_artifacts()
+            .keys()
+            .cloned()
+            .collect();
+        let expected_instances = self.expected_provider_instances(&available_providers);
+        let provider = test_provider_router(&expected_instances);
+        let evidence = ProviderEvidence::capture(
+            &references,
+            &self.provider_configs,
+            validated.context(),
+            &provider,
+            &expected_instances,
+        )?;
         Ok(PlanFile {
             contents: self,
             evidence,
@@ -1180,6 +1550,9 @@ impl<S> PlanFileContents<S> {
                     insert(&mut references, from, SchemaKind::Resource);
                     insert(&mut references, to, SchemaKind::Resource);
                 }
+                Effect::ReleaseListKeys { id, .. } => {
+                    insert(&mut references, id, SchemaKind::Resource);
+                }
                 Effect::Wait {
                     identity: _identity,
                     target_id,
@@ -1229,6 +1602,98 @@ impl<S> PlanFileContents<S> {
         }
         PlanSchemaReferences(references)
     }
+
+    fn expected_provider_instances(
+        &self,
+        available_providers: &BTreeSet<String>,
+    ) -> BTreeSet<ProviderInstanceKey> {
+        fn insert(instances: &mut BTreeSet<ProviderInstanceKey>, id: &ResourceId) {
+            instances.insert(ProviderInstanceKey::from(id));
+        }
+
+        let mut instances = self
+            .provider_configs
+            .as_provider_configs()
+            .iter()
+            .map(ProviderInstanceKey::from)
+            .collect::<BTreeSet<_>>();
+        for effect in self.plan.effects() {
+            match effect {
+                Effect::Read { resource } => insert(&mut instances, &resource.id),
+                Effect::Create(resource) => insert(&mut instances, &resource.id),
+                Effect::ResumeCreate { resource, .. } => {
+                    insert(&mut instances, &resource.id);
+                }
+                Effect::Update { from, to, .. } => {
+                    insert(&mut instances, &from.id);
+                    insert(&mut instances, &to.id);
+                }
+                Effect::Delete { id, .. }
+                | Effect::Import { id, .. }
+                | Effect::Remove { id }
+                | Effect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
+                Effect::DeferredCreate { id, template } => {
+                    insert(&mut instances, id);
+                    insert(&mut instances, &template.template_resource.id);
+                }
+                Effect::Move { from, to, .. } => {
+                    insert(&mut instances, from);
+                    insert(&mut instances, to);
+                }
+                Effect::Wait { target_id, .. } => {
+                    insert(&mut instances, target_id.id().as_inner());
+                }
+                Effect::DeferredReplace(payload) => {
+                    insert(&mut instances, &payload.template.template_resource.id);
+                    for delete in &payload.deletes {
+                        insert(&mut instances, &delete.id);
+                    }
+                }
+            }
+        }
+        for resource in self
+            .sorted_resources
+            .iter()
+            .chain(&self.unresolved_resources)
+        {
+            insert(&mut instances, &resource.id);
+        }
+        for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
+            insert(&mut instances, &data_source.id);
+        }
+        for saved in &self.data_source_values {
+            insert(&mut instances, &saved.id);
+        }
+        for current in &self.current_states {
+            let CurrentStateEntry::Managed {
+                id,
+                current: _current,
+            } = current;
+            insert(&mut instances, id);
+        }
+        if instances.is_empty() {
+            instances.insert(ProviderInstanceKey::new(
+                carina_provider_mock::BUILTIN_PROVIDER_NAME,
+                None,
+            ));
+        }
+        instances.retain(|instance| available_providers.contains(instance.provider()));
+        instances
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn test_provider_router(instances: &BTreeSet<ProviderInstanceKey>) -> ProviderRouter {
+    let mut provider = ProviderRouter::new();
+    for instance in instances {
+        provider.add_provider_instance(
+            instance.clone(),
+            carina_core::provider::InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new(),
+            )),
+        );
+    }
+    provider
 }
 
 impl UnresolvedPlanFileContents {
@@ -1261,7 +1726,8 @@ impl UnresolvedPlanFileContents {
                 }
                 UnresolvedSavedEffect::Delete { id, .. }
                 | UnresolvedSavedEffect::Import { id, .. }
-                | UnresolvedSavedEffect::Remove { id } => {
+                | UnresolvedSavedEffect::Remove { id }
+                | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => {
                     insert(&mut references, id, SchemaKind::Resource);
                 }
                 UnresolvedSavedEffect::DeferredCreate { template, .. } => {
@@ -1313,10 +1779,85 @@ impl UnresolvedPlanFileContents {
         }
         PlanSchemaReferences(references)
     }
+
+    fn expected_provider_instances(
+        &self,
+        available_providers: &BTreeSet<String>,
+    ) -> BTreeSet<ProviderInstanceKey> {
+        fn insert(instances: &mut BTreeSet<ProviderInstanceKey>, id: &ResourceId) {
+            instances.insert(ProviderInstanceKey::from(id));
+        }
+
+        let mut instances = self
+            .provider_configs
+            .as_provider_configs()
+            .iter()
+            .map(ProviderInstanceKey::from)
+            .collect::<BTreeSet<_>>();
+        for effect in self.plan.effects() {
+            match effect {
+                UnresolvedSavedEffect::Read { resource } => insert(&mut instances, &resource.id),
+                UnresolvedSavedEffect::Create(resource)
+                | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+                    insert(&mut instances, &resource.id)
+                }
+                UnresolvedSavedEffect::Update { from, to, .. } => {
+                    insert(&mut instances, &from.id);
+                    insert(&mut instances, &to.id);
+                }
+                UnresolvedSavedEffect::Delete { id, .. }
+                | UnresolvedSavedEffect::Import { id, .. }
+                | UnresolvedSavedEffect::Remove { id }
+                | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
+                UnresolvedSavedEffect::DeferredCreate { id, template } => {
+                    insert(&mut instances, id);
+                    insert(&mut instances, &template.template_resource.id);
+                }
+                UnresolvedSavedEffect::Move { from, to, .. } => {
+                    insert(&mut instances, from);
+                    insert(&mut instances, to);
+                }
+                UnresolvedSavedEffect::Wait { target_id, .. } => {
+                    insert(&mut instances, target_id.id().as_inner());
+                }
+                UnresolvedSavedEffect::DeferredReplace(payload) => {
+                    insert(&mut instances, &payload.template.template_resource.id);
+                    for delete in &payload.deletes {
+                        insert(&mut instances, &delete.id);
+                    }
+                }
+            }
+        }
+        for resource in self
+            .sorted_resources
+            .iter()
+            .chain(&self.unresolved_resources)
+        {
+            insert(&mut instances, &resource.id);
+        }
+        for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
+            insert(&mut instances, &data_source.id);
+        }
+        for saved in &self.data_source_values {
+            insert(&mut instances, &saved.id);
+        }
+        for current in &self.current_states {
+            let CurrentStateEntry::Managed { id, .. } = current;
+            insert(&mut instances, id);
+        }
+        if instances.is_empty() {
+            instances.insert(ProviderInstanceKey::new(
+                carina_provider_mock::BUILTIN_PROVIDER_NAME,
+                None,
+            ));
+        }
+        instances.retain(|instance| available_providers.contains(instance.provider()));
+        instances
+    }
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 32;
+    pub const CURRENT_VERSION: u32 = 34;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -1331,13 +1872,17 @@ impl PlanFile {
         &self.evidence.provider_artifacts
     }
 
+    pub fn provider_scopes(&self) -> &PlanProviderScopes {
+        &self.evidence.provider_scopes.0
+    }
+
     /// Reload state-owned create continuations after the saved-plan apply has
     /// acquired its state lock. The plan contains only an address and marker;
     /// any status change in either direction invalidates it.
     pub(crate) fn reload_in_flight_from_locked_state(
         self,
         state_file: Option<&StateFile>,
-    ) -> Result<UnresolvedReloadedPlanFile, String> {
+    ) -> Result<UnresolvedReloadedPlanFile, LockedStateReloadError> {
         let PlanFile {
             mut contents,
             evidence,
@@ -1356,11 +1901,35 @@ impl PlanFile {
                 } => None,
             })
             .collect();
+        let planned_unknown_origins: HashMap<_, _> = contents
+            .current_states
+            .iter()
+            .filter_map(|entry| match entry {
+                CurrentStateEntry::Managed { id, current } => current
+                    .planned_outcome_unknown_started_at()
+                    .map(|started_at| (moved_origins.origin_for(id).clone(), started_at.clone())),
+            })
+            .collect();
 
         if let Some(state_file) = state_file {
             for row in state_file.resources() {
                 let row_in_flight = match row.current() {
                     carina_state::CurrentInstance::CreateInFlight { pending: _pending } => true,
+                    carina_state::CurrentInstance::CreateOutcomeUnknown { unknown } => {
+                        let locked_id = ResourceId::with_provider_identity(
+                            row.provider.clone(),
+                            row.resource_type.clone(),
+                            row.identity.clone(),
+                            row.directives.provider_instance.clone(),
+                        );
+                        if planned_unknown_origins.get(&locked_id) != Some(unknown.started_at()) {
+                            return Err(carina_core::plan::PlanError::create_outcome_unknown(
+                                locked_id,
+                            )
+                            .into());
+                        }
+                        false
+                    }
                     carina_state::CurrentInstance::None => false,
                     carina_state::CurrentInstance::Applied {
                         identifier: _identifier,
@@ -1386,9 +1955,9 @@ impl PlanFile {
                     row.directives.provider_instance.clone(),
                 );
                 if !planned_in_flight_origins.contains(&locked_id) {
-                    return Err(format!(
+                    return Err(LockedStateReloadError::Config(format!(
                         "saved plan is stale for {locked_id}: create-in-flight status changed from false to true; create a new plan before applying"
-                    ));
+                    )));
                 }
             }
         }
@@ -1406,10 +1975,12 @@ impl PlanFile {
                             .plan
                             .move_authority(persisted_id, &id)
                             .ok_or_else(|| {
-                                format!("saved plan has no move edge from {persisted_id} to {id}")
+                                LockedStateReloadError::Config(format!(
+                                    "saved plan has no move edge from {persisted_id} to {id}"
+                                ))
                             })?;
                         locked_current = rebind_current_for_move(locked_current, &authority)
-                            .map_err(|error| error.to_string())?;
+                            .map_err(|error| LockedStateReloadError::Config(error.to_string()))?;
                     }
                     let current = match (current.into_reload_kind(), locked_current) {
                         (
@@ -1417,17 +1988,39 @@ impl PlanFile {
                             locked @ Current::CreateInFlight(_),
                         ) => Box::new(locked),
                         (ReloadSavedManagedCurrent::CreateInFlightMarker, _locked) => {
-                            return Err(format!(
+                            return Err(LockedStateReloadError::Config(format!(
                                 "saved plan is stale for {id}: create-in-flight status changed from true to false; create a new plan before applying"
-                            ));
+                            )));
+                        }
+                        (
+                            ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker {
+                                started_at: planned_started_at,
+                            },
+                            Current::CreateOutcomeUnknown(unknown),
+                        ) if &planned_started_at == unknown.started_at() => {
+                            Box::new(Current::CreateOutcomeUnknown(unknown))
+                        }
+                        (ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker { .. }, _locked) => {
+                            return Err(LockedStateReloadError::Config(format!(
+                                "saved plan is stale for {id}: create-outcome-unknown status or timestamp changed; create a new plan before applying"
+                            )));
                         }
                         (
                             ReloadSavedManagedCurrent::Snapshot(_saved),
                             Current::CreateInFlight(_pending),
                         ) => {
-                            return Err(format!(
+                            return Err(LockedStateReloadError::Config(format!(
                                 "saved plan is stale for {id}: create-in-flight status changed from false to true; create a new plan before applying"
-                            ));
+                            )));
+                        }
+                        (
+                            ReloadSavedManagedCurrent::Snapshot(_saved),
+                            Current::CreateOutcomeUnknown(unknown),
+                        ) => {
+                            return Err(carina_core::plan::PlanError::create_outcome_unknown(
+                                unknown.id().clone(),
+                            )
+                            .into());
                         }
                         (ReloadSavedManagedCurrent::Snapshot(saved), _locked) => saved,
                     };
@@ -1677,7 +2270,10 @@ impl PlanFile {
                 }
                 UnresolvedSavedEffect::Delete { id, .. }
                 | UnresolvedSavedEffect::Import { id, .. }
-                | UnresolvedSavedEffect::Remove { id } => require_identity(id, &location)?,
+                | UnresolvedSavedEffect::Remove { id }
+                | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => {
+                    require_identity(id, &location)?
+                }
                 UnresolvedSavedEffect::Wait {
                     identity,
                     target_id,
@@ -1775,7 +2371,17 @@ impl PlanFile {
                         replacement.delete_idx
                     ));
                 }
-                _ => {
+                UnresolvedSavedEffect::Read { .. }
+                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::ResumeCreate { .. }
+                | UnresolvedSavedEffect::Update { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::Move { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. }
+                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredReplace(_) => {
                     return Err(format!(
                         "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at {}, expected Delete",
                         replacement.delete_idx,
@@ -1819,7 +2425,7 @@ impl PlanSchemaFingerprints {
                     reference.kind,
                 )
                 .map_or(TypeSchemaFingerprint::Absent, |schema| {
-                    TypeSchemaFingerprint::Present(schema.as_schema().semantic_fingerprint())
+                    TypeSchemaFingerprint::Present(schema.semantic_fingerprint())
                 });
             grouped.entry(reference.provider.clone()).or_default().push(
                 PlanSchemaTypeFingerprint {
@@ -1915,7 +2521,7 @@ impl PlanSchemaFingerprints {
                         reference.resource_type,
                     )),
                     (TypeSchemaFingerprint::Present(recorded), Some(current))
-                        if current.as_schema().semantic_fingerprint() != *recorded =>
+                        if current.semantic_fingerprint() != *recorded =>
                     {
                         changed_types.push(format!(
                             "{} `{}` (changed)",
@@ -2127,6 +2733,7 @@ pub(crate) fn collect_historical_display_attributes<S>(
                             Current::Absent(state) => state.state(),
                             Current::Present(present) => present.state(),
                             Current::CreateInFlight(_pending) => continue,
+                            Current::CreateOutcomeUnknown(_unknown) => continue,
                             Current::MissingIdentifier(state) => state.state(),
                         };
                         let persisted_id = moved_origins.origin_for(key.id());
@@ -2194,7 +2801,17 @@ impl MovedOrigins {
                 Effect::Move { from, to, .. } => {
                     Some((to.as_inner().clone(), from.as_inner().clone()))
                 }
-                _ => None,
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
             })
             .collect();
         Self { by_destination }
@@ -2208,7 +2825,17 @@ impl MovedOrigins {
                 UnresolvedSavedEffect::Move { from, to, .. } => {
                     Some((to.as_inner().clone(), from.as_inner().clone()))
                 }
-                _ => None,
+                UnresolvedSavedEffect::Read { .. }
+                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::ResumeCreate { .. }
+                | UnresolvedSavedEffect::Update { .. }
+                | UnresolvedSavedEffect::Delete { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. }
+                | UnresolvedSavedEffect::DeferredCreate { .. }
+                | UnresolvedSavedEffect::DeferredReplace(_) => None,
             })
             .collect();
         Self { by_destination }
@@ -2283,6 +2910,7 @@ fn deposed_attributes_for_display(
 mod historical_display_tests {
     use super::*;
     use carina_core::resource::{DeferredValue, ResolvedResource};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
     #[test]
     fn production_historical_display_combines_desired_and_persisted_secret_shapes() {
@@ -2312,18 +2940,24 @@ mod historical_display_tests {
             to,
             changed_attributes: vec!["comment".to_string()],
         });
-        let current_states = HashMap::from([(id, Current::from_state(from))]);
+        let current_states = HashMap::from([(id.clone(), Current::from_state(from))]);
 
         // Exercise the same collector and row builder used by CLI and TUI
         // production paths. There is deliberately no persisted state shape:
         // the desired Secret shape must still mask the provider plaintext.
         let historical = collect_historical_display_attributes(&plan, &current_states, None);
-        let app = carina_tui::App::new(
-            &plan,
-            &carina_core::schema::SchemaRegistry::new(),
-            &historical,
-            None,
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("mock.test.resource")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .validate()
+                .expect("display fixture schema must be valid"),
         );
+        let (schemas, provider) =
+            carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
+        let app = carina_tui::App::new(&plan, &schemas, &historical, None, &provider)
+            .expect("detail-row fixture must have an initialized provider route");
         let rendered = format!("{:?}", app.nodes[0].detail_rows);
 
         assert!(
@@ -2418,6 +3052,7 @@ pub(crate) struct UnresolvedReloadedPlanFile {
 #[derive(Debug)]
 pub(crate) struct ReloadedPlanFile {
     contents: PlanFileContents<SavedModuleSource>,
+    evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
 }
 
@@ -2454,7 +3089,7 @@ impl UnresolvedReloadedPlanFile {
     ) -> Result<ReloadedPlanFile, carina_core::resource::ResolvedResourceError> {
         let Self {
             contents,
-            evidence: _evidence,
+            evidence,
             current_states,
         } = self;
         let PlanFileContents {
@@ -2510,12 +3145,17 @@ impl UnresolvedReloadedPlanFile {
         };
         Ok(ReloadedPlanFile {
             contents,
+            evidence,
             current_states,
         })
     }
 }
 
 impl ReloadedPlanFile {
+    pub(crate) fn provider_scopes(&self) -> &RecordedProviderScopes {
+        &self.evidence.provider_scopes
+    }
+
     pub(crate) fn provider_configs(&self) -> &SavedProviderConfigs {
         &self.contents.provider_configs
     }
@@ -2662,11 +3302,17 @@ enum SavedManagedCurrentKind {
     Present(Box<State>),
     MissingIdentifier(Box<State>),
     CreateInFlightMarker,
+    CreateOutcomeUnknownMarker {
+        started_at: carina_core::provider::Timestamp,
+    },
 }
 
 enum ReloadSavedManagedCurrent {
     Snapshot(Box<Current>),
     CreateInFlightMarker,
+    CreateOutcomeUnknownMarker {
+        started_at: carina_core::provider::Timestamp,
+    },
 }
 
 impl SavedManagedCurrent {
@@ -2681,6 +3327,11 @@ impl SavedManagedCurrent {
                 SavedManagedCurrentKind::Present(Box::new(state))
             }
             Current::CreateInFlight(_pending) => SavedManagedCurrentKind::CreateInFlightMarker,
+            Current::CreateOutcomeUnknown(unknown) => {
+                SavedManagedCurrentKind::CreateOutcomeUnknownMarker {
+                    started_at: unknown.started_at().clone(),
+                }
+            }
             Current::MissingIdentifier(state) => {
                 SavedManagedCurrentKind::MissingIdentifier(Box::new(state.state().clone()))
             }
@@ -2690,6 +3341,16 @@ impl SavedManagedCurrent {
 
     fn planned_in_flight(&self) -> bool {
         matches!(self.0, SavedManagedCurrentKind::CreateInFlightMarker)
+    }
+
+    fn planned_outcome_unknown_started_at(&self) -> Option<&carina_core::provider::Timestamp> {
+        match &self.0 {
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at } => Some(started_at),
+            SavedManagedCurrentKind::Absent(_)
+            | SavedManagedCurrentKind::Present(_)
+            | SavedManagedCurrentKind::MissingIdentifier(_)
+            | SavedManagedCurrentKind::CreateInFlightMarker => None,
+        }
     }
 
     fn into_reload_kind(self) -> ReloadSavedManagedCurrent {
@@ -2702,6 +3363,9 @@ impl SavedManagedCurrent {
             SavedManagedCurrentKind::CreateInFlightMarker => {
                 ReloadSavedManagedCurrent::CreateInFlightMarker
             }
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at } => {
+                ReloadSavedManagedCurrent::CreateOutcomeUnknownMarker { started_at }
+            }
         }
     }
 
@@ -2711,6 +3375,7 @@ impl SavedManagedCurrent {
             | SavedManagedCurrentKind::Present(state)
             | SavedManagedCurrentKind::MissingIdentifier(state) => state_contains(state),
             SavedManagedCurrentKind::CreateInFlightMarker => false,
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { .. } => false,
         }
     }
 
@@ -2720,6 +3385,7 @@ impl SavedManagedCurrent {
             | SavedManagedCurrentKind::Present(state)
             | SavedManagedCurrentKind::MissingIdentifier(state) => Some(&state.id),
             SavedManagedCurrentKind::CreateInFlightMarker => None,
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { .. } => None,
         }
     }
 
@@ -2742,16 +3408,22 @@ mod managed_current_serde {
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<State>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<carina_core::provider::Timestamp>,
     }
 
     pub fn serialize<S>(current: &SavedManagedCurrent, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let mut wire = serializer.serialize_struct("Current", 2)?;
+        let mut wire = serializer.serialize_struct("Current", 3)?;
         match &current.0 {
             SavedManagedCurrentKind::CreateInFlightMarker => {
                 wire.serialize_field("status", "create_in_flight")?;
+            }
+            SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at } => {
+                wire.serialize_field("status", "create_outcome_unknown")?;
+                wire.serialize_field("started_at", started_at)?;
             }
             SavedManagedCurrentKind::Absent(state) => {
                 wire.serialize_field("status", "absent")?;
@@ -2773,16 +3445,40 @@ mod managed_current_serde {
     where
         D: Deserializer<'de>,
     {
-        let Wire { status, state } = Wire::deserialize(deserializer)?;
+        let Wire {
+            status,
+            state,
+            started_at,
+        } = Wire::deserialize(deserializer)?;
         if status == "create_in_flight" {
-            if state.is_some() {
+            if state.is_some() || started_at.is_some() {
                 return Err(D::Error::custom(
-                    "create-in-flight saved-plan markers must not contain state or a provider token",
+                    "create-in-flight saved-plan markers must not contain state, a timestamp, or a provider token",
                 ));
             }
             return Ok(SavedManagedCurrent(
                 SavedManagedCurrentKind::CreateInFlightMarker,
             ));
+        }
+        if status == "create_outcome_unknown" {
+            if state.is_some() {
+                return Err(D::Error::custom(
+                    "create-outcome-unknown saved-plan markers must not contain state or a provider token",
+                ));
+            }
+            let started_at = started_at.ok_or_else(|| {
+                D::Error::custom(
+                    "create-outcome-unknown saved-plan markers require a started_at timestamp",
+                )
+            })?;
+            return Ok(SavedManagedCurrent(
+                SavedManagedCurrentKind::CreateOutcomeUnknownMarker { started_at },
+            ));
+        }
+        if started_at.is_some() {
+            return Err(D::Error::custom(format!(
+                "managed current-state tag {status:?} must not contain started_at"
+            )));
         }
         let state = state.ok_or_else(|| {
             D::Error::custom(format!(
@@ -2796,6 +3492,11 @@ mod managed_current_serde {
             Current::CreateInFlight(_pending) => {
                 return Err(D::Error::custom(
                     "saved-plan state payload cannot construct an in-flight create",
+                ));
+            }
+            Current::CreateOutcomeUnknown(_unknown) => {
+                return Err(D::Error::custom(
+                    "saved-plan state payload cannot construct an outcome-unknown create",
                 ));
             }
             Current::MissingIdentifier(_state) => "missing_identifier",
@@ -2813,14 +3514,24 @@ mod managed_current_serde {
 mod managed_current_serde_tests {
     use super::{
         CurrentStateEntry, PlanFile, PlanFileContents, ReloadSavedManagedCurrent,
-        ReloadedCurrentStateEntry, SavedManagedCurrent,
+        ReloadedCurrentStateEntry, SavedManagedCurrent, SavedManagedCurrentKind,
     };
     use carina_core::effect::UnresolvedSavedEffect;
-    use carina_core::provider::{AppliedIdentifier, Sent};
+    use carina_core::provider::{
+        AppliedIdentifier, CreateAttempt, CreateFailureKind, EgressSent, ProviderError, Sent,
+        UnknownCreateOutcome,
+    };
     use carina_core::resource::{
         Current, ResolvedResource, Resource, ResourceId, State, fixture_present_current,
     };
     use carina_state::{ResourceState, StateFile};
+
+    fn reload_error_text(
+        error: &crate::error::LockedStateReloadError,
+        project_dir: &std::path::Path,
+    ) -> String {
+        error.display_with_project_dir(project_dir).to_string()
+    }
 
     fn plan_file_with_current(id: ResourceId, current: SavedManagedCurrent) -> PlanFile {
         PlanFileContents {
@@ -2851,6 +3562,97 @@ mod managed_current_serde_tests {
             &[],
         ))
         .expect("test plan provider evidence must be valid")
+    }
+
+    fn unknown_outcome(id: ResourceId) -> UnknownCreateOutcome {
+        let failure = CreateAttempt::for_test(id).outcome_unknown(
+            EgressSent::for_test(),
+            ProviderError::api_error("guest trapped"),
+        );
+        let CreateFailureKind::OutcomeUnknown { unknown, .. } = failure.into_kind() else {
+            panic!("the egress witness must mint an unknown outcome")
+        };
+        unknown
+    }
+
+    #[test]
+    fn saved_plan_unknown_marker_round_trips_and_rejects_status_changes() {
+        let resource = ResolvedResource::new(Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "unknown",
+            None,
+        ));
+        let id = resource.id.clone();
+        let unknown = unknown_outcome(id.clone());
+        let entry = CurrentStateEntry::Managed {
+            id: id.clone(),
+            current: SavedManagedCurrent::from_current(Current::create_outcome_unknown(
+                unknown.clone(),
+            )),
+        };
+        let encoded = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            encoded["current"]["status"],
+            serde_json::json!("create_outcome_unknown")
+        );
+        assert_eq!(
+            encoded["current"]["started_at"],
+            serde_json::json!(unknown.started_at().as_str())
+        );
+        assert!(encoded["current"].get("state").is_none());
+
+        let row = ResourceState::from_unknown_create_outcome(
+            &resource,
+            &unknown,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        );
+        let mut locked = StateFile::new();
+        locked.upsert_resource(row).unwrap();
+
+        let exact = plan_file_with_current(
+            id.clone(),
+            SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown.clone())),
+        )
+        .reload_in_flight_from_locked_state(Some(&locked))
+        .expect("an unchanged outcome-unknown marker must reload under the lock");
+        let ReloadedCurrentStateEntry::Managed {
+            id: exact_id,
+            current: exact_current,
+        } = exact
+            .current_states()
+            .first()
+            .expect("reloaded outcome-unknown current state");
+        assert_eq!(exact_id, &id);
+        assert!(matches!(
+            exact_current.as_ref(),
+            Current::CreateOutcomeUnknown(reloaded) if reloaded == &unknown
+        ));
+
+        let appeared = plan_file_with_current(
+            id.clone(),
+            SavedManagedCurrent::from_current(Current::absent(id.clone())),
+        )
+        .reload_in_flight_from_locked_state(Some(&locked))
+        .expect_err("an unknown row appearing after planning must invalidate the plan");
+        let appeared = reload_error_text(&appeared, std::path::Path::new("infra/production"));
+        assert!(appeared.contains("the create may have reached the cloud"));
+        assert!(
+            appeared.contains("carina state forget mock.test.Resource unknown infra/production")
+        );
+
+        let disappeared = plan_file_with_current(
+            id,
+            SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown)),
+        )
+        .reload_in_flight_from_locked_state(None)
+        .expect_err("an unknown row disappearing after planning must invalidate the plan");
+        assert!(
+            reload_error_text(&disappeared, std::path::Path::new("."))
+                .contains("status or timestamp changed")
+        );
     }
 
     #[test]
@@ -2898,6 +3700,9 @@ mod managed_current_serde_tests {
                     Current::CreateInFlight(pending) => {
                         panic!("Present serialized as in flight: {pending:?}")
                     }
+                    Current::CreateOutcomeUnknown(unknown) => {
+                        panic!("Present serialized as outcome unknown: {unknown:?}")
+                    }
                     Current::MissingIdentifier(state) => {
                         panic!("Present serialized without an identifier: {state:?}")
                     }
@@ -2921,8 +3726,15 @@ mod managed_current_serde_tests {
             None,
             Sent::AllRequestAttributes,
         );
-        let row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+        let row = ResourceState::from_in_flight(
+            &resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must encode");
         let mut locked_in_flight = StateFile::new();
         locked_in_flight
             .upsert_resource(row)
@@ -2935,6 +3747,7 @@ mod managed_current_serde_tests {
         let became_in_flight = planned_absent
             .reload_in_flight_from_locked_state(Some(&locked_in_flight))
             .expect_err("absent to in-flight must invalidate the saved plan");
+        let became_in_flight = reload_error_text(&became_in_flight, std::path::Path::new("."));
         assert!(
             became_in_flight.contains("false to true"),
             "{became_in_flight}"
@@ -2945,6 +3758,7 @@ mod managed_current_serde_tests {
         let ended = planned_in_flight
             .reload_in_flight_from_locked_state(None)
             .expect_err("in-flight to absent must invalidate the saved plan");
+        let ended = reload_error_text(&ended, std::path::Path::new("."));
         assert!(ended.contains("true to false"), "{ended}");
     }
 
@@ -2965,8 +3779,15 @@ mod managed_current_serde_tests {
             None,
             Sent::AllRequestAttributes,
         );
-        let row = ResourceState::from_in_flight(&unexpected_resource, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+        let row = ResourceState::from_in_flight(
+            &unexpected_resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must encode");
         let mut locked = StateFile::new();
         locked
             .upsert_resource(row)
@@ -2979,6 +3800,7 @@ mod managed_current_serde_tests {
         let error = plan
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect_err("a new in-flight address must invalidate the saved plan");
+        let error = reload_error_text(&error, std::path::Path::new("."));
         assert!(error.contains(&unexpected_id.to_string()), "{error}");
         assert!(error.contains("false to true"), "{error}");
     }
@@ -2997,8 +3819,15 @@ mod managed_current_serde_tests {
             None,
             Sent::AllRequestAttributes,
         );
-        let row = ResourceState::from_in_flight(&source_resource, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+        let row = ResourceState::from_in_flight(
+            &source_resource,
+            &pending,
+            None,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        )
+        .expect("in-flight fixture must encode");
         let mut locked = StateFile::new();
         locked
             .upsert_resource(row)
@@ -3037,6 +3866,62 @@ mod managed_current_serde_tests {
             pending.token().expose_for_provider_call(),
             "state-owned-token"
         );
+    }
+
+    #[test]
+    fn saved_plan_reloads_moved_outcome_unknown_row_from_its_source_address() {
+        use carina_core::resource::ResolvedResourceId;
+
+        let source = ResourceId::with_provider_identity("mock", "test.Resource", "source", None);
+        let destination =
+            ResourceId::with_provider_identity("mock", "test.Resource", "destination", None);
+        let source_resource = ResolvedResource::new(Resource::from_id(source.clone()));
+        let unknown = unknown_outcome(source.clone());
+        let started_at = unknown.started_at().clone();
+        let row = ResourceState::from_unknown_create_outcome(
+            &source_resource,
+            &unknown,
+            None,
+            None,
+            &carina_core::differ::exact_comparison_context_for_tests(),
+        );
+        let mut locked = StateFile::new();
+        locked
+            .upsert_resource(row)
+            .expect("outcome-unknown state fixture must be valid");
+        let mut contents = plan_file_with_current(
+            destination.clone(),
+            SavedManagedCurrent(SavedManagedCurrentKind::CreateOutcomeUnknownMarker {
+                started_at: started_at.clone(),
+            }),
+        )
+        .into_contents();
+        contents.plan.add(UnresolvedSavedEffect::Move {
+            from: ResolvedResourceId::new(source),
+            to: ResolvedResourceId::new(destination.clone()),
+            origin: None,
+        });
+        let plan = contents
+            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
+                (),
+                Vec::new(),
+                &[],
+            ))
+            .expect("test plan provider evidence must be valid");
+
+        let reloaded = plan
+            .reload_in_flight_from_locked_state(Some(&locked))
+            .expect("a moved outcome-unknown marker must reload from its source row");
+        let ReloadedCurrentStateEntry::Managed { id, current } = reloaded
+            .current_states()
+            .first()
+            .expect("moved outcome-unknown current state");
+        assert_eq!(id, &destination);
+        let Current::CreateOutcomeUnknown(unknown) = current.as_ref() else {
+            panic!("moved marker must reload the state-owned unknown outcome")
+        };
+        assert_eq!(unknown.id(), &destination);
+        assert_eq!(unknown.started_at(), &started_at);
     }
 }
 
@@ -3230,6 +4115,7 @@ fn build_plan_file_contents<E>(
                 Current::Absent(state) => Some(state.state()),
                 Current::Present(present) => Some(present.state()),
                 Current::CreateInFlight(_pending) => None,
+                Current::CreateOutcomeUnknown(_unknown) => None,
                 Current::MissingIdentifier(state) => Some(state.state()),
             };
             state.map(|state| redact_current_state(id, state).map(|state| (id.clone(), state)))
@@ -3277,10 +4163,17 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4094: bumped 33→34 — saved plans use stage-typed values, so
+        // parser and deferred-loop placeholders cannot enter expanded values.
+        // carina#4118: bumped 32→33 — keyed partial-update releases add a
+        // serialized state-only Effect variant.
         // carina#4067: bumped 29→31 — saved plans retain authored
         // `ignore_changes` paths and re-resolve them only after schema
-        // fingerprint verification. Version 30 was reserved for provider
-        // protocol v13 and was never emitted.
+        // fingerprint verification. Version 30 was never emitted; provider
+        // protocol v13 uses version 32.
+        // carina#4065: bumped 31→32 — saved plans bind every initialized
+        // provider instance to its reference scope and persist the
+        // create-outcome-unknown marker.
         // carina#4109: bumped 28→29 — saved plans persist anonymous-loop
         // provenance, typed bound/unbound deferred targets, and Move origins.
         // V28 plans carry the old deferred payload and must be regenerated.
@@ -3851,7 +4744,7 @@ pub async fn run_plan(
         }
     }
 
-    render_plan_errors_and_abort(&ctx.plan)?;
+    render_plan_errors_and_abort(&ctx.plan, path)?;
 
     let iam_preflight_result = if check_iam {
         let result = crate::commands::iam_preflight::run_iam_preflight(
@@ -3914,7 +4807,8 @@ pub async fn run_plan(
         &ctx.plan,
         &ctx.managed_current,
         ctx_wiring.schemas(),
-    );
+        &ctx.provider,
+    )?;
 
     if json {
         if let Some(note) = drift_note.as_ref() {
@@ -3944,8 +4838,8 @@ pub async fn run_plan(
             ctx_wiring.schemas(),
             &historical_display,
             Some(&ctx.prev_explicit),
-        )
-        .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+            &ctx.provider,
+        )?;
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -3960,7 +4854,8 @@ pub async fn run_plan(
             &ctx.moved_origins,
             Some(&ctx.prev_explicit),
             Some(&ctx.expansion_trace),
-        );
+            &ctx.provider,
+        )?;
         if let Some(note) = drift_note.as_ref() {
             println!();
             println!("{}", note.yellow());

@@ -2077,6 +2077,69 @@ mode = "invalid_mode"
 }
 
 #[test]
+fn union_enum_and_struct_preserves_enum_quick_fix_diagnostic() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+    };
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional(
+            "mode",
+            AttributeType::union(vec![
+                AttributeType::enum_(
+                    TypeIdentity::bare("Mode"),
+                    Some(vec!["active".to_string(), "passive".to_string()]),
+                    vec![],
+                    None,
+                    None,
+                ),
+                AttributeType::struct_(
+                    "ModeOptions",
+                    vec![StructField::optional("custom", AttributeType::string()).build()],
+                ),
+            ]),
+        )
+        .build(),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    let source = concat!(
+        "provider test {}\n\n",
+        "test.test.resource {\n",
+        "  mode = \"invalid_mode\"\n",
+        "}\n",
+    );
+
+    let diagnostics = custom_engine(schemas).analyze(&create_document(source), None);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("invalid_mode")
+                && diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    let diagnostic = matching[0];
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(3, 9), Position::new(3, 23))
+    );
+    assert_eq!(
+        diagnostic
+            .data
+            .as_ref()
+            .and_then(|data| data.get("tag"))
+            .and_then(serde_json::Value::as_str),
+        Some("carina_enum_mismatch")
+    );
+}
+
+#[test]
 fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
     use carina_core::schema::{
         AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, enum_identity,
@@ -8162,6 +8225,244 @@ let consumer = mock.test.resource {
                     .contains("unknown attribute")
         }),
         "the LSP must not suppress schema-typed unknown attributes on a coalesce lhs: {diagnostics:#?}",
+    );
+}
+
+fn field_group_diagnostic_engine(
+    list: bool,
+    kind: carina_core::schema::FieldGroupKind,
+) -> DiagnosticEngine {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, FieldGroup, ResourceSchema, StructField,
+    };
+
+    let choice = AttributeType::struct_with_field_groups(
+        "EvaluationWindow",
+        vec![
+            StructField::optional("sliding_window", AttributeType::string()).build(),
+            StructField::optional("wall_clock_window", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::new(kind, ["sliding_window", "wall_clock_window"]).unwrap()],
+    );
+    let field_type = AttributeType::ref_("EvaluationWindow");
+    let attribute = if list {
+        AttributeSchema::optional("evaluation_window", AttributeType::list(field_type))
+            .with_block_name("evaluation_window")
+            .build()
+    } else {
+        AttributeSchema::optional("evaluation_window", field_type).build()
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .with_def("EvaluationWindow", choice)
+            .attribute(attribute)
+            .validate()
+            .unwrap(),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn struct_field_group_diagnostic_is_emitted_once_on_the_containing_attribute() {
+    let source = concat!(
+        "provider mock {}\n\n",
+        "mock.test.resource {\n",
+        "  evaluation_window = {}\n",
+        "}\n",
+    );
+    let diagnostics =
+        field_group_diagnostic_engine(false, carina_core::schema::FieldGroupKind::ExactlyOne)
+            .analyze(&create_document(source), None);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("exactly one of"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].message,
+        "evaluation_window: exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(3, 2), Position::new(3, 19))
+    );
+}
+
+#[test]
+fn list_struct_field_group_diagnostic_is_emitted_once_on_the_containing_block() {
+    let source = concat!(
+        "provider mock {}\n\n",
+        "mock.test.resource {\n",
+        "  evaluation_window {\n",
+        "  }\n",
+        "}\n",
+    );
+    let diagnostics =
+        field_group_diagnostic_engine(true, carina_core::schema::FieldGroupKind::ExactlyOne)
+            .analyze(&create_document(source), None);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("exactly one of"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].message,
+        "evaluation_window[0]: exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(3, 2), Position::new(3, 19))
+    );
+}
+
+#[test]
+fn lsp_enforces_at_least_one_and_at_most_one_field_groups() {
+    let missing = concat!(
+        "provider mock {}\n\n",
+        "mock.test.resource {\n",
+        "  evaluation_window = {}\n",
+        "}\n",
+    );
+    let diagnostics =
+        field_group_diagnostic_engine(false, carina_core::schema::FieldGroupKind::AtLeastOne)
+            .analyze(&create_document(missing), None);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("at least one of"))
+            .count(),
+        1,
+        "diagnostics: {diagnostics:#?}"
+    );
+
+    let both = concat!(
+        "provider mock {}\n\n",
+        "mock.test.resource {\n",
+        "  evaluation_window = {\n",
+        "    sliding_window = \"5m\"\n",
+        "    wall_clock_window = \"hour\"\n",
+        "  }\n",
+        "}\n",
+    );
+    let diagnostics =
+        field_group_diagnostic_engine(false, carina_core::schema::FieldGroupKind::AtMostOne)
+            .analyze(&create_document(both), None);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("at most one of"))
+            .count(),
+        1,
+        "diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn union_ref_struct_field_group_diagnostic_names_the_attribute_once() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, FieldGroup, ResourceSchema, StructField,
+    };
+
+    let definition = AttributeType::struct_with_field_groups(
+        "EvaluationWindow",
+        vec![
+            StructField::optional("sliding_window", AttributeType::string()).build(),
+            StructField::optional("wall_clock_window", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::exactly_one(["sliding_window", "wall_clock_window"]).unwrap()],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .with_def("EvaluationWindow", definition)
+            .attribute(
+                AttributeSchema::optional(
+                    "evaluation_window",
+                    AttributeType::union(vec![
+                        AttributeType::ref_("EvaluationWindow"),
+                        AttributeType::string(),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let source = concat!(
+        "provider mock {}\n\n",
+        "mock.test.resource {\n",
+        "  evaluation_window = {}\n",
+        "}\n",
+    );
+    let diagnostics = custom_engine(schemas).analyze(&create_document(source), None);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("exactly one of"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].message,
+        "evaluation_window: exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(3, 2), Position::new(3, 19))
+    );
+}
+
+#[test]
+fn map_ref_struct_field_group_diagnostic_anchors_the_map_entry_once() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, FieldGroup, ResourceSchema, StructField,
+    };
+
+    let definition = AttributeType::struct_with_field_groups(
+        "EvaluationWindow",
+        vec![
+            StructField::optional("sliding_window", AttributeType::string()).build(),
+            StructField::optional("wall_clock_window", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::exactly_one(["sliding_window", "wall_clock_window"]).unwrap()],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .with_def("EvaluationWindow", definition)
+            .attribute(
+                AttributeSchema::optional(
+                    "evaluation_windows",
+                    AttributeType::map(AttributeType::ref_("EvaluationWindow")),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let source = concat!(
+        "provider mock {}\n\n",
+        "mock.test.resource {\n",
+        "  evaluation_windows = {\n",
+        "    primary = {}\n",
+        "  }\n",
+        "}\n",
+    );
+    let diagnostics = custom_engine(schemas).analyze(&create_document(source), None);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("exactly one of"))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        matching[0].message,
+        "evaluation_windows.primary: exactly one of [sliding_window, wall_clock_window] must be set"
+    );
+    assert_eq!(
+        matching[0].range,
+        Range::new(Position::new(4, 4), Position::new(4, 11))
     );
 }
 

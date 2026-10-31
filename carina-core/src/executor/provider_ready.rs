@@ -113,7 +113,7 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// use indexmap::IndexMap;
 ///
 /// fn bypass(factory: &dyn ProviderFactory, attributes: &IndexMap<String, Value>) {
-///     let _ = factory.create_provider(None, attributes);
+///     let _ = factory.create_initialized_provider(None, attributes);
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -954,7 +954,7 @@ mod provider_config_tests {
 
     use super::*;
     use crate::parser::ResolvedProviderConfigs;
-    use crate::provider::{Provider, ProviderError, ProviderResult};
+    use crate::provider::{ProviderError, ProviderResult};
     use crate::resource::{ConcreteValue, ParsedIgnorePath, ParsedIgnorePathSegment};
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, RootlessType, TypeIdentity,
@@ -1079,8 +1079,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -1157,8 +1167,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("routing tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -1875,8 +1895,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -1979,8 +2009,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {

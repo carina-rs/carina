@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
 
+use crate::differ::ComparisonContext;
 use crate::resource::Value;
 use crate::schema::{
     AttributeType, ResourceSchema, ValidatedResourceSchema, empty_defs_for_schema_walks,
@@ -30,9 +31,10 @@ pub(crate) fn schema_aware_equal(
     new: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> bool {
     match attr_type {
-        Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs),
+        Some(t) => crate::differ::type_aware_equal(old, new, Some(t), defs, context),
         None => old.semantically_equal(new),
     }
 }
@@ -51,6 +53,7 @@ pub fn resource_attribute_values_equal(
     new: &Value,
     schema: Option<&ValidatedResourceSchema>,
     attribute_name: &str,
+    context: &ComparisonContext<'_>,
 ) -> bool {
     let Some(attribute) = schema.and_then(|schema| schema.effective_attribute(attribute_name))
     else {
@@ -65,6 +68,7 @@ pub fn resource_attribute_values_equal(
         &new,
         Some(effective_type.as_type()),
         effective_type.defs(),
+        context,
     )
 }
 
@@ -234,6 +238,7 @@ pub fn compute_unchanged_count(
     to_attrs: &HashMap<String, Value>,
     exclude: Option<&std::collections::HashSet<&str>>,
     schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
 ) -> usize {
     let defs: &BTreeMap<String, AttributeType> = schema
         .map(|s| &s.defs)
@@ -248,7 +253,7 @@ pub fn compute_unchanged_count(
                         let attr_type = schema
                             .and_then(|s| s.attributes.get(k.as_str()))
                             .map(|a| &a.attr_type);
-                        schema_aware_equal(nv, v, attr_type, defs)
+                        schema_aware_equal(nv, v, attr_type, defs, context)
                     })
                     .unwrap_or(false)
         })
@@ -414,6 +419,36 @@ mod tests {
     use crate::schema::{
         AttributeSchema, ResourceSchema, StructField, empty_defs_for_schema_walks,
     };
+
+    fn resource_attribute_values_equal(
+        old: &Value,
+        new: &Value,
+        schema: Option<&ValidatedResourceSchema>,
+        attribute_name: &str,
+    ) -> bool {
+        super::resource_attribute_values_equal(
+            old,
+            new,
+            schema,
+            attribute_name,
+            &crate::differ::exact_comparison_context_for_tests(),
+        )
+    }
+
+    fn compute_unchanged_count(
+        from_attrs: &HashMap<String, Value>,
+        to_attrs: &HashMap<String, Value>,
+        exclude: Option<&std::collections::HashSet<&str>>,
+        schema: Option<&ResourceSchema>,
+    ) -> usize {
+        super::compute_unchanged_count(
+            from_attrs,
+            to_attrs,
+            exclude,
+            schema,
+            &crate::differ::exact_comparison_context_for_tests(),
+        )
+    }
 
     #[test]
     fn resource_equality_canonicalizes_provider_output_with_effective_ancestry() {

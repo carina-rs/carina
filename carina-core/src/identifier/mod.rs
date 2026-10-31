@@ -5,16 +5,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::differ::ComparisonContext;
 use crate::effect::ResolvedMove;
 use crate::parser::ProviderConfig;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
-use crate::provider::ProviderFactory;
+use crate::provider::{ComparisonResolutionError, ProviderFactory, ProviderRouter};
 use crate::resource::{
     AnonymousIdentityModuleSource, ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue,
     LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind, ResolvedResourceId,
     Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry, ValidatedResourceSchema};
+use crate::schema::{
+    AttributeType, ResourceSchema, SchemaRegistry, Shape, ValidatedResourceSchema,
+};
 use crate::validation::is_string_compatible_type;
 use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};
 
@@ -1129,7 +1132,12 @@ fn deterministic_value_string<P: PlaceholderKind>(value: &Value<P>) -> String {
     }
 }
 
-fn canonical_create_only_value_string(value: &Value) -> Option<String> {
+/// Stable concrete-value spelling used to decide whether a create-only value
+/// can participate in reconciliation. This deliberately has no provider
+/// context: anonymous identity hashing remains source-spelling based through
+/// [`deterministic_value_string`], while comparison canonicalization happens
+/// only at the matching seam below.
+fn comparable_create_only_value_string(value: &Value) -> Option<String> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
@@ -1145,7 +1153,7 @@ fn canonical_create_only_value_string(value: &Value) -> Option<String> {
         Value::Concrete(ConcreteValue::List(items)) => {
             let parts: Vec<String> = items
                 .iter()
-                .map(canonical_create_only_feature_string)
+                .map(comparable_create_only_feature_string)
                 .collect();
             Some(format!("List([{}])", parts.join(", ")))
         }
@@ -1165,7 +1173,7 @@ fn canonical_create_only_value_string(value: &Value) -> Option<String> {
             let parts: Vec<String> = entries
                 .iter()
                 .map(|(key, item)| {
-                    format!("{:?}: {}", key, canonical_create_only_feature_string(item))
+                    format!("{:?}: {}", key, comparable_create_only_feature_string(item))
                 })
                 .collect();
             Some(format!("Map({{{}}})", parts.join(", ")))
@@ -1174,8 +1182,40 @@ fn canonical_create_only_value_string(value: &Value) -> Option<String> {
     }
 }
 
-fn canonical_create_only_feature_string(value: &Value) -> String {
-    canonical_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
+fn comparable_create_only_feature_string(value: &Value) -> String {
+    comparable_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
+}
+
+/// Canonical comparison spelling for one create-only value under the owning
+/// resource's schema and initialized provider scope.
+///
+/// In particular, refined reference strings use the same
+/// [`ComparisonContext::canonical_string`] projection as `type_aware_equal`,
+/// so a bare reference and its long form cannot compare equal while producing
+/// different prefix-match keys. Resolved candidates do not use this key; they
+/// compare only through `type_aware_equal`.
+fn canonical_create_only_value_string(
+    value: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
+) -> Option<String> {
+    match (
+        value,
+        attr_type.map(|attr_type| attr_type.shape_with_defs(defs)),
+    ) {
+        (
+            Value::Concrete(ConcreteValue::String(value)),
+            Some(Shape::String {
+                identity, to_dsl, ..
+            }),
+        ) => Some(
+            context
+                .canonical_string(value.expose_plaintext(), identity, to_dsl)
+                .into_owned(),
+        ),
+        _ => comparable_create_only_value_string(value),
+    }
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
@@ -2174,8 +2214,9 @@ impl DesiredIdentityValues {
         &self,
         state_values: &StateIdentityValues,
         schema: &ResourceSchema,
+        context: &ComparisonContext<'_>,
     ) -> (usize, bool) {
-        resolved_subset_match(&self.values, &state_values.values, schema)
+        resolved_subset_match(&self.values, &state_values.values, schema, context)
     }
 }
 
@@ -2183,22 +2224,33 @@ fn legacy_row_stable_identity_matches(
     candidate: &LegacyLoopMoveCandidate<'_>,
     state_entry: &AnonymousIdStateInfo,
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-) -> Option<bool> {
-    let schema = registry.get_for(candidate.resource)?;
+) -> Result<Option<bool>, ComparisonResolutionError> {
+    let Some(schema) = registry.get_for(candidate.resource) else {
+        return Ok(None);
+    };
+    let comparison = comparison_provider.comparison_for(registry, &candidate.resource.id)?;
     let schema = schema.as_schema();
     let desired_create_only =
         DesiredCreateOnlyValues::from_resource(candidate.resource, schema, find_state_by_binding);
     let desired_identity =
         DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
     if state_entry.create_only_values.is_empty() && state_entry.identity_values.values.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let (create_only_count, create_only_matches) =
-        desired_create_only.resolved_subset_match(state_entry.create_only_values(), schema);
-    let (identity_count, identity_matches) =
-        desired_identity.resolved_subset_match(&state_entry.identity_values, schema);
-    ((create_only_count + identity_count) > 0).then_some(create_only_matches && identity_matches)
+    let (create_only_count, create_only_matches) = desired_create_only.resolved_subset_match(
+        state_entry.create_only_values(),
+        schema,
+        comparison.context(),
+    );
+    let (identity_count, identity_matches) = desired_identity.resolved_subset_match(
+        &state_entry.identity_values,
+        schema,
+        comparison.context(),
+    );
+    Ok(((create_only_count + identity_count) > 0)
+        .then_some(create_only_matches && identity_matches))
 }
 
 type LegacyLoopAddressKey = (String, String, String, Option<String>);
@@ -2228,11 +2280,12 @@ struct LegacyLoopMoveCandidate<'a> {
 pub fn detect_legacy_loop_address_moves(
     resources: &[Resource],
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
     reserved_moves: &[ResolvedMove],
-) -> Vec<ResolvedMove> {
+) -> Result<Vec<ResolvedMove>, ComparisonResolutionError> {
     let desired_ids: HashSet<LegacyLoopAddressKey> = resources
         .iter()
         .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
@@ -2326,25 +2379,27 @@ pub fn detect_legacy_loop_address_moves(
                 only,
                 state_entry,
                 registry,
+                comparison_provider,
                 find_state_by_binding,
-            ) {
+            )? {
                 Some(true) | None => Some(*only),
                 Some(false) => None,
             },
             [] => None,
             multiple => {
-                let stable_matches: Vec<_> = multiple
-                    .iter()
-                    .copied()
-                    .filter(|candidate| {
-                        legacy_row_stable_identity_matches(
-                            candidate,
-                            state_entry,
-                            registry,
-                            find_state_by_binding,
-                        ) == Some(true)
-                    })
-                    .collect();
+                let mut stable_matches = Vec::new();
+                for candidate in multiple.iter().copied() {
+                    if legacy_row_stable_identity_matches(
+                        candidate,
+                        state_entry,
+                        registry,
+                        comparison_provider,
+                        find_state_by_binding,
+                    )? == Some(true)
+                    {
+                        stable_matches.push(candidate);
+                    }
+                }
                 match stable_matches.as_slice() {
                     [only] => Some(*only),
                     _ => None,
@@ -2357,7 +2412,7 @@ pub fn detect_legacy_loop_address_moves(
             used_sources.insert(source_key);
         }
     }
-    migrations
+    Ok(migrations)
 }
 
 /// Cross-resource state information used to resolve simple deferred
@@ -2421,19 +2476,21 @@ fn canonical_or_resolved_create_only_value(
 #[derive(Clone)]
 struct ResolvedCreateOnlyValue {
     value: Value,
-    comparison_string: String,
 }
 
 impl ResolvedCreateOnlyValue {
     fn from_value(value: Value) -> Option<Self> {
-        let comparison_string = canonical_create_only_value_string(&value)?;
-        Some(Self {
-            value,
-            comparison_string,
-        })
+        comparable_create_only_value_string(&value)?;
+        Some(Self { value })
     }
 
-    fn semantically_equal(&self, other: &Self, schema: &ResourceSchema, attribute: &str) -> bool {
+    fn semantically_equal(
+        &self,
+        other: &Self,
+        schema: &ResourceSchema,
+        attribute: &str,
+        context: &ComparisonContext<'_>,
+    ) -> bool {
         schema
             .attributes
             .get(attribute)
@@ -2443,12 +2500,36 @@ impl ResolvedCreateOnlyValue {
                     &other.value,
                     Some(&attribute_schema.attr_type),
                     &schema.defs,
+                    context,
                 )
             })
     }
 
-    fn starts_with(&self, prefix: &str) -> bool {
-        self.comparison_string.starts_with(prefix)
+    fn starts_with(
+        &self,
+        prefix: &str,
+        schema: &ResourceSchema,
+        attribute: &str,
+        context: &ComparisonContext<'_>,
+    ) -> bool {
+        let Some(attribute_schema) = schema.attributes.get(attribute) else {
+            return false;
+        };
+        let state_key = canonical_create_only_value_string(
+            &self.value,
+            Some(&attribute_schema.attr_type),
+            &schema.defs,
+            context,
+        );
+        let prefix_key = canonical_create_only_value_string(
+            &Value::Concrete(ConcreteValue::String(prefix.into())),
+            Some(&attribute_schema.attr_type),
+            &schema.defs,
+            context,
+        );
+        state_key
+            .zip(prefix_key)
+            .is_some_and(|(state, prefix)| state.starts_with(&prefix))
     }
 }
 
@@ -2465,10 +2546,13 @@ impl DesiredCreateOnlyValue {
         state: &ResolvedCreateOnlyValue,
         schema: &ResourceSchema,
         attribute: &str,
+        context: &ComparisonContext<'_>,
     ) -> Option<bool> {
         match self {
-            Self::Resolved(desired) => Some(desired.semantically_equal(state, schema, attribute)),
-            Self::Prefix(prefix) => Some(state.starts_with(prefix)),
+            Self::Resolved(desired) => {
+                Some(desired.semantically_equal(state, schema, attribute, context))
+            }
+            Self::Prefix(prefix) => Some(state.starts_with(prefix, schema, attribute, context)),
             Self::Unresolved => None,
         }
     }
@@ -2540,13 +2624,14 @@ fn resolved_subset_match(
     desired_values: &HashMap<String, DesiredCreateOnlyValue>,
     state_values: &HashMap<String, ResolvedCreateOnlyValue>,
     schema: &ResourceSchema,
+    context: &ComparisonContext<'_>,
 ) -> (usize, bool) {
     let mut resolved = 0;
     let mut all_match = true;
     for (attribute, desired) in desired_values {
         let Some(matches) = state_values
             .get(attribute)
-            .and_then(|state| desired.matches_state(state, schema, attribute))
+            .and_then(|state| desired.matches_state(state, schema, attribute, context))
         else {
             if !matches!(desired, DesiredCreateOnlyValue::Unresolved) {
                 resolved += 1;
@@ -2612,14 +2697,16 @@ impl DesiredCreateOnlyValues {
         &self,
         state_values: &StateCreateOnlyValues,
         schema: &ResourceSchema,
+        context: &ComparisonContext<'_>,
     ) -> (usize, bool) {
-        resolved_subset_match(&self.values, &state_values.values, schema)
+        resolved_subset_match(&self.values, &state_values.values, schema, context)
     }
 
     fn match_counts(
         &self,
         state_values: &StateCreateOnlyValues,
         schema: &ResourceSchema,
+        context: &ComparisonContext<'_>,
     ) -> (usize, usize) {
         let mut matched = 0;
         let mut mismatched = 0;
@@ -2627,7 +2714,9 @@ impl DesiredCreateOnlyValues {
             let Some(state_value) = state_values.values.get(attribute) else {
                 continue;
             };
-            let Some(matches) = desired_value.matches_state(state_value, schema, attribute) else {
+            let Some(matches) =
+                desired_value.matches_state(state_value, schema, attribute, context)
+            else {
                 continue;
             };
             if matches {
@@ -2641,13 +2730,18 @@ impl DesiredCreateOnlyValues {
 
     /// Compare every configured desired value with canonical persisted state
     /// using the resource schema's type-aware equality rules.
-    pub fn all_match(&self, state_values: &StateCreateOnlyValues, schema: &ResourceSchema) -> bool {
+    pub fn all_match(
+        &self,
+        state_values: &StateCreateOnlyValues,
+        schema: &ResourceSchema,
+        context: &ComparisonContext<'_>,
+    ) -> bool {
         self.values.iter().all(|(attribute, desired)| {
             let Some(state) = state_values.values.get(attribute) else {
                 return false;
             };
             desired
-                .matches_state(state, schema, attribute)
+                .matches_state(state, schema, attribute, context)
                 .unwrap_or(false)
         })
     }
@@ -2742,10 +2836,11 @@ pub fn reconcile_anonymous_identifiers(
     resources: &[Resource],
     data_sources: &[DataSource],
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
-) -> Vec<ResolvedMove> {
+) -> Result<Vec<ResolvedMove>, ComparisonResolutionError> {
     let mut moves = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for id in resources
@@ -2785,6 +2880,7 @@ pub fn reconcile_anonymous_identifiers(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
+        let comparison = comparison_provider.comparison_for(registry, &resource.id)?;
         let schema = schema.as_schema();
 
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
@@ -2870,8 +2966,11 @@ pub fn reconcile_anonymous_identifiers(
                 continue;
             }
 
-            let (matched, mismatched) =
-                resource_co_values.match_counts(entry.create_only_values(), schema);
+            let (matched, mismatched) = resource_co_values.match_counts(
+                entry.create_only_values(),
+                schema,
+                comparison.context(),
+            );
 
             if matched > 0 && mismatched == 0 {
                 full_matches.push(entry);
@@ -2896,7 +2995,7 @@ pub fn reconcile_anonymous_identifiers(
                 .insert(matched_entry.name().to_string());
         }
     }
-    moves
+    Ok(moves)
 }
 
 /// Full desired-resource context plus the subset still eligible and the
@@ -2992,6 +3091,24 @@ impl AnonymousToNamedRenameDetection {
     }
 }
 
+/// State indexes used while matching named resources to anonymous state rows.
+pub struct AnonymousToNamedStateLookup<'a> {
+    find_by_type: &'a dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+    find_by_binding: &'a dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+}
+
+impl<'a> AnonymousToNamedStateLookup<'a> {
+    pub fn new(
+        find_by_type: &'a dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
+        find_by_binding: &'a dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    ) -> Self {
+        Self {
+            find_by_type,
+            find_by_binding,
+        }
+    }
+}
+
 /// Detect let-bound (named) resources that were previously anonymous.
 ///
 /// When a user converts an anonymous resource to a `let`-bound resource while
@@ -3032,12 +3149,12 @@ impl AnonymousToNamedRenameDetection {
 pub fn detect_anonymous_to_named_renames(
     candidates: AnonymousToNamedCandidates<'_>,
     registry: &SchemaRegistry,
-    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
-    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+    comparison_provider: &ProviderRouter,
+    state_lookup: AnonymousToNamedStateLookup<'_>,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> AnonymousToNamedRenameDetection {
+) -> Result<AnonymousToNamedRenameDetection, ComparisonResolutionError> {
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -3073,9 +3190,11 @@ pub fn detect_anonymous_to_named_renames(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
+        let comparison = comparison_provider.comparison_for(registry, &resource.id)?;
         let schema = schema.as_schema();
 
-        let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
+        let state_entries =
+            (state_lookup.find_by_type)(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
         if state_entries
@@ -3096,7 +3215,7 @@ pub fn detect_anonymous_to_named_renames(
         // This is empty only when the resource configures no create-only
         // attributes. Configured-but-unresolved values remain explicit.
         let resource_co_values =
-            DesiredCreateOnlyValues::from_resource(resource, schema, find_state_by_binding);
+            DesiredCreateOnlyValues::from_resource(resource, schema, state_lookup.find_by_binding);
 
         let simhash_match = || {
             let resource_hash =
@@ -3106,8 +3225,11 @@ pub fn detect_anonymous_to_named_renames(
                 .filter(|entry| !used_in_dsl.contains(entry.name()))
                 .filter(|entry| !candidates.claimed_origins.contains(entry.origin_id()))
                 .filter(|entry| {
-                    let (_matched, mismatched) =
-                        resource_co_values.match_counts(entry.create_only_values(), schema);
+                    let (_matched, mismatched) = resource_co_values.match_counts(
+                        entry.create_only_values(),
+                        schema,
+                        comparison.context(),
+                    );
                     mismatched == 0
                 })
                 .filter_map(|entry| match extract_hash_from_identifier(entry.name()) {
@@ -3132,7 +3254,11 @@ pub fn detect_anonymous_to_named_renames(
                 if extract_hash_from_identifier(anonymous_identity).is_none() {
                     continue;
                 }
-                let all_match = resource_co_values.all_match(entry.create_only_values(), schema);
+                let all_match = resource_co_values.all_match(
+                    entry.create_only_values(),
+                    schema,
+                    comparison.context(),
+                );
                 if !all_match {
                     continue;
                 }
@@ -3186,10 +3312,10 @@ pub fn detect_anonymous_to_named_renames(
             .is_some_and(|count| *count == 1)
     });
 
-    AnonymousToNamedRenameDetection {
+    Ok(AnonymousToNamedRenameDetection {
         moves: renames,
         cross_pass_contests,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -3203,6 +3329,10 @@ pub fn detect_anonymous_to_named_renames_for_test(
     claims: &StateBlockClaims,
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        registry,
+        resources.iter().map(|resource| &resource.id),
+    );
     let candidates = resources
         .iter()
         .map(|resource| resource.id.clone())
@@ -3211,12 +3341,13 @@ pub fn detect_anonymous_to_named_renames_for_test(
     let (moves, contests) = detect_anonymous_to_named_renames(
         AnonymousToNamedCandidates::new(resources, &candidates, &claimed_origins),
         registry,
-        find_state_by_type,
-        find_state_by_binding,
+        &comparison_provider,
+        AnonymousToNamedStateLookup::new(find_state_by_type, find_state_by_binding),
         &providers,
         identity_attributes_fn,
         claims,
     )
+    .expect("anonymous-to-named comparison fixture must resolve")
     .into_parts();
     debug_assert!(contests.is_empty());
     moves.into_iter().map(ResolvedMove::into_parts).collect()

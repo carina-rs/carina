@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
-use crate::provider::{AppliedIdentifier, Provider};
+use crate::provider::{AppliedIdentifier, CancelledCreateReport, Provider, ProviderRouter};
 #[cfg(test)]
 use crate::resource::Resource;
 use crate::resource::{ResourceId, ResourceIdentity};
@@ -32,8 +32,8 @@ use super::wait::{
     wait_failure_message,
 };
 use super::{
-    ExecutionAccumulator, ExecutionEvent, ExecutionObserver, ExecutionResult, ProgressInfo,
-    RuntimeExecutionInput, unresolved_data_source_inputs,
+    Applied, ExecutionAccumulator, ExecutionEvent, ExecutionObserver, ExecutionResult,
+    ProgressInfo, RuntimeExecutionInput, unresolved_data_source_inputs,
 };
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
@@ -186,7 +186,17 @@ pub(super) fn is_runtime_noop<S: Clone>(
 ) -> bool {
     match effect {
         Effect::Read { .. } => !is_deferred_read(effect, data_source_values),
-        _ => effect.is_state_operation() && !effect.is_scheduler_meta(),
+        Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::ReleaseListKeys { .. } => true,
+        Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Wait { .. }
+        | Effect::DeferredCreate { .. }
+        | Effect::DeferredReplace(_) => false,
     }
 }
 
@@ -299,6 +309,7 @@ pub(super) async fn execute_effects_sequential<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
     provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     input: &mut RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
     shutdown: &ShutdownToken,
@@ -413,6 +424,7 @@ pub(super) async fn execute_effects_sequential<
         observer.on_event(&ExecutionEvent::EffectFailed {
             effect: &effects[idx],
             error: &message,
+            recovery: None,
             duration: std::time::Duration::ZERO,
             progress,
         });
@@ -607,6 +619,7 @@ pub(super) async fn execute_effects_sequential<
                             observer.on_event(&ExecutionEvent::EffectFailed {
                                 effect: &effects[failed_idx],
                                 error: &message,
+                                recovery: None,
                                 duration: std::time::Duration::ZERO,
                                 progress,
                             });
@@ -640,9 +653,20 @@ pub(super) async fn execute_effects_sequential<
                         crate::resource::Current::CreateInFlight(pending) => Some(pending.clone()),
                         crate::resource::Current::Absent(_)
                         | crate::resource::Current::Present(_)
+                        | crate::resource::Current::CreateOutcomeUnknown(_)
                         | crate::resource::Current::MissingIdentifier(_) => None,
                     }),
-                _ => None,
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::Update { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => None,
             };
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
@@ -671,6 +695,7 @@ pub(super) async fn execute_effects_sequential<
                             basic,
                             &BasicEffectCtx {
                                 provider,
+                                comparison_provider,
                                 provider_check_inputs,
                                 runtime_authored,
                                 preparation: &preparation,
@@ -773,9 +798,10 @@ pub(super) async fn execute_effects_sequential<
                             }
                         }
                         // State operations are handled separately during apply
-                        Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
-                            SingleEffectResult::ReadNoOp
-                        }
+                        Effect::Import { .. }
+                        | Effect::Remove { .. }
+                        | Effect::Move { .. }
+                        | Effect::ReleaseListKeys { .. } => SingleEffectResult::ReadNoOp,
                         Effect::DeferredCreate { .. } => unreachable!(
                             "DeferredCreate is handled synchronously before provider dispatch"
                         ),
@@ -1062,9 +1088,20 @@ pub(super) async fn execute_effects_sequential<
     // Every loop exit passes through this point, so the total includes both
     // cleanup abandonment and any release-mode fail-safe interruptions that
     // were emitted while processing a completed future.
-    let total_interrupted_count = in_flight.abandon(observer);
-    if total_interrupted_count > 0 {
-        accumulated.mutate(|result| result.interrupted_count += total_interrupted_count);
+    let abandonment = in_flight.abandon(observer);
+    if abandonment.interrupted_count > 0 {
+        accumulated.mutate(|result| result.interrupted_count += abandonment.interrupted_count);
+    }
+    for report in abandonment.create_reports {
+        match report {
+            CancelledCreateReport::Untracked => {}
+            CancelledCreateReport::OutcomeUnknown(unknown) => {
+                accumulated.insert_unpublished(
+                    unknown.id().clone(),
+                    Applied::CreateOutcomeUnknown(unknown),
+                );
+            }
+        }
     }
     accumulated.publish_if_dirty(&input.checkpoint_sink);
     let refresh_cancelled = match cleanup_loop.step() {
@@ -1452,7 +1489,10 @@ mod tests {
                 UnresolvedResource::from_pre_resolve(alb.clone()),
             ),
         ]);
-        let schemas = SchemaRegistry::new();
+        let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+            &SchemaRegistry::new(),
+            plan.effects().iter().map(Effect::resource_id),
+        );
         let mut input: RuntimeExecutionInput = ExecutionInput {
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -1476,7 +1516,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            execute_effects_sequential(&provider, &mut input, &observer, &ShutdownToken::running()),
+            execute_effects_sequential(
+                &provider,
+                &comparison_provider,
+                &mut input,
+                &observer,
+                &ShutdownToken::running(),
+            ),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of timing out");
@@ -1570,7 +1616,10 @@ mod tests {
             "listener should depend on both alb and cert_issued; deps: {deps:?}"
         );
 
-        let schemas = SchemaRegistry::new();
+        let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+            &SchemaRegistry::new(),
+            plan.effects().iter().map(Effect::resource_id),
+        );
         let mut input: RuntimeExecutionInput = ExecutionInput {
             plan: &plan,
             provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -1594,7 +1643,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            execute_effects_sequential(&provider, &mut input, &observer, &ShutdownToken::running()),
+            execute_effects_sequential(
+                &provider,
+                &comparison_provider,
+                &mut input,
+                &observer,
+                &ShutdownToken::running(),
+            ),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of polling until timeout");

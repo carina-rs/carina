@@ -422,6 +422,8 @@ plan-module-anonymous-resource:
 	$(PLAN_FIXTURE) module_anonymous_resource
 plan-server-added-list-elements-changed:
 	$(PLAN_FIXTURE) server_added_list_elements_changed
+plan-keyed-partial-update-release:
+	$(PLAN_FIXTURE) keyed_partial_update_release
 plan-server-default-struct-leaf:
 	$(PLAN_FIXTURE) server_default_struct_leaf
 plan-multi-instance-create:

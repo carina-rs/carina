@@ -1302,6 +1302,7 @@ impl DiagnosticEngine {
                             // attribute (carina#3349 invariant lifted into
                             // the type system).
                             let attr_shape = effective_type.shape();
+                            let contains_struct = effective_type.contains_struct();
                             let type_error = match (attr_shape, typecheck_value) {
                                 // Bool type should not receive String
                                 (
@@ -1434,21 +1435,15 @@ impl DiagnosticEngine {
                                 (
                                     carina_core::schema::Shape::List { .. },
                                     Value::Concrete(ConcreteValue::List(_)),
-                                ) if !matches!(
-                                    effective_type.list_element().map(|inner| inner.shape()),
-                                    Some(carina_core::schema::Shape::Struct { .. })
-                                ) =>
-                                {
-                                    effective_attribute
-                                        .validate(attr_value)
-                                        .err()
-                                        .map(|e| e.with_attribute(attr_name).to_string())
-                                }
+                                ) if !contains_struct => effective_attribute
+                                    .validate(attr_value)
+                                    .err()
+                                    .map(|e| e.with_attribute(attr_name).to_string()),
                                 // Validate Map value types
                                 (
                                     carina_core::schema::Shape::Map { .. },
                                     Value::Concrete(ConcreteValue::Map(_)),
-                                ) => effective_attribute
+                                ) if !contains_struct => effective_attribute
                                     .validate(attr_value)
                                     .err()
                                     .map(|e| e.with_attribute(attr_name).to_string()),
@@ -1458,12 +1453,13 @@ impl DiagnosticEngine {
                                 // against Union members here — see #2847
                                 // for the bare-binding (`BindingRef`) form.
                                 (carina_core::schema::Shape::Union, value)
-                                    if !matches!(
-                                        value,
-                                        Value::Deferred(DeferredValue::ResourceRef { .. })
-                                            | Value::Deferred(DeferredValue::BindingRef { .. })
-                                            | Value::Deferred(DeferredValue::Coalesce { .. })
-                                    ) =>
+                                    if !contains_struct
+                                        && !matches!(
+                                            value,
+                                            Value::Deferred(DeferredValue::ResourceRef { .. })
+                                                | Value::Deferred(DeferredValue::BindingRef { .. })
+                                                | Value::Deferred(DeferredValue::Coalesce { .. })
+                                        ) =>
                                 {
                                     effective_attribute.validate(value).err().and_then(|error| {
                                         let tagged = error.with_attribute(attr_name);
@@ -1513,30 +1509,19 @@ impl DiagnosticEngine {
                             // struct-field validation. Same bug class as
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
-                            let is_struct_shape = match effective_type.shape() {
-                                carina_core::schema::Shape::Struct { .. } => true,
-                                carina_core::schema::Shape::List { .. } => {
-                                    effective_type.list_element().is_some_and(|inner| {
-                                        matches!(
-                                            inner.shape(),
-                                            carina_core::schema::Shape::Struct { .. }
-                                        )
-                                    })
-                                }
-                                _ => false,
-                            };
-                            if is_struct_shape {
+                            if contains_struct {
                                 diagnostics.extend(self.validate_struct_value(
                                     doc,
                                     attr_name,
                                     attr_value,
                                     &effective_type,
+                                    self.find_attribute_value_range(doc, attr_name, scope),
                                 ));
                             }
                         }
                     }
 
-                    // Run resource-level validator (e.g., mutually exclusive required fields)
+                    // Run whole-resource validation, including top-level field groups.
                     let mut resolved_attrs = rref.resolved_attributes();
                     for value in resolved_attrs.values_mut() {
                         if let Some(evaluated) =
@@ -1588,6 +1573,13 @@ impl DiagnosticEngine {
                             // calls are materialized only for this shared schema pass,
                             // so retain their masked nested errors: the authored AST
                             // seen by the attribute pass was still a FunctionCall.
+                            if matches!(
+                                &error,
+                                carina_core::schema::TypeError::FieldGroupViolation { path, .. }
+                                    if !path.is_empty()
+                            ) {
+                                continue;
+                            }
                             let is_masked_secret_error = error.to_string().contains("(secret)");
                             if !is_masked_secret_error
                                 && matches!(

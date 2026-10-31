@@ -1453,9 +1453,18 @@ mod tests {
         });
         let expected =
             format!("module 'mod' (call 'c'): argument 'name': bad name (got 'abc'); {detail}");
+        let plan_error = crate::plan::PlanError::new(
+            crate::resource::ResourceId::with_identity("_virtual", "c"),
+            plan_error,
+        );
 
         assert_eq!(resolver_error.to_string(), expected);
         assert_eq!(apply_failure.to_string(), expected);
-        assert_eq!(plan_error.to_string(), expected);
+        assert_eq!(
+            plan_error
+                .display_with_project_dir(std::path::Path::new("."))
+                .to_string(),
+            expected
+        );
     }
 }

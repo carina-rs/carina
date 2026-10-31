@@ -441,7 +441,7 @@ fn print_diff(file: &Path, original: &str, formatted: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+    use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
     use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
@@ -492,8 +492,18 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async { unreachable!("formatting does not instantiate providers") })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

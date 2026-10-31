@@ -61,6 +61,7 @@ pub(crate) enum EffectKind {
     Import,
     Remove,
     Move,
+    Release,
     Wait,
     DeferredCreate,
     DeferredReplace,
@@ -564,6 +565,7 @@ fn effect_owned_resource_id(effect: &Effect) -> Option<&ResourceId> {
         Effect::Import { id, .. } => Some(id.as_inner()),
         Effect::Remove { id } => Some(id.as_inner()),
         Effect::Move { to, .. } => Some(to.as_inner()),
+        Effect::ReleaseListKeys { id, .. } => Some(id.as_inner()),
         Effect::Wait { .. } => None,
         Effect::DeferredCreate { .. } => None,
         Effect::DeferredReplace(_) => None,
@@ -602,6 +604,7 @@ fn effect_module_source(effect: &Effect) -> Option<&ModuleSource> {
         | Effect::Import { .. }
         | Effect::Remove { .. }
         | Effect::Move { .. }
+        | Effect::ReleaseListKeys { .. }
         | Effect::Wait { .. } => None,
     }
 }
@@ -702,6 +705,22 @@ fn node_from_effect(
             Vec::new(),
             Some(format!("from {from}")),
         ),
+        Effect::ReleaseListKeys {
+            id,
+            attribute,
+            key_field: _,
+            keys,
+        } => (
+            id.identity_str().to_string(),
+            id.display_type(),
+            EffectKind::Release,
+            vec![attribute.clone()],
+            Some(format!(
+                "release {} key{} from authored state",
+                keys.len(),
+                if keys.len() == 1 { "" } else { "s" }
+            )),
+        ),
         Effect::Wait {
             identity,
             target_id,
@@ -771,7 +790,13 @@ fn effect_anonymous_discriminator(effect: &Effect) -> Option<String> {
         }
         Effect::Update { to, .. } => (to.binding.as_deref(), &to.id),
         Effect::Delete { binding, id, .. } => (binding.as_deref(), id.as_inner()),
-        _ => return None,
+        Effect::ReleaseListKeys { id, .. } => (None, id.as_inner()),
+        Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. }
+        | Effect::DeferredCreate { .. }
+        | Effect::DeferredReplace(_) => return None,
     };
     resource_anonymous_discriminator(binding, id)
 }
@@ -989,6 +1014,7 @@ fn attach_blast_radius(
                 | EffectKind::Import
                 | EffectKind::Remove
                 | EffectKind::Move
+                | EffectKind::Release
                 | EffectKind::Wait
                 | EffectKind::DeferredCreate
                 | EffectKind::Unchanged => return None,

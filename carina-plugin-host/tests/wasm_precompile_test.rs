@@ -574,10 +574,10 @@ async fn test_precompiled_factory_creates_provider() {
     let config = carina_core::executor::prepare_provider_ready_config(&factory, resolved.as_ref())
         .expect("test provider config should pass preparation");
     let provider = factory
-        .create_provider(None, &config)
+        .create_initialized_provider(None, &config)
         .await
         .expect("provider should init");
-    assert_eq!(provider.name(), "mock");
+    assert_eq!(provider.provider().name(), "mock");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -2604,6 +2604,9 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
                 || attributes_contain_redacted_secret(to.attributes.values())
         }
         UnresolvedSavedEffect::Import { identifier, .. } => contains_redacted_secret(identifier),
+        UnresolvedSavedEffect::ReleaseListKeys { keys, .. } => keys
+            .iter()
+            .any(|key| contains_redacted_secret(key.retained_value())),
         UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
         UnresolvedSavedEffect::DeferredCreate { template, .. } => {
             deferred_template_contains_redacted_secret(template)
@@ -2659,6 +2662,14 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             to: _to,
             origin: _origin,
         } => false,
+        Effect::ReleaseListKeys {
+            id: _id,
+            attribute: _attribute,
+            key_field: _key_field,
+            keys,
+        } => keys
+            .iter()
+            .any(|key| contains_redacted_secret(key.retained_value())),
         Effect::Wait {
             identity: _identity,
             target_id: _target_id,
@@ -4051,6 +4062,26 @@ pub fn redact_secrets_in_effect(
             to: to.clone(),
             origin: origin.clone(),
         },
+        Effect::ReleaseListKeys {
+            id,
+            attribute,
+            key_field,
+            keys,
+        } => Effect::ReleaseListKeys {
+            id: id.clone(),
+            attribute: attribute.clone(),
+            key_field: key_field.clone(),
+            keys: crate::effect::ReleasedListKeys::try_new(
+                keys.iter()
+                    .map(|key| {
+                        redact_secrets_in_value(key.retained_value()).map(|retained| {
+                            crate::effect::ReleasedListKey::new(key.key(), retained)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .expect("redaction preserves non-empty unique release keys"),
+        },
         // Wait effects carry no secret-bearing fields — `until` is a
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
@@ -4081,7 +4112,17 @@ fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resour
         .iter()
         .map(|effect| match effect {
             crate::effect::Effect::Create(resource) => Some(resource.id.clone()),
-            _ => None,
+            crate::effect::Effect::Read { .. }
+            | crate::effect::Effect::ResumeCreate { .. }
+            | crate::effect::Effect::Update { .. }
+            | crate::effect::Effect::Delete { .. }
+            | crate::effect::Effect::Import { .. }
+            | crate::effect::Effect::Remove { .. }
+            | crate::effect::Effect::Move { .. }
+            | crate::effect::Effect::ReleaseListKeys { .. }
+            | crate::effect::Effect::Wait { .. }
+            | crate::effect::Effect::DeferredCreate { .. }
+            | crate::effect::Effect::DeferredReplace(_) => None,
         })
         .collect()
 }
@@ -4128,7 +4169,16 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                     },
                     changed_attributes: changed_attributes.clone(),
                 },
-                _ => redact_secrets_in_effect(effect)?,
+                crate::effect::Effect::Read { .. }
+                | crate::effect::Effect::ResumeCreate { .. }
+                | crate::effect::Effect::Delete { .. }
+                | crate::effect::Effect::Import { .. }
+                | crate::effect::Effect::Remove { .. }
+                | crate::effect::Effect::Move { .. }
+                | crate::effect::Effect::ReleaseListKeys { .. }
+                | crate::effect::Effect::Wait { .. }
+                | crate::effect::Effect::DeferredCreate { .. }
+                | crate::effect::Effect::DeferredReplace(_) => redact_secrets_in_effect(effect)?,
             };
             if let crate::effect::Effect::Update { from, .. } = &mut effect {
                 if let Some(state) = historical.get(&from.id) {
@@ -4283,7 +4333,13 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     template: Box::new(template),
                 })))
             }
-            _ => Ok(effect.clone()),
+            Effect::ResumeCreate { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. } => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;
@@ -4508,7 +4564,18 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<S: Clone>(
                     changed_attributes: changed_attributes.clone(),
                 })
             }
-            _ => Ok(effect.clone()),
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;
@@ -6401,6 +6468,7 @@ pub fn canonicalize_states_with_schemas(
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => continue,
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => continue,
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         let kind = if state.id.resource_type.is_empty() {
@@ -12522,6 +12590,9 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -12549,6 +12620,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12579,6 +12653,9 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -12602,6 +12679,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12640,6 +12720,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12702,9 +12785,19 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
-        let result = diff_test(&desired[0], current, None, None, Some(&schema));
+        let result = diff_test(
+            &desired[0],
+            current,
+            None,
+            None,
+            Some(&schema),
+            &crate::differ::exact_comparison_context_for_tests(),
+        );
         assert!(
             matches!(result, Diff::NoChange(_)),
             "dynamic AZ enum API spelling in state must canonicalize to DSL spelling; got {result:?}"
@@ -12774,6 +12867,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };

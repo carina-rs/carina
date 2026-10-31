@@ -1,21 +1,29 @@
 use colored::Colorize;
+use std::path::Path;
 
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 
 use crate::error::AppError;
 
-pub(crate) fn render_plan_errors_and_abort<S>(plan: &Plan<S>) -> Result<(), AppError> {
+pub(crate) fn render_plan_errors_and_abort<S>(
+    plan: &Plan<S>,
+    project_dir: &Path,
+) -> Result<(), AppError> {
     let errors = plan.errors();
     if errors.is_empty() {
         return Ok(());
     }
 
-    Err(render_plan_errors(errors))
+    Err(render_plan_errors(errors, project_dir))
 }
 
-fn render_plan_errors(errors: &[PlanError]) -> AppError {
+fn render_plan_errors(errors: &[PlanError], project_dir: &Path) -> AppError {
     for err in errors {
-        eprintln!("{} {}", "Error:".red().bold(), err);
+        eprintln!(
+            "{} {}",
+            "Error:".red().bold(),
+            err.display_with_project_dir(project_dir)
+        );
     }
     AppError::Validation(plan_error_summary(errors))
 }
@@ -24,8 +32,8 @@ impl<R> crate::wiring::PostExpansionDiagnostics<R> {
     /// Render this diagnostic outcome in plan-error order and return the
     /// command error that must abort apply. There is deliberately no success
     /// branch: receiving this type already selected the diagnostic outcome.
-    pub(crate) fn render_and_abort(&self) -> AppError {
-        render_plan_errors(self.errors().as_slice())
+    pub(crate) fn render_and_abort(&self, project_dir: &Path) -> AppError {
+        render_plan_errors(self.errors().as_slice(), project_dir)
     }
 }
 
@@ -48,6 +56,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             | PlanErrorKind::IgnoredWriteOnlyValueUnavailable { .. }
             | PlanErrorKind::CreateInFlightOrphan
             | PlanErrorKind::DestroyCreateInFlight
+            | PlanErrorKind::CreateOutcomeUnknown { .. }
             | PlanErrorKind::ResumeCreateRoutingMismatch { .. }
             | PlanErrorKind::ModuleConstraint(_) => other_count += 1,
         }
@@ -93,14 +102,14 @@ mod tests {
     }
 
     fn abort_summary(plan: &Plan) -> String {
-        render_plan_errors_and_abort(plan)
+        render_plan_errors_and_abort(plan, Path::new("."))
             .expect_err("plan errors must abort")
             .to_string()
     }
 
     #[test]
     fn empty_plan_error_helper_returns_ok() {
-        assert!(render_plan_errors_and_abort(&Plan::new()).is_ok());
+        assert!(render_plan_errors_and_abort(&Plan::new(), Path::new(".")).is_ok());
     }
 
     #[test]

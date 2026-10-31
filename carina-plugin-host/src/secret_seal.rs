@@ -4,7 +4,8 @@
 //! providers need the plaintext. Desired-state round trips use this module
 //! instead: secrets become per-call tokens, and the guest response remains an
 //! opaque [`GuestDesired`] until the matching [`Unsealer`] restores known
-//! tokens and isolates attributes containing mangled ones.
+//! tokens, rejects attributes the host marked deferred, and isolates
+//! attributes containing mangled tokens.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,6 +21,7 @@ const TOKEN_NAMESPACE: &str = "carina-sealed-secret";
 
 pub(crate) struct SealedDesired {
     resources: Vec<wit::ResourceDef>,
+    deferred: Vec<Vec<String>>,
 }
 
 impl SealedDesired {
@@ -28,10 +30,10 @@ impl SealedDesired {
         call: F,
     ) -> Result<Result<GuestDesired, P>, E>
     where
-        F: FnOnce(&'a [wit::ResourceDef]) -> Fut,
+        F: FnOnce(&'a [wit::ResourceDef], &'a [Vec<String>]) -> Fut,
         Fut: Future<Output = Result<Result<Vec<wit::ResourceDef>, P>, E>>,
     {
-        let result = call(&self.resources).await?;
+        let result = call(&self.resources, &self.deferred).await?;
         Ok(result.map(GuestDesired::new))
     }
 }
@@ -53,12 +55,14 @@ pub(crate) struct Unsealer {
     secrets: Vec<Value>,
     host_attributes: Vec<indexmap::IndexMap<String, Value>>,
     sent_attributes: Vec<HashMap<String, wit::Value>>,
+    deferred: Vec<Vec<String>>,
     expected_resource_count: usize,
 }
 
 #[derive(Debug)]
 pub(crate) enum SealError {
     ResourceValue(SerializationError),
+    DeferredResourceCountMismatch { resources: usize, deferred: usize },
 }
 
 impl fmt::Display for SealError {
@@ -67,6 +71,13 @@ impl fmt::Display for SealError {
             Self::ResourceValue(error) => {
                 write!(f, "failed to encode sealed resource value: {error}")
             }
+            Self::DeferredResourceCountMismatch {
+                resources,
+                deferred,
+            } => write!(
+                f,
+                "received deferred attribute names for {deferred} resources; expected {resources}"
+            ),
         }
     }
 }
@@ -82,6 +93,7 @@ impl From<SerializationError> for SealError {
 #[derive(Debug)]
 pub(crate) enum RestoreError {
     ResourceCountMismatch { expected: usize, actual: usize },
+    DeferredAttributeReturned { resource_index: usize, name: String },
     ValueDecode(wasm_convert::WasmValueDecodeError),
 }
 
@@ -91,6 +103,13 @@ impl fmt::Display for RestoreError {
             Self::ResourceCountMismatch { expected, actual } => write!(
                 f,
                 "WASM guest returned {actual} normalized resources; expected {expected}"
+            ),
+            Self::DeferredAttributeReturned {
+                resource_index,
+                name,
+            } => write!(
+                f,
+                "WASM guest returned host-deferred attribute '{name}' for normalized resource at index {resource_index}"
             ),
             Self::ValueDecode(error) => {
                 write!(f, "failed to decode normalized resource values: {error}")
@@ -132,9 +151,16 @@ impl RestoredDesired {
     }
 }
 
-pub(crate) fn seal<S: Clone>(
+pub(crate) fn seal_with_deferred<S: Clone>(
     resources: &[Resource<S>],
+    deferred: &[Vec<String>],
 ) -> Result<(SealedDesired, Unsealer), SealError> {
+    if resources.len() != deferred.len() {
+        return Err(SealError::DeferredResourceCountMismatch {
+            resources: resources.len(),
+            deferred: deferred.len(),
+        });
+    }
     let nonce_prefix = format!("{TOKEN_NAMESPACE}:{}:", uuid::Uuid::new_v4().simple());
     let host_attributes = resources
         .iter()
@@ -161,15 +187,24 @@ pub(crate) fn seal<S: Clone>(
         .collect();
 
     Ok((
-        SealedDesired { resources },
+        SealedDesired {
+            resources,
+            deferred: deferred.to_vec(),
+        },
         Unsealer {
             nonce_prefix,
             secrets: sealer.secrets,
             host_attributes,
             sent_attributes,
+            deferred: deferred.to_vec(),
             expected_resource_count,
         },
     ))
+}
+
+#[cfg(test)]
+fn seal<S: Clone>(resources: &[Resource<S>]) -> Result<(SealedDesired, Unsealer), SealError> {
+    seal_with_deferred(resources, &vec![Vec::new(); resources.len()])
 }
 
 struct Sealer {
@@ -218,6 +253,16 @@ impl Unsealer {
         let mut resources = Vec::with_capacity(guest.resources.len());
 
         for (resource_index, resource) in guest.resources.into_iter().enumerate() {
+            if let Some((name, _value)) = resource.attributes.iter().find(|(name, _value)| {
+                self.deferred[resource_index]
+                    .iter()
+                    .any(|deferred| deferred == name)
+            }) {
+                return Err(RestoreError::DeferredAttributeReturned {
+                    resource_index,
+                    name: name.clone(),
+                });
+            }
             let host_attributes = &self.host_attributes[resource_index];
             let sent_attributes = &self.sent_attributes[resource_index];
             let guest_wire_by_key: HashMap<&str, &wit::Value> = resource
@@ -668,6 +713,31 @@ mod tests {
                 "a guest resource count mismatch must be a boundary error"
             );
         }
+    }
+
+    #[test]
+    fn restore_rejects_a_guest_attribute_marked_deferred_by_the_host() {
+        let resources = vec![resource_with_attribute("known", string("host-known"))];
+        let deferred = vec![vec!["pending".to_string()]];
+        let (mut payload, unsealer) =
+            seal_with_deferred(&resources, &deferred).expect("seal should succeed");
+        payload.resources[0].attributes.push((
+            "pending".to_string(),
+            wit::Value::StrVal("guest-value".to_string()),
+        ));
+
+        let error = match unsealer.try_restore(take_guest_resources(&mut payload)) {
+            Ok(_) => panic!("the guest must not synthesize a host-deferred attribute"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RestoreError::DeferredAttributeReturned {
+                resource_index: 0,
+                name,
+            } if name == "pending"
+        ));
     }
 
     #[test]

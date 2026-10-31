@@ -40,7 +40,7 @@ fn loaded_providers_from_factories(
     Arc::new(
         carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(factories),
-            std::iter::empty(),
+            SchemaRegistry::new(),
         ),
     )
 }
@@ -90,17 +90,27 @@ impl ProviderFactory for RegionConfigFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,
         >,
     > {
         unimplemented!("RegionConfigFactory::create_provider is not used in diagnostics tests")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -219,11 +229,12 @@ impl ProviderFactory for SuspendedValidationFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,
@@ -232,6 +243,15 @@ impl ProviderFactory for SuspendedValidationFactory {
         unimplemented!(
             "SuspendedValidationFactory::create_provider is not used in diagnostics tests"
         )
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -314,11 +334,12 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = carina_core::provider::ProviderResult<
-                        Box<dyn carina_core::provider::Provider>,
+                        carina_core::provider::ProviderInitialization,
                     >,
                 > + Send
                 + '_,
@@ -327,6 +348,15 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
         unimplemented!(
             "EnumDeclaredCustomTypeFactory::create_provider is not used in diagnostics tests"
         )
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -418,11 +448,21 @@ impl ProviderFactory for SharedRoleArnFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         unimplemented!("diagnostics tests do not construct providers")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -512,11 +552,21 @@ impl ProviderFactory for BareTypeFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         unimplemented!("diagnostics tests do not construct providers")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -854,11 +904,21 @@ impl ProviderFactory for SchemaFixtureFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         unimplemented!("schema fixture factories do not construct providers")
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {

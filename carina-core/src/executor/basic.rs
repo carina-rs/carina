@@ -14,8 +14,8 @@ use crate::executor::provider_ready::{
 };
 use crate::provider::{
     AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
-    PartialReadDiagnostic, Provider, ProviderReadyResource, ReadRequest, ResumeCreateRequest,
-    ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
+    PartialReadDiagnostic, Provider, ProviderReadyResource, ProviderRouter, ReadRequest,
+    ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -64,6 +64,7 @@ pub(super) enum BasicEffectResult {
     },
     ClassifiedFailure {
         error: String,
+        recovery: Option<Box<crate::plan::PlanError>>,
         resource_id: ResourceId,
         applied: Applied,
     },
@@ -116,10 +117,12 @@ impl<'a, S> StartedBasicEffectResult<'a, S> {
                 diagnostic,
                 ..
             } => started.partially_succeeded(&completed.state, diagnostic, duration),
-            BasicEffectResult::Failure { error, .. }
-            | BasicEffectResult::ClassifiedFailure { error, .. } => {
+            BasicEffectResult::Failure { error, .. } => {
                 started.failed(error, duration);
             }
+            BasicEffectResult::ClassifiedFailure {
+                error, recovery, ..
+            } => started.failed_with_recovery(error, recovery.as_deref(), duration),
             BasicEffectResult::ResumeSuccess { completed, .. } => {
                 let state = completed.observed_state();
                 started.succeeded(Some(&state), duration);
@@ -676,6 +679,7 @@ fn process_basic_outcome<S: Clone>(
         }
         BasicEffectResult::ClassifiedFailure {
             error: _,
+            recovery: _,
             resource_id,
             applied,
         } => {
@@ -739,6 +743,7 @@ pub(super) fn count_actionable_effects<S>(effects: &[Effect<S>]) -> usize {
 /// and keeping dispatch context fields grouped consistently.
 pub(super) struct BasicEffectCtx<'a, S> {
     pub(super) provider: &'a dyn Provider,
+    pub(super) comparison_provider: &'a ProviderRouter,
     pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a, S>,
     pub(super) runtime_authored: bool,
     pub(super) preparation: &'a ProviderPreparationContext<'a>,
@@ -777,7 +782,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
         total,
     };
     let effect = basic.as_effect();
-    let started_effect = in_flight_start.emit_started(observer, effect, progress);
+    let mut started_effect = in_flight_start.emit_started(observer, effect, progress);
 
     let outcome = match basic {
         BasicEffect::Create { resource, .. } => {
@@ -801,7 +806,9 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let request = CreateRequest::checked(resolved);
             let accepted_request = AcceptedRequest::from_create_request(&request)
                 .with_resolved_desired_attributes(resolved_attrs.clone());
-            match super::dispatch_create(provider, &resource.id, request).await {
+            let (create, cancellation) = super::dispatch_create(provider, &resource.id, request);
+            started_effect.track_create_cancellation(cancellation);
+            match create.await {
                 Ok(outcome) => {
                     let (state, request, diagnostic) =
                         super::complete_create_for_writeback(outcome, accepted_request);
@@ -836,12 +843,23 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             refresh: None,
                         }
                     }
+                    CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                        BasicEffectResult::ClassifiedFailure {
+                            error: error.to_string(),
+                            recovery: Some(Box::new(
+                                crate::plan::PlanError::create_outcome_unknown(resource.id.clone()),
+                            )),
+                            resource_id: resource.id.clone(),
+                            applied: Applied::CreateOutcomeUnknown(unknown),
+                        }
+                    }
                     CreateFailureKind::Created { created, error } => {
                         let created =
                             created.with_resolved_desired_attributes(resolved_attrs.clone());
                         let error_str = format!("{error}\n{}", created.post_error_note());
                         BasicEffectResult::ClassifiedFailure {
                             error: error_str,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
@@ -851,6 +869,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             format!("{error}\ncreate still in progress; the next apply resumes it");
                         BasicEffectResult::ClassifiedFailure {
                             error: error_str,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
                         }
@@ -955,6 +974,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         let error = error.to_string();
                         BasicEffectResult::ClassifiedFailure {
                             error,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateEnded,
                         }
@@ -965,6 +985,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         let error = format!("{error}\n{}", created.post_error_note());
                         BasicEffectResult::ClassifiedFailure {
                             error,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::Observed(created.into()),
                         }
@@ -974,6 +995,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             format!("{error}\ncreate still in progress; the next apply resumes it");
                         BasicEffectResult::ClassifiedFailure {
                             error,
+                            recovery: None,
                             resource_id: resource.id.clone(),
                             applied: Applied::CreateInFlight(pending),
                         }
@@ -1040,6 +1062,26 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
+            let owner_schema = preparation
+                .schemas()
+                .get_for(resolved_resource)
+                .expect("managed_update_schema proved that the owner-bound schema exists");
+            let comparison = match ctx
+                .comparison_provider
+                .comparison_context_for(id, owner_schema)
+            {
+                Ok(comparison) => comparison,
+                Err(error) => {
+                    return StartedBasicEffectResult::new(
+                        started_effect,
+                        started,
+                        BasicEffectResult::Failure {
+                            error: error.to_string(),
+                            refresh: None,
+                        },
+                    );
+                }
+            };
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.iter().any(|k| k == key) {
                     continue;
@@ -1075,6 +1117,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         type_info,
                     },
                     resolved_to.ignore_changes(),
+                    &comparison,
                 );
                 if changed {
                     effective_changed.push(key.clone());
@@ -1305,6 +1348,9 @@ mod process_basic_result_tests {
             } => state,
             Applied::Observed(_created) => panic!("unexpected observed create"),
             Applied::CreateInFlight(_pending) => panic!("unexpected in-flight create"),
+            Applied::CreateOutcomeUnknown(_unknown) => {
+                panic!("unexpected unknown create outcome")
+            }
             Applied::CreateEnded => panic!("unexpected ended create"),
             Applied::Imported(_state) => panic!("unexpected import"),
             Applied::DataSource(_state) => panic!("unexpected data source"),

@@ -40,7 +40,8 @@ impl<'a, S> PureMetaStep<'a, S> {
             | Effect::Read { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
-            | Effect::Move { .. } => None,
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. } => None,
         }
     }
 }
@@ -77,7 +78,16 @@ pub(super) fn failure_dependency_key<S>(effect: &Effect<S>) -> Option<String> {
         Effect::DeferredReplace(payload) => {
             Some(payload.template.target.scheduler_key().to_string())
         }
-        _ => effect.binding_name(),
+        Effect::ReleaseListKeys { .. } => None,
+        Effect::Read { .. }
+        | Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. } => effect.binding_name(),
     }
 }
 
@@ -86,7 +96,16 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
         Effect::DeferredCreate { template, .. } => Some(template.target.display_name()),
         Effect::DeferredReplace(payload) => Some(payload.template.target.display_name()),
-        _ => effect.binding_name(),
+        Effect::ReleaseListKeys { .. } => None,
+        Effect::Read { .. }
+        | Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. } => effect.binding_name(),
     }
 }
 

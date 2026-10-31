@@ -258,5 +258,25 @@ The plan output shows each resource with its effect type:
 - **Update** (`~`) -- existing resource with attribute changes
 - **Delete** (`-`) -- resource to be removed
 - **Replace** (`+/-`) -- resource that must be destroyed and recreated
+- **Release** (`!`) -- an omitted key is no longer authored by the configuration,
+  but the remote value is left unchanged because the API does not reset omitted keys
 
-A summary line shows the total count of each effect type.
+A summary line shows the total count of each effect type. Releases have their own
+`to release` count; a plan containing only releases is not reported as "No changes."
+
+## Keyed partial-update list releases
+
+Some provider list attributes are maps in list form: every element has a key,
+and an update changes only the keys sent to the API. Omitting an element does
+not delete or reset its remote value. When a provider declares this behavior,
+Carina shows an authored key removed from configuration as a release instead of
+as a misleading deletion:
+
+```text
+! target_group_attributes["stickiness.enabled"]: left as 'true' (AWS does not revert omitted keys; write the default value to revert)
+```
+
+Applying a release makes no provider API call for that key. It only stops
+treating the element as authored in Carina state, so later plans hide it in the
+same way as a service-added default. To reset the remote setting, keep the
+element in configuration and write the API's default value explicitly.
