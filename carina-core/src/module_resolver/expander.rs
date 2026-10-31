@@ -9,8 +9,8 @@ use crate::binding_index::{BindingIndex, RefType, RefTypeError};
 use crate::eval_value::{BareStructuralHandle, StructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
-    ArgumentOrigin, BindingName, DeferredForExpression, ModuleArgument, ModuleCall, ParseError,
-    ParsedFile, WaitBinding,
+    ArgumentOrigin, BindingName, DeferredForBody, ModuleArgument, ModuleCall, ParseError,
+    ParsedDeferredForExpression, ParsedFile, WaitBinding,
 };
 use crate::resource::{
     AccessMissPolicy, CompositionCall, CompositionCallPath, ConcreteValue, DataSource,
@@ -67,14 +67,49 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         binding_index: Option<&BindingIndex<'_>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
     ) -> Result<ParsedFile, ModuleError> {
-        self.expand_module_call_inner(
-            call,
-            instance_prefix,
-            ref_check,
-            binding_index,
-            resolved_bindings,
-        )
-        .map_err(|error| error.with_failing_call(call.id().clone()))
+        let expanded = self
+            .expand_module_call_inner(
+                call,
+                instance_prefix,
+                ref_check,
+                binding_index,
+                resolved_bindings,
+            )
+            .map_err(|error| error.with_failing_call(call.id().clone()))?;
+        if let Some(error) =
+            ModuleError::from_errors(super::resolver::deferred_for_body_errors(&expanded))
+        {
+            return Err(error.with_failing_call(call.id().clone()));
+        }
+        Ok(expanded)
+    }
+
+    pub(super) fn expand_module_call_checked_collecting(
+        &self,
+        call: &ModuleCall,
+        instance_prefix: &str,
+        ref_check: &super::resolver::RefCheckWitness,
+        binding_index: Option<&BindingIndex<'_>>,
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    ) -> Result<ParsedFile, Vec<ModuleError>> {
+        let expanded = self
+            .expand_module_call_inner(
+                call,
+                instance_prefix,
+                ref_check,
+                binding_index,
+                resolved_bindings,
+            )
+            .map_err(|error| vec![error.with_failing_call(call.id().clone())])?;
+        let errors = super::resolver::deferred_for_body_errors(&expanded)
+            .into_iter()
+            .map(|error| error.with_failing_call(call.id().clone()))
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(expanded)
+        } else {
+            Err(errors)
+        }
     }
 
     fn expand_module_call_inner(
@@ -680,15 +715,21 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // the loop resolves against the prefixed module bindings and
         // its generated resources are isolated per module instance
         // (carina#3126 PR-B).
-        let expanded_deferred_for_expressions: Vec<DeferredForExpression> = module
-            .deferred_for_expressions
+        let expanded_parsed_deferred_for_expressions: Vec<ParsedDeferredForExpression> = module
+            .parsed_deferred_for_expressions()
             .iter()
-            .map(|d| {
-                let source_file = module
-                    .parser_binding_metadata
-                    .resource_source_file(&d.template_resource.id);
-                prefix_deferred_for_expression(
-                    d,
+            .map(|deferred| {
+                let source_file = match &deferred.body {
+                    DeferredForBody::Resource(resource) => module
+                        .parser_binding_metadata
+                        .resource_source_file(&resource.id),
+                    DeferredForBody::Read(data_source) => module
+                        .parser_binding_metadata
+                        .resource_source_file(&data_source.id),
+                    DeferredForBody::ModuleCall(_) => None,
+                };
+                prefix_parsed_deferred_for_expression(
+                    deferred,
                     instance_prefix,
                     &call.module_name,
                     &module_instance_scope,
@@ -735,7 +776,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         contribution.data_sources = data_sources;
         contribution.compositions = compositions;
         contribution.wait_bindings = expanded_wait_bindings;
-        contribution.deferred_for_expressions = expanded_deferred_for_expressions;
+        *contribution.parsed_deferred_for_expressions_mut() =
+            expanded_parsed_deferred_for_expressions;
         contribution.parser_binding_metadata = expanded_parser_metadata;
         contribution.warnings = module.warnings.clone();
         contribution.expansion_trace = expansion_trace;
@@ -1369,7 +1411,7 @@ fn prefix_constraint_expression(
 ///
 /// The single definition of "expand a module attribute value", shared
 /// by [`prefix_module_resource`] (a module resource's attrs) and
-/// [`prefix_deferred_for_expression`] (a loop body's attrs) so the two
+/// [`prefix_parsed_deferred_for_expression`] (a loop body's attrs) so the two
 /// carriers can never drift — the exact carina#3126 bug class.
 fn prefix_attr_value(
     value: &Value,
@@ -1394,7 +1436,7 @@ fn prefix_attr_value(
 /// `canonicalize_in_place` (the #2222 / #2815 / #2817 sequence).
 ///
 /// The single definition of "expand a module resource", shared by the
-/// `module.resources` loop and `prefix_deferred_for_expression`'s
+/// `module.resources` loop and `prefix_parsed_deferred_for_expression`'s
 /// `template_resource` so a loop body inside a module is prefixed
 /// identically to a top-level module resource (carina#3126 PR-B).
 fn prefix_module_resource(
@@ -1819,114 +1861,87 @@ fn check_composition_argument_type(
         })
 }
 
-/// Instance-prefix a [`DeferredForExpression`] crossing a module
-/// boundary, expanding its loop body the same way the
-/// `module.resources` expansion ([`prefix_module_resource`]) does.
-///
-/// The struct is **destructured exhaustively** — the carina#3061 /
-/// carina#3126 compile-time forcing function: a new
-/// `DeferredForExpression` field stops this compiling until someone
-/// classifies it as binding-name (prefix), value/provenance (pass
-/// through), or loop-local (pass through).
-///
-/// carina#3126 PR-B: the loop body declared inside a module must be
-/// expanded *as if it were a module resource* — otherwise its
-/// generated resources collide across module instances and its
-/// iterable resolves against the wrong (unprefixed) binding. Per
-/// field:
-/// - `binding_name` (the generated-resource address prefix, e.g.
-///   `_domain_validation_options`) → instance-prefixed
-///   unconditionally, exactly like `Resource.binding`, so each module
-///   instance's loop resources are uniquely addressed.
-/// - `attributes` and `template_resource` → the full module-resource
-///   treatment via [`prefix_module_resource`] / the same
-///   ref-rewrite + arg-substitute + canonicalize as `module.resources`.
-/// - `file`/`line`/`header`/`resource_type`/`binding`
-///   → provenance / display / non-binding / loop-local: pass through.
-fn prefix_deferred_for_expression(
-    d: &DeferredForExpression,
+/// Prefix the parser-side deferred-loop typestate while it crosses a module
+/// boundary. The iterable receives caller-argument substitution here; the
+/// fallible resource-only conversion deliberately happens later, after every
+/// enclosing module has completed the same step.
+#[allow(clippy::too_many_arguments)]
+fn prefix_parsed_deferred_for_expression(
+    deferred: &ParsedDeferredForExpression,
     instance_prefix: &str,
     module_name: &str,
     module_instance_scope: &ModuleInstanceScope,
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-) -> Result<DeferredForExpression, ArgumentSubstitutionError> {
-    let DeferredForExpression {
+) -> Result<ParsedDeferredForExpression, ArgumentSubstitutionError> {
+    let ParsedDeferredForExpression {
         file,
         line,
+        span,
         header,
-        resource_type,
-        attributes,
         target,
         iterable,
+        iterable_state,
         binding,
-        template_resource,
-    } = d;
+        body,
+    } = deferred;
     let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
         .expect("module instance prefix is non-empty");
     let legacy_parent = module_call
         .loop_origin()
         .map(|origin| origin.legacy_address().clone())
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
+    let target = match target {
+        crate::parser::DeferredForTarget::Bound { binding } => {
+            crate::parser::DeferredForTarget::Bound {
+                binding: apply_instance_prefix(instance_prefix, binding),
+            }
+        }
+        crate::parser::DeferredForTarget::Unbound { template } => {
+            let mut template = template.clone();
+            template.prefix_for_module(&instance_identity, &legacy_parent);
+            crate::parser::DeferredForTarget::Unbound { template }
+        }
+    };
+    let iterable = prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?;
+    let body = match body {
+        DeferredForBody::Resource(resource) => {
+            DeferredForBody::Resource(Box::new(prefix_module_resource_with_identity(
+                resource,
+                instance_prefix,
+                &instance_identity,
+                module_name,
+                module_instance_scope,
+                module_call,
+                intra_module_bindings,
+                arguments,
+            )?))
+        }
+        DeferredForBody::Read(data_source) => {
+            DeferredForBody::Read(Box::new(prefix_module_data_source(
+                data_source,
+                instance_prefix,
+                module_name,
+                module_instance_scope,
+                module_call,
+                intra_module_bindings,
+                arguments,
+            )?))
+        }
+        DeferredForBody::ModuleCall(call) => DeferredForBody::ModuleCall(call.clone()),
+    };
 
-    Ok(DeferredForExpression {
-        // provenance — pass through (like WaitBinding.line)
+    Ok(ParsedDeferredForExpression {
         file: file.clone(),
         line: *line,
-        // verbatim user-surface display text — pass through
-        // (like WaitBinding.until_raw)
+        span: *span,
         header: header.clone(),
-        // provider-qualified type — not a binding
-        resource_type: resource_type.clone(),
-        // The loop body's attrs may reference module-internal bindings
-        // / module arguments — same shared `prefix_attr_value` the
-        // module resource attrs get.
-        attributes: attributes
-            .iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    prefix_attr_value(v, instance_prefix, intra_module_bindings, arguments)?,
-                ))
-            })
-            .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        // Generated-resource address prefix — `binding_name` is a name
-        // the loop *synthesizes* for its own resources (e.g.
-        // `_domain_validation_options`), NOT a reference to a
-        // pre-existing binding, so the caller-collision concern does
-        // not apply: prefix it unconditionally (same as
-        // `Resource.binding`) to isolate each module instance's loop
-        // resources.
-        target: match target {
-            crate::parser::DeferredForTarget::Bound { binding } => {
-                crate::parser::DeferredForTarget::Bound {
-                    binding: apply_instance_prefix(instance_prefix, binding),
-                }
-            }
-            crate::parser::DeferredForTarget::Unbound { template } => {
-                let mut template = template.clone();
-                template.prefix_for_module(&instance_identity, &legacy_parent);
-                crate::parser::DeferredForTarget::Unbound { template }
-            }
-        },
-        // The full iterable is a value expression: rewrite every reference
-        // and substitute module arguments in both coalesce operands.
-        iterable: prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?,
-        // loop-var pattern kind — loop-local, not a module binding
+        target,
+        iterable,
+        iterable_state: iterable_state.clone(),
         binding: binding.clone(),
-        // Full module-resource treatment — identical to a
-        // `module.resources` entry.
-        template_resource: prefix_module_resource_with_identity(
-            template_resource,
-            instance_prefix,
-            &instance_identity,
-            module_name,
-            module_instance_scope,
-            module_call,
-            intra_module_bindings,
-            arguments,
-        )?,
+        body,
     })
 }
 

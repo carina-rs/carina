@@ -46,8 +46,8 @@ pub struct WaitDiagnostic {
 
 /// Run all wait diagnostics against a parsed file + schema registry.
 /// Returns the full list of errors; callers decide how to surface them.
-pub fn validate_wait_bindings<E>(
-    parsed: &File<E>,
+pub fn validate_wait_bindings<E, D>(
+    parsed: &File<E, D>,
     schemas: &SchemaRegistry,
 ) -> Vec<WaitDiagnostic> {
     if parsed.wait_bindings.is_empty() {
@@ -65,7 +65,14 @@ pub fn validate_wait_bindings<E>(
         if let Some(b) = rref.binding() {
             let id = rref.id();
             let target = match rref {
-                ResourceRef::Resource(_) | ResourceRef::Deferred { .. } => WaitTarget::Pollable {
+                ResourceRef::Resource(_) => WaitTarget::Pollable {
+                    provider: id.provider.clone(),
+                    resource_type: id.resource_type.clone(),
+                },
+                ResourceRef::Deferred {
+                    resource: _resource,
+                    deferred: _deferred,
+                } => WaitTarget::Pollable {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
                 },

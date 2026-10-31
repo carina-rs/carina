@@ -3822,7 +3822,12 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("bound deferred loop parses");
-    let template = parsed.deferred_for_expressions[0].clone();
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )
+    .expect("cross the deferred-body resolution seam");
+    let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
         carina_core::parser::DeferredForTarget::Bound { .. }
@@ -3892,7 +3897,12 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
         &ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    let mut template = parsed.deferred_for_expressions[0].clone();
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )
+    .expect("cross the deferred-body resolution seam");
+    let mut template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
         template.target,
         carina_core::parser::DeferredForTarget::Unbound { .. }

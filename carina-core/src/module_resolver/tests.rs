@@ -14,9 +14,10 @@ use indexmap::IndexMap;
 use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner,
-    LoadedProviderContext, ModuleArgument, ModuleCall, ParsedFile, ProviderContext,
-    ResourceTypePath, TypeExpr,
+    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, DeferredForBody,
+    DeferredForExpression, LoadedProviderContext, ModuleArgument, ModuleCall,
+    ModuleResolvedParsedFile, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedFile,
+    ProviderContext, ResourceTypePath, SourceSpan, TypeExpr,
 };
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
@@ -35,16 +36,19 @@ fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType 
     )
 }
 
-fn resolve_modules(parsed: &mut ParsedFile, base_dir: &std::path::Path) -> Result<(), ModuleError> {
+fn resolve_modules(
+    parsed: ParsedFile,
+    base_dir: &std::path::Path,
+) -> Result<ModuleResolvedParsedFile, ModuleError> {
     super::resolve_modules_providerless(parsed, base_dir)
 }
 
 fn resolve_modules_with_config(
-    parsed: &mut ParsedFile,
+    parsed: ParsedFile,
     base_dir: &std::path::Path,
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
-) -> Result<(), ModuleError> {
+) -> Result<ModuleResolvedParsedFile, ModuleError> {
     super::resolve_modules_with_providerless_config(parsed, base_dir, config, schemas)
 }
 
@@ -70,7 +74,35 @@ fn module_arguments(
         .collect()
 }
 
-fn resolve_anonymous_loop_module_fixture(module_body: &str, root_body: &str) -> ParsedFile {
+fn parsed_deferred_resource(expression: DeferredForExpression) -> ParsedDeferredForExpression {
+    let DeferredForExpression {
+        file,
+        line,
+        header,
+        resource_type: _,
+        attributes: _,
+        target,
+        iterable,
+        binding,
+        template_resource,
+    } = expression;
+    ParsedDeferredForExpression {
+        file,
+        line,
+        span: SourceSpan::dummy(),
+        header,
+        target,
+        iterable,
+        iterable_state: crate::parser::ParsedDeferredForIterableState::Deferred,
+        binding,
+        body: DeferredForBody::Resource(Box::new(template_resource)),
+    }
+}
+
+fn resolve_anonymous_loop_module_fixture(
+    module_body: &str,
+    root_body: &str,
+) -> ModuleResolvedParsedFile {
     let root = tempfile::tempdir().expect("temporary module fixture");
     let module_dir = root.path().join("modules/network");
     fs::create_dir_all(&module_dir).expect("create module directory");
@@ -78,10 +110,9 @@ fn resolve_anonymous_loop_module_fixture(module_body: &str, root_body: &str) -> 
     let root_file = root.path().join("main.crn");
     fs::write(&root_file, root_body).expect("write root body");
 
-    let mut parsed = crate::parser::parse_file(root_body, &root_file, &ProviderContext::default())
+    let parsed = crate::parser::parse_file(root_body, &root_file, &ProviderContext::default())
         .expect("root fixture parses");
-    resolve_modules(&mut parsed, root.path()).expect("module fixture expands");
-    parsed
+    resolve_modules(parsed, root.path()).expect("module fixture expands")
 }
 
 fn loop_module_identity_registry() -> crate::schema::SchemaRegistry {
@@ -280,10 +311,9 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     let root_file = root.path().join("main.crn");
     fs::write(&root_file, root_source).expect("write root fixture");
 
-    let mut parsed =
-        crate::parser::parse_file(root_source, &root_file, &ProviderContext::default())
-            .expect("root fixture parses");
-    resolve_modules(&mut parsed, root.path()).expect("nested loop module expands");
+    let parsed = crate::parser::parse_file(root_source, &root_file, &ProviderContext::default())
+        .expect("root fixture parses");
+    let mut parsed = resolve_modules(parsed, root.path()).expect("nested loop module expands");
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
         1,
@@ -396,7 +426,7 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
     let source = "let missing = use { source = './missing' }\nmissing {}\n";
     let base = tempfile::tempdir().expect("temporary module root");
     let source_file = base.path().join("main.crn");
-    let mut parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
+    let parsed = crate::parser::parse_file(source, &source_file, &ProviderContext::default())
         .expect("fixture must parse");
     let expected_span = parsed.module_calls[0].source_span();
     assert_eq!(
@@ -411,7 +441,7 @@ fn resolver_error_from_parsed_call_retains_call_identity() {
     );
 
     let error = super::resolve_modules_with_providerless_config(
-        &mut parsed,
+        parsed,
         base.path(),
         &ProviderContext::default(),
         &crate::schema::SchemaRegistry::new(),
@@ -488,7 +518,7 @@ fn create_test_module() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -618,7 +648,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -807,7 +837,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -994,7 +1024,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -1139,7 +1169,7 @@ fn create_module_with_attributes() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -1453,7 +1483,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -1555,7 +1585,7 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
 /// (one `awscc.iam.Role` whose `role_name` comes from a `name` argument)
 /// and a `root/main.crn` with the caller-supplied body; returns the parsed
 /// root with modules already resolved.
-fn resolve_thing_fixture(root_body: &str) -> ParsedFile {
+fn resolve_thing_fixture(root_body: &str) -> ModuleResolvedParsedFile {
     let tmp = tempfile::tempdir().expect("tempdir");
     let module_dir = tmp.path().join("modules/thing");
     fs::create_dir_all(&module_dir).unwrap();
@@ -1579,12 +1609,11 @@ let role = awscc.iam.Role {
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
-    parsed
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_names(parsed: &ParsedFile) -> HashSet<String> {
+fn role_names(parsed: &ModuleResolvedParsedFile) -> HashSet<String> {
     parsed
         .resources
         .iter()
@@ -2176,8 +2205,8 @@ thing { name = 'after-edit' }
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let mut parsed = resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed");
 
     // Discover the new prefix from the parsed Role.
     let role_name_before = parsed
@@ -2819,7 +2848,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -2884,9 +2913,9 @@ fn test_nested_module_two_level() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
 
-    resolve_modules(&mut parsed, &fixtures_dir).unwrap();
+    let parsed = resolve_modules(parsed, &fixtures_dir).unwrap();
 
     // Should have resources from both inner_module (vpc) and outer_module (sg)
     let resource_types: Vec<&str> = parsed
@@ -2950,8 +2979,8 @@ mock.test.Consumer {
     .unwrap();
 
     let root = fs::read_to_string(fixture.path().join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&root, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, fixture.path()).expect("expand both module levels");
+    let parsed = crate::parser::parse(&root, &ProviderContext::default()).unwrap();
+    let parsed = resolve_modules(parsed, fixture.path()).expect("expand both module levels");
 
     let consumer = parsed
         .resources
@@ -3007,9 +3036,9 @@ fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
 
-    resolve_modules(&mut parsed, &fixtures_dir).unwrap();
+    let parsed = resolve_modules(parsed, &fixtures_dir).unwrap();
 
     // Find the SecurityGroup resource and read its `vpc_id` attribute.
     let sg = parsed
@@ -3057,9 +3086,9 @@ fn test_nested_module_three_level() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root_three_level.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
 
-    resolve_modules(&mut parsed, &fixtures_dir).unwrap();
+    let parsed = resolve_modules(parsed, &fixtures_dir).unwrap();
 
     // Should have the VPC resource from inner_module (through middle_module)
     let resource_types: Vec<&str> = parsed
@@ -3081,9 +3110,9 @@ fn test_nested_module_cycle_detection() {
     let fixtures_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
     let content = fs::read_to_string(fixtures_dir.join("root_cycle.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
 
-    let result = resolve_modules(&mut parsed, &fixtures_dir);
+    let result = resolve_modules(parsed, &fixtures_dir);
     assert!(
         result.is_err(),
         "Should detect circular import, but got: {:?}",
@@ -3441,7 +3470,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -3615,7 +3644,7 @@ let root = outer { outer_port = producer.port }
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
     let resolver = {
@@ -3802,7 +3831,7 @@ fn test_argument_validation_no_message_uses_default() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -3869,7 +3898,7 @@ fn test_argument_validation_len_with_list() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -3966,7 +3995,7 @@ fn test_require_block_passes() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4042,7 +4071,7 @@ fn test_require_block_fails_with_not_expr() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4117,7 +4146,7 @@ fn test_require_block_len_function() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4210,7 +4239,7 @@ fn test_require_block_multiple_constraints() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4556,7 +4585,7 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
 /// root body to a tempdir, parse and resolve, return the parsed root with
 /// modules expanded. Mirrors the directory-scoped fixture shape required by
 /// CLAUDE.md so single-file thinking can't sneak back in.
-fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ParsedFile {
+fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ModuleResolvedParsedFile {
     let tmp = tempfile::tempdir().expect("tempdir");
     let module_dir = tmp.path().join("modules/m");
     fs::create_dir_all(&module_dir).unwrap();
@@ -4567,12 +4596,11 @@ fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ParsedFile
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
-    parsed
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_attr<'a>(parsed: &'a ParsedFile, attr: &str) -> &'a Value {
+fn role_attr<'a>(parsed: &'a ModuleResolvedParsedFile, attr: &str) -> &'a Value {
     parsed
         .resources
         .iter()
@@ -4732,8 +4760,8 @@ let child = selector {
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let mut parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir).expect("module postfix accesses must expand");
+    let parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    let parsed = resolve_modules(parsed, &root_dir).expect("module postfix accesses must expand");
 
     let selected = parsed
         .resources
@@ -4782,8 +4810,8 @@ let child = selector { items = ["x", "y"] }
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let mut parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
-    let error = resolve_modules(&mut parsed, &root_dir)
+    let parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    let error = resolve_modules(parsed, &root_dir)
         .expect_err("known module-argument misses must fail during module expansion");
     let message = error.to_string();
     assert!(
@@ -4875,9 +4903,9 @@ let child = selector { vpc = source }
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
-    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
-    resolve_modules_with_config(
-        &mut parsed,
+    let parsed = crate::parser::parse(root_body, &context).unwrap();
+    let parsed = resolve_modules_with_config(
+        parsed,
         &root_dir,
         &context,
         &crate::schema::SchemaRegistry::new(),
@@ -4929,9 +4957,9 @@ let child = imported { peer = source }
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
-    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
-    resolve_modules_with_config(
-        &mut parsed,
+    let parsed = crate::parser::parse(root_body, &context).unwrap();
+    let parsed = resolve_modules_with_config(
+        parsed,
         &root_dir,
         &context,
         &crate::schema::SchemaRegistry::new(),
@@ -4980,9 +5008,9 @@ let child = imported {
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
-    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
+    let parsed = crate::parser::parse(root_body, &context).unwrap();
     let error = resolve_modules_with_config(
-        &mut parsed,
+        parsed,
         &root_dir,
         &context,
         &crate::schema::SchemaRegistry::new(),
@@ -5024,9 +5052,9 @@ let child = imported { peer = peer.identifier }
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
-    let mut parsed = crate::parser::parse(root_body, &context).unwrap();
-    resolve_modules_with_config(
-        &mut parsed,
+    let parsed = crate::parser::parse(root_body, &context).unwrap();
+    let parsed = resolve_modules_with_config(
+        parsed,
         &root_dir,
         &context,
         &crate::schema::SchemaRegistry::new(),
@@ -5402,8 +5430,8 @@ let prod = bootstrap {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir)
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(parsed, &root_dir)
         .expect("list(String) should flow through usecase to inner module");
 }
 
@@ -5469,8 +5497,8 @@ let prod = outer {}
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir)
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(parsed, &root_dir)
         .expect("list(String) via let alias should pass-through to inner module");
 }
 
@@ -5532,8 +5560,8 @@ let prod = outer {}
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir)
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(parsed, &root_dir)
         .expect("map(String) should flow through usecase to inner module");
 }
 
@@ -5597,8 +5625,8 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let error = resolve_modules(&mut parsed, &root_dir)
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let error = resolve_modules(parsed, &root_dir)
         .expect_err("the checked graph must reject String -> list(String)");
     assert!(
         error
@@ -5667,8 +5695,8 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let error = resolve_modules(&mut parsed, &root_dir)
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let error = resolve_modules(parsed, &root_dir)
         .expect_err("the checked graph must reject Int -> String");
     assert!(
         error.to_string().contains("cannot assign Int to 'name'"),
@@ -5735,8 +5763,8 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let error = resolve_modules(&mut parsed, &root_dir)
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let error = resolve_modules(parsed, &root_dir)
         .expect_err("the checked graph must reject list(Int) -> list(String)");
     assert!(
         error
@@ -5784,14 +5812,14 @@ outer {
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
     let content = fs::read_to_string(tmp.path().join("main.crn")).expect("root source");
-    let mut parsed =
-        crate::parser::parse(&content, &config).expect("root configuration must parse");
+    let parsed = crate::parser::parse(&content, &config).expect("root configuration must parse");
     resolve_modules_with_config(
-        &mut parsed,
+        parsed,
         tmp.path(),
         &config,
         &crate::schema::SchemaRegistry::new(),
-    )
+    )?;
+    Ok(())
 }
 
 /// A declared resource reference is a typed handle for boundary checking even
@@ -5851,9 +5879,9 @@ let instance = child { source = source }
     config
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
-    let mut parsed = crate::parser::parse(root_source, &config).expect("root parse");
-    resolve_modules_with_config(
-        &mut parsed,
+    let parsed = crate::parser::parse(root_source, &config).expect("root parse");
+    let parsed = resolve_modules_with_config(
+        parsed,
         tmp.path(),
         &config,
         &crate::schema::SchemaRegistry::new(),
@@ -5901,9 +5929,9 @@ let instance = child { source = source }
     config
         .resource_types
         .insert(("mock".to_string(), "test.resource".to_string()));
-    let mut parsed = crate::parser::parse(root_source, &config).expect("root parse");
+    let parsed = crate::parser::parse(root_source, &config).expect("root parse");
     let error = resolve_modules_with_config(
-        &mut parsed,
+        parsed,
         tmp.path(),
         &config,
         &crate::schema::SchemaRegistry::new(),
@@ -5998,8 +6026,8 @@ let prod = outer {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir).expect("3-deep list pass-through should resolve");
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    resolve_modules(parsed, &root_dir).expect("3-deep list pass-through should resolve");
 }
 
 // carina-rs/carina#2611: closed-set string types in `arguments`.
@@ -6041,7 +6069,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -6205,8 +6233,8 @@ let r  = uc { env = 'dev' }
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let parsed = resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed");
 
     assert_eq!(
         role_names(&parsed),
@@ -6266,8 +6294,8 @@ m { foo = 'x' }
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let err = resolve_modules(&mut parsed, &root_dir).unwrap_err();
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let err = resolve_modules(parsed, &root_dir).unwrap_err();
     let msg = format!("{err:?}");
     assert!(
         msg.contains("DuplicateBinding") && msg.contains("foo"),
@@ -6289,7 +6317,7 @@ m { foo = 'x' }
 /// the PR-A → PR-B boundary.
 #[test]
 fn test_expand_module_call_propagates_deferred_for_expressions() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -6311,46 +6339,47 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
-        m.deferred_for_expressions.push(DeferredForExpression {
-            file: None,
-            line: 7,
-            header: "for _, opt in cert.domain_validation_options".to_string(),
-            resource_type: "aws.route53.RecordSet".to_string(),
-            attributes: vec![],
-            target: DeferredForTarget::Bound {
-                binding: "_domain_validation_options".to_string(),
-            },
-            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            binding: ForBinding::Map("_".to_string(), "opt".to_string()),
-            template_resource: Resource {
-                id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
-                attributes: {
-                    // The loop body references the module-internal
-                    // `cert` binding — the part of the template
-                    // treatment that actually SURVIVES materialization
-                    // (`substitute_attrs` does not re-run ref-rewrite).
-                    // PR-B must prefix this to `r.cert` so the
-                    // generated RecordSet wires to the prefixed module
-                    // certificate; without it the loop body silently
-                    // dangles. Round-3 review test gap.
-                    let mut a = IndexMap::new();
-                    a.insert(
-                        "validated_cert".to_string(),
-                        Value::resource_ref("cert".to_string(), "arn".to_string(), vec![]),
-                    );
-                    a
+        m.parsed_deferred_for_expressions_mut()
+            .push(parsed_deferred_resource(DeferredForExpression {
+                file: None,
+                line: 7,
+                header: "for _, opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.RecordSet".to_string(),
+                attributes: vec![],
+                target: DeferredForTarget::Bound {
+                    binding: "_domain_validation_options".to_string(),
                 },
-                directives: Directives::default(),
-                resolved_ignore_changes: Default::default(),
-                prefixes: HashMap::new(),
-                binding: None,
-                dependency_bindings: BTreeSet::new(),
-                module_source: None,
-                default_tag_keys: Default::default(),
-                loop_provenance: Default::default(),
-                quoted_string_attrs: std::collections::HashSet::new(),
-            },
-        });
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                binding: ForBinding::Map("_".to_string(), "opt".to_string()),
+                template_resource: Resource {
+                    id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
+                    attributes: {
+                        // The loop body references the module-internal
+                        // `cert` binding — the part of the template
+                        // treatment that actually SURVIVES materialization
+                        // (`substitute_attrs` does not re-run ref-rewrite).
+                        // PR-B must prefix this to `r.cert` so the
+                        // generated RecordSet wires to the prefixed module
+                        // certificate; without it the loop body silently
+                        // dangles. Round-3 review test gap.
+                        let mut a = IndexMap::new();
+                        a.insert(
+                            "validated_cert".to_string(),
+                            Value::resource_ref("cert".to_string(), "arn".to_string(), vec![]),
+                        );
+                        a
+                    },
+                    directives: Directives::default(),
+                    resolved_ignore_changes: Default::default(),
+                    prefixes: HashMap::new(),
+                    binding: None,
+                    dependency_bindings: BTreeSet::new(),
+                    module_source: None,
+                    default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
+                    quoted_string_attrs: std::collections::HashSet::new(),
+                },
+            }));
         m
     };
 
@@ -6375,16 +6404,12 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // reached the caller instead of vanishing at the expansion
     // boundary.
     assert_eq!(
-        expanded.deferred_for_expressions.len(),
+        expanded.parsed_deferred_for_expressions().len(),
         1,
         "module-internal deferred-for must survive expand_module_call (carina#3126)"
     );
-    let d = &expanded.deferred_for_expressions[0];
-    assert_eq!(d.resource_type, "aws.route53.RecordSet");
-    assert!(
-        d.reference_candidates()
-            .contains("r.cert.domain_validation_options")
-    );
+    let d = &expanded.parsed_deferred_for_expressions()[0];
+    assert!(d.root_bindings().contains("r.cert"));
     // carina#3126 PR-B: binding-name fields are instance-prefixed so
     // the loop-generated resources are isolated per module instance
     // and the iterable resolves against the (now prefixed) module
@@ -6400,7 +6425,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // `cert` is a module-internal `let cert` binding → prefixed
     // (same caller-collision guard `rewrite_intra_module_refs`
     // applies to a `ResourceRef` head; a caller-shared name would
-    // NOT be prefixed — see prefix_deferred_for_expression).
+    // NOT be prefixed — see prefix_parsed_deferred_for_expression).
     assert_eq!(
         d.root_bindings(),
         std::collections::BTreeSet::from(["r.cert".to_string()]),
@@ -6412,8 +6437,10 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // intra-module ref must be prefixed, and module_source stamped, so
     // the generated RecordSet wires to the prefixed module certificate.
     // Round-3 review found this load-bearing path had zero coverage.
-    let validated_cert = d
-        .template_resource
+    let DeferredForBody::Resource(template_resource) = &d.body else {
+        panic!("deferred test body must remain a resource")
+    };
+    let validated_cert = template_resource
         .attributes
         .get("validated_cert")
         .expect("template attr preserved");
@@ -6430,33 +6457,35 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     }
     assert!(
         matches!(
-            d.template_resource.module_source,
+            template_resource.module_source,
             Some(crate::resource::ModuleSource::Module(ref source)) if source.instance() == "r"
         ),
         "template_resource must carry the module instance source; got: {:?}",
-        d.template_resource.module_source
+        template_resource.module_source
     );
 }
 
 #[test]
 fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForTarget, ForBinding};
 
     let mut module = create_test_module_with_anonymous_resource();
     module.resources.clear();
-    module.deferred_for_expressions.push(DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for _, account in accounts.items".to_string(),
-        resource_type: "awscc.sso.Assignment".to_string(),
-        attributes: Vec::new(),
-        target: DeferredForTarget::Bound {
-            binding: "assignments".to_string(),
-        },
-        iterable: Value::resource_ref("accounts", "items", Vec::new()),
-        binding: ForBinding::Map("_".to_string(), "account".to_string()),
-        template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
-    });
+    module
+        .parsed_deferred_for_expressions_mut()
+        .push(parsed_deferred_resource(DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for _, account in accounts.items".to_string(),
+            resource_type: "awscc.sso.Assignment".to_string(),
+            attributes: Vec::new(),
+            target: DeferredForTarget::Bound {
+                binding: "assignments".to_string(),
+            },
+            iterable: Value::resource_ref("accounts", "items", Vec::new()),
+            binding: ForBinding::Map("_".to_string(), "account".to_string()),
+            template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
+        }));
 
     let resolver = {
         let mut resolver = ModuleResolver::new(".");
@@ -6467,22 +6496,24 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
     };
     let call = ModuleCall::test("assignments".to_string(), None, HashMap::new());
 
-    let first = resolver
-        .expand_module_call(&call, "first")
-        .unwrap()
-        .deferred_for_expressions
+    let first_expanded = resolver.expand_module_call(&call, "first").unwrap();
+    let first = first_expanded
+        .into_parsed_deferred_for_expressions()
         .into_iter()
         .next()
-        .unwrap()
-        .template_resource;
-    let second = resolver
-        .expand_module_call(&call, "second")
-        .unwrap()
-        .deferred_for_expressions
+        .unwrap();
+    let DeferredForBody::Resource(first) = first.body else {
+        panic!("deferred test body must remain a resource")
+    };
+    let second_expanded = resolver.expand_module_call(&call, "second").unwrap();
+    let second = second_expanded
+        .into_parsed_deferred_for_expressions()
         .into_iter()
         .next()
-        .unwrap()
-        .template_resource;
+        .unwrap();
+    let DeferredForBody::Resource(second) = second.body else {
+        panic!("deferred test body must remain a resource")
+    };
 
     assert_eq!(first.id.identity_str(), None);
     assert_eq!(second.id.identity_str(), None);
@@ -6500,38 +6531,39 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
 /// CI while silently breaking caller-passed iterables.
 #[test]
 fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
         // No module resource/wait is bound `accounts` — it is meant to
         // come from the caller (e.g. an argument), so it is NOT in
         // `intra_module_bindings` and must survive unprefixed.
-        m.deferred_for_expressions.push(DeferredForExpression {
-            file: None,
-            line: 3,
-            header: "for _, a in accounts.list".to_string(),
-            resource_type: "awscc.sso.Assignment".to_string(),
-            attributes: vec![],
-            target: DeferredForTarget::Bound {
-                binding: "_list".to_string(),
-            },
-            iterable: Value::resource_ref("accounts", "list", Vec::new()),
-            binding: ForBinding::Map("_".to_string(), "a".to_string()),
-            template_resource: Resource {
-                id: ResourceId::with_identity("sso.Assignment", "placeholder"),
-                attributes: HashMap::new().into_iter().collect(),
-                directives: Directives::default(),
-                resolved_ignore_changes: Default::default(),
-                prefixes: HashMap::new(),
-                binding: None,
-                dependency_bindings: BTreeSet::new(),
-                module_source: None,
-                default_tag_keys: Default::default(),
-                loop_provenance: Default::default(),
-                quoted_string_attrs: std::collections::HashSet::new(),
-            },
-        });
+        m.parsed_deferred_for_expressions_mut()
+            .push(parsed_deferred_resource(DeferredForExpression {
+                file: None,
+                line: 3,
+                header: "for _, a in accounts.list".to_string(),
+                resource_type: "awscc.sso.Assignment".to_string(),
+                attributes: vec![],
+                target: DeferredForTarget::Bound {
+                    binding: "_list".to_string(),
+                },
+                iterable: Value::resource_ref("accounts", "list", Vec::new()),
+                binding: ForBinding::Map("_".to_string(), "a".to_string()),
+                template_resource: Resource {
+                    id: ResourceId::with_identity("sso.Assignment", "placeholder"),
+                    attributes: HashMap::new().into_iter().collect(),
+                    directives: Directives::default(),
+                    resolved_ignore_changes: Default::default(),
+                    prefixes: HashMap::new(),
+                    binding: None,
+                    dependency_bindings: BTreeSet::new(),
+                    module_source: None,
+                    default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
+                    quoted_string_attrs: std::collections::HashSet::new(),
+                },
+            }));
         m
     };
 
@@ -6551,7 +6583,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     });
 
     let expanded = resolver.expand_module_call(&call, "prod").unwrap();
-    let d = &expanded.deferred_for_expressions[0];
+    let d = &expanded.parsed_deferred_for_expressions()[0];
     // `binding_name` is a synthesized address prefix → always prefixed.
     assert_eq!(d.target.bound_binding(), Some("prod._list"));
     // `accounts` is NOT module-internal → must stay UNPREFIXED
@@ -6629,20 +6661,20 @@ let r = registry {
 "#;
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
-    let mut parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
-    resolve_modules(&mut parsed, &root_dir).expect("resolve_modules should succeed");
+    let parsed = crate::parser::parse(root_body, &ProviderContext::default()).unwrap();
+    let parsed = resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed");
 
     // carina#3126: the module-internal deferred-for survived the full
     // resolve_modules pipeline (through relabel_export_phase +
     // merge_parsed_file), not just expand_module_call.
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "module-internal deferred-for must reach the caller through the \
          single merge surface (carina#3126); got: {:?}",
-        parsed.deferred_for_expressions
+        parsed.deferred_for_expressions()
     );
-    let d = &parsed.deferred_for_expressions[0];
+    let d = &parsed.deferred_for_expressions()[0];
     assert_eq!(d.resource_type, "aws.route53.RecordSet");
     assert!(
         d.reference_candidates()
@@ -6677,6 +6709,116 @@ let r = registry {
     );
     assert_eq!(parsed.wait_bindings[0].binding, "r.cert_issued");
     assert_eq!(parsed.wait_bindings[0].target, "r.cert");
+}
+
+#[test]
+fn resolve_modules_rebuilds_deferred_for_from_typed_parser_order() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.resource { name = "source" }
+
+let first = for item in source.first {
+  mock.test.resource { name = item comment = "first" }
+}
+
+let second = for item in source.second {
+  mock.test.resource { name = item comment = "second" }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("deferred resource loops parse");
+
+    let parsed = resolve_modules(parsed, tmp.path()).expect("deferred loops finalize");
+
+    let comments = parsed
+        .deferred_for_expressions()
+        .iter()
+        .map(|deferred| deferred.template_resource.get_attr("comment"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        comments,
+        [
+            Some(&Value::Concrete(ConcreteValue::String("first".into()))),
+            Some(&Value::Concrete(ConcreteValue::String("second".into()))),
+        ],
+        "finalization must derive order and templates from the typed list alone"
+    );
+}
+
+#[test]
+fn finalize_rejects_undefined_iterable_for_managed_resource_body() {
+    let fixture = tempfile::tempdir().expect("undefined managed iterable fixture");
+    let source_file = fixture.path().join("main.crn");
+    let source = r#"let items = ["one"]
+let resources = for item in itmes {
+  mock.test.resource { name = item }
+}
+"#;
+    fs::write(&source_file, source).expect("write undefined iterable fixture");
+    let loaded = crate::config_loader::load_configuration_with_config(
+        fixture.path(),
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("undefined iterable remains deferred until finalization");
+    let identifier_scope_errors = crate::parser::check_identifier_scope(&loaded.parsed);
+    assert!(matches!(
+        identifier_scope_errors.as_slice(),
+        [crate::parser::ParseError::Located { error, .. }]
+            if matches!(error.as_ref(), crate::parser::ParseError::UndefinedDeferredIterable { name, .. } if name == "itmes")
+    ));
+
+    let error = super::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        fixture.path(),
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("finalization must reject an undefined managed-resource iterable");
+    let ModuleError::ParseInFile { path, error } = error.root_cause() else {
+        panic!("expected a file-owned parse error, got {error:?}");
+    };
+    assert_eq!(path, &source_file);
+    assert!(matches!(
+        error.as_ref(),
+        crate::parser::ParseError::UndefinedDeferredIterable {
+            name,
+            line: 2,
+            span,
+            ..
+        } if name == "itmes" && span.start_line() == 2 && span.end_line() == 4
+    ));
+    assert!(error.to_string().contains("Did you mean `items`"));
+}
+
+#[test]
+fn finalize_reports_every_undefined_iterable_for_managed_resource_bodies() {
+    let parsed = crate::parser::parse(
+        r#"let first = for item in frist_items {
+  mock.test.resource { name = item }
+}
+let second = for item in secnd_items {
+  mock.test.resource { name = item }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("both undefined iterables remain deferred until finalization");
+
+    let error = super::resolve_modules_providerless(parsed, std::path::Path::new("."))
+        .expect_err("finalization must reject both undefined iterables");
+    let message = error.display_relative_to(std::path::Path::new("."));
+
+    assert!(
+        message.contains("Undefined identifier `frist_items`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Undefined identifier `secnd_items`"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -6736,9 +6878,9 @@ let registry_publish = registry {
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
     let config = ProviderContext::default();
-    let mut parsed = crate::parser::parse(root_body, &config).expect("root must parse");
-    resolve_modules_with_config(
-        &mut parsed,
+    let parsed = crate::parser::parse(root_body, &config).expect("root must parse");
+    let parsed = resolve_modules_with_config(
+        parsed,
         &root_dir,
         &config,
         &crate::schema::SchemaRegistry::new(),
@@ -6880,9 +7022,9 @@ let outer = outer_module {}
     fs::write(root_dir.join("main.crn"), root_body).unwrap();
 
     let config = ProviderContext::default();
-    let mut parsed = crate::parser::parse(root_body, &config).expect("root must parse");
-    resolve_modules_with_config(
-        &mut parsed,
+    let parsed = crate::parser::parse(root_body, &config).expect("root must parse");
+    let parsed = resolve_modules_with_config(
+        parsed,
         &root_dir,
         &config,
         &crate::schema::SchemaRegistry::new(),
@@ -7141,8 +7283,8 @@ let rd = infra_deploy {
     .unwrap();
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
-    let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let result = resolve_modules(&mut parsed, &root_dir);
+    let parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
+    let result = resolve_modules(parsed, &root_dir);
     assert!(
         result.is_ok(),
         "list(T)/map(T) usecase arguments must accept a `read`'s \

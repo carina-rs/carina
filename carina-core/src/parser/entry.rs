@@ -1108,7 +1108,7 @@ fn parse_with_seeded_bindings_inner(
     parsed.structural_bindings = ctx.structural_bindings;
     parsed.parser_binding_metadata = parser_binding_metadata;
     parsed.warnings = warnings;
-    parsed.deferred_for_expressions = ctx.deferred_for_expressions;
+    *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;
     let binding_scope = crate::binding_index::BindingNameSet::from_parsed(&parsed);
     parsed.set_loop_binding_scope(binding_scope.iter_names().map(str::to_string).collect());
     // The parser never synthesizes composition resources, so its default

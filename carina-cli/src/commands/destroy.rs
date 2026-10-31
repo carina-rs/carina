@@ -243,7 +243,7 @@ impl DestroyedInstances {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked_owned(
-    mut validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
+    mut validated_config: ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -1401,7 +1401,7 @@ async fn run_destroy_locked(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked_with_ctx(
-    validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
+    validated_config: ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -2215,6 +2215,13 @@ mod tests {
     #[tokio::test]
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+            parsed,
+            &downstream,
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("test fixture crosses module resolution");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(

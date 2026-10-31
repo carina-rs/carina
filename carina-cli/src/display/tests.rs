@@ -91,7 +91,11 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     // Should not panic
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -117,7 +121,11 @@ fn test_print_plan_with_internal_dependency_does_not_panic() {
     // Should not panic
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -664,7 +672,11 @@ fn test_print_plan_compact_does_not_panic() {
     // Should not panic
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         None,
@@ -696,7 +708,11 @@ fn test_print_plan_compact_with_anonymous_resources() {
     // Should not panic; anonymous resources should show hints
     print_plan(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         None,
@@ -833,7 +849,11 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
 
     let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -943,7 +963,11 @@ fn test_deferred_replace_renders_top_level() {
 
     let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -983,7 +1007,11 @@ fn test_deferred_replace_renders_dependent_children() {
 
     let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -1018,7 +1046,11 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
 
     let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::Full,
         &HashMap::new(),
         None,
@@ -1609,7 +1641,11 @@ fn plan_summary_carries_the_exact_export_changes_rendered_by_text_output() {
         type_expr: None,
         new_value: Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     }];
-    let summary = PlanChangeSummary::new(&plan, &export_changes, &[]);
+    let summary = PlanChangeSummary::new(
+        &plan,
+        &export_changes,
+        &crate::plan_summary::resolved_deferred_for_for_test([]),
+    );
     let output = strip_ansi(&format_plan_for_test(
         &plan,
         &summary,
@@ -2015,7 +2051,11 @@ fn module_children_render_with_tree_connectors() {
 
     let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         Some(&SchemaRegistry::new()),
@@ -2060,7 +2100,11 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
 
     let output = strip_ansi(&format_plan_for_test(
         &plan,
-        &PlanChangeSummary::new(&plan, &[], &[]),
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        ),
         DetailLevel::None,
         &HashMap::new(),
         Some(&SchemaRegistry::new()),
