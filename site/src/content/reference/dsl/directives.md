@@ -4,7 +4,9 @@ description: Carina-side lifecycle, ordering, routing, and change-ownership cont
 ---
 
 A `directives` block controls how Carina manages a resource. Directives are not
-resource attributes and are never sent to the provider.
+resource attributes. In provider protocol 13, only delete requests carry the
+resolved provider-visible directives; other request resource records do not
+transport authored directives.
 
 ```crn
 cloud.storage.Bucket {
@@ -20,10 +22,42 @@ cloud.storage.Bucket {
 |-----------|---------|--------|
 | `force_delete` | `false` | Ask the provider to delete a resource even when it contains dependent data |
 | `create_before_destroy` | `false` | Create a replacement before destroying the existing resource |
-| `prevent_destroy` | `false` | Reject a plan that would destroy the resource |
+| `prevent_destroy` | resource schema (normally `false`) | Reject a plan that would destroy the resource |
 | `depends_on` | `[]` | Add ordering dependencies on sibling `let` bindings |
 | `provider` | provider-kind default | Route the resource to a [named provider instance](/reference/dsl/syntax/#named-provider-instances) |
 | `ignore_changes` | `[]` | Leave selected, authored attribute paths under another system's control after creation |
+
+## `prevent_destroy`
+
+A provider can mark a dangerous resource type as protected by default. When it
+does, omitting `prevent_destroy` keeps the protection enabled. To opt out, write
+the literal value explicitly:
+
+```crn
+directives {
+  prevent_destroy = false
+}
+```
+
+To remove an existing resource that is protected by the schema default, opt
+out in two separate applies:
+
+1. Add `prevent_destroy = false` to the existing resource and apply that
+   state-only directive change.
+2. After the first apply succeeds, remove the resource block and apply the
+   resulting destroy plan.
+
+Do not add the opt-out and remove the resource block in the same change: once
+the block is gone, Carina cannot read its new directive. Schema-default
+protection for a removed resource also requires that resource's provider
+schema to be available. If the schema is unavailable, an unspecified removed
+resource is not protected by the schema default.
+
+A non-literal expression that resolves to `true` enables protection. Any other
+non-literal value is treated as unspecified and produces a warning, so it keeps
+any schema-default protection enabled. Only the literal `false` opts out of a
+schema default. An explicit `true` always enables protection, even for resource
+types whose schema default is false.
 
 ## `ignore_changes`
 

@@ -49,7 +49,7 @@
 //! use carina_core::provider::{ProviderReady, ProviderReadyResource};
 //! use carina_core::resource::{ResolvedResource, Resource};
 //! let resolved = ResolvedResource::new(Resource::new("test", "example"));
-//! let _: ProviderReadyResource = ProviderReady(resolved); // private field
+//! let _: ProviderReadyResource = ProviderReady { value: resolved }; // private fields
 //! ```
 //!
 //! ```compile_fail

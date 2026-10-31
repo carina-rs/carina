@@ -4,17 +4,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use carina_core::effect::PlanOp as CorePlanOp;
+#[cfg(test)]
+use carina_core::provider::ProviderDirectiveSchema;
 use carina_core::provider::{
     AppliedState as CoreAppliedState, CreateRequest as CoreCreateRequest,
     DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
     PartialReadDiagnostic as CorePartialReadDiagnostic, PatchOp as CorePatchOp,
-    PendingCreate as CorePendingCreate, ProviderError as CoreProviderError,
-    ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    PendingCreate as CorePendingCreate, ProviderDirectives as CoreProviderDirectives,
+    ProviderError as CoreProviderError, ReadOutcome as CoreReadOutcome,
+    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
     UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
     UpdateRequest as CoreUpdateRequest,
 };
+#[cfg(test)]
+use carina_core::resource::Directives;
 use carina_core::resource::{
-    ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives, RedactedSecretHash,
+    ConcreteValue, DataSource as CoreDataSource, DeferredValue, RedactedSecretHash,
     Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
     State as CoreState, Value as CoreValue,
 };
@@ -22,9 +27,10 @@ use carina_core::resource::{
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeSchemaParts as CoreAttributeSchemaParts,
     AttributeType as CoreAttributeType, InputMode as CoreInputMode,
-    ResourceSchemaParts as CoreResourceSchemaParts, SchemaKind as CoreSchemaKind,
-    SchemaRegistry as CoreSchemaRegistry, StructField as CoreStructField,
-    StructFieldParts as CoreStructFieldParts, UniqueNameSpec as CoreUniqueNameSpec,
+    ResourceSchema as CoreResourceSchema, ResourceSchemaParts as CoreResourceSchemaParts,
+    SchemaKind as CoreSchemaKind, SchemaRegistry as CoreSchemaRegistry,
+    StructField as CoreStructField, StructFieldParts as CoreStructFieldParts,
+    UniqueNameSpec as CoreUniqueNameSpec,
 };
 use carina_core::schema::{
     ValidatedConfigSchema as CoreValidatedConfigSchema,
@@ -1796,18 +1802,18 @@ pub(crate) fn core_to_wit_read_request(_request: &CoreReadRequest) -> wit::ReadR
 /// [`CoreDeleteRequest`].
 pub(crate) fn core_to_wit_delete_request(request: &CoreDeleteRequest) -> wit::DeleteRequest {
     wit::DeleteRequest {
-        directives: core_to_wit_directives(&request.directives),
+        directives: core_to_wit_directives(request.directives()),
     }
 }
 
-/// Convert a [`Directives`] to a [`wit::Directives`].
-pub(crate) fn core_to_wit_directives(directives: &Directives) -> wit::Directives {
+/// Convert effective host directives to a [`wit::Directives`].
+pub(crate) fn core_to_wit_directives(directives: &CoreProviderDirectives) -> wit::Directives {
     // `depends_on` and `provider_instance` are host-only orchestration metadata;
     // the WIT Directives record intentionally carries only these three flags.
     wit::Directives {
-        force_delete: directives.force_delete,
-        create_before_destroy: directives.create_before_destroy,
-        prevent_destroy: directives.prevent_destroy,
+        force_delete: directives.force_delete(),
+        create_before_destroy: directives.create_before_destroy(),
+        prevent_destroy: directives.prevent_destroy(),
     }
 }
 
@@ -2395,6 +2401,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         }
     }
@@ -4004,6 +4011,19 @@ mod tests {
     }
 
     #[test]
+    fn schema_default_prevent_destroy_is_sent_as_true_on_delete() {
+        let schema = CoreResourceSchema::new("test.Protected").default_prevent_destroy();
+        let request = CoreDeleteRequest::resolve(
+            &Directives::default(),
+            ProviderDirectiveSchema::Available(&schema),
+        );
+
+        let wire = core_to_wit_delete_request(&request);
+
+        assert!(wire.directives.prevent_destroy);
+    }
+
+    #[test]
     fn test_state_with_identifier_roundtrip() {
         let id = CoreResourceId::with_provider_identity("aws", "ec2.Vpc", "main", None);
         let attrs = HashMap::from([(
@@ -4633,6 +4653,10 @@ mod tests {
                             "field_groups".to_string(),
                             serde_json::Value::Array(field_groups),
                         );
+                        object.insert(
+                            "default_prevent_destroy".to_string(),
+                            serde_json::Value::Bool(false),
+                        );
                     }
                     if object.contains_key("attr_type") {
                         object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
@@ -4892,7 +4916,8 @@ mod tests {
                         "provider_name":"DomainValidationOptions"
                     }
                 },
-                "field_groups":[]
+                "field_groups":[],
+                "default_prevent_destroy":false
             }]"#,
         )
         .expect("the released ACM semantics must load with required v13 metadata");
@@ -4986,7 +5011,8 @@ mod tests {
                         "keyed_partial_update":null
                     }
                 },
-                "field_groups":[]
+                "field_groups":[],
+                "default_prevent_destroy":false
             }]"#,
         )
         .expect_err("protocol v13 schema JSON must declare nested write_only");
@@ -5007,7 +5033,9 @@ mod tests {
                         "attr_type":{"type":"String"},
                         "required":true
                     }
-                }
+                },
+                "field_groups":[],
+                "default_prevent_destroy":false
             }]"#,
         )
         .expect_err("schema JSON must declare keyed_partial_update explicitly");
@@ -5024,6 +5052,7 @@ mod tests {
                 "resource_type":"s3.Bucket",
                 "attributes":{},
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"attribute"}
             }]"#,
         )
@@ -5048,6 +5077,7 @@ mod tests {
             "description": "EC2 Security Group",
             "unique_name_attribute": "group_name",
             "field_groups": [],
+            "default_prevent_destroy": false,
             "attributes": {
               "group_name": {
                 "name": "group_name",
@@ -5153,6 +5183,7 @@ mod tests {
             unique_name,
             operation_config,
             field_groups,
+            default_prevent_destroy,
             default_wait_timeout,
             default_wait_interval,
             defs,
@@ -5168,6 +5199,7 @@ mod tests {
             validation,
             operation_config,
             field_groups,
+            default_prevent_destroy,
             default_wait_timeout,
             default_wait_interval,
             defs,
@@ -5521,6 +5553,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5542,6 +5575,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5576,6 +5610,7 @@ mod tests {
                 kind: proto::FieldGroupKind::ExactlyOne,
                 fields: vec!["cidr_block".to_string(), "ipv4_ipam_pool_id".to_string()],
             }],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();
@@ -5626,6 +5661,7 @@ mod tests {
                 kind: proto::FieldGroupKind::AtLeastOne,
                 fields: vec!["a".to_string(), "b".to_string()],
             }],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let json = serde_json::to_string(&vec![proto_schema]).unwrap();
@@ -6186,6 +6222,7 @@ mod tests {
             {
                 "resource_type":"aws.ec2.VpcCidrBlockAssociation",
                 "field_groups":[],
+                "default_prevent_destroy":false,
                 "attributes":{
                     "id":{
                         "name":"id",
@@ -6378,6 +6415,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             field_groups: vec![],
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let core_schema = proto_schema_to_core(&proto_schema).unwrap();

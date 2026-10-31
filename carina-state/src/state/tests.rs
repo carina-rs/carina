@@ -9,6 +9,12 @@ fn published_exports_from_state(state: &StateFile) -> PublishedExports {
     PublishedExports::from_state_bytes(&bytes).expect("serialized test exports must decode")
 }
 
+fn persisted_prevent_destroy_json(directives: &PersistedDirectives) -> serde_json::Value {
+    serde_json::to_value(directives)
+        .expect("persisted directives must serialize")["prevent_destroy"]
+        .clone()
+}
+
 fn exact_comparison_context() -> carina_core::differ::ComparisonContext<'static> {
     carina_core::differ::exact_comparison_context_for_tests()
 }
@@ -85,6 +91,7 @@ fn v19_migrates_to_v20_without_rewriting_resource_data() {
                 "nested_write_only": {}
             },
             "protected": true,
+            "directives": {"prevent_destroy": false},
             "binding": "carried_binding"
         }],
         "exports": {"answer": 42}
@@ -103,12 +110,103 @@ fn v19_migrates_to_v20_without_rewriting_resource_data() {
     assert_eq!(state.resources()[0].identity.as_str(), "carried");
     assert!(state.resources()[0].protected);
     assert_eq!(
+        persisted_prevent_destroy_json(&state.resources()[0].directives),
+        serde_json::json!({"kind": "unspecified"})
+    );
+    assert_eq!(
         state.resources()[0].binding.as_deref(),
         Some("carried_binding")
     );
     assert_eq!(
         serde_json::to_value(&state).unwrap()["exports"]["answer"],
         serde_json::json!(42)
+    );
+}
+
+#[test]
+fn v19_migration_preserves_true_and_makes_false_or_missing_unspecified() {
+    let row = |identity: &str, directives: Option<serde_json::Value>| {
+        let mut row = serde_json::json!({
+            "resource_type": "test.Resource",
+            "identity": identity,
+            "provider": "mock",
+            "current": {
+                "kind": "applied",
+                "identifier": format!("provider-{identity}"),
+                "attributes": {},
+                "nested_write_only": {}
+            }
+        });
+        if let Some(directives) = directives {
+            row["directives"] = directives;
+        }
+        row
+    };
+    let json = serde_json::json!({
+        "version": 19,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "prevent-destroy-migration",
+        "carina_version": "legacy",
+        "resources": [
+            row("explicit-true", Some(serde_json::json!({"prevent_destroy": true}))),
+            row("legacy-false", Some(serde_json::json!({"prevent_destroy": false}))),
+            row("legacy-missing", None)
+        ]
+    });
+
+    let state = check_and_migrate(&json.to_string())
+        .expect("v19 directives must migrate")
+        .into_state();
+    let settings = state
+        .resources()
+        .iter()
+        .map(|row| {
+            (
+                row.identity.as_str(),
+                persisted_prevent_destroy_json(&row.directives),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        settings["explicit-true"],
+        serde_json::json!({"kind": "explicit", "value": true})
+    );
+    assert_eq!(
+        settings["legacy-false"],
+        serde_json::json!({"kind": "unspecified"})
+    );
+    assert_eq!(
+        settings["legacy-missing"],
+        serde_json::json!({"kind": "unspecified"})
+    );
+}
+
+#[test]
+fn v20_state_round_trip_preserves_explicit_prevent_destroy_false() {
+    let mut row =
+        ResourceState::try_applied("test.Resource", "explicit-false", "mock", "provider-id")
+            .expect("fixture identifier is non-empty");
+    row.directives = PersistedDirectives::default().with_prevent_destroy(false);
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+
+    let encoded = serde_json::to_string(&state).expect("v20 state must serialize");
+    let decoded = check_and_migrate(&encoded)
+        .expect("v20 state must decode")
+        .into_state();
+
+    assert_eq!(
+        persisted_prevent_destroy_json(&decoded.resources()[0].directives),
+        serde_json::json!({"kind": "explicit", "value": false})
+    );
+    let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(
+        json["resources"][0]["directives"]["prevent_destroy"],
+        serde_json::json!({"kind": "explicit", "value": false})
     );
 }
 
@@ -784,7 +882,7 @@ fn v15_in_flight_row_has_stable_golden_serialization() {
 
     assert_eq!(
         serde_json::to_string(&state.resources()[0]).expect("v15 row serializes"),
-        r#"{"resource_type":"test.Resource","identity":"pending","provider":"mock","current":{"kind":"create_in_flight","envelope":{"token":"opaque-token","identifier":null,"write_only":{},"secrets":{}},"started_at":"2026-10-23T08:00:00Z"},"protected":false,"directives":{"force_delete":false,"create_before_destroy":false,"prevent_destroy":false},"prefixes":{},"name_overrides":{},"binding":null,"dependency_bindings":[]}"#
+        r#"{"resource_type":"test.Resource","identity":"pending","provider":"mock","current":{"kind":"create_in_flight","envelope":{"token":"opaque-token","identifier":null,"write_only":{},"secrets":{}},"started_at":"2026-10-23T08:00:00Z"},"protected":false,"directives":{"force_delete":false,"create_before_destroy":false,"prevent_destroy":{"kind":"unspecified"}},"prefixes":{},"name_overrides":{},"binding":null,"dependency_bindings":[]}"#
     );
 }
 
@@ -1546,10 +1644,7 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
         Some("west")
     );
     assert!(!retained.protected);
-    let expected_directives = Directives {
-        provider_instance: Some("west".to_string()),
-        ..Directives::default()
-    };
+    let expected_directives = Directives::default().with_provider_instance("west");
     assert_eq!(retained.directives, expected_directives);
     assert_eq!(
         StateFile::id_for_resource_state(retained),
@@ -3888,6 +3983,41 @@ fn state_block_address_lookup_ignores_provider_instance() {
 }
 
 #[test]
+fn directive_only_update_requires_the_exact_provider_route() {
+    let mut state = StateFile::new();
+    let mut resource = ResourceState::new("test.Resource", "target", "mock");
+    resource.directives.provider_instance = Some("secondary".to_string());
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
+
+    let default_id =
+        ResolvedResourceId::with_provider_identity("mock", "test.Resource", "target", None);
+    let mut desired = PersistedDirectives::default();
+    desired.force_delete = true;
+    assert!(
+        !state.update_resource_directives(&default_id, desired.clone()),
+        "a display-equal address on another route must not be rewritten"
+    );
+
+    let secondary_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.Resource",
+        "target",
+        Some("secondary".to_string()),
+    );
+    desired.provider_instance = Some("secondary".to_string());
+    assert!(state.update_resource_directives(&secondary_id, desired));
+    assert!(
+        state
+            .find_resource_for_id(&secondary_id)
+            .expect("secondary row")
+            .directives
+            .force_delete
+    );
+}
+
+#[test]
 fn test_build_directives_provider_scoped() {
     use carina_core::resource::ResourceId;
 
@@ -4477,6 +4607,62 @@ fn removing_last_deposed_generation_retains_malformed_current_instance() {
 }
 
 #[test]
+fn removing_last_deposed_generation_prunes_explicit_false_shell() {
+    let key = DeposedKey::new_unique();
+    let mut row = ResourceState::new("test.resource", "shell", "mock");
+    row.directives.set_prevent_destroy(false);
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        key.clone(),
+        "old-id".to_string(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+
+    let removed = state.remove_deposed_generation("mock", "test.resource", "shell", &key);
+
+    assert!(removed.is_some());
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "shell")
+            .is_none(),
+        "an explicit-false row with no current or deposed instance is still an empty shell"
+    );
+}
+
+#[test]
+fn removing_last_deposed_generation_retains_explicit_true_shell() {
+    let key = DeposedKey::new_unique();
+    let mut row = ResourceState::new("test.resource", "shell", "mock");
+    row.directives.set_prevent_destroy(true);
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        key.clone(),
+        "old-id".to_string(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
+
+    let removed = state.remove_deposed_generation("mock", "test.resource", "shell", &key);
+
+    assert!(removed.is_some());
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "shell")
+            .is_some(),
+        "an explicit-true shell must retain the old non-default semantics"
+    );
+}
+
+#[test]
 fn test_from_provider_state_stores_binding_and_dependencies() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
 
@@ -4521,7 +4707,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
 #[test]
 fn state_json_cannot_persist_ignore_changes_paths() {
     let runtime: Directives = serde_json::from_value(serde_json::json!({
-        "prevent_destroy": true,
+        "prevent_destroy": {"kind": "explicit", "value": true},
         "ignore_changes": [{
             "segments": [{ "kind": "attribute", "value": "comment" }]
         }]
@@ -4533,7 +4719,7 @@ fn state_json_cannot_persist_ignore_changes_paths() {
     row.directives = (&runtime).into();
     let encoded = serde_json::to_string(&row).expect("state row serializes");
 
-    assert!(row.directives.prevent_destroy);
+    assert!(row.directives.explicitly_prevents_destroy());
     assert!(!encoded.contains("ignore_changes"), "{encoded}");
     assert!(!encoded.contains("comment"), "{encoded}");
 }
@@ -4547,7 +4733,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         .expect("fixture identifier is non-empty");
     rs.binding = Some("my_subnet".to_string());
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
-    rs.directives.prevent_destroy = true;
+    rs.directives.set_prevent_destroy(true);
     rs.directives.depends_on = vec!["security_group".to_string()];
     state
         .upsert_resource(rs)
@@ -4584,7 +4770,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         "provider-facing orphan state must not contain host metadata"
     );
     assert_eq!(orphan.binding(), Some("my_subnet"));
-    assert!(orphan.directives().prevent_destroy);
+    assert!(orphan.directives().explicitly_prevents_destroy());
     assert_eq!(orphan.directives().depends_on, ["security_group"]);
     assert_eq!(
         orphan_state.dependency_bindings,
@@ -4613,7 +4799,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     };
     assert_eq!(refreshed.binding(), Some("my_subnet"));
     assert_eq!(refreshed_state.id, id);
-    assert!(refreshed.directives().prevent_destroy);
+    assert!(refreshed.directives().explicitly_prevents_destroy());
     assert_eq!(refreshed.directives().depends_on, ["security_group"]);
     assert_eq!(
         refreshed_state.dependency_bindings,

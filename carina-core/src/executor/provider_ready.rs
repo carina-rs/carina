@@ -20,18 +20,20 @@ use crate::module_resolver::{
     evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
 };
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
-use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
+use crate::provider::{
+    CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, UpdateRequest,
+};
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, LiveComposition, ProviderDataSource,
     ProviderModuleSource, ProviderResource, ResolvedDataSource, ResolvedResource, Resource,
     ResourceId, SavedComposition, Value,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry, TypeError};
+use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
 
 /// An immutable value that passed the provider-boundary constraint gate.
 ///
-/// The inner field is deliberately private. There is no `new`, `From`,
+/// The fields are deliberately private. There is no `new`, `From`,
 /// `Default`, or deserialization path; callers obtain this capability only
 /// from [`prepare_provider_ready_resource`].
 ///
@@ -40,15 +42,23 @@ use crate::value::SerializationError;
 /// use carina_core::resource::{ResolvedResource, Resource};
 ///
 /// let resolved = ResolvedResource::new(Resource::new("test", "example"));
-/// let _ready = ProviderReady(resolved); // private tuple field
+/// let _ready = ProviderReady { value: resolved }; // private fields
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProviderReady<T>(T);
+pub struct ProviderReady<T> {
+    value: T,
+    directives: ProviderDirectives,
+}
 
 impl<T> ProviderReady<T> {
     /// Borrow the checked payload.
     pub fn as_inner(&self) -> &T {
-        &self.0
+        &self.value
+    }
+
+    /// Borrow the schema-resolved directives paired with this payload.
+    pub fn directives(&self) -> &ProviderDirectives {
+        &self.directives
     }
 }
 
@@ -373,14 +383,14 @@ impl ModuleConstraintGate {
 impl ProviderReadyResource {
     /// Borrow the provider-facing resource payload.
     pub fn as_resource(&self) -> &ProviderResource {
-        self.0.as_resource()
+        self.value.as_resource()
     }
 }
 
 impl ProviderReadyDataSource {
     /// Borrow the provider-facing data-source payload.
     pub fn as_data_source(&self) -> &ProviderDataSource {
-        self.0.as_inner()
+        self.value.as_inner()
     }
 }
 
@@ -728,7 +738,15 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
     crate::resource::assert_resource_fully_resolved(&resource)?;
     let resource =
         ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
-    Ok(ProviderReady(resource))
+    let directives = context.schemas.resolve_directives(
+        &resource.as_resource().id,
+        SchemaKind::Resource,
+        &resource.as_resource().directives,
+    );
+    Ok(ProviderReady {
+        value: resource,
+        directives,
+    })
 }
 
 /// Validate and prepare a data source for provider dispatch.
@@ -794,9 +812,13 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
-    Ok(ProviderReady(ResolvedDataSource::new(
-        value.into_provider_data_source(),
-    )))
+    let value = ResolvedDataSource::new(value.into_provider_data_source());
+    let directives = context.schemas.resolve_directives(
+        &value.as_inner().id,
+        SchemaKind::DataSource,
+        &value.as_inner().directives,
+    );
+    Ok(ProviderReady { value, directives })
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -940,6 +962,7 @@ mod provider_config_tests {
             "test",
             ResourceSchema::new("widget")
                 .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .default_prevent_destroy()
                 .validate()
                 .expect("valid test schema"),
         );
@@ -957,6 +980,37 @@ mod provider_config_tests {
             .expect("provider preparation must use schema resolution");
 
         assert_eq!(request.resource().ignore_changes().iter().len(), 1);
+        assert!(request.directives().prevent_destroy());
+    }
+
+    #[tokio::test]
+    async fn prepare_update_request_resolves_schema_default_directives() {
+        let resource = Resource::with_provider("test", "widget", "example", None);
+        let from = crate::resource::State::existing(resource.id.clone(), HashMap::new());
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("widget")
+                .default_prevent_destroy()
+                .validate()
+                .expect("valid test schema"),
+        );
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            &[],
+            &crate::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+
+        let request = prepare_update_request(resource, from, &[], &context)
+            .await
+            .expect("provider preparation must resolve directives against the schema");
+
+        assert!(request.directives().prevent_destroy());
     }
 
     #[tokio::test]

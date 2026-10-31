@@ -1,0 +1,16 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.Vpc {
+  cidr_block = '10.0.0.0/16'
+
+  directives {
+    prevent_destroy = false
+  }
+}
+
+awscc.ec2.Subnet {
+  vpc_id     = vpc.vpc_id
+  cidr_block = '10.0.1.0/24'
+}

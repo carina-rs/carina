@@ -26,8 +26,9 @@ use carina_core::provider::Provider;
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
-    ConcreteValue, Current, ResolvedResourceId, Resource, ResourceId, Value,
+    ConcreteValue, Current, PreventDestroySource, ResolvedResourceId, Resource, ResourceId, Value,
 };
+use carina_core::schema::SchemaKind;
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
@@ -574,7 +575,7 @@ async fn run_destroy_locked_owned(
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
     let mut protected_resources: Vec<&Resource> = Vec::new();
-    let mut prevent_destroy_resources: Vec<&Resource> = Vec::new();
+    let mut prevent_destroy_resources: Vec<(&Resource, PreventDestroySource)> = Vec::new();
     let mut resources_to_destroy: Vec<&Resource> = all_resources
         .iter()
         .filter(|r| {
@@ -593,10 +594,16 @@ async fn run_destroy_locked_owned(
                 return false;
             }
 
-            // Check prevent_destroy directive (unless --force)
-            if !force && r.directives.prevent_destroy {
-                prevent_destroy_resources.push(r);
-                return false;
+            // Resolve authored and schema-default protection unless --force.
+            if !force {
+                let resolved_directives = ctx
+                    .schemas()
+                    .resolve_directives(&r.id, SchemaKind::Resource, &r.directives);
+                let prevent_destroy_source = resolved_directives.prevent_destroy_source();
+                if let Some(source) = prevent_destroy_source {
+                    prevent_destroy_resources.push((r, source));
+                    return false;
+                }
             }
 
             // Check if this is the protected state bucket
@@ -721,19 +728,35 @@ async fn run_destroy_locked_owned(
         println!();
         println!(
             "{}",
-            "Error: the following resources have prevent_destroy set and cannot be destroyed:"
+            "Error: the following resources are protected from destruction:"
                 .red()
                 .bold()
         );
         let failure_progress = ProgressBackend::<()>::new(ProgressSink::Human);
-        for resource in &prevent_destroy_resources {
+        for (resource, _source) in &prevent_destroy_resources {
             failure_progress.failed_line(FailedOutcome::summary(resource.id.to_string()));
         }
         println!();
-        println!(
-            "{}",
-            "Use --force to override prevent_destroy and destroy these resources.".yellow()
-        );
+        if prevent_destroy_resources
+            .iter()
+            .any(|(_resource, source)| *source == PreventDestroySource::ExplicitDirective)
+        {
+            println!(
+                "{}",
+                "At least one resource has `prevent_destroy = true`.".yellow()
+            );
+        }
+        if prevent_destroy_resources
+            .iter()
+            .any(|(_resource, source)| *source == PreventDestroySource::SchemaDefault)
+        {
+            println!(
+                "{}",
+                "A resource type is protected from destruction by default; to allow it, write `directives { prevent_destroy = false }`."
+                    .yellow()
+            );
+        }
+        println!("{}", "Use --force to override destruction protection.".yellow());
     }
 
     println!();
@@ -756,7 +779,7 @@ async fn run_destroy_locked_owned(
     // If there are prevent_destroy resources, refuse to proceed
     if !prevent_destroy_resources.is_empty() {
         return Err(AppError::Validation(format!(
-            "{} resource(s) have prevent_destroy set. Use --force to override.",
+            "{} resource(s) are protected from destruction. Use --force to override.",
             prevent_destroy_resources.len()
         )));
     }
@@ -946,6 +969,16 @@ async fn run_destroy_locked_owned(
                 let identifier = identifier.clone();
                 let generation = generation.clone();
                 let directives = directives.clone();
+                let resolved_directives = ctx
+                    .schemas()
+                    .resolve_directives(
+                        resource_id.as_inner(),
+                        SchemaKind::Resource,
+                        &directives,
+                    );
+                let delete_request = carina_core::provider::DeleteRequest::from_resolved(
+                    resolved_directives,
+                );
 
                 let provider_ref = &provider;
                 let result_shutdown = &cancel;
@@ -955,9 +988,7 @@ async fn run_destroy_locked_owned(
                         .delete(
                             resource_id.as_inner(),
                             &identifier,
-                            carina_core::provider::DeleteRequest {
-                                directives: directives.clone(),
-                            },
+                            delete_request,
                         )
                         .await;
                     observe_destroy_result_ready_for_tests(result_shutdown).await;
@@ -3160,7 +3191,7 @@ mod tests {
 
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.binding = Some("main".to_string());
-        row.directives.prevent_destroy = true;
+        row.directives.set_prevent_destroy(true);
         let deposed_key = DeposedKey::new_unique();
         row.deposed.push(DeposedInstance::from_persisted_json(
             deposed_key.clone(),

@@ -65,13 +65,15 @@ use crate::commands::shared::progress::{
 };
 use crate::commands::shared::state_writeback::{
     ApplyStateSaveInputs, ExportResolutionInputs, FinalizeApplyInput, PostApplyStates,
-    ResolveExportValuesPostApplyInput, SkippedExports, materialize_exports,
-    resolve_export_values_post_apply,
+    ResolveExportValuesPostApplyInput, SkippedExports, apply_persisted_directive_changes,
+    materialize_exports, persisted_directive_changes, resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
-use crate::error::{AppError, SavedPlanSecretVerificationError};
+use crate::error::{
+    AppError, SavedPlanDirectiveChangesMismatchError, SavedPlanSecretVerificationError,
+};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProjectedPhase1RefreshInputs, ProviderLoad, ValidatedConfig,
@@ -1170,6 +1172,27 @@ pub(crate) async fn persist_exports_only(
     }
 }
 
+async fn persist_directives_only(
+    backend: &dyn StateBackend,
+    lock: StateLockRef<'_>,
+    mut state: StateFile,
+    directive_change_count: usize,
+) -> Result<(), AppError> {
+    match lock {
+        StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
+        StateLockRef::Disabled(disabled) => {
+            save_state_unlocked(backend, disabled, &mut state).await?
+        }
+    }
+    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} {} resource directive change(s) persisted",
+        "✓".green(),
+        directive_change_count
+    );
+    Ok(())
+}
+
 /// Result of the saved-plan drift pass.
 ///
 /// `verified_planned_states` contains the historical snapshot after each
@@ -1802,6 +1825,8 @@ struct SourceApplyPersistExports {
     wait_aliases: Vec<WaitAliasSpec>,
     managed_current: HashMap<ResourceId, Current>,
     data_source_values: DataSourceValues,
+    directive_change_count: usize,
+    export_change_count: usize,
 }
 
 struct SourceApplyExecuted {
@@ -1821,7 +1846,13 @@ struct SourceApplyExecuted {
 
 enum SavedPlanApplyAfterHeartbeat {
     Done(Option<Duration>),
+    PersistStateOnly(Box<SavedPlanPersistStateOnly>),
     Executed(Box<SavedPlanApplyExecuted>),
+}
+
+struct SavedPlanPersistStateOnly {
+    state: StateFile,
+    directive_change_count: usize,
 }
 
 struct SavedPlanApplyExecuted {
@@ -2162,16 +2193,23 @@ async fn run_apply_locked_owned(
                     &checked_exports_pre_apply,
                     current_exports,
                 );
+                let directive_changes =
+                    persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
+                let directive_change_count = directive_changes.len();
 
-                if export_changes.is_empty() {
+                if export_changes.is_empty() && directive_change_count == 0 {
                     println!("{}", "No changes needed.".green());
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
                 let historical_display =
                     carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
-                let summary =
-                    PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for);
+                let summary = PlanChangeSummary::new(
+                    &plan,
+                    &export_changes,
+                    &residual_deferred_for,
+                    &directive_changes,
+                );
                 print_plan(
                     &plan,
                     &summary,
@@ -2194,14 +2232,37 @@ async fn run_apply_locked_owned(
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
-                println!(
-                    "{}",
-                    format!(
-                        "Persisting {} export change(s) to state.",
-                        export_changes.len()
-                    )
-                    .cyan()
-                );
+                if !export_changes.is_empty() {
+                    println!(
+                        "{}",
+                        format!(
+                            "Persisting {} export change(s) to state.",
+                            export_changes.len()
+                        )
+                        .cyan()
+                    );
+                }
+                if directive_change_count > 0 {
+                    println!(
+                        "{}",
+                        format!(
+                            "Persisting {} resource directive change(s) to state.",
+                            directive_change_count
+                        )
+                        .cyan()
+                    );
+                }
+                let state_file = if directive_change_count > 0 {
+                    let mut state = state_file.unwrap_or_default();
+                    apply_persisted_directive_changes(
+                        &mut state,
+                        &resolved_resources,
+                        &directive_changes,
+                    )?;
+                    Some(state)
+                } else {
+                    state_file
+                };
                 // No-op apply path: compositions were never resolved (no head-of-
                 // pipeline pass ran). carina#3181: compositions live in
                 // `parsed.compositions` and still carry the authored
@@ -2219,6 +2280,8 @@ async fn run_apply_locked_owned(
                         wait_aliases,
                         managed_current,
                         data_source_values,
+                        directive_change_count,
+                        export_change_count: export_changes.len(),
                     },
                 )));
             }
@@ -2249,7 +2312,14 @@ async fn run_apply_locked_owned(
                 &checked_exports_pre_apply,
                 &current_exports,
             );
-            let summary = PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for);
+            let directive_changes =
+                persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
+            let summary = PlanChangeSummary::new(
+                &plan,
+                &export_changes,
+                &residual_deferred_for,
+                &directive_changes,
+            );
             print_plan(
                 &plan,
                 &summary,
@@ -2388,21 +2458,40 @@ async fn run_apply_locked_owned(
                     wait_aliases,
                     managed_current,
                     data_source_values,
+                    directive_change_count,
+                    export_change_count,
                 } = *context;
-                persist_exports_only(
-                    backend.as_ref(),
-                    lock.as_ref(),
-                    state_file,
-                    &resources,
-                    &data_source_values,
-                    &compositions,
-                    &checked_exports,
-                    validated_config.context().schemas(),
-                    &wait_aliases,
-                    &managed_current,
-                    validated_config.context().provider_context(),
-                )
-                .await?;
+                if export_change_count == 0 {
+                    persist_directives_only(
+                        backend.as_ref(),
+                        lock.as_ref(),
+                        state_file.unwrap_or_default(),
+                        directive_change_count,
+                    )
+                    .await?;
+                } else {
+                    persist_exports_only(
+                        backend.as_ref(),
+                        lock.as_ref(),
+                        state_file,
+                        &resources,
+                        &data_source_values,
+                        &compositions,
+                        &checked_exports,
+                        validated_config.context().schemas(),
+                        &wait_aliases,
+                        &managed_current,
+                        validated_config.context().provider_context(),
+                    )
+                    .await?;
+                    if directive_change_count > 0 {
+                        println!(
+                            "  {} {} resource directive change(s) persisted",
+                            "✓".green(),
+                            directive_change_count
+                        );
+                    }
+                }
                 Ok(None)
             }
             SourceApplyAfterHeartbeat::Executed(context) => {
@@ -2971,9 +3060,11 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 34
-    // adds typed deferred integer arithmetic expressions. Format 33 adds the
-    // typed keyed-list release effect. Format 32 records provider
+    // Validate version compatibility before decoding the payload. Format 35
+    // stores tri-state prevent_destroy directives, so format 34 plans must be
+    // regenerated. Format 34 adds typed deferred integer arithmetic
+    // expressions. Format 33 adds the typed keyed-list release effect. Format
+    // 32 records provider
     // instance reference scopes and create-outcome-unknown markers for
     // protocol v13. Format 31 persists authored ignore paths; format 30 was
     // never emitted. Format 29 persists anonymous-loop provenance, typed
@@ -3454,6 +3545,20 @@ async fn run_apply_from_plan_locked_owned(
                 .clone()
                 .into_executable()
                 .map_err(|error| AppError::Config(error.to_string()))?;
+            let directive_changes =
+                persisted_directive_changes(state_file.as_ref(), &resolved_sorted_resources, plan);
+            let recorded_directive_changes = rehydrated_plan_file
+                .reloaded_plan_file()
+                .persisted_directive_changes();
+            if directive_changes != recorded_directive_changes {
+                return Err(AppError::SavedPlanDirectiveChangesMismatch(Box::new(
+                    SavedPlanDirectiveChangesMismatchError {
+                        recorded: recorded_directive_changes.to_vec(),
+                        recomputed: directive_changes,
+                        replan_command: apply_target.replan_command().to_string(),
+                    },
+                )));
+            }
 
             if can_use_export_only_fast_path(plan, &executable_data_source_values) {
                 // Saved plans serialize every `Effect::Read` produced by the
@@ -3485,8 +3590,57 @@ async fn run_apply_from_plan_locked_owned(
                     wait_aliases: &terminal_wait_aliases,
                 });
                 finalize_saved_module_constraints(plan_compositions, &terminal_bindings)?;
-                println!("{}", "No changes needed.".green());
-                return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
+                let directive_change_count = directive_changes.len();
+                if directive_change_count == 0 {
+                    println!("{}", "No changes needed.".green());
+                    return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
+                }
+
+                let historical_display = collect_historical_display_attributes(
+                    plan,
+                    &managed_current,
+                    state_file.as_ref(),
+                );
+                let summary = PlanChangeSummary::from_reloaded_plan(
+                    rehydrated_plan_file.reloaded_plan_file(),
+                );
+                print_plan(
+                    plan,
+                    &summary,
+                    DetailLevel::Full,
+                    &historical_display,
+                    Some(wiring.schemas()),
+                    &HashMap::new(),
+                    None,
+                    None,
+                    &provider,
+                )?;
+                let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+                if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+                    == ApplyConfirmation::Cancelled
+                {
+                    return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
+                }
+                println!(
+                    "{}",
+                    format!(
+                        "Persisting {} resource directive change(s) to state.",
+                        directive_change_count
+                    )
+                    .cyan()
+                );
+                let mut state = state_file.take().unwrap_or_default();
+                apply_persisted_directive_changes(
+                    &mut state,
+                    &resolved_sorted_resources,
+                    &directive_changes,
+                )?;
+                return Ok(SavedPlanApplyAfterHeartbeat::PersistStateOnly(Box::new(
+                    SavedPlanPersistStateOnly {
+                        state,
+                        directive_change_count,
+                    },
+                )));
             }
 
             // Build display-safe historical attributes from current and persisted state.
@@ -3677,6 +3831,20 @@ async fn run_apply_from_plan_locked_owned(
     let op_result = async {
         match heartbeat_result? {
             SavedPlanApplyAfterHeartbeat::Done(result) => Ok(result),
+            SavedPlanApplyAfterHeartbeat::PersistStateOnly(context) => {
+                let SavedPlanPersistStateOnly {
+                    state,
+                    directive_change_count,
+                } = *context;
+                persist_directives_only(
+                    backend.as_ref(),
+                    lock.as_ref(),
+                    state,
+                    directive_change_count,
+                )
+                .await?;
+                Ok(None)
+            }
             SavedPlanApplyAfterHeartbeat::Executed(context) => {
                 let SavedPlanApplyExecuted {
                     result,

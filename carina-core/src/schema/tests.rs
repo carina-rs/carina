@@ -11564,6 +11564,55 @@ fn schema_registry_missing_returns_none() {
 }
 
 #[test]
+fn schema_registry_resolves_missing_schema_with_unavailable_fallback() {
+    let registry = SchemaRegistry::new();
+    let resource = crate::resource::Resource::with_provider("aws", "s3.Bucket", "bucket", None);
+    let directives = crate::resource::Directives::default().with_prevent_destroy(true);
+
+    let resolved = registry.resolve_directives(&resource.id, SchemaKind::Resource, &directives);
+
+    assert!(resolved.prevent_destroy());
+    assert!(
+        registry
+            .try_resolve_directives(&resource.id, SchemaKind::Resource, &directives)
+            .is_none()
+    );
+}
+
+#[test]
+fn schema_registry_resolves_data_source_directives_through_the_same_api() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .as_data_source()
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let data_source =
+        crate::resource::DataSource::with_provider("aws", "s3.Bucket", "bucket", None);
+
+    assert!(
+        registry
+            .try_resolve_directives(
+                &data_source.id,
+                SchemaKind::DataSource,
+                &data_source.directives,
+            )
+            .is_some()
+    );
+    assert!(
+        registry
+            .try_resolve_directives(
+                &data_source.id,
+                SchemaKind::Resource,
+                &data_source.directives,
+            )
+            .is_none()
+    );
+}
+
+#[test]
 fn schema_registry_has_managed_only_does_not_imply_data_source() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -12991,6 +13040,7 @@ enum FingerprintChange {
     FieldGroup,
     WaitTimeout,
     WaitInterval,
+    DefaultPreventDestroy,
     Definition,
     DeclarativeValidator,
 }
@@ -13118,6 +13168,9 @@ fn schema_fingerprint_fixture_with(
     if change == Some(FingerprintChange::FieldGroup) {
         schema = schema.field_group(FieldGroup::at_least_one(["first", "second"]).unwrap());
     }
+    if change == Some(FingerprintChange::DefaultPreventDestroy) {
+        schema = schema.default_prevent_destroy();
+    }
     if change == Some(FingerprintChange::SchemaKind) {
         schema = schema.as_data_source();
     }
@@ -13143,6 +13196,7 @@ fn schema_fingerprint_fixture_with(
             | FingerprintChange::FieldGroup
             | FingerprintChange::WaitTimeout
             | FingerprintChange::WaitInterval
+            | FingerprintChange::DefaultPreventDestroy
             | FingerprintChange::Definition,
         )
         | None => schema,
@@ -13169,6 +13223,36 @@ fn resource_schema_semantic_fingerprint_is_order_independent() {
         forward.semantic_fingerprint(),
         reverse.semantic_fingerprint(),
         "hash-map and nested map insertion order must not affect a schema fingerprint",
+    );
+}
+
+#[test]
+fn resource_schema_default_prevent_destroy_is_opt_in_and_survives_validation() {
+    let ordinary = ResourceSchema::new("test.Ordinary");
+    assert!(!ordinary.parts().default_prevent_destroy);
+
+    let protected = ResourceSchema::new("test.Protected")
+        .default_prevent_destroy()
+        .validate()
+        .expect("the lifecycle default must not invalidate a schema");
+    assert!(protected.parts().default_prevent_destroy);
+}
+
+#[test]
+fn data_source_schema_rejects_default_prevent_destroy() {
+    let error = ResourceSchema::new("test.Lookup")
+        .as_data_source()
+        .default_prevent_destroy()
+        .validate()
+        .expect_err("data sources cannot have a destruction default");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::DefaultPreventDestroy,
+            "data-source schemas cannot set `default_prevent_destroy`",
+        )],
     );
 }
 
@@ -13303,6 +13387,10 @@ fn resource_schema_semantic_fingerprint_covers_planning_and_apply_fields() {
         ("field group", FingerprintChange::FieldGroup),
         ("wait timeout", FingerprintChange::WaitTimeout),
         ("wait interval", FingerprintChange::WaitInterval),
+        (
+            "default prevent destroy",
+            FingerprintChange::DefaultPreventDestroy,
+        ),
         ("definition", FingerprintChange::Definition),
         (
             "declarative validator",

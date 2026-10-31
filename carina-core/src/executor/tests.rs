@@ -2390,10 +2390,7 @@ async fn create_before_destroy_outcome_unknown_records_replacement_create_state(
     let provider = MockProvider::new();
     let source = make_resource("source", &[]);
     let source_id = source.id.clone();
-    let directives = Directives {
-        create_before_destroy: true,
-        ..Directives::default()
-    };
+    let directives = Directives::default().with_create_before_destroy(true);
     let mut plan = Plan::new();
     plan.add(create_effect(source));
     plan.add(Effect::Delete {
