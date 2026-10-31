@@ -11480,87 +11480,129 @@ fn resolve_block_names(
     }
 }
 
-fn resolve_file_block_names<E>(
-    parsed: &mut crate::parser::File<E>,
+fn resolve_file_block_names<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &mut crate::parser::File<E, D>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
-    let mut conflicts = resolve_block_names_detailed(&mut parsed.resources, registry);
-    for data_source in &mut parsed.data_sources {
-        if let Some(schema) = registry.get_for_data_source(data_source) {
-            conflicts.extend(resolve_attribute_block_names(
-                &data_source.id,
-                &mut data_source.attributes,
-                None,
-                schema.as_schema(),
-            ));
+    let mut conflicts = Vec::new();
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource) => {
+                conflicts.extend(resolve_block_names_detailed(
+                    std::slice::from_mut(resource),
+                    registry,
+                ));
+            }
+            crate::parser::ResourceMut::Deferred {
+                resource,
+                attributes,
+            } => {
+                conflicts.extend(resolve_block_names_detailed(
+                    std::slice::from_mut(resource),
+                    registry,
+                ));
+                D::sync_deferred_attributes(attributes, resource);
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                if let Some(schema) = registry.get_for_data_source(data_source) {
+                    conflicts.extend(resolve_attribute_block_names(
+                        &data_source.id,
+                        &mut data_source.attributes,
+                        None,
+                        schema.as_schema(),
+                    ));
+                }
+            }
+            crate::parser::ResourceMut::LiveComposition(_) => {}
         }
-    }
-    for deferred in &mut parsed.deferred_for_expressions {
-        conflicts.extend(resolve_block_names_detailed(
-            std::slice::from_mut(&mut deferred.template_resource),
-            registry,
-        ));
-        deferred.attributes = deferred
-            .template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
     }
     conflicts
 }
 
-fn resolve_file_block_names_with_authored<E, A>(
-    parsed: &mut crate::parser::File<E>,
-    authored: &crate::parser::File<A>,
+fn managed_resource_by_id<'a, E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &'a crate::parser::File<E, D>,
+    id: &crate::resource::ResourceId,
+) -> Option<&'a Resource> {
+    parsed
+        .iter_all_resources()
+        .find_map(|resource| match resource {
+            crate::parser::ResourceRef::Resource(resource) if resource.id == *id => Some(resource),
+            crate::parser::ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } if resource.id == *id => Some(resource),
+            crate::parser::ResourceRef::Resource(_)
+            | crate::parser::ResourceRef::LiveComposition(_)
+            | crate::parser::ResourceRef::DataSource(_) => None,
+            crate::parser::ResourceRef::Deferred {
+                resource: _resource,
+                deferred: _deferred,
+            } => None,
+        })
+}
+
+fn resolve_file_block_names_with_authored<
+    E,
+    D: crate::parser::DeferredForPhaseTraversal,
+    A,
+    AD: crate::parser::DeferredForPhaseTraversal,
+>(
+    parsed: &mut crate::parser::File<E, D>,
+    authored: &crate::parser::File<A, AD>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
-    let mut conflicts = resolve_block_names_detailed_with_authored(
-        &mut parsed.resources,
-        &authored.resources,
-        registry,
-    );
-    for data_source in &mut parsed.data_sources {
-        if let Some(schema) = registry.get_for_data_source(data_source) {
-            let authored_attributes = authored
-                .data_sources
-                .iter()
-                .find(|candidate| candidate.id == data_source.id)
-                .map(|candidate| &candidate.attributes);
-            conflicts.extend(resolve_attribute_block_names(
-                &data_source.id,
-                &mut data_source.attributes,
-                authored_attributes,
-                schema.as_schema(),
-            ));
+    let mut conflicts = Vec::new();
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource) => {
+                let authored_resources = managed_resource_by_id(authored, &resource.id)
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default();
+                conflicts.extend(resolve_block_names_detailed_with_authored(
+                    std::slice::from_mut(resource),
+                    authored_resources,
+                    registry,
+                ));
+            }
+            crate::parser::ResourceMut::Deferred {
+                resource,
+                attributes,
+            } => {
+                let authored_resources = managed_resource_by_id(authored, &resource.id)
+                    .map(std::slice::from_ref)
+                    .unwrap_or_default();
+                conflicts.extend(resolve_block_names_detailed_with_authored(
+                    std::slice::from_mut(resource),
+                    authored_resources,
+                    registry,
+                ));
+                D::sync_deferred_attributes(attributes, resource);
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                if let Some(schema) = registry.get_for_data_source(data_source) {
+                    let authored_attributes = authored
+                        .data_sources
+                        .iter()
+                        .find(|candidate| candidate.id == data_source.id)
+                        .map(|candidate| &candidate.attributes);
+                    conflicts.extend(resolve_attribute_block_names(
+                        &data_source.id,
+                        &mut data_source.attributes,
+                        authored_attributes,
+                        schema.as_schema(),
+                    ));
+                }
+            }
+            crate::parser::ResourceMut::LiveComposition(_) => {}
         }
-    }
-    for deferred in &mut parsed.deferred_for_expressions {
-        let authored_resources = authored
-            .deferred_for_expressions
-            .iter()
-            .find(|candidate| candidate.template_resource.id == deferred.template_resource.id)
-            .map(|candidate| std::slice::from_ref(&candidate.template_resource))
-            .unwrap_or_default();
-        conflicts.extend(resolve_block_names_detailed_with_authored(
-            std::slice::from_mut(&mut deferred.template_resource),
-            authored_resources,
-            registry,
-        ));
-        deferred.attributes = deferred
-            .template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
     }
     conflicts
 }
 
 /// Resolve block names in one evaluated file, including deferred-for
 /// templates that can materialize after refresh.
-pub fn resolve_file_block_names_with_schemas<E>(
-    parsed: &mut crate::parser::File<E>,
+pub fn resolve_file_block_names_with_schemas<E, D: crate::parser::DeferredForPhaseTraversal>(
+    parsed: &mut crate::parser::File<E, D>,
     registry: &SchemaRegistry,
 ) -> Result<(), Vec<BlockNameConflict>> {
     let conflicts = resolve_file_block_names(parsed, registry);
@@ -11577,11 +11619,13 @@ pub fn resolve_file_block_names_with_schemas<E>(
 /// This raw primitive returns plain values and carries no pairing guarantee.
 /// Only carina-cli's validated-wiring transition may mint its canonical
 /// resource pair from these values.
-pub fn resolve_config_block_names<E>(
-    mut parsed: crate::parser::File<E>,
+pub type ResolvedConfigBlockNames<E, D> = (crate::parser::File<E, D>, Vec<Resource>);
+
+pub fn resolve_config_block_names<E, D: crate::parser::DeferredForPhaseTraversal>(
+    mut parsed: crate::parser::File<E, D>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<(crate::parser::File<E>, Vec<Resource>), Vec<BlockNameConflict>> {
+) -> Result<ResolvedConfigBlockNames<E, D>, Vec<BlockNameConflict>> {
     let mut unresolved = unresolved.into_inner();
     let mut conflicts = resolve_file_block_names_with_authored(&mut parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();

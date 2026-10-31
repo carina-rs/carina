@@ -8,6 +8,43 @@ use std::path::{Path, PathBuf};
 
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
 
+/// A body kind that cannot be expanded after a deferred `for` iterable
+/// becomes known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferredForBodyKind {
+    ModuleCall { name: String },
+    Read { resource_type: String },
+}
+
+impl std::fmt::Display for DeferredForBodyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModuleCall { name } => write!(f, "module call `{name}`"),
+            Self::Read { resource_type } => write!(f, "read `{resource_type}`"),
+        }
+    }
+}
+
+/// State of the iterable at the final post-module-expansion conversion seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredForIterableResolution {
+    StillDeferred,
+    DependsOnEnclosingModuleArgument,
+    ConcreteAfterModuleArgumentSubstitution,
+}
+
+/// Details for a deferred `for` body that cannot cross the final module
+/// expansion seam.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", format_deferred_for_body_unsupported(*line, header, body, *iterable_resolution))]
+pub struct DeferredForBodyUnsupportedError {
+    pub line: usize,
+    pub header: String,
+    pub body: DeferredForBodyKind,
+    pub span: SourceSpan,
+    pub iterable_resolution: DeferredForIterableResolution,
+}
+
 /// Typed identity and authored token span for an unresolved declaration type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnresolvedTypeToken {
@@ -59,6 +96,19 @@ pub enum ParseError {
         kind: crate::resource::LoopKind,
         line: usize,
         span: Option<super::SourceSpan>,
+    },
+
+    #[error("{0}")]
+    DeferredForBodyUnsupported(Box<DeferredForBodyUnsupportedError>),
+
+    #[error(
+        "Deferred `for` expression `{header}` at line {line} cannot build its body template because its loop value is not known at plan time: {error}"
+    )]
+    DeferredForBodyTemplate {
+        line: usize,
+        header: String,
+        span: SourceSpan,
+        error: Box<ParseError>,
     },
 
     /// Provider-aware parsing could not resolve a type annotation. The
@@ -131,6 +181,9 @@ pub enum ParseError {
     UndefinedIdentifier {
         name: String,
         line: usize,
+        /// Exact authored expression span when the reporting seam retains it.
+        /// Older identifier checks that only know a line leave this as `None`.
+        span: Option<Box<SourceSpan>>,
         /// Edit-distance close match among in-scope bindings, if any.
         /// Filled by the check site when a `suggest_similar_name` result is
         /// available; None for hand-constructed errors.
@@ -138,6 +191,19 @@ pub enum ParseError {
         /// Concrete binding names in scope at the check site, sorted for
         /// deterministic rendering. Empty when no bindings have been
         /// declared at all.
+        in_scope: Vec<String>,
+    },
+
+    /// A bare deferred-`for` iterable that remained unbound after the
+    /// directory binding namespace was known. This is distinct from an
+    /// ordinary spanned identifier error so module-call ownership is decided
+    /// by semantic origin rather than by the incidental presence of a span.
+    #[error("{}", format_undefined_identifier(name, suggestion.as_deref(), in_scope))]
+    UndefinedDeferredIterable {
+        name: String,
+        line: usize,
+        span: Box<SourceSpan>,
+        suggestion: Option<String>,
         in_scope: Vec<String>,
     },
 
@@ -172,6 +238,35 @@ fn format_cyclic_let_binding(chain: &[String]) -> String {
         )
     } else {
         format!("Cyclic let binding detected: {rendered}")
+    }
+}
+
+fn format_deferred_for_body_unsupported(
+    line: usize,
+    header: &str,
+    body: &DeferredForBodyKind,
+    iterable_resolution: DeferredForIterableResolution,
+) -> String {
+    match iterable_resolution {
+        DeferredForIterableResolution::StillDeferred => format!(
+            "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
+             is still unresolved after module expansion, and only a managed resource body can be \
+             deferred until apply. Iterate over a value known before module expansion, or put \
+             managed resources directly in the loop body"
+        ),
+        DeferredForIterableResolution::DependsOnEnclosingModuleArgument => format!(
+            "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
+             still depends on an enclosing module argument at this module-expansion boundary, \
+             and replaying {body} after nested module expansion is not supported. Move the loop \
+             to the caller where that argument is supplied, or put managed resources directly \
+             in the loop body"
+        ),
+        DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution => format!(
+            "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
+             is concrete after module argument substitution, but replaying {body} after module \
+             expansion is not supported. Move the loop to the caller where the iterable is known \
+             during parsing, or put managed resources directly in the loop body"
+        ),
     }
 }
 
@@ -282,6 +377,15 @@ impl ParseError {
         line: usize,
         known_bindings: Vec<String>,
     ) -> ParseError {
+        Self::undefined_identifier_at(name, line, known_bindings, None)
+    }
+
+    pub(crate) fn undefined_identifier_at(
+        name: String,
+        line: usize,
+        known_bindings: Vec<String>,
+        span: Option<SourceSpan>,
+    ) -> ParseError {
         let known_refs: Vec<&str> = known_bindings.iter().map(String::as_str).collect();
         let suggestion = crate::schema::suggest_similar_name(&name, &known_refs);
         let mut in_scope = known_bindings;
@@ -289,6 +393,26 @@ impl ParseError {
         ParseError::UndefinedIdentifier {
             name,
             line,
+            span: span.map(Box::new),
+            suggestion,
+            in_scope,
+        }
+    }
+
+    pub(crate) fn undefined_deferred_iterable(
+        name: String,
+        line: usize,
+        known_bindings: Vec<String>,
+        span: SourceSpan,
+    ) -> ParseError {
+        let known_refs: Vec<&str> = known_bindings.iter().map(String::as_str).collect();
+        let suggestion = crate::schema::suggest_similar_name(&name, &known_refs);
+        let mut in_scope = known_bindings;
+        in_scope.sort();
+        ParseError::UndefinedDeferredIterable {
+            name,
+            line,
+            span: Box::new(span),
             suggestion,
             in_scope,
         }

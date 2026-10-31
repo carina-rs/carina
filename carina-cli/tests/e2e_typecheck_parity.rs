@@ -136,7 +136,7 @@ fn cli_diagnostics_at(
 fn cli_validated_file(
     factories: Vec<Box<dyn ProviderFactory>>,
     fixture: &TempDir,
-) -> carina_core::parser::InferredFile {
+) -> carina_core::parser::ModuleResolvedInferredFile {
     let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
         &carina_core::parser::ProviderContext::default(),
@@ -3430,22 +3430,21 @@ awscc.cloudfront.Distribution {
     .expect("write module fixture");
 
     let config = carina_core::parser::ProviderContext::default();
-    let mut loaded = carina_core::config_loader::load_configuration_with_config(
+    let loaded = carina_core::config_loader::load_configuration_with_config(
         fixture.path(),
         &config,
         &schemas,
     )
     .expect("load caller configuration");
-    carina_core::module_resolver::resolve_modules_with_providerless_config(
-        &mut loaded.parsed,
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        loaded.parsed,
         fixture.path(),
         &config,
         &schemas,
     )
     .expect("expand module call without panicking");
 
-    let expanded = loaded
-        .parsed
+    let expanded = parsed
         .resources
         .iter()
         .find(|resource| resource.id.resource_type == "cloudfront.Distribution")

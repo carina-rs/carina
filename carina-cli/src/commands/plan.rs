@@ -3999,7 +3999,7 @@ fn build_plan_file<E>(
 #[allow(clippy::too_many_arguments)]
 fn build_plan_file_from_parts<E, R>(
     path: &Path,
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
@@ -4021,7 +4021,7 @@ fn build_plan_file_from_parts<E, R>(
 #[allow(clippy::too_many_arguments)]
 fn build_plan_file_contents<E>(
     path: &Path,
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
@@ -5232,7 +5232,7 @@ impl ResolvedProviderInputs {
 /// command chooses both missing-state policy and load scope; provider
 /// construction then requires the returned typed configs.
 pub(crate) async fn load_and_resolve_provider_configs<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
     policy: UpstreamMissingStatePolicy,
@@ -5293,7 +5293,7 @@ struct ProviderReferencedUpstream {
 }
 
 async fn load_provider_referenced_upstream_states<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
@@ -5332,7 +5332,7 @@ async fn load_provider_referenced_upstream_states<E>(
 /// the visited key: this keeps the walk field-sensitive and terminates local
 /// reference cycles.
 fn provider_referenced_upstream_states<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
 ) -> Vec<ProviderReferencedUpstream> {
     fn enqueue_value(
         value: &Value,
@@ -5605,6 +5605,20 @@ async fn walk_upstream_cycles_only(
 }
 
 #[cfg(test)]
+fn resolve_file_for_test<E: carina_core::parser::ExportParamLike>(
+    parsed: carina_core::parser::File<E>,
+    base_dir: &Path,
+) -> carina_core::parser::ModuleResolvedFile<E> {
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        base_dir,
+        &ProviderContext::default(),
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution")
+}
+
+#[cfg(test)]
 mod load_upstream_states_tests {
     use super::*;
     use std::fs;
@@ -5642,6 +5656,7 @@ mod load_upstream_states_tests {
             unresolved_attributes: indexmap::IndexMap::new(),
             binding: None,
         });
+        let parsed = resolve_file_for_test(parsed, dir.path());
 
         let error = match load_and_resolve_provider_configs(
             &parsed,
@@ -5688,6 +5703,7 @@ mod load_upstream_states_tests {
             unresolved_attributes: indexmap::IndexMap::new(),
             binding: None,
         });
+        let parsed = resolve_file_for_test(parsed, dir.path());
 
         let error = match load_and_resolve_provider_configs(
             &parsed,
@@ -5746,6 +5762,7 @@ mod load_upstream_states_tests {
                 source: unrelated,
             },
         ]);
+        let parsed = resolve_file_for_test(parsed, temp.path());
 
         let inputs = load_and_resolve_provider_configs(
             &parsed,
@@ -5788,6 +5805,7 @@ mod load_upstream_states_tests {
         );
         parsed.resources.push(bridge); // allow: direct — fixture test inspection
         parsed.resources.push(relay); // allow: direct — fixture test inspection
+        let parsed = resolve_file_for_test(parsed, &downstream);
 
         let inputs = load_and_resolve_provider_configs(
             &parsed,
@@ -5834,6 +5852,7 @@ mod load_upstream_states_tests {
             );
             parsed.resources.push(resource); // allow: direct — fixture test inspection
         }
+        let parsed = resolve_file_for_test(parsed, Path::new("."));
 
         assert!(provider_referenced_upstream_states(&parsed).is_empty());
     }
@@ -6591,7 +6610,7 @@ mod run_plan_out_tests {
             to: carina_core::resource::ResolvedResource::new(updated_effect),
             changed_attributes: vec!["comment".to_string(), "web_acl_arn".to_string()],
         });
-        let parsed = carina_core::parser::ParsedFile::default();
+        let parsed = resolve_file_for_test(carina_core::parser::ParsedFile::default(), tmp.path());
         let ctx = crate::wiring::PlanContext {
             plan,
             provider: ProviderRouter::new(),
@@ -6611,7 +6630,7 @@ mod run_plan_out_tests {
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
-            residual_deferred_for: Vec::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
@@ -6830,7 +6849,8 @@ mod run_plan_out_tests {
                 identity,
             ))));
         }
-        let summary = PlanChangeSummary::new(&plan, &[], &[]);
+        let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();
@@ -6884,7 +6904,8 @@ mod run_plan_out_tests {
                 identity,
             ))));
         }
-        let summary = PlanChangeSummary::new(&plan, &[], &[]);
+        let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();
@@ -6968,6 +6989,7 @@ mod run_plan_out_tests {
 
         let mut parsed = carina_core::parser::ParsedFile::default();
         parsed.data_sources = vec![parsed_data_source];
+        let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
@@ -6980,7 +7002,7 @@ mod run_plan_out_tests {
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
-            residual_deferred_for: Vec::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
@@ -7052,7 +7074,7 @@ mod run_plan_out_tests {
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: Default::default(),
         };
-        let parsed = carina_core::parser::ParsedFile::default();
+        let parsed = resolve_file_for_test(carina_core::parser::ParsedFile::default(), tmp.path());
         let ctx = crate::wiring::PlanContext {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
@@ -7065,7 +7087,7 @@ mod run_plan_out_tests {
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
-            residual_deferred_for: Vec::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
@@ -7102,7 +7124,7 @@ mod run_plan_out_tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("main.crn");
         fs::write(&path, "provider mock {}\n").unwrap();
-        let parsed = carina_core::parser::ParsedFile::default();
+        let parsed = resolve_file_for_test(carina_core::parser::ParsedFile::default(), tmp.path());
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             carina_core::resource::ConcreteValue::String("upstream-secret".into()),
         ))));
@@ -7121,7 +7143,7 @@ mod run_plan_out_tests {
                 HashMap::from([("password".to_string(), secret)]),
             )]),
             prev_explicit: HashMap::new(),
-            residual_deferred_for: Vec::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
@@ -7165,6 +7187,7 @@ mod run_plan_out_tests {
         };
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers = vec![configured.clone()];
+        let parsed = resolve_file_for_test(parsed, tmp.path());
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
             &HashMap::new(),
@@ -7183,7 +7206,7 @@ mod run_plan_out_tests {
             moved_origins: HashMap::new(),
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
-            residual_deferred_for: Vec::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let wiring = ValidatedConfig::from_factories_for_test((), Vec::new(), &[configured]);

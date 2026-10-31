@@ -6,7 +6,7 @@
 
 use super::ast::{
     AttributePath, AttributePathSegment, BareBindingKind, BareBindingSource, BareBindingUse,
-    BindingScopeId, BindingUseOwner, DeferredForExpression, ModuleCallId, ParsedBindingUses,
+    BindingScopeId, BindingUseOwner, ModuleCallId, ParsedBindingUses, ParsedDeferredForExpression,
     PendingFunctionTypeCheck, PendingValueSlot, ProviderConfig, ResourceAddress, SourceFileId,
     SourceSpan, TypeExpr, UpstreamState, UserFunction, WaitBinding,
 };
@@ -92,8 +92,12 @@ pub(crate) struct ParseContext<'cfg> {
     pub(super) named_provider_instances: Vec<ProviderConfig>,
     /// Non-fatal warnings collected during parsing
     pub(super) warnings: Vec<ParseWarning>,
-    /// Deferred for-expressions collected during parsing
-    pub(super) deferred_for_expressions: Vec<DeferredForExpression>,
+    /// Deferred for-expressions collected during parsing.
+    ///
+    /// The resource-only resolved representation is produced later by the
+    /// module-resolution seam; parser output has exactly one deferred-loop
+    /// source of truth.
+    pub(super) parsed_deferred_for_expressions: Vec<ParsedDeferredForExpression>,
     /// Names pre-registered via the directory-aware seed pass
     /// (`parse_with_seeded_bindings`). Excluded from local duplicate-
     /// binding checks, so a `let role = ...` in this file does not
@@ -134,7 +138,7 @@ impl<'cfg> ParseContext<'cfg> {
             wait_bindings: HashMap::new(),
             named_provider_instances: Vec::new(),
             warnings: Vec::new(),
-            deferred_for_expressions: Vec::new(),
+            parsed_deferred_for_expressions: Vec::new(),
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,

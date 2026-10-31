@@ -1777,7 +1777,11 @@ mod tests {
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
             .collect();
-        let summary = crate::plan_summary::PlanChangeSummary::new(plan, &[], &[]);
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        );
         build_model(PlanImageInput {
             plan,
             desired_resources: &desired,

@@ -1,8 +1,15 @@
 use carina_core::effect::Effect;
-use carina_core::parser::DeferredForExpression;
+use carina_core::parser::{DeferredForExpression, ResolvedDeferredForExpressions};
 use carina_core::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, PlanSummaryPart};
 
-use crate::commands::plan::ExportChange;
+use crate::commands::plan::{ExportChange, ReloadedPlanFile};
+
+#[cfg(test)]
+pub(crate) fn resolved_deferred_for_for_test(
+    expressions: impl IntoIterator<Item = DeferredForExpression>,
+) -> ResolvedDeferredForExpressions {
+    ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
+}
 
 /// Effect categories shared by plan text and plan-image summaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,7 +54,23 @@ impl PlanChangeSummary {
     pub fn new<S>(
         plan: &Plan<S>,
         export_changes: &[ExportChange],
-        residual_deferred_for: &[DeferredForExpression],
+        residual_deferred_for: &ResolvedDeferredForExpressions,
+    ) -> Self {
+        Self::from_parts(
+            plan,
+            export_changes,
+            residual_deferred_for.as_slice().to_vec(),
+        )
+    }
+
+    pub(crate) fn from_reloaded_plan(plan_file: &ReloadedPlanFile) -> Self {
+        Self::from_parts(plan_file.plan(), &[], Vec::new())
+    }
+
+    fn from_parts<S>(
+        plan: &Plan<S>,
+        export_changes: &[ExportChange],
+        residual_deferred_for: Vec<DeferredForExpression>,
     ) -> Self {
         let plan_summary = plan.summary();
         let resume_create = plan
@@ -97,7 +120,7 @@ impl PlanChangeSummary {
             text_parts,
             deferred_effects: plan_summary.deferred,
             export_changes: export_changes.to_vec(),
-            residual_deferred_for: residual_deferred_for.to_vec(),
+            residual_deferred_for,
             has_plan_effects: !plan.effects().is_empty()
                 || !plan.ignored_change_summaries().is_empty(),
         }
@@ -145,7 +168,7 @@ mod tests {
     use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, DataSource, ResolvedDataSource, Resource, Value};
 
-    use super::PlanChangeSummary;
+    use super::{PlanChangeSummary, resolved_deferred_for_for_test};
     use crate::commands::plan::ExportChange;
 
     fn residual_deferred_for() -> DeferredForExpression {
@@ -172,13 +195,15 @@ mod tests {
             type_expr: None,
             new_value: Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
         };
-        let deferred = residual_deferred_for();
+        let no_deferred = resolved_deferred_for_for_test([]);
+        let deferred = resolved_deferred_for_for_test([residual_deferred_for()]);
 
-        assert!(!PlanChangeSummary::new(&plan, &[], &[]).has_changes());
+        assert!(!PlanChangeSummary::new(&plan, &[], &no_deferred).has_changes());
         assert!(
-            PlanChangeSummary::new(&plan, std::slice::from_ref(&export_change), &[]).has_changes()
+            PlanChangeSummary::new(&plan, std::slice::from_ref(&export_change), &no_deferred,)
+                .has_changes()
         );
-        assert!(PlanChangeSummary::new(&plan, &[], std::slice::from_ref(&deferred)).has_changes());
+        assert!(PlanChangeSummary::new(&plan, &[], &deferred).has_changes());
     }
 
     #[test]
@@ -188,6 +213,7 @@ mod tests {
             resource: ResolvedDataSource::new(DataSource::new("test.lookup", "lookup")),
         });
 
-        assert!(PlanChangeSummary::new(&plan, &[], &[]).has_changes());
+        let no_deferred = resolved_deferred_for_for_test([]);
+        assert!(PlanChangeSummary::new(&plan, &[], &no_deferred).has_changes());
     }
 }

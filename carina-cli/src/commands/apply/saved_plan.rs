@@ -498,13 +498,13 @@ pub(super) struct SavedPlanSecretCandidates {
 
 #[cfg(test)]
 pub(super) struct TestSavedPlanSecretCandidates {
-    parsed: carina_core::parser::InferredFile,
+    parsed: carina_core::parser::ModuleResolvedInferredFile,
     provider_inputs: ResolvedProviderInputs,
 }
 
 #[cfg(test)]
 impl TestSavedPlanSecretCandidates {
-    pub(super) fn parsed(&self) -> &carina_core::parser::InferredFile {
+    pub(super) fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
         &self.parsed
     }
 
@@ -526,7 +526,7 @@ impl SavedPlanSecretCandidates {
 
     #[cfg(test)]
     pub(super) fn from_test_parts(
-        parsed: carina_core::parser::InferredFile,
+        parsed: carina_core::parser::ModuleResolvedInferredFile,
         provider_inputs: ResolvedProviderInputs,
     ) -> TestSavedPlanSecretCandidates {
         TestSavedPlanSecretCandidates {
@@ -535,7 +535,7 @@ impl SavedPlanSecretCandidates {
         }
     }
 
-    pub(super) fn parsed(&self) -> &carina_core::parser::InferredFile {
+    pub(super) fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
         self.validated.resources().parsed()
     }
 
@@ -1099,6 +1099,10 @@ pub(super) struct ExecutablePlanFile {
 }
 
 impl ExecutablePlanFile {
+    pub(super) fn reloaded_plan_file(&self) -> &ReloadedPlanFile {
+        &self.plan.plan_file
+    }
+
     pub(super) fn plan(&self) -> &SavedPlan {
         self.plan.plan()
     }
