@@ -56,7 +56,8 @@ use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
 use carina_provider_resolver::{
-    ProviderLoadIdentity, ProviderLoadSource, ProviderTrustClass, VerifiedLoad,
+    ConsentedEgress, EgressSectionError, LockedEgress, ProviderLoadIdentity, ProviderLoadSource,
+    ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
 };
 
 use crate::{secret_seal, wasm_convert};
@@ -291,7 +292,9 @@ impl WasiHttpImports {
         let imports: Vec<_> = component_imports
             .iter()
             .filter_map(|name| {
-                name.strip_prefix("wasi:http/")?;
+                if !carina_provider_resolver::is_wasi_http_import(name) {
+                    return None;
+                }
                 let version = match name.rsplit_once('@') {
                     Some((_, raw)) => semver::Version::parse(raw)
                         .map(WasiHttpImportVersion::Semver)
@@ -603,6 +606,12 @@ impl std::error::Error for ProviderInstantiationError {}
 /// to prose or treating unrelated provider bring-up failures as cache faults.
 #[derive(Debug)]
 pub enum WasmProviderLoadError {
+    /// The exact loaded bytes carried an invalid or missing egress declaration.
+    EgressDeclaration(EgressSectionError),
+    /// The project lock could not be read while selecting an egress record.
+    EgressLock(carina_provider_resolver::LockedEgressLoadError),
+    /// The selected lock record did not authorize the exact loaded declaration.
+    EgressConsent(carina_provider_resolver::EgressConsentError),
     /// `Component::deserialize_file` rejected a precompiled cache entry.
     PrecompiledDeserialization(PrecompiledComponentDeserializationError),
     /// The component could not be instantiated as a Carina provider.
@@ -625,6 +634,9 @@ pub enum WasmProviderLoadError {
 impl fmt::Display for WasmProviderLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            WasmProviderLoadError::EgressDeclaration(error) => error.fmt(f),
+            WasmProviderLoadError::EgressLock(error) => error.fmt(f),
+            WasmProviderLoadError::EgressConsent(error) => error.fmt(f),
             WasmProviderLoadError::PrecompiledDeserialization(error) => error.fmt(f),
             WasmProviderLoadError::Instantiation(error) => error.fmt(f),
             WasmProviderLoadError::ProviderNameMismatch {
@@ -642,7 +654,20 @@ impl fmt::Display for WasmProviderLoadError {
     }
 }
 
-impl std::error::Error for WasmProviderLoadError {}
+impl std::error::Error for WasmProviderLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EgressDeclaration(source) => source.source(),
+            Self::EgressLock(source) => source.source(),
+            Self::EgressConsent(source) => source.source(),
+            Self::PrecompiledDeserialization(_)
+            | Self::Instantiation(_)
+            | Self::ProviderNameMismatch { .. }
+            | Self::Metadata { .. }
+            | Self::Other(_) => None,
+        }
+    }
+}
 
 impl WasmProviderLoadError {
     fn metadata(
@@ -671,6 +696,24 @@ impl WasmProviderLoadError {
 impl From<ProviderInstantiationError> for WasmProviderLoadError {
     fn from(error: ProviderInstantiationError) -> Self {
         WasmProviderLoadError::Instantiation(error)
+    }
+}
+
+impl From<EgressSectionError> for WasmProviderLoadError {
+    fn from(error: EgressSectionError) -> Self {
+        Self::EgressDeclaration(error)
+    }
+}
+
+impl From<carina_provider_resolver::LockedEgressLoadError> for WasmProviderLoadError {
+    fn from(error: carina_provider_resolver::LockedEgressLoadError) -> Self {
+        Self::EgressLock(error)
+    }
+}
+
+impl From<carina_provider_resolver::EgressConsentError> for WasmProviderLoadError {
+    fn from(error: carina_provider_resolver::EgressConsentError) -> Self {
+        Self::EgressConsent(error)
     }
 }
 
@@ -709,6 +752,7 @@ impl std::error::Error for PrecompiledComponentDeserializationError {}
 /// typed until the `ProviderFactory` trait boundary.
 #[derive(Debug)]
 enum WasmProviderInstanceError {
+    MissingEgressConsent,
     Instantiation(ProviderInstantiationError),
     InfoCall(wasmtime::Error),
     WallBudgetExceeded {
@@ -735,6 +779,9 @@ fn default_provider_instantiation_error_mapper(error: ProviderInstantiationError
 impl WasmProviderInstanceError {
     fn into_provider_error_with(self, mapper: &ProviderInstantiationErrorMapper) -> ProviderError {
         match self {
+            WasmProviderInstanceError::MissingEgressConsent => {
+                ProviderError::internal("provider runtime instance is missing consented egress")
+            }
             WasmProviderInstanceError::Instantiation(error) => mapper(error),
             WasmProviderInstanceError::InfoCall(error) => wasm_trap_provider_error("info", error),
             WasmProviderInstanceError::WallBudgetExceeded { operation, source } => {
@@ -850,19 +897,74 @@ fn write_error_chain_inline(f: &mut fmt::Formatter<'_>, error: &wasmtime::Error)
     Ok(())
 }
 
-// -- HTTP allow-list hooks --
+// -- HTTP egress hooks --
 
-/// HTTP allow-list suffix patterns for outgoing requests from WASM plugins.
-///
-/// Hosts matching these suffix patterns are permitted. See also
-/// [`HTTP_ALLOWED_EXACT_HOSTS`] for exact-match entries.
-const HTTP_ALLOWED_HOST_SUFFIXES: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn"];
+/// The complete network capability carried by one guest store.
+#[derive(Debug, Clone)]
+enum GuestNetwork {
+    SchemaOnly,
+    Runtime {
+        kind: ProviderKind,
+        egress: ConsentedEgress,
+    },
+}
 
-/// Metadata service addresses for EC2 IMDS and ECS task metadata.
-const METADATA_ENDPOINTS: [IpAddr; 3] = [
+impl GuestNetwork {
+    fn kind(&self) -> Option<ProviderKind> {
+        match self {
+            Self::SchemaOnly => None,
+            Self::Runtime { kind, egress: _ } => Some(*kind),
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_explicit_egress(declaration: &VerifiedEgressDeclaration) -> LockedEgress {
+    let directory = tempfile::tempdir().expect("create egress lock directory");
+    let canonical_source = declaration.source().to_string();
+    let source = canonical_source
+        .strip_prefix("file://")
+        .map(|path| format!("file://{}", directory.path().join(path).display()))
+        .unwrap_or(canonical_source);
+    let sha256 = declaration.sha256().as_str();
+    let hosts = declaration
+        .patterns()
+        .iter()
+        .map(|pattern| format!("    {:?},", pattern.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        directory.path().join("carina-providers.lock"),
+        format!(
+            "version = 5\n\n[[provider]]\nname = \"not-consent-identity\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {sha256:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n"
+        ),
+    )
+    .expect("write egress lock");
+    let (lock, _migration) = carina_provider_resolver::LockFile::load(directory.path())
+        .expect("load egress lock")
+        .expect("egress lock exists")
+        .into_parts();
+    lock.locked_egress(declaration, directory.path())
+        .expect("lock has consent for the declaration source")
+}
+
+/// Metadata service addresses owned by the AWS provider kind.
+const AWS_METADATA_ENDPOINTS: [IpAddr; 3] = [
     IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
     IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2)),
     IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
+];
+
+/// Every metadata address withheld from ordinary resolved destinations.
+///
+/// Alibaba and Azure metadata are deliberately not owned by any
+/// [`ProviderKind`], so they remain withheld even from AWS-kind providers.
+const METADATA_ENDPOINTS: [IpAddr; 5] = [
+    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+    IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2)),
+    IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
+    IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
+    IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16)),
 ];
 
 /// Connect timeout used when probing and capping metadata endpoint requests.
@@ -925,22 +1027,37 @@ impl Drop for EpochTicker {
 enum DestinationDenied {
     HostNotAllowed,
     MetadataWithheld(IpAddr),
+    LoopbackAddressDenied(IpAddr),
+    UnspecifiedAddressDenied(IpAddr),
     LinkLocalAddressDenied(IpAddr),
+    PrivateAddressDenied(IpAddr),
 }
 
 impl fmt::Display for DestinationDenied {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DestinationDenied::HostNotAllowed => f.write_str("host is not in the allow-list"),
+            DestinationDenied::HostNotAllowed => {
+                f.write_str("host is not in the provider's consented egress declaration")
+            }
             DestinationDenied::MetadataWithheld(address) => {
                 write!(
                     f,
                     "instance-metadata address {address} is not available to this provider"
                 )
             }
+            DestinationDenied::LoopbackAddressDenied(address) => {
+                write!(f, "loopback resolved address {address} is denied")
+            }
+            DestinationDenied::UnspecifiedAddressDenied(address) => {
+                write!(f, "unspecified resolved address {address} is denied")
+            }
             DestinationDenied::LinkLocalAddressDenied(address) => {
                 write!(f, "link-local resolved address {address} is denied")
             }
+            DestinationDenied::PrivateAddressDenied(address) => write!(
+                f,
+                "private resolved address {address} is not available to this provider"
+            ),
         }
     }
 }
@@ -974,9 +1091,12 @@ impl fmt::Display for EgressDenied {
         match (self.kind, &self.label.source, &self.reason) {
             (
                 Some(ProviderKind::Untrusted),
-                ProviderLoadSource::LocalFile { path },
-                DestinationDenied::MetadataWithheld(_address),
-            ) => write!(
+                ProviderLoadSource::LocalFile {
+                    path,
+                    canonical_source: _,
+                },
+                DestinationDenied::MetadataWithheld(address),
+            ) if AWS_METADATA_ENDPOINTS.contains(address) => write!(
                 formatter,
                 "provider '{}' ({}) is untrusted, so it gets no credentials and no \
                  instance-metadata access; its request to {} was denied. Grant this local build \
@@ -992,8 +1112,8 @@ impl fmt::Display for EgressDenied {
             (
                 Some(ProviderKind::Untrusted),
                 ProviderLoadSource::Remote { source: _ },
-                DestinationDenied::MetadataWithheld(_address),
-            ) => write!(
+                DestinationDenied::MetadataWithheld(address),
+            ) if AWS_METADATA_ENDPOINTS.contains(address) => write!(
                 formatter,
                 "provider '{}' ({}) is untrusted, so it gets no credentials and no \
                  instance-metadata access; its request to {} was denied because its source is \
@@ -1001,18 +1121,21 @@ impl fmt::Display for EgressDenied {
                 self.label.name, self.label.source, self.destination,
             ),
             (
-                None | Some(ProviderKind::Aws) | Some(ProviderKind::GitHub),
-                ProviderLoadSource::LocalFile { path: _ }
+                None
+                | Some(ProviderKind::Aws)
+                | Some(ProviderKind::GitHub)
+                | Some(ProviderKind::Untrusted),
+                ProviderLoadSource::LocalFile {
+                    path: _,
+                    canonical_source: _,
+                }
                 | ProviderLoadSource::Remote { source: _ },
                 DestinationDenied::HostNotAllowed
                 | DestinationDenied::MetadataWithheld(_)
-                | DestinationDenied::LinkLocalAddressDenied(_),
-            )
-            | (
-                Some(ProviderKind::Untrusted),
-                ProviderLoadSource::LocalFile { path: _ }
-                | ProviderLoadSource::Remote { source: _ },
-                DestinationDenied::HostNotAllowed | DestinationDenied::LinkLocalAddressDenied(_),
+                | DestinationDenied::LoopbackAddressDenied(_)
+                | DestinationDenied::UnspecifiedAddressDenied(_)
+                | DestinationDenied::LinkLocalAddressDenied(_)
+                | DestinationDenied::PrivateAddressDenied(_),
             ) => write!(
                 formatter,
                 "provider '{}' ({}) request to {} was denied: {}",
@@ -1063,13 +1186,33 @@ enum AllowedHostTarget {
 
 /// The only destination type accepted by the TCP connection handler.
 ///
-/// Instances are created only by [`vet_resolved_destination`], which checks
-/// every resolved address before constructing this value.
+/// Production instances are created only by [`vet_resolved_destination`],
+/// which checks every resolved address before constructing this value. The
+/// cfg-gated [`HttpTestRoute`] mechanism has the only test-only constructor.
 struct VettedDestination {
     host: String,
     first: SocketAddr,
     rest: Vec<SocketAddr>,
     is_metadata: bool,
+}
+
+impl VettedDestination {
+    /// Construct the integration-test-only loopback destination selected by
+    /// [`HttpTestRoute`]. Production builds have no route variant and compile
+    /// no bypass constructor.
+    #[cfg(any(test, feature = "test-utils"))]
+    fn from_http_test_route(allowed_host: AllowedHost, destination: HttpTestDestination) -> Self {
+        let host = match allowed_host.target {
+            AllowedHostTarget::Name(host) => host,
+            AllowedHostTarget::Literal(address) => address.to_string(),
+        };
+        Self {
+            host,
+            first: destination.address(),
+            rest: Vec::new(),
+            is_metadata: false,
+        }
+    }
 }
 
 /// A factory-scoped HTTP route used only by host/guest integration tests.
@@ -1078,9 +1221,70 @@ struct VettedDestination {
 /// instead of a process-global override, prevents parallel tests from changing
 /// one another's outbound policy.
 #[derive(Clone, Debug)]
-struct HttpTestRoute {
-    host: String,
-    destination: SocketAddr,
+enum HttpTestRoute {
+    #[cfg(any(test, feature = "test-utils"))]
+    Configured {
+        host: String,
+        destination: SocketAddr,
+    },
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HttpTestDestination(SocketAddr);
+
+#[cfg(any(test, feature = "test-utils"))]
+impl HttpTestDestination {
+    fn loopback(address: SocketAddr) -> Option<Self> {
+        let canonical_address = canonical_policy_address(address.ip());
+        match ResolvedAddressClass::classify(canonical_address) {
+            ResolvedAddressClass::Loopback => Some(Self(address)),
+            ResolvedAddressClass::Metadata
+            | ResolvedAddressClass::Unspecified
+            | ResolvedAddressClass::LinkLocal
+            | ResolvedAddressClass::Private
+            | ResolvedAddressClass::Public => None,
+        }
+    }
+
+    fn address(self) -> SocketAddr {
+        self.0
+    }
+}
+
+impl HttpTestRoute {
+    #[cfg(any(test, feature = "test-utils"))]
+    fn new(host: String, destination: SocketAddr) -> Self {
+        Self::Configured { host, destination }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn resolution_for(&self, host: &str, port: u16, use_tls: bool) -> Option<ResolvedAddresses> {
+        match self {
+            Self::Configured {
+                host: route_host,
+                destination,
+            } if !use_tls
+                && route_host.eq_ignore_ascii_case(host)
+                && destination.port() == port =>
+            {
+                Some(match HttpTestDestination::loopback(*destination) {
+                    Some(destination) => ResolvedAddresses::HttpTestRoute(destination),
+                    None => ResolvedAddresses::Standard(vec![*destination]),
+                })
+            }
+            Self::Configured {
+                host: _,
+                destination: _,
+            } => None,
+        }
+    }
+}
+
+enum ResolvedAddresses {
+    Standard(Vec<SocketAddr>),
+    #[cfg(any(test, feature = "test-utils"))]
+    HttpTestRoute(HttpTestDestination),
 }
 
 fn ip_literal(host: &str) -> Option<IpAddr> {
@@ -1091,7 +1295,7 @@ fn ip_literal(host: &str) -> Option<IpAddr> {
         .ok()
 }
 
-/// Canonicalize addresses before applying metadata and link-local policy.
+/// Canonicalize addresses before applying resolved-address policy.
 ///
 /// In addition to IPv4-mapped IPv6, treat the final 32 bits of the NAT64
 /// well-known prefix and the RFC 8215 local-use prefix as their embedded IPv4
@@ -1116,54 +1320,96 @@ fn canonical_policy_address(address: IpAddr) -> IpAddr {
     }
 }
 
-fn provider_permits_metadata(kind: Option<ProviderKind>, address: IpAddr) -> bool {
+/// Security-relevant class of one canonical resolved address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedAddressClass {
+    Metadata,
+    Loopback,
+    Unspecified,
+    LinkLocal,
+    Private,
+    Public,
+}
+
+impl ResolvedAddressClass {
+    /// Classify an address that has already passed through
+    /// [`canonical_policy_address`]. Metadata wins over every range class.
+    fn classify(address: IpAddr) -> Self {
+        if METADATA_ENDPOINTS.contains(&address) {
+            return Self::Metadata;
+        }
+
+        match address {
+            IpAddr::V4(address) if address.is_loopback() => Self::Loopback,
+            IpAddr::V6(address) if address.is_loopback() => Self::Loopback,
+            IpAddr::V4(address) if address.is_unspecified() => Self::Unspecified,
+            IpAddr::V6(address) if address.is_unspecified() => Self::Unspecified,
+            IpAddr::V4(address) if address.is_link_local() => Self::LinkLocal,
+            IpAddr::V6(address) if (address.segments()[0] & 0xffc0) == 0xfe80 => Self::LinkLocal,
+            IpAddr::V4(address) => {
+                let [first, second, _, _] = address.octets();
+                if first == 10
+                    || (first == 172 && (16..=31).contains(&second))
+                    || (first == 192 && second == 168)
+                    || (first == 100 && (64..=127).contains(&second))
+                {
+                    Self::Private
+                } else {
+                    Self::Public
+                }
+            }
+            IpAddr::V6(address) => {
+                if (address.segments()[0] & 0xfe00) == 0xfc00 {
+                    Self::Private
+                } else {
+                    Self::Public
+                }
+            }
+        }
+    }
+}
+
+fn provider_permits_metadata(kind: Option<ProviderKind>, canonical_address: IpAddr) -> bool {
     match kind {
-        Some(kind) => kind
-            .metadata_endpoints()
-            .contains(&canonical_policy_address(address)),
+        Some(kind) => kind.metadata_endpoints().contains(&canonical_address),
         None => false,
     }
 }
 
-fn check_host(kind: Option<ProviderKind>, host: &str) -> Result<AllowedHost, DestinationDenied> {
+fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, DestinationDenied> {
+    let kind = network.kind();
     let target = match ip_literal(host) {
-        Some(address) if is_metadata_host(address) => {
-            if provider_permits_metadata(kind, address) {
-                AllowedHostTarget::Literal(address)
-            } else {
-                return Err(DestinationDenied::MetadataWithheld(
-                    canonical_policy_address(address),
-                ));
+        Some(address) => {
+            let canonical_address = canonical_policy_address(address);
+            match ResolvedAddressClass::classify(canonical_address) {
+                ResolvedAddressClass::Metadata => {
+                    if provider_permits_metadata(kind, canonical_address) {
+                        AllowedHostTarget::Literal(canonical_address)
+                    } else {
+                        return Err(DestinationDenied::MetadataWithheld(canonical_address));
+                    }
+                }
+                ResolvedAddressClass::Loopback
+                | ResolvedAddressClass::Unspecified
+                | ResolvedAddressClass::LinkLocal
+                | ResolvedAddressClass::Private
+                | ResolvedAddressClass::Public => {
+                    return Err(DestinationDenied::HostNotAllowed);
+                }
             }
         }
-        Some(address) if is_link_local(address) => {
-            return Err(DestinationDenied::LinkLocalAddressDenied(
-                canonical_policy_address(address),
-            ));
-        }
-        Some(_) => return Err(DestinationDenied::HostNotAllowed),
-        None if HTTP_ALLOWED_HOST_SUFFIXES
-            .iter()
-            .any(|suffix| host.ends_with(suffix)) =>
-        {
-            AllowedHostTarget::Name(host.to_string())
-        }
-        None => return Err(DestinationDenied::HostNotAllowed),
+        None => match network {
+            GuestNetwork::SchemaOnly => return Err(DestinationDenied::HostNotAllowed),
+            GuestNetwork::Runtime { kind: _, egress } if egress.allows(host) => {
+                AllowedHostTarget::Name(host.to_string())
+            }
+            GuestNetwork::Runtime { kind: _, egress: _ } => {
+                return Err(DestinationDenied::HostNotAllowed);
+            }
+        },
     };
 
     Ok(AllowedHost { kind, target })
-}
-
-/// Returns `true` if the address is an EC2 or ECS metadata endpoint.
-fn is_metadata_host(address: IpAddr) -> bool {
-    METADATA_ENDPOINTS.contains(&canonical_policy_address(address))
-}
-
-fn is_link_local(address: IpAddr) -> bool {
-    match canonical_policy_address(address) {
-        IpAddr::V4(address) => address.is_link_local(),
-        IpAddr::V6(address) => (address.segments()[0] & 0xffc0) == 0xfe80,
-    }
 }
 
 fn vet_resolved_destination(
@@ -1176,20 +1422,43 @@ fn vet_resolved_destination(
         AllowedHostTarget::Name(host) => host,
         AllowedHostTarget::Literal(address) => address.to_string(),
     };
+    let private_address_policy = match kind {
+        Some(kind) => kind.private_address_policy(),
+        None => PrivateAddressPolicy::Deny,
+    };
     let mut destination_is_metadata = false;
     for address in std::iter::once(&first).chain(rest) {
         let canonical_ip = canonical_policy_address(address.ip());
-        let metadata = is_metadata_host(canonical_ip);
-        if metadata && !provider_permits_metadata(kind, canonical_ip) {
-            return Err((DestinationDenied::MetadataWithheld(canonical_ip), host));
+        match ResolvedAddressClass::classify(canonical_ip) {
+            ResolvedAddressClass::Metadata => {
+                if !provider_permits_metadata(kind, canonical_ip) {
+                    return Err((DestinationDenied::MetadataWithheld(canonical_ip), host));
+                }
+                destination_is_metadata = true;
+            }
+            ResolvedAddressClass::Loopback => {
+                return Err((DestinationDenied::LoopbackAddressDenied(canonical_ip), host));
+            }
+            ResolvedAddressClass::Unspecified => {
+                return Err((
+                    DestinationDenied::UnspecifiedAddressDenied(canonical_ip),
+                    host,
+                ));
+            }
+            ResolvedAddressClass::LinkLocal => {
+                return Err((
+                    DestinationDenied::LinkLocalAddressDenied(canonical_ip),
+                    host,
+                ));
+            }
+            ResolvedAddressClass::Private => match private_address_policy {
+                PrivateAddressPolicy::Allow => {}
+                PrivateAddressPolicy::Deny => {
+                    return Err((DestinationDenied::PrivateAddressDenied(canonical_ip), host));
+                }
+            },
+            ResolvedAddressClass::Public => {}
         }
-        if !metadata && is_link_local(canonical_ip) {
-            return Err((
-                DestinationDenied::LinkLocalAddressDenied(canonical_ip),
-                host,
-            ));
-        }
-        destination_is_metadata |= metadata;
     }
 
     Ok(VettedDestination {
@@ -1204,14 +1473,14 @@ fn vet_resolved_destination(
 /// policy without performing network I/O.
 #[cfg(test)]
 fn check_destination(
-    kind: Option<ProviderKind>,
+    network: &GuestNetwork,
     host: &str,
     resolved: &[SocketAddr],
 ) -> Result<VettedDestination, DestinationDenied> {
     let (first, rest) = resolved
         .split_first()
         .expect("test resolution must contain at least one address");
-    let allowed_host = check_host(kind, host)?;
+    let allowed_host = check_host(network, host)?;
     vet_resolved_destination(allowed_host, *first, rest)
         .map_err(|(reason, _denied_destination)| reason)
 }
@@ -1257,7 +1526,7 @@ fn probe_metadata_endpoints() -> bool {
     use std::net::{SocketAddr, TcpStream};
 
     std::thread::scope(|s| {
-        let handles: Vec<_> = METADATA_ENDPOINTS
+        let handles: Vec<_> = AWS_METADATA_ENDPOINTS
             .iter()
             .map(|address| {
                 s.spawn(move || {
@@ -1304,14 +1573,14 @@ fn dns_error_code() -> wasmtime_wasi_http::p2::bindings::http::types::ErrorCode 
     })
 }
 
-/// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to the
-/// existing AWS hostname suffixes and this store's typed metadata policy.
+/// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to this
+/// store's consented declaration and typed resolved-address policy.
 ///
 /// Metadata requests are capped at [`METADATA_PROBE_TIMEOUT`] so that non-EC2/ECS
 /// environments fail fast rather than waiting for the SDK's default timeout.
 struct AllowListHttpHooks {
     label: Arc<ProviderLabel>,
-    kind: Option<ProviderKind>,
+    network: GuestNetwork,
     resolver: Arc<dyn DestinationResolver>,
     test_route: Option<HttpTestRoute>,
     call_egress: Option<CallEgressRecorder>,
@@ -1320,12 +1589,12 @@ struct AllowListHttpHooks {
 impl AllowListHttpHooks {
     fn with_resolver(
         label: Arc<ProviderLabel>,
-        kind: Option<ProviderKind>,
+        network: GuestNetwork,
         resolver: Arc<dyn DestinationResolver>,
     ) -> Self {
         Self {
             label,
-            kind,
+            network,
             resolver,
             test_route: None,
             call_egress: None,
@@ -1334,10 +1603,10 @@ impl AllowListHttpHooks {
 
     fn with_test_route(
         label: Arc<ProviderLabel>,
-        kind: Option<ProviderKind>,
+        network: GuestNetwork,
         test_route: Option<HttpTestRoute>,
     ) -> Self {
-        let mut hooks = Self::with_resolver(label, kind, Arc::new(TokioDestinationResolver));
+        let mut hooks = Self::with_resolver(label, network, Arc::new(TokioDestinationResolver));
         hooks.test_route = test_route;
         hooks
     }
@@ -1362,31 +1631,21 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             .uri()
             .port_u16()
             .unwrap_or(if config.use_tls { 443 } else { 80 });
-        let test_destination = self
+        let kind = self.network.kind();
+        let allowed_host = check_host(&self.network, host).map_err(|reason| {
+            wasmtime_wasi_http::p2::HttpError::trap(EgressDenied::new(
+                Arc::clone(&self.label),
+                kind,
+                host.to_string(),
+                reason,
+            ))
+        })?;
+        #[cfg(any(test, feature = "test-utils"))]
+        let test_resolution = self
             .test_route
             .as_ref()
-            .filter(|route| {
-                !config.use_tls
-                    && route.host.eq_ignore_ascii_case(host)
-                    && route.destination.port() == port
-            })
-            .map(|route| route.destination);
-        let allowed_host = match test_destination {
-            Some(_) => AllowedHost {
-                kind: self.kind,
-                target: AllowedHostTarget::Name(host.to_string()),
-            },
-            None => check_host(self.kind, host).map_err(|reason| {
-                wasmtime_wasi_http::p2::HttpError::trap(EgressDenied::new(
-                    Arc::clone(&self.label),
-                    self.kind,
-                    host.to_string(),
-                    reason,
-                ))
-            })?,
-        };
+            .and_then(|route| route.resolution_for(host, port, config.use_tls));
         let label = Arc::clone(&self.label);
-        let kind = self.kind;
         let resolver = Arc::clone(&self.resolver);
         let mut pending_egress = self
             .call_egress
@@ -1403,69 +1662,80 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             let handler_start = std::time::Instant::now();
             let trace = trace_state.is_some();
             let resolved = async {
-                Ok::<_, ErrorCode>(match test_destination {
-                    Some(destination) => vec![destination],
-                    None => match &allowed_host.target {
-                        AllowedHostTarget::Name(host) => tokio::time::timeout(
-                            config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
-                            resolver.resolve(host.clone(), port),
-                        )
-                        .await
-                        .map_err(|_| {
-                            log::warn!(
-                                "WASM plugin HTTP request timed out resolving host {:?}",
-                                host,
-                            );
-                            ErrorCode::ConnectionTimeout
-                        })?
-                        .map_err(|error| {
-                            log::warn!(
-                                "WASM plugin HTTP request failed to resolve host {:?}: {}",
-                                host,
-                                error,
-                            );
-                            dns_error_code()
-                        })?,
-                        AllowedHostTarget::Literal(address) => {
-                            vec![SocketAddr::new(*address, port)]
-                        }
-                    },
-                })
+                #[cfg(any(test, feature = "test-utils"))]
+                if let Some(resolution) = test_resolution {
+                    return Ok::<_, ErrorCode>(resolution);
+                }
+
+                let addresses = match &allowed_host.target {
+                    AllowedHostTarget::Name(host) => tokio::time::timeout(
+                        config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
+                        resolver.resolve(host.clone(), port),
+                    )
+                    .await
+                    .map_err(|_| {
+                        log::warn!(
+                            "WASM plugin HTTP request timed out resolving host {:?}",
+                            host,
+                        );
+                        ErrorCode::ConnectionTimeout
+                    })?
+                    .map_err(|error| {
+                        log::warn!(
+                            "WASM plugin HTTP request failed to resolve host {:?}: {}",
+                            host,
+                            error,
+                        );
+                        dns_error_code()
+                    })?,
+                    AllowedHostTarget::Literal(address) => {
+                        vec![SocketAddr::new(*address, port)]
+                    }
+                };
+                Ok::<_, ErrorCode>(ResolvedAddresses::Standard(addresses))
             }
             .await;
-            let result = match resolved {
+            let vetted = match resolved {
                 Err(error) => Ok(Err(error)),
-                Ok(resolved) => match resolved.split_first() {
+                Ok(ResolvedAddresses::Standard(resolved)) => match resolved.split_first() {
                     None => Ok(Err(dns_error_code())),
                     Some((first, rest)) => {
-                        match vet_resolved_destination(allowed_host, *first, rest) {
-                            Err((reason, destination)) => Err(wasmtime::Error::new(
-                                EgressDenied::new(label, kind, destination, reason),
-                            )),
-                            Ok(vetted) => {
-                                if let Some(pending) = pending_egress.take() {
-                                    if vetted.is_metadata {
-                                        pending.not_dispatched();
-                                    } else {
-                                        pending.dispatched();
-                                    }
-                                }
-                                let mut config = config;
-                                let cap = if vetted.is_metadata {
-                                    METADATA_PROBE_TIMEOUT
-                                } else {
-                                    HTTP_API_REQUEST_TIMEOUT
-                                };
-                                config.connect_timeout = config.connect_timeout.min(cap);
-                                config.first_byte_timeout = config.first_byte_timeout.min(cap);
-                                config.between_bytes_timeout =
-                                    config.between_bytes_timeout.min(cap);
-
-                                Ok(send_request_handler(request, config, vetted, trace).await)
-                            }
-                        }
+                        vet_resolved_destination(allowed_host, *first, rest).map(Ok)
                     }
                 },
+                #[cfg(any(test, feature = "test-utils"))]
+                Ok(ResolvedAddresses::HttpTestRoute(destination)) => Ok(Ok(
+                    VettedDestination::from_http_test_route(allowed_host, destination),
+                )),
+            };
+            let result = match vetted {
+                Err((reason, destination)) => Err(wasmtime::Error::new(EgressDenied::new(
+                    label,
+                    kind,
+                    destination,
+                    reason,
+                ))),
+                Ok(Err(error)) => Ok(Err(error)),
+                Ok(Ok(vetted)) => {
+                    if let Some(pending) = pending_egress.take() {
+                        if vetted.is_metadata {
+                            pending.not_dispatched();
+                        } else {
+                            pending.dispatched();
+                        }
+                    }
+                    let mut config = config;
+                    let cap = if vetted.is_metadata {
+                        METADATA_PROBE_TIMEOUT
+                    } else {
+                        HTTP_API_REQUEST_TIMEOUT
+                    };
+                    config.connect_timeout = config.connect_timeout.min(cap);
+                    config.first_byte_timeout = config.first_byte_timeout.min(cap);
+                    config.between_bytes_timeout = config.between_bytes_timeout.min(cap);
+
+                    Ok(send_request_handler(request, config, vetted, trace).await)
+                }
             };
             if let Some((method, uri, spawn_start)) = trace_state {
                 let queue_ms = handler_start.duration_since(spawn_start).as_millis();
@@ -1505,7 +1775,8 @@ fn trace_http_enabled() -> bool {
 }
 
 /// Local copy of `wasmtime_wasi_http::p2::default_send_request_handler` that
-/// connects only to addresses produced by [`vet_resolved_destination`].
+/// connects only to addresses produced by [`vet_resolved_destination`] or by
+/// the cfg-gated [`HttpTestRoute`] integration-test mechanism.
 ///
 /// Both traced and untraced requests use this handler, preventing the
 /// connection path from performing a second DNS lookup after policy checks.
@@ -2438,10 +2709,10 @@ async fn create_instance(
     engine: &Engine,
     component: &Component,
     label: Arc<ProviderLabel>,
-    kind: Option<ProviderKind>,
+    network: GuestNetwork,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut store = GuestStore::new(engine, label, kind, None, build_store_limits(), budget);
+    let mut store = GuestStore::new(engine, label, network, None, build_store_limits(), budget);
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
@@ -2515,9 +2786,9 @@ impl ConfiguredProvider {
     }
 }
 
-/// A provider kind whose credential and metadata partitions the host knows
-/// about. It is classified only from the resolver-owned verified-source
-/// identity, never from configured or guest-reported names.
+/// A provider kind whose credential, metadata, and private-address partitions
+/// the host knows about. It is classified only from the resolver-owned
+/// verified-source identity, never from configured or guest-reported names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderKind {
     /// AWS native-SDK and Cloud Control providers; both consume the AWS
@@ -2528,6 +2799,13 @@ enum ProviderKind {
     /// Any provider the host has no credential partition for (e.g. the mock
     /// provider). Receives the shared group only.
     Untrusted,
+}
+
+/// Whether a provider kind may connect to a resolved private address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateAddressPolicy {
+    Allow,
+    Deny,
 }
 
 impl ProviderKind {
@@ -2543,13 +2821,25 @@ impl ProviderKind {
     }
 
     /// Metadata endpoints reachable by this kind. This match is deliberately
-    /// adjacent to [`Self::credential_partition`] so adding a kind cannot
-    /// compile without deciding both secret-bearing capabilities.
+    /// adjacent to [`Self::credential_partition`] and
+    /// [`Self::private_address_policy`] so adding a kind cannot compile without
+    /// deciding all network-bearing capabilities.
     fn metadata_endpoints(self) -> &'static [IpAddr] {
         match self {
-            ProviderKind::Aws => &METADATA_ENDPOINTS,
+            ProviderKind::Aws => &AWS_METADATA_ENDPOINTS,
             ProviderKind::GitHub => &[],
             ProviderKind::Untrusted => &[],
+        }
+    }
+
+    /// Private-address policy for this kind. This match stays next to the
+    /// credential and metadata partitions so a new kind must decide every
+    /// network-bearing capability in one place.
+    fn private_address_policy(self) -> PrivateAddressPolicy {
+        match self {
+            ProviderKind::Aws => PrivateAddressPolicy::Allow,
+            ProviderKind::GitHub => PrivateAddressPolicy::Deny,
+            ProviderKind::Untrusted => PrivateAddressPolicy::Deny,
         }
     }
 }
@@ -2612,14 +2902,14 @@ async fn create_instance_with_http(
     engine: &Engine,
     component: &Component,
     label: Arc<ProviderLabel>,
-    kind: Option<ProviderKind>,
+    network: GuestNetwork,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
     let mut store = GuestStore::new_with_http_test_route(
         engine,
         label,
-        kind,
+        network,
         Some(WasiHttpCtx::new()),
         build_store_limits(),
         budget,
@@ -2651,16 +2941,19 @@ async fn create_instance_for_world(
     engine: &Engine,
     component: &Component,
     label: Arc<ProviderLabel>,
-    kind: Option<ProviderKind>,
+    network: GuestNetwork,
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 ) -> Result<LiveInstance, WasmBindingCreationError> {
     let (store, bindings) = match world {
         InstantiationWorld::HttpEnabled => {
-            create_instance_with_http(engine, component, label, kind, budget, http_test_route).await
+            create_instance_with_http(engine, component, label, network, budget, http_test_route)
+                .await
         }
-        InstantiationWorld::Basic => create_instance(engine, component, label, kind, budget).await,
+        InstantiationWorld::Basic => {
+            create_instance(engine, component, label, network, budget).await
+        }
     }?;
     Ok(LiveInstance::new(store, bindings, world))
 }
@@ -2669,7 +2962,7 @@ async fn create_runtime_instance(
     engine: &Engine,
     component: &Component,
     label: Arc<ProviderLabel>,
-    kind: Option<ProviderKind>,
+    network: GuestNetwork,
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
@@ -2678,7 +2971,7 @@ async fn create_runtime_instance(
         engine,
         component,
         label,
-        kind,
+        network,
         world,
         budget,
         http_test_route,
@@ -3504,7 +3797,7 @@ struct RebuildContext {
     engine: Engine,
     component: Component,
     label: Arc<ProviderLabel>,
-    kind: Option<ProviderKind>,
+    network: GuestNetwork,
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
@@ -3521,7 +3814,7 @@ impl RebuildContext {
             engine,
             component,
             label,
-            kind: None,
+            network: GuestNetwork::SchemaOnly,
             world: InstantiationWorld::HttpEnabled,
             budget,
             http_test_route: None,
@@ -3533,7 +3826,7 @@ impl RebuildContext {
             &self.engine,
             &self.component,
             Arc::clone(&self.label),
-            self.kind,
+            self.network.clone(),
             self.world,
             self.budget,
             self.http_test_route.clone(),
@@ -3689,6 +3982,7 @@ pub struct WasmProviderFactory {
     engine: Engine,
     component: Component,
     configured: ConfiguredProvider,
+    runtime_network: GuestNetwork,
     budget: GuestCallBudget,
     display_name: String,
     version: String,
@@ -3963,6 +4257,7 @@ impl WasmProviderFactory {
         component: Component,
         epoch_ticker: EpochTicker,
         configured: ConfiguredProvider,
+        runtime_network: GuestNetwork,
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
         let mut rebuild = RebuildContext::new(
@@ -4005,6 +4300,7 @@ impl WasmProviderFactory {
             engine,
             component,
             configured,
+            runtime_network,
             budget,
             display_name,
             version,
@@ -4031,6 +4327,7 @@ impl WasmProviderFactory {
         load: VerifiedLoad,
         user_dirs: &UserDirs,
     ) -> Result<Self, WasmProviderLoadError> {
+        VerifiedEgressDeclaration::read(&load)?;
         let configured = ConfiguredProvider::new(load.identity());
         let wasm_bytes = load.bytes().clone();
         let cache_dir = user_dirs.compiled_wasm_cache_dir().to_path_buf();
@@ -4039,6 +4336,7 @@ impl WasmProviderFactory {
                 wasm_bytes.as_bytes(),
                 &cache_dir,
                 configured,
+                GuestNetwork::SchemaOnly,
             )
             .await
         });
@@ -4050,15 +4348,72 @@ impl WasmProviderFactory {
         load: VerifiedLoad,
         cache_dir: &Path,
     ) -> Result<Self, WasmProviderLoadError> {
+        VerifiedEgressDeclaration::read(&load)?;
         let configured = ConfiguredProvider::new(load.identity());
-        Self::from_bytes_with_cache_dir_configured(load.bytes().as_bytes(), cache_dir, configured)
-            .await
+        Self::from_bytes_with_cache_dir_configured(
+            load.bytes().as_bytes(),
+            cache_dir,
+            configured,
+            GuestNetwork::SchemaOnly,
+        )
+        .await
+    }
+
+    /// Load a provider for credentialed runtime use with consent already
+    /// derived from this load's declaration and lock record.
+    pub async fn from_bytes_with_egress(
+        load: VerifiedLoad,
+        user_dirs: &UserDirs,
+        locked_egress: Option<&LockedEgress>,
+    ) -> Result<Self, WasmProviderLoadError> {
+        let declaration = VerifiedEgressDeclaration::read(&load)?;
+        let egress =
+            ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
+        let configured = ConfiguredProvider::new(load.identity());
+        let runtime_network = GuestNetwork::Runtime {
+            kind: configured.kind,
+            egress,
+        };
+        let wasm_bytes = load.bytes().clone();
+        let cache_dir = user_dirs.compiled_wasm_cache_dir().to_path_buf();
+        Self::from_bytes_with_cache_dir_configured(
+            wasm_bytes.as_bytes(),
+            &cache_dir,
+            configured,
+            runtime_network,
+        )
+        .await
+    }
+
+    /// Test/cache-dir form of [`Self::from_bytes_with_egress`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn from_bytes_with_cache_dir_and_egress(
+        load: VerifiedLoad,
+        cache_dir: &Path,
+        locked_egress: Option<&LockedEgress>,
+    ) -> Result<Self, WasmProviderLoadError> {
+        let declaration = VerifiedEgressDeclaration::read(&load)?;
+        let egress =
+            ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
+        let configured = ConfiguredProvider::new(load.identity());
+        let runtime_network = GuestNetwork::Runtime {
+            kind: configured.kind,
+            egress,
+        };
+        Self::from_bytes_with_cache_dir_configured(
+            load.bytes().as_bytes(),
+            cache_dir,
+            configured,
+            runtime_network,
+        )
+        .await
     }
 
     async fn from_bytes_with_cache_dir_configured(
         wasm_bytes: &[u8],
         cache_dir: &Path,
         configured: ConfiguredProvider,
+        runtime_network: GuestNetwork,
     ) -> Result<Self, WasmProviderLoadError> {
         let cwasm_name = Self::cache_key(wasm_bytes);
         let cwasm_path = cache_dir.join(&cwasm_name);
@@ -4070,7 +4425,7 @@ impl WasmProviderFactory {
             && let Err(error) = Self::precompile(wasm_bytes, &cwasm_path)
         {
             eprintln!("Failed to write precompile cache, loading directly: {error}");
-            return Self::new_uncached_configured(wasm_bytes, configured).await;
+            return Self::new_uncached_configured(wasm_bytes, configured, runtime_network).await;
         }
 
         let engine = Self::create_engine()?;
@@ -4098,7 +4453,7 @@ impl WasmProviderFactory {
         };
 
         let epoch_ticker = EpochTicker::start(engine.clone());
-        Self::bring_up_component(engine, component, epoch_ticker, configured).await
+        Self::bring_up_component(engine, component, epoch_ticker, configured, runtime_network).await
     }
 
     /// Load provider bytes without any precompile caching.
@@ -4107,18 +4462,35 @@ impl WasmProviderFactory {
         wasm_bytes: &[u8],
         identity: ProviderLoadIdentity,
     ) -> Result<Self, WasmProviderLoadError> {
-        Self::new_uncached_configured(wasm_bytes, ConfiguredProvider::new(&identity)).await
+        let load = VerifiedLoad::for_test(wasm_bytes, identity);
+        let declaration = VerifiedEgressDeclaration::read(&load)?;
+        let locked_egress = test_explicit_egress(&declaration);
+        let runtime_network = GuestNetwork::Runtime {
+            kind: ConfiguredProvider::new(load.identity()).kind,
+            egress: ConsentedEgress::from_lock(
+                Some(&locked_egress),
+                declaration,
+                load.carina_rs_signed(),
+            )?,
+        };
+        Self::new_uncached_configured(
+            load.bytes().as_bytes(),
+            ConfiguredProvider::new(load.identity()),
+            runtime_network,
+        )
+        .await
     }
 
     async fn new_uncached_configured(
         wasm_bytes: &[u8],
         configured: ConfiguredProvider,
+        runtime_network: GuestNetwork,
     ) -> Result<Self, WasmProviderLoadError> {
         let engine = Self::create_engine()?;
         let component = Self::load_component_from_bytes(&engine, wasm_bytes)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
-        Self::bring_up_component(engine, component, epoch_ticker, configured).await
+        Self::bring_up_component(engine, component, epoch_ticker, configured, runtime_network).await
     }
 
     /// Precompile provider bytes and save the result to a .cwasm file.
@@ -4188,6 +4560,7 @@ impl WasmProviderFactory {
             component,
             epoch_ticker,
             ConfiguredProvider::new(&identity),
+            GuestNetwork::SchemaOnly,
         )
         .await
     }
@@ -4205,11 +4578,20 @@ impl WasmProviderFactory {
         } else {
             InstantiationWorld::Basic
         };
+        let network = match &self.runtime_network {
+            GuestNetwork::SchemaOnly => {
+                return Err(WasmProviderInstanceError::MissingEgressConsent);
+            }
+            GuestNetwork::Runtime { kind, egress } => GuestNetwork::Runtime {
+                kind: *kind,
+                egress: egress.clone(),
+            },
+        };
         let mut live = create_runtime_instance(
             &self.engine,
             &self.component,
             Arc::clone(&self.configured.label),
-            Some(self.configured.kind),
+            network,
             world,
             self.budget,
             self.http_test_route.clone(),
@@ -4313,10 +4695,7 @@ impl WasmProviderFactory {
         host: impl Into<String>,
         destination: SocketAddr,
     ) -> Self {
-        let route = HttpTestRoute {
-            host: host.into(),
-            destination,
-        };
+        let route = HttpTestRoute::new(host.into(), destination);
         self.init_instance.rebuild.http_test_route = Some(route.clone());
         self.http_test_route = Some(route);
         self
@@ -6825,8 +7204,10 @@ mod tests {
         AccessPath, ApplyTimeUnknown, ConcreteValue, Current, DeferredValue, InterpolationPart,
         ModuleSource,
     };
+    use std::borrow::Cow;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use wasm_encoder::{Component as EncoderComponent, CustomSection};
     use wasmtime::component::ResourceTable;
     use wasmtime_wasi::WasiCtxView;
 
@@ -6839,6 +7220,7 @@ mod tests {
             name: name.to_string(),
             source: ProviderLoadSource::LocalFile {
                 path: PathBuf::from(format!("/test-providers/{name}.wasm")),
+                canonical_source: PathBuf::from(format!("{name}.wasm")),
             },
         })
     }
@@ -6855,6 +7237,80 @@ mod tests {
             name: name.to_string(),
             source: ProviderLoadSource::Remote { source },
         })
+    }
+
+    fn test_network(kind: ProviderKind, hosts: &[&str]) -> GuestNetwork {
+        let declaration_json = serde_json::json!({
+            "version": 1,
+            "hosts": hosts,
+        })
+        .to_string();
+        let mut component = EncoderComponent::new();
+        component.section(&CustomSection {
+            name: Cow::Borrowed("carina:egress"),
+            data: Cow::Owned(declaration_json.into_bytes()),
+        });
+        let class = match kind {
+            ProviderKind::Aws => ProviderTrustClass::Aws,
+            ProviderKind::GitHub => ProviderTrustClass::GitHub,
+            ProviderKind::Untrusted => ProviderTrustClass::Untrusted,
+        };
+        let load = VerifiedLoad::for_test(
+            component.finish(),
+            ProviderLoadIdentity::for_test("network-test", class),
+        );
+        let declaration = VerifiedEgressDeclaration::read(&load).unwrap();
+        let locked = test_explicit_egress(&declaration);
+        let egress =
+            ConsentedEgress::from_lock(Some(&locked), declaration, load.carina_rs_signed())
+                .unwrap();
+        GuestNetwork::Runtime { kind, egress }
+    }
+
+    fn amazonaws_network(kind: ProviderKind) -> GuestNetwork {
+        test_network(kind, &["**.amazonaws.com", "**.amazonaws.com.cn"])
+    }
+
+    #[tokio::test]
+    async fn runtime_factory_binds_lock_record_to_the_same_loaded_artifact() {
+        let component_with_host = |host: &str| {
+            let declaration_json = serde_json::json!({
+                "version": 1,
+                "hosts": [host],
+            })
+            .to_string();
+            let mut component = EncoderComponent::new();
+            component.section(&CustomSection {
+                name: Cow::Borrowed("carina:egress"),
+                data: Cow::Owned(declaration_json.into_bytes()),
+            });
+            component.finish()
+        };
+        let first = VerifiedLoad::for_test(
+            component_with_host("first.example.com"),
+            ProviderLoadIdentity::for_test("network-test", ProviderTrustClass::Untrusted),
+        );
+        let first_declaration = VerifiedEgressDeclaration::read(&first).unwrap();
+        let first_lock = test_explicit_egress(&first_declaration);
+        let second = VerifiedLoad::for_test(
+            component_with_host("second.example.com"),
+            ProviderLoadIdentity::for_test("network-test", ProviderTrustClass::Untrusted),
+        );
+        let cache = tempfile::tempdir().unwrap();
+
+        let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            second,
+            cache.path(),
+            Some(&first_lock),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WasmProviderLoadError::EgressConsent(
+                carina_provider_resolver::EgressConsentError::DeclarationMismatch
+            ))
+        ));
     }
 
     async fn rebuildable_state_test_factory() -> Option<WasmProviderFactory> {
@@ -6892,8 +7348,15 @@ mod tests {
             .http_test_route
             .as_ref()
             .expect("validation rebuild context must retain the test route");
-        assert_eq!(route.host, "phase-test.invalid");
-        assert_eq!(route.destination, destination);
+        let retained_destination =
+            match route.resolution_for("phase-test.invalid", destination.port(), false) {
+                Some(ResolvedAddresses::HttpTestRoute(destination)) => destination.address(),
+                Some(ResolvedAddresses::Standard(_)) => {
+                    panic!("the loopback test route must carry the exemption witness")
+                }
+                None => panic!("the retained test route must match"),
+            };
+        assert_eq!(retained_destination, destination);
     }
 
     #[test]
@@ -8818,6 +9281,18 @@ mod tests {
         // group reaches it (asserted via env_keys_for_kind above).
         assert!(ProviderKind::Untrusted.credential_partition().is_empty());
         assert!(ProviderKind::Untrusted.metadata_endpoints().is_empty());
+        assert_eq!(
+            ProviderKind::Untrusted.private_address_policy(),
+            PrivateAddressPolicy::Deny
+        );
+        assert_eq!(
+            ProviderKind::GitHub.private_address_policy(),
+            PrivateAddressPolicy::Deny
+        );
+        assert_eq!(
+            ProviderKind::Aws.private_address_policy(),
+            PrivateAddressPolicy::Allow
+        );
     }
 
     #[test]
@@ -8843,28 +9318,46 @@ mod tests {
     }
 
     #[test]
-    fn test_http_allowlist_permits_amazonaws_com() {
-        assert!(check_host(None, "s3.amazonaws.com").is_ok());
-        assert!(check_host(None, "ec2.us-east-1.amazonaws.com").is_ok());
-        assert!(check_host(None, "sts.amazonaws.com").is_ok());
-        assert!(check_host(None, "cloudformation.ap-northeast-1.amazonaws.com").is_ok());
+    fn provider_kind_does_not_grant_amazonaws_egress() {
+        for kind in [
+            ProviderKind::Aws,
+            ProviderKind::GitHub,
+            ProviderKind::Untrusted,
+        ] {
+            let network = test_network(kind, &[]);
+            assert!(
+                check_host(&network, "sts.amazonaws.com").is_err(),
+                "{kind:?} reached an undeclared amazonaws.com host"
+            );
+        }
     }
 
     #[test]
-    fn test_http_allowlist_permits_amazonaws_com_cn() {
-        assert!(check_host(None, "s3.amazonaws.com.cn").is_ok());
-        assert!(check_host(None, "ec2.cn-north-1.amazonaws.com.cn").is_ok());
-        assert!(check_host(None, "sts.cn-northwest-1.amazonaws.com.cn").is_ok());
+    fn consented_egress_permits_amazonaws_com() {
+        let network = amazonaws_network(ProviderKind::Untrusted);
+        assert!(check_host(&network, "s3.amazonaws.com").is_ok());
+        assert!(check_host(&network, "ec2.us-east-1.amazonaws.com").is_ok());
+        assert!(check_host(&network, "sts.amazonaws.com").is_ok());
+        assert!(check_host(&network, "cloudformation.ap-northeast-1.amazonaws.com").is_ok());
+    }
+
+    #[test]
+    fn consented_egress_permits_amazonaws_com_cn() {
+        let network = amazonaws_network(ProviderKind::Untrusted);
+        assert!(check_host(&network, "s3.amazonaws.com.cn").is_ok());
+        assert!(check_host(&network, "ec2.cn-north-1.amazonaws.com.cn").is_ok());
+        assert!(check_host(&network, "sts.cn-northwest-1.amazonaws.com.cn").is_ok());
     }
 
     #[test]
     fn test_http_allowlist_permits_with_port() {
+        let network = amazonaws_network(ProviderKind::Untrusted);
         let standard: hyper::Uri = "https://s3.amazonaws.com:443/".parse().unwrap();
         let china: hyper::Uri = "https://ec2.cn-north-1.amazonaws.com.cn:443/"
             .parse()
             .unwrap();
-        assert!(check_host(None, standard.host().unwrap()).is_ok());
-        assert!(check_host(None, china.host().unwrap()).is_ok());
+        assert!(check_host(&network, standard.host().unwrap()).is_ok());
+        assert!(check_host(&network, china.host().unwrap()).is_ok());
     }
 
     #[test]
@@ -8897,22 +9390,54 @@ mod tests {
 
     #[test]
     fn test_http_allowlist_blocks_other_hosts() {
-        assert!(check_host(None, "evil.example.com").is_err());
-        assert!(check_host(None, "attacker.io").is_err());
-        assert!(check_host(None, "localhost").is_err());
-        assert!(check_host(None, "").is_err());
+        let network = amazonaws_network(ProviderKind::Untrusted);
+        assert!(check_host(&network, "evil.example.com").is_err());
+        assert!(check_host(&network, "attacker.io").is_err());
+        assert!(check_host(&network, "localhost").is_err());
+        assert!(check_host(&network, "").is_err());
         // Ensure partial matches don't pass
-        assert!(check_host(None, "not-amazonaws.com").is_err());
-        assert!(check_host(None, "amazonaws.com.evil.com").is_err());
-        assert!(check_host(None, "fakeamazonaws.com").is_err());
+        assert!(check_host(&network, "not-amazonaws.com").is_err());
+        assert!(check_host(&network, "amazonaws.com.evil.com").is_err());
+        assert!(check_host(&network, "fakeamazonaws.com").is_err());
         // Bare domain without service prefix is not a valid AWS endpoint
-        assert!(check_host(None, "amazonaws.com").is_err());
+        assert!(check_host(&network, "amazonaws.com").is_err());
+    }
+
+    #[test]
+    fn request_policy_rejects_noncanonical_ip_literals() {
+        let network = amazonaws_network(ProviderKind::Untrusted);
+        for host in ["127.1", "2130706433", "0x7f.1", "0177.0.0.1"] {
+            assert!(check_host(&network, host).is_err(), "allowed {host}");
+        }
+    }
+
+    #[test]
+    fn request_policy_rejects_non_ldh_hostnames() {
+        let unrelated = amazonaws_network(ProviderKind::Untrusted);
+        for host in ["a_b.com", "x\"y.com", "host:443", "-a.com", "a-.com"] {
+            assert!(check_host(&unrelated, host).is_err(), "allowed {host}");
+        }
+
+        let network = test_network(ProviderKind::Untrusted, &["**.example.com"]);
+        for host in [
+            "a_b.example.com",
+            "x\"y.example.com",
+            "host:443",
+            "-a.example.com",
+            "a-.example.com",
+        ] {
+            assert!(check_host(&network, host).is_err(), "allowed {host}");
+        }
+        assert!(check_host(&network, "a-b.example.com").is_ok());
+        let exact = test_network(ProviderKind::Untrusted, &["a-b.com"]);
+        assert!(check_host(&exact, "a-b.com").is_ok());
     }
 
     #[test]
     fn metadata_denials_have_a_distinct_variant_before_and_after_resolution() {
+        let network = amazonaws_network(ProviderKind::Untrusted);
         let metadata = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
-        let literal_denial = match check_host(Some(ProviderKind::Untrusted), "169.254.169.254") {
+        let literal_denial = match check_host(&network, "169.254.169.254") {
             Ok(_) => panic!("an untrusted provider must not reach an IP-literal metadata host"),
             Err(denial) => denial,
         };
@@ -8921,7 +9446,7 @@ mod tests {
             DestinationDenied::MetadataWithheld(address) if address == metadata
         ));
 
-        let allowed = check_host(Some(ProviderKind::Untrusted), "service.amazonaws.com")
+        let allowed = check_host(&network, "service.amazonaws.com")
             .expect("the AWS hostname should pass the pre-resolution allow-list");
         let resolved_denial =
             match vet_resolved_destination(allowed, SocketAddr::new(metadata, 443), &[]) {
@@ -8936,7 +9461,7 @@ mod tests {
         ));
 
         let link_local = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1));
-        let allowed = check_host(Some(ProviderKind::Untrusted), "service.amazonaws.com")
+        let allowed = check_host(&network, "service.amazonaws.com")
             .expect("the AWS hostname should pass the pre-resolution allow-list");
         let link_local_denial =
             match vet_resolved_destination(allowed, SocketAddr::new(link_local, 443), &[]) {
@@ -8956,6 +9481,7 @@ mod tests {
                 name: "mock_http".to_string(),
                 source: ProviderLoadSource::LocalFile {
                     path: PathBuf::from("/opt/providers/mock_http.wasm"),
+                    canonical_source: PathBuf::from("mock_http.wasm"),
                 },
             }),
             Some(ProviderKind::Untrusted),
@@ -8997,18 +9523,50 @@ mod tests {
     }
 
     #[test]
+    fn egress_denied_display_does_not_offer_aws_grant_for_other_cloud_metadata() {
+        let address = IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200));
+        let rendered = EgressDenied::new(
+            local_provider_label("widget"),
+            Some(ProviderKind::Untrusted),
+            address.to_string(),
+            DestinationDenied::MetadataWithheld(address),
+        )
+        .to_string();
+
+        assert!(
+            rendered.contains(
+                "instance-metadata address 100.100.100.200 is not available to this provider"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--trust-local-provider"), "{rendered}");
+    }
+
+    #[test]
     fn egress_denied_display_names_every_generic_reason_and_validation_instance() {
         let label = remote_provider_label("aws", "carina-rs/aws");
         let cases = [
             (
                 DestinationDenied::HostNotAllowed,
-                "host is not in the allow-list",
+                "host is not in the provider's consented egress declaration",
             ),
             (
                 DestinationDenied::LinkLocalAddressDenied(IpAddr::V4(Ipv4Addr::new(
                     169, 254, 1, 1,
                 ))),
                 "link-local resolved address 169.254.1.1 is denied",
+            ),
+            (
+                DestinationDenied::LoopbackAddressDenied(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                "loopback resolved address 127.0.0.1 is denied",
+            ),
+            (
+                DestinationDenied::UnspecifiedAddressDenied(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                "unspecified resolved address :: is denied",
+            ),
+            (
+                DestinationDenied::PrivateAddressDenied(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+                "private resolved address 10.0.0.5 is not available to this provider",
             ),
             (
                 DestinationDenied::MetadataWithheld(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
@@ -9044,127 +9602,339 @@ mod tests {
         assert_eq!(
             validation_instance,
             "provider 'awscc' (carina-rs/awscc) request to example.invalid was denied: host is not \
-             in the allow-list"
+             in the provider's consented egress declaration"
         );
     }
 
-    #[tokio::test]
-    async fn metadata_destination_policy_matrix() {
-        let kinds = [
-            Some(ProviderKind::Aws),
-            Some(ProviderKind::GitHub),
-            Some(ProviderKind::Untrusted),
-            None,
-        ];
-        let destinations = [
+    fn vet_address(
+        kind: ProviderKind,
+        address: IpAddr,
+    ) -> Result<VettedDestination, DestinationDenied> {
+        vet_resolved_destination(
+            AllowedHost {
+                kind: Some(kind),
+                target: AllowedHostTarget::Name("x.amazonaws.com".to_string()),
+            },
+            SocketAddr::new(address, 443),
+            &[],
+        )
+        .map_err(|(reason, _host)| reason)
+    }
+
+    #[test]
+    fn resolved_address_policy_matrix_is_exhaustive_per_kind() {
+        let cases = [
             (
-                "169.254.169.254",
-                IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+                "AWS metadata v4",
+                "169.254.169.254".parse().unwrap(),
+                ResolvedAddressClass::Metadata,
                 true,
-            ),
-            (
-                "169.254.170.2",
-                IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2)),
-                true,
-            ),
-            (
-                "[fd00:ec2::254]",
-                IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
-                true,
-            ),
-            (
-                "[64:ff9b::a9fe:a9fe]",
-                "64:ff9b::a9fe:a9fe".parse().unwrap(),
-                true,
-            ),
-            (
-                "[64:ff9b::a9fe:aa02]",
-                "64:ff9b::a9fe:aa02".parse().unwrap(),
-                true,
-            ),
-            (
-                "[64:ff9b::a9fe:101]",
-                "64:ff9b::a9fe:101".parse().unwrap(),
                 false,
             ),
             (
-                "[64:ff9b:1::a9fe:a9fe]",
-                "64:ff9b:1::a9fe:a9fe".parse().unwrap(),
+                "AWS metadata v6",
+                "fd00:ec2::254".parse().unwrap(),
+                ResolvedAddressClass::Metadata,
+                true,
+                false,
+            ),
+            (
+                "Alibaba metadata before CGNAT",
+                "100.100.100.200".parse().unwrap(),
+                ResolvedAddressClass::Metadata,
+                false,
+                false,
+            ),
+            (
+                "Azure metadata",
+                "168.63.129.16".parse().unwrap(),
+                ResolvedAddressClass::Metadata,
+                false,
+                false,
+            ),
+            (
+                "loopback v4",
+                "127.0.0.1".parse().unwrap(),
+                ResolvedAddressClass::Loopback,
+                false,
+                false,
+            ),
+            (
+                "loopback v6",
+                "::1".parse().unwrap(),
+                ResolvedAddressClass::Loopback,
+                false,
+                false,
+            ),
+            (
+                "unspecified v4",
+                "0.0.0.0".parse().unwrap(),
+                ResolvedAddressClass::Unspecified,
+                false,
+                false,
+            ),
+            (
+                "unspecified v6",
+                "::".parse().unwrap(),
+                ResolvedAddressClass::Unspecified,
+                false,
+                false,
+            ),
+            (
+                "link-local v4",
+                "169.254.1.1".parse().unwrap(),
+                ResolvedAddressClass::LinkLocal,
+                false,
+                false,
+            ),
+            (
+                "link-local v6",
+                "fe80::1".parse().unwrap(),
+                ResolvedAddressClass::LinkLocal,
+                false,
+                false,
+            ),
+            (
+                "private v4",
+                "10.0.0.1".parse().unwrap(),
+                ResolvedAddressClass::Private,
+                true,
+                false,
+            ),
+            (
+                "private v6",
+                "fd12::1".parse().unwrap(),
+                ResolvedAddressClass::Private,
+                true,
+                false,
+            ),
+            (
+                "public v4",
+                "203.0.113.10".parse().unwrap(),
+                ResolvedAddressClass::Public,
+                true,
                 true,
             ),
             (
-                "[64:ff9b:1::a9fe:aa02]",
-                "64:ff9b:1::a9fe:aa02".parse().unwrap(),
+                "public v6",
+                "2001:db8::1".parse().unwrap(),
+                ResolvedAddressClass::Public,
+                true,
                 true,
             ),
             (
-                "[64:ff9b:1::a9fe:101]",
-                "64:ff9b:1::a9fe:101".parse().unwrap(),
+                "IPv4-mapped private",
+                "::ffff:10.0.0.1".parse().unwrap(),
+                ResolvedAddressClass::Private,
+                true,
                 false,
             ),
             (
-                "169.254.1.1",
-                IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+                "IPv4-mapped loopback",
+                "::ffff:127.0.0.1".parse().unwrap(),
+                ResolvedAddressClass::Loopback,
+                false,
                 false,
             ),
             (
-                "[fe80::1]",
-                IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
-                false,
-            ),
-            (
-                "[::ffff:169.254.169.254]",
+                "IPv4-mapped AWS metadata",
                 "::ffff:169.254.169.254".parse().unwrap(),
+                ResolvedAddressClass::Metadata,
                 true,
+                false,
+            ),
+            (
+                "NAT64 private",
+                "64:ff9b::a00:1".parse().unwrap(),
+                ResolvedAddressClass::Private,
+                true,
+                false,
+            ),
+            (
+                "NAT64 AWS metadata",
+                "64:ff9b::a9fe:a9fe".parse().unwrap(),
+                ResolvedAddressClass::Metadata,
+                true,
+                false,
+            ),
+            (
+                "local-use NAT64 AWS metadata",
+                "64:ff9b:1::a9fe:a9fe".parse().unwrap(),
+                ResolvedAddressClass::Metadata,
+                true,
+                false,
+            ),
+            (
+                "RFC 1918 upper boundary",
+                "172.31.255.255".parse().unwrap(),
+                ResolvedAddressClass::Private,
+                true,
+                false,
+            ),
+            (
+                "outside RFC 1918 boundary",
+                "172.32.0.0".parse().unwrap(),
+                ResolvedAddressClass::Public,
+                true,
+                true,
+            ),
+            (
+                "outside CGNAT boundary",
+                "100.63.255.255".parse().unwrap(),
+                ResolvedAddressClass::Public,
+                true,
+                true,
+            ),
+            (
+                "CGNAT lower boundary",
+                "100.64.0.0".parse().unwrap(),
+                ResolvedAddressClass::Private,
+                true,
+                false,
             ),
         ];
 
-        for kind in kinds {
-            for (literal_host, address, is_metadata_endpoint) in destinations {
-                let expected = kind == Some(ProviderKind::Aws) && is_metadata_endpoint;
+        for kind in [
+            ProviderKind::Aws,
+            ProviderKind::GitHub,
+            ProviderKind::Untrusted,
+        ] {
+            for (name, address, expected_class, aws_allowed, other_allowed) in cases {
+                let canonical = canonical_policy_address(address);
                 assert_eq!(
-                    check_destination(kind, literal_host, &[SocketAddr::new(address, 80)]).is_ok(),
-                    expected,
-                    "literal host {literal_host} with kind {kind:?}"
+                    ResolvedAddressClass::classify(canonical),
+                    expected_class,
+                    "wrong class for {name} ({address})"
                 );
-                let resolver = StubResolver {
-                    addresses: HashMap::from([(
-                        "x.amazonaws.com".to_string(),
-                        vec![SocketAddr::new(address, 443)],
-                    )]),
+                let expected = if kind == ProviderKind::Aws {
+                    aws_allowed
+                } else {
+                    other_allowed
                 };
-                let resolved = resolver
-                    .resolve("x.amazonaws.com".to_string(), 443)
-                    .await
-                    .unwrap();
                 assert_eq!(
-                    check_destination(kind, "x.amazonaws.com", &resolved).is_ok(),
+                    vet_address(kind, address).is_ok(),
                     expected,
-                    "resolved address {address} with kind {kind:?}"
+                    "wrong policy for {name} ({address}) and {kind:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn normal_amazonaws_destination_is_allowed_for_every_kind() {
+    fn ip_literal_policy_classifies_metadata_and_generically_denies_other_literals() {
+        for kind in [
+            ProviderKind::Aws,
+            ProviderKind::GitHub,
+            ProviderKind::Untrusted,
+        ] {
+            let network = amazonaws_network(kind);
+            for address in ["100.100.100.200", "168.63.129.16"] {
+                assert!(matches!(
+                    check_host(&network, address),
+                    Err(DestinationDenied::MetadataWithheld(_))
+                ));
+            }
+            for address in [
+                "127.0.0.1",
+                "0.0.0.0",
+                "169.254.1.1",
+                "10.0.0.1",
+                "203.0.113.10",
+                "[::1]",
+                "[::]",
+                "[fe80::1]",
+                "[fd12::1]",
+                "[2001:db8::1]",
+            ] {
+                assert!(matches!(
+                    check_host(&network, address),
+                    Err(DestinationDenied::HostNotAllowed)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_public_and_private_resolution_is_denied_except_for_aws() {
+        let public = SocketAddr::new("203.0.113.10".parse().unwrap(), 443);
+        let private = SocketAddr::new("10.0.0.5".parse().unwrap(), 443);
+
+        assert!(
+            check_destination(
+                &amazonaws_network(ProviderKind::Aws),
+                "x.amazonaws.com",
+                &[public, private],
+            )
+            .is_ok()
+        );
+        for kind in [ProviderKind::GitHub, ProviderKind::Untrusted] {
+            assert!(matches!(
+                check_destination(
+                    &amazonaws_network(kind),
+                    "x.amazonaws.com",
+                    &[public, private],
+                ),
+                Err(DestinationDenied::PrivateAddressDenied(address))
+                    if address == private.ip()
+            ));
+        }
+    }
+
+    #[test]
+    fn schema_only_network_denies_every_resolved_address_class() {
+        for address in [
+            "169.254.169.254",
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.1.1",
+            "10.0.0.1",
+            "203.0.113.10",
+            "fd00:ec2::254",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd12::1",
+            "2001:db8::1",
+        ] {
+            assert!(matches!(
+                check_destination(
+                    &GuestNetwork::SchemaOnly,
+                    "x.amazonaws.com",
+                    &[SocketAddr::new(address.parse().unwrap(), 443)],
+                ),
+                Err(DestinationDenied::HostNotAllowed)
+            ));
+        }
+    }
+
+    #[test]
+    fn normal_amazonaws_destination_is_allowed_for_every_consented_runtime_kind() {
         let public_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443);
         for kind in [
-            Some(ProviderKind::Aws),
-            Some(ProviderKind::GitHub),
-            Some(ProviderKind::Untrusted),
-            None,
+            ProviderKind::Aws,
+            ProviderKind::GitHub,
+            ProviderKind::Untrusted,
         ] {
+            let network = amazonaws_network(kind);
             assert!(
-                check_destination(kind, "x.amazonaws.com", &[public_address]).is_ok(),
+                check_destination(&network, "x.amazonaws.com", &[public_address]).is_ok(),
                 "public AWS endpoint denied for {kind:?}"
             );
         }
-
-        let denied_link_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 443);
         assert!(
             check_destination(
-                Some(ProviderKind::Aws),
+                &GuestNetwork::SchemaOnly,
+                "x.amazonaws.com",
+                &[public_address]
+            )
+            .is_err()
+        );
+
+        let denied_link_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 443);
+        let network = amazonaws_network(ProviderKind::Aws);
+        assert!(
+            check_destination(
+                &network,
                 "x.amazonaws.com",
                 &[public_address, denied_link_local],
             )
@@ -9179,8 +9949,14 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(uri.host(), Some("[fd00:ec2::254]"));
-        assert!(check_host(Some(ProviderKind::Aws), uri.host().unwrap()).is_ok());
-        assert!(check_host(Some(ProviderKind::GitHub), uri.host().unwrap()).is_err());
+        assert!(check_host(&amazonaws_network(ProviderKind::Aws), uri.host().unwrap()).is_ok());
+        assert!(
+            check_host(
+                &amazonaws_network(ProviderKind::GitHub),
+                uri.host().unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -9194,7 +9970,7 @@ mod tests {
         ] {
             let mut hooks = AllowListHttpHooks::with_resolver(
                 local_provider_label("aws"),
-                Some(ProviderKind::Aws),
+                amazonaws_network(ProviderKind::Aws),
                 Arc::new(CountingResolver {
                     calls: Arc::clone(&calls),
                 }),
@@ -9247,13 +10023,19 @@ mod tests {
     }
 
     #[test]
-    fn test_is_metadata_host() {
+    fn metadata_classification_precedes_address_ranges() {
         for endpoint in METADATA_ENDPOINTS {
-            assert!(is_metadata_host(endpoint));
+            assert_eq!(
+                ResolvedAddressClass::classify(endpoint),
+                ResolvedAddressClass::Metadata
+            );
         }
-        assert!(!is_metadata_host(IpAddr::V4(Ipv4Addr::new(
-            169, 254, 169, 1
-        ))));
+        assert_eq!(
+            ResolvedAddressClass::classify(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 1))),
+            ResolvedAddressClass::LinkLocal
+        );
+        assert!(!AWS_METADATA_ENDPOINTS.contains(&IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200))));
+        assert!(!AWS_METADATA_ENDPOINTS.contains(&IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16))));
     }
 
     #[test]
@@ -9327,7 +10109,7 @@ mod tests {
 
         let mut hooks = AllowListHttpHooks::with_resolver(
             local_provider_label("mock_http"),
-            Some(ProviderKind::Untrusted),
+            test_network(ProviderKind::Untrusted, &[]),
             Arc::new(StubResolver {
                 addresses: HashMap::new(),
             }),
@@ -9377,7 +10159,7 @@ mod tests {
         };
         let mut hooks = AllowListHttpHooks::with_resolver(
             local_provider_label("mock_http"),
-            Some(ProviderKind::Untrusted),
+            amazonaws_network(ProviderKind::Untrusted),
             Arc::new(resolver),
         );
         let request = hyper::Request::builder()
@@ -9418,7 +10200,7 @@ mod tests {
         let started = CreateAttempt::for_test(id).start_guest_call();
         let mut hooks = AllowListHttpHooks::with_resolver(
             local_provider_label("aws"),
-            Some(ProviderKind::Aws),
+            amazonaws_network(ProviderKind::Aws),
             Arc::new(NeverResolver),
         );
         hooks.call_egress = Some(started.egress_recorder());
@@ -9454,11 +10236,11 @@ mod tests {
         let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 4443));
         let mut hooks = AllowListHttpHooks::with_test_route(
             local_provider_label("mock_http"),
-            Some(ProviderKind::Untrusted),
-            Some(HttpTestRoute {
-                host: "phase-test.invalid".to_string(),
+            test_network(ProviderKind::Untrusted, &[]),
+            Some(HttpTestRoute::new(
+                "phase-test.invalid".to_string(),
                 destination,
-            }),
+            )),
         );
         let request = hyper::Request::builder()
             .uri("https://phase-test.invalid:4443/")
@@ -9482,7 +10264,7 @@ mod tests {
 
         let mut hooks = AllowListHttpHooks::with_resolver(
             local_provider_label("mock_http"),
-            Some(ProviderKind::Untrusted),
+            amazonaws_network(ProviderKind::Untrusted),
             Arc::new(NeverResolver),
         );
         let request = hyper::Request::builder()
@@ -9517,7 +10299,7 @@ mod tests {
 
         let mut hooks = AllowListHttpHooks::with_resolver(
             local_provider_label("mock_http"),
-            Some(ProviderKind::Untrusted),
+            amazonaws_network(ProviderKind::Untrusted),
             Arc::new(StubResolver {
                 addresses: HashMap::new(),
             }),
@@ -9546,7 +10328,7 @@ mod tests {
 
         let mut hooks = AllowListHttpHooks::with_resolver(
             local_provider_label("mock_http"),
-            None,
+            amazonaws_network(ProviderKind::Untrusted),
             Arc::new(StubResolver {
                 addresses: HashMap::from([("service.amazonaws.com".to_string(), Vec::new())]),
             }),
@@ -9591,13 +10373,13 @@ mod tests {
         };
         let closed_address = socket.local_addr().unwrap();
 
-        let resolver = StubResolver {
-            addresses: HashMap::from([("closed.amazonaws.com".to_string(), vec![closed_address])]),
-        };
-        let mut hooks = AllowListHttpHooks::with_resolver(
+        let mut hooks = AllowListHttpHooks::with_test_route(
             local_provider_label("mock_http"),
-            Some(ProviderKind::Untrusted),
-            Arc::new(resolver),
+            amazonaws_network(ProviderKind::Untrusted),
+            Some(HttpTestRoute::new(
+                "closed.amazonaws.com".to_string(),
+                closed_address,
+            )),
         );
         let request = hyper::Request::builder()
             .uri(format!(
@@ -9650,15 +10432,22 @@ mod tests {
             .body(empty_outgoing_body())
             .unwrap();
         let config = test_outgoing_request_config(false);
-        let destination = vet_resolved_destination(
+        let test_route = HttpTestRoute::new("phase-test.invalid".to_string(), server_address);
+        let test_destination =
+            match test_route.resolution_for("phase-test.invalid", server_address.port(), false) {
+                Some(ResolvedAddresses::HttpTestRoute(destination)) => destination,
+                Some(ResolvedAddresses::Standard(_)) => {
+                    panic!("the loopback test route must carry the exemption witness")
+                }
+                None => panic!("the exact HTTP test route must select its destination"),
+            };
+        let destination = VettedDestination::from_http_test_route(
             AllowedHost {
                 kind: Some(ProviderKind::Untrusted),
                 target: AllowedHostTarget::Name("phase-test.invalid".to_string()),
             },
-            server_address,
-            &[],
-        )
-        .expect("the public loopback test destination must pass post-resolution policy");
+            test_destination,
+        );
         let server = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let (mut stream, _) = loop {
@@ -9738,16 +10527,13 @@ mod tests {
                 .unwrap();
         });
 
-        let resolver = StubResolver {
-            addresses: HashMap::from([(
-                "redirector.amazonaws.com".to_string(),
-                vec![server_address],
-            )]),
-        };
-        let mut hooks = AllowListHttpHooks::with_resolver(
+        let mut hooks = AllowListHttpHooks::with_test_route(
             local_provider_label("mock_http"),
-            Some(ProviderKind::Untrusted),
-            Arc::new(resolver),
+            amazonaws_network(ProviderKind::Untrusted),
+            Some(HttpTestRoute::new(
+                "redirector.amazonaws.com".to_string(),
+                server_address,
+            )),
         );
         let request = hyper::Request::builder()
             .uri(format!(
@@ -9784,9 +10570,10 @@ mod tests {
 
         let follow_up: hyper::Uri = location.parse().unwrap();
         let follow_up_address = SocketAddr::new(METADATA_ENDPOINTS[0], 80);
+        let aws_network = amazonaws_network(ProviderKind::Aws);
         assert!(
             check_destination(
-                Some(ProviderKind::Aws),
+                &aws_network,
                 follow_up.host().unwrap(),
                 &[follow_up_address]
             )
@@ -9799,9 +10586,13 @@ mod tests {
             Some(ProviderKind::Untrusted),
             None,
         ] {
+            let network = match kind {
+                Some(kind) => test_network(kind, &[]),
+                None => GuestNetwork::SchemaOnly,
+            };
             let mut hooks = AllowListHttpHooks::with_resolver(
                 local_provider_label("redirect-test"),
-                kind,
+                network,
                 Arc::new(CountingResolver {
                     calls: Arc::clone(&resolver_calls),
                 }),
@@ -9861,7 +10652,7 @@ mod tests {
         let mut store = GuestStore::new(
             &engine,
             local_provider_label("epoch-test"),
-            None,
+            GuestNetwork::SchemaOnly,
             None,
             build_store_limits(),
             GuestCallBudget::PRODUCTION,
@@ -9884,7 +10675,7 @@ mod tests {
         let mut store = GuestStore::new(
             &engine,
             local_provider_label("epoch-test"),
-            None,
+            GuestNetwork::SchemaOnly,
             None,
             build_store_limits(),
             GuestCallBudget::PRODUCTION,
@@ -10188,7 +10979,7 @@ mod tests {
             &engine,
             &component,
             local_provider_label("runtime-test"),
-            None,
+            GuestNetwork::SchemaOnly,
             InstantiationWorld::HttpEnabled,
             GuestCallBudget::PRODUCTION,
             None,
@@ -10230,7 +11021,7 @@ mod tests {
             &engine,
             &component,
             local_provider_label("runtime-test"),
-            None,
+            GuestNetwork::SchemaOnly,
             InstantiationWorld::Basic,
             GuestCallBudget::PRODUCTION,
             None,
@@ -10410,7 +11201,7 @@ mod tests {
         let mut store = GuestStore::new(
             &engine,
             local_provider_label("wall-budget-test"),
-            None,
+            GuestNetwork::SchemaOnly,
             None,
             build_store_limits(),
             GuestCallBudget::new(
@@ -10961,7 +11752,7 @@ mod tests {
             &engine,
             &component,
             local_provider_label("mock"),
-            None,
+            GuestNetwork::SchemaOnly,
             InstantiationWorld::Basic,
             GuestCallBudget::PRODUCTION,
             None,
@@ -10978,7 +11769,7 @@ mod tests {
                 engine,
                 component,
                 label: local_provider_label("mock"),
-                kind: None,
+                network: GuestNetwork::SchemaOnly,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
                 http_test_route: None,
@@ -11027,7 +11818,7 @@ mod tests {
                 engine,
                 component,
                 label: local_provider_label("rebuild-test"),
-                kind: None,
+                network: GuestNetwork::SchemaOnly,
                 world: InstantiationWorld::Basic,
                 budget: GuestCallBudget::PRODUCTION,
                 http_test_route: None,
@@ -11106,7 +11897,7 @@ mod tests {
         let mut store = GuestStore::new(
             &engine,
             local_provider_label("wall-budget-test"),
-            None,
+            GuestNetwork::SchemaOnly,
             None,
             build_store_limits(),
             GuestCallBudget::new(

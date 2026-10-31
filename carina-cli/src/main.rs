@@ -230,8 +230,11 @@ enum Commands {
         upgrade: bool,
         /// Require the lock file to match providers.crn exactly; error if any
         /// provider is missing from the lock. Intended for CI (like cargo --locked).
-        #[arg(long, conflicts_with = "upgrade")]
+        #[arg(long, conflicts_with_all = ["upgrade", "accept_egress"])]
         locked: bool,
+        /// Accept the provider-declared egress hosts for this canonical source
+        #[arg(long, value_name = "SOURCE", action = clap::ArgAction::Append)]
+        accept_egress: Vec<String>,
         /// Migrate the state file from the backend recorded in
         /// carina-backend.lock to the currently configured backend when
         /// they differ. Without this flag, init only warns about a backend
@@ -390,7 +393,6 @@ async fn main() {
         trusted_local_env,
     )
     .expect("trusted local provider grant inputs are installed once at process startup");
-
     let plan_images = match &cli.command {
         Commands::Plan {
             image,
@@ -596,6 +598,7 @@ async fn main() {
                     path,
                     upgrade,
                     locked,
+                    accept_egress,
                     migrate_state,
                     force,
                 } => {
@@ -607,6 +610,7 @@ async fn main() {
                         locked,
                         migrate_state,
                         force,
+                        &accept_egress,
                     )
                     .await
                     .map_err(error::AppError::from)
@@ -1433,6 +1437,7 @@ mod error_format_tests {
     #[test]
     fn init_migrate_state_help_describes_pending_migration() {
         let mut command = Cli::command();
+        command.build();
         let init = command
             .find_subcommand_mut("init")
             .expect("init subcommand exists");

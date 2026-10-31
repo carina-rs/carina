@@ -107,6 +107,27 @@ fn missing_provider_plugin() {
 }
 
 #[test]
+fn validate_rejects_control_characters_in_file_provider_sources() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("main.crn"),
+        "provider mock {\n  source = \"file://provider\u{1b}.wasm\"\n}\n",
+    )
+    .unwrap();
+
+    let output = carina_validate_path(project.path());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "validate unexpectedly succeeded");
+    assert!(
+        stderr.contains("file:// paths must not contain control characters"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(r"file://provider\u{1b}.wasm"), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'), "{stderr:?}");
+}
+
+#[test]
 fn arguments_block_rejected_in_root() {
     // Issue #2198. An `arguments` block belongs on the module side of a
     // module boundary; a provider block proves this directory is instead a

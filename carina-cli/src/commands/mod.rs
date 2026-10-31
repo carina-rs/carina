@@ -317,14 +317,20 @@ pub fn validate_and_resolve_with_provider_load_for_test(
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
-    validate_and_resolve_with_config(
-        parsed,
-        base_dir,
-        &providers,
-        skip_resource_validation,
-        duplicate_declarations,
-    )
+    let (providers, load_error) =
+        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+    if let Some(error) = load_error {
+        return Err(error);
+    }
+    providers
+        .validation_report(
+            parsed,
+            base_dir,
+            skip_resource_validation,
+            duplicate_declarations,
+        )
+        .into_result()
+        .map_err(|errors| collapse_errors(errors.into_vec()))
 }
 
 /// Test-support collecting, non-minting validation entry point.
@@ -1269,6 +1275,7 @@ mod tests {
             .path()
             .join(".carina/providers/file/local-provider/local-provider.wasm");
         std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, b"not a wasm component").unwrap();
         std::fs::write(&installed_path, b"not a wasm component").unwrap();
 
         let mut parsed = empty_parsed_file();
@@ -1289,7 +1296,7 @@ mod tests {
         let message = error.to_string();
 
         assert!(
-            message.contains("Failed to load WASM component"),
+            message.contains("failed to read provider component"),
             "{message}"
         );
         assert!(!message.contains("Run `carina init`"), "{message}");
