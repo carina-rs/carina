@@ -561,6 +561,25 @@ backend s3 {
         )
         .expect("write undefined iterable fixture");
 
+        let loaded = load_configuration_with_config(
+            fixture.path(),
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("load merged undefined iterable fixture");
+        let scope_errors = carina_core::parser::check_identifier_scope(&loaded.parsed);
+        assert_eq!(
+            scope_errors.len(),
+            1,
+            "the merged parse must contain exactly one scope error: {scope_errors:#?}",
+        );
+        match &scope_errors[0] {
+            carina_core::parser::ParseError::UndefinedIdentifier { name, .. } => {
+                assert_eq!(name, "does_not_exist");
+            }
+            other => panic!("unexpected scope error: {other}"),
+        }
+
         let errors = validate_with_factories(fixture.path(), Vec::new());
         let occurrences = errors
             .iter()
@@ -598,6 +617,35 @@ let attach = mock.test.resource {
                 .iter()
                 .all(|error| !error.contains("Undefined identifier `caller`")),
             "cross-file binding must be in scope in the owning pipeline: {errors:#?}",
+        );
+    }
+
+    #[test]
+    fn validate_pipeline_accepts_cross_file_data_source_reference_scope() {
+        let fixture = tempfile::tempdir().expect("cross-file data-source reference fixture");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"provider mock {}
+let observed_names = roles.names
+"#,
+        )
+        .expect("write data-source reference consumer");
+        std::fs::write(
+            fixture.path().join("bindings.crn"),
+            r#"let roles = read mock.iam.Roles {
+  name_regex = ".*"
+}
+"#,
+        )
+        .expect("write data-source reference producer");
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.contains("Undefined identifier `roles`")),
+            "cross-file data-source binding must be in scope in the owning pipeline: {errors:#?}",
         );
     }
 
