@@ -26,7 +26,7 @@ use carina_core::resource::absolute_binding_address_for_test;
 use carina_core::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, DataSource, Directives, PartialReadMarker,
     PendingReRead, PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State,
-    Value, canonicalize_persisted_absolute_binding_address,
+    Value,
 };
 use carina_core::schema::{
     FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
@@ -1498,12 +1498,12 @@ impl StateFile {
                         error,
                     })?;
             if let Some(binding) = r.binding.take() {
-                r.binding = Some(canonicalize_persisted_absolute_binding_address(&binding));
+                r.binding = Some(binding.canonicalize_persisted_map_keys());
             }
             r.dependency_bindings = r
                 .dependency_bindings
                 .iter()
-                .map(canonicalize_persisted_absolute_binding_address)
+                .map(AbsoluteBindingAddress::canonicalize_persisted_map_keys)
                 .collect();
         }
         Ok(())

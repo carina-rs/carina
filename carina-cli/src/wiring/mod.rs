@@ -1601,6 +1601,8 @@ impl ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile> {
         if reconcile_modules && let Some(state) = state_file.as_ref() {
             module_resolver::reconcile_anonymous_module_instances(
                 &mut resources.resources,
+                &mut resources.data_sources,
+                &mut resources.wait_bindings,
                 &mut resources.compositions,
                 &|provider, resource_type| {
                     state
@@ -2296,22 +2298,6 @@ pub fn validate_deferred_populate_refs_with_ctx<E>(
     .into_iter()
     .map(|d| AppError::Validation(d.message))
     .collect()
-}
-
-pub fn validate_resource_ref_types_with_ctx<
-    E: carina_core::parser::ExportParamLike<Binding = AbsoluteBindingAddress>,
->(
-    ctx: &WiringContext,
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
-    argument_names: &HashSet<String>,
-) -> Vec<AppError> {
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
-    lift_validation_result(validation::validate_resource_ref_types(
-        parsed,
-        ctx.schemas(),
-        argument_names,
-        &bindings,
-    ))
 }
 
 pub fn validate_composition_ref_types_with_ctx<E>(

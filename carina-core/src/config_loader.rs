@@ -311,6 +311,7 @@ impl UnresolvedConfigSnapshot {
 /// the static-analysis pipeline and report them together with downstream
 /// findings (#2102). Blocking errors (bad parse, missing modules) still
 /// come back as `Err` from the loader.
+#[non_exhaustive]
 pub struct LoadedConfig {
     /// Post-inference file: every export carries its origin and any typed
     /// unchecked reason directly on the parameter.
@@ -332,6 +333,19 @@ pub struct LoadedConfig {
     /// load boundary so editor callers retain the parsed tree; validation
     /// commands decide whether to treat them as hard errors.
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
+}
+
+impl LoadedConfig {
+    /// Cross root binding resolution for a configuration produced by the
+    /// directory loader, without expanding module calls.
+    pub fn into_root_expanded(
+        self,
+    ) -> crate::parser::File<
+        crate::parser::ExpandedInferredExportParam,
+        crate::resource::AbsoluteBindingAddress,
+    > {
+        crate::module_resolver::expand_root_directory_file(self.parsed)
+    }
 }
 
 /// A `ParsedFile` produced by `parse_directory_files` after the
@@ -643,6 +657,7 @@ pub fn parse_directory_with_overrides(
 
 /// Directory parse result for editor and other non-blocking consumers that
 /// need the merged AST together with load-seam diagnostics.
+#[non_exhaustive]
 pub struct DirectoryParseResult {
     pub parsed: ParsedFile,
     /// A merged view of the directory parser's per-file output, after its
@@ -711,6 +726,22 @@ impl DirectoryParseResult {
         self.semantic_files
             .iter()
             .find_map(|(candidate, parsed)| (candidate == path).then_some(parsed))
+    }
+
+    /// Cross root binding resolution for the merged directory parse.
+    pub fn root_expanded(&self) -> crate::parser::ExpandedParsedFile {
+        crate::module_resolver::expand_root_directory_file(self.parsed.clone())
+    }
+
+    /// Cross root binding resolution for one real file from this directory.
+    /// The file must have been retained by the diagnostic parse itself.
+    pub fn root_expanded_semantic_file(
+        &self,
+        path: &Path,
+    ) -> Option<crate::parser::ExpandedParsedFile> {
+        self.semantic_file(path)
+            .cloned()
+            .map(crate::module_resolver::expand_root_directory_file)
     }
 }
 

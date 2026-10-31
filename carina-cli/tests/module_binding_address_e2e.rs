@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
+use carina_core::effect::UnresolvedSavedEffect;
 use carina_core::resource::{DeferredValue, Value};
 use tempfile::TempDir;
 
@@ -272,4 +273,188 @@ let app = app_module {}
         }
         other => panic!("expected an unresolved module-local ResourceRef, got {other:?}"),
     }
+}
+
+#[test]
+fn forwarded_module_parameter_is_pending_for_wait_target_and_dependencies() {
+    let project = Project::new();
+    project.write(
+        "mod/main.crn",
+        r#"arguments {
+  dep: mock.test.resource
+}
+
+let inner_mod = use { source = "../inner" }
+let i = inner_mod { dep = dep }
+"#,
+    );
+    project.write("mod/extra.crn", "let module_note = \"multi-file outer\"\n");
+    project.write(
+        "inner/main.crn",
+        r#"arguments {
+  dep: mock.test.resource
+}
+
+let r = mock.test.resource {
+  name = "inner"
+}
+"#,
+    );
+    project.write(
+        "inner/waits.crn",
+        r#"let dependency_wait = wait r {
+  until      = r.name == "inner"
+  depends_on = [dep]
+}
+
+let target_wait = wait dep {
+  until = dep.name == "outer"
+}
+"#,
+    );
+
+    let validate = project.run(&["validate", "mod"]);
+    project.assert_success("carina validate mod", &validate);
+}
+
+#[test]
+fn anonymous_module_remap_updates_create_and_delete_dependency_addresses() {
+    let project = Project::new();
+    project.write("providers.crn", "provider mock {}\n");
+    project.write("notes.crn", "let root_note = \"multi-file root\"\n");
+    project.write(
+        "main.crn",
+        r#"let m = use { source = "./modules/m" }
+
+m { label = "consumer-a1" }
+"#,
+    );
+    project.write("modules/m/arguments.crn", "arguments { label: String }\n");
+    project.write(
+        "modules/m/seed.crn",
+        r#"let seed = mock.test.resource {
+  name = "seed"
+}
+"#,
+    );
+    project.write(
+        "modules/m/consumer.crn",
+        r#"let consumer = mock.test.resource {
+  name = label
+
+  directives {
+    depends_on = [seed]
+  }
+}
+"#,
+    );
+
+    project.assert_success("carina init", &project.run(&["init", "."]));
+    project.assert_success(
+        "initial carina apply",
+        &project.run(&["apply", "--auto-approve", "."]),
+    );
+
+    project.write(
+        "main.crn",
+        r#"let m = use { source = "./modules/m" }
+
+m { label = "consumer-a2" }
+"#,
+    );
+    let plan_output = project.run(&[
+        "plan",
+        "--refresh=false",
+        "--out",
+        "remapped-plan.json",
+        ".",
+    ]);
+    project.assert_success("remapped carina plan", &plan_output);
+    let plan: PlanFile = serde_json::from_slice(
+        &fs::read(project.root.join("remapped-plan.json")).expect("read remapped plan"),
+    )
+    .expect("decode remapped plan");
+
+    let consumer = plan
+        .unresolved_resources
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str().ends_with(".consumer"))
+        })
+        .expect("expanded consumer resource");
+    let seed = plan
+        .unresolved_resources
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.as_str().ends_with(".seed"))
+        })
+        .expect("expanded seed resource");
+    let consumer_binding = consumer.binding.as_ref().expect("consumer binding");
+    let seed_binding = seed.binding.as_ref().expect("seed binding");
+
+    let create_dependencies = plan
+        .plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            UnresolvedSavedEffect::Create(resource)
+                if resource.binding.as_ref() == Some(consumer_binding) =>
+            {
+                Some(&resource.directives.depends_on)
+            }
+            UnresolvedSavedEffect::Read { .. }
+            | UnresolvedSavedEffect::Create(_)
+            | UnresolvedSavedEffect::ResumeCreate { .. }
+            | UnresolvedSavedEffect::Update { .. }
+            | UnresolvedSavedEffect::Delete { .. }
+            | UnresolvedSavedEffect::Import { .. }
+            | UnresolvedSavedEffect::Remove { .. }
+            | UnresolvedSavedEffect::Move { .. }
+            | UnresolvedSavedEffect::ReleaseListKeys { .. }
+            | UnresolvedSavedEffect::Wait { .. }
+            | UnresolvedSavedEffect::DeferredCreate { .. }
+            | UnresolvedSavedEffect::DeferredReplace(_) => None,
+        })
+        .expect("replacement create for consumer");
+    assert_eq!(
+        create_dependencies,
+        &vec![seed_binding.clone()],
+        "Create.directives.depends_on must follow the state-prefix remap",
+    );
+
+    let delete_dependencies = plan
+        .plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            UnresolvedSavedEffect::Delete {
+                binding: Some(binding),
+                explicit_dependencies,
+                ..
+            } if binding == consumer_binding => Some(explicit_dependencies),
+            UnresolvedSavedEffect::Read { .. }
+            | UnresolvedSavedEffect::Create(_)
+            | UnresolvedSavedEffect::ResumeCreate { .. }
+            | UnresolvedSavedEffect::Update { .. }
+            | UnresolvedSavedEffect::Delete { .. }
+            | UnresolvedSavedEffect::Import { .. }
+            | UnresolvedSavedEffect::Remove { .. }
+            | UnresolvedSavedEffect::Move { .. }
+            | UnresolvedSavedEffect::ReleaseListKeys { .. }
+            | UnresolvedSavedEffect::Wait { .. }
+            | UnresolvedSavedEffect::DeferredCreate { .. }
+            | UnresolvedSavedEffect::DeferredReplace(_) => None,
+        })
+        .expect("replacement delete for consumer");
+    assert_eq!(
+        delete_dependencies,
+        &std::collections::HashSet::from([seed_binding.clone()]),
+        "Delete.explicit_dependencies must follow the state-prefix remap",
+    );
 }

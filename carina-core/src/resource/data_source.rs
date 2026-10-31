@@ -14,10 +14,12 @@ use std::ops::Deref;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, feature = "test-support"))]
+use super::RootScope;
 use super::{
     AbsoluteBindingAddress, BindingAddress, Directives, ModuleSource, ProviderModuleSource,
-    RelativeBindingName, ResourceId, ResourceIdentity, ResourceIdentityState, RootScope,
-    SavedModuleSource, Value,
+    RelativeBindingName, ResourceId, ResourceIdentity, ResourceIdentityState, SavedModuleSource,
+    Value,
 };
 
 /// A read-only resource (data source).
@@ -90,11 +92,12 @@ pub type AuthoredDataSource<S = ModuleSource> = DataSource<S, RelativeBindingNam
 pub type ExpandedDataSource<S = ModuleSource> = DataSource<S, AbsoluteBindingAddress>;
 
 impl<S> DataSource<S, RelativeBindingName> {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn resolve_root(self, scope: &RootScope) -> DataSource<S, AbsoluteBindingAddress> {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resolve_root_for_test(self) -> DataSource<S, AbsoluteBindingAddress> {
         self.resolve_root(&RootScope::new())
     }
@@ -130,6 +133,42 @@ impl<S> DataSource<S, RelativeBindingName> {
             dependency_bindings: dependency_bindings.into_iter().map(resolve).collect(),
             module_source,
             quoted_string_attrs,
+        }
+    }
+
+    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(RelativeBindingName::new(binding.into()));
+        self
+    }
+}
+
+impl DataSource<ModuleSource, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = self;
+        for value in attributes.values_mut() {
+            value.map_absolute_bindings(map);
+        }
+        directives.map_absolute_bindings(map);
+        if let Some(binding) = binding {
+            *binding = map(binding);
+        }
+        *dependency_bindings = std::mem::take(dependency_bindings)
+            .into_iter()
+            .map(|binding| map(&binding))
+            .collect();
+        if let Some(source) = module_source {
+            source.map_absolute_bindings(map);
         }
     }
 }
@@ -262,13 +301,6 @@ impl<S, B: BindingAddress> DataSource<S, B> {
 
     pub fn with_attribute(mut self, key: impl Into<String>, value: Value<B>) -> Self {
         self.attributes.insert(key.into(), value);
-        self
-    }
-}
-
-impl<S> DataSource<S, RelativeBindingName> {
-    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
-        self.binding = Some(RelativeBindingName::new(binding.into()));
         self
     }
 }

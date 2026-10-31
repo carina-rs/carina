@@ -1,7 +1,7 @@
 use super::*;
 use crate::parser::{
     ArgumentOrigin, LoadedProviderContext, ModuleArgument, ParsedFile, ProviderContext,
-    RelativeBindingName, UntilPredicateAst, WaitBinding,
+    RelativeBindingName, ResolveExportBindingPhase, UntilPredicateAst, WaitBinding,
 };
 use crate::resource::{
     AuthoredCompositionCall as CompositionCall, AuthoredCompositionCallPath as CompositionCallPath,

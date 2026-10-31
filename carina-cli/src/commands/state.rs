@@ -877,12 +877,7 @@ fn resolve_resource_address<'a>(
     for rs in state.resources() {
         if let Some(binding) = &rs.binding {
             let spelling = binding.as_str();
-            if query_starts_with_address(query, spelling)
-                && let Ok(parsed) = carina_core::resource::parse_cli_absolute_binding_address(
-                    &query[..spelling.len()],
-                )
-                && &parsed == binding
-            {
+            if query_starts_with_address(query, spelling) {
                 let take = match &best {
                     None => true,
                     Some(previous) => {
@@ -6960,7 +6955,12 @@ mod tests {
         let plan = build_plan_from_state(&state);
 
         let vpc_effect = &plan.effects()[0];
-        assert_eq!(vpc_effect.binding_name(), Some("vpc".to_string()),);
+        assert_eq!(
+            vpc_effect
+                .binding_address()
+                .map(carina_core::resource::BindingAddress::as_str),
+            Some("vpc"),
+        );
     }
 
     #[test]

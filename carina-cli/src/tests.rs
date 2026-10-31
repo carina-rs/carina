@@ -14,7 +14,9 @@ use carina_core::executor::{
     AcceptedRequest, Applied, ExecutionCheckpointSink, ExecutionEvent, ExecutionObserver,
     ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
 };
-use carina_core::parser::{LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext};
+use carina_core::parser::{
+    LoadedProviderContext, ParsedFile, ProviderConfig, ProviderContext, ResolveExportBindingPhase,
+};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, ProviderError, ProviderResult,
@@ -1288,7 +1290,7 @@ fn test_detailed_exitcode_wait_only_no_changes() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "cert_issued".into(),
+        identity: carina_core::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: ManagedWaitTarget::for_test(&resolved(Resource::new("acm.Certificate", "cert"))),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -3982,7 +3984,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
     let target_id = managed_target.resolved_id().as_inner().clone();
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: "lookup_ready".into(),
+        identity: carina_core::resource::absolute_binding_address_for_test("lookup_ready"),
         target_id: ManagedWaitTarget::for_test(&managed_target),
         until: WaitPredicate::equals(
             AttrPath::single("status"),

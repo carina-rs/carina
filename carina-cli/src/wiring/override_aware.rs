@@ -235,6 +235,8 @@ impl<E> CanonicalResourcePair<E> {
     ) {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
             &mut self.parsed.resources,
+            &mut self.parsed.data_sources,
+            &mut self.parsed.wait_bindings,
             &mut self.parsed.compositions,
             find_state_names_by_type,
             claims,

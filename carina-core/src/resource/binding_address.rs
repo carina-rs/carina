@@ -38,18 +38,6 @@ impl RelativeBindingName {
     pub(super) fn into_value_string(self) -> ValueString {
         self.0
     }
-
-    pub(crate) fn replace_spelling(&self, spelling: String) -> Self {
-        Self(ValueString::derived_from(spelling, [&self.0]))
-    }
-
-    pub(crate) fn replace_spelling_with_source(
-        &self,
-        spelling: String,
-        source: &ValueString,
-    ) -> Self {
-        Self(ValueString::derived_from(spelling, [&self.0, source]))
-    }
 }
 
 impl From<String> for RelativeBindingName {
@@ -151,19 +139,6 @@ impl AbsoluteBindingAddress {
         Self(value)
     }
 
-    fn from_persisted(value: ValueString) -> Self {
-        Self(value)
-    }
-
-    fn from_cli_input(value: ValueString) -> Self {
-        Self(value)
-    }
-
-    #[cfg(feature = "test-support")]
-    fn from_test(value: ValueString) -> Self {
-        Self(value)
-    }
-
     pub(crate) fn with_index(&self, index: i64) -> Self {
         Self(ValueString::derived_from(
             format!("{}[{index}]", self.as_str()),
@@ -189,7 +164,7 @@ impl AbsoluteBindingAddress {
         )))
     }
 
-    pub(crate) fn canonicalize_persisted_map_keys(&self) -> Self {
+    pub fn canonicalize_persisted_map_keys(&self) -> Self {
         Self(ValueString::derived_from(
             crate::utils::canonicalize_map_key_address(self.as_str()),
             [&self.0],
@@ -197,37 +172,21 @@ impl AbsoluteBindingAddress {
     }
 }
 
-/// Canonicalize legacy map-key spelling in an address already loaded from
-/// persisted state. This cannot turn authored text into an absolute address.
-pub fn canonicalize_persisted_absolute_binding_address(
-    address: &AbsoluteBindingAddress,
-) -> AbsoluteBindingAddress {
-    address.canonicalize_persisted_map_keys()
-}
+const EMPTY_ABSOLUTE_BINDING_ADDRESS: &str = "an absolute binding address cannot be empty";
 
-/// Parse an absolute binding address supplied explicitly by a CLI user.
-///
-/// This is the only production string-to-address boundary. Authored DSL names
-/// must instead cross either the root or module scope resolver.
-pub fn parse_cli_absolute_binding_address(
-    input: &str,
-) -> Result<AbsoluteBindingAddress, ParseAbsoluteBindingAddressError> {
-    if input.is_empty() {
-        return Err(ParseAbsoluteBindingAddressError);
+fn validate_absolute_binding_address(value: ValueString) -> Result<ValueString, &'static str> {
+    if value.expose_plaintext().is_empty() {
+        Err(EMPTY_ABSOLUTE_BINDING_ADDRESS)
+    } else {
+        Ok(value)
     }
-    Ok(AbsoluteBindingAddress::from_cli_input(input.into()))
 }
-
-/// Error returned when a CLI address spelling is empty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("an absolute binding address cannot be empty")]
-pub struct ParseAbsoluteBindingAddressError;
 
 /// Construct an absolute address for a fixture that cannot practically be
 /// built through parse-and-expand.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub fn absolute_binding_address_for_test(spelling: impl Into<String>) -> AbsoluteBindingAddress {
-    AbsoluteBindingAddress::from_test(spelling.into().into())
+    AbsoluteBindingAddress(spelling.into().into())
 }
 
 impl<'de> Deserialize<'de> for AbsoluteBindingAddress {
@@ -235,7 +194,10 @@ impl<'de> Deserialize<'de> for AbsoluteBindingAddress {
     where
         D: Deserializer<'de>,
     {
-        ValueString::deserialize(deserializer).map(Self::from_persisted)
+        let value = ValueString::deserialize(deserializer)?;
+        validate_absolute_binding_address(value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -284,14 +246,17 @@ impl BindingAddress for RelativeBindingName {
     }
 
     fn with_index(&self, index: i64) -> Self {
-        self.replace_spelling(format!("{}[{index}]", self.as_str()))
+        Self(ValueString::derived_from(
+            format!("{}[{index}]", self.as_str()),
+            [&self.0],
+        ))
     }
 
     fn with_map_key(&self, key: &ValueString) -> Self {
-        self.replace_spelling_with_source(
+        Self(ValueString::derived_from(
             crate::utils::map_key_address(self.as_str(), key.expose_plaintext()),
-            key,
-        )
+            [&self.0, key],
+        ))
     }
 
     fn module_argument_placeholder(name: String) -> Option<Self> {
@@ -323,47 +288,41 @@ impl BindingAddress for AbsoluteBindingAddress {
     }
 }
 
-macro_rules! impl_string_comparisons {
-    ($ty:ty) => {
-        impl PartialEq<str> for $ty {
-            fn eq(&self, other: &str) -> bool {
-                self.as_str() == other
-            }
-        }
-
-        impl PartialEq<&str> for $ty {
-            fn eq(&self, other: &&str) -> bool {
-                self.as_str() == *other
-            }
-        }
-
-        impl PartialEq<$ty> for str {
-            fn eq(&self, other: &$ty) -> bool {
-                self == other.as_str()
-            }
-        }
-
-        impl PartialEq<$ty> for &str {
-            fn eq(&self, other: &$ty) -> bool {
-                *self == other.as_str()
-            }
-        }
-
-        impl PartialEq<String> for $ty {
-            fn eq(&self, other: &String) -> bool {
-                self.as_str() == other
-            }
-        }
-
-        impl PartialEq<$ty> for String {
-            fn eq(&self, other: &$ty) -> bool {
-                self == other.as_str()
-            }
-        }
-    };
+impl PartialEq<str> for RelativeBindingName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
 }
 
-impl_string_comparisons!(RelativeBindingName);
+impl PartialEq<&str> for RelativeBindingName {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<RelativeBindingName> for str {
+    fn eq(&self, other: &RelativeBindingName) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<RelativeBindingName> for &str {
+    fn eq(&self, other: &RelativeBindingName) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<String> for RelativeBindingName {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<RelativeBindingName> for String {
+    fn eq(&self, other: &RelativeBindingName) -> bool {
+        self == other.as_str()
+    }
+}
 
 impl From<RelativeBindingName> for String {
     fn from(value: RelativeBindingName) -> Self {
@@ -374,5 +333,23 @@ impl From<RelativeBindingName> for String {
 impl From<AbsoluteBindingAddress> for String {
     fn from(value: AbsoluteBindingAddress) -> Self {
         value.into_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AbsoluteBindingAddress;
+
+    #[test]
+    fn persisted_absolute_binding_address_rejects_empty_spelling() {
+        let error = serde_json::from_str::<AbsoluteBindingAddress>(r#""""#)
+            .expect_err("an empty persisted binding address must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("an absolute binding address cannot be empty"),
+            "unexpected deserialization error: {error}",
+        );
     }
 }

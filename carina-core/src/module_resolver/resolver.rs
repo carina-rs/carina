@@ -1318,14 +1318,34 @@ fn root_expansion_scope() -> RootScope {
 
 /// Cross the root-directory binding phase without loading module calls.
 ///
-/// Callers use this only when module expansion is intentionally unavailable
-/// (for example, diagnostics that must continue after a module-boundary
-/// error). The root scope remains owned by this expansion entry point.
-pub fn expand_root_directory_file<E: ResolveExportBindingPhase>(
+/// This primitive is crate-private so an arbitrary hand-built `ParsedFile`
+/// cannot cross the phase boundary. Public callers enter through a
+/// loader-owned `LoadedConfig` or `DirectoryParseResult`; the one editor
+/// operation that needs only an export parameter uses
+/// [`prepare_root_export_validation`] instead.
+pub(crate) fn expand_root_directory_file<E: ResolveExportBindingPhase>(
     parsed: crate::parser::File<E>,
 ) -> crate::parser::File<E::Absolute, AbsoluteBindingAddress> {
     let root = root_expansion_scope();
     finish_root_expansion(parsed, Vec::new(), &root)
+}
+
+/// Resolve one authored export and construct its root validation bindings.
+///
+/// LSP fallback diagnostics use this narrow API when full module expansion is
+/// unavailable. It deliberately exposes neither `RootScope` nor whole-file
+/// root expansion.
+pub fn prepare_root_export_validation(
+    parameter: crate::parser::ParsedExportParam,
+    parsed: &ParsedFile,
+) -> (
+    crate::parser::ExpandedParsedExportParam,
+    crate::binding_index::ResolvedBindings,
+) {
+    let root = root_expansion_scope();
+    let parameter = parameter.resolve_root(&root);
+    let bindings = crate::binding_index::ResolvedBindings::for_root_validation(parsed, &root);
+    (parameter, bindings)
 }
 
 /// Resolve all modules in a parsed file

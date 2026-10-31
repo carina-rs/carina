@@ -1,9 +1,7 @@
 //! Schema-backed state backend configuration.
 
 use carina_core::parser;
-use carina_core::resource::{
-    AbsoluteBindingAddress, BindingAddress, ConcreteValue, RelativeBindingName, Value, ValueString,
-};
+use carina_core::resource::{BindingAddress, ConcreteValue, Value, ValueString};
 use carina_core::schema::{
     AttributeType, DslTransform, TypeError, TypeIdentity, ValidatedConfigSchema,
 };
@@ -457,24 +455,10 @@ fn resolve_local_backend<B: BindingAddress>(
     Ok(BackendConfig::Local(LocalBackendSettings { path }))
 }
 
-impl TryFrom<&parser::BackendConfig<RelativeBindingName>> for BackendConfig {
+impl<B: BindingAddress> TryFrom<&parser::BackendConfig<B>> for BackendConfig {
     type Error = BackendConfigError;
 
-    fn try_from(config: &parser::BackendConfig<RelativeBindingName>) -> Result<Self, Self::Error> {
-        match config.backend_type.as_str() {
-            S3_BACKEND_TYPE => resolve_s3_backend(config),
-            LOCAL_BACKEND_TYPE => resolve_local_backend(config),
-            other => Err(BackendConfigError::UnsupportedBackend(other.to_string())),
-        }
-    }
-}
-
-impl TryFrom<&parser::BackendConfig<AbsoluteBindingAddress>> for BackendConfig {
-    type Error = BackendConfigError;
-
-    fn try_from(
-        config: &parser::BackendConfig<AbsoluteBindingAddress>,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(config: &parser::BackendConfig<B>) -> Result<Self, Self::Error> {
         match config.backend_type.as_str() {
             S3_BACKEND_TYPE => resolve_s3_backend(config),
             LOCAL_BACKEND_TYPE => resolve_local_backend(config),

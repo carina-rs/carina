@@ -24,7 +24,8 @@ use crate::resource::DataSource;
 use crate::resource::{
     AbsoluteBindingAddress, DeposedKey, Directives, LoopElementOrigin, ModuleSource,
     ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, SavedModuleSource, State, Value, resolve_resource_ignore_changes,
+    ResourceIdentity, SavedModuleSource, State, UnboundLoopTemplate, Value,
+    resolve_resource_ignore_changes,
 };
 use crate::schema::FieldName;
 use crate::wait::ManagedWaitTarget;
@@ -63,6 +64,16 @@ pub enum ScheduleEdge {
     /// This effect must complete before the resource identity can proceed, but
     /// only when that identity resolves to a delete effect.
     BlockedByIfDelete(ResourceIdentity),
+}
+
+/// Equality key used by the scheduler's cross-phase failure propagation.
+/// Binding addresses, provider resource identities, and unbound loop targets
+/// stay distinct even when their display spellings happen to match.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum SchedulerKey {
+    Binding(AbsoluteBindingAddress),
+    Resource(ResourceIdentity),
+    Loop(UnboundLoopTemplate),
 }
 
 /// Generation addressed by an effect.
@@ -383,19 +394,21 @@ impl From<ReleasedListKeys> for Vec<ReleasedListKey> {
     }
 }
 
-fn deferred_replace_delete_dependencies(deletes: &[DeferredReplaceDelete]) -> BTreeSet<String> {
+fn deferred_replace_delete_dependencies(
+    deletes: &[DeferredReplaceDelete],
+) -> BTreeSet<AbsoluteBindingAddress> {
     deletes
         .iter()
-        .flat_map(|delete| delete.dependencies.iter().map(ToString::to_string))
+        .flat_map(|delete| delete.dependencies.iter().cloned())
         .collect()
 }
 
 fn deferred_replace_delete_explicit_dependencies(
     deletes: &[DeferredReplaceDelete],
-) -> HashSet<String> {
+) -> HashSet<AbsoluteBindingAddress> {
     deletes
         .iter()
-        .flat_map(|delete| delete.explicit_dependencies.iter().map(ToString::to_string))
+        .flat_map(|delete| delete.explicit_dependencies.iter().cloned())
         .collect()
 }
 
@@ -746,7 +759,7 @@ pub enum EffectWithSource<S> {
     /// `notes/specs/2026-05-09-wait-construct-design.md` §State file.
     Wait {
         /// The wait's own identity (e.g. `"cert_issued"`).
-        identity: ResourceIdentity,
+        identity: AbsoluteBindingAddress,
         /// Managed target selected by the differ (`wait cert { ... }` →
         /// `cert`'s resolved resource id).
         target_id: ManagedWaitTarget,
@@ -850,7 +863,7 @@ pub enum UnresolvedSavedEffect {
         keys: ReleasedListKeys,
     },
     Wait {
-        identity: ResourceIdentity,
+        identity: AbsoluteBindingAddress,
         target_id: ManagedWaitTarget,
         until: WaitPredicate,
         until_surface: String,
@@ -1485,7 +1498,7 @@ impl EffectWithSource<ModuleSource> {
             ),
             (
                 Effect::Wait {
-                    identity: ResourceIdentity::new("w"),
+                    identity: absolute_binding("w"),
                     target_id: fixture_managed_wait_target(id.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
@@ -1782,7 +1795,7 @@ impl<S> EffectWithSource<S> {
             | Effect::ReleaseListKeys { id, .. }
             | Effect::DeferredCreate { id, .. } => id.identity().clone(),
             Effect::Move { to, .. } => to.identity().clone(),
-            Effect::Wait { identity, .. } => identity.clone(),
+            Effect::Wait { identity, .. } => ResourceIdentity::new(identity.as_str()),
             Effect::DeferredReplace(payload) => payload.id.identity().clone(),
         }
     }
@@ -1841,32 +1854,21 @@ impl<S> EffectWithSource<S> {
         }
     }
 
-    /// Returns the binding name for this effect's resource, if it has one.
-    pub fn binding_name(&self) -> Option<String> {
+    /// Returns the typed binding address for this effect, if it has one.
+    pub fn binding_address(&self) -> Option<&AbsoluteBindingAddress> {
         match self {
-            Effect::Read { resource } => resource.binding.as_ref().map(ToString::to_string),
-            Effect::Create(resource) => resource.binding.as_ref().map(ToString::to_string),
-            Effect::ResumeCreate { resource, .. } => {
-                resource.binding.as_ref().map(ToString::to_string)
-            }
-            Effect::Update { to, .. } => to.binding.as_ref().map(ToString::to_string),
-            Effect::Delete { binding, .. } => binding.as_ref().map(ToString::to_string),
-            Effect::Import { .. } => None,
-            Effect::Remove { .. } => None,
-            Effect::Move { .. } => None,
-            Effect::ReleaseListKeys { .. } => None,
-            Effect::Wait { identity, .. } => Some(identity.to_string()),
-            // INVARIANT: DeferredCreate has no binding identity until the
-            // upstream resolves at apply time (the iterable's cardinality is
-            // unknown), so binding_name() is None. DeferredReplace already
-            // owns the deletes' pre-apply bindings, so its template's
-            // binding_name is the stable identity. A consumer iterating
-            // `plan.effects().filter_map(|e| e.binding_name())` will see
-            // DeferredReplaces and skip DeferredCreates — this is intentional.
-            Effect::DeferredCreate { .. } => None,
-            Effect::DeferredReplace(payload) => {
-                payload.template.target.bound_binding().map(str::to_string)
-            }
+            Effect::Read { resource } => resource.binding.as_ref(),
+            Effect::Create(resource) => resource.binding.as_ref(),
+            Effect::ResumeCreate { resource, .. } => resource.binding.as_ref(),
+            Effect::Update { to, .. } => to.binding.as_ref(),
+            Effect::Delete { binding, .. } => binding.as_ref(),
+            Effect::Wait { identity, .. } => Some(identity),
+            Effect::DeferredReplace(payload) => payload.template.target.bound_binding_address(),
+            Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::DeferredCreate { .. } => None,
         }
     }
 
@@ -1971,39 +1973,18 @@ impl<S> EffectWithSource<S> {
     ///
     /// State-only effects (Import, Remove, Move, ReleaseListKeys) return an empty set —
     /// they are scheduling primitives, not resource-state operations.
-    pub fn explicit_dependencies(&self) -> HashSet<String> {
+    pub fn explicit_dependencies(&self) -> HashSet<AbsoluteBindingAddress> {
         match self {
-            Effect::Read { resource } => resource
-                .directives
-                .depends_on
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            Effect::Create(resource) => resource
-                .directives
-                .depends_on
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            Effect::ResumeCreate { resource, .. } => resource
-                .directives
-                .depends_on
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            Effect::Update { to, .. } => to
-                .directives
-                .depends_on
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            Effect::Read { resource } => resource.directives.depends_on.iter().cloned().collect(),
+            Effect::Create(resource) => resource.directives.depends_on.iter().cloned().collect(),
+            Effect::ResumeCreate { resource, .. } => {
+                resource.directives.depends_on.iter().cloned().collect()
+            }
+            Effect::Update { to, .. } => to.directives.depends_on.iter().cloned().collect(),
             Effect::Delete {
                 explicit_dependencies,
                 ..
-            } => explicit_dependencies
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            } => explicit_dependencies.iter().cloned().collect(),
             Effect::Import { .. } => HashSet::new(),
             Effect::Remove { .. } => HashSet::new(),
             Effect::Move { .. } => HashSet::new(),
@@ -2011,10 +1992,7 @@ impl<S> EffectWithSource<S> {
             Effect::Wait {
                 explicit_dependencies,
                 ..
-            } => explicit_dependencies
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            } => explicit_dependencies.iter().cloned().collect(),
             Effect::DeferredCreate { .. } => HashSet::new(),
             Effect::DeferredReplace(payload) => {
                 deferred_replace_delete_explicit_dependencies(&payload.deletes)
@@ -2032,22 +2010,21 @@ impl<S> EffectWithSource<S> {
     ///
     /// This concentrates the "what blocks me?" rule in one place so callers
     /// cannot forget Wait's implicit target binding.
-    pub fn blocking_bindings(&self) -> Vec<String> {
+    pub(crate) fn blocking_keys(&self) -> Vec<SchedulerKey> {
         match self {
             Effect::Wait {
                 target_id,
                 explicit_dependencies,
                 ..
             } => {
-                let target_binding = target_id.id().identity_str();
+                let target_identity = target_id.id().identity().clone();
                 let mut out = Vec::with_capacity(1 + explicit_dependencies.len());
-                out.push(target_binding.to_string());
+                out.push(SchedulerKey::Resource(target_identity));
                 out.extend(
                     explicit_dependencies
                         .iter()
-                        .filter(|dep| dep.as_str() != target_binding)
-                        .map(ToString::to_string)
-                        .collect::<BTreeSet<_>>(),
+                        .cloned()
+                        .map(SchedulerKey::Binding),
                 );
                 out
             }
@@ -2062,30 +2039,20 @@ impl<S> EffectWithSource<S> {
             | Effect::ReleaseListKeys { .. } => {
                 let mut deps = BTreeSet::new();
                 if let Some(resource) = self.as_resource_ref() {
-                    deps.extend(
-                        crate::deps::get_resource_value_ref_dependencies(resource)
-                            .into_iter()
-                            .map(|binding| binding.to_string()),
-                    );
+                    deps.extend(crate::deps::get_resource_value_ref_dependencies(resource));
                 }
                 deps.extend(self.explicit_dependencies());
-                deps.into_iter().collect()
+                deps.into_iter().map(SchedulerKey::Binding).collect()
             }
             Effect::DeferredCreate { template, .. } => template
                 .root_bindings()
                 .into_iter()
-                .map(|binding| binding.to_string())
+                .map(SchedulerKey::Binding)
                 .collect(),
             Effect::DeferredReplace(payload) => {
                 let mut deps = deferred_replace_delete_dependencies(&payload.deletes);
-                deps.extend(
-                    payload
-                        .template
-                        .root_bindings()
-                        .into_iter()
-                        .map(|binding| binding.to_string()),
-                );
-                deps.into_iter().collect()
+                deps.extend(payload.template.root_bindings());
+                deps.into_iter().map(SchedulerKey::Binding).collect()
             }
         }
     }
@@ -2117,9 +2084,15 @@ impl<S> EffectWithSource<S> {
                 edges
             }
             Effect::Wait { .. } | Effect::DeferredCreate { .. } | Effect::DeferredReplace(_) => {
-                self.blocking_bindings()
+                self.blocking_keys()
                     .into_iter()
-                    .map(ResourceIdentity::new)
+                    .map(|key| match key {
+                        SchedulerKey::Binding(binding) => ResourceIdentity::new(binding.as_str()),
+                        SchedulerKey::Resource(identity) => identity,
+                        SchedulerKey::Loop(template) => {
+                            ResourceIdentity::new(template.scheduler_key())
+                        }
+                    })
                     .map(ScheduleEdge::DependsOn)
                     .collect()
             }
@@ -2439,7 +2412,7 @@ mod tests {
             (
                 "Wait",
                 Effect::Wait {
-                    identity: ResourceIdentity::new("w"),
+                    identity: absolute_binding("w"),
                     target_id: fixture_managed_wait_target(rid.clone()),
                     until: WaitPredicate::equals(
                         AttrPath::single("status"),
@@ -2553,7 +2526,10 @@ mod tests {
     #[test]
     fn deferred_create_blocking_bindings_is_upstream_only() {
         let effect = deferred_create_effect();
-        assert_eq!(effect.blocking_bindings(), vec!["cert".to_string()]);
+        assert_eq!(
+            effect.blocking_keys(),
+            vec![SchedulerKey::Binding(absolute_binding("cert"))]
+        );
     }
 
     #[test]
@@ -2572,8 +2548,11 @@ mod tests {
         };
 
         assert_eq!(
-            effect.blocking_bindings(),
-            vec!["fallback".to_string(), "primary".to_string()],
+            effect.blocking_keys(),
+            vec![
+                SchedulerKey::Binding(absolute_binding("fallback")),
+                SchedulerKey::Binding(absolute_binding("primary")),
+            ],
         );
     }
 
@@ -2604,8 +2583,11 @@ mod tests {
         }));
 
         assert_eq!(
-            effect.blocking_bindings(),
-            vec!["cert".to_string(), "foo".to_string()]
+            effect.blocking_keys(),
+            vec![
+                SchedulerKey::Binding(absolute_binding("cert")),
+                SchedulerKey::Binding(absolute_binding("foo")),
+            ]
         );
     }
 
@@ -2637,7 +2619,7 @@ mod tests {
 
         assert_eq!(
             effect.explicit_dependencies(),
-            HashSet::from(["foo".to_string()])
+            HashSet::from([absolute_binding("foo")])
         );
     }
 
@@ -2828,22 +2810,25 @@ mod tests {
     }
 
     #[test]
-    fn binding_name_returns_binding() {
+    fn binding_address_returns_binding() {
         let resource: Resource =
             Resource::new("test", "my_binding").with_root_binding("my_binding");
         let effect = Effect::Create(ResolvedResource::new(resource));
-        assert_eq!(effect.binding_name(), Some("my_binding".to_string()));
+        assert_eq!(
+            effect.binding_address(),
+            Some(&absolute_binding("my_binding"))
+        );
     }
 
     #[test]
-    fn binding_name_returns_none_without_binding() {
+    fn binding_address_returns_none_without_binding() {
         use crate::resource::{ConcreteValue, Value};
         let resource: Resource = Resource::new("test", "no_binding").with_attribute(
             "name",
             Value::Concrete(ConcreteValue::String("test".into())),
         );
         let effect = Effect::Create(ResolvedResource::new(resource));
-        assert_eq!(effect.binding_name(), None);
+        assert_eq!(effect.binding_address(), None);
     }
 
     #[test]
@@ -2933,7 +2918,11 @@ mod tests {
         };
         let create = Effect::Create(ResolvedResource::new(bucket.clone()));
         let got = create.explicit_dependencies();
-        assert!(got.contains("role") && got.contains("kms"), "got {:?}", got);
+        assert!(
+            got.contains(&absolute_binding("role")) && got.contains(&absolute_binding("kms")),
+            "got {:?}",
+            got
+        );
     }
 
     #[test]
@@ -2952,8 +2941,12 @@ mod tests {
             blocked_by_updates: HashSet::new(),
         };
         let got = effect.explicit_dependencies();
-        assert!(got.contains("role"));
-        assert!(!got.contains("kms"), "kms is value-ref-only; got {:?}", got);
+        assert!(got.contains(&absolute_binding("role")));
+        assert!(
+            !got.contains(&absolute_binding("kms")),
+            "kms is value-ref-only; got {:?}",
+            got
+        );
     }
 
     #[test]
@@ -3029,7 +3022,7 @@ mod tests {
         use std::time::Duration;
 
         let _: Effect = Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: absolute_binding("cert_issued"),
             target_id: fixture_managed_wait_target(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -3053,7 +3046,7 @@ mod tests {
         use std::time::Duration;
 
         let e: Effect = Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: absolute_binding("cert_issued"),
             target_id: fixture_managed_wait_target(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -3068,7 +3061,7 @@ mod tests {
             interval: Duration::from_secs(5),
             explicit_dependencies: std::collections::HashSet::new(),
         };
-        assert_eq!(e.binding_name(), Some("cert_issued".to_string()));
+        assert_eq!(e.binding_address(), Some(&absolute_binding("cert_issued")));
     }
 
     #[test]
@@ -3078,7 +3071,7 @@ mod tests {
         use std::time::Duration;
 
         let e: Effect = Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: absolute_binding("cert_issued"),
             target_id: fixture_managed_wait_target(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -3106,7 +3099,7 @@ mod tests {
 
         let target = ResolvedResource::new(Resource::new("acm.Certificate", "cert"));
         let original = Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: absolute_binding("cert_issued"),
             target_id: ManagedWaitTarget::new(&target),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -3207,7 +3200,7 @@ mod tests {
             origin: None,
         };
         let wait = Effect::Wait {
-            identity: ResourceIdentity::new("w"),
+            identity: absolute_binding("w"),
             target_id: fixture_managed_wait_target(rid.clone()),
             until: WaitPredicate::equals(
                 crate::wait::predicate::AttrPath::single("status"),

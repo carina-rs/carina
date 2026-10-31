@@ -25,7 +25,7 @@ use carina_core::module_resolver;
 use carina_core::parser::BackendConfig;
 #[cfg(test)]
 use carina_core::parser::ProviderContext;
-use carina_core::resource::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
+use carina_core::resource::BindingAddress;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendSelection,
@@ -99,58 +99,14 @@ pub(crate) enum ReadBackendWarningPolicy<'a> {
 /// backend differs from `carina-backend.lock`, the returned
 /// [`ResolvedReadBackend`] points at the locked old backend. A warning policy
 /// is mandatory and is applied before the readable backend is returned.
-pub(crate) trait BackendSelectionBindingAddress: BindingAddress {
-    fn for_read(
-        project_dir: &Path,
-        configured: Option<&BackendConfig<Self>>,
-    ) -> carina_state::BackendResult<carina_state::ReadBackendSelection>;
-
-    fn verified_for_mutation(
-        project_dir: &Path,
-        configured: Option<&BackendConfig<Self>>,
-    ) -> carina_state::BackendResult<MutationBackendSelection>;
-}
-
-impl BackendSelectionBindingAddress for RelativeBindingName {
-    fn for_read(
-        project_dir: &Path,
-        configured: Option<&BackendConfig<Self>>,
-    ) -> carina_state::BackendResult<carina_state::ReadBackendSelection> {
-        BackendSelection::for_read(project_dir, configured)
-    }
-
-    fn verified_for_mutation(
-        project_dir: &Path,
-        configured: Option<&BackendConfig<Self>>,
-    ) -> carina_state::BackendResult<MutationBackendSelection> {
-        BackendSelection::verified_for_mutation(project_dir, configured)
-    }
-}
-
-impl BackendSelectionBindingAddress for AbsoluteBindingAddress {
-    fn for_read(
-        project_dir: &Path,
-        configured: Option<&BackendConfig<Self>>,
-    ) -> carina_state::BackendResult<carina_state::ReadBackendSelection> {
-        BackendSelection::for_read_expanded(project_dir, configured)
-    }
-
-    fn verified_for_mutation(
-        project_dir: &Path,
-        configured: Option<&BackendConfig<Self>>,
-    ) -> carina_state::BackendResult<MutationBackendSelection> {
-        BackendSelection::verified_for_mutation_expanded(project_dir, configured)
-    }
-}
-
-pub(crate) async fn resolve_backend_for_read<B: BackendSelectionBindingAddress>(
+pub(crate) async fn resolve_backend_for_read<B: BindingAddress>(
     base_dir: &Path,
     command_path: &Path,
     backend_config: Option<&BackendConfig<B>>,
     lock_requirement: BackendLockRequirement,
     warning_policy: ReadBackendWarningPolicy<'_>,
 ) -> Result<ResolvedReadBackend, AppError> {
-    let selection = B::for_read(base_dir, backend_config)?;
+    let selection = BackendSelection::for_read(base_dir, backend_config)?;
     if lock_requirement == BackendLockRequirement::RequirePresent && !selection.lock_present() {
         return Err(AppError::Config(format!(
             "Backend lock file not found. Run `{}` to initialize the project.",
@@ -165,12 +121,12 @@ pub(crate) async fn resolve_backend_for_read<B: BackendSelectionBindingAddress>(
     Ok(backend)
 }
 
-pub(crate) fn verify_for_mutation<B: BackendSelectionBindingAddress>(
+pub(crate) fn verify_for_mutation<B: BindingAddress>(
     project_dir: &Path,
     backend_config: Option<&BackendConfig<B>>,
     command: DriftCommand,
 ) -> Result<VerifiedMutationBackendSelection, AppError> {
-    match B::verified_for_mutation(project_dir, backend_config)? {
+    match BackendSelection::verified_for_mutation(project_dir, backend_config)? {
         MutationBackendSelection::MissingLock { path } => Err(AppError::Config(format!(
             "Backend lock file not found at {}. Run `{}` to initialize the project.",
             path.display(),

@@ -235,7 +235,7 @@ fn topological_sort<S: Clone, B: BindingAddress>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::Effect;
+    use crate::effect::{Effect, SchedulerKey};
     use crate::resource::{
         AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
         ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource,
@@ -249,7 +249,7 @@ mod tests {
 
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: absolute_binding("cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(
                 &crate::resource::ResolvedResource::new(Resource::new("acm.Certificate", "cert")),
             ),
@@ -486,18 +486,12 @@ mod tests {
     #[test]
     fn wait_blocking_bindings_include_target_before_explicit_dependencies() {
         let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
-        let blocking_bindings = effect.blocking_bindings();
-
         assert_eq!(
-            blocking_bindings.first().map(|binding| binding.as_str()),
-            Some("cert"),
-        );
-        assert_eq!(
-            blocking_bindings
-                .into_iter()
-                .map(|binding| binding.to_string())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["cert".to_string(), "other_failed".to_string()])
+            effect.blocking_keys(),
+            vec![
+                SchedulerKey::Resource(ResourceIdentity::new("cert")),
+                SchedulerKey::Binding(absolute_binding("other_failed")),
+            ]
         );
     }
 

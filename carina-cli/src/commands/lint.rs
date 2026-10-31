@@ -41,15 +41,6 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
         .collect()
 }
 
-fn mixed_tag_key_style_warnings_for_population<E, B: carina_core::resource::BindingAddress, D>(
-    root_inputs: &[(PathBuf, String)],
-    parsed: &carina_core::parser::File<E, B, D>,
-    base_dir: &Path,
-) -> Vec<LintWarning> {
-    let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
-    mixed_tag_key_style_warnings(&tag_keys)
-}
-
 enum LintFile {
     Blocked(carina_core::parser::InferredFile),
     Resolved(carina_core::parser::ModuleResolvedInferredFile),
@@ -114,10 +105,12 @@ impl LintFile {
     ) -> Vec<LintWarning> {
         match self {
             Self::Blocked(parsed) => {
-                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+                let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
+                mixed_tag_key_style_warnings(&tag_keys)
             }
             Self::Resolved(parsed) => {
-                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+                let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
+                mixed_tag_key_style_warnings(&tag_keys)
             }
         }
     }
@@ -438,8 +431,8 @@ mod tests {
         );
         let root_inputs = vec![(root_file, root_source.to_string())];
 
-        let warnings =
-            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
+        let tag_keys = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
+        let warnings = mixed_tag_key_style_warnings(&tag_keys);
 
         assert_eq!(warnings.len(), 2);
         assert!(warnings.iter().all(|warning| warning.file == module_file));
@@ -466,8 +459,8 @@ mod tests {
             (db_file.clone(), db_source.to_string()),
         ];
 
-        let warnings =
-            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
+        let tag_keys = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
+        let warnings = mixed_tag_key_style_warnings(&tag_keys);
 
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].file, db_file);

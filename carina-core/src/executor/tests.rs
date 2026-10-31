@@ -352,7 +352,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
         vec![
             create_effect(wait_target.clone()),
             Effect::Wait {
-                identity: ResourceIdentity::new("wait_ready"),
+                identity: crate::resource::absolute_binding_address_for_test("wait_ready"),
                 target_id: managed_wait_target(wait_target.id.clone()),
                 until: WaitPredicate::equals(
                     AttrPath::single("status"),
@@ -4806,7 +4806,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     );
     let mut plan = Plan::new();
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("target_ready"),
+        identity: crate::resource::absolute_binding_address_for_test("target_ready"),
         target_id: managed_wait_target(target_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -5040,7 +5040,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_ready"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_ready"),
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -5107,7 +5107,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_ready"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_ready"),
         target_id: managed_wait_target(cert_id),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8796,7 +8796,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -8953,7 +8953,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -9060,7 +9060,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),
@@ -9688,7 +9688,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        identity: ResourceIdentity::new("cert_issued"),
+        identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
         target_id: managed_wait_target(cert_id.clone()),
         until: WaitPredicate::equals(
             AttrPath::single("status"),

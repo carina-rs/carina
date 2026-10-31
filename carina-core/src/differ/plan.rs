@@ -853,7 +853,7 @@ fn create_plan_parts(
         )?);
 
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new(wb.binding.as_str()),
+            identity: wb.binding.clone(),
             target_id: target,
             until,
             until_surface: wb.until_raw.clone(),

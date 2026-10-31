@@ -62,6 +62,8 @@ fn reconcile_anonymous_module_instances(
 ) {
     crate::module_resolver::reconcile_anonymous_module_instances(
         resources,
+        &mut [],
+        &mut [],
         compositions,
         find_state_names_by_type,
         &crate::identifier::StateBlockClaims::empty(),
@@ -2113,6 +2115,8 @@ thing { name = 'after-edit' }
 
     crate::module_resolver::reconcile_anonymous_module_instances(
         &mut claimed_from.resources,
+        &mut claimed_from.data_sources,
+        &mut claimed_from.wait_bindings,
         &mut claimed_from.compositions,
         &state_lookup,
         &claims,
@@ -2166,6 +2170,8 @@ thing { name = 'after-edit' }
 
     crate::module_resolver::reconcile_anonymous_module_instances(
         &mut claimed_to.resources,
+        &mut claimed_to.data_sources,
+        &mut claimed_to.wait_bindings,
         &mut claimed_to.compositions,
         &state_lookup,
         &claims,

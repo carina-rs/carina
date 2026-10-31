@@ -802,9 +802,6 @@ fn resolve_required_value_status(
 
 fn evaluate_runtime_user_function(
     function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
-    functions: &std::sync::Arc<
-        HashMap<String, crate::parser::UserFunction<AbsoluteBindingAddress>>,
-    >,
     args: &[FunctionArgument<AbsoluteBindingAddress>],
     bindings: &ResolvedBindings,
     config: Option<&crate::parser::ProviderContext>,
@@ -925,25 +922,17 @@ fn evaluate_runtime_user_function(
         })?;
     }
 
-    // Keep the lexical scope argument live and explicit: nested resolved calls
-    // embedded in the body carry this same captured map and are evaluated by
-    // the exhaustive `ResolvedFunctionCall` arm below.
-    let _ = functions;
     Ok(result)
 }
 
 pub(crate) fn evaluate_module_resolved_user_function(
     function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
-    functions: &std::sync::Arc<
-        HashMap<String, crate::parser::UserFunction<AbsoluteBindingAddress>>,
-    >,
     arguments: &[FunctionArgument<AbsoluteBindingAddress>],
     config: &crate::parser::ProviderContext,
     call_line: usize,
 ) -> Result<Value, crate::parser::ParseError> {
     evaluate_runtime_user_function(
         function,
-        functions,
         arguments,
         &ResolvedBindings::default(),
         Some(config),
@@ -1124,7 +1113,6 @@ fn resolve_ref_value_inner(
             let config = config.unwrap_or(&default_config);
             evaluate_runtime_user_function(
                 function,
-                functions,
                 &resolved_args,
                 bindings,
                 Some(config),

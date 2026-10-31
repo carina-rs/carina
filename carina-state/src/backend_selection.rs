@@ -7,9 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use carina_core::parser::{
-    BackendConfig as ParserBackendConfig, ExpandedBackendConfig as ExpandedParserBackendConfig,
-};
+use carina_core::parser::BackendConfig as ParserBackendConfig;
+use carina_core::resource::BindingAddress;
 use thiserror::Error;
 
 use crate::backend::{BackendError, BackendResult};
@@ -252,20 +251,11 @@ impl BackendSelection {
     /// A pending migration selects the old backend recorded in the lock and
     /// returns its drift metadata without printing. Missing locks are allowed
     /// here so the command layer can retain command-specific policy.
-    pub fn for_read(
+    pub fn for_read<B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig>,
+        configured: Option<&ParserBackendConfig<B>>,
     ) -> BackendResult<ReadBackendSelection> {
         let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
-        Self::for_read_inspection(inspection)
-    }
-
-    /// Expanded-config counterpart of [`BackendSelection::for_read`].
-    pub fn for_read_expanded(
-        project_dir: &Path,
-        configured: Option<&ExpandedParserBackendConfig>,
-    ) -> BackendResult<ReadBackendSelection> {
-        let inspection = inspect_expanded(&canonical_project_dir(project_dir), configured)?;
         Self::for_read_inspection(inspection)
     }
 
@@ -290,20 +280,11 @@ impl BackendSelection {
     /// Select a backend for an operation that may mutate state.
     ///
     /// Only the `Verified` result carries a constructible backend token.
-    pub fn verified_for_mutation(
+    pub fn verified_for_mutation<B: BindingAddress>(
         project_dir: &Path,
-        configured: Option<&ParserBackendConfig>,
+        configured: Option<&ParserBackendConfig<B>>,
     ) -> BackendResult<MutationBackendSelection> {
         let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
-        Self::verified_for_mutation_inspection(inspection)
-    }
-
-    /// Expanded-config counterpart of [`BackendSelection::verified_for_mutation`].
-    pub fn verified_for_mutation_expanded(
-        project_dir: &Path,
-        configured: Option<&ExpandedParserBackendConfig>,
-    ) -> BackendResult<MutationBackendSelection> {
-        let inspection = inspect_expanded(&canonical_project_dir(project_dir), configured)?;
         Self::verified_for_mutation_inspection(inspection)
     }
 
@@ -413,20 +394,9 @@ pub fn inspect_backend_drift(
     inspect(project_dir, configured).map(|inspection| inspection.status)
 }
 
-fn inspect(
+fn inspect<B: BindingAddress>(
     project_dir: &Path,
-    configured: Option<&ParserBackendConfig>,
-) -> BackendResult<BackendInspection> {
-    let configured = configured
-        .map(BackendConfig::try_from)
-        .transpose()
-        .map_err(BackendError::from)?;
-    inspect_resolved(project_dir, configured)
-}
-
-fn inspect_expanded(
-    project_dir: &Path,
-    configured: Option<&ExpandedParserBackendConfig>,
+    configured: Option<&ParserBackendConfig<B>>,
 ) -> BackendResult<BackendInspection> {
     let configured = configured
         .map(BackendConfig::try_from)
@@ -646,7 +616,7 @@ mod tests {
         let alias = root.path().join("project-alias");
         symlink(&project, &alias).unwrap();
 
-        let selected = BackendSelection::for_read(&alias, None).unwrap();
+        let selected = BackendSelection::for_read(&alias, None::<&ParserBackendConfig>).unwrap();
         let BackendTarget::Configured { base_dir, .. } = selected.selection.target() else {
             panic!("project read must select a configured backend target")
         };

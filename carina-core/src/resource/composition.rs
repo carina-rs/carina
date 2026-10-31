@@ -105,7 +105,7 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
             source_argument: _source_argument,
         } = self;
         match value {
-            CompositionAttributeValue::Forwarded(_path) => false,
+            CompositionAttributeValue::Forwarded(_) => false,
             CompositionAttributeValue::Derived(value) => {
                 crate::value::contains_redacted_secret(value)
             }
@@ -213,6 +213,23 @@ impl LiveCompositionAttribute<RelativeBindingName> {
     }
 }
 
+impl LiveCompositionAttribute<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            value,
+            declared_type: _declared_type,
+            source_argument: _source_argument,
+        } = self;
+        match value {
+            CompositionAttributeValue::Forwarded(path) => path.map_absolute_bindings(map),
+            CompositionAttributeValue::Derived(value) => value.map_absolute_bindings(map),
+        }
+    }
+}
+
 /// Saved-plan form of one module output.
 ///
 /// Declaration and parser provenance are deliberately absent: a saved plan
@@ -237,10 +254,7 @@ impl SavedCompositionAttribute {
     pub fn contains_redacted_secret_placeholder(&self) -> bool {
         let Self { value } = self;
         match value {
-            CompositionAttributeValue::Forwarded(path) => {
-                let _path = path;
-                false
-            }
+            CompositionAttributeValue::Forwarded(_) => false,
             CompositionAttributeValue::Derived(value) => {
                 crate::value::contains_redacted_secret(value)
             }
@@ -250,10 +264,7 @@ impl SavedCompositionAttribute {
     pub fn forwarded_path(&self) -> Option<&AccessPath> {
         match &self.value {
             CompositionAttributeValue::Forwarded(path) => Some(path),
-            CompositionAttributeValue::Derived(value) => {
-                let _value = value;
-                None
-            }
+            CompositionAttributeValue::Derived(_) => None,
         }
     }
 
@@ -394,6 +405,23 @@ impl LiveCompositionArgument<RelativeBindingName> {
     }
 }
 
+impl LiveCompositionArgument<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            operand,
+            metadata:
+                LiveCompositionArgumentMetadata {
+                    declared_type: _declared_type,
+                    origin: _origin,
+                },
+        } = self;
+        operand.map_absolute_bindings(map);
+    }
+}
+
 /// Saved-plan form of a module-call argument.
 ///
 /// This is intentionally value-only. It has no declaration, origin, or
@@ -504,6 +532,20 @@ impl<B: BindingAddress> PendingModuleConstraint<B> {
     }
 }
 
+impl PendingModuleConstraint<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            expression,
+            message: _message,
+        } = self;
+        expression.map_absolute_bindings(map);
+    }
+}
+
 /// The function-shaped I/O surface of a live composition.
 ///
 /// Carries both halves of the module-call boundary on the expanded
@@ -577,8 +619,10 @@ pub type AuthoredCompositionCall = CompositionCall<RelativeBindingName>;
 pub type ExpandedCompositionCall = CompositionCall<AbsoluteBindingAddress>;
 
 impl CompositionCall<RelativeBindingName> {
-    #[cfg(test)]
-    pub(crate) fn resolve_root(self, scope: &RootScope) -> CompositionCall<AbsoluteBindingAddress> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> CompositionCall<AbsoluteBindingAddress> {
         let Self {
             id,
             module_name,
@@ -591,11 +635,36 @@ impl CompositionCall<RelativeBindingName> {
         CompositionCall {
             id,
             module_name,
-            binding: binding.map(|binding| scope.resolve(binding)),
+            binding: binding.map(resolve),
             instance,
             module_source,
             module_directory,
             loop_origin,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_root(self, scope: &RootScope) -> CompositionCall<AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+}
+
+impl CompositionCall<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            module_name: _module_name,
+            binding,
+            instance: _instance,
+            module_source: _module_source,
+            module_directory: _module_directory,
+            loop_origin: _loop_origin,
+        } = self;
+        if let Some(binding) = binding {
+            *binding = map(binding);
         }
     }
 }
@@ -716,35 +785,26 @@ impl CompositionCallPath<RelativeBindingName> {
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
     ) -> CompositionCallPath<AbsoluteBindingAddress> {
-        let resolve_call =
-            |call: CompositionCall<RelativeBindingName>,
-             resolve: &mut dyn FnMut(RelativeBindingName) -> AbsoluteBindingAddress| {
-                let CompositionCall {
-                    id,
-                    module_name,
-                    binding,
-                    instance,
-                    module_source,
-                    module_directory,
-                    loop_origin,
-                } = call;
-                CompositionCall {
-                    id,
-                    module_name,
-                    binding: binding.map(resolve),
-                    instance,
-                    module_source,
-                    module_directory,
-                    loop_origin,
-                }
-            };
         let Self { root, descendants } = self;
         CompositionCallPath {
-            root: resolve_call(root, resolve),
+            root: root.resolve_bindings(resolve),
             descendants: descendants
                 .into_iter()
-                .map(|call| resolve_call(call, resolve))
+                .map(|call| call.resolve_bindings(resolve))
                 .collect(),
+        }
+    }
+}
+
+impl CompositionCallPath<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self { root, descendants } = self;
+        root.map_absolute_bindings(map);
+        for call in descendants {
+            call.map_absolute_bindings(map);
         }
     }
 }
@@ -1327,6 +1387,44 @@ impl LiveComposition<RelativeBindingName> {
 }
 
 impl LiveComposition<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name: _module_name,
+            instance: _instance,
+            call_path,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = self;
+        let LiveCompositionSignature {
+            arguments,
+            attributes,
+            pending_constraints,
+        } = signature;
+        for argument in arguments.values_mut() {
+            argument.map_absolute_bindings(map);
+        }
+        for attribute in attributes.values_mut() {
+            attribute.map_absolute_bindings(map);
+        }
+        for constraint in pending_constraints {
+            constraint.map_absolute_bindings(map);
+        }
+        if let Some(binding) = binding {
+            *binding = map(binding);
+        }
+        *dependency_bindings = std::mem::take(dependency_bindings)
+            .into_iter()
+            .map(|binding| map(&binding))
+            .collect();
+        call_path.map_absolute_bindings(map);
+    }
+
     pub fn into_saved_with_resolver(
         self,
         resolver: &mut CompositionSourceIdentityResolver,

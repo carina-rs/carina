@@ -1534,11 +1534,22 @@ impl ResolvedBindings {
         parsed: &crate::parser::File<E>,
         root: &crate::resource::RootScope,
     ) -> Self {
-        let resolve_value = |value: &Value<RelativeBindingName>| {
-            value
-                .clone()
-                .resolve_bindings(&mut |binding| root.resolve(binding))
-        };
+        Self::build_validation(
+            parsed,
+            |value: &Value<RelativeBindingName>| {
+                value
+                    .clone()
+                    .resolve_bindings(&mut |binding| root.resolve(binding))
+            },
+            |binding| root.resolve(binding.clone()),
+        )
+    }
+
+    fn build_validation<E, B: BindingAddress, D>(
+        parsed: &crate::parser::File<E, B, D>,
+        mut map_value: impl FnMut(&Value<B>) -> Value,
+        mut map_binding: impl FnMut(&B) -> AbsoluteBindingAddress,
+    ) -> Self {
         let mut by_name = HashMap::new();
 
         for resource in &parsed.resources {
@@ -1548,11 +1559,11 @@ impl ResolvedBindings {
             let attributes = resource
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), resolve_value(value)))
+                .map(|(name, value)| (name.clone(), map_value(value)))
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
-                binding.to_string(),
+                map_binding(binding).to_string(),
                 ResolvedBinding {
                     attributes,
                     source: BindingValueSource::Local,
@@ -1571,11 +1582,11 @@ impl ResolvedBindings {
             let attributes = data_source
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), resolve_value(value)))
+                .map(|(name, value)| (name.clone(), map_value(value)))
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
-                binding.to_string(),
+                map_binding(binding).to_string(),
                 ResolvedBinding {
                     attributes,
                     source: BindingValueSource::Local,
@@ -1595,11 +1606,14 @@ impl ResolvedBindings {
                 .signature
                 .attributes
                 .iter()
-                .map(|(name, attribute)| (name.clone(), resolve_value(&attribute.to_value())))
+                .map(|(name, attribute)| {
+                    let value = attribute.to_value();
+                    (name.clone(), map_value(&value))
+                })
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
-                binding.to_string(),
+                map_binding(binding).to_string(),
                 ResolvedBinding {
                     attributes,
                     source: BindingValueSource::Local,
@@ -1617,8 +1631,8 @@ impl ResolvedBindings {
             .wait_bindings
             .iter()
             .map(|wait| WaitAliasSpec {
-                binding: root.resolve(wait.binding.clone()),
-                target: root.resolve(wait.target.clone()),
+                binding: map_binding(&wait.binding),
+                target: map_binding(&wait.target),
             })
             .collect::<Vec<_>>();
         bindings.layer_wait_aliases(&wait_aliases);
@@ -1629,95 +1643,7 @@ impl ResolvedBindings {
     pub fn for_expanded_validation<E, D>(
         parsed: &crate::parser::File<E, AbsoluteBindingAddress, D>,
     ) -> Self {
-        let mut by_name = HashMap::new();
-
-        for resource in &parsed.resources {
-            let Some(binding) = resource.binding.as_ref() else {
-                continue;
-            };
-            let attributes = resource
-                .attributes
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<HashMap<_, _>>();
-            let definitive_attributes = attributes.keys().cloned().collect();
-            by_name.insert(
-                binding.to_string(),
-                ResolvedBinding {
-                    attributes,
-                    source: BindingValueSource::Local,
-                    completeness: BindingCompleteness::Incomplete,
-                    definitive_attributes,
-                    changed_attributes: HashSet::new(),
-                    refreshable_attributes: HashSet::new(),
-                    removed_sensitive_attributes: HashSet::new(),
-                },
-            );
-        }
-        for data_source in &parsed.data_sources {
-            let Some(binding) = data_source.binding.as_ref() else {
-                continue;
-            };
-            let attributes = data_source
-                .attributes
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<HashMap<_, _>>();
-            let definitive_attributes = attributes.keys().cloned().collect();
-            by_name.insert(
-                binding.to_string(),
-                ResolvedBinding {
-                    attributes,
-                    source: BindingValueSource::Local,
-                    completeness: BindingCompleteness::Incomplete,
-                    definitive_attributes,
-                    changed_attributes: HashSet::new(),
-                    refreshable_attributes: HashSet::new(),
-                    removed_sensitive_attributes: HashSet::new(),
-                },
-            );
-        }
-        for composition in &parsed.compositions {
-            let Some(binding) = composition.binding.as_ref() else {
-                continue;
-            };
-            let attributes = composition
-                .signature
-                .attributes
-                .iter()
-                .map(|(name, attribute)| (name.clone(), attribute.to_value()))
-                .collect::<HashMap<_, _>>();
-            let definitive_attributes = attributes.keys().cloned().collect();
-            by_name.insert(
-                binding.to_string(),
-                ResolvedBinding {
-                    attributes,
-                    source: BindingValueSource::Local,
-                    completeness: BindingCompleteness::Incomplete,
-                    definitive_attributes,
-                    changed_attributes: HashSet::new(),
-                    refreshable_attributes: HashSet::new(),
-                    removed_sensitive_attributes: HashSet::new(),
-                },
-            );
-        }
-
-        let mut bindings = Self { by_name };
-        let wait_aliases = parsed
-            .wait_bindings
-            .iter()
-            .map(WaitAliasSpec::from)
-            .collect::<Vec<_>>();
-        bindings.layer_wait_aliases(&wait_aliases);
-        bindings
-    }
-
-    /// Compatibility name for callers that already hold the expanded
-    /// semantic file used by validation.
-    pub fn for_validation<E, D>(
-        parsed: &crate::parser::File<E, AbsoluteBindingAddress, D>,
-    ) -> Self {
-        Self::for_expanded_validation(parsed)
+        Self::build_validation(parsed, |value| value.clone(), |binding| binding.clone())
     }
 
     /// Build the explicitly incomplete value view used to resolve query

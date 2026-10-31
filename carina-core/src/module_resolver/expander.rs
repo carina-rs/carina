@@ -634,6 +634,28 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             local_bindings: &intra_module_bindings,
             arguments: argument_substitutions,
             call_path: &expanded_call_path,
+            argument_placeholders: argument_substitutions
+                .arguments
+                .keys()
+                .map(|name| {
+                    let placeholder = Value::Deferred(DeferredValue::Unknown(
+                        crate::resource::UnknownReason::ModuleArgument {
+                            name: name.clone(),
+                            source_line: argument_substitutions.default_line.into(),
+                            diagnostic_name: None,
+                        },
+                    ));
+                    (
+                        name.clone(),
+                        ResolvedArgument::<RelativeBindingName> {
+                            argument: ModuleArgument::new(placeholder),
+                            origin: ArgumentOrigin::Defaulted,
+                            caller_reference: None,
+                            forwarded_from_enclosing_parameter: false,
+                        },
+                    )
+                })
+                .collect(),
         };
 
         let nested_binding_index = BindingIndex::from_parsed(module, self.schemas);
@@ -854,7 +876,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             module
                 .wait_bindings
                 .iter()
-                .map(|wait| resolve_wait_binding(wait, &module_scope_resolver))
+                .filter_map(|wait| resolve_wait_binding(wait, &module_scope_resolver).transpose())
                 .collect::<Result<_, _>>()
                 .map_err(contextualize_access_error)?;
 
@@ -1052,10 +1074,7 @@ fn resolve_nested_module_call(
                             handle.clone().with_alias(binding),
                         ));
                     }
-                    StructuralOperandRef::Parameter {
-                        name,
-                        access_base: _access_base,
-                    } => {
+                    StructuralOperandRef::Parameter { name, .. } => {
                         return resolver
                             .arguments
                             .arguments
@@ -1172,12 +1191,11 @@ fn resolve_dependency_bindings(
                     crate::deps::collect_dependencies(value, &mut dependencies);
                     resolved.extend(dependencies);
                 }
-                StructuralOperandRef::Parameter { name, access_base } => {
+                StructuralOperandRef::Parameter { .. } => {
                     // A standalone module has no concrete caller operand yet.
                     // It therefore contributes no concrete dependency edge;
                     // a real outer call will substitute the handle before
                     // this expansion boundary is crossed.
-                    let _pending_parameter = (name, access_base);
                 }
             }
         } else {
@@ -1195,7 +1213,7 @@ fn resolve_directive_dependencies(
         .iter()
         .filter_map(|binding| {
             resolver
-                .resolve_optional_dependency_binding(binding, "directives.depends_on")
+                .resolve_dependency_binding(binding, "directives.depends_on")
                 .transpose()
         })
         .collect()
@@ -1204,7 +1222,7 @@ fn resolve_directive_dependencies(
 fn resolve_wait_binding(
     wb: &WaitBinding,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<crate::parser::WaitBinding<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+) -> Result<Option<crate::parser::WaitBinding<AbsoluteBindingAddress>>, ArgumentSubstitutionError> {
     let WaitBinding {
         binding,
         target,
@@ -1214,13 +1232,20 @@ fn resolve_wait_binding(
         depends_on,
         line,
     } = wb;
-    Ok(crate::parser::WaitBinding {
+    let Some(target) = resolver.resolve_dependency_binding(target, "wait target")? else {
+        return Ok(None);
+    };
+    let Some(predicate_root) =
+        resolver.resolve_dependency_binding(&until_predicate.root, "wait predicate root")?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(crate::parser::WaitBinding {
         binding: resolver.resolve_declared_binding(binding)?,
-        target: resolver.resolve_dependency_binding(target, "wait target")?,
+        target,
         until_raw: until_raw.clone(),
         until_predicate: crate::parser::UntilPredicateAst {
-            root: resolver
-                .resolve_dependency_binding(&until_predicate.root, "wait predicate root")?,
+            root: predicate_root,
             attribute_segments: until_predicate.attribute_segments.clone(),
             rhs: resolver
                 .resolve_value(&until_predicate.rhs, ArgumentSubstitutionPosition::Value)?,
@@ -1228,10 +1253,14 @@ fn resolve_wait_binding(
         timeout_secs: *timeout_secs,
         depends_on: depends_on
             .iter()
-            .map(|binding| resolver.resolve_dependency_binding(binding, "wait depends_on"))
+            .filter_map(|binding| {
+                resolver
+                    .resolve_dependency_binding(binding, "wait depends_on")
+                    .transpose()
+            })
             .collect::<Result<_, _>>()?,
         line: *line,
-    })
+    }))
 }
 
 fn authored_value_reference_path(value: &Value) -> Option<crate::resource::AuthoredReferencePath> {
@@ -1437,6 +1466,7 @@ struct ModuleScopeResolver<'a> {
     local_bindings: &'a HashSet<RelativeBindingName>,
     arguments: ArgumentSubstitutions<'a>,
     call_path: &'a crate::resource::ExpandedCompositionCallPath,
+    argument_placeholders: HashMap<String, ResolvedArgument<RelativeBindingName>>,
 }
 
 impl ModuleScopeResolver<'_> {
@@ -1455,13 +1485,13 @@ impl ModuleScopeResolver<'_> {
         &self,
         binding: &RelativeBindingName,
         context: &str,
-    ) -> Result<AbsoluteBindingAddress, ArgumentSubstitutionError> {
+    ) -> Result<Option<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
         if let Some(argument) = self.arguments.arguments.get(binding.as_str()) {
             return match argument.value_ref() {
                 StructuralOperandRef::Handle { handle, .. }
                     if handle.kind().is_dependency_target() =>
                 {
-                    Ok(handle.canonical_binding().clone())
+                    Ok(Some(handle.canonical_binding().clone()))
                 }
                 StructuralOperandRef::Handle { handle, .. } => Err(ArgumentSubstitutionError {
                     source_file: Some(self.arguments.caller_source_file.to_path_buf()),
@@ -1483,32 +1513,10 @@ impl ModuleScopeResolver<'_> {
                     ),
                     parse_error: None,
                 }),
-                StructuralOperandRef::Parameter { name, .. } => Err(ArgumentSubstitutionError {
-                    source_file: Some(self.arguments.caller_source_file.to_path_buf()),
-                    line: argument.source_line(self.arguments.default_line),
-                    message: format!("unresolved forwarded module parameter '{name}'"),
-                    parse_error: None,
-                }),
+                StructuralOperandRef::Parameter { .. } => Ok(None),
             };
         }
-        self.resolve_declared_binding(binding)
-    }
-
-    fn resolve_optional_dependency_binding(
-        &self,
-        binding: &RelativeBindingName,
-        context: &str,
-    ) -> Result<Option<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
-        if let Some(argument) = self.arguments.arguments.get(binding.as_str())
-            && let StructuralOperandRef::Parameter { name, access_base } = argument.value_ref()
-        {
-            // This is a valid but not-yet-instantiated forwarded dependency.
-            // There is no absolute address to emit until an outer call supplies
-            // the concrete handle.
-            let _pending_parameter = (name, access_base);
-            return Ok(None);
-        }
-        self.resolve_dependency_binding(binding, context).map(Some)
+        self.resolve_declared_binding(binding).map(Some)
     }
 
     fn resolve_value(
@@ -1516,33 +1524,10 @@ impl ModuleScopeResolver<'_> {
         value: &Value,
         position: ArgumentSubstitutionPosition,
     ) -> Result<ExpandedValue, ArgumentSubstitutionError> {
-        let placeholders = self
-            .arguments
-            .arguments
-            .keys()
-            .map(|name| {
-                let placeholder = Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
-                        name: name.clone(),
-                        source_line: self.arguments.default_line.into(),
-                        diagnostic_name: None,
-                    },
-                ));
-                (
-                    name.clone(),
-                    ResolvedArgument::<RelativeBindingName> {
-                        argument: ModuleArgument::new(placeholder),
-                        origin: ArgumentOrigin::Defaulted,
-                        caller_reference: None,
-                        forwarded_from_enclosing_parameter: false,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
         let normalized = substitute_arguments_with_position(
             value,
             ArgumentSubstitutions {
-                arguments: &placeholders,
+                arguments: &self.argument_placeholders,
                 default_line: self.arguments.default_line,
                 caller_source_file: self.arguments.caller_source_file,
                 binding_index: None,
@@ -1635,8 +1620,7 @@ fn resolve_module_binding_uses(
                             handle.clone().with_alias(record.authored.name.clone()),
                         )
                     }
-                    Some(StructuralOperandRef::Parameter { name, access_base }) => {
-                        let _forwarded_name = name;
+                    Some(StructuralOperandRef::Parameter { access_base, .. }) => {
                         BareBindingSource::Value {
                             value: std::sync::Arc::new(access_base.clone()),
                             declared_type: declared_type.clone(),
@@ -1654,8 +1638,7 @@ fn resolve_module_binding_uses(
                 .get(handle.canonical_binding().as_str())
                 .map(|argument| argument.value_ref())
             {
-                Some(StructuralOperandRef::Parameter { name, access_base }) => {
-                    let _forwarded_name = name;
+                Some(StructuralOperandRef::Parameter { access_base, .. }) => {
                     BareBindingSource::Value {
                         value: std::sync::Arc::new(access_base.clone()),
                         declared_type: None,
@@ -1964,7 +1947,7 @@ fn evaluate_expanded_module_functions(
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
-            functions,
+            functions: _,
             args,
             source_line,
         }) => {
@@ -1976,10 +1959,8 @@ fn evaluate_expanded_module_functions(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let line = source_line.get().unwrap_or(function.body.source_line);
-            crate::resolver::evaluate_module_resolved_user_function(
-                function, functions, &args, config, line,
-            )
-            .map_err(|error| function_substitution_error(error, line))?
+            crate::resolver::evaluate_module_resolved_user_function(function, &args, config, line)
+                .map_err(|error| function_substitution_error(error, line))?
         }
         Value::Deferred(DeferredValue::Access(access)) => access
             .rebuild_with_base(
@@ -2201,47 +2182,46 @@ fn expand_module_composition(
         .iter()
         .map(|(name, argument)| {
             let (declared_type, origin) = argument.metadata();
-            let resolved =
-                match argument.operand_ref() {
-                    StructuralOperandRef::Value(value) => {
-                        let parameter = match value {
-                            Value::Deferred(DeferredValue::Unknown(
-                                crate::resource::UnknownReason::ModuleArgument { name, .. },
-                            )) => Some(name.as_str()),
-                            Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                                Some(binding.as_str())
-                            }
-                            Value::Concrete(_)
-                            | Value::Deferred(
-                                DeferredValue::ResourceRef { .. }
-                                | DeferredValue::Coalesce { .. }
-                                | DeferredValue::Interpolation(_)
-                                | DeferredValue::FunctionCall { .. }
-                                | DeferredValue::ResolvedFunctionCall { .. }
-                                | DeferredValue::Unavailable { .. }
-                                | DeferredValue::Access(_)
-                                | DeferredValue::Secret(_)
-                                | DeferredValue::RedactedSecret { .. }
-                                | DeferredValue::Unknown(_),
-                            ) => None,
-                        };
-                        let forwarded_handle = parameter
-                            .and_then(|parameter| {
-                                resolver
-                                    .arguments
-                                    .arguments
-                                    .get(parameter)
-                                    .map(|argument| (parameter, argument))
-                            })
-                            .and_then(|(parameter, argument)| match argument.value_ref() {
-                                StructuralOperandRef::Handle {
-                                    handle,
-                                    access_base,
-                                } => Some((parameter, handle, access_base)),
-                                StructuralOperandRef::Value(_)
-                                | StructuralOperandRef::Parameter { .. } => None,
-                            });
-                        match forwarded_handle {
+            let resolved = match argument.operand_ref() {
+                StructuralOperandRef::Value(value) => {
+                    let parameter = match value {
+                        Value::Deferred(DeferredValue::Unknown(
+                            crate::resource::UnknownReason::ModuleArgument { name, .. },
+                        )) => Some(name.as_str()),
+                        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+                            Some(binding.as_str())
+                        }
+                        Value::Concrete(_)
+                        | Value::Deferred(
+                            DeferredValue::ResourceRef { .. }
+                            | DeferredValue::Coalesce { .. }
+                            | DeferredValue::Interpolation(_)
+                            | DeferredValue::FunctionCall { .. }
+                            | DeferredValue::ResolvedFunctionCall { .. }
+                            | DeferredValue::Unavailable { .. }
+                            | DeferredValue::Access(_)
+                            | DeferredValue::Secret(_)
+                            | DeferredValue::RedactedSecret { .. }
+                            | DeferredValue::Unknown(_),
+                        ) => None,
+                    };
+                    let forwarded_handle = parameter
+                        .and_then(|parameter| {
+                            resolver
+                                .arguments
+                                .arguments
+                                .get(parameter)
+                                .map(|argument| (parameter, argument))
+                        })
+                        .and_then(|(parameter, argument)| match argument.value_ref() {
+                            StructuralOperandRef::Handle {
+                                handle,
+                                access_base,
+                            } => Some((parameter, handle, access_base)),
+                            StructuralOperandRef::Value(_)
+                            | StructuralOperandRef::Parameter { .. } => None,
+                        });
+                    match forwarded_handle {
                         Some((parameter, handle, access_base)) => {
                             crate::resource::LiveCompositionArgument::from_handle_with_static_type(
                                 access_base.clone(),
@@ -2256,27 +2236,26 @@ fn expand_module_composition(
                             origin,
                         ),
                     }
-                    }
-                    StructuralOperandRef::Handle {
-                        handle,
-                        access_base,
-                    } => crate::resource::LiveCompositionArgument::from_handle_with_static_type(
-                        resolver
-                            .resolve_value(access_base, ArgumentSubstitutionPosition::AccessBase)?,
-                        declared_type.clone(),
-                        resolver.resolve_structural_handle(handle)?,
-                        origin,
-                    ),
-                    StructuralOperandRef::Parameter {
-                        name: parameter,
-                        access_base: _access_base,
-                    } => {
-                        let substituted = resolver
-                            .arguments
-                            .arguments
-                            .get(parameter)
-                            .ok_or_else(|| resolver.unknown_binding(parameter))?;
-                        match substituted.value_ref() {
+                }
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base,
+                } => crate::resource::LiveCompositionArgument::from_handle_with_static_type(
+                    resolver
+                        .resolve_value(access_base, ArgumentSubstitutionPosition::AccessBase)?,
+                    declared_type.clone(),
+                    resolver.resolve_structural_handle(handle)?,
+                    origin,
+                ),
+                StructuralOperandRef::Parameter {
+                    name: parameter, ..
+                } => {
+                    let substituted = resolver
+                        .arguments
+                        .arguments
+                        .get(parameter)
+                        .ok_or_else(|| resolver.unknown_binding(parameter))?;
+                    match substituted.value_ref() {
                         StructuralOperandRef::Value(value) => {
                             crate::resource::LiveCompositionArgument::from_value(
                                 value.clone(),
@@ -2287,26 +2266,25 @@ fn expand_module_composition(
                         StructuralOperandRef::Handle {
                             handle,
                             access_base,
-                        } => crate::resource::LiveCompositionArgument::from_handle_with_static_type(
-                            access_base.clone(),
-                            declared_type.clone(),
-                            handle.clone().with_alias(parameter),
-                            origin,
-                        ),
-                        StructuralOperandRef::Parameter {
-                            name: forwarded,
-                            access_base: forwarded_access_base,
                         } => {
-                            let _forwarded_parameter_name = forwarded;
-                            crate::resource::LiveCompositionArgument::from_value(
-                                forwarded_access_base.clone(),
+                            crate::resource::LiveCompositionArgument::from_handle_with_static_type(
+                                access_base.clone(),
                                 declared_type.clone(),
+                                handle.clone().with_alias(parameter),
                                 origin,
                             )
                         }
+                        StructuralOperandRef::Parameter {
+                            access_base: forwarded_access_base,
+                            ..
+                        } => crate::resource::LiveCompositionArgument::from_value(
+                            forwarded_access_base.clone(),
+                            declared_type.clone(),
+                            origin,
+                        ),
                     }
-                    }
-                };
+                }
+            };
             check_composition_argument_type(
                 name,
                 &resolved,
@@ -3096,6 +3074,8 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// instance prefixes already exist in state.
 pub fn reconcile_anonymous_module_instances(
     resources: &mut [crate::resource::Resource],
+    data_sources: &mut [crate::resource::DataSource],
+    wait_bindings: &mut [crate::parser::WaitBinding<AbsoluteBindingAddress>],
     compositions: &mut [crate::resource::LiveComposition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
@@ -3235,8 +3215,8 @@ pub fn reconcile_anonymous_module_instances(
         return;
     }
 
-    // Apply remaps: rewrite identity and `binding` for every resource whose
-    // instance prefix is in the remap table.
+    // Apply remaps to string identities first. Typed binding addresses move
+    // together in one exhaustive traversal below.
     for r in resources.iter_mut() {
         let Some(identity) = r.id.identity_str() else {
             continue;
@@ -3256,21 +3236,11 @@ pub fn reconcile_anonymous_module_instances(
                 &ResourceIdentity::new(old_prefix.clone()),
                 &ResourceIdentity::new(new_prefix.clone()),
             );
-            if let Some(ref binding) = r.binding
-                && let Some(remapped) = rewrite_binding_prefix(binding, &prefix_remap)
-            {
-                r.binding = Some(remapped);
-            }
             if let Some(crate::resource::ModuleSource::Module(module)) = &r.module_source {
                 let mut remapped_call_path = module.module_call_path().clone();
                 for call in remapped_call_path.calls_mut() {
                     if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
                         call.instance = rewritten;
-                    }
-                    if let Some(binding) = call.binding.as_ref()
-                        && let Some(rewritten) = rewrite_binding_prefix(binding, &prefix_remap)
-                    {
-                        call.binding = Some(rewritten);
                     }
                 }
                 r.module_source = Some(crate::resource::ModuleSource::expanded_module(
@@ -3285,34 +3255,47 @@ pub fn reconcile_anonymous_module_instances(
         }
     }
 
-    // After remapping resource names, every expanded surface that names the
-    // anonymous instance must move with it. That includes managed-resource
-    // references plus composition identities, bindings, arguments, and
-    // outputs retained for post-expansion validation and post-apply export
-    // resolution.
-    for r in resources.iter_mut() {
-        let mut replacements = Vec::new();
-        for (key, value) in r.attributes.iter() {
-            let rewritten = rewrite_ref_prefixes(value, &prefix_remap);
-            if rewritten != *value {
-                replacements.push((key.clone(), rewritten));
+    for data_source in data_sources.iter_mut() {
+        let Some(identity) = data_source.id.identity_str() else {
+            continue;
+        };
+        let Some((prefix, rest)) = split_instance_prefix(identity) else {
+            continue;
+        };
+        let Some((module_name, simhash)) = parse_synthetic_instance_prefix(prefix) else {
+            continue;
+        };
+        if let Some(&target) = prefix_remap.get(&(module_name.to_string(), simhash)) {
+            let old_prefix = prefix.to_string();
+            let new_prefix = format!("{}_{:016x}", module_name, target);
+            data_source
+                .id
+                .set_identity(ResourceIdentity::new(format!("{}.{}", new_prefix, rest)));
+            if let Some(crate::resource::ModuleSource::Module(module)) = &data_source.module_source
+            {
+                let mut remapped_call_path = module.module_call_path().clone();
+                for call in remapped_call_path.calls_mut() {
+                    if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
+                        call.instance = rewritten;
+                    }
+                }
+                data_source.module_source = Some(crate::resource::ModuleSource::expanded_module(
+                    module.name(),
+                    new_prefix.clone(),
+                    module
+                        .identity_scope()
+                        .remap_prefix(&old_prefix, &new_prefix),
+                    remapped_call_path,
+                ));
             }
-        }
-        for (key, new_value) in replacements {
-            r.set_attr(key, new_value);
         }
     }
 
-    for composition in compositions {
+    for composition in compositions.iter_mut() {
         if let Some(identity) = rewrite_name_prefix(composition.id.identity_str(), &prefix_remap) {
             composition.id = composition
                 .id
                 .instantiate_with_identity(ResourceIdentity::new(identity));
-        }
-        if let Some(binding) = composition.binding.as_ref()
-            && let Some(rewritten) = rewrite_binding_prefix(binding, &prefix_remap)
-        {
-            composition.binding = Some(rewritten);
         }
         if let Some(rewritten) = rewrite_name_prefix(&composition.instance, &prefix_remap) {
             composition.instance = rewritten;
@@ -3321,21 +3304,23 @@ pub fn reconcile_anonymous_module_instances(
             if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
                 call.instance = rewritten;
             }
-            if let Some(binding) = call.binding.as_ref()
-                && let Some(rewritten) = rewrite_binding_prefix(binding, &prefix_remap)
-            {
-                call.binding = Some(rewritten);
-            }
         }
+    }
 
-        for argument in composition.signature.arguments.values_mut() {
-            let rewritten = rewrite_ref_prefixes(argument.value(), &prefix_remap);
-            *argument = argument.with_value(rewritten);
-        }
-        for attribute in composition.signature.attributes.values_mut() {
-            let rewritten = rewrite_ref_prefixes(&attribute.to_value(), &prefix_remap);
-            *attribute = attribute.with_value(rewritten);
-        }
+    let mut remap_binding = |binding: &AbsoluteBindingAddress| {
+        rewrite_binding_prefix(binding, &prefix_remap).unwrap_or_else(|| binding.clone())
+    };
+    for resource in resources {
+        resource.map_absolute_bindings(&mut remap_binding);
+    }
+    for data_source in data_sources {
+        data_source.map_absolute_bindings(&mut remap_binding);
+    }
+    for wait_binding in wait_bindings {
+        wait_binding.map_absolute_bindings(&mut remap_binding);
+    }
+    for composition in compositions {
+        composition.map_absolute_bindings(&mut remap_binding);
     }
 }
 
@@ -3353,15 +3338,6 @@ fn rewrite_name_prefix(
         Some(rest) => format!("{new_prefix}.{rest}"),
         None => new_prefix,
     })
-}
-
-fn rewrite_ref_prefixes(
-    value: &crate::resource::Value,
-    remap: &std::collections::HashMap<(String, SimHash), SimHash>,
-) -> crate::resource::Value {
-    value
-        .clone()
-        .map_bindings(&mut |binding| rewrite_binding_prefix(&binding, remap).unwrap_or(binding))
 }
 
 fn rewrite_binding_prefix(
@@ -3419,6 +3395,8 @@ mod tests {
         reconcile_anonymous_module_instances(
             &mut resources,
             &mut [],
+            &mut [],
+            &mut [],
             &|_, _| vec![format!("{state_prefix}.leaf")],
             &crate::identifier::StateBlockClaims::empty(),
         );
@@ -3472,6 +3450,8 @@ mod tests {
 
         reconcile_anonymous_module_instances(
             &mut resources,
+            &mut [],
+            &mut [],
             &mut [],
             &|_, _| vec![format!("{state_prefix}.leaf")],
             &crate::identifier::StateBlockClaims::empty(),

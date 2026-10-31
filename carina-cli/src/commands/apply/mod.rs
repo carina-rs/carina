@@ -3119,9 +3119,9 @@ async fn run_apply_from_plan_with_observer_factory(
     );
     let (inspected_plan, parsed_backend) = match inspected_plan {
         InspectedPlanFile::Verified(plan) => {
-            let parsed_backend = loaded_current_config.ok().map(|config| {
-                carina_core::module_resolver::expand_root_directory_file(config.parsed).backend
-            });
+            let parsed_backend = loaded_current_config
+                .ok()
+                .map(|config| config.into_root_expanded().backend);
             (
                 ProviderBoundPlanFile::verified(plan, providers),
                 parsed_backend,

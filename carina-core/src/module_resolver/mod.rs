@@ -18,6 +18,12 @@
 //! - `resolver`: the `ModuleResolver` struct/impl driver and the
 //!   `resolve_modules*` top-level entry points.
 //! - `validation`: expression evaluator for `validate` and `require` blocks.
+//!
+//! Root binding expansion is public only through directory-backed entry
+//! points: `config_loader::LoadedConfig` for a loaded configuration root and
+//! `config_loader::DirectoryParseResult` for a directory parsed by editor
+//! diagnostics. Module directories validated standalone enter through the
+//! ordinary `resolve_modules*` APIs and intentionally behave as roots.
 
 mod error;
 mod expander;
@@ -36,12 +42,13 @@ pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
     RefCheckedModuleGraph, ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
     ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
-    ResolvedModuleConstraintStatus, expand_root_directory_file, resolve_modules,
+    ResolvedModuleConstraintStatus, prepare_root_export_validation, resolve_modules,
     resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
     resolve_modules_with_providerless_config, resolve_modules_with_providerless_diagnostics,
 };
 pub(crate) use resolver::{
-    resolve_upstream_modules_with_config, resolve_upstream_modules_with_providerless_config,
+    expand_root_directory_file, resolve_upstream_modules_with_config,
+    resolve_upstream_modules_with_providerless_config,
 };
 pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,

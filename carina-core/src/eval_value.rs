@@ -297,14 +297,10 @@ impl StructuralHandle<RelativeBindingName> {
             kind,
         }
     }
-}
 
-impl StructuralHandle<crate::resource::RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
-        resolve: &mut impl FnMut(
-            crate::resource::RelativeBindingName,
-        ) -> crate::resource::AbsoluteBindingAddress,
+        resolve: &mut impl FnMut(RelativeBindingName) -> crate::resource::AbsoluteBindingAddress,
     ) -> StructuralHandle<crate::resource::AbsoluteBindingAddress> {
         self.map_bindings(resolve)
     }

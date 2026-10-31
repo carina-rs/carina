@@ -2,7 +2,7 @@ use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::{Effect, UnresolvedSavedEffect};
-use carina_core::parser::ProviderConfig;
+use carina_core::parser::{ProviderConfig, ResolveExportBindingPhase};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,

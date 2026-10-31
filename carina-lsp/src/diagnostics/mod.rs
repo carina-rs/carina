@@ -493,16 +493,20 @@ impl DiagnosticEngine {
         let merged = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
-        if let Some(current_file) = current_parsed {
+        if let (Some(current_file), Some(current_file_path), Some(result)) =
+            (current_parsed, current_file_path, merged_result.as_ref())
+        {
             diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
                 doc,
                 current_file,
-                merged.unwrap_or(current_file),
+                current_file_path,
+                &result.directory,
             ));
             diagnostics.extend(self.loop_anonymous_identity_diagnostics(
                 doc,
                 current_file,
-                merged.unwrap_or(current_file),
+                current_file_path,
+                &result.directory,
                 base_path,
             ));
         }
@@ -902,15 +906,8 @@ impl DiagnosticEngine {
                     }
                 }
             }
-            let export_value_bindings = expanded_graph.map_or_else(
-                || {
-                    let expanded = carina_core::module_resolver::expand_root_directory_file(
-                        pre_expansion_input.clone(),
-                    );
-                    carina_core::binding_index::ResolvedBindings::for_expanded_validation(&expanded)
-                },
-                carina_core::binding_index::ResolvedBindings::for_expanded_validation,
-            );
+            let export_value_bindings = expanded_graph
+                .map(carina_core::binding_index::ResolvedBindings::for_expanded_validation);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
             let expanded_compositions = expanded_graph.map(|graph| graph.compositions.as_slice());
             let expanded_binding_index = expanded_graph.map(|graph| {
@@ -1831,7 +1828,8 @@ impl DiagnosticEngine {
                 parsed,
                 &semantic_view,
                 expanded_graph,
-                &export_value_bindings,
+                pre_expansion_input,
+                export_value_bindings.as_ref(),
             ));
 
             // Unused `let` detection. When a directory parse is available,

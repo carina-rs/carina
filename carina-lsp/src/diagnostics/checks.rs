@@ -594,12 +594,14 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         current_file: &ParsedFile,
-        directory: &ParsedFile,
+        current_file_path: &std::path::Path,
+        directory: &carina_core::config_loader::DirectoryParseResult,
     ) -> Vec<Diagnostic> {
-        let resolved_directory =
-            carina_core::module_resolver::expand_root_directory_file(directory.clone());
-        let resolved_current_file =
-            carina_core::module_resolver::expand_root_directory_file(current_file.clone());
+        let resolved_directory = directory.root_expanded();
+        let Some(resolved_current_file) = directory.root_expanded_semantic_file(current_file_path)
+        else {
+            return Vec::new();
+        };
         let conflicts =
             carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
                 &resolved_directory.resources,
@@ -671,13 +673,15 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         current_file: &ParsedFile,
-        directory: &ParsedFile,
+        current_file_path: &std::path::Path,
+        directory: &carina_core::config_loader::DirectoryParseResult,
         configuration_root: Option<&std::path::Path>,
     ) -> Vec<Diagnostic> {
-        let resolved_directory =
-            carina_core::module_resolver::expand_root_directory_file(directory.clone());
-        let resolved_current_file =
-            carina_core::module_resolver::expand_root_directory_file(current_file.clone());
+        let resolved_directory = directory.root_expanded();
+        let Some(resolved_current_file) = directory.root_expanded_semantic_file(current_file_path)
+        else {
+            return Vec::new();
+        };
         let mut resources = resolved_directory.resources;
         let providers = resolved_directory.providers;
         let canonical_resources = match carina_core::value::canonicalize_resources_with_schemas(
@@ -2511,38 +2515,46 @@ impl DiagnosticEngine {
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
         expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
-        value_bindings: &ResolvedBindings,
+        root_file: &ParsedFile,
+        expanded_value_bindings: Option<&ResolvedBindings>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         for param in &parsed.export_params {
-            let expanded_param = expanded
+            let expanded_param_from_graph = expanded
                 .and_then(|expanded| {
                     expanded.export_params.iter().find(|candidate| {
                         candidate.source_file() == param.source_file()
                             && candidate.source_span() == param.source_span()
                     })
                 })
-                .cloned()
-                .or_else(|| {
-                    let semantic_param = match semantic_view.authored_export_parameter(param) {
-                        Some(semantic_param) => semantic_param.clone(),
-                        None => {
-                            let value = semantic_view.export_value_for_typecheck(param)?;
-                            let mut fallback = param.clone();
-                            fallback.value = Some(value.clone());
-                            fallback
-                        }
-                    };
-                    let mut fallback_file = ParsedFile::default();
-                    fallback_file.export_params.push(semantic_param);
-                    carina_core::module_resolver::expand_root_directory_file(fallback_file)
-                        .export_params
-                        .into_iter()
-                        .next()
-                });
-            let Some(expanded_param) = expanded_param else {
-                continue;
+                .cloned();
+            let expanded_param;
+            let fallback_bindings;
+            let value_bindings = if let Some(from_graph) = expanded_param_from_graph {
+                let Some(bindings) = expanded_value_bindings else {
+                    continue;
+                };
+                expanded_param = from_graph;
+                bindings
+            } else {
+                let semantic_param = match semantic_view.authored_export_parameter(param) {
+                    Some(semantic_param) => semantic_param.clone(),
+                    None => {
+                        let Some(value) = semantic_view.export_value_for_typecheck(param) else {
+                            continue;
+                        };
+                        let mut fallback = param.clone();
+                        fallback.value = Some(value.clone());
+                        fallback
+                    }
+                };
+                (expanded_param, fallback_bindings) =
+                    carina_core::module_resolver::prepare_root_export_validation(
+                        semantic_param,
+                        root_file,
+                    );
+                &fallback_bindings
             };
             let message = match self.provider_context.loaded() {
                 Some(provider_context) => carina_core::validation::check_export_values_pre_apply(

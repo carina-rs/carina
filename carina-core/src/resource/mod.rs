@@ -37,12 +37,9 @@ use crate::parser::display_string_literal;
 use crate::provider::{AppliedIdentifier, InFlightCreate, UnknownCreateOutcome};
 use crate::schema::{AttributeType, DslMap, ResourceSchema, Shape, ShapeWalkBudget, TypeIdentity};
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use binding_address::absolute_binding_address_for_test;
-pub use binding_address::{
-    AbsoluteBindingAddress, BindingAddress, ParseAbsoluteBindingAddressError, RelativeBindingName,
-    canonicalize_persisted_absolute_binding_address, parse_cli_absolute_binding_address,
-};
+pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
@@ -63,7 +60,8 @@ pub(crate) use loop_origin::{LegacyLoopAddress, LoopModulePrefixOrigin};
 /// The root adds no textual prefix, but making it explicit keeps root and
 /// module resources on the same absolute-address side of the phase boundary.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RootScope {
+#[doc(hidden)]
+pub struct RootScope {
     _private: (),
 }
 
@@ -1292,6 +1290,27 @@ impl AccessPath<RelativeBindingName> {
         segments: Vec<PathSegment>,
     ) -> Self {
         Self::from_binding(binding.into(), attribute, segments)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn resolve_root(self, scope: &RootScope) -> AccessPath<AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn resolve_root_for_test(self) -> AccessPath<AbsoluteBindingAddress> {
+        self.resolve_root(&RootScope::new())
+    }
+
+    pub fn resolve_module(self, scope: &ModuleInstanceScope) -> AccessPath<AbsoluteBindingAddress> {
+        self.resolve_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> AccessPath<AbsoluteBindingAddress> {
+        self.map_bindings(resolve)
     }
 }
 
@@ -4415,6 +4434,7 @@ impl Value<RelativeBindingName> {
 
     /// Resolve every authored binding carried anywhere in this value tree in
     /// the root scope.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn resolve_root(self, scope: &RootScope) -> Value<AbsoluteBindingAddress> {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
@@ -4435,6 +4455,15 @@ impl Value<RelativeBindingName> {
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
     ) -> Value<AbsoluteBindingAddress> {
         self.map_bindings(resolve)
+    }
+}
+
+impl Value<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        *self = self.clone().map_bindings(&mut |binding| map(&binding));
     }
 }
 
@@ -4543,28 +4572,6 @@ impl<B: BindingAddress> ConcreteValue<B> {
     }
 }
 
-impl AccessPath<RelativeBindingName> {
-    pub(crate) fn resolve_root(self, scope: &RootScope) -> AccessPath<AbsoluteBindingAddress> {
-        self.resolve_bindings(&mut |binding| scope.resolve(binding))
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn resolve_root_for_test(self) -> AccessPath<AbsoluteBindingAddress> {
-        self.resolve_root(&RootScope::new())
-    }
-
-    pub fn resolve_module(self, scope: &ModuleInstanceScope) -> AccessPath<AbsoluteBindingAddress> {
-        self.resolve_bindings(&mut |binding| scope.resolve(binding))
-    }
-
-    pub(crate) fn resolve_bindings(
-        self,
-        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> AccessPath<AbsoluteBindingAddress> {
-        self.map_bindings(resolve)
-    }
-}
-
 impl<B: BindingAddress> AccessPath<B> {
     fn map_bindings<T: BindingAddress>(self, map: &mut impl FnMut(B) -> T) -> AccessPath<T> {
         let Self {
@@ -4577,6 +4584,15 @@ impl<B: BindingAddress> AccessPath<B> {
             attribute,
             segments,
         }
+    }
+}
+
+impl AccessPath<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        *self = self.clone().map_bindings(&mut |binding| map(&binding));
     }
 }
 
@@ -4626,6 +4642,15 @@ impl<B: BindingAddress> StructuralOperand<B> {
                 access_base: access_base.map_bindings(map),
             },
         }
+    }
+}
+
+impl StructuralOperand<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        *self = self.clone().map_bindings(&mut |binding| map(&binding));
     }
 }
 
@@ -6596,6 +6621,25 @@ impl Directives<RelativeBindingName> {
     }
 }
 
+impl Directives<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            force_delete: _force_delete,
+            create_before_destroy: _create_before_destroy,
+            prevent_destroy: _prevent_destroy,
+            depends_on,
+            ignore_changes: _ignore_changes,
+            provider_instance: _provider_instance,
+        } = self;
+        for binding in depends_on {
+            *binding = map(binding);
+        }
+    }
+}
+
 impl<B: BindingAddress> Default for Directives<B> {
     fn default() -> Self {
         Self {
@@ -6952,6 +6996,21 @@ impl Hash for ModuleSource {
 }
 
 impl ModuleSource {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        match self {
+            Self::Root => {}
+            Self::Module(ModuleCallSource {
+                name: _name,
+                instance: _instance,
+                scope: _scope,
+                call_path,
+            }) => call_path.map_absolute_bindings(map),
+        }
+    }
+
     pub(crate) fn expanded_module(
         name: impl Into<String>,
         instance: impl Into<String>,
@@ -7124,6 +7183,7 @@ pub type AuthoredResource<S = ModuleSource> = Resource<S, RelativeBindingName>;
 pub type ExpandedResource<S = ModuleSource> = Resource<S, AbsoluteBindingAddress>;
 
 impl<S> Resource<S, RelativeBindingName> {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn resolve_root(self, scope: &RootScope) -> Resource<S, AbsoluteBindingAddress> {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
@@ -7183,6 +7243,41 @@ impl<S> Resource<S, RelativeBindingName> {
     pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
         self.dependency_bindings = deps.into_iter().map(RelativeBindingName::new).collect();
         self
+    }
+}
+
+impl Resource<ModuleSource, AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            id: _id,
+            attributes,
+            directives,
+            resolved_ignore_changes: _resolved_ignore_changes,
+            prefixes: _prefixes,
+            binding,
+            dependency_bindings,
+            module_source,
+            default_tag_keys: _default_tag_keys,
+            loop_provenance: _loop_provenance,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = self;
+        for value in attributes.values_mut() {
+            value.map_absolute_bindings(map);
+        }
+        directives.map_absolute_bindings(map);
+        if let Some(binding) = binding {
+            *binding = map(binding);
+        }
+        *dependency_bindings = std::mem::take(dependency_bindings)
+            .into_iter()
+            .map(|binding| map(&binding))
+            .collect();
+        if let Some(source) = module_source {
+            source.map_absolute_bindings(map);
+        }
     }
 }
 
@@ -7323,11 +7418,6 @@ impl<S, B: BindingAddress> Resource<S, B> {
 
     pub fn with_attribute(mut self, key: impl Into<String>, value: Value<B>) -> Self {
         self.attributes.insert(key.into(), value);
-        self
-    }
-
-    pub fn with_value_attributes(mut self, attrs: HashMap<String, Value<B>>) -> Self {
-        self.attributes = attrs.into_iter().collect();
         self
     }
 }

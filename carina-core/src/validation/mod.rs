@@ -730,20 +730,20 @@ fn declared_value_assignable_to_sink(
 
 fn plain_module_value_type(type_expr: &TypeExpr) -> bool {
     match type_expr {
-        TypeExpr::String => true,
-        TypeExpr::Bool => true,
-        TypeExpr::Int => true,
-        TypeExpr::Float => true,
-        TypeExpr::Duration => true,
-        TypeExpr::Simple(_name) => true,
-        TypeExpr::List(_element) => true,
-        TypeExpr::Map(_value) => true,
-        TypeExpr::SchemaType { owned: _owned } => true,
-        TypeExpr::Struct { fields: _fields } => true,
-        TypeExpr::Ref(_resource) => false,
-        TypeExpr::DottedUnresolved(_path) => false,
-        TypeExpr::StringLiteral(_value) => false,
-        TypeExpr::Union(_members) => false,
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Simple(_)
+        | TypeExpr::List(_)
+        | TypeExpr::Map(_)
+        | TypeExpr::SchemaType { owned: _ }
+        | TypeExpr::Struct { fields: _ } => true,
+        TypeExpr::Ref(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::StringLiteral(_)
+        | TypeExpr::Union(_) => false,
     }
 }
 

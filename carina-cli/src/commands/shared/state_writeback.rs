@@ -6928,7 +6928,9 @@ mod apply_state_save_tests {
 #[cfg(test)]
 mod export_writeback_tests {
     use super::*;
-    use carina_core::parser::{ExpandedInferredExportParam, InferredExportParam};
+    use carina_core::parser::{
+        ExpandedInferredExportParam, InferredExportParam, ResolveExportBindingPhase,
+    };
     use carina_core::resource::{
         AuthoredValue, ConcreteValue, DeferredValue, InterpolationPart, PartialReadMarker,
         PendingReRead, UnknownReason, Value,

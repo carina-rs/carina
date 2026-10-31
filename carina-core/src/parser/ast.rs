@@ -18,10 +18,10 @@ use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandle
 use crate::provider_source::ProviderSource;
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, DataSource, DeferredValue, Directives,
-    ForLoopElement, FunctionArgument, GraphNode, LeafNode, LiveComposition, ModuleInstanceScope,
-    ModuleSource, PathSegment, RelativeBindingName, Resource, ResourceId, ResourceIdentity,
-    RootScope, SavedModuleSource, StructuralOperand, StructuralOperandRef, UnboundLoopTemplate,
-    UnknownReason, Value,
+    ForLoopElement, FunctionArgument, LeafNode, LiveComposition, ModuleInstanceScope, ModuleSource,
+    PathSegment, RelativeBindingName, Resource, ResourceId, ResourceIdentity, RootScope,
+    SavedModuleSource, StructuralOperand, StructuralOperandRef, UnboundLoopTemplate, UnknownReason,
+    Value,
 };
 use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
@@ -1233,6 +1233,46 @@ impl ValidateExpr<RelativeBindingName> {
     }
 }
 
+impl ValidateExpr<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        match self {
+            Self::Bool(_value) => {}
+            Self::Int(_value) => {}
+            Self::Float(_value) => {}
+            Self::Duration(_value) => {}
+            Self::String(_value) => {}
+            Self::Var(_name) => {}
+            Self::Access {
+                argument: _argument,
+                path: _path,
+            } => {}
+            Self::BoundArgument {
+                argument: _argument,
+                operand: _operand,
+                value,
+            } => value.map_absolute_bindings(map),
+            Self::Compare { lhs, op: _op, rhs } => {
+                lhs.map_absolute_bindings(map);
+                rhs.map_absolute_bindings(map);
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.map_absolute_bindings(map);
+                right.map_absolute_bindings(map);
+            }
+            Self::Not(value) => value.map_absolute_bindings(map),
+            Self::FunctionCall { name: _name, args } => {
+                for argument in args {
+                    argument.map_absolute_bindings(map);
+                }
+            }
+            Self::Null => {}
+        }
+    }
+}
+
 /// A require block: `require <condition>, "error message"`
 /// Used for cross-argument constraints at the module top level.
 #[derive(Debug, Clone)]
@@ -2423,27 +2463,6 @@ impl<B: BindingAddress> ModuleCall<B> {
     }
 }
 
-#[cfg(test)]
-impl ModuleCall<RelativeBindingName> {
-    pub(crate) fn test(
-        module_name: impl Into<String>,
-        binding_name: Option<String>,
-        arguments: HashMap<String, ModuleArgument<RelativeBindingName>>,
-    ) -> Self {
-        let span = SourceSpan::dummy();
-        Self::from_authored_arguments_in_source(
-            module_name,
-            binding_name.map(RelativeBindingName::new),
-            span,
-            arguments
-                .into_iter()
-                .map(|(name, argument)| (name, AuthoredModuleArgument::new(argument, span, span)))
-                .collect(),
-            PathBuf::from("test.crn"),
-        )
-    }
-}
-
 /// Borrowed view of one parser-authored module-call argument.
 #[derive(Debug)]
 pub struct AuthoredArgumentRef<'a, B: BindingAddress = RelativeBindingName> {
@@ -2906,6 +2925,7 @@ pub struct BackendConfig<B: BindingAddress = RelativeBindingName> {
 }
 
 impl BackendConfig<RelativeBindingName> {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn resolve_root(self, scope: &RootScope) -> BackendConfig<AbsoluteBindingAddress> {
         let Self {
             backend_type,
@@ -2927,7 +2947,7 @@ impl BackendConfig<RelativeBindingName> {
         }
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn resolve_root_for_test(self) -> BackendConfig<AbsoluteBindingAddress> {
         self.resolve_root(&RootScope::new())
     }
@@ -3020,6 +3040,35 @@ pub struct WaitBinding<B: BindingAddress = RelativeBindingName> {
     pub line: usize,
 }
 
+impl WaitBinding<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            binding,
+            target,
+            until_raw: _until_raw,
+            until_predicate,
+            timeout_secs: _timeout_secs,
+            depends_on,
+            line: _line,
+        } = self;
+        *binding = map(binding);
+        *target = map(target);
+        let UntilPredicateAst {
+            root,
+            attribute_segments: _attribute_segments,
+            rhs,
+        } = until_predicate;
+        *root = map(root);
+        rhs.map_absolute_bindings(map);
+        for dependency in depends_on {
+            *dependency = map(dependency);
+        }
+    }
+}
+
 /// An export parameter as seen post-inference (#2360 stage 2).
 ///
 /// `static_type` retains whether the effective type came from an annotation or
@@ -3085,6 +3134,17 @@ pub trait ResolveExportBindingPhase:
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
     ) -> Self::Absolute;
+
+    /// Resolve a root-authored export expression into the expanded binding
+    /// phase used by validation and planning.
+    fn resolve_root(self, scope: &RootScope) -> Self::Absolute {
+        self.resolve_export_bindings(&mut |binding| scope.resolve(binding))
+    }
+
+    #[cfg(feature = "test-support")]
+    fn resolve_root_for_test(self) -> Self::Absolute {
+        self.resolve_root(&RootScope::new())
+    }
 }
 
 impl ResolveExportBindingPhase for ParsedExportParam<RelativeBindingName> {
@@ -3109,19 +3169,6 @@ impl ResolveExportBindingPhase for ParsedExportParam<RelativeBindingName> {
     }
 }
 
-impl ParsedExportParam<RelativeBindingName> {
-    /// Resolve this root-authored export expression into the uniform expanded
-    /// binding-address phase used by validation and planning.
-    pub(crate) fn resolve_root(self, scope: &RootScope) -> ExpandedParsedExportParam {
-        self.resolve_export_bindings(&mut |binding| scope.resolve(binding))
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn resolve_root_for_test(self) -> ExpandedParsedExportParam {
-        self.resolve_root(&RootScope::new())
-    }
-}
-
 impl ResolveExportBindingPhase for InferredExportParam<RelativeBindingName> {
     type Absolute = InferredExportParam<AbsoluteBindingAddress>;
 
@@ -3142,19 +3189,6 @@ impl ResolveExportBindingPhase for InferredExportParam<RelativeBindingName> {
     }
 }
 
-impl InferredExportParam<RelativeBindingName> {
-    /// Resolve this root-authored inferred export into the uniform expanded
-    /// binding-address phase used by validation and planning.
-    pub(crate) fn resolve_root(self, scope: &RootScope) -> ExpandedInferredExportParam {
-        self.resolve_export_bindings(&mut |binding| scope.resolve(binding))
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn resolve_root_for_test(self) -> ExpandedInferredExportParam {
-        self.resolve_root(&RootScope::new())
-    }
-}
-
 impl ModuleArgument<RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
@@ -3168,6 +3202,25 @@ impl ModuleArgument<RelativeBindingName> {
 }
 
 impl ModuleCall<RelativeBindingName> {
+    #[cfg(test)]
+    pub(crate) fn test(
+        module_name: impl Into<String>,
+        binding_name: Option<String>,
+        arguments: HashMap<String, ModuleArgument<RelativeBindingName>>,
+    ) -> Self {
+        let span = SourceSpan::dummy();
+        Self::from_authored_arguments_in_source(
+            module_name,
+            binding_name.map(RelativeBindingName::new),
+            span,
+            arguments
+                .into_iter()
+                .map(|(name, argument)| (name, AuthoredModuleArgument::new(argument, span, span)))
+                .collect(),
+            PathBuf::from("test.crn"),
+        )
+    }
+
     pub(crate) fn try_resolve_bindings<E>(
         self,
         resolve_binding: &mut impl FnMut(RelativeBindingName) -> Result<AbsoluteBindingAddress, E>,
@@ -4724,15 +4777,6 @@ impl<E> File<E, AbsoluteBindingAddress, ResolvedDeferredForPhase<AbsoluteBinding
 }
 
 impl<E> File<E, AbsoluteBindingAddress> {
-    /// Consume `self` and yield all concrete top-level graph nodes.
-    pub fn into_graph_nodes(self) -> impl Iterator<Item = GraphNode> {
-        self.resources
-            .into_iter()
-            .map(GraphNode::from)
-            .chain(self.compositions.into_iter().map(GraphNode::from))
-            .chain(self.data_sources.into_iter().map(GraphNode::from))
-    }
-
     /// Consume `self` and yield concrete leaf nodes only.
     pub fn into_leaf_nodes(self) -> impl Iterator<Item = LeafNode> {
         self.resources

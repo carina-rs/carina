@@ -1153,7 +1153,7 @@ mod tests {
     };
     use crate::resource::{
         AbsoluteBindingAddress, ConcreteValue, Directives, ExpandedResource as Resource,
-        LiveComposition, ResolvedResource, ResourceIdentity, RootScope, State, Value,
+        LiveComposition, ResolvedResource, RootScope, State, Value,
     };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -1469,7 +1469,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),
@@ -1580,7 +1580,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: managed_wait_target(cert_id.clone()),
             until: WaitPredicate::equals(
                 AttrPath::single("status"),

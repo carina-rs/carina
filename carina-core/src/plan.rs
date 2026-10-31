@@ -1392,7 +1392,7 @@ mod tests {
             "cert",
         ))));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("cert_issued"),
+            identity: crate::resource::absolute_binding_address_for_test("cert_issued"),
             target_id: crate::wait::ManagedWaitTarget::new(&resolved(Resource::new(
                 "acm.Certificate",
                 "cert",

@@ -669,7 +669,8 @@ async fn run_destroy_locked_owned(
         .iter()
         .map(|effect| {
             effect
-                .binding_name()
+                .binding_address()
+                .map(ToString::to_string)
                 .unwrap_or_else(|| effect.resource_id().identity_display().to_string())
         })
         .collect();
@@ -838,7 +839,10 @@ async fn run_destroy_locked_owned(
     let resource_info: Vec<(String, Effect)> = delete_effects
         .iter()
         .map(|effect| {
-            let binding = effect.binding_name().unwrap_or_else(|| {
+            let binding = effect
+                .binding_address()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
                 let id = effect.resource_id();
                 format!("{}:{}", id.resource_type, id.identity_display())
             });
@@ -3084,9 +3088,10 @@ mod tests {
             Some(&state_file),
             &HashSet::new(),
         ));
+        let child_binding = absolute_binding("child");
         let child_delete = effects
             .iter()
-            .find(|effect| effect.binding_name().as_deref() == Some("child"))
+            .find(|effect| effect.binding_address() == Some(&child_binding))
             .expect("child orphan must produce a Delete");
         assert!(matches!(
             child_delete,
@@ -3111,7 +3116,7 @@ mod tests {
         let depths = compute_delete_depths(effects.len(), &deletion_deps);
         let names = effects
             .iter()
-            .map(|effect| effect.binding_name().unwrap())
+            .map(|effect| effect.binding_address().unwrap().to_string())
             .collect::<Vec<_>>();
         let order = topological_delete_order(effects.len(), &deletion_deps, &depths, &names)
             .expect("orphan dependency graph must be acyclic");

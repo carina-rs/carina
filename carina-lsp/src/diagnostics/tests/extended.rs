@@ -5939,8 +5939,7 @@ let first = unrelated { }
 "#,
     );
     let parsed = doc.parsed().expect("fixture must parse");
-    let mut binding_input =
-        carina_core::module_resolver::expand_root_directory_file(parsed.clone());
+    let mut binding_input = parsed.clone().resolve_root_for_test();
 
     let mut source = composition("source", "missing-source-call");
     source.signature.attributes.insert(
@@ -13597,33 +13596,31 @@ let app = awscc.ec2.Vpc {
 #[test]
 fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
     let temp = tempfile::tempdir().unwrap();
-    let current_file = temp.path().join("main.crn");
-    let sibling_file = temp.path().join("defaults.crn");
-    let current_source = "tags = {\n\u{3000}\u{3000}managed_by = \"carina\"\n}";
-    let sibling_source =
-        "tags = {\n    Name = \"application\"\n    Environment = \"production\"\n}";
-    let merged_result = carina_core::config_loader::DirectoryParseResult {
-        parsed: carina_core::parser::ParsedFile::default(),
-        authored_bindings: carina_core::config_loader::AuthoredBindingView::parse_file_source(
-            "",
-            std::path::Path::new("test.crn"),
+    let current_source = "let current = mock.test.resource {\n    tags = {\n\u{3000}\u{3000}managed_by = \"carina\"\n    }\n}";
+    let parseable_current_source =
+        "let current = mock.test.resource {\n    tags = {\n  managed_by = \"carina\"\n    }\n}";
+    let sibling_source = "let defaults = mock.test.resource {\n    tags = {\n        Name = \"application\"\n        Environment = \"production\"\n    }\n}";
+    std::fs::write(temp.path().join("main.crn"), parseable_current_source).unwrap();
+    std::fs::write(temp.path().join("defaults.crn"), sibling_source).unwrap();
+    let mut merged_result =
+        carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            temp.path(),
             &carina_core::parser::ProviderContext::default(),
+            &std::collections::HashMap::new(),
         )
-        .unwrap(),
-        duplicate_declarations: Vec::new(),
-        source_files: vec![
-            (current_file, current_source.to_string()),
-            (sibling_file, sibling_source.to_string()),
-        ],
-        sole_backend_file: None,
-        semantic_files: Vec::new(),
-    };
+        .expect("directory fixture must parse");
+    let (_, parsed_source) = merged_result
+        .source_files
+        .iter_mut()
+        .find(|(path, _)| path.ends_with("main.crn"))
+        .expect("parsed directory retains main.crn source");
+    *parsed_source = current_source.to_string();
 
     let diagnostics =
         test_engine().check_mixed_tag_key_styles("main.crn", temp.path(), &merged_result);
 
     assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
-    assert_eq!(diagnostics[0].range.start.line, 1);
+    assert_eq!(diagnostics[0].range.start.line, 2);
     assert_eq!(diagnostics[0].range.start.character, 2);
     assert_eq!(diagnostics[0].range.end.character, 12);
 }
@@ -13748,6 +13745,43 @@ fn nested_forwarded_handle_remains_a_dependency_operand_in_lsp() {
             "a forwarded parameter is still pending handle classification: {diagnostics:#?}",
         );
     }
+}
+
+#[test]
+fn forwarded_module_parameter_is_pending_for_waits_in_lsp() {
+    let root = tempfile::tempdir().unwrap();
+    let outer = root.path().join("outer");
+    let inner = root.path().join("inner");
+    std::fs::create_dir(&outer).unwrap();
+    std::fs::create_dir(&inner).unwrap();
+    let outer_source = r#"arguments { dep: mock.test.resource }
+let inner_mod = use { source = "../inner" }
+let i = inner_mod { dep = dep }
+"#;
+    std::fs::write(outer.join("main.crn"), outer_source).unwrap();
+    std::fs::write(outer.join("extra.crn"), "let note = \"outer\"\n").unwrap();
+    std::fs::write(
+        inner.join("main.crn"),
+        "arguments { dep: mock.test.resource }\nlet r = mock.test.resource { name = \"inner\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        inner.join("waits.crn"),
+        "let dependency_wait = wait r { until = r.name == \"inner\" depends_on = [dep] }\n\
+         let target_wait = wait dep { until = dep.name == \"outer\" }\n",
+    )
+    .unwrap();
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), &outer, "main.crn", outer_source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic
+                .message
+                .contains("unresolved forwarded module parameter 'dep'")
+        }),
+        "LSP diagnostics must treat forwarded wait operands as pending, matching the CLI: {diagnostics:#?}",
+    );
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::detail_rows::DetailRow;
-use crate::effect::Effect;
+use crate::effect::{Effect, SchedulerKey};
 use crate::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, ReplaceDisplayInfo};
 use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, Value};
 use crate::value::{
@@ -83,8 +83,8 @@ pub fn deferred_for_verb<S>(
     let roots = template.root_bindings();
     if plan.effects().iter().any(|effect| {
         effect
-            .binding_name()
-            .is_some_and(|binding| roots.iter().any(|root| root.as_str() == binding))
+            .binding_address()
+            .is_some_and(|binding| roots.contains(binding))
     }) {
         "applies"
     } else {
@@ -200,7 +200,15 @@ where
                 let rl = effect
                     .as_resource_ref()
                     .expect("variant carries a resource");
-                let deps = effect.blocking_bindings().into_iter().collect();
+                let deps = effect
+                    .blocking_keys()
+                    .into_iter()
+                    .map(|key| match key {
+                        SchedulerKey::Binding(binding) => binding.to_string(),
+                        SchedulerKey::Resource(identity) => identity.to_string(),
+                        SchedulerKey::Loop(template) => template.scheduler_key().to_string(),
+                    })
+                    .collect();
                 (Some(rl), deps)
             }
             Effect::Delete {
@@ -257,7 +265,7 @@ where
                 target_id,
                 ..
             } => {
-                // Scheduling uses `Effect::blocking_bindings()` so
+                // Scheduling uses `Effect::blocking_keys()` so
                 // wait targets and explicit wait-block dependencies
                 // both block dispatch. The display tree intentionally
                 // uses only the target edge because it visualizes the
@@ -613,7 +621,7 @@ mod tests {
         Directives, ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
         ExpandedInterpolationPart as InterpolationPart, ExpandedUnknownReason as UnknownReason,
         ExpandedValue as Value, PathSegment, RelativeBindingName, ResolvedResource, Resource,
-        ResourceId, ResourceIdentity, RootScope, State, Subscript,
+        ResourceId, RootScope, State, Subscript,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
@@ -1036,7 +1044,9 @@ mod tests {
             template: Box::new(deferred),
         })));
         plan.add(Effect::Wait {
-            identity: ResourceIdentity::new("wait_validation_record_0"),
+            identity: crate::resource::absolute_binding_address_for_test(
+                "wait_validation_record_0",
+            ),
             target_id: crate::wait::ManagedWaitTarget::new(
                 &crate::resource::ResolvedResource::new(Resource::new(
                     "route53.Record",
