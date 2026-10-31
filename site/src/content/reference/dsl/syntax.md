@@ -172,7 +172,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-If the schema declares identity paths, Carina generates the resource's state identity from only those values; paths may name top-level attributes or nested struct fields. Other create-only values can force replacement without changing the address. A schema with no declared identity falls back to configured top-level create-only attributes. When the selected values are absent, identity is derived from the resource's other attributes; two such anonymous resources of the same type and provider route are rejected as ambiguous. Equal declared identity values are also rejected. Bind one with `let` to give it a distinct, stable identity.
+If the schema declares identity paths, Carina generates the resource's state identity from only those values; paths may name top-level attributes or nested struct fields. Other create-only values can force replacement without changing the address. Every declared identity value on an anonymous resource must be present and known at plan time. Missing, unknown, deferred, and apply-time-only reference values are errors; write the value or bind the resource with `let`. A concrete module argument is known at plan time. A schema with no declared identity falls back to configured top-level create-only attributes and, when none are configured, to the resource's other attributes. Multiple resources using that attribute-derived fallback are rejected as ambiguous. Equal declared identity values are also rejected.
 
 ### Named Resources (Let Bindings)
 

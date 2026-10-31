@@ -718,6 +718,27 @@ impl DiagnosticEngine {
         {
             for error in error.into_individual_errors() {
                 match error {
+                    carina_core::identifier::AnonymousIdentityError::IncompleteDeclaredIdentity(
+                        incomplete,
+                    ) => {
+                        let message = incomplete.to_string();
+                        for (resource, span) in
+                            top_level_anonymous_resources_with_spans(doc, current_file)
+                        {
+                            if !incomplete.includes(resource, &self.schemas) {
+                                continue;
+                            }
+                            let line = span.start_line.saturating_sub(1) as u32;
+                            let col = span.start_column.saturating_sub(1) as u32;
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                span.end_column.saturating_sub(1) as u32,
+                                DiagnosticSeverity::ERROR,
+                                message.clone(),
+                            ));
+                        }
+                    }
                     carina_core::identifier::AnonymousIdentityError::Loop(conflict) => {
                         if current_name != conflict.file() {
                             continue;

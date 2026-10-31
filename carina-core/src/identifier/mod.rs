@@ -157,22 +157,40 @@ pub enum AnonymousIdentityBasis {
     /// No stable schema attribute is set, so the identifier is derived from
     /// mutable user attributes.
     AttributeDerived,
+    /// The schema declares identity paths, but at least one value is absent or
+    /// is not concrete at plan time. Anonymous resources cannot derive an
+    /// address from this basis.
+    IncompleteDeclaredIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum StableAnonymousHashInputs {
-    /// The new rule: a schema with declared identity hashes only those paths.
-    DeclaredIdentity {
-        values: BTreeMap<IdentityPath, String>,
-        declared_path_count: usize,
-    },
+struct CompleteIdentityValues(BTreeMap<IdentityPath, String>);
+
+impl CompleteIdentityValues {
+    fn as_map(&self) -> &BTreeMap<IdentityPath, String> {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityValues {
+    Complete(CompleteIdentityValues),
+    Incomplete { missing_paths: Vec<IdentityPath> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnonymousIdentityInputs {
+    /// A schema with declared identity hashes only those paths. Completeness
+    /// is carried in the type so an incomplete set cannot reach the hash
+    /// function.
+    DeclaredIdentity(IdentityValues),
     /// The legacy rule, retained byte-for-byte for schemas without identity.
     CreateOnly(BTreeMap<String, String>),
 }
 
-impl StableAnonymousHashInputs {
+impl AnonymousIdentityInputs {
     fn is_declared_identity(&self) -> bool {
-        matches!(self, Self::DeclaredIdentity { .. })
+        matches!(self, Self::DeclaredIdentity(_))
     }
 }
 
@@ -226,35 +244,74 @@ fn value_at_identity_path_root<'a>(
     Some(value)
 }
 
+fn value_is_known_at_plan_time(value: &Value) -> bool {
+    match value {
+        Value::Concrete(ConcreteValue::List(values)) => {
+            values.iter().all(value_is_known_at_plan_time)
+        }
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            values.values().all(value_is_known_at_plan_time)
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::StringList(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Duration(_),
+        ) => true,
+        Value::Deferred(_) => false,
+    }
+}
+
+fn identity_hash_value<S>(resource: &Resource<S>, path: &IdentityPath) -> Option<String> {
+    if path.segments().len() == 1
+        && (resource.prefixes.contains_key(path.attribute_name())
+            || resource
+                .attributes
+                .contains_key(&format!("{}_prefix", path.attribute_name())))
+    {
+        return None;
+    }
+
+    value_at_identity_path(resource, path)
+        .filter(|value| value_is_known_at_plan_time(value))
+        .map(deterministic_value_string)
+}
+
 /// Return the immutable schema inputs that participate in an anonymous
 /// resource's standard identity hash.
 ///
 /// This is the single selection seam for the identity-only and legacy
-/// create-only rules. An unresolved top-level `<attribute>_prefix` is treated
-/// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
-/// [`Resource::prefixes`]. Nested identity paths read their value directly
-/// from the enclosing concrete struct.
-fn stable_anonymous_hash_inputs<S>(
+/// create-only rules. For the legacy create-only rule, an unresolved top-level
+/// `<attribute>_prefix` is treated identically to the same prefix after
+/// [`resolve_attr_prefixes`] moves it into [`Resource::prefixes`]. For declared
+/// identity, either prefix form is incomplete because the generated value is
+/// not known at plan time. Nested identity paths read their value directly from
+/// the enclosing concrete struct.
+fn anonymous_identity_inputs<S>(
     resource: &Resource<S>,
     schema: &ValidatedResourceSchema,
-) -> StableAnonymousHashInputs {
+) -> AnonymousIdentityInputs {
     if !schema.identity_paths().is_empty() {
-        let values = schema
-            .identity_paths()
-            .iter()
-            .filter_map(|path| {
-                let value = if path.segments().len() == 1 {
-                    top_level_stable_hash_value(resource, path.attribute_name())
-                } else {
-                    value_at_identity_path(resource, path).map(deterministic_value_string)
-                }?;
-                Some((path.clone(), value))
-            })
-            .collect();
-        StableAnonymousHashInputs::DeclaredIdentity {
-            values,
-            declared_path_count: schema.identity_paths().len(),
+        let mut values = BTreeMap::new();
+        let mut missing_paths = Vec::new();
+        for path in schema.identity_paths() {
+            match identity_hash_value(resource, path) {
+                Some(value) => {
+                    values.insert(path.clone(), value);
+                }
+                None => missing_paths.push(path.clone()),
+            }
         }
+        let values = if missing_paths.is_empty() {
+            IdentityValues::Complete(CompleteIdentityValues(values))
+        } else {
+            IdentityValues::Incomplete { missing_paths }
+        };
+        AnonymousIdentityInputs::DeclaredIdentity(values)
     } else {
         let values = schema
             .as_schema()
@@ -265,36 +322,22 @@ fn stable_anonymous_hash_inputs<S>(
                     .map(|value| (attribute.to_string(), value))
             })
             .collect();
-        StableAnonymousHashInputs::CreateOnly(values)
+        AnonymousIdentityInputs::CreateOnly(values)
     }
 }
 
-/// Central policy seam for the pending missing-declared-identity decision.
-///
-/// For now, exactly as with today's empty stable inputs, a declared identity
-/// with any missing path is attribute-derived. If the policy changes,
-/// hashing, classification, and migration must continue to call this one
-/// function.
-fn declared_identity_basis(all_paths_present: bool) -> AnonymousIdentityBasis {
-    if all_paths_present {
-        AnonymousIdentityBasis::Stable
-    } else {
-        AnonymousIdentityBasis::AttributeDerived
-    }
-}
-
-fn anonymous_identity_basis(inputs: &StableAnonymousHashInputs) -> AnonymousIdentityBasis {
+fn anonymous_identity_basis(inputs: &AnonymousIdentityInputs) -> AnonymousIdentityBasis {
     match inputs {
-        StableAnonymousHashInputs::DeclaredIdentity {
-            values,
-            declared_path_count,
-        } => declared_identity_basis(
-            *declared_path_count > 0 && values.len() == *declared_path_count,
-        ),
-        StableAnonymousHashInputs::CreateOnly(values) if !values.is_empty() => {
+        AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(_)) => {
             AnonymousIdentityBasis::Stable
         }
-        StableAnonymousHashInputs::CreateOnly(_) => AnonymousIdentityBasis::AttributeDerived,
+        AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete { .. }) => {
+            AnonymousIdentityBasis::IncompleteDeclaredIdentity
+        }
+        AnonymousIdentityInputs::CreateOnly(values) if !values.is_empty() => {
+            AnonymousIdentityBasis::Stable
+        }
+        AnonymousIdentityInputs::CreateOnly(_) => AnonymousIdentityBasis::AttributeDerived,
     }
 }
 
@@ -318,7 +361,7 @@ fn encode_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
 /// its first 32 bits for the existing eight-hex-character address suffix.
 fn hash_declared_identity_inputs(
     provider_identity: &BTreeMap<String, String>,
-    identity: &BTreeMap<IdentityPath, String>,
+    identity: &CompleteIdentityValues,
 ) -> u32 {
     let mut hasher = Sha256::new();
     encode_length_prefixed(&mut hasher, b"carina-anonymous-identity-v1");
@@ -327,8 +370,8 @@ fn hash_declared_identity_inputs(
         encode_length_prefixed(&mut hasher, key.as_bytes());
         encode_length_prefixed(&mut hasher, value.as_bytes());
     }
-    encode_count(&mut hasher, identity.len());
-    for (path, value) in identity {
+    encode_count(&mut hasher, identity.as_map().len());
+    for (path, value) in identity.as_map() {
         encode_count(&mut hasher, path.segments().len());
         for segment in path.segments() {
             match segment {
@@ -352,14 +395,14 @@ fn hash_declared_identity_inputs(
 ///
 /// Returns `None` when the resource has no schema, so its identity basis is
 /// unknown. Otherwise, the selected policy input values determine whether the
-/// basis is stable. A selected deferred value still has a deterministic value
-/// spelling and therefore remains a stable immutable input.
+/// basis is stable. Declared identity is incomplete when any selected value is
+/// absent or remains deferred at plan time.
 pub fn classify_anonymous_identity_basis<S>(
     resource: &Resource<S>,
     registry: &SchemaRegistry,
 ) -> Option<AnonymousIdentityBasis> {
     let schema = registry.get_for(resource)?;
-    Some(anonymous_identity_basis(&stable_anonymous_hash_inputs(
+    Some(anonymous_identity_basis(&anonymous_identity_inputs(
         resource,
         schema.schema(),
     )))
@@ -427,6 +470,102 @@ impl AnonymousResourceKind {
             format!("{}.{}", self.provider, self.resource_type)
         }
     }
+}
+
+/// An anonymous resource whose schema-declared identity cannot produce an
+/// address because one or more values are absent or unknown at plan time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteDeclaredIdentity {
+    kind: AnonymousResourceKind,
+    missing_paths: Vec<IdentityPath>,
+}
+
+impl IncompleteDeclaredIdentity {
+    /// Whether this typed failure describes the authored resource. Source-aware
+    /// adapters use this to attach the shared validate/plan message without
+    /// reconstructing identity completeness policy.
+    pub fn includes<S: AnonymousIdentityModuleSource>(
+        &self,
+        resource: &Resource<S>,
+        registry: &SchemaRegistry,
+    ) -> bool {
+        if resource.binding.is_some()
+            || resource.id.identity_str().is_some()
+            || AnonymousResourceKind::of(resource) != self.kind
+        {
+            return false;
+        }
+        let Some(schema) = registry.get_for(resource) else {
+            return false;
+        };
+        matches!(
+            anonymous_identity_inputs(resource, schema.schema()),
+            AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete {
+                missing_paths
+            }) if missing_paths == self.missing_paths
+        )
+    }
+
+    /// Identity paths whose values were absent or not known at plan time.
+    pub fn missing_paths(&self) -> &[IdentityPath] {
+        &self.missing_paths
+    }
+}
+
+impl std::fmt::Display for IncompleteDeclaredIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let paths = self
+            .missing_paths
+            .iter()
+            .map(|path| format!("'{path}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (value_noun, missing_verb, repair_noun) = if self.missing_paths.len() == 1 {
+            ("identity value", "is", "the identity value")
+        } else {
+            ("identity values", "are", "each identity value")
+        };
+        write!(
+            formatter,
+            "Anonymous resource of type '{}' cannot derive an address because {value_noun} \
+             {paths} {missing_verb} missing or not known at plan time. Write {repair_noun} or \
+             give the resource a name with `let`.",
+            self.kind.display_type(),
+        )
+    }
+}
+
+impl std::error::Error for IncompleteDeclaredIdentity {}
+
+/// Find every anonymous declaration group with incomplete schema-declared
+/// identity. Equal failures are grouped so CLI output is deterministic while
+/// source-aware callers can still attach the error to each declaration.
+pub fn check_incomplete_declared_identities<S: AnonymousIdentityModuleSource>(
+    resources: &[Resource<S>],
+    registry: &SchemaRegistry,
+) -> Vec<IncompleteDeclaredIdentity> {
+    let mut failures = BTreeSet::new();
+    for resource in resources {
+        if resource.binding.is_some() || resource.id.identity_str().is_some() {
+            continue;
+        }
+        let Some(schema) = registry.get_for(resource) else {
+            continue;
+        };
+        let AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete { missing_paths }) =
+            anonymous_identity_inputs(resource, schema.schema())
+        else {
+            continue;
+        };
+        failures.insert((AnonymousResourceKind::of(resource), missing_paths));
+    }
+    failures
+        .into_iter()
+        .map(|(kind, missing_paths)| IncompleteDeclaredIdentity {
+            kind,
+            missing_paths,
+        })
+        .collect()
 }
 
 /// A group of anonymous resources whose identities would all be derived from
@@ -614,6 +753,8 @@ impl std::error::Error for AnonymousResourceIdentifierCollision {}
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum AnonymousIdentityError {
     #[error(transparent)]
+    IncompleteDeclaredIdentity(Box<IncompleteDeclaredIdentity>),
+    #[error(transparent)]
     AttributeDerived(Box<AttributeDerivedAnonymousResourceConflict>),
     #[error(transparent)]
     Collision(#[from] AnonymousResourceIdentifierCollision),
@@ -733,6 +874,12 @@ pub fn compute_anonymous_identifiers_with_factories<S: AnonymousIdentityModuleSo
 impl From<AttributeDerivedAnonymousResourceConflict> for AnonymousIdentityError {
     fn from(error: AttributeDerivedAnonymousResourceConflict) -> Self {
         Self::AttributeDerived(Box::new(error))
+    }
+}
+
+impl From<IncompleteDeclaredIdentity> for AnonymousIdentityError {
+    fn from(error: IncompleteDeclaredIdentity) -> Self {
+        Self::IncompleteDeclaredIdentity(Box::new(error))
     }
 }
 
@@ -990,6 +1137,11 @@ pub(crate) fn identity_required_bindings(
                     .entry(AnonymousResourceKind::of(resource))
                     .or_default()
                     .push(resource);
+            }
+            Some(AnonymousIdentityBasis::IncompleteDeclaredIdentity) => {
+                if let Some(binding) = &resource.binding {
+                    required.insert(binding.clone());
+                }
             }
             Some(AnonymousIdentityBasis::Stable) => {}
         }
@@ -1935,6 +2087,11 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
 
     let mut module_collision_discovery = discover_loop_module_prefix_collisions(resources);
     let mut identity_errors = std::mem::take(&mut module_collision_discovery.plain_errors);
+    identity_errors.extend(
+        check_incomplete_declared_identities(resources, registry)
+            .into_iter()
+            .map(AnonymousIdentityError::from),
+    );
     let mut direct_conflict_sources = Vec::new();
 
     if conflict_policy.rejects_attribute_derived() {
@@ -1974,7 +2131,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
     }
 
     // First pass: compute identifiers and detect collisions.
-    let mut computed: Vec<(usize, String, StableAnonymousHashInputs)> = Vec::new();
+    let mut computed: Vec<(usize, String, AnonymousIdentityInputs)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
         if resource.id.identity_str().is_some() {
@@ -2006,36 +2163,42 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
             }
         }
 
-        let hash_values = stable_anonymous_hash_inputs(resource, schema.schema());
-        let use_simhash =
-            anonymous_identity_basis(&hash_values) == AnonymousIdentityBasis::AttributeDerived;
-
-        let hash_suffix = if use_simhash {
-            // Use SimHash for locality-sensitive hashing: similar inputs produce
-            // similar hashes, enabling Hamming distance reconciliation.
-            let simhash = simhash_from_identity_and_resource(&identity_values, resource);
-            AnonymousHashSuffix::SimHash(simhash)
-        } else {
-            let hash = match &hash_values {
-                StableAnonymousHashInputs::DeclaredIdentity { values, .. } => {
-                    hash_declared_identity_inputs(&identity_values, values)
+        let hash_values = anonymous_identity_inputs(resource, schema.schema());
+        let hash_suffix = match &hash_values {
+            AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) => {
+                AnonymousHashSuffix::Standard(hash_declared_identity_inputs(
+                    &identity_values,
+                    values,
+                ))
+            }
+            AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Incomplete { .. }) => {
+                // The typed error was collected above. There is deliberately
+                // no hash branch for incomplete identity values.
+                continue;
+            }
+            AnonymousIdentityInputs::CreateOnly(values) if values.is_empty() => {
+                // Use SimHash for locality-sensitive hashing: similar inputs
+                // produce similar hashes, enabling Hamming-distance
+                // reconciliation for the legacy no-identity rule.
+                AnonymousHashSuffix::SimHash(simhash_from_identity_and_resource(
+                    &identity_values,
+                    resource,
+                ))
+            }
+            AnonymousIdentityInputs::CreateOnly(values) => {
+                // Preserve the legacy create-only encoding exactly for
+                // resource types that declare no identity paths.
+                let mut hasher = std::hash::DefaultHasher::new();
+                for (key, value) in &identity_values {
+                    key.hash(&mut hasher);
+                    value.hash(&mut hasher);
                 }
-                StableAnonymousHashInputs::CreateOnly(values) => {
-                    // Preserve the legacy create-only encoding exactly for
-                    // resource types that declare no identity paths.
-                    let mut hasher = std::hash::DefaultHasher::new();
-                    for (key, value) in &identity_values {
-                        key.hash(&mut hasher);
-                        value.hash(&mut hasher);
-                    }
-                    for (key, value) in values {
-                        key.hash(&mut hasher);
-                        value.hash(&mut hasher);
-                    }
-                    (hasher.finish() & 0xFFFFFFFF) as u32
+                for (key, value) in values {
+                    key.hash(&mut hasher);
+                    value.hash(&mut hasher);
                 }
-            };
-            AnonymousHashSuffix::Standard(hash)
+                AnonymousHashSuffix::Standard((hasher.finish() & 0xFFFFFFFF) as u32)
+            }
         };
         let hash_str = hash_suffix.discriminator();
 
@@ -2098,19 +2261,17 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
         Vec<usize>,
     >::new();
     for (computed_index, (resource_index, _, inputs)) in computed.iter().enumerate() {
-        let StableAnonymousHashInputs::DeclaredIdentity { values, .. } = inputs else {
+        let AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) = inputs
+        else {
             continue;
         };
-        if anonymous_identity_basis(inputs) != AnonymousIdentityBasis::Stable {
-            continue;
-        }
         let resource = &resources[*resource_index];
         declared_identity_groups
             .entry((
                 resource.id.provider.clone(),
                 resource.id.resource_type.clone(),
                 resource.id.provider_instance.clone(),
-                values.clone(),
+                values.as_map().clone(),
             ))
             .or_default()
             .push(computed_index);
@@ -2544,10 +2705,7 @@ fn legacy_row_stable_identity_matches(
     if !schema.identity_paths().is_empty() {
         let desired_identity =
             DesiredIdentityValues::from_resource(candidate.resource, schema, find_state_by_binding);
-        if declared_identity_basis(desired_identity.is_complete(schema))
-            != AnonymousIdentityBasis::Stable
-            || state_entry.identity_values.values.is_empty()
-        {
+        if !desired_identity.is_complete(schema) || state_entry.identity_values.values.is_empty() {
             return Ok(None);
         }
         return Ok(Some(desired_identity.all_match(
@@ -3303,9 +3461,7 @@ pub fn reconcile_anonymous_identifiers(
                 find_state_by_binding,
             );
 
-            if declared_identity_basis(desired_identity.is_complete(validated_schema))
-                == AnonymousIdentityBasis::Stable
-            {
+            if desired_identity.is_complete(validated_schema) {
                 let matches = state_entries
                     .candidates()
                     .filter(|entry| entry.name() != resource_identity)

@@ -90,10 +90,11 @@ list is also create-only. When a schema declares no identity paths, Carina uses
 configured top-level create-only values as the compatibility fallback.
 
 Two anonymous resources of the same type and provider route cannot have equal
-declared identity values; use `let` to name at least one of them. If a declared
-identity value is absent, Carina currently uses the existing
-attribute-derived fallback. Multiple such resources of the same kind remain
-ambiguous and are rejected.
+declared identity values; use `let` to name at least one of them. Every declared
+identity value must also be present and known at plan time. An omitted value,
+an unknown or deferred value, or a reference whose result is known only after
+apply cannot produce an anonymous address. Write the identity value directly,
+pass a plan-time-known module argument, or give the resource a name with `let`.
 
 When a provider first adds identity declarations, an existing state row may
 still have the address produced by the older create-only rule. Carina matches

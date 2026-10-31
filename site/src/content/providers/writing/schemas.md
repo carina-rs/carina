@@ -116,7 +116,7 @@ equal to a bare name.
 What the attributes declare:
 
 - `create_only` means the API cannot change the value in place, so a change replaces the resource.
-- `identity` marks an immutable value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
+- `identity` marks an immutable value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Every value must be present and known at plan time; otherwise the user must write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
 - `with_default` gives the value the host assumes when the configuration leaves the attribute out.
 - `with_description` shows up in the editor and in the generated docs.
 
@@ -251,7 +251,11 @@ Every identity component must be declared. For example, a DNS record key needs
 the hosted zone, record name, and record type; marking only the name can make
 two different real-world records collide. Two anonymous resources on the same
 provider route with equal complete identity values are rejected. Give one a
-stable name with `let` when both objects are intentional.
+stable name with `let` when both objects are intentional. Identity declarations
+should select user inputs that can be concrete during planning: omitted values,
+unknowns, deferred expressions, generated prefixes, and references to
+provider-populated attributes cannot address an anonymous resource. A concrete
+module argument can.
 
 Enum values in the DSL follow the snake_case convention. When the API spells a value differently, map it with `dsl_aliases` (pairs of API value and DSL spelling) or with a `DslTransform` in `to_dsl`, such as `DslTransform::HyphenToUnderscore` for values like `us-east-1`.
 
