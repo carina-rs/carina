@@ -19,8 +19,9 @@ use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in
 use crate::resource::{
     AuthoredConcreteValue as ConcreteValue, AuthoredDataSource as DataSource,
     AuthoredDeferredValue as DeferredValue, AuthoredDirectives as Directives,
-    AuthoredResource as Resource, AuthoredValue as Value, LoopElementOrigin, LoopProvenance,
-    ParsedIgnorePath, ParsedIgnorePathSegment, ResourceId, ResourceIdentity,
+    AuthoredResource as Resource, AuthoredValue as Value, DiagnosticSourceLocations,
+    LoopElementOrigin, LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment, ResourceId,
+    ResourceIdentity,
 };
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -493,6 +494,7 @@ fn parse_directives(
                     });
                 }
                 let mut names = Vec::new();
+                let mut source_lines = Vec::new();
                 for element in list.into_inner() {
                     let element_line = element.line_col().0;
                     let eval = parse_expression_eval(element, ctx)?;
@@ -502,11 +504,14 @@ fn parse_directives(
                         element_line,
                         BindingNameUse::Dependency,
                     )?);
+                    source_lines.push(element_line);
                 }
                 directives.depends_on = names
                     .into_iter()
                     .map(crate::resource::RelativeBindingName::new)
                     .collect();
+                directives.depends_on_diagnostic_sources =
+                    DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }
             "provider" => {
                 let eval = parse_expression_eval(value_pair, ctx)?;

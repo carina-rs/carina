@@ -1991,6 +1991,7 @@ pub fn directives_to_protocol(directives: &Directives) -> protocol::Directives {
         create_before_destroy,
         prevent_destroy,
         depends_on: _depends_on,
+        depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
         // Host-only lifecycle metadata. Providers must never receive authored
         // ignore paths; the host resolves and enforces them around CRUD calls.
         ignore_changes: _ignore_changes,
@@ -2015,6 +2016,7 @@ pub fn protocol_to_directives(directives: &protocol::Directives) -> Directives {
         create_before_destroy: *create_before_destroy,
         prevent_destroy: *prevent_destroy,
         depends_on: Vec::new(),
+        depends_on_diagnostic_sources: Default::default(),
         ignore_changes: Vec::new(),
         provider_instance: None,
     }

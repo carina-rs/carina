@@ -4,9 +4,14 @@ let seed = mock.test.resource {
 
 let consumer = mock.test.resource {
   name    = "${label}-consumer"
-  comment = secret(local.attr)
+  comment = "${label}-updated"
 
   directives {
     depends_on = [seed, upstream]
   }
+}
+
+let after_ready = mock.test.resource {
+  name    = "${label}-after"
+  comment = consumer_ready.identifier
 }

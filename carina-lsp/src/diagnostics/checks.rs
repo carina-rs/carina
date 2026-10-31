@@ -1441,11 +1441,10 @@ impl DiagnosticEngine {
             }
         };
         if !matches!(module_resolution, MergedModuleResolution::Expanded { .. }) {
-            let _ = carina_core::parser::resolve_provider_unresolved_attributes(
-                &mut result.parsed,
-                &self.provider_context,
-            );
-            let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
+            let _ = result
+                .parsed
+                .resolve_provider_unresolved_attributes(&self.provider_context);
+            let _ = result.parsed.finalize_provider_configs();
         }
         Ok(MergedParseResult {
             directory: result,
@@ -1768,7 +1767,7 @@ impl DiagnosticEngine {
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
         }
-        let mut merged = carina_core::config_loader::parse_directory_with_overrides(
+        let merged = carina_core::config_loader::parse_directory_with_overrides(
             base_path,
             &self.provider_context,
             &overrides,
@@ -1802,6 +1801,7 @@ impl DiagnosticEngine {
             return carina_core::parser::finalize_provider_configs(&mut resolved).err();
         }
         {
+            let mut merged = merged.into_parsed();
             // The primary diagnostics pass owns the module error. A provider
             // value that reads a failed module's output cannot be finalized
             // soundly, but unrelated provider values still can (and must) be
@@ -1823,14 +1823,14 @@ impl DiagnosticEngine {
                     )
                 });
             }
+            if let Err(e) = carina_core::parser::resolve_provider_unresolved_attributes(
+                &mut merged,
+                &self.provider_context,
+            ) {
+                return Some(e);
+            }
+            return carina_core::parser::finalize_provider_configs(&mut merged).err();
         }
-        if let Err(e) = carina_core::parser::resolve_provider_unresolved_attributes(
-            &mut merged,
-            &self.provider_context,
-        ) {
-            return Some(e);
-        }
-        carina_core::parser::finalize_provider_configs(&mut merged).err()
     }
 
     /// Collect every binding name declared anywhere in `base_path` by
@@ -2515,7 +2515,7 @@ impl DiagnosticEngine {
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
         expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
-        root_file: &ParsedFile,
+        root_directory: Option<&carina_core::config_loader::ParsedRootDirectory>,
         expanded_value_bindings: Option<&ResolvedBindings>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -2538,6 +2538,9 @@ impl DiagnosticEngine {
                 expanded_param = from_graph;
                 bindings
             } else {
+                let Some(root_directory) = root_directory else {
+                    continue;
+                };
                 let semantic_param = match semantic_view.authored_export_parameter(param) {
                     Some(semantic_param) => semantic_param.clone(),
                     None => {
@@ -2552,7 +2555,7 @@ impl DiagnosticEngine {
                 (expanded_param, fallback_bindings) =
                     carina_core::module_resolver::prepare_root_export_validation(
                         semantic_param,
-                        root_file,
+                        root_directory,
                     );
                 &fallback_bindings
             };

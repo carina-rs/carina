@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+use crate::config_loader::{ParsedRootDirectory, RootDirectoryParse};
 use crate::parser::{
     LoadedProviderContext, ModuleCallDiagnosticSource, ModuleResolvedFile,
     ModuleResolvedParsedFile, ParseError, ParsedDeferredForPhase, ParsedFile, ProviderContext,
@@ -655,7 +656,7 @@ mod diagnostic_status_tests {
 /// ).unwrap();
 /// checked.expand(&mut second).unwrap();
 /// ```
-pub struct RefCheckedModuleGraph<'parsed, 'cfg, E> {
+pub(crate) struct RefCheckedModuleGraph<'parsed, 'cfg, E> {
     parsed: &'parsed mut crate::parser::File<E>,
     resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     root_witness: RefCheckWitness,
@@ -1175,7 +1176,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingN
 {
     /// Load the complete reachable module graph and validate every reference
     /// boundary before making expansion available.
-    pub fn check(
+    fn check(
         parsed: &'parsed mut crate::parser::File<E>,
         base_dir: &Path,
         config: &'cfg LoadedProviderContext,
@@ -1187,7 +1188,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingN
 
     /// Bootstrap/editor variant that retains structural value checks while
     /// skipping provider-owned custom-type leaves.
-    pub fn check_providerless(
+    fn check_providerless(
         parsed: &'parsed mut crate::parser::File<E>,
         base_dir: &Path,
         config: &'cfg ProviderContext,
@@ -1212,7 +1213,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingN
     }
 
     /// Consume the checked graph and expand its root configuration.
-    pub fn expand(
+    fn expand(
         mut self,
     ) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError>
     where
@@ -1318,11 +1319,11 @@ fn root_expansion_scope() -> RootScope {
 
 /// Cross the root-directory binding phase without loading module calls.
 ///
-/// This primitive is crate-private so an arbitrary hand-built `ParsedFile`
-/// cannot cross the phase boundary. Public callers enter through a
-/// loader-owned `LoadedConfig` or `DirectoryParseResult`; the one editor
-/// operation that needs only an export parameter uses
-/// [`prepare_root_export_validation`] instead.
+/// This raw-file primitive is crate-private. Public module-resolution entry
+/// points require a [`RootDirectoryParse`], whose private field can be
+/// produced only by the directory loader/parser (or the explicitly gated test
+/// constructor). Directory-result methods use the same private primitive for
+/// editor-only root views of their loader-owned semantic files.
 pub(crate) fn expand_root_directory_file<E: ResolveExportBindingPhase>(
     parsed: crate::parser::File<E>,
 ) -> crate::parser::File<E::Absolute, AbsoluteBindingAddress> {
@@ -1337,20 +1338,33 @@ pub(crate) fn expand_root_directory_file<E: ResolveExportBindingPhase>(
 /// root expansion.
 pub fn prepare_root_export_validation(
     parameter: crate::parser::ParsedExportParam,
-    parsed: &ParsedFile,
+    directory: &ParsedRootDirectory,
 ) -> (
     crate::parser::ExpandedParsedExportParam,
     crate::binding_index::ResolvedBindings,
 ) {
     let root = root_expansion_scope();
     let parameter = parameter.resolve_root(&root);
-    let bindings = crate::binding_index::ResolvedBindings::for_root_validation(parsed, &root);
+    let bindings =
+        crate::binding_index::ResolvedBindings::for_root_validation(directory.parsed(), &root);
     (parameter, bindings)
 }
 
-/// Resolve all modules in a parsed file
+/// Resolve all modules in a directory parser result.
+///
+/// A caller-built file is not evidence that its bindings belong to the root
+/// directory being expanded:
+///
+/// ```compile_fail
+/// use std::path::Path;
+/// use carina_core::module_resolver::resolve_modules;
+/// use carina_core::parser::ParsedFile;
+///
+/// let parsed = ParsedFile::default();
+/// let _ = resolve_modules(parsed, Path::new("."));
+/// ```
 pub fn resolve_modules(
-    parsed: crate::parser::ParsedFile,
+    parsed: ParsedRootDirectory,
     base_dir: &Path,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     resolve_modules_with_providerless_config(
@@ -1363,7 +1377,7 @@ pub fn resolve_modules(
 
 /// Resolve all modules without a loaded provider catalog.
 pub fn resolve_modules_providerless(
-    parsed: crate::parser::ParsedFile,
+    parsed: ParsedRootDirectory,
     base_dir: &Path,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     resolve_modules(parsed, base_dir)
@@ -1375,11 +1389,12 @@ pub fn resolve_modules_providerless(
 /// `ParsedFile` (parser phase) or `InferredFile` (post-loader phase) —
 /// the resolver only touches `uses`, `module_calls`, and `resources`.
 pub fn resolve_modules_with_config<E: ResolveExportBindingPhase>(
-    mut parsed: crate::parser::File<E>,
+    parsed: RootDirectoryParse<E>,
     base_dir: &Path,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let mut parsed = parsed.into_parsed();
     let expanded =
         RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
     finalize_deferred_for_bodies(expanded)
@@ -1388,11 +1403,12 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase>(
 /// Resolve modules in a bootstrap/editor context. Every value check is
 /// classified first, and provider-owned schema types are left unchecked.
 pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase>(
-    mut parsed: crate::parser::File<E>,
+    parsed: RootDirectoryParse<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let mut parsed = parsed.into_parsed();
     let expanded =
         RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
             .expand()?;
@@ -1433,7 +1449,7 @@ pub(crate) fn resolve_upstream_modules_with_config<E: ResolveExportBindingPhase>
 /// Residuals returned from this seam have those call-owned errors removed,
 /// including individual covered members of a mixed reference-type failure.
 pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase + Clone>(
-    parsed: &crate::parser::File<E>,
+    parsed: &RootDirectoryParse<E>,
     base_dir: &Path,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
@@ -1441,7 +1457,7 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase + Clone>(
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
     resolve_modules_with_diagnostics_and_resolver(
-        parsed,
+        parsed.parsed(),
         resolver,
         config.as_provider_context(),
         covered_findings,
@@ -1451,14 +1467,19 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase + Clone>(
 /// Editor/bootstrap diagnostic expansion with provider-owned value checks
 /// unavailable by construction.
 pub fn resolve_modules_with_providerless_diagnostics<E: ResolveExportBindingPhase + Clone>(
-    parsed: &crate::parser::File<E>,
+    parsed: &RootDirectoryParse<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let resolver = ModuleResolver::with_providerless_constraint_reports(base_dir, config, schemas);
-    resolve_modules_with_diagnostics_and_resolver(parsed, resolver, config, covered_findings)
+    resolve_modules_with_diagnostics_and_resolver(
+        parsed.parsed(),
+        resolver,
+        config,
+        covered_findings,
+    )
 }
 
 fn resolve_modules_with_diagnostics_and_resolver<E: ResolveExportBindingPhase + Clone>(

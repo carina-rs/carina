@@ -178,6 +178,31 @@ impl StructuralHandleMetadata<RelativeBindingName> {
     }
 }
 
+impl StructuralHandleMetadata<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        match self {
+            Self::Handle { access_base } => {
+                if let Some(access_base) = access_base {
+                    access_base.map_absolute_bindings(map);
+                }
+            }
+            Self::List(items) => {
+                for item in items.iter_mut().flatten() {
+                    item.map_absolute_bindings(map);
+                }
+            }
+            Self::Map(entries) => {
+                for metadata in entries.values_mut() {
+                    metadata.map_absolute_bindings(map);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StructuralReference<B: BindingAddress> {
     Addressable(B),
@@ -303,6 +328,15 @@ impl StructuralHandle<RelativeBindingName> {
         resolve: &mut impl FnMut(RelativeBindingName) -> crate::resource::AbsoluteBindingAddress,
     ) -> StructuralHandle<crate::resource::AbsoluteBindingAddress> {
         self.map_bindings(resolve)
+    }
+}
+
+impl StructuralHandle<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        *self = self.clone().map_bindings(&mut |binding| map(&binding));
     }
 }
 

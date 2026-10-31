@@ -232,12 +232,13 @@ impl<E> CanonicalResourcePair<E> {
         &mut self,
         find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
         claims: &carina_core::identifier::StateBlockClaims,
-    ) {
+    ) where
+        E: carina_core::parser::ExportParamLike<
+                Binding = carina_core::resource::AbsoluteBindingAddress,
+            >,
+    {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut self.parsed.resources,
-            &mut self.parsed.data_sources,
-            &mut self.parsed.wait_bindings,
-            &mut self.parsed.compositions,
+            &mut self.parsed,
             find_state_names_by_type,
             claims,
         );

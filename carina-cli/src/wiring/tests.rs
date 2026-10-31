@@ -520,7 +520,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
-    let parsed = resolve_file_for_test(loaded.parsed);
+    let parsed = resolve_file_for_test(loaded.parsed.into_parsed());
     let provider_configs = resolved_provider_configs(&parsed);
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         vec![Box::new(RawEnumStateFactory)],
@@ -615,7 +615,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
-    let parsed = resolve_file_for_test(loaded.parsed);
+    let parsed = resolve_file_for_test(loaded.parsed.into_parsed());
     let provider_configs = resolved_provider_configs(&parsed);
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         vec![Box::new(RawEnumStateFactory)],
@@ -822,7 +822,7 @@ let first = test.thing {
             &SchemaRegistry::new(),
         )
         .expect("load multi-file fixture");
-        let parsed = resolve_file_for_test(loaded.parsed);
+        let parsed = resolve_file_for_test(loaded.parsed.into_parsed());
         let provider_configs = resolved_provider_configs(&parsed);
         let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
             vec![Box::new(RawEnumStateFactory)],
@@ -935,7 +935,7 @@ let direct = awscc.ec2.Route {
             &SchemaRegistry::new(),
         )
         .expect("load multi-file fixture");
-        let parsed = resolve_file_for_test(loaded.parsed);
+        let parsed = resolve_file_for_test(loaded.parsed.into_parsed());
         let provider_configs = resolved_provider_configs(&parsed);
         let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
             vec![Box::new(AssociationCreateOnlyFactory)],
@@ -1047,7 +1047,7 @@ query {}
     let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         &root_dir,
         &config,
         &SchemaRegistry::new(),
@@ -1136,7 +1136,7 @@ outer {{}}
     let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         &root_dir,
         &config,
         &SchemaRegistry::new(),
@@ -1209,7 +1209,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     };
 
     let evaluated_error = match incomplete_load().validate_evaluated_config(
-        invalid_config(),
+        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
         Path::new("."),
         true,
         &[],
@@ -1219,7 +1219,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     };
     let unresolved = carina_core::parser::ParsedFile::default();
     let pair_error = match incomplete_load().validate_config_pair(
-        invalid_config(),
+        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         Path::new("."),
         true,
@@ -1264,8 +1264,13 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let error = match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[])
-    {
+    let error = match providers.validate_config_pair(
+        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+        unresolved,
+        Path::new("."),
+        false,
+        &[],
+    ) {
         Ok(_) => panic!("plan-style validation must reject both independent errors"),
         Err(error) => error,
     };
@@ -1454,6 +1459,7 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
     );
 
     let parsed = carina_core::parser::InferredFile::default();
+    let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
     let report = providers.validation_report(&parsed, base.path(), true, &[]);
 
     assert!(report.errors().is_empty());
@@ -1666,7 +1672,7 @@ fn parse(
     let parsed =
         carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)?;
     Ok(carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )?)
 }
@@ -1722,7 +1728,7 @@ fn resolve_file_for_test<E: carina_core::parser::ResolveExportBindingPhase>(
     parsed: carina_core::parser::File<E>,
 ) -> carina_core::parser::ModuleResolvedFile<E::Absolute> {
     carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
         std::path::Path::new("."),
         &carina_core::parser::ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
@@ -6545,7 +6551,8 @@ fn legacy_loop_detector_resolves_ref_only_ambiguity_through_state_view() {
             &SchemaRegistry::new(),
         )
         .expect("load multi-file fixture")
-        .parsed,
+        .parsed
+        .into_parsed(),
     );
     let providers = resolved_provider_configs(&parsed);
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);

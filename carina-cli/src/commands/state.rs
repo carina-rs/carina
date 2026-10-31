@@ -2707,7 +2707,7 @@ mod tests {
         base_dir: &Path,
     ) -> carina_core::parser::ModuleResolvedFile<E::Absolute> {
         carina_core::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
             base_dir,
             &ProviderContext::default(),
             &SchemaRegistry::new(),
@@ -3052,7 +3052,12 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &downstream, true, &[])
+            .validate_evaluated_config(
+                carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                &downstream,
+                true,
+                &[],
+            )
             .unwrap();
 
         run_state_refresh_locked(
@@ -3074,7 +3079,12 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[])
+            .validate_evaluated_config(
+                carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                &base_dir,
+                true,
+                &[],
+            )
             .unwrap();
 
         run_state_refresh_locked(
@@ -3096,7 +3106,12 @@ mod tests {
         let backend = non_empty_refresh_backend("mock");
         let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
-            .validate_evaluated_config(parsed, &base_dir, true, &[])
+            .validate_evaluated_config(
+                carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+                &base_dir,
+                true,
+                &[],
+            )
             .unwrap();
 
         run_state_refresh_locked(
@@ -4346,7 +4361,7 @@ mod tests {
         )
         .expect("test config should parse");
         let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
         .expect("state-refresh fixture crosses module resolution");
@@ -5710,6 +5725,7 @@ mod tests {
             create_before_destroy: true,
             prevent_destroy: true,
             depends_on: vec![absolute_binding("security_group")],
+            depends_on_diagnostic_sources: Default::default(),
             provider_instance: Some("west".to_string()),
             ignore_changes: Vec::new(),
         }
@@ -5794,6 +5810,7 @@ mod tests {
                 create_before_destroy: true,
                 prevent_destroy: true,
                 depends_on: vec![absolute_binding("security_group")],
+                depends_on_diagnostic_sources: Default::default(),
                 provider_instance: Some("west".to_string()),
                 ignore_changes: Vec::new(),
             }

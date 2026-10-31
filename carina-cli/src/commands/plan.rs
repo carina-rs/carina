@@ -5617,7 +5617,7 @@ fn resolve_file_for_test<E: carina_core::parser::ResolveExportBindingPhase>(
     base_dir: &Path,
 ) -> carina_core::parser::ModuleResolvedFile<E::Absolute> {
     carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
         base_dir,
         &ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
@@ -6350,6 +6350,7 @@ exports { region: String = "ap-northeast-1" }"#,
         )
         .expect("load config")
         .parsed
+        .into_parsed()
         .resolve_root_for_test();
         let mut guard = seed_cycle_guard(&dir_b);
         let bindings = load_upstream_states(

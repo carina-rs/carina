@@ -29,8 +29,11 @@ fn resolve_remote_bindings(
 }
 
 fn cross_deferred_for_resolution_seam(parsed: ParsedFile) -> ModuleResolvedParsedFile {
-    crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-        .expect("deferred fixture crosses the module-resolution seam")
+    crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("deferred fixture crosses the module-resolution seam")
 }
 
 fn known(type_expr: TypeExpr) -> TypeExpr {
@@ -3183,6 +3186,7 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
 
     let parsed = parse_directory(tmp.path(), &ProviderContext::default())
         .unwrap()
+        .into_parsed()
         .resolve_root(&crate::resource::RootScope::new());
     let resolved = resolve_provider_attributes_with_remote(
         &parsed,
@@ -3220,6 +3224,7 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
 
     let parsed = parse_directory(tmp.path(), &ProviderContext::default())
         .unwrap()
+        .into_parsed()
         .resolve_root(&crate::resource::RootScope::new());
     let error = resolve_provider_attributes_with_remote(
         &parsed,
@@ -11304,9 +11309,11 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
         errs.as_slice(),
         [ParseError::UndefinedDeferredIterable { name, .. }] if name == "org"
     ));
-    let err =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect_err("finalization must reject the bare undefined iterable");
+    let err = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect_err("finalization must reject the bare undefined iterable");
     let crate::module_resolver::ModuleError::Parse(parse_error) = err.root_cause() else {
         panic!("expected a typed parse error, got {err:?}");
     };

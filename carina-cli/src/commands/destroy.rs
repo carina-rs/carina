@@ -1338,6 +1338,7 @@ async fn run_destroy_locked(
             .await;
         }
     };
+    let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
     let validated_config = match providers.validate_evaluated_config(parsed, base_dir, true, &[]) {
         Ok(validated_config) => validated_config,
         Err(error) => {
@@ -2190,7 +2191,7 @@ mod tests {
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
             &downstream,
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),

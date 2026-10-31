@@ -283,7 +283,9 @@ impl ProviderBoundPlanFile {
             InspectedPlanFile::NeedsSecretVerification(plan) => {
                 let unresolved = carina_core::parser::ParsedFile::default();
                 let providers = providers.check_saved_plan_config_pair(
-                    carina_core::parser::InferredFile::default(),
+                    carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(
+                        carina_core::parser::InferredFile::default(),
+                    ),
                     carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
                     base_dir,
                     false,

@@ -260,7 +260,8 @@ fn resolve_upstream_exports_with_context<B: crate::resource::BindingAddress>(
             continue;
         }
         match parse_directory(&source_abs, config) {
-            Ok(mut parsed) => {
+            Ok(parsed) => {
+                let mut parsed = parsed.into_parsed();
                 // Normalize every consumer-visible declaration before module
                 // expansion and export inference. Inference compares the
                 // structural TypeExpr values it receives, so leaving one
@@ -1277,7 +1278,9 @@ mod tests {
     fn parse_project(source: &str) -> ParsedFile {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("main.crn"), source).unwrap();
-        parse_directory(tmp.path(), &ctx()).expect("parse_directory")
+        parse_directory(tmp.path(), &ctx())
+            .expect("parse_directory")
+            .into_parsed()
     }
 
     fn inference_not_run_entry() -> UpstreamExportEntry {
@@ -2043,7 +2046,9 @@ mod tests {
             provider_name, source
         );
         fs::write(tmp.path().join("main.crn"), full).unwrap();
-        parse_directory(tmp.path(), &ctx()).expect("parse_directory")
+        parse_directory(tmp.path(), &ctx())
+            .expect("parse_directory")
+            .into_parsed()
     }
 
     /// Preserve the historical positional-walker coverage while exercising

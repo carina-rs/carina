@@ -88,7 +88,7 @@ fn resolve_file_for_test<E: carina_core::parser::ResolveExportBindingPhase>(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
         &base_dir,
         &carina_core::parser::ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
@@ -915,8 +915,11 @@ for account_id in orgs.accounts {
         &ProviderContext::default(),
     )
     .expect("parse saved-plan loop provenance fixture");
-    let parsed = carina_core::module_resolver::resolve_modules_providerless(parsed, Path::new("."))
-        .expect("cross the deferred-body resolution seam");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        Path::new("."),
+    )
+    .expect("cross the deferred-body resolution seam");
 
     let mut deferred = parsed.deferred_for_expressions().to_vec().into_iter();
 
@@ -2117,7 +2120,7 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
         crate::provider_upstream_test_support::provider_upstream_fixture();
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
-        parsed,
+        carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
         &downstream,
         &ProviderContext::default(),
         &SchemaRegistry::new(),
@@ -3656,7 +3659,7 @@ let lookup = read mock.iam.Roles {{
         &loaded.duplicate_declarations,
     );
     assert!(validation_errors.is_empty(), "{validation_errors:?}");
-    let mut parsed = resolve_file_for_test(parsed);
+    let mut parsed = resolve_file_for_test(parsed.into_parsed());
     let mut composition = saved_module_composition(string_value("bad"), "bad");
     composition.signature.attributes.insert(
         "value".to_string(),
@@ -9153,7 +9156,7 @@ mod apply_deferred_for_parity {
         )
         .expect("parse");
         carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
         .expect("cross the deferred-body resolution seam")

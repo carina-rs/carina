@@ -2599,7 +2599,12 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
     let result = run_state_refresh_locked(
         validated_config,
@@ -2649,7 +2654,12 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -2718,7 +2728,12 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let providers =
         ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
-        .validate_evaluated_config(parsed, std::path::Path::new("."), true, &[])
+        .validate_evaluated_config(
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+            true,
+            &[],
+        )
         .unwrap();
 
     let result = run_state_refresh_locked(
@@ -3831,7 +3846,7 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
     )
     .expect("bound deferred loop parses");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
     .expect("cross the deferred-body resolution seam");
@@ -3906,7 +3921,7 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
     )
     .expect("unbound deferred loop parses");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
-        parsed,
+        carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
         std::path::Path::new("."),
     )
     .expect("cross the deferred-body resolution seam");

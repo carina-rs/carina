@@ -1207,13 +1207,19 @@ fn resolve_dependency_bindings(
 
 fn resolve_directive_dependencies(
     dependencies: &[RelativeBindingName],
+    diagnostic_sources: &crate::resource::DiagnosticSourceLocations,
     resolver: &ModuleScopeResolver<'_>,
 ) -> Result<Vec<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
     dependencies
         .iter()
-        .filter_map(|binding| {
+        .enumerate()
+        .filter_map(|(index, binding)| {
             resolver
-                .resolve_dependency_binding(binding, "directives.depends_on")
+                .resolve_dependency_binding_at(
+                    binding,
+                    "directives.depends_on",
+                    diagnostic_sources.get_owned(index),
+                )
                 .transpose()
         })
         .collect()
@@ -1232,11 +1238,17 @@ fn resolve_wait_binding(
         depends_on,
         line,
     } = wb;
-    let Some(target) = resolver.resolve_dependency_binding(target, "wait target")? else {
+    let diagnostic_source = Some((None, *line));
+    let Some(target) =
+        resolver.resolve_dependency_binding_at(target, "wait target", diagnostic_source.clone())?
+    else {
         return Ok(None);
     };
-    let Some(predicate_root) =
-        resolver.resolve_dependency_binding(&until_predicate.root, "wait predicate root")?
+    let Some(predicate_root) = resolver.resolve_dependency_binding_at(
+        &until_predicate.root,
+        "wait predicate root",
+        diagnostic_source.clone(),
+    )?
     else {
         return Ok(None);
     };
@@ -1255,7 +1267,11 @@ fn resolve_wait_binding(
             .iter()
             .filter_map(|binding| {
                 resolver
-                    .resolve_dependency_binding(binding, "wait depends_on")
+                    .resolve_dependency_binding_at(
+                        binding,
+                        "wait depends_on",
+                        diagnostic_source.clone(),
+                    )
                     .transpose()
             })
             .collect::<Result<_, _>>()?,
@@ -1474,17 +1490,26 @@ impl ModuleScopeResolver<'_> {
         &self,
         binding: &RelativeBindingName,
     ) -> Result<AbsoluteBindingAddress, ArgumentSubstitutionError> {
+        self.resolve_declared_binding_at(binding, None)
+    }
+
+    fn resolve_declared_binding_at(
+        &self,
+        binding: &RelativeBindingName,
+        diagnostic_source: Option<(Option<std::path::PathBuf>, usize)>,
+    ) -> Result<AbsoluteBindingAddress, ArgumentSubstitutionError> {
         if self.local_bindings.contains(binding) {
             Ok(self.scope.resolve(binding.clone()))
         } else {
-            Err(self.unknown_binding(binding.as_str()))
+            Err(self.unknown_binding_at(binding.as_str(), diagnostic_source))
         }
     }
 
-    fn resolve_dependency_binding(
+    fn resolve_dependency_binding_at(
         &self,
         binding: &RelativeBindingName,
         context: &str,
+        diagnostic_source: Option<(Option<std::path::PathBuf>, usize)>,
     ) -> Result<Option<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
         if let Some(argument) = self.arguments.arguments.get(binding.as_str()) {
             return match argument.value_ref() {
@@ -1516,7 +1541,8 @@ impl ModuleScopeResolver<'_> {
                 StructuralOperandRef::Parameter { .. } => Ok(None),
             };
         }
-        self.resolve_declared_binding(binding).map(Some)
+        self.resolve_declared_binding_at(binding, diagnostic_source)
+            .map(Some)
     }
 
     fn resolve_value(
@@ -1537,7 +1563,8 @@ impl ModuleScopeResolver<'_> {
         )?;
         for binding in normalized.root_bindings() {
             if !self.local_bindings.contains(&binding) {
-                return Err(self.unknown_binding(binding.as_str()));
+                let diagnostic_source = normalized.diagnostic_source_for_root_binding(&binding);
+                return Err(self.unknown_binding_at(binding.as_str(), diagnostic_source));
             }
         }
         let expanded = normalized.resolve_module(self.scope);
@@ -1579,9 +1606,19 @@ impl ModuleScopeResolver<'_> {
     }
 
     fn unknown_binding(&self, binding: &str) -> ArgumentSubstitutionError {
+        self.unknown_binding_at(binding, None)
+    }
+
+    fn unknown_binding_at(
+        &self,
+        binding: &str,
+        diagnostic_source: Option<(Option<std::path::PathBuf>, usize)>,
+    ) -> ArgumentSubstitutionError {
+        let (source_file, line) =
+            diagnostic_source.unwrap_or_else(|| (None, self.arguments.default_line));
         ArgumentSubstitutionError {
-            source_file: None,
-            line: self.arguments.default_line,
+            source_file,
+            line,
             message: format!(
                 "unknown binding '{binding}' in {}",
                 self.scope.description()
@@ -2062,6 +2099,7 @@ fn expand_module_resource_with_identity(
         create_before_destroy,
         prevent_destroy,
         depends_on,
+        depends_on_diagnostic_sources,
         provider_instance,
         ignore_changes,
     } = directives;
@@ -2076,7 +2114,12 @@ fn expand_module_resource_with_identity(
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on: resolve_directive_dependencies(&depends_on, resolver)?,
+            depends_on: resolve_directive_dependencies(
+                &depends_on,
+                &depends_on_diagnostic_sources,
+                resolver,
+            )?,
+            depends_on_diagnostic_sources,
             provider_instance,
             ignore_changes,
         },
@@ -2124,6 +2167,7 @@ fn expand_module_data_source(
         create_before_destroy,
         prevent_destroy,
         depends_on,
+        depends_on_diagnostic_sources,
         provider_instance,
         ignore_changes,
     } = directives;
@@ -2137,7 +2181,12 @@ fn expand_module_data_source(
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on: resolve_directive_dependencies(&depends_on, resolver)?,
+            depends_on: resolve_directive_dependencies(
+                &depends_on,
+                &depends_on_diagnostic_sources,
+                resolver,
+            )?,
+            depends_on_diagnostic_sources,
             provider_instance,
             ignore_changes,
         },
@@ -3066,26 +3115,26 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// case by Hamming-distance matching: for each current DSL instance prefix
 /// whose address is absent from state, find a state-only prefix for the same
 /// module within `SIMHASH_HAMMING_THRESHOLD` bits; if exactly one candidate
-/// qualifies, rewrite the current resources and their retained compositions
-/// to use the state address.
+/// qualifies, rewrite every identity-bearing resource/composition and then
+/// traverse the complete finalized file to move every absolute binding slot
+/// to the same state-backed address.
 ///
 /// `find_state_names_by_type` returns every state resource name for a given
 /// `(provider, resource_type)` — the reconciler uses them to discover which
 /// instance prefixes already exist in state.
-pub fn reconcile_anonymous_module_instances(
-    resources: &mut [crate::resource::Resource],
-    data_sources: &mut [crate::resource::DataSource],
-    wait_bindings: &mut [crate::parser::WaitBinding<AbsoluteBindingAddress>],
-    compositions: &mut [crate::resource::LiveComposition],
+pub fn reconcile_anonymous_module_instances<E>(
+    file: &mut crate::parser::ModuleResolvedFile<E>,
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
-) {
+) where
+    E: crate::parser::ExportParamLike<Binding = AbsoluteBindingAddress>,
+{
     use std::collections::{HashMap, HashSet};
 
     // Collect current (provider, resource_type) pairs that appear in the
     // expanded DSL — we'll query state for matching entries.
     let mut touched_types: HashSet<(String, String)> = HashSet::new();
-    for r in resources.iter() {
+    for r in &file.resources {
         let Some(identity) = r.id.identity_str() else {
             continue;
         };
@@ -3104,7 +3153,7 @@ pub fn reconcile_anonymous_module_instances(
     // across all of its resources).
     let mut current_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     let mut claimed_current_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
-    for r in resources.iter() {
+    for r in &file.resources {
         let Some(identity) = r.id.identity_str() else {
             continue;
         };
@@ -3217,7 +3266,7 @@ pub fn reconcile_anonymous_module_instances(
 
     // Apply remaps to string identities first. Typed binding addresses move
     // together in one exhaustive traversal below.
-    for r in resources.iter_mut() {
+    for r in &mut file.resources {
         let Some(identity) = r.id.identity_str() else {
             continue;
         };
@@ -3255,7 +3304,7 @@ pub fn reconcile_anonymous_module_instances(
         }
     }
 
-    for data_source in data_sources.iter_mut() {
+    for data_source in &mut file.data_sources {
         let Some(identity) = data_source.id.identity_str() else {
             continue;
         };
@@ -3291,7 +3340,7 @@ pub fn reconcile_anonymous_module_instances(
         }
     }
 
-    for composition in compositions.iter_mut() {
+    for composition in &mut file.compositions {
         if let Some(identity) = rewrite_name_prefix(composition.id.identity_str(), &prefix_remap) {
             composition.id = composition
                 .id
@@ -3310,18 +3359,7 @@ pub fn reconcile_anonymous_module_instances(
     let mut remap_binding = |binding: &AbsoluteBindingAddress| {
         rewrite_binding_prefix(binding, &prefix_remap).unwrap_or_else(|| binding.clone())
     };
-    for resource in resources {
-        resource.map_absolute_bindings(&mut remap_binding);
-    }
-    for data_source in data_sources {
-        data_source.map_absolute_bindings(&mut remap_binding);
-    }
-    for wait_binding in wait_bindings {
-        wait_binding.map_absolute_bindings(&mut remap_binding);
-    }
-    for composition in compositions {
-        composition.map_absolute_bindings(&mut remap_binding);
-    }
+    file.map_absolute_bindings(&mut remap_binding);
 }
 
 fn rewrite_name_prefix(
@@ -3390,20 +3428,21 @@ mod tests {
             ResourceIdentity::new(current_prefix.clone()),
         ));
         resource.loop_provenance = provenance;
-        let mut resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
+        let mut file = crate::parser::ModuleResolvedParsedFile::default();
+        file.resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
 
         reconcile_anonymous_module_instances(
-            &mut resources,
-            &mut [],
-            &mut [],
-            &mut [],
+            &mut file,
             &|_, _| vec![format!("{state_prefix}.leaf")],
             &crate::identifier::StateBlockClaims::empty(),
         );
 
         let expected_name = format!("{state_prefix}.leaf");
-        assert_eq!(resources[0].id.identity_str(), Some(expected_name.as_str()));
-        let [module_prefix] = resources[0].loop_provenance.module_prefixes() else {
+        assert_eq!(
+            file.resources[0].id.identity_str(),
+            Some(expected_name.as_str())
+        );
+        let [module_prefix] = file.resources[0].loop_provenance.module_prefixes() else {
             panic!("module prefix provenance retained");
         };
         assert_eq!(module_prefix.current_prefix().as_str(), state_prefix);
@@ -3446,21 +3485,22 @@ mod tests {
             None,
         );
         resource.loop_provenance = crate::resource::LoopProvenance::direct(direct);
-        let mut resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
+        let mut file = crate::parser::ModuleResolvedParsedFile::default();
+        file.resources = vec![resource.resolve_root(&crate::resource::RootScope::new())];
 
         reconcile_anonymous_module_instances(
-            &mut resources,
-            &mut [],
-            &mut [],
-            &mut [],
+            &mut file,
             &|_, _| vec![format!("{state_prefix}.leaf")],
             &crate::identifier::StateBlockClaims::empty(),
         );
 
         let expected_name = format!("{state_prefix}.leaf");
-        assert_eq!(resources[0].id.identity_str(), Some(expected_name.as_str()));
         assert_eq!(
-            resources[0]
+            file.resources[0].id.identity_str(),
+            Some(expected_name.as_str())
+        );
+        assert_eq!(
+            file.resources[0]
                 .loop_provenance
                 .direct_origin()
                 .expect("direct origin retained")

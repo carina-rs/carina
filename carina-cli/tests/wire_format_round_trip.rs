@@ -10,7 +10,7 @@ use carina_cli::commands::plan::PlanFile;
 use carina_core::effect::UnresolvedSavedEffect;
 use carina_state::{StateFile, check_and_migrate};
 
-fn assert_json_value_round_trip<T>(fixture: &str)
+fn assert_json_value_round_trip<T>(fixture: &str) -> Value
 where
     T: DeserializeOwned + Serialize,
 {
@@ -19,6 +19,7 @@ where
     let reserialized = serde_json::to_value(decoded).expect("fixture must re-serialize");
 
     assert_eq!(reserialized, original);
+    reserialized
 }
 
 fn assert_module_prefixed_addresses(addresses: BTreeSet<String>) {
@@ -87,4 +88,141 @@ fn pre_change_saved_plan_binding_addresses_keep_the_existing_wire_shape() {
         .collect();
 
     assert_module_prefixed_addresses(addresses);
+}
+
+fn json_strings(value: &Value) -> BTreeSet<String> {
+    value
+        .as_array()
+        .expect("binding-address slot must be a JSON array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("binding address must stay a JSON string")
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn base_binary_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
+    let fixture =
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.plan.json");
+    let round_tripped = assert_json_value_round_trip::<PlanFile>(fixture);
+
+    let wait_bindings = round_tripped["wait_bindings"]
+        .as_array()
+        .expect("saved plan must contain wait bindings")
+        .iter()
+        .map(|wait| {
+            (
+                wait["binding"].as_str().expect("wait binding").to_string(),
+                wait["target"].as_str().expect("wait target").to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        wait_bindings,
+        BTreeSet::from([
+            (
+                "direct.consumer_ready".to_string(),
+                "direct.consumer".to_string(),
+            ),
+            (
+                "looped[0].consumer_ready".to_string(),
+                "looped[0].consumer".to_string(),
+            ),
+        ]),
+    );
+
+    let effects = round_tripped["plan"]["effects"]
+        .as_array()
+        .expect("saved plan effects");
+    let read_bindings = effects
+        .iter()
+        .filter_map(|effect| effect.get("Read"))
+        .map(|read| {
+            read["resource"]["binding"]
+                .as_str()
+                .expect("data-source binding")
+                .to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        read_bindings,
+        BTreeSet::from(["direct.lookup".to_string(), "looped[0].lookup".to_string(),]),
+    );
+
+    let waits = effects
+        .iter()
+        .filter_map(|effect| effect.get("Wait"))
+        .collect::<Vec<_>>();
+    assert_eq!(waits.len(), 2, "fixture must exercise Wait effects");
+    for wait in waits {
+        let identity = wait["identity"].as_str().expect("wait identity");
+        let prefix = identity
+            .strip_suffix(".consumer_ready")
+            .expect("module-prefixed wait identity");
+        let expected_target = format!("{prefix}.consumer");
+        assert_eq!(
+            wait["target_id"]["identity"].as_str(),
+            Some(expected_target.as_str()),
+            "Wait target must retain its absolute spelling",
+        );
+        assert_eq!(
+            json_strings(&wait["explicit_dependencies"]),
+            BTreeSet::from([format!("{prefix}.seed")]),
+            "Wait dependencies must retain absolute spellings",
+        );
+    }
+
+    let updates = effects
+        .iter()
+        .filter_map(|effect| effect.get("Update"))
+        .collect::<Vec<_>>();
+    assert_eq!(updates.len(), 2, "fixture must exercise Update effects");
+    for update in updates {
+        let binding = update["to"]["binding"].as_str().expect("update binding");
+        let prefix = binding
+            .strip_suffix(".consumer")
+            .expect("module-prefixed consumer update");
+        assert_eq!(
+            json_strings(&update["from"]["dependency_bindings"]),
+            BTreeSet::from([format!("{prefix}.seed"), "root".to_string()]),
+            "Update.from dependency bindings must retain absolute spellings",
+        );
+        assert_eq!(
+            json_strings(&update["to"]["directives"]["depends_on"]),
+            BTreeSet::from([format!("{prefix}.seed"), "root".to_string()]),
+            "Update.to directive dependencies must retain absolute spellings",
+        );
+    }
+
+    let deletes = effects
+        .iter()
+        .filter_map(|effect| effect.get("Delete"))
+        .collect::<Vec<_>>();
+    assert_eq!(deletes.len(), 2, "fixture must exercise Delete effects");
+    for delete in deletes {
+        let binding = delete["binding"].as_str().expect("delete binding");
+        let prefix = binding
+            .strip_suffix(".nested.leaf")
+            .expect("module-prefixed nested delete");
+        let expected = BTreeSet::from([format!("{prefix}.consumer")]);
+        assert_eq!(
+            json_strings(&delete["dependencies"]),
+            expected,
+            "Delete dependencies must retain absolute spellings",
+        );
+        assert_eq!(
+            json_strings(&delete["explicit_dependencies"]),
+            expected,
+            "Delete explicit dependencies must retain absolute spellings",
+        );
+        assert_eq!(
+            json_strings(&delete["directives"]["depends_on"]),
+            expected,
+            "Delete directive dependencies must retain absolute spellings",
+        );
+    }
 }

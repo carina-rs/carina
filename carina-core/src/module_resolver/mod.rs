@@ -40,7 +40,7 @@ pub use loader::{
 };
 pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
-    RefCheckedModuleGraph, ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
+    ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
     ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, prepare_root_export_validation, resolve_modules,
     resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,

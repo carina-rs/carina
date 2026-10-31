@@ -2725,9 +2725,9 @@ impl ModuleCallDiagnosticSource {
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
-    structural_handles: IndexMap<String, StructuralHandle<B>>,
-    structural_aliases: IndexMap<String, StructuralHandle<B>>,
-    value_structural_handles: IndexMap<String, StructuralHandleMetadata<B>>,
+    structural_handles: IndexMap<B, StructuralHandle<B>>,
+    structural_aliases: IndexMap<B, StructuralHandle<B>>,
+    value_structural_handles: IndexMap<B, StructuralHandleMetadata<B>>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
     argument_type_sources: IndexMap<String, (SourceFileId, SourceSpan)>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck<B>>,
@@ -2759,35 +2759,12 @@ pub(crate) struct PendingFunctionTypeCheck<B: BindingAddress = RelativeBindingNa
 }
 
 impl<B: BindingAddress> ParserBindingMetadata<B> {
-    pub(crate) fn structural_handles(&self) -> &IndexMap<String, StructuralHandle<B>> {
+    pub(crate) fn structural_handles(&self) -> &IndexMap<B, StructuralHandle<B>> {
         &self.structural_handles
     }
 
-    pub(crate) fn insert_structural_handle(&mut self, name: String, handle: StructuralHandle<B>) {
-        self.structural_handles.insert(name, handle);
-    }
-
-    pub(crate) fn structural_aliases(&self) -> &IndexMap<String, StructuralHandle<B>> {
+    pub(crate) fn structural_aliases(&self) -> &IndexMap<B, StructuralHandle<B>> {
         &self.structural_aliases
-    }
-
-    pub(crate) fn insert_structural_alias(&mut self, name: String, handle: StructuralHandle<B>) {
-        self.structural_aliases.insert(name, handle);
-    }
-
-    pub(crate) fn value_structural_handles(
-        &self,
-        name: &str,
-    ) -> Option<&StructuralHandleMetadata<B>> {
-        self.value_structural_handles.get(name)
-    }
-
-    pub(crate) fn insert_value_structural_handles(
-        &mut self,
-        name: String,
-        metadata: StructuralHandleMetadata<B>,
-    ) {
-        self.value_structural_handles.insert(name, metadata);
     }
 
     pub(crate) fn insert_resource_source_file(&mut self, id: ResourceId, path: PathBuf) {
@@ -2837,7 +2814,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
         self.pending_function_type_checks.clear();
     }
 
-    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&B) -> bool) {
         self.structural_handles.retain(|name, _| keep(name));
         self.structural_aliases.retain(|name, _| keep(name));
         self.value_structural_handles.retain(|name, _| keep(name));
@@ -2854,6 +2831,94 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
             .extend(other.argument_type_sources);
         for check in other.pending_function_type_checks {
             self.insert_pending_function_type_check(check);
+        }
+    }
+}
+
+impl ParserBindingMetadata<RelativeBindingName> {
+    pub(crate) fn insert_structural_handle(
+        &mut self,
+        name: String,
+        handle: StructuralHandle<RelativeBindingName>,
+    ) {
+        self.structural_handles
+            .insert(RelativeBindingName::new(name), handle);
+    }
+
+    pub(crate) fn insert_structural_alias(
+        &mut self,
+        name: String,
+        handle: StructuralHandle<RelativeBindingName>,
+    ) {
+        self.structural_aliases
+            .insert(RelativeBindingName::new(name), handle);
+    }
+
+    pub(crate) fn value_structural_handles_by_name(
+        &self,
+        name: &str,
+    ) -> Option<&StructuralHandleMetadata<RelativeBindingName>> {
+        self.value_structural_handles.get(name)
+    }
+
+    pub(crate) fn insert_value_structural_handles(
+        &mut self,
+        name: String,
+        metadata: StructuralHandleMetadata<RelativeBindingName>,
+    ) {
+        self.value_structural_handles
+            .insert(RelativeBindingName::new(name), metadata);
+    }
+}
+
+impl ParserBindingMetadata<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            structural_handles,
+            structural_aliases,
+            value_structural_handles,
+            resource_source_files: _resource_source_files,
+            argument_type_sources: _argument_type_sources,
+            pending_function_type_checks,
+        } = self;
+
+        let mut mapped_structural_handles = IndexMap::new();
+        for (binding, mut handle) in std::mem::take(structural_handles) {
+            let binding = map(&binding);
+            handle.map_absolute_bindings(map);
+            mapped_structural_handles.insert(binding, handle);
+        }
+        *structural_handles = mapped_structural_handles;
+
+        let mut mapped_structural_aliases = IndexMap::new();
+        for (binding, mut handle) in std::mem::take(structural_aliases) {
+            let binding = map(&binding);
+            handle.map_absolute_bindings(map);
+            mapped_structural_aliases.insert(binding, handle);
+        }
+        *structural_aliases = mapped_structural_aliases;
+
+        let mut mapped_value_structural_handles = IndexMap::new();
+        for (binding, mut metadata) in std::mem::take(value_structural_handles) {
+            let binding = map(&binding);
+            metadata.map_absolute_bindings(map);
+            mapped_value_structural_handles.insert(binding, metadata);
+        }
+        *value_structural_handles = mapped_value_structural_handles;
+
+        for check in pending_function_type_checks {
+            let PendingFunctionTypeCheck {
+                function_name: _function_name,
+                arguments,
+                source_line: _source_line,
+                source_file: _source_file,
+            } = check;
+            for argument in arguments {
+                argument.map_absolute_bindings(map);
+            }
         }
     }
 }
@@ -3299,6 +3364,32 @@ impl ModuleCall<RelativeBindingName> {
     }
 }
 
+impl ModuleCall<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            module_name: _module_name,
+            binding_name,
+            arguments,
+            source: _source,
+            loop_origin: _loop_origin,
+        } = self;
+        if let Some(binding) = binding_name {
+            *binding = map(binding);
+        }
+        for authored in arguments.values_mut() {
+            let AuthoredModuleArgument {
+                argument,
+                key_span: _key_span,
+                value_span: _value_span,
+            } = authored;
+            argument.operand.map_absolute_bindings(map);
+        }
+    }
+}
+
 impl<S> DeferredForExpression<S, RelativeBindingName> {
     #[cfg(test)]
     pub(crate) fn resolve_root(
@@ -3352,6 +3443,36 @@ impl<S> DeferredForExpression<S, RelativeBindingName> {
     }
 }
 
+impl DeferredForExpression<ModuleSource, AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            file: _file,
+            line: _line,
+            header: _header,
+            resource_type: _resource_type,
+            attributes,
+            target,
+            iterable,
+            binding: _binding,
+            template_resource,
+        } = self;
+        for (_name, value) in attributes {
+            value.map_absolute_bindings(map);
+        }
+        match target {
+            DeferredForTarget::Bound { binding } => *binding = map(binding),
+            DeferredForTarget::Unbound {
+                template: _template,
+            } => {}
+        }
+        iterable.map_absolute_bindings(map);
+        template_resource.map_absolute_bindings(map);
+    }
+}
+
 impl ParserBindingMetadata<RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
@@ -3368,15 +3489,15 @@ impl ParserBindingMetadata<RelativeBindingName> {
         ParserBindingMetadata {
             structural_handles: structural_handles
                 .into_iter()
-                .map(|(name, handle)| (name, handle.resolve_bindings(resolve)))
+                .map(|(name, handle)| (resolve(name), handle.resolve_bindings(resolve)))
                 .collect(),
             structural_aliases: structural_aliases
                 .into_iter()
-                .map(|(name, handle)| (name, handle.resolve_bindings(resolve)))
+                .map(|(name, handle)| (resolve(name), handle.resolve_bindings(resolve)))
                 .collect(),
             value_structural_handles: value_structural_handles
                 .into_iter()
-                .map(|(name, metadata)| (name, metadata.resolve_bindings(resolve)))
+                .map(|(name, metadata)| (resolve(name), metadata.resolve_bindings(resolve)))
                 .collect(),
             resource_source_files,
             argument_type_sources,
@@ -3441,6 +3562,36 @@ impl ParsedBindingUses<RelativeBindingName> {
                 })
                 .collect(),
             record_indices_by_owner,
+        }
+    }
+}
+
+impl ParsedBindingUses<AbsoluteBindingAddress> {
+    fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let Self {
+            records,
+            record_indices_by_owner: _record_indices_by_owner,
+        } = self;
+        for record in records {
+            let ParsedBareBindingUse {
+                authored: _authored,
+                source,
+                pending_slot: _pending_slot,
+            } = record;
+            match source {
+                BareBindingSource::Value {
+                    value,
+                    declared_type: _declared_type,
+                } => {
+                    let mut mapped = (**value).clone();
+                    mapped.map_absolute_bindings(map);
+                    *value = Arc::new(mapped);
+                }
+                BareBindingSource::Structural(handle) => handle.map_absolute_bindings(map),
+            }
         }
     }
 }
@@ -3919,6 +4070,174 @@ impl<E, D: Default> Default for File<E, AbsoluteBindingAddress, D> {
             warnings: Vec::new(),
             deferred_for_phase: D::default(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
+        }
+    }
+}
+
+impl<E: ExportParamLike<Binding = AbsoluteBindingAddress>>
+    File<E, AbsoluteBindingAddress, ResolvedDeferredForPhase<AbsoluteBindingAddress>>
+{
+    /// Rewrite every expanded binding address held by a finalized file.
+    ///
+    /// The exhaustive `File` destructure is intentional: adding a new
+    /// top-level slot forces this traversal to classify it before the crate
+    /// compiles. Each binding-bearing member then delegates to an exhaustive
+    /// phase-specific traversal of its own shape.
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses: _uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings: _warnings,
+            deferred_for_phase,
+            expansion_trace: _expansion_trace,
+        } = self;
+
+        for provider in providers {
+            let ProviderConfig {
+                name: _name,
+                attributes,
+                default_tags,
+                source: _source,
+                version: _version,
+                revision: _revision,
+                unresolved_attributes,
+                binding: _binding,
+            } = provider;
+            for value in attributes.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+            for value in default_tags.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+            for value in unresolved_attributes.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+        }
+        for resource in resources {
+            resource.map_absolute_bindings(map);
+        }
+        for data_source in data_sources {
+            data_source.map_absolute_bindings(map);
+        }
+        for composition in compositions {
+            composition.map_absolute_bindings(map);
+        }
+        for value in variables.values_mut() {
+            value.map_absolute_bindings(map);
+        }
+        for call in module_calls {
+            call.map_absolute_bindings(map);
+        }
+        for argument in arguments {
+            let ArgumentParameter {
+                name: _name,
+                static_type: _static_type,
+                default,
+                description: _description,
+                validations,
+            } = argument;
+            if let Some(default) = default {
+                default.map_absolute_bindings(map);
+            }
+            for validation in validations {
+                let ValidationBlock {
+                    condition,
+                    error_message: _error_message,
+                    source: _source,
+                } = validation;
+                condition.map_absolute_bindings(map);
+            }
+        }
+        for attribute in attribute_params {
+            let AttributeParameter {
+                name: _name,
+                static_type: _static_type,
+                value,
+                source: _source,
+            } = attribute;
+            if let Some(value) = value {
+                value.map_absolute_bindings(map);
+            }
+        }
+        for export in export_params {
+            let mut value = export.value().cloned();
+            if let Some(value) = &mut value {
+                value.map_absolute_bindings(map);
+            }
+            export.set_value(value);
+        }
+        if let Some(backend) = backend {
+            let BackendConfig {
+                backend_type: _backend_type,
+                attributes,
+                attribute_spans: _attribute_spans,
+            } = backend;
+            for value in attributes.values_mut() {
+                value.map_absolute_bindings(map);
+            }
+        }
+        for block in state_blocks {
+            match block {
+                StateBlock::Import {
+                    to: _to,
+                    to_span: _to_span,
+                    id,
+                } => id.map_absolute_bindings(map),
+                StateBlock::Removed { from: _from } => {}
+                StateBlock::Moved {
+                    addresses: _addresses,
+                } => {}
+            }
+        }
+        for function in user_functions.values_mut() {
+            *function = function.clone().map_bindings(&mut |binding| map(&binding));
+        }
+        for upstream in upstream_states {
+            let UpstreamState {
+                binding,
+                source: _source,
+            } = upstream;
+            *binding = map(binding);
+        }
+        for wait in wait_bindings {
+            wait.map_absolute_bindings(map);
+        }
+        for require in requires {
+            let RequireBlock {
+                condition,
+                error_message: _error_message,
+                source: _source,
+            } = require;
+            condition.map_absolute_bindings(map);
+        }
+        *structural_bindings = std::mem::take(structural_bindings)
+            .into_iter()
+            .map(|binding| map(&binding))
+            .collect();
+        parser_binding_metadata.map_absolute_bindings(map);
+        parsed_binding_uses.map_absolute_bindings(map);
+        for deferred in deferred_for_phase.expressions.iter_mut() {
+            deferred.map_absolute_bindings(map);
         }
     }
 }
@@ -4588,7 +4907,7 @@ impl<E, B: BindingAddress, D> File<E, B, D> {
             self.parser_binding_metadata
                 .structural_handles()
                 .keys()
-                .map(String::as_str),
+                .map(BindingAddress::as_str),
         );
         names
     }
@@ -5515,9 +5834,11 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         let deferred = &parsed.deferred_for_expressions()[0];
         let children = expand_deferred_children(
             deferred,
@@ -5601,9 +5922,11 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         let target = &parsed.deferred_for_expressions()[0].target;
         let mut json = serde_json::to_value(target).expect("serialize deferred target");
         json["template"]["source"]

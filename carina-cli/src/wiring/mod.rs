@@ -777,7 +777,7 @@ impl<'a> ValidationReport<'a> {
 fn validation_report_from<'a>(
     context: &'a WiringContext,
     load_errors: &HashMap<String, String>,
-    parsed: &carina_core::parser::InferredFile,
+    parsed: &carina_core::config_loader::InferredRootDirectory,
     base_dir: &Path,
     skip_resource_validation: bool,
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
@@ -817,7 +817,7 @@ fn sorted_provider_load_errors(load_errors: &HashMap<String, String>) -> Vec<App
 fn resolve_config_pair_errors_with_context(
     context: &WiringContext,
     load_errors: &HashMap<String, String>,
-    parsed: carina_core::parser::InferredFile,
+    parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
@@ -847,7 +847,7 @@ fn resolve_config_pair_errors_with_context(
 fn resolve_config_pair_with_context(
     context: &WiringContext,
     load_errors: &HashMap<String, String>,
-    parsed: carina_core::parser::InferredFile,
+    parsed: carina_core::config_loader::InferredRootDirectory,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     base_dir: &Path,
     skip_resource_validation: bool,
@@ -975,7 +975,9 @@ impl ProviderLoad {
         validation_report_from(
             &self.context,
             &self.load_errors,
-            parsed,
+            &carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(
+                parsed.clone(),
+            ),
             base_dir,
             skip_resource_validation,
             duplicate_declarations,
@@ -986,7 +988,7 @@ impl ProviderLoad {
     /// one executable owner.
     pub fn validate_evaluated_config(
         self,
-        parsed: carina_core::parser::InferredFile,
+        parsed: carina_core::config_loader::InferredRootDirectory,
         base_dir: &Path,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
@@ -1035,7 +1037,7 @@ impl ProviderLoad {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn validate_config_pair(
         self,
-        parsed: carina_core::parser::InferredFile,
+        parsed: carina_core::config_loader::InferredRootDirectory,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
@@ -1136,7 +1138,7 @@ impl CompleteProviderLoad {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn check_saved_plan_config_pair(
         self,
-        parsed: carina_core::parser::InferredFile,
+        parsed: carina_core::config_loader::InferredRootDirectory,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
@@ -1216,7 +1218,7 @@ impl CheckedSavedPlanInputs {
 impl ReportingProviderLoad {
     pub(crate) fn validation_report<'a>(
         &'a self,
-        parsed: &carina_core::parser::InferredFile,
+        parsed: &carina_core::config_loader::InferredRootDirectory,
         base_dir: &Path,
         skip_resource_validation: bool,
         duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
@@ -1484,7 +1486,7 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::ExpandedInferred
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn revalidate_config_pair(
         self,
-        parsed: carina_core::parser::InferredFile,
+        parsed: carina_core::config_loader::InferredRootDirectory,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
         base_dir: &Path,
         skip_resource_validation: bool,
@@ -1518,7 +1520,12 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
     pub(crate) fn reconcile_identities_with_state(
         &mut self,
         state_file: &Option<StateFile>,
-    ) -> StateBlockResolution {
+    ) -> StateBlockResolution
+    where
+        E: carina_core::parser::ExportParamLike<
+                Binding = carina_core::resource::AbsoluteBindingAddress,
+            >,
+    {
         let Self { wiring, resources } = self;
         let ctx = wiring.context();
         reconcile_canonical_prefixed_names(&mut resources.inner, state_file);
@@ -1600,10 +1607,7 @@ impl ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile> {
         );
         if reconcile_modules && let Some(state) = state_file.as_ref() {
             module_resolver::reconcile_anonymous_module_instances(
-                &mut resources.resources,
-                &mut resources.data_sources,
-                &mut resources.wait_bindings,
-                &mut resources.compositions,
+                resources,
                 &|provider, resource_type| {
                     state
                         .resources_by_type(provider, resource_type)

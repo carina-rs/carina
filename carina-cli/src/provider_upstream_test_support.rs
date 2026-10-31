@@ -114,7 +114,8 @@ pub(crate) fn provider_upstream_fixture() -> (tempfile::TempDir, PathBuf, Inferr
         &SchemaRegistry::new(),
     )
     .unwrap()
-    .parsed;
+    .parsed
+    .into_parsed();
     (temp, downstream, parsed)
 }
 

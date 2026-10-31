@@ -1220,6 +1220,8 @@ pub struct AccessPath<B: BindingAddress = AbsoluteBindingAddress> {
     attribute: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     segments: Vec<PathSegment>,
+    #[serde(skip, default)]
+    diagnostic_source: DiagnosticSourceLocation,
 }
 
 pub type AuthoredAccessPath = AccessPath<RelativeBindingName>;
@@ -1290,6 +1292,18 @@ impl AccessPath<RelativeBindingName> {
         segments: Vec<PathSegment>,
     ) -> Self {
         Self::from_binding(binding.into(), attribute, segments)
+    }
+
+    pub(crate) fn with_segments_at_source(
+        binding: impl Into<RelativeBindingName>,
+        attribute: impl Into<String>,
+        segments: Vec<PathSegment>,
+        source_file: &std::path::Path,
+        source_line: usize,
+    ) -> Self {
+        let mut path = Self::with_segments(binding, attribute, segments);
+        path.diagnostic_source = DiagnosticSourceLocation::authored(source_file, source_line);
+        path
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1380,6 +1394,7 @@ impl<B: BindingAddress> AccessPath<B> {
             binding,
             attribute,
             segments,
+            diagnostic_source: DiagnosticSourceLocation::default(),
         }
     }
 
@@ -1411,6 +1426,10 @@ impl<B: BindingAddress> AccessPath<B> {
     /// for a top-level attribute reference. carina#3025.
     pub fn segments(&self) -> &[PathSegment] {
         &self.segments
+    }
+
+    pub(crate) fn diagnostic_source_owned(&self) -> Option<(Option<std::path::PathBuf>, usize)> {
+        self.diagnostic_source.owned()
     }
 
     /// Returns the leading run of `.field` segments before the first
@@ -2776,6 +2795,13 @@ impl DiagnosticSourceLine {
     }
 }
 
+impl Hash for DiagnosticSourceLine {
+    fn hash<H: Hasher>(&self, _state: &mut H) {
+        // Source positions are excluded from value identity. Hashing must
+        // follow the same rule as `PartialEq`.
+    }
+}
+
 impl From<usize> for DiagnosticSourceLine {
     fn from(line: usize) -> Self {
         Self::authored(line)
@@ -2792,6 +2818,81 @@ impl PartialEq for DiagnosticSourceLine {
 }
 
 impl Eq for DiagnosticSourceLine {}
+
+/// Parser-only source provenance for one binding-bearing syntax node.
+///
+/// The path and line are diagnostic metadata: they never participate in
+/// equality, hashing, or serialization. Deserialized and programmatically
+/// constructed values therefore remain semantically identical to authored
+/// values while parser-produced nodes can still point an error at the exact
+/// source expression.
+#[derive(Debug, Clone, Default)]
+struct DiagnosticSourceLocation {
+    source_file: Option<std::path::PathBuf>,
+    source_line: DiagnosticSourceLine,
+}
+
+impl DiagnosticSourceLocation {
+    fn authored(source_file: &std::path::Path, source_line: usize) -> Self {
+        Self {
+            source_file: Some(source_file.to_path_buf()),
+            source_line: DiagnosticSourceLine::authored(source_line),
+        }
+    }
+
+    fn owned(&self) -> Option<(Option<std::path::PathBuf>, usize)> {
+        self.source_line
+            .get()
+            .map(|line| (self.source_file.clone(), line))
+    }
+}
+
+impl PartialEq for DiagnosticSourceLocation {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticSourceLocation {}
+
+impl Hash for DiagnosticSourceLocation {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
+/// Diagnostic source slots aligned with [`Directives::depends_on`].
+///
+/// This wrapper is public only because `Directives` is publicly
+/// constructible. Its contents have no public constructor and are populated
+/// exclusively by the parser. The wrapper deliberately compares equal for
+/// every value so diagnostic provenance cannot become configuration identity.
+#[derive(Debug, Clone, Default)]
+pub struct DiagnosticSourceLocations(Vec<DiagnosticSourceLocation>);
+
+impl DiagnosticSourceLocations {
+    pub(crate) fn authored(
+        source_file: &std::path::Path,
+        source_lines: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        Self(
+            source_lines
+                .into_iter()
+                .map(|line| DiagnosticSourceLocation::authored(source_file, line))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn get_owned(&self, index: usize) -> Option<(Option<std::path::PathBuf>, usize)> {
+        self.0.get(index).and_then(DiagnosticSourceLocation::owned)
+    }
+}
+
+impl PartialEq for DiagnosticSourceLocations {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DiagnosticSourceLocations {}
 
 /// Diagnostic-safe explanation retained after a built-in was attempted and
 /// failed during permissive resolution.
@@ -3054,6 +3155,22 @@ impl<B: BindingAddress> Value<B> {
             roots.insert(binding.clone());
         });
         roots
+    }
+
+    /// Return the authored source of the first resource-reference node whose
+    /// root is `binding`. Programmatic and deserialized references have no
+    /// diagnostic source and return `None`.
+    pub(crate) fn diagnostic_source_for_root_binding(
+        &self,
+        binding: &B,
+    ) -> Option<(Option<std::path::PathBuf>, usize)> {
+        let mut source = None;
+        self.visit_resource_refs(&mut |path| {
+            if source.is_none() && path.binding_address() == binding {
+                source = path.diagnostic_source_owned();
+            }
+        });
+        source
     }
 
     /// Whether this value contains no runtime-deferred computation.
@@ -4578,11 +4695,13 @@ impl<B: BindingAddress> AccessPath<B> {
             binding,
             attribute,
             segments,
+            diagnostic_source,
         } = self;
         AccessPath {
             binding: map(binding),
             attribute,
             segments,
+            diagnostic_source,
         }
     }
 }
@@ -4602,6 +4721,15 @@ impl FunctionArgument<RelativeBindingName> {
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
     ) -> FunctionArgument<AbsoluteBindingAddress> {
         self.map_bindings(resolve)
+    }
+}
+
+impl FunctionArgument<AbsoluteBindingAddress> {
+    pub(crate) fn map_absolute_bindings(
+        &mut self,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        self.operand.map_absolute_bindings(map);
     }
 }
 
@@ -6580,6 +6708,11 @@ pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
     /// Vec to preserve source order for `carina fmt` round-tripping.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<B>,
+    /// Parser-only source locations aligned with `depends_on`. This is skipped
+    /// by serde and ignored by equality; programmatic callers should leave it
+    /// at its default value.
+    #[serde(skip, default)]
+    pub depends_on_diagnostic_sources: DiagnosticSourceLocations,
     /// Authored attribute paths whose external changes Carina must preserve.
     /// These remain syntax-only until resolved against the resource schema.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -6605,6 +6738,7 @@ impl Directives<RelativeBindingName> {
             create_before_destroy,
             prevent_destroy,
             depends_on,
+            depends_on_diagnostic_sources,
             ignore_changes,
             provider_instance,
         } = self;
@@ -6613,6 +6747,7 @@ impl Directives<RelativeBindingName> {
             create_before_destroy,
             prevent_destroy,
             depends_on: depends_on.into_iter().map(resolve).collect(),
+            depends_on_diagnostic_sources,
             ignore_changes,
             // Provider instance routing is not a binding address. Modules
             // cannot declare providers, so this slot deliberately stays text.
@@ -6631,6 +6766,7 @@ impl Directives<AbsoluteBindingAddress> {
             create_before_destroy: _create_before_destroy,
             prevent_destroy: _prevent_destroy,
             depends_on,
+            depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
             ignore_changes: _ignore_changes,
             provider_instance: _provider_instance,
         } = self;
@@ -6647,6 +6783,7 @@ impl<B: BindingAddress> Default for Directives<B> {
             create_before_destroy: false,
             prevent_destroy: false,
             depends_on: Vec::new(),
+            depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
             ignore_changes: Vec::new(),
             provider_instance: None,
         }
@@ -6679,6 +6816,7 @@ impl From<&ExpandedDirectives> for PersistedDirectives {
             create_before_destroy,
             prevent_destroy,
             depends_on,
+            depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
             ignore_changes: _ignore_changes,
             provider_instance,
         } = directives;
@@ -6705,6 +6843,7 @@ impl From<&PersistedDirectives> for ExpandedDirectives {
             create_before_destroy: directives.create_before_destroy,
             prevent_destroy: directives.prevent_destroy,
             depends_on: directives.depends_on.clone(),
+            depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
             ignore_changes: Vec::new(),
             provider_instance: directives.provider_instance.clone(),
         }

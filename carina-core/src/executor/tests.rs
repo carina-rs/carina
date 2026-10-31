@@ -169,9 +169,11 @@ fn anonymous_deferred_collision_fixture() -> (
         &crate::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    let parsed =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect("deferred fixture crosses the module-resolution seam");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("deferred fixture crosses the module-resolution seam");
     let template = parsed.deferred_for_expressions()[0].clone();
     let mut bindings = ResolvedBindings::default();
     bindings.set_with_completeness(

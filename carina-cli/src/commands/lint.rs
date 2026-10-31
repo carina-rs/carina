@@ -180,7 +180,7 @@ pub fn run_lint(
             )
         })?)
     } else {
-        LintFile::Blocked(parsed)
+        LintFile::Blocked(parsed.into_parsed())
     };
 
     // Collect source texts for each .crn file

@@ -1,8 +1,2 @@
-let child_module = use {
-  source = "../child"
-}
-
-let nested = child_module {
-  label    = label
-  upstream = consumer
-}
+# The nested module call existed in the state used to produce the saved
+# update/delete plan, so removing it yields module-prefixed Delete effects.

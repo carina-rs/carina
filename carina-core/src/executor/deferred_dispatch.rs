@@ -506,9 +506,11 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
@@ -568,9 +570,11 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound enum loop parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         let template = &parsed.deferred_for_expressions()[0];
         let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::enum_identifier("foo"),
@@ -653,9 +657,11 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(

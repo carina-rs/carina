@@ -1250,7 +1250,7 @@ impl BindingNameSet {
         // sibling files by the directory loader.
         for structural in parsed.parser_binding_metadata.structural_handles().keys() {
             by_name
-                .entry(structural.clone())
+                .entry(structural.as_str().to_owned())
                 .or_insert(BindingNameKind::Structural);
         }
         for var_name in parsed.variables.keys() {

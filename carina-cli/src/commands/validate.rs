@@ -448,7 +448,7 @@ mod tests {
         parsed: carina_core::parser::ParsedFile,
     ) -> carina_core::parser::ModuleResolvedParsedFile {
         carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
         .expect("test fixture crosses module resolution")
@@ -820,7 +820,7 @@ let observed_names = roles.names
         )
         .expect("fixture parses");
         let parsed = carina_core::module_resolver::resolve_modules_providerless(
-            parsed,
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
             std::path::Path::new("."),
         )
         .expect("cross the deferred-body resolution seam");

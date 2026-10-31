@@ -157,6 +157,10 @@ impl<'cfg> ParseContext<'cfg> {
         self.binding_scope_source_file = source_file.to_path_buf();
     }
 
+    pub(super) fn source_file(&self) -> &std::path::Path {
+        &self.binding_scope_source_file
+    }
+
     pub(super) fn child_scope(&self) -> Self {
         let ordinal = self.next_binding_scope.get();
         self.next_binding_scope.set(ordinal + 1);

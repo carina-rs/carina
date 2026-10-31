@@ -284,7 +284,13 @@ fn parse_namespaced_id_value(
             })
             .collect();
         segments.extend(trailing_segments);
-        let path = AccessPath::with_segments(parts[0].to_string(), parts[1].to_string(), segments);
+        let path = AccessPath::with_segments_at_source(
+            parts[0].to_string(),
+            parts[1].to_string(),
+            segments,
+            ctx.source_file(),
+            line,
+        );
         EvalValue::from_value(Value::Deferred(DeferredValue::ResourceRef { path }))
     };
 
@@ -302,10 +308,12 @@ fn parse_namespaced_id_value(
                 })
                 .collect();
             segments.extend(trailing_segments);
-            let path = AccessPath::with_segments(
+            let path = AccessPath::with_segments_at_source(
                 handle.canonical_binding_name().to_string(),
                 parts[1].to_string(),
                 segments,
+                ctx.source_file(),
+                line,
             );
             return Ok(EvalValue::from_value(Value::Deferred(
                 DeferredValue::ResourceRef { path },

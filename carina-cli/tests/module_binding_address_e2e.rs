@@ -458,3 +458,126 @@ m { label = "consumer-a2" }
         "Delete.explicit_dependencies must follow the state-prefix remap",
     );
 }
+
+#[test]
+fn anonymous_module_remap_updates_deferred_for_templates_in_saved_plan() {
+    let project = Project::new();
+    project.write("providers.crn", "provider mock {}\n");
+    project.write(
+        "backend.crn",
+        "backend local { path = 'carina.state.json' }\n",
+    );
+    project.write("notes.crn", "let root_note = \"multi-file root\"\n");
+    project.write(
+        "main.crn",
+        r#"let app_module = use { source = "./modules/app" }
+
+app_module { marker = "one" }
+"#,
+    );
+    project.write(
+        "modules/app/arguments.crn",
+        "arguments { marker: String }\n",
+    );
+    project.write(
+        "modules/app/resources.crn",
+        r#"let seed = mock.test.deferred_source {
+  name = "seed"
+}
+
+let consumer = mock.test.resource {
+  name    = "consumer"
+  comment = marker
+}
+"#,
+    );
+    project.assert_success("carina init", &project.run(&["init", "."]));
+    project.assert_success(
+        "initial carina apply",
+        &project.run(&["apply", "--auto-approve", "."]),
+    );
+
+    let mock_state_path = project.root.join(".carina/state.json");
+    let mut mock_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&mock_state_path).expect("read mock provider state"))
+            .expect("decode mock provider state");
+    let seed = mock_state["states"]
+        .as_object_mut()
+        .expect("mock provider resources")
+        .values_mut()
+        .find(|resource| resource["name"] == "seed")
+        .expect("module deferred source");
+    seed["generated_rules"] = serde_json::json!([{ "action": "part" }]);
+    fs::write(
+        &mock_state_path,
+        serde_json::to_vec_pretty(&mock_state).expect("encode mock provider state"),
+    )
+    .expect("update mock provider state");
+    project.write(
+        "modules/app/deferred.crn",
+        r#"let parts = for rule in seed.generated_rules {
+  mock.test.resource {
+    name    = rule.action
+    comment = consumer.identifier
+  }
+}
+"#,
+    );
+    project.assert_success(
+        "materialize deferred-for child",
+        &project.run(&["apply", "--auto-approve", "."]),
+    );
+
+    project.write(
+        "main.crn",
+        r#"let app_module = use { source = "./modules/app" }
+
+app_module { marker = "onf" }
+"#,
+    );
+    let plan = project.run(&[
+        "plan",
+        "--refresh=false",
+        "--out",
+        "remapped-deferred-plan.json",
+        ".",
+    ]);
+    project.assert_success("remapped deferred-for plan", &plan);
+
+    let apply = project.run(&["apply", "--auto-approve", "remapped-deferred-plan.json"]);
+    project.assert_success("apply remapped deferred-for saved plan", &apply);
+}
+
+#[test]
+fn validate_reports_unknown_module_reference_at_the_module_source_line() {
+    let project = Project::new();
+    project.write("providers.crn", "provider mock {}\n");
+    project.write(
+        "imports.crn",
+        "let imported = use { source = \"./modules/bad\" }\n",
+    );
+    project.write(
+        "call.crn",
+        "\n\n\n\n\n\n\nlet instance = imported { marker = \"root\" }\n",
+    );
+    project.write(
+        "modules/bad/arguments.crn",
+        "arguments { marker: String }\n",
+    );
+    project.write(
+        "modules/bad/resource.crn",
+        "\n\nlet consumer = mock.test.resource {\n  name = marker\n  directives { depends_on = [missing] }\n}\n",
+    );
+
+    let output = project.run(&["validate", "."]);
+    assert!(!output.status.success(), "fixture must fail validation");
+    let output = output_text(&output);
+    assert!(
+        output.contains("module 'imported' (modules/bad/resource.crn) at line 5:"),
+        "diagnostic must name the authored module reference, not the root call: {output}",
+    );
+    assert!(
+        output.contains("unknown binding 'missing'"),
+        "diagnostic must retain the resolver failure: {output}",
+    );
+}

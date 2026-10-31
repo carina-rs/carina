@@ -1182,9 +1182,11 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred fixture parses");
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         parsed
             .into_deferred_for_expressions()
             .into_iter()

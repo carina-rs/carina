@@ -945,7 +945,12 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
     let mut names: Vec<&'a str> = structural.iter().copied().collect();
     names.extend(module_parameters.keys().copied());
     names.extend(variables.keys().map(String::as_str));
-    names.extend(metadata.structural_handles().keys().map(String::as_str));
+    names.extend(
+        metadata
+            .structural_handles()
+            .keys()
+            .map(BindingAddress::as_str),
+    );
     names.sort_unstable();
     names.dedup();
 
@@ -966,7 +971,7 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
                 // contain an `if` binding whose provisional condition made
                 // us inspect a structural branch. Once the fixed point has a
                 // real value for that binding, the classified value wins.
-                match metadata.value_structural_handles(name) {
+                match metadata.value_structural_handles_by_name(name) {
                     Some(structural_handles) => {
                         BindingSeed::value_with_structural_handles(name, value, structural_handles)
                     }
@@ -2223,9 +2228,11 @@ for item in source.arn {
             template.attributes.get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
-        let parsed =
-            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-                .expect("deferred fixture crosses the module-resolution seam");
+        let parsed = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .expect("deferred fixture crosses the module-resolution seam");
         assert!(matches!(
             parsed.deferred_for_expressions()[0]
                 .attributes

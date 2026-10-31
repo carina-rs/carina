@@ -475,7 +475,7 @@ fn extend_expanded_binding_use_errors(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_resolve_errors_inner(
     access: &crate::wiring::ValidationPipelineAccess,
-    mut parsed: carina_core::parser::InferredFile,
+    mut parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &Path,
     ctx: &WiringContext,
     load_errors: &HashMap<String, String>,
@@ -510,10 +510,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
 
     if !skip_resource_validation {
         let schema_checked_exports =
-            carina_core::validation::inference::retry_unchecked_export_inference(
-                &mut parsed,
-                ctx.loaded_provider_schemas(),
-            );
+            parsed.retry_unchecked_export_inference(ctx.loaded_provider_schemas());
         errors.extend(
             carina_core::validation::inference::attached_inference_failures(schema_checked_exports)
                 .map(|failure| {
@@ -593,11 +590,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     // removed type cannot ride into apply. The recursive module-call checker
     // below runs this same typed resolver over every imported module.
     let mut root_type_resolution_findings = Vec::new();
-    let type_resolution = carina_core::validation::resolve_file_type_exprs_report(
-        &mut parsed,
-        enriched_context,
-        None,
-    );
+    let type_resolution = parsed.resolve_type_exprs_report(enriched_context);
     for diagnostic in type_resolution.into_diagnostics() {
         match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
             Ok(finding) => root_type_resolution_findings.push(finding),
@@ -605,9 +598,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
         }
     }
     extend_module_call_errors(&mut errors, root_type_resolution_findings);
-    if let Err(error) =
-        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, enriched_context)
-    {
+    if let Err(error) = parsed.resolve_resource_refs_with_config(enriched_context) {
         errors.push(AppError::Config(error.to_string()));
     }
     if !skip_resource_validation {
@@ -1045,7 +1036,7 @@ mod tests {
     type ValidateAndResolveErrors =
         fn(
             &crate::wiring::ValidationPipelineAccess,
-            carina_core::parser::InferredFile,
+            carina_core::config_loader::InferredRootDirectory,
             &Path,
             &WiringContext,
             &HashMap<String, String>,

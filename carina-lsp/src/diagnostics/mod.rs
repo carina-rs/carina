@@ -448,7 +448,7 @@ impl DiagnosticEngine {
         // function document rather than the caller document.
         if let (Some(result), Some(current_file_path)) = (merged_result.as_ref(), current_file_path)
         {
-            let mut strict = result.directory.parsed.clone();
+            let mut strict = result.directory.parsed.parsed().clone();
             if let Err(error) = carina_core::parser::resolve_resource_refs_with_config(
                 &mut strict,
                 &self.provider_context,
@@ -490,9 +490,10 @@ impl DiagnosticEngine {
                 &result.directory,
             ));
         }
-        let merged = merged_result
+        let merged_root = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
+        let merged = merged_root.map(|root| root.parsed());
         if let (Some(current_file), Some(current_file_path), Some(result)) =
             (current_parsed, current_file_path, merged_result.as_ref())
         {
@@ -1828,7 +1829,7 @@ impl DiagnosticEngine {
                 parsed,
                 &semantic_view,
                 expanded_graph,
-                pre_expansion_input,
+                merged_root,
                 export_value_bindings.as_ref(),
             ));
 

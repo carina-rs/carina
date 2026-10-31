@@ -6750,7 +6750,9 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
 
     let path = fixture.path().join("main.crn");
     let document = create_document_at(source, path.clone());
-    let resolver_input = document.parsed().expect("root parse").clone();
+    let resolver_input = carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(
+        document.parsed().expect("root parse").clone(),
+    );
     let report = match &engine.provider_context {
         DiagnosticProviderContext::Loaded(provider_context) => {
             carina_core::module_resolver::resolve_modules_with_diagnostics(
@@ -12727,6 +12729,89 @@ fn module_parameter_dependency_and_ref_attribute_are_valid_in_module_scope() {
                     .contains("cannot apply access .name to mock.compute.Instance")
         }),
         "valid typed module-parameter usage produced diagnostics: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("modules/bad");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(root.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        root.path().join("imports.crn"),
+        "let imported = use { source = \"./modules/bad\" }\n",
+    )
+    .unwrap();
+    let call_source = "\n\n\n\n\n\n\nlet instance = imported { marker = \"root\" }\n";
+    let call_path = root.path().join("call.crn");
+    std::fs::write(&call_path, call_source).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments { marker: String }\n",
+    )
+    .unwrap();
+    let module_source = "\n\nlet consumer = mock.test.resource {\n  name = marker\n  directives { depends_on = [missing] }\n}\n";
+    let module_path = module.join("resource.crn");
+    std::fs::write(&module_path, module_source).unwrap();
+
+    let engine = structural_ref_engine();
+    let call_doc = crate::document::Document::new_with_path(
+        call_source.to_string(),
+        call_path,
+        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    let merged = engine
+        .parse_merged_with_buffer(&call_doc, Some("call.crn"), root.path())
+        .expect("root directory parses before module expansion");
+    let errors = match &merged.module_resolution {
+        crate::diagnostics::checks::MergedModuleResolution::ConstraintFailed {
+            findings: _,
+            errors,
+        }
+        | crate::diagnostics::checks::MergedModuleResolution::Unowned { errors } => errors,
+        crate::diagnostics::checks::MergedModuleResolution::Expanded { graph: _ } => {
+            panic!("unknown module reference must reject expansion")
+        }
+    };
+    let error = errors
+        .iter()
+        .find(|error| {
+            error
+                .display_relative_to(root.path())
+                .to_string()
+                .contains("unknown binding 'missing'")
+        })
+        .unwrap_or_else(|| {
+            let rendered = errors
+                .iter()
+                .map(|error| error.display_relative_to(root.path()).to_string())
+                .collect::<Vec<_>>();
+            panic!("missing resolver error: {rendered:#?}")
+        });
+    let module_doc = crate::document::Document::new_with_path(
+        module_source.to_string(),
+        module_path.clone(),
+        std::sync::Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    let diagnostics = engine.module_resolver_error_diagnostics(
+        &module_doc,
+        merged.directory.parsed.parsed(),
+        error,
+        root.path(),
+        Some(&module_path),
+    );
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("unknown binding 'missing'"))
+        .unwrap_or_else(|| panic!("missing module-file diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.range.start.line, 4, "{diagnostic:#?}");
+    assert!(
+        diagnostic
+            .message
+            .contains("modules/bad/resource.crn) at line 5"),
+        "CLI/LSP must render the same authored location: {diagnostic:#?}",
     );
 }
 

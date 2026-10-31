@@ -43,7 +43,10 @@ fn resolve_modules(
     parsed: ParsedFile,
     base_dir: &std::path::Path,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
-    super::resolve_modules_providerless(parsed, base_dir)
+    super::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        base_dir,
+    )
 }
 
 fn resolve_modules_with_config(
@@ -52,7 +55,12 @@ fn resolve_modules_with_config(
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
-    super::resolve_modules_with_providerless_config(parsed, base_dir, config, schemas)
+    super::resolve_modules_with_providerless_config(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        base_dir,
+        config,
+        schemas,
+    )
 }
 
 fn reconcile_anonymous_module_instances(
@@ -60,14 +68,16 @@ fn reconcile_anonymous_module_instances(
     compositions: &mut [crate::resource::ExpandedLiveComposition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
+    let mut file = crate::parser::ModuleResolvedParsedFile::default();
+    file.resources = resources.to_vec();
+    file.compositions = compositions.to_vec();
     crate::module_resolver::reconcile_anonymous_module_instances(
-        resources,
-        &mut [],
-        &mut [],
-        compositions,
+        &mut file,
         find_state_names_by_type,
         &crate::identifier::StateBlockClaims::empty(),
     );
+    resources.clone_from_slice(&file.resources);
+    compositions.clone_from_slice(&file.compositions);
 }
 
 fn module_arguments(
@@ -2114,10 +2124,7 @@ thing { name = 'after-edit' }
     let mut claimed_from = claimed_from;
 
     crate::module_resolver::reconcile_anonymous_module_instances(
-        &mut claimed_from.resources,
-        &mut claimed_from.data_sources,
-        &mut claimed_from.wait_bindings,
-        &mut claimed_from.compositions,
+        &mut claimed_from,
         &state_lookup,
         &claims,
     );
@@ -2169,10 +2176,7 @@ thing { name = 'after-edit' }
     let mut claimed_to = claimed_to;
 
     crate::module_resolver::reconcile_anonymous_module_instances(
-        &mut claimed_to.resources,
-        &mut claimed_to.data_sources,
-        &mut claimed_to.wait_bindings,
-        &mut claimed_to.compositions,
+        &mut claimed_to,
         &state_lookup,
         &claims,
     );
@@ -6991,8 +6995,11 @@ let second = for item in secnd_items {
     )
     .expect("both undefined iterables remain deferred until finalization");
 
-    let error = super::resolve_modules_providerless(parsed, std::path::Path::new("."))
-        .expect_err("finalization must reject both undefined iterables");
+    let error = super::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect_err("finalization must reject both undefined iterables");
     let message = error.display_relative_to(std::path::Path::new("."));
 
     assert!(
