@@ -1207,7 +1207,7 @@ mock.test.Thing {
     }
 
     #[test]
-    fn apply_time_reference_lsp_error_matches_validate_and_plan_in_multi_file_directory() {
+    fn apply_time_reference_has_no_incomplete_identity_lsp_error() {
         let source = r#"let source = mock.test.resource {
   name = "identity-source"
 }
@@ -1222,14 +1222,35 @@ mock.test.Thing {
 "#;
 
         let diagnostics = incomplete_budget_diagnostics(&[("source.crn", source)], budget);
-        let matching = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.message == INCOMPLETE_BUDGET_IDENTITY_ERROR)
-            .collect::<Vec<_>>();
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.message != INCOMPLETE_BUDGET_IDENTITY_ERROR),
+            "an authored resource reference is a complete identity value: {diagnostics:#?}",
+        );
+    }
 
-        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
-        assert_eq!(matching[0].range.start.line, 0);
-        assert_eq!(matching[0].range.start.character, 0);
+    #[test]
+    fn route53_reference_identity_directory_has_no_lsp_errors() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../carina-cli/tests/fixtures/anonymous_reference_identity");
+        let path = fixture.join("records.crn");
+        let records = std::fs::read_to_string(&path).expect("read shared RecordSet fixture");
+        let state = builtin_mock_provider_state(&fixture);
+        let document = Document::new_with_path(
+            records,
+            path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+
+        let diagnostics = state.diagnostic_engine.analyze(&document, Some(&path));
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.severity != Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            }),
+            "the shared multi-file reference-identity fixture must be LSP-valid: {diagnostics:#?}",
+        );
     }
 
     #[test]

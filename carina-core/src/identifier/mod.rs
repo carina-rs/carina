@@ -158,16 +158,35 @@ pub enum AnonymousIdentityBasis {
     /// mutable user attributes.
     AttributeDerived,
     /// The schema declares identity paths, but at least one value is absent or
-    /// is not concrete at plan time. Anonymous resources cannot derive an
-    /// address from this basis.
+    /// has no stable value or reference expression at plan time. Anonymous
+    /// resources cannot derive an address from this basis.
     IncompleteDeclaredIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CompleteIdentityValues(BTreeMap<IdentityPath, String>);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CompleteIdentityValue {
+    /// A user-written value in its schema-canonical spelling. Prefixes use
+    /// the same `Prefix(...)` spelling as the legacy create-only hash.
+    Written(String),
+    /// An authored resource-reference expression. The spelling is exactly
+    /// the one used by the legacy create-only hash, so resolving the target
+    /// later cannot change this identity input.
+    ReferenceExpression(String),
+}
+
+impl CompleteIdentityValue {
+    fn hash_spelling(&self) -> &str {
+        match self {
+            Self::Written(value) | Self::ReferenceExpression(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CompleteIdentityValues(BTreeMap<IdentityPath, CompleteIdentityValue>);
 
 impl CompleteIdentityValues {
-    fn as_map(&self) -> &BTreeMap<IdentityPath, String> {
+    fn as_map(&self) -> &BTreeMap<IdentityPath, CompleteIdentityValue> {
         &self.0
     }
 }
@@ -306,17 +325,25 @@ fn identity_path_input<'a, S>(
     value_at_identity_path(resource, path).map(IdentityPathInput::Value)
 }
 
-fn identity_hash_value<S>(
+fn complete_identity_value<S>(
     resource: &Resource<S>,
     schema: &ValidatedResourceSchema,
     path: &IdentityPath,
-) -> Option<String> {
+) -> Option<CompleteIdentityValue> {
     match identity_path_input(resource, path)? {
-        IdentityPathInput::Prefix(prefix) => Some(format!("Prefix({prefix:?})")),
+        IdentityPathInput::Prefix(prefix) => Some(CompleteIdentityValue::Written(format!(
+            "Prefix({prefix:?})"
+        ))),
+        IdentityPathInput::Value(value @ Value::Deferred(DeferredValue::ResourceRef { .. })) => {
+            Some(CompleteIdentityValue::ReferenceExpression(
+                deterministic_value_string(value),
+            ))
+        }
         IdentityPathInput::Value(value) if value_is_known_at_plan_time(value) => {
             let names = identity_path_field_names(path);
             let node = schema.effective_node_at_path(&names)?;
             schema_canonical_value_string(value, Some(node.field_type()), schema.as_schema().defs())
+                .map(CompleteIdentityValue::Written)
         }
         IdentityPathInput::Value(_) | IdentityPathInput::UnresolvedPrefix => None,
     }
@@ -338,7 +365,7 @@ fn anonymous_identity_inputs<S>(
         let mut values = BTreeMap::new();
         let mut missing_paths = Vec::new();
         for path in schema.identity_paths() {
-            match identity_hash_value(resource, schema, path) {
+            match complete_identity_value(resource, schema, path) {
                 Some(value) => {
                     values.insert(path.clone(), value);
                 }
@@ -424,7 +451,7 @@ fn hash_declared_identity_inputs(
                 }
             }
         }
-        encode_length_prefixed(&mut hasher, value.as_bytes());
+        encode_length_prefixed(&mut hasher, value.hash_spelling().as_bytes());
     }
     let digest = hasher.finalize();
     u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 has four bytes"))
@@ -435,7 +462,9 @@ fn hash_declared_identity_inputs(
 /// Returns `None` when the resource has no schema, so its identity basis is
 /// unknown. Otherwise, the selected policy input values determine whether the
 /// basis is stable. Declared identity is incomplete when any selected value is
-/// absent or remains deferred at plan time.
+/// absent or has no stable expression at plan time. Authored resource
+/// references are complete because their expressions, rather than their later
+/// resolved values, enter the hash.
 pub fn classify_anonymous_identity_basis<S>(
     resource: &Resource<S>,
     registry: &SchemaRegistry,
@@ -2318,15 +2347,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
     // provider's natural key. Detect equal complete declared identities by
     // type and provider route before grouping ordinary address collisions so
     // different module-scoped addresses cannot hide the same real-world key.
-    let mut declared_identity_groups = BTreeMap::<
-        (
-            String,
-            String,
-            Option<String>,
-            BTreeMap<IdentityPath, String>,
-        ),
-        Vec<usize>,
-    >::new();
+    let mut declared_identity_groups =
+        BTreeMap::<(String, String, Option<String>, CompleteIdentityValues), Vec<usize>>::new();
     for (computed_index, (resource_index, _, inputs)) in computed.iter().enumerate() {
         let AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) = inputs
         else {
@@ -2338,7 +2360,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs<S: AnonymousIdentityM
                 resource.id.provider.clone(),
                 resource.id.resource_type.clone(),
                 resource.id.provider_instance.clone(),
-                values.as_map().clone(),
+                values.clone(),
             ))
             .or_default()
             .push(computed_index);
@@ -2715,7 +2737,9 @@ impl DesiredIdentityValues {
                     Some((path.clone(), value))
                 }
                 IdentityPathInput::Value(value) => {
-                    let value = ResolvedCreateOnlyValue::from_value(value.clone())
+                    let resolved = resolve_deferred_create_only_value(value, find_state_by_binding)
+                        .unwrap_or_else(|| value.clone());
+                    let value = ResolvedCreateOnlyValue::from_value(resolved)
                         .map(DesiredCreateOnlyValue::Resolved)
                         .unwrap_or(DesiredCreateOnlyValue::Unresolved);
                     Some((path.clone(), value))
@@ -2958,8 +2982,8 @@ pub fn detect_legacy_loop_address_moves(
     Ok(migrations)
 }
 
-/// Cross-resource state information used to resolve simple deferred
-/// create-only references like `route_table_id = private_rtb.id`.
+/// Cross-resource state information used to resolve deferred create-only
+/// references like `route_table_id = private_rtb.id` and longer access paths.
 #[derive(Clone)]
 pub struct AnonymousIdBindingStateInfo {
     /// The resource name stored in state. Let-bound resources are usually
@@ -2981,9 +3005,6 @@ fn resolve_deferred_create_only_value(
     let Value::Deferred(DeferredValue::ResourceRef { path }) = value else {
         return None;
     };
-    if !path.segments().is_empty() {
-        return None;
-    }
 
     let candidates: Vec<AnonymousIdBindingStateInfo> = find_state_by_binding(path.binding())
         .into_iter()
@@ -2992,7 +3013,17 @@ fn resolve_deferred_create_only_value(
     let [entry] = candidates.as_slice() else {
         return None;
     };
-    entry.attribute_values.get(path.attribute()).cloned()
+    let mut resolved = entry.attribute_values.get(path.attribute()).cloned()?;
+    for segment in path.segments() {
+        resolved = crate::resource::apply_postfix_access(
+            resolved,
+            segment.clone(),
+            0,
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .ok()?;
+    }
+    matches!(resolved, Value::Concrete(_)).then_some(resolved)
 }
 
 fn canonical_or_resolved_create_only_value(
@@ -3461,9 +3492,9 @@ pub enum AnonymousIdentifierReconciliationError {
 /// create-only values. Existence checks inspect every entry, while heuristic
 /// matching only inspects unclaimed candidates.
 /// `find_state_by_binding` takes a binding name and returns state entries
-/// carrying that binding across resource types, for resolving single-hop
-/// deferred create-only refs of the exact form `binding.attr`. Binding
-/// resolution is unresolvable when zero state entries match and ambiguous when
+/// carrying that binding across resource types, for resolving deferred
+/// create-only refs rooted at `binding.attr`, including longer access paths.
+/// Binding resolution is unresolvable when zero state entries match and ambiguous when
 /// multiple state entries with the same binding are visible in scope; both
 /// cases yield no value and are not errors. Dotted bindings are already
 /// module-qualified by their binding string, while bare bindings only resolve
@@ -3816,8 +3847,8 @@ impl<'a> AnonymousToNamedStateLookup<'a> {
 ///
 /// Returns resolved moves from each old anonymous state row to the matched
 /// named resource. The wiring layer applies them before running the differ.
-/// `find_state_by_binding` resolves the same single-hop `binding.attr`
-/// references as [`reconcile_anonymous_identifiers`]; missing or ambiguous
+/// `find_state_by_binding` resolves the same `binding.attr`-rooted reference
+/// chains as [`reconcile_anonymous_identifiers`]; missing or ambiguous
 /// binding rows leave that create-only value unresolved. Unlike anonymous
 /// reconciliation's documented partial matching, rename detection never uses
 /// a create-only subset: every configured value must be resolved before the

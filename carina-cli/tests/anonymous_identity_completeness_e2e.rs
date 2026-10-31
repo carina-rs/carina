@@ -73,6 +73,42 @@ fn assert_success(label: &str, output: &Output) {
     );
 }
 
+fn planned_identity(output: &Output, display_type: &str) -> String {
+    let rendered = output_text(output);
+    let marker = format!("{display_type} ");
+    rendered
+        .lines()
+        .find_map(|line| {
+            let suffix = line.split_once(&marker)?.1;
+            suffix
+                .split_whitespace()
+                .next()
+                .filter(|identity| identity.contains('_'))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("plan did not render an address for {display_type}:\n{rendered}"))
+}
+
+fn state_identity(scenario: &Scenario, resource_type: &str) -> String {
+    let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(scenario.project.join("carina.state.json")).expect("read local state"),
+    )
+    .expect("parse local state");
+    let rows = state["resources"]
+        .as_array()
+        .expect("state resources")
+        .iter()
+        .filter(|row| row["resource_type"] == resource_type)
+        .collect::<Vec<_>>();
+    let [row] = rows.as_slice() else {
+        panic!("expected one {resource_type} state row: {rows:#?}");
+    };
+    row["identity"]
+        .as_str()
+        .expect("state identity")
+        .to_string()
+}
+
 fn assert_validate_and_plan_error(scenario: &Scenario) {
     for args in [
         ["validate", "."].as_slice(),
@@ -120,7 +156,7 @@ fn omitted_identity_value_is_rejected_in_a_multi_file_directory() {
 }
 
 #[test]
-fn apply_time_resource_reference_identity_is_rejected_in_a_multi_file_directory() {
+fn apply_time_resource_reference_identity_keeps_its_plan_time_address() {
     let scenario = Scenario::new();
     scenario.write(
         "source.crn",
@@ -142,7 +178,31 @@ fn apply_time_resource_reference_identity_is_rejected_in_a_multi_file_directory(
     );
     scenario.init();
 
-    assert_validate_and_plan_error(&scenario);
+    assert_success(
+        "reference identity validate",
+        &scenario.carina(&["validate", "."]),
+    );
+    let initial_plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    assert_success("reference identity initial plan", &initial_plan);
+    let planned = planned_identity(&initial_plan, "mock.budgets.Budget");
+
+    assert_success(
+        "reference identity apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    assert_eq!(
+        state_identity(&scenario, "budgets.Budget"),
+        planned,
+        "resolving source.identifier during apply must not re-key the Budget",
+    );
+
+    let converged = scenario.carina(&["plan", "--refresh=false", "."]);
+    assert_success("reference identity converged plan", &converged);
+    assert!(
+        output_text(&converged).contains("No changes. Infrastructure is up-to-date."),
+        "the post-apply plan must retain the reference-derived address:\n{}",
+        output_text(&converged),
+    );
 }
 
 #[test]

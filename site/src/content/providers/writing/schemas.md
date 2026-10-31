@@ -116,7 +116,7 @@ equal to a bare name.
 What the attributes declare:
 
 - `create_only` means the API cannot change the value in place, so a change replaces the resource.
-- `identity` marks an immutable value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Every value must be present and known at plan time; otherwise the user must write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
+- `identity` marks an immutable value as part of the real-world object's natural key. If a resource schema declares any identity paths, an anonymous address hashes only those identity values. Every value must be present with stable plan-time material: written values are schema-canonicalized and resource references are hashed by their authored expressions. A missing value or one with no plan-time expression requires the user to write it or bind the resource with `let`. Other create-only values do not move the address. If the schema declares no identity, Carina falls back to hashing configured top-level create-only values.
 - `with_default` gives the value the host assumes when the configuration leaves the attribute out.
 - `with_description` shows up in the editor and in the generated docs.
 

@@ -362,6 +362,13 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .build(),
             )
             .attribute(AttributeSchema::optional("cost_filters", AttributeType::string()).build()),
+        ResourceSchema::new("route53.HostedZone")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build()),
         ResourceSchema::new("route53.RecordSet")
             .attribute(
                 AttributeSchema::required("hosted_zone_id", AttributeType::string())
@@ -865,15 +872,19 @@ impl MockProvider {
         })
     }
 
-    fn test_resource_identifier(id: &ResourceId, name: Option<&str>) -> Option<String> {
-        if id.resource_type != "test.resource" {
-            return None;
+    fn generated_attribute(id: &ResourceId, name: Option<&str>) -> Option<(&'static str, String)> {
+        match id.resource_type.as_str() {
+            "test.resource" => name
+                .or_else(|| id.identity_str())
+                .map(|identity| ("identifier", format!("{identity}-id"))),
+            "route53.HostedZone" => id
+                .identity_str()
+                .map(|identity| ("id", format!("{identity}-id"))),
+            _ => None,
         }
-        name.or_else(|| id.identity_str())
-            .map(|identity| format!("{identity}-id"))
     }
 
-    fn populate_test_resource_identifier_json(
+    fn populate_generated_attribute_json(
         id: &ResourceId,
         attrs: &mut HashMap<String, PersistedValue>,
     ) {
@@ -885,21 +896,18 @@ impl MockProvider {
                     Value::Concrete(ConcreteValue::String(value)) => Some(value.into_plaintext()),
                     _ => None,
                 });
-        if let Some(identifier) = Self::test_resource_identifier(id, name.as_deref()) {
-            attrs.entry("identifier".to_string()).or_insert_with(|| {
+        if let Some((attribute, value)) = Self::generated_attribute(id, name.as_deref()) {
+            attrs.entry(attribute.to_string()).or_insert_with(|| {
                 PersistedValue::encode_provider_value(
-                    &Value::Concrete(ConcreteValue::String(identifier.into())),
+                    &Value::Concrete(ConcreteValue::String(value.into())),
                     None,
                 )
-                .expect("mock identifier is persistable")
+                .expect("mock generated attribute is persistable")
             });
         }
     }
 
-    fn populate_test_resource_identifier_value(
-        id: &ResourceId,
-        attrs: &mut HashMap<String, Value>,
-    ) {
+    fn populate_generated_attribute_value(id: &ResourceId, attrs: &mut HashMap<String, Value>) {
         let name = attrs
             .get("name")
             .and_then(|value| match value {
@@ -907,10 +915,10 @@ impl MockProvider {
                 _ => None,
             })
             .map(str::to_string);
-        if let Some(identifier) = Self::test_resource_identifier(id, name.as_deref()) {
+        if let Some((attribute, value)) = Self::generated_attribute(id, name.as_deref()) {
             attrs
-                .entry("identifier".to_string())
-                .or_insert_with(|| Value::Concrete(ConcreteValue::String(identifier.into())));
+                .entry(attribute.to_string())
+                .or_insert_with(|| Value::Concrete(ConcreteValue::String(value.into())));
         }
     }
 
@@ -1180,7 +1188,7 @@ impl MockProvider {
             Ok(attrs) => attrs,
             Err(error) => return Err(attempt.untracked(error)),
         };
-        Self::populate_test_resource_identifier_json(&id, &mut attrs);
+        Self::populate_generated_attribute_json(&id, &mut attrs);
 
         let partial_create = self.partial_create_config_for(&id);
         if let Some(config) = partial_create {
@@ -1198,7 +1206,7 @@ impl MockProvider {
         }
 
         let mut state_attrs = persisted_values;
-        Self::populate_test_resource_identifier_value(&id, &mut state_attrs);
+        Self::populate_generated_attribute_value(&id, &mut state_attrs);
         Self::strip_unobservable_nested_write_only(&mut state_attrs);
         if let Some(config) = partial_create {
             for attr in &config.missing_attributes {
@@ -1255,7 +1263,7 @@ impl MockProvider {
                     error,
                 )
             })?;
-        Self::populate_test_resource_identifier_json(id, &mut persisted);
+        Self::populate_generated_attribute_json(id, &mut persisted);
         states.insert(key, persisted);
         self.save_states(&states).map_err(|error| {
             ProviderError::internal_caused_by(
@@ -1265,7 +1273,7 @@ impl MockProvider {
         })?;
 
         let mut attributes = persisted_values;
-        Self::populate_test_resource_identifier_value(id, &mut attributes);
+        Self::populate_generated_attribute_value(id, &mut attributes);
         Self::strip_unobservable_nested_write_only(&mut attributes);
         Ok(attributes)
     }

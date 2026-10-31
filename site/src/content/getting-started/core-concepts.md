@@ -91,15 +91,17 @@ configured top-level create-only values as the compatibility fallback.
 
 Two anonymous resources of the same type and provider route cannot have equal
 declared identity values; use `let` to name at least one of them. Every declared
-identity value must also be present and known at plan time. An omitted value,
-an unknown or deferred value, or a reference whose result is known only after
-apply cannot produce an anonymous address. Write the identity value directly,
-pass a plan-time-known module argument, or give the resource a name with `let`.
+identity value must also be present and have stable plan-time material. Carina
+canonicalizes a written value and hashes a resource reference by its authored
+expression, so `zone.id` has a stable address before the zone exists. An omitted
+value or a value with no plan-time expression cannot produce an anonymous
+address; write the value or give the resource a name with `let`.
 
 When a provider first adds identity declarations, an existing state row may
-still have the address produced by the older create-only rule. Carina matches
-that row by the identity values stored in state and plans a one-time `Move`.
-After apply, the next plan uses the new address and is clean.
+still have the address produced by the older create-only rule, including one
+that hashed a reference expression. Carina matches that row by the identity
+values stored in state and plans a one-time `Move`. After apply, the next plan
+uses the new address and is clean.
 
 ## DSL syntax
 

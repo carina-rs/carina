@@ -55,10 +55,12 @@ This is a schema-JSON-only extension. The WIT world and protocol version remain
 identity-only address encoding; when no identity path is declared, the host
 retains the create-only fallback. Nested paths are represented as typed
 attribute/struct-field segments in the host and are never transported as a
-dotted string. Every declared identity value must be present and concrete at
-plan time before the host can encode an anonymous address. Missing, unknown,
-deferred, and apply-time-only reference values are rejected; a `let` binding
-remains available when the provider cannot know the natural key during plan.
+dotted string. Every declared identity value must be present and have stable
+plan-time material before the host can encode an anonymous address. A written
+value is schema-canonicalized; a resource reference is hashed by its authored
+reference expression, so its address stays stable when the target later
+resolves. Missing values and values with no plan-time expression are rejected;
+a `let` binding remains available when no stable identity material exists.
 
 Every resource schema JSON record also carries the required boolean
 `default_prevent_destroy`. Providers use it for resource kinds whose deletion

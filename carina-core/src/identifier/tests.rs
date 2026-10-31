@@ -705,7 +705,7 @@ fn anonymous_deferred_declared_identity_is_a_typed_error() {
 }
 
 #[test]
-fn anonymous_reference_valued_declared_identity_remains_incomplete() {
+fn anonymous_reference_valued_declared_identity_produces_a_stable_address() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -723,14 +723,16 @@ fn anonymous_reference_valued_declared_identity_remains_incomplete() {
     resource.set_attr("name", Value::resource_ref("source", "name", Vec::new()));
     let mut resources = vec![resource];
 
-    let error =
-        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
-            .expect_err("reference-valued declared identity policy must remain unchanged");
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("a reference expression is a complete declared identity value");
 
-    assert!(matches!(
-        error,
-        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
-    ));
+    assert!(
+        resources[0]
+            .id
+            .identity_str()
+            .is_some_and(|identity| identity.starts_with("mock_test_resource_")),
+        "the anonymous address must be known before the reference resolves",
+    );
 }
 
 #[test]
@@ -907,6 +909,114 @@ fn composite_identity_hashes_every_record_set_key_component() {
         .map(|resource| resource.id.identity_str().unwrap())
         .collect::<HashSet<_>>();
     assert_eq!(identities.len(), resources.len());
+}
+
+fn reference_record_set(zone_binding: &str, name: &str, record_type: &str) -> Resource {
+    let mut resource = Resource::pending_with_provider("mock", "route53.RecordSet", None);
+    resource.set_attr(
+        "hosted_zone_id".to_string(),
+        Value::resource_ref(zone_binding, "id", Vec::new()),
+    );
+    resource.set_attr("name".to_string(), concrete_string(name));
+    resource.set_attr("type".to_string(), concrete_string(record_type));
+    resource
+}
+
+#[test]
+fn equal_reference_expressions_and_written_identity_values_are_duplicates() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema"),
+    );
+    let mut resources = vec![
+        reference_record_set("zone", "www.example.com", "A"),
+        reference_record_set("zone", "www.example.com", "A"),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("the same reference expression and written key must be a duplicate");
+
+    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    assert!(
+        error.to_string().contains("equal declared identity values"),
+        "{error}",
+    );
+}
+
+#[test]
+fn different_reference_expressions_are_distinct_identity_values() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema"),
+    );
+    let mut resources = vec![
+        reference_record_set("primary_zone", "www.example.com", "A"),
+        reference_record_set("secondary_zone", "www.example.com", "A"),
+    ];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("different authored references remain distinct even if they later resolve equally");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn longer_reference_chain_is_a_complete_identity_value() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("identity schema fixture must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "name",
+        Value::resource_ref("source", "details", vec!["generated_name".to_string()]),
+    );
+    let mut resources = vec![resource];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("a longer resource-reference chain is complete at plan time");
+
+    assert!(resources[0].id.identity_str().is_some());
+}
+
+#[test]
+fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
+    let reference = Value::resource_ref("source", "details", vec!["generated_name".to_string()]);
+    let source = AnonymousIdBindingStateInfo {
+        name: "source".to_string(),
+        attribute_values: HashMap::from([(
+            "details".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "generated_name".to_string(),
+                concrete_string("resolved-name"),
+            )]))),
+        )]),
+    };
+
+    let resolved = resolve_deferred_create_only_value(&reference, &|binding| {
+        (binding == "source")
+            .then(|| source.clone())
+            .into_iter()
+            .collect()
+    });
+
+    assert_eq!(resolved, Some(concrete_string("resolved-name")));
 }
 
 #[test]

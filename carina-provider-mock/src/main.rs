@@ -344,6 +344,13 @@ impl MockProcessProvider {
                 Value::Int(i64::from(polls_served)),
             );
         }
+        if id.resource_type == "route53.HostedZone" {
+            request
+                .resource
+                .attributes
+                .entry("id".to_string())
+                .or_insert_with(|| Value::String(format!("{}-id", id.identity)));
+        }
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
         let resource = request.resource;
@@ -604,6 +611,18 @@ impl CarinaProvider for MockProcessProvider {
                 )
                 .validate()
                 .expect("Budget-shaped mock schema must be valid"),
+            CoreResourceSchema::new("route53.HostedZone")
+                .attribute(
+                    CoreAttributeSchema::required("name", CoreAttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::provider_populated("id", CoreAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .expect("HostedZone-shaped mock schema must be valid"),
             CoreResourceSchema::new("route53.RecordSet")
                 .attribute(
                     CoreAttributeSchema::required("hosted_zone_id", CoreAttributeType::string())
