@@ -94,6 +94,16 @@ fn value_depends_on_module_output(
     visiting_variables: &mut HashSet<String>,
 ) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(|value| {
+                value_depends_on_module_output(
+                    value,
+                    module_bindings,
+                    variables,
+                    visiting_variables,
+                )
+            })
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             if module_bindings.contains(path.binding()) {
                 return true;
@@ -172,6 +182,19 @@ fn value_depends_on_module_output(
                     variables,
                     visiting_variables,
                 )
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_depends_on_module_output(
+                expression.lhs(),
+                module_bindings,
+                variables,
+                visiting_variables,
+            ) || value_depends_on_module_output(
+                expression.rhs(),
+                module_bindings,
+                variables,
+                visiting_variables,
+            )
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -280,6 +303,7 @@ impl<'a> ContextFreeValue<'a> {
                 // bare/dotted name, so even a dotted spelling needs directory
                 // authority before it is safe to type-check.
                 Value::Concrete(ConcreteValue::EnumIdentifier(_))
+                | Value::Deferred(DeferredValue::ModuleIf(_))
                 | Value::Deferred(DeferredValue::ResourceRef { .. })
                 | Value::Deferred(DeferredValue::BindingRef { .. })
                 | Value::Deferred(DeferredValue::FunctionCall { .. })
@@ -301,6 +325,9 @@ impl<'a> ContextFreeValue<'a> {
                 Value::Deferred(DeferredValue::Secret(inner)) => is_context_free(inner),
                 Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                     is_context_free(value) && is_context_free(default)
+                }
+                Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                    is_context_free(expression.lhs()) && is_context_free(expression.rhs())
                 }
             }
         }
@@ -527,6 +554,10 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_matching_function_call(value, matches_name)
                 || contains_matching_function_call(default, matches_name)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_matching_function_call(expression.lhs(), matches_name)
+                || contains_matching_function_call(expression.rhs(), matches_name)
         }
         _ => false,
     }

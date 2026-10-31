@@ -3060,6 +3060,24 @@ impl StructuralOperand {
         }
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Value { value, access_base } => {
+                visit(value)?;
+                if let Some(access_base) = access_base {
+                    visit(access_base)?;
+                }
+            }
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => {
+                visit(access_base)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_map<E>(
         &self,
         mut map: impl FnMut(&Value) -> Result<Value, E>,
@@ -3067,7 +3085,7 @@ impl StructuralOperand {
         Ok(match self {
             Self::Value { value, access_base } => Self::Value {
                 value: map(value)?,
-                access_base: access_base.as_ref().map(&mut map).transpose()?,
+                access_base: access_base.as_ref().map(map).transpose()?,
             },
             Self::Handle {
                 handle,
@@ -3139,6 +3157,13 @@ impl FunctionArgument {
 
     pub(crate) fn walker_value_mut(&mut self) -> &mut Value {
         self.operand.traversal_value_mut()
+    }
+
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.operand.try_visit_values(visit)
     }
 
     pub(crate) fn try_map_value<E>(
@@ -3293,6 +3318,10 @@ impl fmt::Display for UnavailableReason {
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
 pub enum DeferredValue {
+    /// Parser-only module-template conditional. Module expansion selects a
+    /// branch after argument substitution; this variant is rejected by serde
+    /// and by the expanded-contribution boundary.
+    ModuleIf(Box<crate::parser::DeferredValueIf>),
     /// Reference to another resource's attribute via an access path.
     ResourceRef { path: AccessPath },
     /// Reference to a binding without an attribute selector.
@@ -3303,6 +3332,9 @@ pub enum DeferredValue {
         value: Box<Value>,
         default: Box<Value>,
     },
+    /// A typed binary Int expression that is evaluated once both operands are
+    /// available. This is an intrinsic node, not a hidden built-in call.
+    IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr),
     /// String interpolation: `"prefix-${expr}-suffix"`
     Interpolation(Vec<InterpolationPart>),
     /// Built-in function call: `join("-", ["a", "b"])` or via pipe
@@ -3369,9 +3401,19 @@ impl DeferredValue {
         &self,
     ) -> Option<(crate::builtins::BuiltinFunction, &[FunctionArgument])> {
         match self {
+            Self::ModuleIf(_) => None,
             Self::FunctionCall { name, args, .. } => Some((*name, args)),
             Self::Unavailable { name, args, .. } => Some((*name, args)),
-            _ => None,
+            Self::ResourceRef { .. }
+            | Self::BindingRef { .. }
+            | Self::Coalesce { .. }
+            | Self::IntegerArithmetic(_)
+            | Self::Interpolation(_)
+            | Self::ResolvedFunctionCall { .. }
+            | Self::Access(_)
+            | Self::Secret(_)
+            | Self::RedactedSecret { .. }
+            | Self::Unknown(_) => None,
         }
     }
 }
@@ -3536,9 +3578,11 @@ impl Value {
             )
             | Value::Deferred(DeferredValue::RedactedSecret { .. }) => true,
             Value::Deferred(
-                DeferredValue::ResourceRef { .. }
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Coalesce { .. }
+                | DeferredValue::IntegerArithmetic(_)
                 | DeferredValue::Interpolation(_)
                 | DeferredValue::FunctionCall { .. }
                 | DeferredValue::Unavailable { .. }
@@ -3574,6 +3618,7 @@ impl Serialize for DeferredValue {
                 value: &'a Value,
                 default: &'a Value,
             },
+            IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr),
             Interpolation(&'a [InterpolationPart]),
             FunctionCall {
                 name: &'a str,
@@ -3590,6 +3635,9 @@ impl Serialize for DeferredValue {
         }
 
         match self {
+            Self::ModuleIf(_) => Err(serde::ser::Error::custom(
+                "module-template conditional cannot be serialized before expansion",
+            )),
             Self::ResourceRef { path } => {
                 SerializableDeferredValue::ResourceRef { path }.serialize(serializer)
             }
@@ -3599,6 +3647,9 @@ impl Serialize for DeferredValue {
             .serialize(serializer),
             Self::Coalesce { value, default } => {
                 SerializableDeferredValue::Coalesce { value, default }.serialize(serializer)
+            }
+            Self::IntegerArithmetic(expression) => {
+                SerializableDeferredValue::IntegerArithmetic(expression).serialize(serializer)
             }
             Self::Interpolation(parts) => {
                 SerializableDeferredValue::Interpolation(parts).serialize(serializer)
@@ -3646,6 +3697,7 @@ impl<'de> Deserialize<'de> for DeferredValue {
                 value: Box<Value>,
                 default: Box<Value>,
             },
+            IntegerArithmetic(crate::integer_arithmetic::ValidatedIntegerExpr),
             Interpolation(Vec<InterpolationPart>),
             FunctionCall {
                 name: String,
@@ -3667,6 +3719,9 @@ impl<'de> Deserialize<'de> for DeferredValue {
             DeserializableDeferredValue::BindingRef { binding } => Ok(Self::BindingRef { binding }),
             DeserializableDeferredValue::Coalesce { value, default } => {
                 Ok(Self::Coalesce { value, default })
+            }
+            DeserializableDeferredValue::IntegerArithmetic(expression) => {
+                Ok(Self::IntegerArithmetic(expression))
             }
             DeserializableDeferredValue::Interpolation(parts) => Ok(Self::Interpolation(parts)),
             DeserializableDeferredValue::FunctionCall { name, args, .. } => {
@@ -3701,6 +3756,7 @@ impl<'de> Deserialize<'de> for DeferredValue {
 impl fmt::Debug for DeferredValue {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ModuleIf(deferred) => f.debug_tuple("ModuleIf").field(deferred).finish(),
             Self::ResourceRef { path } => {
                 f.debug_struct("ResourceRef").field("path", path).finish()
             }
@@ -3712,6 +3768,10 @@ impl fmt::Debug for DeferredValue {
                 .debug_struct("Coalesce")
                 .field("value", value)
                 .field("default", default)
+                .finish(),
+            Self::IntegerArithmetic(expression) => f
+                .debug_tuple("IntegerArithmetic")
+                .field(expression)
                 .finish(),
             Self::Interpolation(parts) => f.debug_tuple("Interpolation").field(parts).finish(),
             Self::FunctionCall {
@@ -4535,6 +4595,7 @@ impl ConcreteValue {
 /// Phase 1 of [RFC #2972](https://github.com/carina-rs/carina/issues/2972).
 #[derive(Debug, Clone, Copy)]
 pub enum DeferredValueRef<'a> {
+    ModuleIf(&'a crate::parser::DeferredValueIf),
     ResourceRef {
         path: &'a AccessPath,
     },
@@ -4545,6 +4606,7 @@ pub enum DeferredValueRef<'a> {
         value: &'a Value,
         default: &'a Value,
     },
+    IntegerArithmetic(&'a crate::integer_arithmetic::ValidatedIntegerExpr),
     Interpolation(&'a [InterpolationPart]),
     FunctionCall {
         name: &'a str,
@@ -4572,6 +4634,10 @@ impl Value {
     /// plaintext must be excluded from diagnostics.
     pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+                .values()
+                .into_iter()
+                .any(Value::contains_diagnostic_sensitive_string),
             Value::Concrete(ConcreteValue::String(value)) => value.is_diagnostic_sensitive(),
             Value::Concrete(ConcreteValue::StringList(values)) => {
                 values.iter().any(ValueString::is_diagnostic_sensitive)
@@ -4609,6 +4675,10 @@ impl Value {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.contains_diagnostic_sensitive_string()
                     || default.contains_diagnostic_sensitive_string()
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().contains_diagnostic_sensitive_string()
+                    || expression.rhs().contains_diagnostic_sensitive_string()
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.contains_diagnostic_sensitive_string()
@@ -4666,10 +4736,14 @@ impl Value {
     pub fn as_deferred(&self) -> Option<DeferredValueRef<'_>> {
         match self {
             Value::Deferred(d) => Some(match d {
+                DeferredValue::ModuleIf(deferred) => DeferredValueRef::ModuleIf(deferred),
                 DeferredValue::ResourceRef { path } => DeferredValueRef::ResourceRef { path },
                 DeferredValue::BindingRef { binding } => DeferredValueRef::BindingRef { binding },
                 DeferredValue::Coalesce { value, default } => {
                     DeferredValueRef::Coalesce { value, default }
+                }
+                DeferredValue::IntegerArithmetic(expression) => {
+                    DeferredValueRef::IntegerArithmetic(expression)
                 }
                 DeferredValue::Interpolation(parts) => DeferredValueRef::Interpolation(parts),
                 DeferredValue::FunctionCall {
@@ -4867,6 +4941,10 @@ impl PartialEq for Value {
 
         match (self, other) {
             (
+                Value::Deferred(DeferredValue::ModuleIf(a)),
+                Value::Deferred(DeferredValue::ModuleIf(b)),
+            ) => a == b,
+            (
                 Value::Deferred(DeferredValue::Unknown(a @ UnknownReason::ModuleArgument { .. })),
                 Value::Deferred(DeferredValue::Unknown(b @ UnknownReason::ModuleArgument { .. })),
             ) => a == b,
@@ -4941,6 +5019,10 @@ impl PartialEq for Value {
                     default: bd,
                 }),
             ) => av == bv && ad == bd,
+            (
+                Value::Deferred(DeferredValue::IntegerArithmetic(a)),
+                Value::Deferred(DeferredValue::IntegerArithmetic(b)),
+            ) => a == b,
             (
                 Value::Deferred(DeferredValue::Interpolation(a)),
                 Value::Deferred(DeferredValue::Interpolation(b)),
@@ -5084,6 +5166,13 @@ impl Value {
     /// only has a `&mut Value` (e.g. inside `IndexMap::values_mut()`).
     pub fn canonicalize_in_place(&mut self) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                **deferred = deferred.map(|value| {
+                    let mut value = value.clone();
+                    value.canonicalize_in_place();
+                    value
+                });
+            }
             Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
                     item.canonicalize_in_place();
@@ -5098,6 +5187,18 @@ impl Value {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.canonicalize_in_place();
                 default.canonicalize_in_place();
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                let expression = expression.clone();
+                let original =
+                    Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+                let mut lhs = expression.lhs().clone();
+                let mut rhs = expression.rhs().clone();
+                lhs.canonicalize_in_place();
+                rhs.canonicalize_in_place();
+                *self = expression
+                    .evaluate_with_operands(lhs, rhs)
+                    .unwrap_or(original);
             }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
@@ -5200,6 +5301,11 @@ impl Value {
         f: &mut impl FnMut(&AccessPath, ResourceRefUsage),
     ) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred.values().into_iter().for_each(|value| {
+                    value.visit_resource_refs_with_usage_inner(usage, f);
+                });
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
@@ -5250,6 +5356,14 @@ impl Value {
                 value.visit_resource_refs_with_usage_inner(value_usage, f);
                 default.visit_resource_refs_with_usage_inner(default_usage, f);
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression
+                    .lhs()
+                    .visit_resource_refs_with_usage_inner(usage, f);
+                expression
+                    .rhs()
+                    .visit_resource_refs_with_usage_inner(usage, f);
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.visit_resource_refs_with_usage_inner(usage, f)
             }
@@ -5278,6 +5392,12 @@ impl Value {
     /// that needs both must call both — drift is visible at the call site.
     pub fn visit_binding_refs(&self, f: &mut impl FnMut(&str)) {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| value.visit_binding_refs(f));
+            }
             Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
@@ -5312,6 +5432,10 @@ impl Value {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.visit_binding_refs(f);
                 default.visit_binding_refs(f);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().visit_binding_refs(f);
+                expression.rhs().visit_binding_refs(f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_binding_refs(f),
             Value::Concrete(ConcreteValue::String(_))
@@ -5362,6 +5486,9 @@ pub fn contains_resource_ref(value: &Value) -> bool {
 /// `Value::Deferred(DeferredValue::Unknown)`.
 pub fn value_contains_unknown(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(value_contains_unknown)
+        }
         Value::Deferred(DeferredValue::Unknown(_)) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(value_contains_unknown),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unknown),
@@ -5382,6 +5509,9 @@ pub fn value_contains_unknown(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_unknown(value) || value_contains_unknown(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_contains_unknown(expression.lhs()) || value_contains_unknown(expression.rhs())
         }
         _ => false,
     }
@@ -5426,6 +5556,9 @@ pub(crate) fn find_unavailable_evaluation(
     )> {
         let recurse = |value| find(value, coalesce_policy, secret_policy, inside_secret);
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred.values().into_iter().find_map(recurse)
+            }
             Value::Deferred(DeferredValue::Unavailable {
                 name,
                 reason,
@@ -5464,6 +5597,9 @@ pub(crate) fn find_unavailable_evaluation(
                     UnavailableCoalescePolicy::ExcludeDefault => None,
                     UnavailableCoalescePolicy::IncludeDefault => recurse(default),
                 })
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                recurse(expression.lhs()).or_else(|| recurse(expression.rhs()))
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -5516,6 +5652,12 @@ impl Value {
     fn hash_into(&self, hasher: &mut impl Hasher) {
         std::mem::discriminant(self).hash(hasher);
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| value.hash_into(hasher));
+            }
             Value::Concrete(ConcreteValue::String(s)) => s.hash(hasher),
             Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.hash(hasher),
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.hash(hasher),
@@ -5578,6 +5720,11 @@ impl Value {
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.hash_into(hasher);
                 default.hash_into(hasher);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                expression.lhs().hash_into(hasher);
+                expression.op().hash(hasher);
+                expression.rhs().hash_into(hasher);
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 parts.len().hash(hasher);
@@ -6386,6 +6533,10 @@ fn pairing_hashes(
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
             hashes.push(secret_state_pairing_hash());
         }
+        // Arithmetic has its own canonical hash above. A nested Secret is
+        // normalized to an outer Secret by the evaluator before comparison,
+        // so operand hashes must not become candidate hashes for the result.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {}
         _ => {}
     }
     if let Some(attr_type) = attr_type {
@@ -6635,6 +6786,79 @@ fn similarity_score(
     }
 }
 
+/// The authored `prevent_destroy` setting.
+///
+/// `Unspecified` is distinct from an explicit `false`: only the latter opts a
+/// resource out of schema-default destruction protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PreventDestroy {
+    #[default]
+    Unspecified,
+    Explicit(bool),
+}
+
+/// Why a resource is protected from destruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreventDestroySource {
+    ExplicitDirective,
+    SchemaDefault,
+}
+
+/// Effective destruction protection after resolving a directive against its
+/// resource schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreventDestroyResolution {
+    NotProtected,
+    Protected(PreventDestroySource),
+}
+
+/// Whether the resource schema needed for directive resolution is available.
+///
+/// The named `Unavailable` branch keeps compatibility paths explicit. A
+/// missing registry lookup must not silently become schema-free resolution.
+#[derive(Debug, Clone, Copy)]
+pub enum ProviderDirectiveSchema<'a> {
+    Available(&'a ResourceSchema),
+    Unavailable,
+}
+
+impl PreventDestroyResolution {
+    /// Return the protection provenance, or `None` when destruction is allowed.
+    pub fn source(self) -> Option<PreventDestroySource> {
+        match self {
+            Self::NotProtected => None,
+            Self::Protected(source) => Some(source),
+        }
+    }
+}
+
+impl PreventDestroy {
+    /// Resolve the effective protection and its provenance.
+    ///
+    /// When a schema is unavailable, an unspecified directive preserves the
+    /// historical orphan-delete behavior and is not considered protected.
+    pub fn resolve(self, schema: ProviderDirectiveSchema<'_>) -> PreventDestroyResolution {
+        match self {
+            Self::Explicit(true) => {
+                PreventDestroyResolution::Protected(PreventDestroySource::ExplicitDirective)
+            }
+            Self::Explicit(false) => PreventDestroyResolution::NotProtected,
+            Self::Unspecified => match schema {
+                ProviderDirectiveSchema::Available(schema)
+                    if schema.prevents_destroy_by_default() =>
+                {
+                    PreventDestroyResolution::Protected(PreventDestroySource::SchemaDefault)
+                }
+                ProviderDirectiveSchema::Available(_) | ProviderDirectiveSchema::Unavailable => {
+                    PreventDestroyResolution::NotProtected
+                }
+            },
+        }
+    }
+}
+
 /// Carina-side directives for a resource.
 ///
 /// These are instructions to Carina about how to handle the resource,
@@ -6648,9 +6872,10 @@ pub struct Directives {
     /// If true, create the new resource before destroying the old one during replacement
     #[serde(default)]
     pub create_before_destroy: bool,
-    /// If true, prevent the resource from being destroyed
+    /// Authored destruction-protection setting. Private so effective policy
+    /// can only be obtained through [`PreventDestroy::resolve`].
     #[serde(default)]
-    pub prevent_destroy: bool,
+    prevent_destroy: PreventDestroy,
     /// Explicit ordering edges declared by the user. Each element is the
     /// binding name of a sibling `let` (resource / wait / module).
     /// Set semantics (deduplicated, order-insensitive); represented as
@@ -6681,7 +6906,7 @@ pub struct PersistedDirectives {
     #[serde(default)]
     pub create_before_destroy: bool,
     #[serde(default)]
-    pub prevent_destroy: bool,
+    prevent_destroy: PreventDestroy,
     #[serde(
         default,
         skip_serializing_if = "PersistedDestroyDependencies::is_empty"
@@ -6689,6 +6914,253 @@ pub struct PersistedDirectives {
     pub depends_on: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
+}
+
+/// A persisted directive field recorded in a state-only change set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedDirectiveField {
+    ForceDelete,
+    CreateBeforeDestroy,
+    PreventDestroy,
+    DependsOn,
+    ProviderInstance,
+}
+
+impl PersistedDirectiveField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ForceDelete => "force_delete",
+            Self::CreateBeforeDestroy => "create_before_destroy",
+            Self::PreventDestroy => "prevent_destroy",
+            Self::DependsOn => "depends_on",
+            Self::ProviderInstance => "provider_instance",
+        }
+    }
+}
+
+impl Display for PersistedDirectiveField {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Typed value carried by one side of a persisted directive field change.
+///
+/// The untagged representation keeps machine-readable plan JSON natural:
+/// booleans remain booleans, dependency sets are arrays, provider instances
+/// are strings or null, and [`PreventDestroy`] retains its tagged tri-state
+/// shape. Equality therefore compares semantic values rather than labels
+/// produced for terminal rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedDirectiveFieldValue {
+    Boolean(bool),
+    PreventDestroy(PreventDestroy),
+    DependsOn(PersistedDestroyDependencies),
+    ProviderInstance(Option<String>),
+}
+
+impl PersistedDirectiveFieldValue {
+    fn render(&self) -> String {
+        match self {
+            Self::Boolean(value) => value.to_string(),
+            Self::PreventDestroy(value) => prevent_destroy_label(*value).to_string(),
+            Self::DependsOn(dependencies) => dependencies_label(dependencies),
+            Self::ProviderInstance(provider_instance) => {
+                provider_instance_label(provider_instance.as_deref())
+            }
+        }
+    }
+}
+
+/// One persisted directive field whose authored value changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDirectiveFieldChange {
+    name: PersistedDirectiveField,
+    from: PersistedDirectiveFieldValue,
+    to: PersistedDirectiveFieldValue,
+}
+
+impl PersistedDirectiveFieldChange {
+    pub fn name(&self) -> PersistedDirectiveField {
+        self.name
+    }
+
+    pub fn rendered_from(&self) -> String {
+        self.from.render()
+    }
+
+    pub fn rendered_to(&self) -> String {
+        self.to.render()
+    }
+}
+
+impl Directives {
+    pub fn with_force_delete(mut self, value: bool) -> Self {
+        self.force_delete = value;
+        self
+    }
+
+    pub fn with_create_before_destroy(mut self, value: bool) -> Self {
+        self.create_before_destroy = value;
+        self
+    }
+
+    pub fn with_depends_on(mut self, depends_on: crate::parser::UnexpandedDependencies) -> Self {
+        self.depends_on = depends_on;
+        self
+    }
+
+    pub fn with_provider_instance(mut self, provider_instance: impl Into<String>) -> Self {
+        self.provider_instance = Some(provider_instance.into());
+        self
+    }
+
+    pub(crate) fn prevent_destroy_setting(&self) -> PreventDestroy {
+        self.prevent_destroy
+    }
+
+    /// Whether this authored setting explicitly protects destruction without
+    /// consulting a schema.
+    pub fn explicitly_prevents_destroy(&self) -> bool {
+        matches!(self.prevent_destroy, PreventDestroy::Explicit(true))
+    }
+
+    pub fn set_prevent_destroy(&mut self, value: bool) {
+        self.prevent_destroy = PreventDestroy::Explicit(value);
+    }
+
+    pub fn with_prevent_destroy(mut self, value: bool) -> Self {
+        self.set_prevent_destroy(value);
+        self
+    }
+}
+
+impl PersistedDirectives {
+    /// Project a desired resource into the exact directive shape written to
+    /// state. Provider routing falls back to the resolved resource ID when the
+    /// authored directive uses the provider kind's default instance.
+    pub fn desired_for<S>(resource: &ResolvedResource<S>) -> Self {
+        let mut desired = Self::from_resolved(
+            &resource.directives,
+            resource.persisted_explicit_destroy_dependencies().clone(),
+        );
+        if desired.provider_instance.is_none() {
+            desired.provider_instance = resource.id.provider_instance.clone();
+        }
+        desired
+    }
+
+    /// Describe every persisted field that differs between the current and
+    /// desired projections.
+    ///
+    /// Both values are destructured exhaustively so adding a persisted field
+    /// requires this comparison to be updated. `depends_on` follows its
+    /// documented set semantics rather than source-order semantics.
+    pub fn field_changes_to(&self, desired: &Self) -> Vec<PersistedDirectiveFieldChange> {
+        let PersistedDirectives {
+            force_delete: current_force_delete,
+            create_before_destroy: current_create_before_destroy,
+            prevent_destroy: current_prevent_destroy,
+            depends_on: current_depends_on,
+            provider_instance: current_provider_instance,
+        } = self;
+        let PersistedDirectives {
+            force_delete: desired_force_delete,
+            create_before_destroy: desired_create_before_destroy,
+            prevent_destroy: desired_prevent_destroy,
+            depends_on: desired_depends_on,
+            provider_instance: desired_provider_instance,
+        } = desired;
+
+        let mut fields = Vec::new();
+        if current_force_delete != desired_force_delete {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::ForceDelete,
+                from: PersistedDirectiveFieldValue::Boolean(*current_force_delete),
+                to: PersistedDirectiveFieldValue::Boolean(*desired_force_delete),
+            });
+        }
+        if current_create_before_destroy != desired_create_before_destroy {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::CreateBeforeDestroy,
+                from: PersistedDirectiveFieldValue::Boolean(*current_create_before_destroy),
+                to: PersistedDirectiveFieldValue::Boolean(*desired_create_before_destroy),
+            });
+        }
+        if current_prevent_destroy != desired_prevent_destroy {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::PreventDestroy,
+                from: PersistedDirectiveFieldValue::PreventDestroy(*current_prevent_destroy),
+                to: PersistedDirectiveFieldValue::PreventDestroy(*desired_prevent_destroy),
+            });
+        }
+
+        if current_depends_on != desired_depends_on {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::DependsOn,
+                from: PersistedDirectiveFieldValue::DependsOn(current_depends_on.clone()),
+                to: PersistedDirectiveFieldValue::DependsOn(desired_depends_on.clone()),
+            });
+        }
+        if current_provider_instance != desired_provider_instance {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::ProviderInstance,
+                from: PersistedDirectiveFieldValue::ProviderInstance(
+                    current_provider_instance.clone(),
+                ),
+                to: PersistedDirectiveFieldValue::ProviderInstance(
+                    desired_provider_instance.clone(),
+                ),
+            });
+        }
+        fields
+    }
+
+    /// Return the authored tri-state destruction-protection setting stored in state.
+    pub fn prevent_destroy_setting(&self) -> PreventDestroy {
+        self.prevent_destroy
+    }
+
+    /// Whether this persisted setting protects destruction without consulting
+    /// a schema. Used by state-shell retention, which intentionally has no
+    /// schema registry.
+    pub fn explicitly_prevents_destroy(&self) -> bool {
+        matches!(self.prevent_destroy, PreventDestroy::Explicit(true))
+    }
+
+    pub fn set_prevent_destroy(&mut self, value: bool) {
+        self.prevent_destroy = PreventDestroy::Explicit(value);
+    }
+
+    pub fn with_prevent_destroy(mut self, value: bool) -> Self {
+        self.set_prevent_destroy(value);
+        self
+    }
+}
+
+fn prevent_destroy_label(value: PreventDestroy) -> &'static str {
+    match value {
+        PreventDestroy::Unspecified => "unspecified",
+        PreventDestroy::Explicit(false) => "false",
+        PreventDestroy::Explicit(true) => "true",
+    }
+}
+
+fn dependencies_label(dependencies: &PersistedDestroyDependencies) -> String {
+    format!(
+        "[{}]",
+        dependencies
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn provider_instance_label(provider_instance: Option<&str>) -> String {
+    provider_instance.unwrap_or("unspecified").to_string()
 }
 
 impl PersistedDirectives {
@@ -6716,13 +7188,23 @@ impl PersistedDirectives {
 
 impl From<&PersistedDirectives> for Directives {
     fn from(directives: &PersistedDirectives) -> Self {
+        let PersistedDirectives {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on,
+            provider_instance,
+        } = directives;
         Self {
-            force_delete: directives.force_delete,
-            create_before_destroy: directives.create_before_destroy,
-            prevent_destroy: directives.prevent_destroy,
-            depends_on: crate::parser::UnexpandedDependencies::default(),
+            force_delete: *force_delete,
+            create_before_destroy: *create_before_destroy,
+            prevent_destroy: *prevent_destroy,
+            depends_on: {
+                let _persisted_dependencies = depends_on;
+                crate::parser::UnexpandedDependencies::default()
+            },
             ignore_changes: Vec::new(),
-            provider_instance: directives.provider_instance.clone(),
+            provider_instance: provider_instance.clone(),
         }
     }
 }
@@ -8313,6 +8795,9 @@ pub(crate) fn assert_value_fully_resolved(
 ) -> Result<(), crate::value::SerializationError> {
     let context = crate::value::SerializationContext::WasmBoundary;
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(crate::value::SerializationError::UnexpandedModuleIf { context })
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
                 assert_value_fully_resolved(item)?;
@@ -8343,6 +8828,9 @@ pub(crate) fn assert_value_fully_resolved(
         }
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(crate::value::SerializationError::UnresolvedCoalesce { context })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(crate::value::SerializationError::UnresolvedIntegerArithmetic { context })
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(crate::value::SerializationError::UnresolvedInterpolation { context })

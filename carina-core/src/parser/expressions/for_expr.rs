@@ -378,7 +378,7 @@ pub(crate) fn parse_for_expr(
         if var == "_" || identifier_appears_in(body_text, var) {
             continue;
         }
-        ctx.warnings.push(ParseWarning {
+        ctx.push_warning(ParseWarning {
             file: None,
             line: for_line,
             kind: WarningKind::UnusedForBinding,
@@ -436,7 +436,8 @@ pub(crate) fn parse_for_expr(
                     }
                     Some(
                         UnexpandedStructuralHandleMetadata::Handle { .. }
-                        | UnexpandedStructuralHandleMetadata::Map(_),
+                        | UnexpandedStructuralHandleMetadata::Map(_)
+                        | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -478,7 +479,8 @@ pub(crate) fn parse_for_expr(
                     }
                     Some(
                         UnexpandedStructuralHandleMetadata::Handle { .. }
-                        | UnexpandedStructuralHandleMetadata::Map(_),
+                        | UnexpandedStructuralHandleMetadata::Map(_)
+                        | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -524,7 +526,8 @@ pub(crate) fn parse_for_expr(
                     }
                     Some(
                         UnexpandedStructuralHandleMetadata::Handle { .. }
-                        | UnexpandedStructuralHandleMetadata::List(_),
+                        | UnexpandedStructuralHandleMetadata::List(_)
+                        | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
                     )
                     | None => None,
                 };
@@ -555,15 +558,13 @@ pub(crate) fn parse_for_expr(
         // not collapse to the default before the reference snapshot is known
         // to be complete.
         (_, Value::Deferred(_)) => {
-            let iterable_surface =
-                if let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-                    ..
-                })) = &iterable
-                {
-                    iterable_surface.clone()
-                } else {
-                    crate::value::format_value(&iterable)
-                };
+            let iterable_surface = match &iterable {
+                Value::Deferred(
+                    DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })
+                    | DeferredValue::ModuleIf(_),
+                ) => iterable_surface.clone(),
+                _ => crate::value::format_value(&iterable),
+            };
             let header = deferred_for_header(&binding, &iterable_surface);
             record_deferred_for_expression(
                 body_pair.clone(),
@@ -640,6 +641,9 @@ pub(crate) fn parse_for_expr(
                     }
                     Value::Deferred(DeferredValue::ResourceRef { path }) => {
                         format!("unresolved reference {}", path.to_dot_string())
+                    }
+                    value @ Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+                        crate::ValueDescription::of(value).to_string()
                     }
                     Value::Concrete(ConcreteValue::List(_)) => "list".to_string(),
                     Value::Concrete(ConcreteValue::Map(_)) => "map".to_string(),

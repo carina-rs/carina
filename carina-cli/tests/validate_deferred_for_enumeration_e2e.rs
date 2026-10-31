@@ -304,6 +304,34 @@ fn validate_enumerates_deferred_for_body_over_same_config_read_attr() {
 }
 
 #[test]
+fn validate_lists_authored_module_if_iterable_expression() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"arguments {
+  flag: Bool
+  enabled: list(String)
+  disabled: list(String)
+}
+let names = if flag { enabled } else { disabled }
+let resources = for name in names {
+  aws.route53.RecordSet { name = name }
+}
+"#,
+    )]);
+
+    let ids = carina_cli::commands::validate::validated_resource_ids_with_factories(
+        fixture.path(),
+        factories(),
+    );
+    let listing = ids.join("\n");
+    assert!(
+        listing.contains("deferred: for name in names"),
+        "validate did not preserve the authored iterable expression: {listing}",
+    );
+    assert!(!listing.contains("unresolved module argument"), "{listing}");
+}
+
+#[test]
 fn validate_reports_runtime_deferred_module_call_body_at_resolution_seam() {
     let fixture = write_fixture(&[
         ("providers.crn", "provider aws { region = 'us-east-1' }\n"),

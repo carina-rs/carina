@@ -39,6 +39,12 @@ identities are rejected while decoding. The registry retains one table per
 schema owner rather than one global identity table. Owner forms also contribute
 to semantic schema fingerprint encoding v5.
 
+Every resource schema JSON record also carries the required boolean
+`default_prevent_destroy`. Providers use it for resource kinds whose deletion
+is intrinsically dangerous. There is no serde default: a provider that omits
+the field fails to load instead of silently disabling protection. This is a
+JSON schema-record change only; the WIT world and protocol version remain 13.
+
 State format 20 adds `create_outcome_unknown`, a token-less current instance
 containing only the create's UTC `started_at` timestamp. The host writes this
 row when an initial guest create fails after at least one host-approved request
@@ -48,6 +54,11 @@ provider read. Recovery is explicit: import replaces it when the resource
 exists, while `carina state forget` clears only the current instance after the
 operator confirms the resource is absent; any deposed generations remain
 tracked for deletion.
+
+State format 20 also stores `prevent_destroy` as a tri-state directive. During
+the v19→v20 migration, legacy `true` becomes explicit true, while legacy
+`false` or a missing field becomes unspecified. Unspecified state rows inherit
+the resource schema default; an explicit false is the only persisted opt-out.
 
 Saved-plan format 31 persists authored `ignore_changes` paths for schema-time
 re-resolution. Format 30 was never emitted; provider protocol v13 uses format
@@ -62,6 +73,28 @@ or accounts remain distinct. The format also records an outcome-unknown marker
 and its `started_at` timestamp, never an identifier or continuation token.
 Apply reloads that marker under the state lock and rejects any lifecycle or
 timestamp change before provider effects run.
+
+Saved-plan format 33 adds typed keyed-list release effects. Saved-plan format
+34 adds the structural `IntegerArithmetic` deferred value so an Int expression
+whose operands become known during apply is preserved without lowering to a
+builtin or string. Older plans are rejected with the standard replan guidance;
+the state format is unchanged.
+
+Saved-plan format 35 stores the same tri-state directive shape and the exact
+state-only directive change set shown during planning. The set contains only
+desired resources that have no managed mutation in the execution plan; a
+resource handled by create, update, replace, move, or another mutating effect
+persists its directives through normal state writeback instead. Each entry
+carries the full routed resource ID and typed per-field `from`/`to` values.
+Saved-plan apply recomputes the set against locked state and compares those
+typed identities and values, refusing a mismatch with re-plan guidance before
+provider effects run. Format 34 plans cannot distinguish explicit false from
+an unspecified value and must be regenerated.
+
+Saved-plan format 36 stores complete resolved dependency addresses and the
+graph-projected destroy dependencies used by typed module handles and legacy
+state migration. Format 35 plans contain binding text rather than that typed
+projection and must be regenerated.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host

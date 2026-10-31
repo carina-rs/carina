@@ -23,7 +23,10 @@ use crate::DetailLevel;
 use crate::display::{
     format_destroy_plan_with_delete_instances, format_plan_with_delete_instances,
 };
-use crate::fixture_plan::{FixturePlan, build_plan_from_fixture_name, provider_router_for_plan};
+use crate::fixture_plan::{
+    FixturePlan, build_fixture_plan_change_summary, build_plan_from_fixture_name,
+    provider_router_for_plan,
+};
 use crate::moved_hint::MovedBlockHint;
 use crate::plan_summary::PlanChangeSummary;
 
@@ -42,7 +45,7 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     let deferred_for_expressions = crate::plan_summary::resolved_deferred_for_for_test(
         deferred_for_expressions.iter().cloned(),
     );
-    let summary = PlanChangeSummary::new(plan, export_changes, &deferred_for_expressions);
+    let summary = PlanChangeSummary::new(plan, export_changes, &deferred_for_expressions, &[]);
     let provider = provider_router_for_plan(plan);
     format_plan_with_delete_instances(
         plan,
@@ -196,6 +199,26 @@ fn snapshot_postfix_access() {
     ));
 
     insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deferred_integer_arithmetic_is_structural() {
+    let expression = carina_core::integer_arithmetic::evaluate_integer_values(
+        carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Unknown(
+            carina_core::resource::UnknownReason::ForValue,
+        )),
+        carina_core::integer_arithmetic::IntegerOp::Divide,
+        carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::Int(60)),
+        carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("deferred Int arithmetic must be structurally valid");
+    let rendered = carina_core::plan_tree::render_deferred_for_template_value(
+        &expression,
+        "source",
+        "applies",
+    );
+
+    insta::assert_snapshot!(rendered.plain(), @"(known after source applies) / 60");
 }
 
 #[test]
@@ -615,6 +638,35 @@ fn snapshot_no_changes() {
         None,
         None,
     ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_state_only_directive_change() {
+    let fp = build_plan_from_fixture_name("state_only_directive_change");
+    assert!(
+        fp.plan.effects().is_empty(),
+        "the fixture must contain no provider-visible effects"
+    );
+    let summary = build_fixture_plan_change_summary(&fp);
+    let provider = provider_router_for_plan(&fp.plan);
+    let historical_display =
+        carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&fp.plan);
+    let output = strip_ansi(
+        &format_plan_with_delete_instances(
+            &fp.plan,
+            &summary,
+            DetailLevel::Full,
+            &historical_display,
+            Some(&fp.schemas),
+            &fp.moved_origins,
+            Some(&fp.prev_explicit),
+            Some(&fp.expansion_trace),
+            &provider,
+        )
+        .expect("state-only fixture plan must render"),
+    );
+
     insta::assert_snapshot!(output);
 }
 

@@ -12,10 +12,10 @@ use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateObservation,
     CreateOutcome, CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Provider,
-    ProviderError, ProviderErrorKind, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
-    ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome,
-    ResumeOutcomeKind, SavedAttrs, Sent, SentRecord, UnobservedReason, UpdateRequest,
-    hydrate_provider_states, normalize_provider_states,
+    ProviderDirectiveSchema, ProviderError, ProviderErrorKind, ProviderFactory,
+    ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest, ResumeFailure,
+    ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind, SavedAttrs, Sent, SentRecord,
+    UnobservedReason, UpdateRequest, hydrate_provider_states, normalize_provider_states,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, EnumValueResolver, ProviderResource,
@@ -44,6 +44,13 @@ fn mock_http_load(bytes: &[u8]) -> VerifiedLoad {
 
 fn mock_identifier() -> AppliedIdentifier {
     AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty")
+}
+
+fn delete_request_without_schema() -> DeleteRequest {
+    DeleteRequest::resolve(
+        &carina_core::resource::Directives::default(),
+        ProviderDirectiveSchema::Unavailable,
+    )
 }
 
 fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
@@ -1299,7 +1306,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
     let delete_started = Instant::now();
     provider
         .provider()
-        .delete(&id, &mock_identifier(), DeleteRequest::default())
+        .delete(&id, &mock_identifier(), delete_request_without_schema())
         .await
         .expect("pending delete should settle");
     assert!(
@@ -3054,7 +3061,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     // Delete
     provider
         .provider()
-        .delete(&id, &mock_identifier(), DeleteRequest::default())
+        .delete(&id, &mock_identifier(), delete_request_without_schema())
         .await
         .expect("delete should succeed");
 

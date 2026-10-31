@@ -4,6 +4,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use super::DeferredStructuralIf;
 use super::ast::{
     AttributePath, AttributePathSegment, BareBindingKind, BareBindingSource, BareBindingUse,
     BindingScopeId, BindingUseOwner, ModuleCallId, ParsedBindingUses, ParsedDeferredForExpression,
@@ -91,13 +92,15 @@ pub(crate) struct ParseContext<'cfg> {
     /// `ParsedFile.providers` by the top-level parse loop.
     pub(super) named_provider_instances: Vec<ProviderConfig>,
     /// Non-fatal warnings collected during parsing
-    pub(super) warnings: Vec<ParseWarning>,
+    warnings: Rc<RefCell<Vec<ParseWarning>>>,
     /// Deferred for-expressions collected during parsing.
     ///
     /// The resource-only resolved representation is produced later by the
     /// module-resolution seam; parser output has exactly one deferred-loop
     /// source of truth.
     pub(super) parsed_deferred_for_expressions: Vec<ParsedDeferredForExpression>,
+    /// Module-argument-dependent structural `if` templates.
+    pub(super) deferred_module_ifs: Vec<DeferredStructuralIf>,
     /// Names pre-registered via the directory-aware seed pass
     /// (`parse_with_seeded_bindings`). Excluded from local duplicate-
     /// binding checks, so a `let role = ...` in this file does not
@@ -120,6 +123,10 @@ pub(crate) struct ParseContext<'cfg> {
     pub(super) binding_scope: BindingScopeId,
     binding_scope_source_file: std::path::PathBuf,
     next_binding_scope: Rc<Cell<u64>>,
+    /// The exact preprocessing map for the file whose pest pairs are being
+    /// lowered. Shared ownership lets nested parser contexts preserve authored
+    /// positions without exposing a raw line/column constructor.
+    source_position_map: Option<Arc<crate::heredoc::PreprocessResult>>,
 }
 
 impl<'cfg> ParseContext<'cfg> {
@@ -137,8 +144,9 @@ impl<'cfg> ParseContext<'cfg> {
             upstream_states: HashMap::new(),
             wait_bindings: HashMap::new(),
             named_provider_instances: Vec::new(),
-            warnings: Vec::new(),
+            warnings: Rc::new(RefCell::new(Vec::new())),
             parsed_deferred_for_expressions: Vec::new(),
+            deferred_module_ifs: Vec::new(),
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
@@ -146,12 +154,34 @@ impl<'cfg> ParseContext<'cfg> {
             binding_scope: BindingScopeId::root(std::path::Path::new("test.crn")),
             binding_scope_source_file: std::path::PathBuf::from("test.crn"),
             next_binding_scope: Rc::new(Cell::new(1)),
+            source_position_map: None,
         }
+    }
+
+    pub(super) fn set_preprocessed_file(&mut self, file: &super::PreprocessedFile) {
+        self.source_position_map = Some(file.shared_position_map());
+    }
+
+    pub(super) fn original_position(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> Result<crate::heredoc::OriginalPosition, ParseError> {
+        self.source_position_map
+            .as_ref()
+            .map(|map| map.original_position(pair.as_span().start()))
+            .ok_or_else(|| ParseError::InternalError {
+                expected: "original-source position map".to_string(),
+                context: format!("lowering {:?} from preprocessed source", pair.as_rule()),
+            })
     }
 
     pub(super) fn set_source_scope(&mut self, source_file: &std::path::Path) {
         self.binding_scope = BindingScopeId::root(source_file);
         self.binding_scope_source_file = source_file.to_path_buf();
+    }
+
+    pub(super) fn source_file(&self) -> &std::path::Path {
+        &self.binding_scope_source_file
     }
 
     pub(super) fn child_scope(&self) -> Self {
@@ -166,6 +196,30 @@ impl<'cfg> ParseContext<'cfg> {
 
     pub(super) fn take_parsed_binding_uses(&self) -> ParsedBindingUses {
         std::mem::take(&mut *self.parsed_binding_uses.borrow_mut())
+    }
+
+    pub(super) fn push_warning(&self, warning: ParseWarning) {
+        self.warnings.borrow_mut().push(warning);
+    }
+
+    pub(super) fn extend_warnings(&self, warnings: impl IntoIterator<Item = ParseWarning>) {
+        self.warnings.borrow_mut().extend(warnings);
+    }
+
+    pub(super) fn take_warnings(&self) -> Vec<ParseWarning> {
+        let warnings = std::mem::take(&mut *self.warnings.borrow_mut());
+        let mut deduplicated = Vec::with_capacity(warnings.len());
+        for warning in warnings {
+            if !deduplicated.contains(&warning) {
+                deduplicated.push(warning);
+            }
+        }
+        deduplicated
+    }
+
+    pub(super) fn restore_warnings(&self, mut warnings: Vec<ParseWarning>) {
+        warnings.append(&mut self.take_warnings());
+        *self.warnings.borrow_mut() = warnings;
     }
 
     pub(super) fn remap_binding_use_resource(&self, from: &ResourceId, to: &ResourceId) {
@@ -404,6 +458,14 @@ pub(super) enum StructuralSinkMode {
 #[derive(Clone)]
 pub(crate) struct ExpressionMode<'a> {
     sink: Option<ExpressionSink<'a>>,
+    source: Option<IntegerOperandContext<'a>>,
+    is_integer_operand: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IntegerOperandContext<'a> {
+    pub(crate) source_file: &'a std::path::Path,
+    pub(crate) preprocessed_file: &'a super::PreprocessedFile,
 }
 
 #[derive(Clone)]
@@ -418,7 +480,11 @@ struct ExpressionSink<'a> {
 
 impl ExpressionMode<'_> {
     pub(super) const fn untyped() -> Self {
-        Self { sink: None }
+        Self {
+            sink: None,
+            source: None,
+            is_integer_operand: false,
+        }
     }
 }
 
@@ -437,6 +503,11 @@ impl<'a> ExpressionMode<'a> {
                 preprocessed_file,
                 structural: StructuralSinkMode::Pending,
             }),
+            source: Some(IntegerOperandContext {
+                source_file,
+                preprocessed_file,
+            }),
+            is_integer_operand: false,
         }
     }
 
@@ -462,12 +533,53 @@ impl<'a> ExpressionMode<'a> {
                 preprocessed_file,
                 structural,
             }),
+            source: Some(IntegerOperandContext {
+                source_file,
+                preprocessed_file,
+            }),
+            is_integer_operand: false,
+        }
+    }
+
+    pub(super) const fn with_source(
+        source_file: &'a std::path::Path,
+        preprocessed_file: &'a super::PreprocessedFile,
+    ) -> Self {
+        Self {
+            sink: None,
+            source: Some(IntegerOperandContext {
+                source_file,
+                preprocessed_file,
+            }),
+            is_integer_operand: false,
+        }
+    }
+
+    pub(super) fn for_integer_operand(&self) -> Self {
+        let source = self.source.or_else(|| {
+            self.sink.as_ref().map(|sink| IntegerOperandContext {
+                source_file: sink.source_file,
+                preprocessed_file: sink.preprocessed_file,
+            })
+        });
+        Self {
+            sink: None,
+            source,
+            is_integer_operand: true,
+        }
+    }
+
+    pub(super) const fn integer_operand_context(&self) -> Option<IntegerOperandContext<'a>> {
+        if self.is_integer_operand {
+            self.source
+        } else {
+            None
         }
     }
 
     pub(super) fn at_attribute(&self, name: impl Into<String>) -> Self {
         let Some(sink) = &self.sink else {
-            return Self::untyped();
+            return self.clone();
         };
         let path = AttributePath::root(name);
         Self {
@@ -476,6 +588,8 @@ impl<'a> ExpressionMode<'a> {
                 path,
                 ..sink.clone()
             }),
+            source: self.source,
+            is_integer_operand: self.is_integer_operand,
         }
     }
 
@@ -484,7 +598,7 @@ impl<'a> ExpressionMode<'a> {
         match self.sink.as_ref() {
             Some(sink) if sink.root_path.root_name() == "<resource>" => self.at_attribute(name),
             Some(_) => self.at_struct_field(name),
-            None => Self::untyped(),
+            None => self.clone(),
         }
     }
 
@@ -502,7 +616,7 @@ impl<'a> ExpressionMode<'a> {
 
     fn with_segment(&self, segment: AttributePathSegment) -> Self {
         let Some(sink) = &self.sink else {
-            return Self::untyped();
+            return self.clone();
         };
         Self {
             sink: Some(ExpressionSink {
@@ -514,6 +628,8 @@ impl<'a> ExpressionMode<'a> {
                 structural: StructuralSinkMode::Pending,
                 ..sink.clone()
             }),
+            source: self.source,
+            is_integer_operand: self.is_integer_operand,
         }
     }
 

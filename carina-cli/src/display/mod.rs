@@ -287,6 +287,37 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
     out
 }
 
+pub(crate) fn format_persisted_directive_changes(
+    changes: &[crate::commands::shared::state_writeback::PersistedDirectiveChange],
+) -> String {
+    let mut out = String::new();
+    writeln!(out, "{}", "State-only directive updates:".cyan().bold()).unwrap();
+    writeln!(out).unwrap();
+    for (index, change) in changes.iter().enumerate() {
+        if index > 0 {
+            writeln!(out).unwrap();
+        }
+        writeln!(
+            out,
+            "  {} {}",
+            "~".yellow(),
+            change.resource_id.to_string().cyan().bold()
+        )
+        .unwrap();
+        for field in &change.fields {
+            writeln!(
+                out,
+                "    {}: {} -> {}",
+                field.name(),
+                field.rendered_from(),
+                field.rendered_to()
+            )
+            .unwrap();
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
     plan: &Plan<S>,
@@ -349,76 +380,107 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
         return Ok(out);
     }
 
-    writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
-    writeln!(out).unwrap();
-
-    let historical_display = historical_display.historical_display(plan);
-    out.push_str(&format_plan_tree(
-        plan,
-        detail,
-        &historical_display,
-        schemas,
-        moved_origins,
-        prev_explicit,
-        expansion_trace,
-        provider,
-    )?);
-    append_destroy_ordering_warnings(&mut out, plan);
-
-    // Show deferred for-expressions
-    for deferred in summary.residual_deferred_for() {
-        out.push_str(&format_deferred_for_expression(deferred));
-    }
-
-    // Show export changes if any
     let export_changes = summary.export_changes();
-    if !export_changes.is_empty() {
+    if summary.has_non_directive_changes() {
+        writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
         writeln!(out).unwrap();
-        writeln!(out, "{}", "Exports:".cyan().bold()).unwrap();
-        writeln!(out).unwrap();
-        for change in export_changes {
-            out.push_str(&format_export_change(change));
+
+        let historical_display = historical_display.historical_display(plan);
+        out.push_str(&format_plan_tree(
+            plan,
+            detail,
+            &historical_display,
+            schemas,
+            moved_origins,
+            prev_explicit,
+            expansion_trace,
+            provider,
+        )?);
+        append_destroy_ordering_warnings(&mut out, plan);
+
+        // Show deferred for-expressions
+        for deferred in summary.residual_deferred_for() {
+            out.push_str(&format_deferred_for_expression(deferred));
+        }
+
+        // Show export changes if any
+        if !export_changes.is_empty() {
+            writeln!(out).unwrap();
+            writeln!(out, "{}", "Exports:".cyan().bold()).unwrap();
+            writeln!(out).unwrap();
+            for change in export_changes {
+                out.push_str(&format_export_change(change));
+            }
         }
     }
 
+    let persisted_directive_changes = summary.persisted_directive_changes();
+    if !persisted_directive_changes.is_empty() {
+        if summary.has_non_directive_changes() {
+            writeln!(out).unwrap();
+        }
+        out.push_str(&format_persisted_directive_changes(
+            persisted_directive_changes,
+        ));
+    }
+
     writeln!(out).unwrap();
-    let mut parts: Vec<String> = summary
-        .text_parts()
-        .iter()
-        .copied()
-        .map(|part| match part {
-            PlanSummaryPart::Read { count } => format!("{} to read", count.to_string().cyan()),
-            PlanSummaryPart::Import { count } => format!("{} to import", count.to_string().cyan()),
-            PlanSummaryPart::Create { count } => {
-                let count = count.to_string().green();
-                format!("{} to add", count)
-            }
-            PlanSummaryPart::Update { count } => {
-                format!("{} to change", count.to_string().yellow())
-            }
-            PlanSummaryPart::Replace { count } => {
-                format!("{} to replace", count.to_string().magenta())
-            }
-            PlanSummaryPart::Delete { count } => {
-                format!("{} to destroy", count.to_string().red())
-            }
-            PlanSummaryPart::Remove { count } => {
-                // carina#3332: state-only removal is not a destructive failure;
-                // color the count yellow to agree with the `~` Remove row in
-                // the tree above instead of red (which pairs with `✗`/Delete).
-                format!("{} to remove from state", count.to_string().yellow())
-            }
-            PlanSummaryPart::Move { count } => format!("{} to move", count.to_string().yellow()),
-            PlanSummaryPart::Release { count } => {
-                format!("{} to release", count.to_string().yellow())
-            }
-            PlanSummaryPart::Wait { count } => format!("{} to wait", count.to_string().magenta()),
-        })
-        .collect();
+    let mut parts: Vec<String> = if summary.has_non_directive_changes() {
+        summary
+            .text_parts()
+            .iter()
+            .copied()
+            .map(|part| match part {
+                PlanSummaryPart::Read { count } => format!("{} to read", count.to_string().cyan()),
+                PlanSummaryPart::Import { count } => {
+                    format!("{} to import", count.to_string().cyan())
+                }
+                PlanSummaryPart::Create { count } => {
+                    let count = count.to_string().green();
+                    format!("{} to add", count)
+                }
+                PlanSummaryPart::Update { count } => {
+                    format!("{} to change", count.to_string().yellow())
+                }
+                PlanSummaryPart::Replace { count } => {
+                    format!("{} to replace", count.to_string().magenta())
+                }
+                PlanSummaryPart::Delete { count } => {
+                    format!("{} to destroy", count.to_string().red())
+                }
+                PlanSummaryPart::Remove { count } => {
+                    // carina#3332: state-only removal is not a destructive failure;
+                    // color the count yellow to agree with the `~` Remove row in
+                    // the tree above instead of red (which pairs with `✗`/Delete).
+                    format!("{} to remove from state", count.to_string().yellow())
+                }
+                PlanSummaryPart::Move { count } => {
+                    format!("{} to move", count.to_string().yellow())
+                }
+                PlanSummaryPart::Release { count } => {
+                    format!("{} to release", count.to_string().yellow())
+                }
+                PlanSummaryPart::Wait { count } => {
+                    format!("{} to wait", count.to_string().magenta())
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if !export_changes.is_empty() {
         parts.push(format!(
             "{} export change(s)",
             export_changes.len().to_string().cyan()
+        ));
+    }
+    if !persisted_directive_changes.is_empty() {
+        let count = persisted_directive_changes.len();
+        let noun = if count == 1 { "change" } else { "changes" };
+        parts.push(format!(
+            "{} resource directive {}",
+            count.to_string().yellow(),
+            noun
         ));
     }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();

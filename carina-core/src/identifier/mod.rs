@@ -1006,6 +1006,12 @@ pub fn reconcile_prefixed_names(
 /// so the output is consistent across runs (HashMap iteration order is random).
 fn deterministic_value_string(value: &Value) -> String {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
+            "ModuleIf({}, {}, {})",
+            deterministic_value_string(deferred.condition().value()),
+            deterministic_value_string(deferred.then_value()),
+            deterministic_value_string(deferred.else_value())
+        ),
         Value::Concrete(ConcreteValue::String(s)) => {
             format!("String({:?})", s.expose_plaintext())
         }
@@ -1049,6 +1055,12 @@ fn deterministic_value_string(value: &Value) -> String {
             "Coalesce({}, {})",
             deterministic_value_string(value),
             deterministic_value_string(default)
+        ),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => format!(
+            "IntegerArithmetic({:?}, {}, {})",
+            expression.op(),
+            deterministic_value_string(expression.lhs()),
+            deterministic_value_string(expression.rhs())
         ),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;

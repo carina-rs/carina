@@ -3,7 +3,7 @@
 
 use pest::iterators::Pair;
 
-use crate::eval_value::EvalValue;
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandleKind};
 use crate::parser::context::{ParseBindingRef, ParseContext};
 use crate::parser::{ParseError, Rule, TypeExpr, UnexpandedDependencyOperand};
 use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
@@ -25,7 +25,12 @@ pub(in crate::parser) fn parse_dependency_operand(
 ) -> Result<UnexpandedDependencyOperand, ParseError> {
     let line = expression.line_col().0;
     match super::super::parse_expression_eval(expression, ctx)? {
-        EvalValue::UnexpandedStructuralHandle(handle) if handle.is_for_binding() => {
+        EvalValue::UnexpandedStructuralHandle(handle)
+            if matches!(
+                handle.kind(),
+                UnexpandedStructuralHandleKind::For | UnexpandedStructuralHandleKind::If
+            ) =>
+        {
             Ok(UnexpandedDependencyOperand::BareBinding(
                 handle.canonical_binding_name().into_owned().into(),
             ))

@@ -1043,7 +1043,9 @@ impl StateFile {
     /// v19: Replaced the partial-read marker's untyped detail with a typed
     ///      pending re-read reason. The v18 migration classifies legacy
     ///      details as incomplete reads.
-    /// v20: Added a token-less create-outcome-unknown current instance.
+    /// v20: Added a token-less create-outcome-unknown current instance and
+    ///      made `prevent_destroy` tri-state so explicit false remains
+    ///      distinct from an unspecified schema-defaulted value.
     /// v21: Replaced binding-text dependency records on current/deposed
     ///      instances and persisted directives with complete resolved IDs.
     pub const CURRENT_VERSION: u32 = 21;
@@ -1395,6 +1397,25 @@ impl StateFile {
                 && r.resource_type == resource_type
                 && r.identity.as_str() == identity
         })
+    }
+
+    /// Replace only the persisted directives on the exactly routed row
+    /// identified by `id`. No other row field is reconstructed or rewritten.
+    pub fn update_resource_directives(
+        &mut self,
+        id: &ResolvedResourceId,
+        directives: PersistedDirectives,
+    ) -> bool {
+        let Some(row) = self.resources.iter_mut().find(|row| {
+            row.provider == id.provider
+                && row.resource_type == id.resource_type
+                && row.identity.as_str() == id.identity_str()
+                && row.directives.provider_instance == id.provider_instance
+        }) else {
+            return false;
+        };
+        row.directives = directives;
+        true
     }
 
     /// Find the persisted row identified by a routing-agnostic state-block
@@ -3461,14 +3482,13 @@ impl ResourceState {
     /// deposed generations. This controls removal of an empty shell only; it
     /// must not be used to classify [`CurrentInstance::None`] while loading.
     fn is_deposed_only_shell(&self) -> bool {
-        let shell_directives = PersistedDirectives {
-            provider_instance: self.directives.provider_instance.clone(),
-            ..PersistedDirectives::default()
-        };
         matches!(self.current, CurrentInstance::None)
             && !self.deposed.is_empty()
             && !self.protected
-            && self.directives == shell_directives
+            && !self.directives.force_delete
+            && !self.directives.create_before_destroy
+            && !self.directives.explicitly_prevents_destroy()
+            && self.directives.depends_on.is_empty()
             && self.prefixes.is_empty()
             && self.name_overrides.is_empty()
             && is_empty_explicit(&self.explicit)
@@ -3916,13 +3936,7 @@ impl ResourceState {
             self.protected = existing.protected;
             self.name_overrides = existing.name_overrides.clone();
         }
-        self.directives = PersistedDirectives::from_resolved(
-            &resource.directives,
-            resource.persisted_explicit_destroy_dependencies().clone(),
-        );
-        if self.directives.provider_instance.is_none() {
-            self.directives.provider_instance = resource.id.provider_instance.clone();
-        }
+        self.directives = PersistedDirectives::desired_for(resource);
         self.prefixes = resource.prefixes.clone();
         self.explicit = match authoring_basis {
             DesiredAuthoringBasis::Sent(sent_desired) => {
@@ -4454,8 +4468,8 @@ fn is_empty_explicit(e: &ExplicitFields) -> bool {
 /// Exact v14 row shape used only at the v14 → v15 migration boundary.
 /// Keeping this DTO separate from [`ResourceState`] prevents the current
 /// loader from accepting the legacy parallel identifier/attribute fields.
-#[derive(Deserialize, PartialEq, Default)]
-struct ResourceStateV14DirectivesDto {
+#[derive(Debug, Default, Deserialize, PartialEq)]
+struct LegacyPersistedDirectives {
     #[serde(default)]
     force_delete: bool,
     #[serde(default)]
@@ -4479,7 +4493,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     protected: bool,
     #[serde(default)]
-    directives: ResourceStateV14DirectivesDto,
+    directives: LegacyPersistedDirectives,
     #[serde(default)]
     prefixes: HashMap<String, String>,
     #[serde(default)]
@@ -4515,9 +4529,9 @@ fn migrate_v14_current_instance(content: &str) -> Result<String, BackendError> {
                     "Failed to migrate state file from v14: {error}"
                 ))
             })?;
-        let shell_directives = ResourceStateV14DirectivesDto {
+        let shell_directives = LegacyPersistedDirectives {
             provider_instance: legacy.directives.provider_instance.clone(),
-            ..ResourceStateV14DirectivesDto::default()
+            ..LegacyPersistedDirectives::default()
         };
         let is_deposed_only_shell = legacy.identifier.is_none()
             && !legacy.deposed.is_empty()
@@ -4679,14 +4693,57 @@ fn migrate_v18_partial_read_reason(content: &str) -> Result<String, BackendError
     })
 }
 
-/// v19 → v20: reserve the token-less create-outcome-unknown current kind.
-/// Existing resource rows need no structural rewrite.
+/// v19 → v20: reserve the token-less create-outcome-unknown current kind and
+/// make destruction protection tri-state. Legacy `true` remains explicit;
+/// legacy `false` or a missing field becomes unspecified so a schema default
+/// can protect the resource.
 fn migrate_v19_create_outcome_unknown(content: &str) -> Result<String, BackendError> {
     let mut root: serde_json::Value = serde_json::from_str(content).map_err(|error| {
         BackendError::InvalidState(format!("Failed to migrate state file from v19: {error}"))
     })?;
-    // Keep main's v19 -> v20 link explicit. Using CURRENT_VERSION here would
-    // bypass v20 -> v21 after the next state-format bump.
+    let resources = root
+        .get_mut("resources")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v19: resources must be an array".to_string(),
+            )
+        })?;
+    for resource in resources {
+        let resource = resource.as_object_mut().ok_or_else(|| {
+            BackendError::InvalidState(
+                "Failed to migrate state file from v19: resource must be an object".to_string(),
+            )
+        })?;
+        let directives = resource
+            .entry("directives".to_string())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                BackendError::InvalidState(
+                    "Failed to migrate state file from v19: directives must be an object"
+                        .to_string(),
+                )
+            })?;
+        let legacy = match directives.remove("prevent_destroy") {
+            Some(serde_json::Value::Bool(value)) => value,
+            None => false,
+            Some(_) => {
+                return Err(BackendError::InvalidState(
+                    "Failed to migrate state file from v19: directives.prevent_destroy must be a boolean"
+                        .to_string(),
+                ));
+            }
+        };
+        let migrated = if legacy {
+            serde_json::json!({"kind": "explicit", "value": true})
+        } else {
+            serde_json::json!({"kind": "unspecified"})
+        };
+        directives.insert("prevent_destroy".to_string(), migrated);
+    }
+    // This transition must stop at v20. The graph-aware v20 -> v21
+    // dependency classification is a separate, configuration-aware step.
     root["version"] = serde_json::json!(20);
     serde_json::to_string(&root).map_err(|error| {
         BackendError::InvalidState(format!("Failed to migrate state file from v19: {error}"))

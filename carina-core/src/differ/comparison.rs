@@ -653,6 +653,12 @@ fn contains_pending_reread(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_pending_reread(value) || contains_pending_reread(default)
         }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_pending_reread)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_pending_reread(expression.lhs()) || contains_pending_reread(expression.rhs())
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -846,6 +852,7 @@ fn has_observable_content(value: &Value) -> bool {
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(has_observable_content),
         Value::Concrete(ConcreteValue::StringList(items)) => !items.is_empty(),
         Value::Deferred(DeferredValue::Secret(inner)) => has_observable_content(inner),
+        Value::Deferred(DeferredValue::ModuleIf(_)) => true,
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -857,6 +864,7 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
+        | Value::Deferred(DeferredValue::IntegerArithmetic(_))
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
         | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })

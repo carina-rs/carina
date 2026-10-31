@@ -928,6 +928,44 @@ for name, account_id in things {
 }
 
 #[test]
+fn unused_for_bindings_on_different_lines_emit_distinct_lsp_diagnostics() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"for x in [1, 2] {
+  awscc.ec2.Vpc { cidr_block = "10.0.0.0/16" }
+}
+
+for x in [3, 4] {
+  awscc.ec2.Vpc { cidr_block = "10.0.1.0/24" }
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let unused: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("for-loop binding 'x' is unused")
+        })
+        .collect();
+
+    assert_eq!(
+        unused.len(),
+        2,
+        "each authored loop must emit its own LSP diagnostic: {diagnostics:#?}"
+    );
+    assert_eq!(
+        unused
+            .iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>(),
+        vec![0, 4]
+    );
+}
+
+#[test]
 fn used_for_binding_no_lsp_diagnostic() {
     let engine = test_engine();
     let doc = create_document(

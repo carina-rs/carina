@@ -123,6 +123,93 @@ fn tmlanguage_has_pascal_case_type_pattern() {
     );
 }
 
+#[test]
+fn tmlanguage_scopes_comments_and_arithmetic_inside_interpolation() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let content = fs::read_to_string(manifest_dir.join(VSCODE_GRAMMAR)).unwrap();
+    let grammar: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+    let comments = grammar["repository"]["comments"]["patterns"]
+        .as_array()
+        .expect("comments patterns");
+    assert!(comments.iter().any(|pattern| {
+        pattern["name"] == "comment.line.double-slash.carina" && pattern["match"] == "//.*$"
+    }));
+    assert!(
+        comments
+            .iter()
+            .any(|pattern| pattern["include"] == "#block-comment")
+    );
+    assert_eq!(
+        grammar["repository"]["block-comment"]["name"],
+        "comment.block.carina"
+    );
+    assert_eq!(
+        grammar["repository"]["block-comment"]["patterns"][0]["include"], "#block-comment",
+        "block comments must recurse so nested comments retain comment scope",
+    );
+
+    let operators = grammar["repository"]["operators"]["patterns"]
+        .as_array()
+        .expect("operator patterns");
+    let arithmetic = operators
+        .iter()
+        .find(|pattern| pattern["name"] == "keyword.operator.arithmetic.carina")
+        .expect("arithmetic operator scope");
+    assert_eq!(arithmetic["match"], r"[+\-*/%]");
+
+    let first_scope = |operator: &str| {
+        operators
+            .iter()
+            .find_map(|pattern| {
+                let match_pattern = pattern["match"].as_str()?;
+                let regex = regex::Regex::new(&format!("^(?:{match_pattern})")).ok()?;
+                regex
+                    .find(operator)
+                    .filter(|matched| matched.start() == 0)
+                    .and_then(|_| pattern["name"].as_str())
+            })
+            .unwrap_or_else(|| panic!("no TextMate operator scope matched {operator:?}"))
+    };
+    assert_eq!(
+        first_scope(">>"),
+        "keyword.operator.expression.carina",
+        "TextMate uses the first matching pattern, so `>>` must not be consumed as two comparisons",
+    );
+    assert_eq!(first_scope("|>"), "keyword.operator.expression.carina");
+    assert_eq!(first_scope("??"), "keyword.operator.expression.carina");
+    assert_eq!(first_scope(">="), "keyword.operator.comparison.carina");
+
+    let strings = grammar["repository"]["strings"]["patterns"]
+        .as_array()
+        .expect("string patterns");
+    for scope in [
+        "string.unquoted.heredoc.carina",
+        "string.quoted.double.carina",
+    ] {
+        let string = strings
+            .iter()
+            .find(|pattern| pattern["name"] == scope)
+            .unwrap_or_else(|| panic!("missing {scope}"));
+        let interpolation = string["patterns"]
+            .as_array()
+            .and_then(|patterns| {
+                patterns
+                    .iter()
+                    .find(|pattern| pattern["name"] == "meta.embedded.expression.carina")
+            })
+            .unwrap_or_else(|| panic!("missing interpolation in {scope}"));
+        assert!(
+            interpolation["patterns"]
+                .as_array()
+                .is_some_and(|patterns| patterns
+                    .iter()
+                    .any(|pattern| pattern["include"] == "#expression")),
+            "{scope} interpolation must reuse the expression scopes",
+        );
+    }
+}
+
 fn assert_grammar_has_single_quoted_string_pattern(path: &str) {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let content = fs::read_to_string(manifest_dir.join(path)).unwrap();

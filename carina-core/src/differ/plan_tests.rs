@@ -5,10 +5,12 @@ use std::collections::{BTreeSet, HashSet};
 
 use crate::explicit::{ExplicitFields, PendingPaths};
 use crate::plan::{
-    PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
+    PlanErrorKind, PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
+    SchemaNotRegisteredError,
 };
 use crate::resource::{
-    ConcreteValue, PersistedDestroyDependencies, PersistedDirectives, ResolvedResourceId, Resource,
+    ConcreteValue, Directives, PersistedDestroyDependencies, PersistedDirectives,
+    ResolvedResourceId, Resource,
 };
 
 fn diff_test(
@@ -2444,10 +2446,10 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
     let orphan_state =
         existing_state(orphan_id.clone(), HashMap::new()).with_identifier("service-123");
     let dependency_id = ResolvedResourceId::with_identity("example.Dependency", "x");
-    let directives = crate::resource::PersistedDirectives {
-        depends_on: PersistedDestroyDependencies::from_test_dependencies([dependency_id.clone()]),
-        ..Default::default()
-    };
+    let directives = crate::resource::PersistedDirectives::from_resolved(
+        &Directives::default(),
+        PersistedDestroyDependencies::from_test_dependencies([dependency_id.clone()]),
+    );
     let orphans = Orphans::from([Orphan::from_state(
         orphan_state,
         Some("service".to_string()),
@@ -2663,12 +2665,10 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
     let current_states = HashMap::from([(consumer_id.clone(), consumer_state)]);
     let directives_map = HashMap::from([(
         consumer_id.clone(),
-        crate::resource::PersistedDirectives {
-            depends_on: PersistedDestroyDependencies::from_test_dependencies([resolved_id(
-                &dependency_id,
-            )]),
-            ..Default::default()
-        },
+        crate::resource::PersistedDirectives::from_resolved(
+            &Directives::default(),
+            PersistedDestroyDependencies::from_test_dependencies([resolved_id(&dependency_id)]),
+        ),
     )]);
     let orphans = Orphans::from([Orphan::from_state(
         dependency_state,
@@ -3060,10 +3060,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id.clone(), attrs),
         None,
-        crate::resource::PersistedDirectives {
-            prevent_destroy: true,
-            ..Default::default()
-        },
+        crate::resource::PersistedDirectives::default().with_prevent_destroy(true),
     )]);
 
     let plan = create_plan(
@@ -3096,13 +3093,88 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     assert_eq!(
         &plan.errors()[0].kind,
         &PlanErrorKind::PreventDestroy {
-            action: PreventDestroyAction::DeleteRemovedFromConfiguration
+            action: PreventDestroyAction::DeleteRemovedFromConfiguration,
+            source: PreventDestroySource::ExplicitDirective,
         }
     );
     assert_eq!(
         plan.errors()[0].resource_id,
         ResourceId::with_identity("ec2.Vpc", "my-vpc")
     );
+}
+
+#[test]
+fn schema_default_prevent_destroy_blocks_orphan_delete_when_schema_is_available() {
+    let orphan_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let orphans = Orphans::from([Orphan::from_state(
+        existing_state(orphan_id.clone(), HashMap::new()),
+        None,
+        PersistedDirectives::default(),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("ec2.Vpc")
+            .default_prevent_destroy()
+            .validate()
+            .expect("schema fixture must validate"),
+    );
+
+    let plan = create_plan(
+        &[],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            HashMap::new(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+
+    assert!(plan.effects().is_empty());
+    assert_eq!(
+        plan.errors()[0].kind,
+        PlanErrorKind::PreventDestroy {
+            action: PreventDestroyAction::DeleteRemovedFromConfiguration,
+            source: PreventDestroySource::SchemaDefault,
+        }
+    );
+}
+
+#[test]
+fn unspecified_orphan_without_a_registered_schema_keeps_existing_delete_behavior() {
+    let orphan_id = ResourceId::with_identity("retired.Type", "orphan");
+    let orphans = Orphans::from([Orphan::from_state(
+        existing_state(orphan_id, HashMap::new()),
+        None,
+        PersistedDirectives::default(),
+    )]);
+
+    let plan = create_plan(
+        &[],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            HashMap::new(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &orphans,
+        &[],
+    );
+
+    assert!(!plan.has_errors());
+    assert!(matches!(plan.effects(), [Effect::Delete { .. }]));
 }
 
 #[test]
@@ -3115,7 +3187,7 @@ fn prevent_destroy_blocks_replace() {
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
     );
-    resource.directives.prevent_destroy = true;
+    resource.directives.set_prevent_destroy(true);
 
     let resources = vec![resource];
 
@@ -3175,8 +3247,93 @@ fn prevent_destroy_blocks_replace() {
     assert_eq!(
         &plan.errors()[0].kind,
         &PlanErrorKind::PreventDestroy {
-            action: PreventDestroyAction::Replace
+            action: PreventDestroyAction::Replace,
+            source: PreventDestroySource::ExplicitDirective,
         }
+    );
+}
+
+#[test]
+fn schema_default_prevent_destroy_blocks_replace_and_explicit_false_allows_it() {
+    use crate::schema::{AttributeSchema, AttributeType};
+
+    let desired = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
+    );
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id,
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
+            )]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .default_prevent_destroy()
+            .validate()
+            .expect("schema fixture must validate"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &crate::schema::SchemaRegistry::new(),
+        &[],
+    );
+
+    let blocked = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+    assert_eq!(
+        blocked.errors()[0].kind,
+        PlanErrorKind::PreventDestroy {
+            action: PreventDestroyAction::Replace,
+            source: PreventDestroySource::SchemaDefault,
+        }
+    );
+
+    let mut opted_out = desired;
+    opted_out.directives = Directives::default().with_prevent_destroy(false);
+    let allowed = create_plan(
+        &[opted_out],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(!allowed.has_errors(), "{:?}", allowed.errors());
+    assert!(
+        allowed
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Delete { .. })),
+        "explicit false must allow the replacement delete: {:?}",
+        allowed.effects()
     );
 }
 
@@ -3188,7 +3345,7 @@ fn prevent_destroy_does_not_block_update() {
         "versioning",
         Value::Concrete(ConcreteValue::String("Enabled".into())),
     );
-    resource.directives.prevent_destroy = true;
+    resource.directives.set_prevent_destroy(true);
 
     let resources = vec![resource];
 
@@ -3243,7 +3400,7 @@ fn prevent_destroy_does_not_block_create() {
         "bucket",
         Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
-    resource.directives.prevent_destroy = true;
+    resource.directives.set_prevent_destroy(true);
 
     let resources = vec![resource];
 
@@ -3379,7 +3536,7 @@ fn without_prevent_destroy_delete_works_normally() {
             &crate::schema::SchemaRegistry::new(),
             &[],
         ),
-        &HashMap::new(), // no directives (default = prevent_destroy: false)
+        &HashMap::new(), // no directives (prevent_destroy is unspecified)
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
@@ -3414,10 +3571,8 @@ fn prevent_destroy_collects_multiple_errors() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
     );
-    let prevent_destroy = crate::resource::PersistedDirectives {
-        prevent_destroy: true,
-        ..Default::default()
-    };
+    let prevent_destroy =
+        crate::resource::PersistedDirectives::default().with_prevent_destroy(true);
     let orphans = Orphans::from([
         Orphan::from_state(
             existing_state(first_id, attrs1),

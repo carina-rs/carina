@@ -67,6 +67,7 @@ pub enum NodeKind {
     ArgumentsParam,
     ArgumentsParamBlock,
     ArgumentsParamAttr,
+    ValidationBlockAttr,
     AttributesParam,
     ExportsParam,
     TypeExpr,

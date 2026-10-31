@@ -1792,6 +1792,7 @@ mod tests {
             plan,
             &[],
             &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
         );
         build_model(PlanImageInput {
             plan,

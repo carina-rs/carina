@@ -74,7 +74,9 @@ validate_expr = { validate_or_expr }
 validate_or_expr = { validate_and_expr ~ ("||" ~ validate_and_expr)* }
 validate_and_expr = { validate_not_expr ~ ("&&" ~ validate_not_expr)* }
 validate_not_expr = { "!" ~ validate_not_expr | validate_comparison }
-validate_comparison = { validate_primary ~ (compare_op ~ validate_primary)? }
+validate_comparison = { validate_additive_expr ~ (compare_op ~ validate_additive_expr)? }
+validate_additive_expr = { validate_multiplicative_expr ~ (add_op ~ validate_multiplicative_expr)* }
+validate_multiplicative_expr = { validate_primary ~ (multiplicative_op ~ validate_primary)* }
 compare_op = { ">=" | "<=" | "!=" | "==" | ">" | "<" }
 validate_primary = {
     validate_function_call
@@ -255,7 +257,19 @@ coalesce_expr = { pipe_expr ~ ("??" ~ pipe_expr)* }
 pipe_expr = { compose_expr ~ ("|>" ~ function_call)* }
 
 // Compose operator: f >> g (function composition, binds tighter than |>)
-compose_expr = { postfix_expr ~ (">>" ~ postfix_expr)* }
+compose_expr = { additive_expr ~ (">>" ~ additive_expr)* }
+
+// Integer arithmetic. Operators are surfaced as named Pest rules so parser
+// lowering can map exhaustively to the closed IntegerOp enum.
+additive_expr = { multiplicative_expr ~ (add_op ~ multiplicative_expr)* }
+multiplicative_expr = { postfix_expr ~ (multiplicative_op ~ postfix_expr)* }
+add_op = { plus_op | minus_op }
+multiplicative_op = { multiply_op | divide_op | remainder_op }
+plus_op = { "+" }
+minus_op = { "-" }
+multiply_op = { "*" }
+divide_op = { "/" }
+remainder_op = { "%" }
 
 // Field/index access is a postfix operator on any primary value. Reference
 // primaries keep consuming their own suffixes so resource references retain

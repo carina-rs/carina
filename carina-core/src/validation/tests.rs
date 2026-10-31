@@ -220,6 +220,7 @@ fn empty_parsed() -> ParsedFile {
         parsed_binding_uses: Default::default(),
         warnings: Vec::new(),
         deferred_for_phase: crate::parser::ParsedDeferredForPhase::default(),
+        deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -276,7 +277,7 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     );
 }
 
-fn validate_resource_ref_types_for_test<E>(
+fn validate_resource_ref_types_for_test<E: crate::parser::ExportParamLike>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
@@ -287,6 +288,242 @@ fn validate_resource_ref_types_for_test<E>(
         .map(|argument| argument.name.clone())
         .collect();
     super::validate_resource_ref_types(parsed, schemas, &argument_names, &bindings)
+}
+
+#[test]
+fn unused_let_integer_arithmetic_requires_proven_int_operands() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let invalid = source.ratio + 1
+let sink = mock.test.Consumer { count = invalid }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::provider_populated("ratio", AttributeType::float()).build())
+            .validate()
+            .expect("source schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+            .validate()
+            .expect("consumer schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("an unused arithmetic let must still prove both operands are Int");
+    assert_eq!(
+        error, "operator '+': left operand must be Int, got Float",
+        "the declaration and its consuming resource attribute must not duplicate the finding",
+    );
+}
+
+#[test]
+fn refined_int_resource_operand_is_still_an_int_operand() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let valid = source.count + 1
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "count",
+                    AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("source schema must be valid"),
+    );
+
+    validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect("a refined Int retains its Int arithmetic shape");
+}
+
+#[test]
+fn refined_string_resource_operand_is_not_an_int_operand() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let invalid = source.count + 1
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "count",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::bare("CountLabel")),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("source schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("a refined String must not become an arithmetic Int operand");
+    assert!(error.contains("left operand must be Int"), "{error}");
+}
+
+#[test]
+fn deferred_string_resource_attribute_is_not_an_int_operand() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        "let source = mock.test.Source {}\nlet invalid = source.label + 1\n",
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(
+                AttributeSchema::provider_populated("label", AttributeType::string()).build(),
+            )
+            .validate()
+            .expect("source schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("a deferred String attribute cannot be an arithmetic operand");
+    assert_eq!(error, "operator '+': left operand must be Int, got String");
+}
+
+#[test]
+fn integer_arithmetic_result_obeys_the_declared_resource_sink() {
+    use crate::schema::AttributeSchema;
+
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.Source {}
+let invalid = mock.test.Consumer { label = source.count + 1 }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("sink fixture must parse before schema-aware validation");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::provider_populated("count", AttributeType::int()).build())
+            .validate()
+            .expect("source schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Consumer")
+            .attribute(AttributeSchema::required("label", AttributeType::string()).build())
+            .validate()
+            .expect("consumer schema must be valid"),
+    );
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas)
+        .expect_err("an Int expression cannot satisfy a String resource sink");
+    assert!(
+        error.contains("expected String") && error.contains("got Int"),
+        "unexpected result-sink diagnostic: {error}"
+    );
+}
+
+#[test]
+fn module_attribute_integer_arithmetic_uses_declared_argument_types() {
+    let valid = crate::parser::parse(
+        r#"
+arguments { count: Int }
+attributes { doubled: Int = count * 2 }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("valid module fixture must parse");
+    validate_resource_ref_types_for_test(&valid, &SchemaRegistry::new())
+        .expect("a declared Int module argument proves the arithmetic operand");
+
+    let invalid = crate::parser::parse(
+        r#"
+arguments { ratio: Float }
+attributes { rounded: Int = ratio + 1 }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("invalid module fixture must parse before type validation");
+    let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
+        .expect_err("a declared Float module argument cannot be used in integer arithmetic");
+    assert_eq!(error, "operator '+': left operand must be Int, got Float");
+}
+
+#[test]
+fn unused_function_integer_arithmetic_uses_declared_parameter_types() {
+    let valid = crate::parser::parse(
+        "fn doubled(value: Int): Int { value * 2 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("valid function fixture must parse");
+    validate_resource_ref_types_for_test(&valid, &SchemaRegistry::new())
+        .expect("a declared Int function parameter proves the arithmetic operand");
+
+    let invalid = crate::parser::parse(
+        "fn rounded(value: Float): Int { value + 1 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("invalid function fixture must parse before type validation");
+    let error = validate_resource_ref_types_for_test(&invalid, &SchemaRegistry::new())
+        .expect_err("an unused function must still reject a Float arithmetic operand");
+    assert_eq!(error, "operator '+': left operand must be Int, got Float");
+
+    let invalid_return = crate::parser::parse(
+        "fn mislabeled(value: Int): String { value + 1 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("return-sink fixture must parse before directory type validation");
+    let error = validate_resource_ref_types_for_test(&invalid_return, &SchemaRegistry::new())
+        .expect_err("an arithmetic Int result cannot satisfy a declared String return type");
+    assert!(
+        error.contains("expected String") && error.contains("got Int"),
+        "unexpected return-sink diagnostic: {error}"
+    );
+
+    let untyped = crate::parser::parse(
+        "fn unproven(value): Int { value + 1 }\n",
+        &ProviderContext::default(),
+    )
+    .expect("untyped-parameter fixture must parse before directory type validation");
+    let error = validate_resource_ref_types_for_test(&untyped, &SchemaRegistry::new())
+        .expect_err("an untyped function parameter cannot prove an Int operand");
+    assert!(
+        error.contains("left operand must be Int") && error.contains("unproven type"),
+        "unexpected untyped-operand diagnostic: {error}"
+    );
 }
 
 fn function_ref_schema() -> SchemaRegistry {

@@ -265,3 +265,26 @@ fn warning_from_unbound_loop_after_bars_yields_single_blank_line_on_pty() {
          Execution Plan header for an unbound loop.\n{out}"
     );
 }
+
+#[test]
+fn distinct_unused_for_bindings_on_different_lines_are_both_printed() {
+    let tmp = init_project(
+        "backend local { path = \"carina.state.json\" }\n\
+         provider mock {}\n\
+         let first = for x in [\"a\", \"b\"] {\n\
+         \u{20}\u{20}mock.test.resource { name = \"first\" }\n\
+         }\n\
+         let second = for x in [\"c\", \"d\"] {\n\
+         \u{20}\u{20}mock.test.resource { name = \"second\" }\n\
+         }\n",
+    );
+
+    let out = run_on_pty(&["plan", tmp.path().to_str().unwrap()], tmp.path());
+    let flattened = without_rendered_line_breaks(&out);
+
+    assert_eq!(
+        flattened.matches("for-loop binding 'x' is unused").count(),
+        2,
+        "each authored loop must emit its own CLI warning:\n{out}"
+    );
+}

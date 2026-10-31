@@ -64,7 +64,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
 
     let prevent_destroy_summary = || {
         format!(
-            "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
+            "{} resource(s) are protected from destruction and cannot be deleted or replaced",
             prevent_destroy_count
         )
     };
@@ -82,7 +82,8 @@ mod tests {
     use super::*;
 
     use carina_core::plan::{
-        PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
+        PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
+        SchemaNotRegisteredError,
     };
     use carina_core::resource::ResourceId;
 
@@ -147,15 +148,16 @@ mod tests {
     }
 
     #[test]
-    fn prevent_destroy_summary_keeps_existing_text() {
+    fn prevent_destroy_summary_describes_effective_protection() {
         let plan = plan_with_errors(vec![error(PlanErrorKind::PreventDestroy {
             action: PreventDestroyAction::Delete,
+            source: PreventDestroySource::ExplicitDirective,
         })]);
         let summary = abort_summary(&plan);
 
         assert_eq!(
             summary,
-            "1 resource(s) have prevent_destroy set and cannot be deleted or replaced"
+            "1 resource(s) are protected from destruction and cannot be deleted or replaced"
         );
     }
 
@@ -164,6 +166,7 @@ mod tests {
         let plan = plan_with_errors(vec![
             error(PlanErrorKind::PreventDestroy {
                 action: PreventDestroyAction::Delete,
+                source: PreventDestroySource::SchemaDefault,
             }),
             error(PlanErrorKind::SchemaNotRegistered(
                 SchemaNotRegisteredError {
@@ -176,7 +179,7 @@ mod tests {
 
         assert_eq!(
             summary,
-            "1 resource(s) have prevent_destroy set and cannot be deleted or replaced\n\
+            "1 resource(s) are protected from destruction and cannot be deleted or replaced\n\
              plan failed with 2 error(s)"
         );
     }

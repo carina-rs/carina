@@ -14,6 +14,8 @@ plan-all-create:
 	$(PLAN_FIXTURE) all_create
 plan-no-changes:
 	$(PLAN_FIXTURE) no_changes
+plan-state-only-directive-change:
+	$(PLAN_FIXTURE) state_only_directive_change
 plan-empty-explicit-children-no-changes:
 	$(PLAN_FIXTURE) empty_explicit_children_no_changes
 plan-mixed:
@@ -180,6 +182,9 @@ plan-fixtures:
 	@echo ""
 	@echo "=== no_changes ==="
 	@$(MAKE) plan-no-changes
+	@echo ""
+	@echo "=== state_only_directive_change ==="
+	@$(MAKE) plan-state-only-directive-change
 	@echo ""
 	@echo "=== mixed_operations ==="
 	@$(MAKE) plan-mixed
@@ -435,7 +440,7 @@ plan-multi-instance-create:
 	$(PLAN_FIXTURE) multi_instance_create
 plan-multi-instance-module:
 	$(PLAN_FIXTURE) multi_instance_module
-.PHONY: plan-image plan-all-create plan-no-changes plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-legacy-orphan-unknown-destroy-ordering plan-compact plan-import-deferred-interpolation \
+.PHONY: plan-image plan-all-create plan-no-changes plan-state-only-directive-change plan-empty-explicit-children-no-changes plan-no-changes-enum plan-dynamic-enum-az-no-diff plan-route53-hosted-zone-name-strip-suffix-no-diff plan-mixed plan-image-module-cascade plan-image-reference-layout plan-image-anonymous plan-delete plan-deposed-delete plan-deposed-delete-update-dependency plan-delete-list-of-maps plan-legacy-orphan-unknown-destroy-ordering plan-compact plan-import-deferred-interpolation \
         plan-map-diff plan-replace-create-only plan-anonymous-create-only-rekey \
         plan-anonymous-old-identity-name-override plan-anonymous-old-identity-update \
         plan-anonymous-loop-insert-before plan-anonymous-loop-reorder \

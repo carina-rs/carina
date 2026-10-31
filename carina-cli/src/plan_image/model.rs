@@ -131,6 +131,7 @@ pub(crate) struct StateSummary {
 pub(crate) struct GraphChangeSummary {
     effect_parts: Vec<PlanEffectSummaryPart>,
     export_change_count: usize,
+    persisted_directive_change_count: usize,
     residual_deferred_for_count: usize,
     has_changes: bool,
 }
@@ -140,6 +141,7 @@ impl GraphChangeSummary {
         Self {
             effect_parts: summary.effect_parts().to_vec(),
             export_change_count: summary.export_change_count(),
+            persisted_directive_change_count: summary.persisted_directive_change_count(),
             residual_deferred_for_count: summary.residual_deferred_for_count(),
             has_changes: summary.has_changes(),
         }
@@ -155,6 +157,10 @@ impl GraphChangeSummary {
 
     pub(crate) fn export_change_count(&self) -> usize {
         self.export_change_count
+    }
+
+    pub(crate) fn persisted_directive_change_count(&self) -> usize {
+        self.persisted_directive_change_count
     }
 
     pub(crate) fn residual_deferred_for_count(&self) -> usize {
@@ -1276,6 +1282,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
 
@@ -1305,6 +1312,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
@@ -1336,6 +1344,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
@@ -1476,6 +1485,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
@@ -1500,6 +1510,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let leaf = model.node(&GraphNodeId::Effect(2)).unwrap();
@@ -1535,6 +1546,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let connector_id = GraphNodeId::Unchanged(ResolvedResourceId::new(connector.id));
@@ -1554,7 +1566,12 @@ mod tests {
             compositions: &[],
             expansion_trace: None,
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
+            summary: &PlanChangeSummary::new(
+                &fixture.plan,
+                &[],
+                &fixture.deferred_for_expressions,
+                &[],
+            ),
         });
 
         let replacements: Vec<_> = model
@@ -1597,6 +1614,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let source = model
@@ -1648,6 +1666,7 @@ mod tests {
                     &plan,
                     &[],
                     &crate::plan_summary::resolved_deferred_for_for_test([]),
+                    &[],
                 ),
             )
         });
@@ -1704,6 +1723,7 @@ mod tests {
                     &plan,
                     &[],
                     &crate::plan_summary::resolved_deferred_for_for_test([]),
+                    &[],
                 ),
             )
         });
@@ -1730,7 +1750,12 @@ mod tests {
             compositions: &fixture.compositions,
             expansion_trace: Some(&fixture.expansion_trace),
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
+            summary: &PlanChangeSummary::new(
+                &fixture.plan,
+                &[],
+                &fixture.deferred_for_expressions,
+                &[],
+            ),
         });
 
         let replacements: Vec<_> = model

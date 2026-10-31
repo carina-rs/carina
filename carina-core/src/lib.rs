@@ -28,6 +28,7 @@ pub mod formatter;
 pub mod heredoc;
 pub mod hint;
 pub mod identifier;
+pub mod integer_arithmetic;
 pub mod keywords;
 pub mod lint;
 pub mod module;

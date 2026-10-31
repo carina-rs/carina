@@ -399,6 +399,24 @@ fn rewrite_handle_output_refs(
         Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
             DeferredValue::Secret(Box::new(rewrite_handle_output_refs(inner, outputs, owner)?)),
         )),
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(
+                deferred.try_map(|value| rewrite_handle_output_refs(value, outputs, owner))?,
+            ))))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = rewrite_handle_output_refs(expression.lhs(), outputs, owner)?;
+            let rhs = rewrite_handle_output_refs(expression.rhs(), outputs, owner)?;
+            let expression = expression.rebuild(lhs, rhs).map_err(|error| {
+                ExpandedGraphResolutionError::ValueAccess {
+                    owner: owner.to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+            Ok(Value::Deferred(DeferredValue::IntegerArithmetic(
+                expression,
+            )))
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)

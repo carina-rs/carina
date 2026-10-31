@@ -16,11 +16,15 @@ use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
+pub use crate::resource::PreventDestroySource;
 use crate::resource::{
     DeposedKey, Directives, ResolvedDependencies, ResolvedResource, ResolvedResourceId, ResourceId,
     Value,
 };
 pub use crate::resource::{ModuleSource, SavedModuleSource};
+
+const SCHEMA_DEFAULT_PREVENT_DESTROY_OPT_OUT: &str =
+    "; to allow this, write `directives { prevent_destroy = false }`";
 
 /// Error detected while constructing a plan.
 ///
@@ -89,6 +93,7 @@ pub enum CreateBeforeDestroyError {
 pub enum PlanErrorKind {
     PreventDestroy {
         action: PreventDestroyAction,
+        source: PreventDestroySource,
     },
     SchemaNotRegistered(SchemaNotRegisteredError),
     ReplacementCannotCoexist(ReplacementCannotCoexistError),
@@ -189,8 +194,15 @@ impl PlanError {
         Self { resource_id, kind }
     }
 
-    pub fn prevent_destroy(resource_id: ResourceId, action: PreventDestroyAction) -> Self {
-        Self::new(resource_id, PlanErrorKind::PreventDestroy { action })
+    pub fn prevent_destroy(
+        resource_id: ResourceId,
+        action: PreventDestroyAction,
+        source: PreventDestroySource,
+    ) -> Self {
+        Self::new(
+            resource_id,
+            PlanErrorKind::PreventDestroy { action, source },
+        )
     }
 
     pub fn create_outcome_unknown(resource_id: ResourceId) -> Self {
@@ -243,7 +255,7 @@ impl From<crate::provider::IgnoredWriteOnlyValueError> for PlanErrorKind {
 }
 
 impl PlanErrorKind {
-    fn prevent_destroy_message(action: PreventDestroyAction) -> &'static str {
+    fn explicit_prevent_destroy_message(action: PreventDestroyAction) -> &'static str {
         match action {
             PreventDestroyAction::Replace => {
                 "resource has prevent_destroy set, but the plan would replace it (which requires destroying the old resource)"
@@ -259,6 +271,25 @@ impl PlanErrorKind {
             }
         }
     }
+
+    fn schema_default_prevent_destroy_message_fragment(
+        action: PreventDestroyAction,
+    ) -> &'static str {
+        match action {
+            PreventDestroyAction::Replace => {
+                "resource type is protected from destruction by default, but the plan would replace it (which requires destroying the old resource)"
+            }
+            PreventDestroyAction::Delete => {
+                "resource type is protected from destruction by default, but the plan would delete it"
+            }
+            PreventDestroyAction::DeleteRemovedFromConfiguration => {
+                "resource type is protected from destruction by default, but the plan would delete it (resource removed from configuration)"
+            }
+            PreventDestroyAction::CascadeReplace => {
+                "resource type is protected from destruction by default, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
+            }
+        }
+    }
 }
 
 impl PlanErrorKind {
@@ -268,7 +299,15 @@ impl PlanErrorKind {
         project_dir: &Path,
     ) -> std::fmt::Result {
         match self {
-            Self::PreventDestroy { action } => f.write_str(Self::prevent_destroy_message(*action)),
+            Self::PreventDestroy { action, source } => match source {
+                PreventDestroySource::ExplicitDirective => {
+                    f.write_str(Self::explicit_prevent_destroy_message(*action))
+                }
+                PreventDestroySource::SchemaDefault => {
+                    f.write_str(Self::schema_default_prevent_destroy_message_fragment(*action))?;
+                    f.write_str(SCHEMA_DEFAULT_PREVENT_DESTROY_OPT_OUT)
+                }
+            },
             Self::SchemaNotRegistered(err) => write!(f, "{err}"),
             Self::ReplacementCannotCoexist(err) => write!(f, "{err}"),
             Self::MissingProviderIdentifier => f.write_str(
@@ -1793,8 +1832,44 @@ mod tests {
 
         for (action, expected) in cases {
             assert_eq!(
-                render_plan_error_kind(PlanErrorKind::PreventDestroy { action }),
+                render_plan_error_kind(PlanErrorKind::PreventDestroy {
+                    action,
+                    source: PreventDestroySource::ExplicitDirective,
+                }),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn plan_error_kind_display_pins_schema_default_prevent_destroy_actions() {
+        let opt_out = "to allow this, write `directives { prevent_destroy = false }`";
+        let cases = [
+            (
+                PreventDestroyAction::Replace,
+                "resource type is protected from destruction by default, but the plan would replace it (which requires destroying the old resource)",
+            ),
+            (
+                PreventDestroyAction::Delete,
+                "resource type is protected from destruction by default, but the plan would delete it",
+            ),
+            (
+                PreventDestroyAction::DeleteRemovedFromConfiguration,
+                "resource type is protected from destruction by default, but the plan would delete it (resource removed from configuration)",
+            ),
+            (
+                PreventDestroyAction::CascadeReplace,
+                "resource type is protected from destruction by default, but cascade from a replaced dependency would replace it (which requires destroying the old resource)",
+            ),
+        ];
+
+        for (action, prefix) in cases {
+            assert_eq!(
+                render_plan_error_kind(PlanErrorKind::PreventDestroy {
+                    action,
+                    source: PreventDestroySource::SchemaDefault,
+                }),
+                format!("{prefix}; {opt_out}")
             );
         }
     }

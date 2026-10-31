@@ -233,6 +233,14 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
             .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
             .attribute(AttributeSchema::optional("parent_name", AttributeType::string()).build())
             .with_unique_name_attribute("name"),
+        ResourceSchema::new("test.default_prevent_destroy")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("name")
+            .default_prevent_destroy(),
         ResourceSchema::new(SERVER_ADDED_LIST_RESOURCE_TYPE)
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -1713,6 +1721,13 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn delete_request_without_schema() -> DeleteRequest {
+        DeleteRequest::resolve(
+            &carina_core::resource::Directives::default(),
+            carina_core::provider::ProviderDirectiveSchema::Unavailable,
+        )
+    }
+
     #[test]
     fn builtin_schemas_are_all_valid() {
         let schemas = builtin_schemas();
@@ -2550,7 +2565,7 @@ mod tests {
                 .expect("update should succeed");
 
             provider
-                .delete(&id, &identifier, DeleteRequest::default())
+                .delete(&id, &identifier, delete_request_without_schema())
                 .await
                 .expect("delete should succeed");
         });
@@ -2698,7 +2713,7 @@ mod tests {
         let identifier =
             AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
         runtime
-            .block_on(provider.delete(&id, &identifier, DeleteRequest::default()))
+            .block_on(provider.delete(&id, &identifier, delete_request_without_schema()))
             .unwrap();
         let elapsed = started.elapsed();
 

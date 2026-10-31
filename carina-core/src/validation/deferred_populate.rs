@@ -126,6 +126,19 @@ fn collect_unsynchronized_refs(
     out: &mut Vec<DeferredPopulateDiagnostic>,
 ) {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for nested in deferred.values() {
+                collect_unsynchronized_refs(
+                    nested,
+                    attribute_key,
+                    holder_binding,
+                    by_binding,
+                    synchronized,
+                    schemas,
+                    out,
+                );
+            }
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             check_ref(
                 path,
@@ -229,6 +242,26 @@ fn collect_unsynchronized_refs(
             );
             collect_unsynchronized_refs(
                 default,
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            collect_unsynchronized_refs(
+                expression.lhs(),
+                attribute_key,
+                holder_binding,
+                by_binding,
+                synchronized,
+                schemas,
+                out,
+            );
+            collect_unsynchronized_refs(
+                expression.rhs(),
                 attribute_key,
                 holder_binding,
                 by_binding,

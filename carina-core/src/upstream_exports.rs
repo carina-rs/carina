@@ -738,10 +738,20 @@ pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredFor
 ) -> Vec<UpstreamForIterableShapeError> {
     fn visit_possible_iterables(value: &Value, f: &mut impl FnMut(&crate::resource::AccessPath)) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| visit_possible_iterables(value, f));
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 visit_possible_iterables(value, f);
                 visit_possible_iterables(default, f);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                visit_possible_iterables(expression.lhs(), f);
+                visit_possible_iterables(expression.rhs(), f);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => visit_possible_iterables(inner, f),
             // References inside a function argument constrain that argument,

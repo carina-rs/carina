@@ -452,6 +452,20 @@ fn walk_custom_lookup_on_path<'a>(
     errors: &mut Vec<TypeError>,
     visited_refs: &mut Vec<&'a str>,
 ) {
+    if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
+        for branch in &deferred.values()[1..] {
+            walk_custom_lookup_on_path(
+                attr_type,
+                branch,
+                attr_name,
+                lookup,
+                defs,
+                errors,
+                visited_refs,
+            );
+        }
+        return;
+    }
     // `Secret` is a sensitivity wrapper, not an unresolved value. Providers
     // may validate the plaintext, but diagnostics crossing back out of this
     // boundary must discard every user-derived value/message.
@@ -499,6 +513,7 @@ fn walk_custom_lookup_on_path<'a>(
             | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
             | Value::Deferred(DeferredValue::Access(_))
             | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::IntegerArithmetic(_))
             | Value::Deferred(DeferredValue::Interpolation(_))
             | Value::Deferred(DeferredValue::Unknown(_))
     ) {
@@ -4599,6 +4614,46 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
         ));
     }
 
+    if matches!(value, Value::Deferred(DeferredValue::IntegerArithmetic(_))) {
+        return match &attr.kind {
+            AT::Int { .. } => Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred)),
+            AT::Float { .. } => Some(Fit::with_kind(
+                FitExactness::COERCIBLE,
+                attr,
+                FitKind::Deferred,
+            )),
+            AT::Union(members) => {
+                let selected = fit_union_members_on_path(
+                    members.as_raw_slice(),
+                    value,
+                    defs,
+                    ancestry,
+                    purpose,
+                    visited_refs,
+                )?;
+                let exactness = selected.fit.exactness;
+                Some(Fit::with_kind(
+                    exactness,
+                    attr,
+                    FitKind::Union {
+                        member: selected.member,
+                        fit: Box::new(selected.fit),
+                    },
+                ))
+            }
+            AT::Ref(_) => unreachable!("fit dispatch received an unresolved Ref"),
+            AT::String { .. }
+            | AT::ResourceHandle { .. }
+            | AT::StringLiteralSet { .. }
+            | AT::Bool
+            | AT::Duration
+            | AT::Enum { .. }
+            | AT::List { .. }
+            | AT::Map { .. }
+            | AT::Struct { .. } => None,
+        };
+    }
+
     let Some(concrete) = value.as_concrete() else {
         return Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred));
     };
@@ -6954,6 +7009,7 @@ impl TypeError {
 impl Value {
     pub fn type_name(&self) -> String {
         match self {
+            Value::Deferred(DeferredValue::ModuleIf(_)) => "ModuleIf".to_string(),
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
             Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier".to_string(),
             Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "CanonicalEnum".to_string(),
@@ -6971,6 +7027,7 @@ impl Value {
                 format!("BindingRef({})", binding)
             }
             Value::Deferred(DeferredValue::Coalesce { .. }) => "Coalesce".to_string(),
+            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int".to_string(),
             Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation".to_string(),
             Value::Deferred(
                 DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
@@ -7597,6 +7654,7 @@ pub enum UniqueNameSpec {
 ///     unique_name,
 ///     operation_config,
 ///     field_groups,
+///     default_prevent_destroy,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7610,6 +7668,7 @@ pub enum UniqueNameSpec {
 ///     unique_name,
 ///     operation_config,
 ///     field_groups,
+///     default_prevent_destroy,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7633,6 +7692,9 @@ pub struct ResourceSchema {
     pub(crate) operation_config: Option<OperationConfig>,
     /// Declarative cardinality constraints over sibling attributes.
     pub(crate) field_groups: Vec<FieldGroup>,
+    /// Whether resources of this type are protected from destruction unless
+    /// the user explicitly opts out.
+    pub(crate) default_prevent_destroy: bool,
     /// Default total timeout for `wait <target> { ... }` polling against
     /// this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_TIMEOUT`].
@@ -7668,6 +7730,7 @@ pub struct ResourceSchemaParts<'a> {
     pub unique_name: &'a UniqueNameSpec,
     pub operation_config: Option<&'a OperationConfig>,
     pub field_groups: &'a [FieldGroup],
+    pub default_prevent_destroy: bool,
     pub default_wait_timeout: Option<std::time::Duration>,
     pub default_wait_interval: Option<std::time::Duration>,
     pub defs: &'a std::collections::BTreeMap<String, AttributeType>,
@@ -7703,6 +7766,7 @@ pub enum SchemaValidationIssueLocation {
     Definition(String),
     FieldGroup(usize),
     UniqueName,
+    DefaultPreventDestroy,
 }
 
 impl SchemaValidationIssueLocation {
@@ -7710,7 +7774,7 @@ impl SchemaValidationIssueLocation {
         match self {
             Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}")),
             Self::Definition(path) => Self::Definition(format!("{path}{suffix}")),
-            Self::FieldGroup(_) | Self::UniqueName => {
+            Self::FieldGroup(_) | Self::UniqueName | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
         }
@@ -7719,7 +7783,10 @@ impl SchemaValidationIssueLocation {
     pub fn attribute_path(&self) -> Option<&str> {
         match self {
             Self::Attribute(path) => Some(path),
-            Self::Definition(_) | Self::FieldGroup(_) | Self::UniqueName => None,
+            Self::Definition(_)
+            | Self::FieldGroup(_)
+            | Self::UniqueName
+            | Self::DefaultPreventDestroy => None,
         }
     }
 }
@@ -7731,6 +7798,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
             Self::Definition(path) => write!(f, "defs.{path}"),
             Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
+            Self::DefaultPreventDestroy => f.write_str("default_prevent_destroy"),
         }
     }
 }
@@ -10143,6 +10211,7 @@ impl ResourceSchema {
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
             field_groups: Vec::new(),
+            default_prevent_destroy: false,
             default_wait_timeout: None,
             default_wait_interval: None,
             defs: std::collections::BTreeMap::new(),
@@ -10155,6 +10224,14 @@ impl ResourceSchema {
         let mut issues = Vec::new();
         let mut visited_definitions = HashSet::new();
         let mut identified_kinds = HashMap::new();
+
+        if self.kind == SchemaKind::DataSource && self.default_prevent_destroy {
+            push_schema_issue(
+                &mut issues,
+                &SchemaValidationIssueLocation::DefaultPreventDestroy,
+                "data-source schemas cannot set `default_prevent_destroy`".to_string(),
+            );
+        }
 
         for name in &self.duplicate_attributes {
             let location = SchemaValidationIssueLocation::Attribute(name.clone());
@@ -10262,6 +10339,7 @@ impl ResourceSchema {
             unique_name: &self.unique_name,
             operation_config: self.operation_config.as_ref(),
             field_groups: &self.field_groups,
+            default_prevent_destroy: self.default_prevent_destroy,
             default_wait_timeout: self.default_wait_timeout,
             default_wait_interval: self.default_wait_interval,
             defs: &self.defs,
@@ -10298,6 +10376,12 @@ impl ResourceSchema {
 
     pub fn field_groups(&self) -> &[FieldGroup] {
         &self.field_groups
+    }
+
+    /// Return whether this resource type is protected from destruction by
+    /// default when no explicit directive is present.
+    pub fn prevents_destroy_by_default(&self) -> bool {
+        self.default_prevent_destroy
     }
 
     pub fn default_wait_timeout(&self) -> Option<std::time::Duration> {
@@ -10533,6 +10617,13 @@ impl ResourceSchema {
     /// Add a declarative cardinality constraint over top-level attributes.
     pub fn field_group(mut self, group: FieldGroup) -> Self {
         self.field_groups.push(group);
+        self
+    }
+
+    /// Protect resources of this type from destruction unless users write an
+    /// explicit `prevent_destroy = false` directive.
+    pub fn default_prevent_destroy(mut self) -> Self {
+        self.default_prevent_destroy = true;
         self
     }
 
@@ -12430,6 +12521,17 @@ impl<'a> OwnerBoundResourceSchema<'a> {
         self.schema
     }
 
+    /// Resolve provider-visible directives against this registered schema.
+    pub fn resolve_directives(
+        self,
+        directives: &crate::resource::Directives,
+    ) -> crate::provider::ProviderDirectives {
+        crate::provider::ProviderDirectives::resolve(
+            directives,
+            crate::resource::ProviderDirectiveSchema::Available(self.schema.as_schema()),
+        )
+    }
+
     /// Return the complete reference-form table declared by this schema's
     /// owner. Forms are provider-wide rather than per resource occurrence.
     pub fn reference_forms(self) -> &'a ReferenceForms {
@@ -12504,6 +12606,7 @@ pub struct SchemaRegistry {
     data_sources: HashMap<(String, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
+    identified_scalar_kinds: BTreeMap<(String, TypeIdentity), RefinedScalarKind>,
 }
 
 /// Failure to combine owner-bound schema registry declarations.
@@ -12544,6 +12647,15 @@ impl SchemaRegistry {
     #[doc(hidden)]
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
+        for (identity, declaration) in identified_declarations_from_witnesses(
+            std::slice::from_ref(&schema),
+            &ValidatedConfigSchema::default(),
+        ) {
+            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
+                self.identified_scalar_kinds
+                    .insert((provider.clone(), identity), kind);
+            }
+        }
         self.reference_forms.entry(provider.clone()).or_default();
         let key = (provider, schema.as_schema().resource_type.clone());
         match schema.as_schema().kind {
@@ -12578,6 +12690,12 @@ impl SchemaRegistry {
         self.reference_forms
             .insert(provider.clone(), incoming.clone());
         self.witness_backed_reference_forms.insert(provider.clone());
+        for (identity, declaration) in witness.identified_declarations() {
+            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
+                self.identified_scalar_kinds
+                    .insert((provider.clone(), identity), kind);
+            }
+        }
         for schema in witness.resources() {
             let key = (provider.clone(), schema.as_schema().resource_type.clone());
             match schema.as_schema().kind {
@@ -12601,6 +12719,7 @@ impl SchemaRegistry {
             data_sources,
             reference_forms,
             witness_backed_reference_forms,
+            identified_scalar_kinds,
         } = other;
         for (owner, incoming) in &reference_forms {
             if witness_backed_reference_forms.contains(owner)
@@ -12625,7 +12744,18 @@ impl SchemaRegistry {
                 self.reference_forms.entry(owner).or_insert(forms);
             }
         }
+        self.identified_scalar_kinds.extend(identified_scalar_kinds);
         Ok(())
+    }
+
+    pub(crate) fn identified_scalar_kind(
+        &self,
+        owner: &str,
+        identity: &TypeIdentity,
+    ) -> Option<RefinedScalarKind> {
+        self.identified_scalar_kinds
+            .get(&(owner.to_string(), identity.clone()))
+            .copied()
     }
 
     /// Look up a schema by explicit `(provider, resource_type, kind)`.
@@ -12660,6 +12790,37 @@ impl SchemaRegistry {
             &resource.id.resource_type,
             SchemaKind::Resource,
         )
+    }
+
+    /// Resolve every provider-visible directive with one missing-schema policy.
+    ///
+    /// Registry misses use the named schema-unavailable compatibility path.
+    /// Callers that require a schema must use [`Self::try_resolve_directives`]
+    /// and surface the miss as an error.
+    pub fn resolve_directives(
+        &self,
+        resource_id: &crate::resource::ResourceId,
+        kind: SchemaKind,
+        directives: &crate::resource::Directives,
+    ) -> crate::provider::ProviderDirectives {
+        self.try_resolve_directives(resource_id, kind, directives)
+            .unwrap_or_else(|| {
+                crate::provider::ProviderDirectives::resolve(
+                    directives,
+                    crate::resource::ProviderDirectiveSchema::Unavailable,
+                )
+            })
+    }
+
+    /// Resolve directives only when the explicitly selected schema exists.
+    pub fn try_resolve_directives(
+        &self,
+        resource_id: &crate::resource::ResourceId,
+        kind: SchemaKind,
+        directives: &crate::resource::Directives,
+    ) -> Option<crate::provider::ProviderDirectives> {
+        self.get(&resource_id.provider, &resource_id.resource_type, kind)
+            .map(|schema| schema.resolve_directives(directives))
     }
 
     /// Look up the `DataSource` schema for a given [`DataSource`].

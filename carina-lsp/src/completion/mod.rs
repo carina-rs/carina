@@ -986,7 +986,7 @@ struct UpstreamDepth2Match {
 }
 
 /// Returns a bare identifier partial after interpolation-expression trivia.
-/// The partial may follow `${`, `(`, or `,`; spaces, tabs, and physical
+/// The partial may follow `${`, `(`, `,`, or an arithmetic operator; spaces, tabs, and physical
 /// newlines between that delimiter and the partial are accepted. Returns
 /// `None` past a dot (the depth-1/depth-2 detectors cover those), outside an
 /// interpolation, or inside a nested string/comment.
@@ -1027,7 +1027,9 @@ fn detect_interpolation_bare_partial(text: &str, position: Position) -> Option<S
     if !matches!(
         boundary,
         crate::lex::InterpolationCodeToken::Start
-            | crate::lex::InterpolationCodeToken::Character('(' | ',')
+            | crate::lex::InterpolationCodeToken::Character(
+                '(' | ',' | '+' | '-' | '*' | '/' | '%'
+            )
     ) {
         return None;
     }
@@ -1330,6 +1332,18 @@ mod helper_tests {
                 detect_interpolation_bare_partial(text, pos_at_end(text)).as_deref(),
                 Some("ab"),
                 "completion must fire after an expression delimiter in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_bare_partial_after_each_integer_operator() {
+        for operator in ["+", "-", "*", "/", "%"] {
+            let text = format!("value = \"${{count {operator} par");
+            assert_eq!(
+                detect_interpolation_bare_partial(&text, pos_at_end(&text)).as_deref(),
+                Some("par"),
+                "operator {operator}",
             );
         }
     }

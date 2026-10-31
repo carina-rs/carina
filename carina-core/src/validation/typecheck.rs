@@ -252,6 +252,18 @@ fn check_type_expr_value_inner_with_mode(
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> Result<(), TypeExprValueError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for branch in &deferred.values()[1..] {
+                check_type_expr_value_inner_with_mode(
+                    expected,
+                    branch,
+                    config,
+                    inference,
+                    provider_custom_types,
+                )?;
+            }
+            return Ok(());
+        }
         Value::Deferred(DeferredValue::ResourceRef { .. }) => match expected {
             TypeExpr::StringLiteral(_) | TypeExpr::Ref(_) => {
                 return Err(mismatch(expected, value));
@@ -292,6 +304,11 @@ fn check_type_expr_value_inner_with_mode(
                 ))
                 | Err(crate::static_type::InferenceIssue::Failed(
                     error @ super::inference::InferenceError::UnknownAttribute { .. },
+                ))
+                | Err(crate::static_type::InferenceIssue::Failed(
+                    error @ super::inference::InferenceError::InvalidIntegerArithmeticOperand {
+                        ..
+                    },
                 )) => Err(TypeExprValueError::InvalidAccess { error }),
                 Err(crate::static_type::InferenceIssue::Failed(
                     super::inference::InferenceError::UnknownType { .. }
@@ -305,6 +322,26 @@ fn check_type_expr_value_inner_with_mode(
                     | crate::static_type::NotInferableReason::NonInferableBinding { .. }
                     | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
                 )) => Ok(()),
+            };
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            let inferred = match inference {
+                TypecheckInference::Available { bindings, schemas } => {
+                    super::inference::infer_type_from_value(value, bindings, schemas)
+                }
+                TypecheckInference::Unavailable => {
+                    super::inference::infer_type_from_value_without_bindings(value)
+                }
+            };
+            return match inferred {
+                Ok(actual) if inferred_type_fits(expected, &actual) => Ok(()),
+                Ok(_) => Err(mismatch(expected, value)),
+                Err(crate::static_type::InferenceIssue::Failed(error)) => {
+                    Err(TypeExprValueError::InvalidAccess { error })
+                }
+                Err(crate::static_type::InferenceIssue::NotInferable(_)) => {
+                    Err(mismatch(expected, value))
+                }
             };
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => return Ok(()),
@@ -574,6 +611,8 @@ pub(crate) fn value_kind_name(value: &Value) -> &'static str {
         ) => "function result",
         Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable value",
         Value::Deferred(DeferredValue::Access(_)) => "access value",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "conditional value",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int",
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
             "secret value"
         }

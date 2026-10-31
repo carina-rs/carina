@@ -91,7 +91,7 @@ let networks = for name, cidr in cidrs {
 
 ## If Expression
 
-The `if` expression conditionally produces a resource or value.
+The `if` expression conditionally produces a resource or value. Its condition must be a `Bool` known without reading runtime resource attributes. Literal and other fully static conditions are evaluated immediately. In a module template, a `Bool` module argument—or a pure user-defined function of module arguments—is selected separately for each module instance.
 
 ### Conditional Resource Creation
 
@@ -108,7 +108,7 @@ if is_production {
 
 ### If/Else as a Value
 
-`if`/`else` can be used inline to choose between values:
+`if`/`else` can be used inline to choose between values. An `else` branch is required for every value-producing `if`, including a literal condition in a root file, because otherwise there is no value when the condition is false. Consequently, `let x = if true { 'a' }` is an error; add an `else` branch, such as `let x = if true { 'a' } else { 'b' }`:
 
 ```crn
 awscc.ec2.Vpc {
@@ -119,6 +119,22 @@ awscc.ec2.Vpc {
   }
 }
 ```
+
+### Module Template Conditions
+
+```crn
+arguments {
+  enabled: Bool
+}
+
+fn identity(value: Bool): Bool { value }
+
+attributes {
+  label: String = if identity(enabled) { 'enabled' } else { 'disabled' }
+}
+```
+
+Both branches are parsed and validated with the module. The chosen branch is materialized after the caller's arguments are substituted. A module argument may be forwarded through another module and remains deferred until an outer caller supplies a concrete `Bool`. Conditions that depend on resource references remain invalid.
 
 ### Local Bindings in If Body
 

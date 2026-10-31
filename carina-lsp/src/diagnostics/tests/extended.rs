@@ -651,6 +651,35 @@ fn authored_binding_regression_schemas() -> SchemaRegistry {
 }
 
 #[test]
+fn prevent_destroy_non_literal_uses_the_shared_parser_warning_in_lsp() {
+    let engine = custom_engine(authored_binding_regression_schemas());
+    let source = r#"provider mock {}
+let allow_destroy = false
+mock.test.resource {
+  name = "example"
+  directives { prevent_destroy = allow_destroy }
+}
+"#;
+
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("only a literal `false` opts out of schema-default protection")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        warnings[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(warnings[0].range.start.line, 4);
+}
+
+#[test]
 fn unused_binding_analysis_matches_validate_for_authored_values() {
     struct Case {
         label: &'static str,
@@ -9150,6 +9179,76 @@ fn single_quoted_interpolation_like_sequence_emits_warning_at_span() {
 }
 
 #[test]
+fn non_literal_prevent_destroy_warning_is_directory_scoped() {
+    let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
+    let resource = r#"let account = mock.test.resource {
+  name = "example"
+  directives { prevent_destroy = allow_destroy }
+}
+"#;
+    std::fs::write(
+        fixture.path().join("flags.crn"),
+        "let allow_destroy = false\n",
+    )
+    .expect("write sibling expression input");
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write sibling provider fixture");
+    std::fs::write(fixture.path().join("resources.crn"), resource).expect("write resource fixture");
+
+    let path = fixture.path().join("resources.crn");
+    let diagnostics =
+        test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("only a literal `false` opts out of schema-default protection")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
+    let warning = warnings[0];
+
+    assert_eq!(
+        warning.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(warning.range.start.line, 2);
+}
+
+#[test]
+fn sibling_true_prevent_destroy_expression_does_not_warn() {
+    let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
+    let resource = r#"let account = mock.test.resource {
+  name = "example"
+  directives { prevent_destroy = protect }
+}
+"#;
+    std::fs::write(fixture.path().join("flags.crn"), "let protect = true\n")
+        .expect("write sibling expression input");
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write sibling provider fixture");
+    std::fs::write(fixture.path().join("resources.crn"), resource).expect("write resource fixture");
+
+    let path = fixture.path().join("resources.crn");
+    let diagnostics =
+        test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("only a literal `false` opts out of schema-default protection")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        warnings.is_empty(),
+        "the directory-resolved true value enables protection without an opt-out warning: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn single_quoted_interpolation_warning_uses_original_line_after_heredoc() {
     let engine = test_engine();
     let buffer = r#"let doc = <<EOF
@@ -13889,6 +13988,59 @@ attributes { o: String = name_with_suffix(r) }
     assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
     assert_eq!(matching[0].range.start.line, 1);
     assert_eq!(matching[0].range.start.character, 45);
+}
+
+#[test]
+fn module_argument_if_has_no_runtime_condition_diagnostic_when_opened_standalone() {
+    let module = tempfile::tempdir().unwrap();
+    let source = r#"arguments { flag: Bool }
+fn identity(value: Bool): Bool { value }
+attributes {
+  selected: String = if identity(flag) { "yes" } else { "no" }
+}
+"#;
+    std::fs::write(module.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), module.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time",
+            )
+        }),
+        "a standalone module argument is a template dependency, not a runtime condition: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn module_argument_if_validates_both_value_branches_when_opened_standalone() {
+    let module = tempfile::tempdir().unwrap();
+    let source = r#"arguments { flag: Bool }
+attributes {
+  selected: String = if flag { "yes" } else { 42 }
+}
+"#;
+    std::fs::write(module.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), module.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time",
+            )
+        }),
+        "the unresolved module-only condition itself must not be diagnosed: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'selected': type mismatch")
+                || (diagnostic.message.contains("expected String")
+                    && diagnostic.message.contains("got int"))
+        }),
+        "the unselected-at-template-time else branch must still be type-checked: {diagnostics:#?}",
+    );
 }
 
 #[test]
