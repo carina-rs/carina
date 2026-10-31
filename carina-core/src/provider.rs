@@ -27,9 +27,11 @@ use carina_provider_protocol::types::{
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
+pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
-    ProviderResource, Resource, ResourceId, State, Value, ValueString,
+    PreventDestroyResolution, PreventDestroySource, ProviderResource, Resource, ResourceId, State,
+    Value, ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
@@ -762,6 +764,12 @@ impl CreateRequest {
         &self.resource
     }
 
+    /// Effective directives resolved while the resource crossed the provider
+    /// preparation boundary.
+    pub fn directives(&self) -> &ProviderDirectives {
+        self.resource.directives()
+    }
+
     pub(crate) fn sent_attributes(&self) -> SentAttributes {
         SentAttributes::from_resource(self.resource.as_resource())
     }
@@ -817,6 +825,8 @@ pub struct UpdateRequest {
     /// Structured description of the user's intended change and any write-only
     /// values reasserted alongside it.
     patch: UpdatePatch,
+    /// Effective directives resolved from the desired resource's schema.
+    directives: ProviderDirectives,
 }
 
 impl UpdateRequest {
@@ -827,7 +837,11 @@ impl UpdateRequest {
         schema: &ResourceSchema,
     ) -> Result<Self, IgnoredWriteOnlyValueError> {
         let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
-        Ok(Self { from, patch })
+        Ok(Self {
+            from,
+            patch,
+            directives: *resource.directives(),
+        })
     }
 
     /// Current provider-side state.
@@ -839,15 +853,129 @@ impl UpdateRequest {
     pub fn patch(&self) -> &UpdatePatch {
         &self.patch
     }
+
+    /// Effective directives resolved while the desired resource crossed the
+    /// provider preparation boundary.
+    pub fn directives(&self) -> &ProviderDirectives {
+        &self.directives
+    }
 }
 
 /// Per-operation request record for [`Provider::delete`].
 ///
 /// Mirrors `delete-request` in `wit/types.wit`.
-#[derive(Debug, Clone, Default)]
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::DeleteRequest;
+///
+/// let _ = DeleteRequest::default();
+/// ```
+#[derive(Debug, Clone)]
 pub struct DeleteRequest {
-    /// Carina-side directives for the resource.
-    pub directives: Directives,
+    /// Effective provider-visible directives for the resource.
+    directives: ProviderDirectives,
+}
+
+impl DeleteRequest {
+    /// Resolve authored directives against the resource schema before crossing
+    /// the provider boundary.
+    pub fn resolve(directives: &Directives, schema: ProviderDirectiveSchema<'_>) -> Self {
+        Self {
+            directives: ProviderDirectives::resolve(directives, schema),
+        }
+    }
+
+    /// Construct a delete request from directives already resolved through a
+    /// schema registry or an explicitly named schema-unavailable path.
+    pub fn from_resolved(directives: ProviderDirectives) -> Self {
+        Self { directives }
+    }
+
+    /// Effective directives carried by this request.
+    pub fn directives(&self) -> &ProviderDirectives {
+        &self.directives
+    }
+}
+
+/// Effective directive values transported to providers.
+///
+/// Callers cannot forge an effective value without resolving authored
+/// directives against an explicitly available or unavailable schema:
+///
+/// ```compile_fail,E0451
+/// use carina_core::provider::ProviderDirectives;
+///
+/// let _ = ProviderDirectives {
+///     force_delete: false,
+///     create_before_destroy: false,
+///     prevent_destroy: false,
+/// };
+/// ```
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::ProviderDirectives;
+///
+/// let _ = ProviderDirectives::default();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderDirectives {
+    pub(crate) force_delete: bool,
+    pub(crate) create_before_destroy: bool,
+    pub(crate) prevent_destroy: bool,
+    pub(crate) prevent_destroy_source: Option<PreventDestroySource>,
+}
+
+impl ProviderDirectives {
+    /// Resolve the provider-visible directive subset against an explicitly
+    /// available or unavailable resource schema.
+    pub fn resolve(directives: &Directives, schema: ProviderDirectiveSchema<'_>) -> Self {
+        let prevent_destroy_resolution = directives.prevent_destroy_setting().resolve(schema);
+        let prevent_destroy_source = prevent_destroy_resolution.source();
+        let prevent_destroy = matches!(
+            prevent_destroy_resolution,
+            PreventDestroyResolution::Protected(_)
+        );
+        Self {
+            force_delete: directives.force_delete,
+            create_before_destroy: directives.create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source,
+        }
+    }
+
+    /// Decode values that have already crossed the effective-directives wire
+    /// boundary. This is crate-private so authored callers cannot forge policy.
+    #[cfg(test)]
+    pub(crate) fn from_effective_wire(
+        force_delete: bool,
+        create_before_destroy: bool,
+        prevent_destroy: bool,
+    ) -> Self {
+        Self {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            prevent_destroy_source: prevent_destroy
+                .then_some(PreventDestroySource::ExplicitDirective),
+        }
+    }
+
+    pub fn force_delete(&self) -> bool {
+        self.force_delete
+    }
+
+    pub fn create_before_destroy(&self) -> bool {
+        self.create_before_destroy
+    }
+
+    pub fn prevent_destroy(&self) -> bool {
+        self.prevent_destroy
+    }
+
+    /// Provenance for effective destruction protection, when enabled.
+    pub fn prevent_destroy_source(&self) -> Option<PreventDestroySource> {
+        self.prevent_destroy_source
+    }
 }
 
 /// A structured description of the user's intended change to a resource.
@@ -4546,8 +4674,8 @@ pub trait Provider: Send + Sync {
     /// Delete an existing resource. `identifier` is the cloud-side
     /// internal ID (e.g. `vpc-xxx`).
     ///
-    /// `request.directives` carries the resource's Carina-side directives
-    /// (force-delete, create-before-destroy, prevent-destroy).
+    /// `request.directives()` carries the resource's schema-resolved effective
+    /// directives (force-delete, create-before-destroy, prevent-destroy).
     fn delete(
         &self,
         id: &ResourceId,
@@ -7235,6 +7363,10 @@ mod tests {
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::unavailable(Box::new(provider))
+    }
+
+    fn delete_request_without_schema() -> DeleteRequest {
+        DeleteRequest::resolve(&Directives::default(), ProviderDirectiveSchema::Unavailable)
     }
 
     #[test]
@@ -10718,7 +10850,7 @@ mod tests {
         router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
-        let request = DeleteRequest::default();
+        let request = delete_request_without_schema();
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
         let result = router.delete(&id, &identifier, request).await;

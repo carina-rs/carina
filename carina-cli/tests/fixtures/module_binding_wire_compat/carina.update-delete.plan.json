@@ -1,9 +1,9 @@
 {
-  "version": 34,
+  "version": 35,
   "carina_version": "0.9.0",
-  "timestamp": "2026-10-31T08:49:05.055111+00:00",
+  "timestamp": "2026-10-31T10:49:11.791567+00:00",
   "source_path": "carina-cli/tests/fixtures/module_binding_wire_compat",
-  "state_lineage": "11a14ee5-783c-4b8b-8e72-98e2343762ba",
+  "state_lineage": "3ece2d76-0686-41a1-a096-960716c688de",
   "state_serial": 4,
   "provider_configs": [
     {
@@ -37,7 +37,9 @@
             "directives": {
               "force_delete": false,
               "create_before_destroy": false,
-              "prevent_destroy": false
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
             },
             "binding": "direct.lookup",
             "dependency_bindings": [],
@@ -66,7 +68,9 @@
             "directives": {
               "force_delete": false,
               "create_before_destroy": false,
-              "prevent_destroy": false
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
             },
             "binding": "looped[0].lookup",
             "dependency_bindings": [],
@@ -94,7 +98,7 @@
               },
               "comment": {
                 "RedactedSecret": {
-                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$6H4XQg5f3NufK9bWbkujqA$x3nMeXZgdpgUWFUMt+Y4gPxmbOWLuiqkvAoGDWsUWE0"
+                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
                 }
               },
               "name": {
@@ -125,7 +129,9 @@
             "directives": {
               "force_delete": false,
               "create_before_destroy": false,
-              "prevent_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              },
               "depends_on": [
                 "direct.seed",
                 "root"
@@ -164,7 +170,9 @@
           "directives": {
             "force_delete": false,
             "create_before_destroy": false,
-            "prevent_destroy": false
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
           },
           "prefixes": {},
           "binding": "direct.after_ready",
@@ -189,16 +197,16 @@
             },
             "identifier": "mock-id",
             "attributes": {
-              "comment": {
-                "RedactedSecret": {
-                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$h6ELqN70BEfVBwdCCVLwPg$wJAfpxXkFMurljkpqwgQnNg2VPyq+j3DFzmQ/TYVyYw"
-                }
-              },
               "identifier": {
                 "String": "loop-consumer-id"
               },
               "name": {
                 "String": "loop-consumer"
+              },
+              "comment": {
+                "RedactedSecret": {
+                  "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+                }
               }
             },
             "exists": true,
@@ -225,7 +233,9 @@
             "directives": {
               "force_delete": false,
               "create_before_destroy": false,
-              "prevent_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              },
               "depends_on": [
                 "looped[0].seed",
                 "root"
@@ -264,7 +274,9 @@
           "directives": {
             "force_delete": false,
             "create_before_destroy": false,
-            "prevent_destroy": false
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
           },
           "prefixes": {},
           "binding": "looped[0].after_ready",
@@ -290,7 +302,9 @@
           "directives": {
             "force_delete": false,
             "create_before_destroy": false,
-            "prevent_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            },
             "depends_on": [
               "direct.consumer"
             ]
@@ -315,7 +329,9 @@
           "directives": {
             "force_delete": false,
             "create_before_destroy": false,
-            "prevent_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            },
             "depends_on": [
               "looped[0].consumer"
             ]
@@ -400,7 +416,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "root",
@@ -421,7 +439,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "direct.seed",
@@ -450,7 +470,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "direct.seed",
           "root"
@@ -483,7 +505,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "direct.after_ready",
@@ -511,7 +535,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "looped[0].seed",
@@ -540,7 +566,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "looped[0].seed",
           "root"
@@ -573,7 +601,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "looped[0].after_ready",
@@ -603,7 +633,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "root",
@@ -624,7 +656,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "direct.seed",
@@ -653,7 +687,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "direct.seed",
           "root"
@@ -691,7 +727,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "direct.after_ready",
@@ -719,7 +757,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "looped[0].seed",
@@ -748,7 +788,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "looped[0].seed",
           "root"
@@ -786,7 +828,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "binding": "looped[0].after_ready",
@@ -905,7 +949,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "binding": "direct.lookup",
       "dependency_bindings": [],
@@ -930,7 +976,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "binding": "looped[0].lookup",
       "dependency_bindings": [],
@@ -957,7 +1005,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "binding": "direct.lookup",
       "dependency_bindings": [],
@@ -982,7 +1032,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "binding": "looped[0].lookup",
       "dependency_bindings": [],
@@ -1044,6 +1096,111 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
+        "identity": "looped[0].nested.leaf"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].nested.leaf"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "identifier": {
+              "String": "loop-nested-id"
+            },
+            "name": {
+              "String": "loop-nested"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "looped[0].consumer"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
+              }
+            },
+            "name": {
+              "String": "direct-consumer"
+            },
+            "identifier": {
+              "String": "direct-consumer-id"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "direct.seed",
+            "root"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "name": {
+              "String": "loop-consumer"
+            },
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+              }
+            },
+            "identifier": {
+              "String": "loop-consumer-id"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            "looped[0].seed",
+            "root"
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
         "identity": "looped[0].after_ready"
       },
       "current": {
@@ -1066,103 +1223,6 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "direct.consumer"
-      },
-      "current": {
-        "status": "present",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.consumer"
-          },
-          "identifier": "mock-id",
-          "attributes": {
-            "name": {
-              "String": "direct-consumer"
-            },
-            "comment": {
-              "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$6H4XQg5f3NufK9bWbkujqA$x3nMeXZgdpgUWFUMt+Y4gPxmbOWLuiqkvAoGDWsUWE0"
-              }
-            },
-            "identifier": {
-              "String": "direct-consumer-id"
-            }
-          },
-          "exists": true,
-          "dependency_bindings": [
-            "direct.seed",
-            "root"
-          ]
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.seed"
-      },
-      "current": {
-        "status": "present",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.seed"
-          },
-          "identifier": "mock-id",
-          "attributes": {
-            "identifier": {
-              "String": "direct-seed-id"
-            },
-            "name": {
-              "String": "direct-seed"
-            }
-          },
-          "exists": true,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "looped[0].nested.leaf"
-      },
-      "current": {
-        "status": "present",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "looped[0].nested.leaf"
-          },
-          "identifier": "mock-id",
-          "attributes": {
-            "name": {
-              "String": "loop-nested"
-            },
-            "identifier": {
-              "String": "loop-nested-id"
-            }
-          },
-          "exists": true,
-          "dependency_bindings": [
-            "looped[0].consumer"
-          ]
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
         "identity": "looped[0].seed"
       },
       "current": {
@@ -1175,67 +1235,14 @@
           },
           "identifier": "mock-id",
           "attributes": {
-            "name": {
-              "String": "loop-seed"
-            },
             "identifier": {
               "String": "loop-seed-id"
-            }
-          },
-          "exists": true,
-          "dependency_bindings": []
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.nested.leaf"
-      },
-      "current": {
-        "status": "present",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.nested.leaf"
-          },
-          "identifier": "mock-id",
-          "attributes": {
-            "identifier": {
-              "String": "direct-nested-id"
             },
             "name": {
-              "String": "direct-nested"
+              "String": "loop-seed"
             }
           },
           "exists": true,
-          "dependency_bindings": [
-            "direct.consumer"
-          ]
-        }
-      }
-    },
-    {
-      "kind": "managed",
-      "id": {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.after_ready"
-      },
-      "current": {
-        "status": "absent",
-        "state": {
-          "id": {
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "direct.after_ready"
-          },
-          "identifier": null,
-          "attributes": {},
-          "exists": false,
           "dependency_bindings": []
         }
       }
@@ -1274,7 +1281,29 @@
       "id": {
         "provider": "mock",
         "resource_type": "test.resource",
-        "identity": "looped[0].consumer"
+        "identity": "direct.after_ready"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.after_ready"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
       },
       "current": {
         "status": "present",
@@ -1282,26 +1311,49 @@
           "id": {
             "provider": "mock",
             "resource_type": "test.resource",
-            "identity": "looped[0].consumer"
+            "identity": "direct.seed"
           },
           "identifier": "mock-id",
           "attributes": {
-            "comment": {
-              "RedactedSecret": {
-                "hash": "$argon2id$v=19$m=19456,t=2,p=1$h6ELqN70BEfVBwdCCVLwPg$wJAfpxXkFMurljkpqwgQnNg2VPyq+j3DFzmQ/TYVyYw"
-              }
+            "name": {
+              "String": "direct-seed"
             },
             "identifier": {
-              "String": "loop-consumer-id"
-            },
+              "String": "direct-seed-id"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.nested.leaf"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.nested.leaf"
+          },
+          "identifier": "mock-id",
+          "attributes": {
             "name": {
-              "String": "loop-consumer"
+              "String": "direct-nested"
+            },
+            "identifier": {
+              "String": "direct-nested-id"
             }
           },
           "exists": true,
           "dependency_bindings": [
-            "looped[0].seed",
-            "root"
+            "direct.consumer"
           ]
         }
       }
@@ -1319,6 +1371,7 @@
       "target": "looped[0].consumer"
     }
   ],
+  "persisted_directive_changes": [],
   "schema_fingerprints": {
     "providers": {
       "mock": {
@@ -1327,14 +1380,14 @@
             "kind": "resource",
             "resource_type": "test.resource",
             "fingerprint": {
-              "present": "d88d11aac1f85c1bd922b4407e3a4c145665c750e04d3e80e58ee0579c44d91c"
+              "present": "ebe39904297c3428437d065e907bda92d239cdf7cc469f33ebf16503dace865c"
             }
           },
           {
             "kind": "data_source",
             "resource_type": "iam.Roles",
             "fingerprint": {
-              "present": "02b7c78184edb60eb2e104798a09be4f0e65e1dcdf9706af9ba81f0addd9a332"
+              "present": "7e4c0cd4c98f7ced2cf325fefe56203597382a097fbd24c96d9bccc6aa663786"
             }
           }
         ]

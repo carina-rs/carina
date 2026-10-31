@@ -21,6 +21,7 @@ use crate::resolver::resolve_ref_value;
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
+use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
 
 use super::wait::{InFlightStart, StartedEffect};
@@ -1219,16 +1220,12 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             directives,
             ..
         } => {
-            match provider
-                .delete(
-                    id,
-                    identifier,
-                    DeleteRequest {
-                        directives: directives.clone(),
-                    },
-                )
-                .await
-            {
+            let resolved_directives =
+                preparation
+                    .schemas()
+                    .resolve_directives(id, SchemaKind::Resource, directives);
+            let request = DeleteRequest::from_resolved(resolved_directives);
+            match provider.delete(id, identifier, request).await {
                 Ok(()) => BasicEffectResult::Deleted {
                     instance_key: DeletedInstanceKey::new(
                         id.clone(),

@@ -2,7 +2,7 @@
   "version": 20,
   "exports_version": 1,
   "serial": 4,
-  "lineage": "11a14ee5-783c-4b8b-8e72-98e2343762ba",
+  "lineage": "3ece2d76-0686-41a1-a096-960716c688de",
   "carina_version": "0.9.0",
   "resources": [
     {
@@ -13,8 +13,8 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "identifier": "root-id",
-          "name": "root"
+          "name": "root",
+          "identifier": "root-id"
         },
         "nested_write_only": {}
       },
@@ -22,7 +22,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "name_overrides": {},
@@ -45,8 +47,8 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "identifier": "direct-seed-id",
-          "name": "direct-seed"
+          "name": "direct-seed",
+          "identifier": "direct-seed-id"
         },
         "nested_write_only": {}
       },
@@ -54,7 +56,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "name_overrides": {},
@@ -77,11 +81,11 @@
         "kind": "applied",
         "identifier": "mock-id",
         "attributes": {
-          "identifier": "direct-consumer-id",
           "name": "direct-consumer",
           "comment": {
-            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$6H4XQg5f3NufK9bWbkujqA$x3nMeXZgdpgUWFUMt+Y4gPxmbOWLuiqkvAoGDWsUWE0"
-          }
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$W2wwmJ/Vmlf1Y83aP7THBA$5H91MmSDROpz3ujyBLyxXg8rUldJaeKTwKM2V3mY9Z8"
+          },
+          "identifier": "direct-consumer-id"
         },
         "nested_write_only": {}
       },
@@ -89,7 +93,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "direct.seed",
           "root"
@@ -131,7 +137,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "direct.consumer"
         ]
@@ -168,7 +176,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
       },
       "prefixes": {},
       "name_overrides": {},
@@ -192,10 +202,10 @@
         "identifier": "mock-id",
         "attributes": {
           "name": "loop-consumer",
-          "identifier": "loop-consumer-id",
           "comment": {
-            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$h6ELqN70BEfVBwdCCVLwPg$wJAfpxXkFMurljkpqwgQnNg2VPyq+j3DFzmQ/TYVyYw"
-          }
+            "$secret": "$argon2id$v=19$m=19456,t=2,p=1$vhDBSL7GJeUFxfWmzRpt0g$+RdamqybSNQWQtSCZAdJJXW73fXGYS45uYF3xNg7lK0"
+          },
+          "identifier": "loop-consumer-id"
         },
         "nested_write_only": {}
       },
@@ -203,7 +213,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "looped[0].seed",
           "root"
@@ -245,7 +257,9 @@
       "directives": {
         "force_delete": false,
         "create_before_destroy": false,
-        "prevent_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
         "depends_on": [
           "looped[0].consumer"
         ]

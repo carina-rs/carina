@@ -2101,10 +2101,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
                 );
                 attrs
             },
-            directives: Directives {
-                provider_instance: Some("us".to_string()),
-                ..Directives::default()
-            },
+            directives: Directives::default().with_provider_instance("us"),
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".into()),
@@ -2208,10 +2205,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             );
             attrs
         },
-        directives: Directives {
-            provider_instance: Some("us".to_string()),
-            ..Directives::default()
-        },
+        directives: Directives::default().with_provider_instance("us"),
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix).into()),

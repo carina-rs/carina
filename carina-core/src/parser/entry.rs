@@ -644,7 +644,7 @@ fn parse_with_seeded_bindings_inner(
     ctx.set_preprocessed_file(&preprocessed_file);
     ctx.set_source_scope(source_file);
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
-    ctx.warnings.extend(single_quote_warnings);
+    ctx.extend_warnings(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
     ctx.extend_user_functions(seeded_user_functions.clone());
     ctx.seeded_user_functions
@@ -686,8 +686,7 @@ fn parse_with_seeded_bindings_inner(
                                 // later argument's default expression can reference
                                 // earlier arguments (#2393).
                                 let parsed_arguments_block = {
-                                    let warnings = std::mem::take(&mut ctx.warnings);
-                                    let mut warnings = warnings;
+                                    let mut warnings = ctx.take_warnings();
                                     let result = parse_arguments_block(
                                         stmt,
                                         config,
@@ -696,7 +695,7 @@ fn parse_with_seeded_bindings_inner(
                                         source_file,
                                         &mut warnings,
                                     );
-                                    ctx.warnings = warnings;
+                                    ctx.restore_warnings(warnings);
                                     result?
                                 };
                                 let ParsedArgumentsBlock {
@@ -708,8 +707,7 @@ fn parse_with_seeded_bindings_inner(
                             }
                             Rule::attributes_block => {
                                 let parsed_attribute_params = {
-                                    let warnings = std::mem::take(&mut ctx.warnings);
-                                    let mut warnings = warnings;
+                                    let mut warnings = ctx.take_warnings();
                                     let result = parse_attributes_block(
                                         stmt,
                                         &ctx,
@@ -717,15 +715,14 @@ fn parse_with_seeded_bindings_inner(
                                         source_file,
                                         &mut warnings,
                                     );
-                                    ctx.warnings = warnings;
+                                    ctx.restore_warnings(warnings);
                                     result?
                                 };
                                 attribute_params.extend(parsed_attribute_params);
                             }
                             Rule::exports_block => {
                                 let parsed_export_params = {
-                                    let warnings = std::mem::take(&mut ctx.warnings);
-                                    let mut warnings = warnings;
+                                    let mut warnings = ctx.take_warnings();
                                     let result = parse_exports_block(
                                         stmt,
                                         &ctx,
@@ -733,7 +730,7 @@ fn parse_with_seeded_bindings_inner(
                                         source_file,
                                         &mut warnings,
                                     );
-                                    ctx.warnings = warnings;
+                                    ctx.restore_warnings(warnings);
                                     result?
                                 };
                                 export_params.extend(parsed_export_params);
@@ -816,11 +813,10 @@ fn parse_with_seeded_bindings_inner(
                             }
                             Rule::fn_def => {
                                 let user_fn = {
-                                    let warnings = std::mem::take(&mut ctx.warnings);
-                                    let mut warnings = warnings;
+                                    let mut warnings = ctx.take_warnings();
                                     let result =
                                         parse_fn_def(stmt, &ctx, &mut warnings, &preprocessed_file);
-                                    ctx.warnings = warnings;
+                                    ctx.restore_warnings(warnings);
                                     result?
                                 };
                                 let fn_name = user_fn.name.clone();
@@ -1104,6 +1100,7 @@ fn parse_with_seeded_bindings_inner(
     // so `compositions` is empty here.
 
     let parsed_binding_uses = ctx.take_parsed_binding_uses();
+    let warnings = ctx.take_warnings();
     let mut user_functions = Arc::unwrap_or_clone(ctx.user_functions);
     user_functions.retain(|name, _| !ctx.seeded_user_functions.contains(name));
 
@@ -1131,7 +1128,7 @@ fn parse_with_seeded_bindings_inner(
         .map(crate::resource::RelativeBindingName::new)
         .collect();
     parsed.parser_binding_metadata = parser_binding_metadata;
-    parsed.warnings = ctx.warnings;
+    parsed.warnings = warnings;
     *parsed.parsed_deferred_for_expressions_mut() = ctx.parsed_deferred_for_expressions;
     parsed.deferred_module_ifs = ctx.deferred_module_ifs;
     let binding_scope = crate::binding_index::BindingNameSet::from_parsed(&parsed);

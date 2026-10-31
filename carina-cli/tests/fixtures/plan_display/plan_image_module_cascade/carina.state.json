@@ -36,7 +36,9 @@
         "metric_name": "bridge"
       },
       "protected": false,
-      "directives": {},
+      "directives": {
+        "depends_on": ["source"]
+      },
       "prefixes": {},
       "name_overrides": {},
       "binding": "connector",
@@ -59,7 +61,9 @@
         "description": "old sink description"
       },
       "protected": false,
-      "directives": {},
+      "directives": {
+        "depends_on": ["connector"]
+      },
       "prefixes": {},
       "name_overrides": {},
       "binding": "sink",

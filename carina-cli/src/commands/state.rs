@@ -1342,13 +1342,11 @@ async fn run_state_bucket_delete(
     })?;
     let bucket_id =
         ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
+    let delete_request =
+        state_bucket_delete_request(validated_config.context().schemas(), &bucket_id)?;
     match bucket_provider
         .provider()
-        .delete(
-            &bucket_id,
-            &bucket_identifier,
-            carina_core::provider::DeleteRequest::default(),
-        )
+        .delete(&bucket_id, &bucket_identifier, delete_request)
         .await
     {
         Ok(()) => {
@@ -1362,6 +1360,29 @@ async fn run_state_bucket_delete(
         }
         Err(e) => Err(AppError::Provider(e)),
     }
+}
+
+fn state_bucket_delete_request(
+    schemas: &carina_core::schema::SchemaRegistry,
+    resource_id: &ResourceId,
+) -> Result<carina_core::provider::DeleteRequest, AppError> {
+    let directives = carina_core::resource::Directives::default();
+    let resolved = schemas
+        .try_resolve_directives(
+            resource_id,
+            carina_core::schema::SchemaKind::Resource,
+            &directives,
+        )
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "No managed resource schema registered for state bucket type \
+                 '{}.{}'",
+                resource_id.provider, resource_id.resource_type
+            ))
+        })?;
+    Ok(carina_core::provider::DeleteRequest::from_resolved(
+        resolved,
+    ))
 }
 
 async fn load_state_bucket_delete_provider_inputs<E>(
@@ -3155,6 +3176,24 @@ mod tests {
                 "arn:aws:iam::123456789012:role/upstream".into()
             )))
         );
+    }
+
+    #[test]
+    fn state_bucket_delete_request_resolves_the_bucket_schema() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("s3.Bucket")
+                .default_prevent_destroy()
+                .validate()
+                .expect("bucket schema must validate"),
+        );
+
+        let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "state", None);
+        let request = state_bucket_delete_request(&schemas, &id)
+            .expect("the registered bucket schema must resolve");
+
+        assert!(request.directives().prevent_destroy());
     }
 
     #[tokio::test]
@@ -5720,16 +5759,13 @@ mod tests {
         let mut row = ResourceState::try_applied("ec2.Subnet", "main", "awscc", "subnet-current")
             .expect("fixture identifier is non-empty")
             .with_attribute("token", json!("old-token"));
-        row.directives = carina_core::resource::Directives {
-            force_delete: true,
-            create_before_destroy: true,
-            prevent_destroy: true,
-            depends_on: vec![absolute_binding("security_group")],
-            depends_on_diagnostic_sources: Default::default(),
-            provider_instance: Some("west".to_string()),
-            ignore_changes: Vec::new(),
-        }
-        .into();
+        row.directives = carina_core::resource::Directives::default()
+            .with_force_delete(true)
+            .with_create_before_destroy(true)
+            .with_depends_on(vec![absolute_binding("security_group")])
+            .with_provider_instance("west")
+            .with_prevent_destroy(true)
+            .into();
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -5805,15 +5841,12 @@ mod tests {
         );
         assert_eq!(
             refreshed.directives,
-            carina_core::resource::Directives {
-                force_delete: true,
-                create_before_destroy: true,
-                prevent_destroy: true,
-                depends_on: vec![absolute_binding("security_group")],
-                depends_on_diagnostic_sources: Default::default(),
-                provider_instance: Some("west".to_string()),
-                ignore_changes: Vec::new(),
-            }
+            carina_core::resource::Directives::default()
+                .with_force_delete(true)
+                .with_create_before_destroy(true)
+                .with_depends_on(vec![absolute_binding("security_group")])
+                .with_provider_instance("west")
+                .with_prevent_destroy(true)
         );
         assert_eq!(
             refreshed.prefixes,
@@ -5863,7 +5896,8 @@ mod tests {
         assert!(matches!(
             &plan.errors()[0].kind,
             carina_core::plan::PlanErrorKind::PreventDestroy {
-                action: carina_core::plan::PreventDestroyAction::DeleteRemovedFromConfiguration
+                action: carina_core::plan::PreventDestroyAction::DeleteRemovedFromConfiguration,
+                source: carina_core::plan::PreventDestroySource::ExplicitDirective,
             }
         ));
     }

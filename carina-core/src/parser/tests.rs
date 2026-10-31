@@ -6,7 +6,7 @@ use crate::resource::{
     AuthoredInterpolationPart as InterpolationPart, AuthoredUnknownReason as UnknownReason,
     AuthoredValue as Value, ExpandedConcreteValue, ExpandedDeferredValue,
     ExpandedInterpolationPart, ExpandedResource, ExpandedUnknownReason, ExpandedValue,
-    ForLoopElement, LoopKind, LoopOriginKind, RootScope,
+    ForLoopElement, LoopKind, LoopOriginKind, PreventDestroy, RootScope,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -2360,7 +2360,82 @@ fn parse_directives_default_when_absent() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 1);
     assert!(!result.resources[0].directives.force_delete);
-    assert!(!result.resources[0].directives.prevent_destroy);
+    assert_eq!(
+        result.resources[0].directives.prevent_destroy_setting(),
+        PreventDestroy::Unspecified
+    );
+}
+
+#[test]
+fn parse_prevent_destroy_preserves_literal_true_and_false_as_explicit() {
+    for (literal, expected) in [
+        ("true", PreventDestroy::Explicit(true)),
+        ("false", PreventDestroy::Explicit(false)),
+    ] {
+        let input = format!(
+            r#"
+                let resource = mock.test.resource {{
+                    name = "example"
+                    directives {{ prevent_destroy = {literal} }}
+                }}
+            "#
+        );
+        let parsed = parse(&input, &ProviderContext::default()).expect("literal must parse");
+        assert_eq!(
+            parsed.resources[0].directives.prevent_destroy_setting(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn parse_prevent_destroy_non_literal_remains_unspecified() {
+    let input = r#"
+        let protection = false
+        let resource = mock.test.resource {
+            name = "example"
+            directives { prevent_destroy = protection }
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("expression must parse");
+    assert_eq!(
+        parsed.resources[0].directives.prevent_destroy_setting(),
+        PreventDestroy::Unspecified,
+        "an expression that currently evaluates to false must not opt out of schema protection"
+    );
+    assert!(
+        parsed.warnings.iter().any(|warning| warning
+            .message
+            .contains("only a literal `false` opts out of schema-default protection")),
+        "a silently ignored opt-out must produce an actionable warning: {:?}",
+        parsed.warnings
+    );
+}
+
+#[test]
+fn parse_prevent_destroy_non_literal_true_fails_closed() {
+    let input = r#"
+        let protection = true
+        let resource = mock.test.resource {
+            name = "example"
+            directives { prevent_destroy = protection }
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default()).expect("expression must parse");
+    assert_eq!(
+        parsed.resources[0].directives.prevent_destroy_setting(),
+        PreventDestroy::Explicit(true),
+        "a non-literal expression that resolves to true must retain fail-closed protection"
+    );
+    assert!(
+        parsed.warnings.iter().all(|warning| !warning
+            .message
+            .contains("only a literal `false` opts out of schema-default protection")),
+        "a fail-closed non-literal true must not emit an opt-out warning: {:?}",
+        parsed.warnings
+    );
 }
 
 #[test]
@@ -11294,6 +11369,78 @@ let calls = for x in src.list { child { item = x } }
     assert!(matches!(bodies[0].body, DeferredForBody::Resource(_)));
     assert!(matches!(bodies[1].body, DeferredForBody::Read(_)));
     assert!(matches!(bodies[2].body, DeferredForBody::ModuleCall(_)));
+}
+
+#[test]
+fn deferred_for_resource_body_surfaces_non_literal_prevent_destroy_warning() {
+    let parsed = parse(
+        r#"let allow_destroy = false
+let src = mock.test.resource { name = "src" }
+let resources = for x in src.list {
+  mock.test.resource {
+    name = x
+    directives { prevent_destroy = allow_destroy }
+  }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("a deferred resource body with directives must parse");
+
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    let DeferredForBody::Resource(template) = &deferred.body else {
+        panic!("expected a deferred resource body")
+    };
+    assert_eq!(
+        template.directives.prevent_destroy_setting(),
+        PreventDestroy::Unspecified,
+        "a non-literal false must not opt out of schema-default protection"
+    );
+
+    let warnings = parsed
+        .warnings
+        .iter()
+        .filter(|warning| warning.kind == WarningKind::NonLiteralPreventDestroy)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "the warning emitted while parsing the cloned deferred-body context must reach the file: {:?}",
+        parsed.warnings
+    );
+    assert_eq!(
+        warnings[0].message,
+        NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE
+    );
+}
+
+#[test]
+fn static_for_deduplicates_non_literal_prevent_destroy_warning() {
+    let parsed = parse(
+        r#"let allow_destroy = false
+for name in ["one", "two", "three"] {
+  mock.test.resource {
+    name = name
+    directives { prevent_destroy = allow_destroy }
+  }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("a static resource loop with directives must parse");
+
+    assert_eq!(
+        parsed.warnings.len(),
+        1,
+        "one authored expression must produce one warning even when its loop body expands three times: {:?}",
+        parsed.warnings
+    );
+    assert_eq!(
+        parsed.warnings[0].kind,
+        WarningKind::NonLiteralPreventDestroy
+    );
 }
 
 #[test]

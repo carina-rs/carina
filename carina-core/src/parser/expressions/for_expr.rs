@@ -382,7 +382,7 @@ pub(crate) fn parse_for_expr(
         if var == "_" || identifier_appears_in(body_text, var) {
             continue;
         }
-        ctx.warnings.push(ParseWarning {
+        ctx.push_warning(ParseWarning {
             file: None,
             line: for_line,
             kind: WarningKind::UnusedForBinding,

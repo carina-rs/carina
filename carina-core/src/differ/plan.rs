@@ -56,17 +56,7 @@ struct RefAttr {
 }
 
 /// Check which changed attributes are create-only according to the schema
-fn find_changed_create_only(
-    provider: &str,
-    resource_type: &str,
-    changed_attributes: &[String],
-    registry: &SchemaRegistry,
-) -> Vec<String> {
-    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Resource) else {
-        return Vec::new();
-    };
-    let schema = schema.as_schema();
-
+fn find_changed_create_only(changed_attributes: &[String], schema: &ResourceSchema) -> Vec<String> {
     let create_only_attrs = schema.create_only_attributes();
     changed_attributes
         .iter()
@@ -576,20 +566,20 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
-                        let changed_create_only = find_changed_create_only(
-                            &resource.id.provider,
-                            &resource.id.resource_type,
-                            &changed_attributes,
-                            registry,
-                        );
+                        let changed_create_only =
+                            find_changed_create_only(&changed_attributes, schema);
 
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
                         {
-                            if resource.directives.prevent_destroy {
+                            let prevent_destroy_source = owner_schema
+                                .resolve_directives(&resource.directives)
+                                .prevent_destroy_source();
+                            if let Some(source) = prevent_destroy_source {
                                 plan.add_error(PlanError::prevent_destroy(
                                     id.clone(),
                                     PreventDestroyAction::Replace,
+                                    source,
                                 ));
                                 continue;
                             }
@@ -668,10 +658,14 @@ fn create_plan_parts(
             }
         };
         let directives = orphan.directives().clone();
-        if directives.prevent_destroy {
+        let resolved_directives =
+            registry.resolve_directives(id, SchemaKind::Resource, &directives);
+        let prevent_destroy_source = resolved_directives.prevent_destroy_source();
+        if let Some(source) = prevent_destroy_source {
             plan.add_error(PlanError::prevent_destroy(
                 id.clone(),
                 PreventDestroyAction::DeleteRemovedFromConfiguration,
+                source,
             ));
             continue;
         }
@@ -1213,12 +1207,15 @@ fn promote_pending_replaces_for_dependents(
                 .iter()
                 .map(|ref_attr| ref_attr.attribute.clone())
                 .collect();
-            let create_only_refs = find_changed_create_only(
+            let Some(owner_schema) = registry.get(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                &ref_attr_names,
-                registry,
-            );
+                SchemaKind::Resource,
+            ) else {
+                continue;
+            };
+            let create_only_refs =
+                find_changed_create_only(&ref_attr_names, owner_schema.schema().as_schema());
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
                 let ref_hints: Vec<(String, String)> = ref_attrs
@@ -1233,25 +1230,32 @@ fn promote_pending_replaces_for_dependents(
                         changed_create_only,
                         ref_hints,
                     );
-                } else if resource.directives.prevent_destroy {
-                    plan.add_error(PlanError::prevent_destroy(
-                        resource.id.clone(),
-                        PreventDestroyAction::CascadeReplace,
-                    ));
-                    continue;
-                } else if let Some(pending) = promote_resource_to_pending_replace(
-                    plan,
-                    resource,
-                    changed_create_only,
-                    ref_hints,
-                    current_states,
-                    registry,
-                    outcome_unknown_import_replacements,
-                ) {
-                    pending_replaces.insert(consumer_identity.clone(), pending);
-                    promoted = true;
                 } else {
-                    continue;
+                    let prevent_destroy_source = owner_schema
+                        .resolve_directives(&resource.directives)
+                        .prevent_destroy_source();
+                    if let Some(source) = prevent_destroy_source {
+                        plan.add_error(PlanError::prevent_destroy(
+                            resource.id.clone(),
+                            PreventDestroyAction::CascadeReplace,
+                            source,
+                        ));
+                        continue;
+                    }
+                    if let Some(pending) = promote_resource_to_pending_replace(
+                        plan,
+                        resource,
+                        changed_create_only,
+                        ref_hints,
+                        current_states,
+                        registry,
+                        outcome_unknown_import_replacements,
+                    ) {
+                        pending_replaces.insert(consumer_identity.clone(), pending);
+                        promoted = true;
+                    } else {
+                        continue;
+                    }
                 }
 
                 if let Some(replaced) = pending_replaces.get_mut(&replaced_identity) {

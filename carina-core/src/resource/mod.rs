@@ -6879,6 +6879,79 @@ fn similarity_score(
     }
 }
 
+/// The authored `prevent_destroy` setting.
+///
+/// `Unspecified` is distinct from an explicit `false`: only the latter opts a
+/// resource out of schema-default destruction protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PreventDestroy {
+    #[default]
+    Unspecified,
+    Explicit(bool),
+}
+
+/// Why a resource is protected from destruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreventDestroySource {
+    ExplicitDirective,
+    SchemaDefault,
+}
+
+/// Effective destruction protection after resolving a directive against its
+/// resource schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreventDestroyResolution {
+    NotProtected,
+    Protected(PreventDestroySource),
+}
+
+/// Whether the resource schema needed for directive resolution is available.
+///
+/// The named `Unavailable` branch keeps compatibility paths explicit. A
+/// missing registry lookup must not silently become schema-free resolution.
+#[derive(Debug, Clone, Copy)]
+pub enum ProviderDirectiveSchema<'a> {
+    Available(&'a ResourceSchema),
+    Unavailable,
+}
+
+impl PreventDestroyResolution {
+    /// Return the protection provenance, or `None` when destruction is allowed.
+    pub fn source(self) -> Option<PreventDestroySource> {
+        match self {
+            Self::NotProtected => None,
+            Self::Protected(source) => Some(source),
+        }
+    }
+}
+
+impl PreventDestroy {
+    /// Resolve the effective protection and its provenance.
+    ///
+    /// When a schema is unavailable, an unspecified directive preserves the
+    /// historical orphan-delete behavior and is not considered protected.
+    pub fn resolve(self, schema: ProviderDirectiveSchema<'_>) -> PreventDestroyResolution {
+        match self {
+            Self::Explicit(true) => {
+                PreventDestroyResolution::Protected(PreventDestroySource::ExplicitDirective)
+            }
+            Self::Explicit(false) => PreventDestroyResolution::NotProtected,
+            Self::Unspecified => match schema {
+                ProviderDirectiveSchema::Available(schema)
+                    if schema.prevents_destroy_by_default() =>
+                {
+                    PreventDestroyResolution::Protected(PreventDestroySource::SchemaDefault)
+                }
+                ProviderDirectiveSchema::Available(_) | ProviderDirectiveSchema::Unavailable => {
+                    PreventDestroyResolution::NotProtected
+                }
+            },
+        }
+    }
+}
+
 /// Carina-side directives for a resource.
 ///
 /// These are instructions to Carina about how to handle the resource,
@@ -6893,9 +6966,11 @@ pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
     /// If true, create the new resource before destroying the old one during replacement
     #[serde(default)]
     pub create_before_destroy: bool,
-    /// If true, prevent the resource from being destroyed
+    /// Authored destruction-protection setting. Crate-private only so typed
+    /// phase conversions can carry it; effective policy is obtained through
+    /// [`PreventDestroy::resolve`].
     #[serde(default)]
-    pub prevent_destroy: bool,
+    pub(crate) prevent_destroy: PreventDestroy,
     /// Explicit ordering edges declared by the user. Each element is the
     /// binding name of a sibling `let` (resource / wait / module).
     /// Set semantics (deduplicated, order-insensitive); represented as
@@ -6975,7 +7050,7 @@ impl<B: BindingAddress> Default for Directives<B> {
         Self {
             force_delete: false,
             create_before_destroy: false,
-            prevent_destroy: false,
+            prevent_destroy: PreventDestroy::default(),
             depends_on: Vec::new(),
             depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
             ignore_changes: Vec::new(),
@@ -6996,11 +7071,257 @@ pub struct PersistedDirectives {
     #[serde(default)]
     pub create_before_destroy: bool,
     #[serde(default)]
-    pub prevent_destroy: bool,
+    prevent_destroy: PreventDestroy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<AbsoluteBindingAddress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
+}
+
+/// A persisted directive field recorded in a state-only change set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedDirectiveField {
+    ForceDelete,
+    CreateBeforeDestroy,
+    PreventDestroy,
+    DependsOn,
+    ProviderInstance,
+}
+
+impl PersistedDirectiveField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ForceDelete => "force_delete",
+            Self::CreateBeforeDestroy => "create_before_destroy",
+            Self::PreventDestroy => "prevent_destroy",
+            Self::DependsOn => "depends_on",
+            Self::ProviderInstance => "provider_instance",
+        }
+    }
+}
+
+impl Display for PersistedDirectiveField {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Typed value carried by one side of a persisted directive field change.
+///
+/// The untagged representation keeps machine-readable plan JSON natural:
+/// booleans remain booleans, dependency sets are arrays, provider instances
+/// are strings or null, and [`PreventDestroy`] retains its tagged tri-state
+/// shape. Equality therefore compares semantic values rather than labels
+/// produced for terminal rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedDirectiveFieldValue {
+    Boolean(bool),
+    PreventDestroy(PreventDestroy),
+    DependsOn(BTreeSet<AbsoluteBindingAddress>),
+    ProviderInstance(Option<String>),
+}
+
+impl PersistedDirectiveFieldValue {
+    fn render(&self) -> String {
+        match self {
+            Self::Boolean(value) => value.to_string(),
+            Self::PreventDestroy(value) => prevent_destroy_label(*value).to_string(),
+            Self::DependsOn(bindings) => bindings_label(bindings),
+            Self::ProviderInstance(provider_instance) => {
+                provider_instance_label(provider_instance.as_deref())
+            }
+        }
+    }
+}
+
+/// One persisted directive field whose authored value changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDirectiveFieldChange {
+    name: PersistedDirectiveField,
+    from: PersistedDirectiveFieldValue,
+    to: PersistedDirectiveFieldValue,
+}
+
+impl PersistedDirectiveFieldChange {
+    pub fn name(&self) -> PersistedDirectiveField {
+        self.name
+    }
+
+    pub fn rendered_from(&self) -> String {
+        self.from.render()
+    }
+
+    pub fn rendered_to(&self) -> String {
+        self.to.render()
+    }
+}
+
+impl<B: BindingAddress> Directives<B> {
+    pub fn with_force_delete(mut self, value: bool) -> Self {
+        self.force_delete = value;
+        self
+    }
+
+    pub fn with_create_before_destroy(mut self, value: bool) -> Self {
+        self.create_before_destroy = value;
+        self
+    }
+
+    pub fn with_depends_on(mut self, depends_on: Vec<B>) -> Self {
+        self.depends_on = depends_on;
+        self
+    }
+
+    pub fn with_provider_instance(mut self, provider_instance: impl Into<String>) -> Self {
+        self.provider_instance = Some(provider_instance.into());
+        self
+    }
+
+    pub(crate) fn prevent_destroy_setting(&self) -> PreventDestroy {
+        self.prevent_destroy
+    }
+
+    /// Whether this authored setting explicitly protects destruction without
+    /// consulting a schema.
+    pub fn explicitly_prevents_destroy(&self) -> bool {
+        matches!(self.prevent_destroy, PreventDestroy::Explicit(true))
+    }
+
+    pub fn set_prevent_destroy(&mut self, value: bool) {
+        self.prevent_destroy = PreventDestroy::Explicit(value);
+    }
+
+    pub fn with_prevent_destroy(mut self, value: bool) -> Self {
+        self.set_prevent_destroy(value);
+        self
+    }
+}
+
+impl PersistedDirectives {
+    /// Project a desired resource into the exact directive shape written to
+    /// state. Provider routing falls back to the resolved resource ID when the
+    /// authored directive uses the provider kind's default instance.
+    pub fn desired_for<S>(resource: &Resource<S>) -> Self {
+        let mut desired = Self::from(&resource.directives);
+        if desired.provider_instance.is_none() {
+            desired.provider_instance = resource.id.provider_instance.clone();
+        }
+        desired
+    }
+
+    /// Describe every persisted field that differs between the current and
+    /// desired projections.
+    ///
+    /// Both values are destructured exhaustively so adding a persisted field
+    /// requires this comparison to be updated. `depends_on` follows its
+    /// documented set semantics rather than source-order semantics.
+    pub fn field_changes_to(&self, desired: &Self) -> Vec<PersistedDirectiveFieldChange> {
+        let PersistedDirectives {
+            force_delete: current_force_delete,
+            create_before_destroy: current_create_before_destroy,
+            prevent_destroy: current_prevent_destroy,
+            depends_on: current_depends_on,
+            provider_instance: current_provider_instance,
+        } = self;
+        let PersistedDirectives {
+            force_delete: desired_force_delete,
+            create_before_destroy: desired_create_before_destroy,
+            prevent_destroy: desired_prevent_destroy,
+            depends_on: desired_depends_on,
+            provider_instance: desired_provider_instance,
+        } = desired;
+
+        let mut fields = Vec::new();
+        if current_force_delete != desired_force_delete {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::ForceDelete,
+                from: PersistedDirectiveFieldValue::Boolean(*current_force_delete),
+                to: PersistedDirectiveFieldValue::Boolean(*desired_force_delete),
+            });
+        }
+        if current_create_before_destroy != desired_create_before_destroy {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::CreateBeforeDestroy,
+                from: PersistedDirectiveFieldValue::Boolean(*current_create_before_destroy),
+                to: PersistedDirectiveFieldValue::Boolean(*desired_create_before_destroy),
+            });
+        }
+        if current_prevent_destroy != desired_prevent_destroy {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::PreventDestroy,
+                from: PersistedDirectiveFieldValue::PreventDestroy(*current_prevent_destroy),
+                to: PersistedDirectiveFieldValue::PreventDestroy(*desired_prevent_destroy),
+            });
+        }
+
+        let current_depends_on = current_depends_on.iter().cloned().collect::<BTreeSet<_>>();
+        let desired_depends_on = desired_depends_on.iter().cloned().collect::<BTreeSet<_>>();
+        if current_depends_on != desired_depends_on {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::DependsOn,
+                from: PersistedDirectiveFieldValue::DependsOn(current_depends_on),
+                to: PersistedDirectiveFieldValue::DependsOn(desired_depends_on),
+            });
+        }
+        if current_provider_instance != desired_provider_instance {
+            fields.push(PersistedDirectiveFieldChange {
+                name: PersistedDirectiveField::ProviderInstance,
+                from: PersistedDirectiveFieldValue::ProviderInstance(
+                    current_provider_instance.clone(),
+                ),
+                to: PersistedDirectiveFieldValue::ProviderInstance(
+                    desired_provider_instance.clone(),
+                ),
+            });
+        }
+        fields
+    }
+
+    /// Return the authored tri-state destruction-protection setting stored in state.
+    pub fn prevent_destroy_setting(&self) -> PreventDestroy {
+        self.prevent_destroy
+    }
+
+    /// Whether this persisted setting protects destruction without consulting
+    /// a schema. Used by state-shell retention, which intentionally has no
+    /// schema registry.
+    pub fn explicitly_prevents_destroy(&self) -> bool {
+        matches!(self.prevent_destroy, PreventDestroy::Explicit(true))
+    }
+
+    pub fn set_prevent_destroy(&mut self, value: bool) {
+        self.prevent_destroy = PreventDestroy::Explicit(value);
+    }
+
+    pub fn with_prevent_destroy(mut self, value: bool) -> Self {
+        self.set_prevent_destroy(value);
+        self
+    }
+}
+
+fn prevent_destroy_label(value: PreventDestroy) -> &'static str {
+    match value {
+        PreventDestroy::Unspecified => "unspecified",
+        PreventDestroy::Explicit(false) => "false",
+        PreventDestroy::Explicit(true) => "true",
+    }
+}
+
+fn bindings_label(bindings: &BTreeSet<AbsoluteBindingAddress>) -> String {
+    format!(
+        "[{}]",
+        bindings
+            .iter()
+            .map(AbsoluteBindingAddress::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn provider_instance_label(provider_instance: Option<&str>) -> String {
+    provider_instance.unwrap_or("unspecified").to_string()
 }
 
 impl From<&ExpandedDirectives> for PersistedDirectives {
@@ -7032,14 +7353,21 @@ impl From<ExpandedDirectives> for PersistedDirectives {
 
 impl From<&PersistedDirectives> for ExpandedDirectives {
     fn from(directives: &PersistedDirectives) -> Self {
+        let PersistedDirectives {
+            force_delete,
+            create_before_destroy,
+            prevent_destroy,
+            depends_on,
+            provider_instance,
+        } = directives;
         Self {
-            force_delete: directives.force_delete,
-            create_before_destroy: directives.create_before_destroy,
-            prevent_destroy: directives.prevent_destroy,
-            depends_on: directives.depends_on.clone(),
+            force_delete: *force_delete,
+            create_before_destroy: *create_before_destroy,
+            prevent_destroy: *prevent_destroy,
+            depends_on: depends_on.clone(),
             depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
             ignore_changes: Vec::new(),
-            provider_instance: directives.provider_instance.clone(),
+            provider_instance: provider_instance.clone(),
         }
     }
 }

@@ -25,6 +25,7 @@ use carina_core::schema::{
 use carina_state::{PublishedExports, StateFile, check_and_migrate};
 
 use crate::commands::plan::compute_export_diffs;
+use crate::commands::shared::state_writeback::persisted_directive_changes;
 use crate::moved_hint::{MovedBlockHints, detect_moved_block_hints};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{LoadedProviderFactory, ProviderLoad, ValidatedConfig};
@@ -296,10 +297,16 @@ pub fn build_fixture_plan_change_summary(fixture: &FixturePlan) -> PlanChangeSum
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&fixture.resolved_export_params, &current_exports);
+    let directive_changes = persisted_directive_changes(
+        fixture.state_file.as_ref(),
+        &fixture.desired_resources,
+        &fixture.plan,
+    );
     PlanChangeSummary::new(
         &fixture.plan,
         &export_changes,
         &fixture.deferred_for_expressions,
+        &directive_changes,
     )
 }
 

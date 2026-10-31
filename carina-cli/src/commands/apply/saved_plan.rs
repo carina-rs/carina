@@ -1339,7 +1339,7 @@ mod tests {
         provider_configs: Vec<ProviderConfig>,
     ) -> PlanFile {
         empty_plan_contents(provider_configs)
-            .record_for_test(ctx)
+            .record_for_test(ctx, Vec::new())
             .expect("test plan provider evidence must be valid")
     }
 
@@ -1436,7 +1436,7 @@ mod tests {
             .upsert_resource(source_row)
             .expect("test state setup must be valid");
         let plan_file = contents
-            .record_for_test(&builtin_context())
+            .record_for_test(&builtin_context(), Vec::new())
             .expect("test plan provider evidence must be valid")
             .reload_in_flight_from_locked_state(Some(&locked_state))
             .expect("reload saved move plan")
@@ -1637,7 +1637,7 @@ mod tests {
     fn record_rejects_artifact_origin_that_does_not_match_config_source() {
         let context = wasm_context("mock", b"artifact");
         let error = empty_plan_contents(vec![remote_provider_config("mock", "carina-rs/mock")])
-            .record_for_test(&context)
+            .record_for_test(&context, Vec::new())
             .expect_err("a file-origin load cannot evidence a remote provider source")
             .to_string();
 
@@ -1820,7 +1820,7 @@ mod tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record_for_test(&builtin_context())
+        .record_for_test(&builtin_context(), Vec::new())
         .expect("test plan provider evidence must be valid")
         .reload_in_flight_from_locked_state(None)
         .expect("reload saved plan")
