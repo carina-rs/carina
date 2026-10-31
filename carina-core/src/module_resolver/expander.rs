@@ -9,16 +9,17 @@ use crate::binding_index::{BindingIndex, RefType, RefTypeError};
 use crate::eval_value::{BareStructuralHandle, StructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
-    ArgumentOrigin, BareBindingSource, DeferredForBody, ModuleArgument, ModuleCall, ParseError,
+    ArgumentOrigin, BareBindingSource, DeferredForBody, DeferredIfBody, DeferredIfCondition,
+    DeferredStructuralIf, DeferredValueIf, ModuleArgument, ModuleCall, ParseError,
     ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForIterableState, ParsedFile,
     RelativeBindingName, WaitBinding,
 };
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, AuthoredDataSource as DataSource,
     AuthoredDeferredValue as DeferredValue, AuthoredResource as Resource, AuthoredValue as Value,
-    BindingAddress, ExpandedValue, LegacyLoopAddress, ModuleInstanceScope, ModuleSource,
-    PathSegment, ResourceId, ResourceIdentity, ResourceIdentityState, StructuralOperandRef,
-    ValuePathSegmentResult, apply_value_path_segment,
+    BindingAddress, ConcreteValue, ExpandedValue, LegacyLoopAddress, ModuleInstanceScope,
+    ModuleSource, PathSegment, ResourceId, ResourceIdentity, ResourceIdentityState,
+    StructuralOperandRef, ValuePathSegmentResult, apply_value_path_segment,
 };
 
 use super::error::ModuleError;
@@ -74,6 +75,14 @@ fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingNam
                     DeferredForBody::Read(data_source) => data_source.binding.clone(),
                     DeferredForBody::ModuleCall(call) => call.binding_name.clone(),
                 }),
+        )
+        .chain(
+            module
+                .deferred_module_ifs
+                .iter()
+                .flat_map(DeferredStructuralIf::branches)
+                .filter_map(DeferredIfBody::binding_address)
+                .cloned(),
         )
         .collect()
 }
@@ -454,7 +463,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         for arg in &module.arguments {
             let argument = resolved_arguments.get(&arg.name).unwrap();
             let line = match argument.origin {
-                ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
+                ArgumentOrigin::Authored {
+                    key_span: _,
+                    value_span,
+                } => value_span.start_line(),
                 ArgumentOrigin::Defaulted => call_line,
             };
             let static_type = P::resolve_static_type(&arg.static_type, self.config());
@@ -473,7 +485,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 continue;
             };
             match argument.value_ref() {
-                StructuralOperandRef::Handle { handle, .. } => {
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base: _,
+                } => {
                     if let Err(error) =
                         crate::validation::check_handle_sink(handle, &resolved_parameter)
                     {
@@ -487,7 +502,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     }
                     continue;
                 }
-                StructuralOperandRef::Parameter { .. } => continue,
+                StructuralOperandRef::Parameter {
+                    name: _,
+                    access_base: _,
+                } => continue,
                 StructuralOperandRef::Value(_) => {}
             }
             let value = argument
@@ -658,9 +676,18 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .collect(),
         };
 
+        // A module-argument condition is decided only after the call-site
+        // values have crossed the typed module scope. Selected bodies remain
+        // authored/relative until the normal expansion routines below resolve
+        // them through `ModuleInstanceScope`.
+        let selected_module_ifs =
+            select_deferred_module_ifs(module, &expanded_call, &module_scope_resolver)
+                .map_err(contextualize_access_error)?;
+        let selected = &selected_module_ifs.contribution;
+
         let nested_binding_index = BindingIndex::from_parsed(module, self.schemas);
         let mut nested_contributions = Vec::new();
-        for nested_call in &module.module_calls {
+        for nested_call in module.module_calls.iter().chain(&selected.module_calls) {
             let local_prefix = instance_prefix_for_call(nested_call);
             let local_scope = ModuleInstanceScope::for_call(
                 &nested_call.module_name,
@@ -703,14 +730,21 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut expanded_binding_uses =
             resolve_module_binding_uses(module.bare_binding_uses(), &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
-        for resource in &module.resources {
+        for resource in module.resources.iter().chain(&selected.resources) {
             let source_file = module
                 .parser_binding_metadata
                 .resource_source_file(&resource.id);
-            let expanded = expand_module_resource(resource, &expanded_call, &module_scope_resolver)
-                .map_err(|error| {
-                    contextualize_access_error(error.with_optional_source_file(source_file))
-                })?;
+            let expanded = expand_module_resource(
+                resource,
+                module
+                    .parser_binding_metadata
+                    .template_dependency_values(&resource.id),
+                &expanded_call,
+                &module_scope_resolver,
+            )
+            .map_err(|error| {
+                contextualize_access_error(error.with_optional_source_file(source_file))
+            })?;
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
@@ -721,13 +755,20 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 
         // Expand data sources with substituted values.
         let mut data_sources: Vec<crate::resource::ExpandedDataSource> = Vec::new();
-        for data_source in &module.data_sources {
+        for data_source in module.data_sources.iter().chain(&selected.data_sources) {
             let source_file = module
                 .parser_binding_metadata
                 .resource_source_file(&data_source.id);
-            let expanded = expand_module_data_source(data_source, &module_scope_resolver).map_err(
-                |error| contextualize_access_error(error.with_optional_source_file(source_file)),
-            )?;
+            let expanded = expand_module_data_source(
+                data_source,
+                module
+                    .parser_binding_metadata
+                    .template_dependency_values(&data_source.id),
+                &module_scope_resolver,
+            )
+            .map_err(|error| {
+                contextualize_access_error(error.with_optional_source_file(source_file))
+            })?;
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
                     .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
@@ -837,13 +878,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                                 argument.origin,
                             )
                         }
-                        StructuralOperandRef::Parameter { access_base, .. } => {
-                            crate::resource::LiveCompositionArgument::from_value_with_static_type(
-                                access_base.clone(),
-                                static_type.clone(),
-                                argument.origin,
-                            )
-                        }
+                        StructuralOperandRef::Parameter {
+                            name: _,
+                            access_base,
+                        } => crate::resource::LiveCompositionArgument::from_value_with_static_type(
+                            access_base.clone(),
+                            static_type.clone(),
+                            argument.origin,
+                        ),
                     };
                     signature_arguments.insert(arg.name.clone(), recorded);
                 }
@@ -892,17 +934,28 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .parsed_deferred_for_expressions()
             .iter()
             .map(|deferred| {
-                let source_file = match &deferred.body {
-                    DeferredForBody::Resource(resource) => module
-                        .parser_binding_metadata
-                        .resource_source_file(&resource.id),
-                    DeferredForBody::Read(data_source) => module
-                        .parser_binding_metadata
-                        .resource_source_file(&data_source.id),
-                    DeferredForBody::ModuleCall(_) => None,
+                let (source_file, dependency_values) = match &deferred.body {
+                    DeferredForBody::Resource(resource) => (
+                        module
+                            .parser_binding_metadata
+                            .resource_source_file(&resource.id),
+                        module
+                            .parser_binding_metadata
+                            .template_dependency_values(&resource.id),
+                    ),
+                    DeferredForBody::Read(data_source) => (
+                        module
+                            .parser_binding_metadata
+                            .resource_source_file(&data_source.id),
+                        module
+                            .parser_binding_metadata
+                            .template_dependency_values(&data_source.id),
+                    ),
+                    DeferredForBody::ModuleCall(_) => (None, None),
                 };
                 expand_parsed_deferred_for_expression(
                     deferred,
+                    dependency_values,
                     &expanded_call,
                     &module_scope_resolver,
                 )
@@ -956,11 +1009,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         *contribution.parsed_deferred_for_expressions_mut() =
             expanded_parsed_deferred_for_expressions;
         contribution.parser_binding_metadata = expanded_parser_metadata;
+        contribution.deferred_module_ifs = selected_module_ifs.forwarded.clone();
         contribution.warnings = module.warnings.clone();
         for nested in nested_contributions {
             contribution.merge_from(nested);
         }
         contribution.expansion_trace = expansion_trace;
+        reject_dropped_conditional_references(&selected_module_ifs, &contribution)?;
         Ok(contribution)
     }
 
@@ -1031,8 +1086,63 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 Some(path.binding().to_string())
             }
-            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => None,
-            _ => None,
+            Value::Concrete(
+                crate::resource::ConcreteValue::String(_)
+                | crate::resource::ConcreteValue::EnumIdentifier(_)
+                | crate::resource::ConcreteValue::CanonicalEnum(_)
+                | crate::resource::ConcreteValue::Int(_)
+                | crate::resource::ConcreteValue::Float(_)
+                | crate::resource::ConcreteValue::Bool(_)
+                | crate::resource::ConcreteValue::Duration(_)
+                | crate::resource::ConcreteValue::List(_)
+                | crate::resource::ConcreteValue::StringList(_)
+                | crate::resource::ConcreteValue::Map(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::Coalesce {
+                    value: _,
+                    default: _,
+                }
+                | DeferredValue::IntegerArithmetic(_)
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall {
+                    name: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::ResolvedFunctionCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::Unavailable {
+                    name: _,
+                    args: _,
+                    reason: _,
+                    source_line: _,
+                }
+                | DeferredValue::Access(_)
+                | DeferredValue::Secret(_)
+                | DeferredValue::RedactedSecret { hash: _ }
+                | DeferredValue::Unknown(
+                    crate::resource::UnknownReason::UpstreamExport { path: _ }
+                    | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                    | crate::resource::UnknownReason::ForKey
+                    | crate::resource::UnknownReason::ForIndex
+                    | crate::resource::UnknownReason::ForValue
+                    | crate::resource::UnknownReason::FnParam { name: _ }
+                    | crate::resource::UnknownReason::ModuleArgument {
+                        name: _,
+                        source_line: _,
+                        diagnostic_name: _,
+                    }
+                    | crate::resource::UnknownReason::FnLocal { name: _ }
+                    | crate::resource::UnknownReason::EmptyInterpolation
+                    | crate::resource::UnknownReason::PendingReRead(_),
+                ),
+            ) => None,
         })?;
     argument_values
         .contains_key(&candidate)
@@ -1050,33 +1160,82 @@ fn resolve_nested_module_call(
             let forwarded_name = match value {
                 Value::Deferred(DeferredValue::BindingRef { binding }) => Some(binding.as_str()),
                 Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument { name, .. },
+                    crate::resource::UnknownReason::ModuleArgument {
+                        name,
+                        source_line: _,
+                        diagnostic_name: _,
+                    },
                 )) => Some(name.as_str()),
-                Value::Concrete(_)
+                Value::Concrete(
+                    crate::resource::ConcreteValue::String(_)
+                    | crate::resource::ConcreteValue::EnumIdentifier(_)
+                    | crate::resource::ConcreteValue::CanonicalEnum(_)
+                    | crate::resource::ConcreteValue::Int(_)
+                    | crate::resource::ConcreteValue::Float(_)
+                    | crate::resource::ConcreteValue::Bool(_)
+                    | crate::resource::ConcreteValue::Duration(_)
+                    | crate::resource::ConcreteValue::List(_)
+                    | crate::resource::ConcreteValue::StringList(_)
+                    | crate::resource::ConcreteValue::Map(_),
+                )
                 | Value::Deferred(
-                    DeferredValue::ResourceRef { .. }
-                    | DeferredValue::Coalesce { .. }
+                    DeferredValue::ModuleIf(_)
+                    | DeferredValue::ResourceRef { path: _ }
+                    | DeferredValue::Coalesce {
+                        value: _,
+                        default: _,
+                    }
                     | DeferredValue::IntegerArithmetic(_)
                     | DeferredValue::Interpolation(_)
-                    | DeferredValue::FunctionCall { .. }
-                    | DeferredValue::ResolvedFunctionCall { .. }
-                    | DeferredValue::Unavailable { .. }
+                    | DeferredValue::FunctionCall {
+                        name: _,
+                        args: _,
+                        source_line: _,
+                    }
+                    | DeferredValue::ResolvedFunctionCall {
+                        function: _,
+                        functions: _,
+                        args: _,
+                        source_line: _,
+                    }
+                    | DeferredValue::Unavailable {
+                        name: _,
+                        args: _,
+                        reason: _,
+                        source_line: _,
+                    }
                     | DeferredValue::Access(_)
                     | DeferredValue::Secret(_)
-                    | DeferredValue::RedactedSecret { .. }
-                    | DeferredValue::Unknown(_),
+                    | DeferredValue::RedactedSecret { hash: _ }
+                    | DeferredValue::Unknown(
+                        crate::resource::UnknownReason::UpstreamExport { path: _ }
+                        | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                        | crate::resource::UnknownReason::ForKey
+                        | crate::resource::UnknownReason::ForIndex
+                        | crate::resource::UnknownReason::ForValue
+                        | crate::resource::UnknownReason::FnParam { name: _ }
+                        | crate::resource::UnknownReason::FnLocal { name: _ }
+                        | crate::resource::UnknownReason::EmptyInterpolation
+                        | crate::resource::UnknownReason::PendingReRead(_),
+                    ),
                 ) => None,
             };
             if let Some(binding) = forwarded_name
                 && let Some(forwarded) = resolver.arguments.arguments.get(binding)
             {
                 match forwarded.value_ref() {
-                    StructuralOperandRef::Handle { handle, .. } => {
+                    StructuralOperandRef::Handle {
+                        handle,
+                        access_base: _,
+                    } => {
                         return Ok(ModuleArgument::from_handle(
                             handle.clone().with_alias(binding),
                         ));
                     }
-                    StructuralOperandRef::Parameter { name, .. } => {
+                    StructuralOperandRef::Parameter {
+                        name,
+                        access_base: _,
+                    } => {
                         return resolver
                             .arguments
                             .arguments
@@ -1094,26 +1253,35 @@ fn resolve_nested_module_call(
                 .transpose()?;
             Ok(ModuleArgument::from_parts(value, access_base))
         }
-        StructuralOperandRef::Handle { handle, .. } => {
+        StructuralOperandRef::Handle {
+            handle,
+            access_base: _,
+        } => {
             resolver.resolve_declared_binding(handle.canonical_binding())?;
             let handle = handle
                 .clone()
                 .resolve_bindings(&mut |binding| resolver.scope.resolve(binding));
             Ok(ModuleArgument::from_handle(handle))
         }
-        StructuralOperandRef::Parameter { name, .. } => {
+        StructuralOperandRef::Parameter {
+            name,
+            access_base: _,
+        } => {
             let forwarded = resolver
                 .arguments
                 .arguments
                 .get(name)
                 .ok_or_else(|| resolver.unknown_binding(name))?;
             match forwarded.value_ref() {
-                StructuralOperandRef::Handle { handle, .. } => {
-                    Ok(ModuleArgument::from_handle(handle.clone().with_alias(name)))
-                }
-                StructuralOperandRef::Value(_) | StructuralOperandRef::Parameter { .. } => {
-                    Ok(forwarded.argument.clone())
-                }
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base: _,
+                } => Ok(ModuleArgument::from_handle(handle.clone().with_alias(name))),
+                StructuralOperandRef::Value(_)
+                | StructuralOperandRef::Parameter {
+                    name: _,
+                    access_base: _,
+                } => Ok(forwarded.argument.clone()),
             }
         }
     };
@@ -1185,7 +1353,10 @@ fn resolve_dependency_bindings(
     for binding in dependency_bindings {
         if let Some(argument) = resolver.arguments.arguments.get(binding.as_str()) {
             match argument.value_ref() {
-                StructuralOperandRef::Handle { handle, .. } => {
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base: _,
+                } => {
                     resolved.insert(handle.canonical_binding().clone());
                 }
                 StructuralOperandRef::Value(value) => {
@@ -1193,7 +1364,10 @@ fn resolve_dependency_bindings(
                     crate::deps::collect_dependencies(value, &mut dependencies);
                     resolved.extend(dependencies);
                 }
-                StructuralOperandRef::Parameter { .. } => {
+                StructuralOperandRef::Parameter {
+                    name: _,
+                    access_base: _,
+                } => {
                     // A standalone module has no concrete caller operand yet.
                     // It therefore contributes no concrete dependency edge;
                     // a real outer call will substitute the handle before
@@ -1203,6 +1377,20 @@ fn resolve_dependency_bindings(
         } else {
             resolved.insert(resolver.resolve_declared_binding(binding)?);
         }
+    }
+    Ok(resolved)
+}
+
+fn resolve_dependency_values<'a>(
+    values: impl IntoIterator<Item = &'a Value>,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<BTreeSet<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+    let mut resolved = BTreeSet::new();
+    for value in values {
+        let value = resolve_module_value(value, resolver)?;
+        let mut dependencies = HashSet::new();
+        crate::deps::collect_dependencies(&value, &mut dependencies);
+        resolved.extend(dependencies);
     }
     Ok(resolved)
 }
@@ -1289,18 +1477,62 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             Some(crate::resource::ReferencePath::Binding(binding.clone()))
         }
-        Value::Concrete(_)
+        Value::Concrete(
+            crate::resource::ConcreteValue::String(_)
+            | crate::resource::ConcreteValue::EnumIdentifier(_)
+            | crate::resource::ConcreteValue::CanonicalEnum(_)
+            | crate::resource::ConcreteValue::Int(_)
+            | crate::resource::ConcreteValue::Float(_)
+            | crate::resource::ConcreteValue::Bool(_)
+            | crate::resource::ConcreteValue::Duration(_)
+            | crate::resource::ConcreteValue::List(_)
+            | crate::resource::ConcreteValue::StringList(_)
+            | crate::resource::ConcreteValue::Map(_),
+        )
         | Value::Deferred(
-            DeferredValue::Coalesce { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
             | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
-            | DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Unavailable { .. }
+            | DeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | DeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
+            | DeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
             | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::RedactedSecret { hash: _ }
+            | DeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                | crate::resource::UnknownReason::ForKey
+                | crate::resource::UnknownReason::ForIndex
+                | crate::resource::UnknownReason::ForValue
+                | crate::resource::UnknownReason::FnParam { name: _ }
+                | crate::resource::UnknownReason::ModuleArgument {
+                    name: _,
+                    source_line: _,
+                    diagnostic_name: _,
+                }
+                | crate::resource::UnknownReason::FnLocal { name: _ }
+                | crate::resource::UnknownReason::EmptyInterpolation
+                | crate::resource::UnknownReason::PendingReRead(_),
+            ),
         ) => crate::resource::module_argument_reference_path(value),
     }
 }
@@ -1310,12 +1542,16 @@ fn authored_argument_reference_path(
 ) -> Option<crate::resource::AuthoredReferencePath> {
     match argument.value_ref() {
         StructuralOperandRef::Value(value) => authored_value_reference_path(value),
-        StructuralOperandRef::Handle { handle, .. } => Some(
-            crate::resource::ReferencePath::Binding(handle.canonical_binding().clone()),
-        ),
-        StructuralOperandRef::Parameter { access_base, .. } => {
-            authored_value_reference_path(access_base)
-        }
+        StructuralOperandRef::Handle {
+            handle,
+            access_base: _,
+        } => Some(crate::resource::ReferencePath::Binding(
+            handle.canonical_binding().clone(),
+        )),
+        StructuralOperandRef::Parameter {
+            name: _,
+            access_base,
+        } => authored_value_reference_path(access_base),
     }
 }
 
@@ -1358,7 +1594,11 @@ fn module_parameter_postfix<B: BindingAddress>(
     ) -> Option<(String, Vec<PathSegment>)> {
         match value {
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument { name, .. },
+                crate::resource::UnknownReason::ModuleArgument {
+                    name,
+                    source_line: _,
+                    diagnostic_name: _,
+                },
             )) if arguments.contains_key(name) => Some((name.clone(), Vec::new())),
             Value::Deferred(DeferredValue::Access(access)) => {
                 let (argument, mut postfix) = collect(access.base(), arguments)?;
@@ -1380,19 +1620,63 @@ fn module_parameter_postfix<B: BindingAddress>(
             {
                 Some((binding.as_str().to_string(), Vec::new()))
             }
-            Value::Concrete(_)
+            Value::Concrete(
+                crate::resource::ConcreteValue::String(_)
+                | crate::resource::ConcreteValue::EnumIdentifier(_)
+                | crate::resource::ConcreteValue::CanonicalEnum(_)
+                | crate::resource::ConcreteValue::Int(_)
+                | crate::resource::ConcreteValue::Float(_)
+                | crate::resource::ConcreteValue::Bool(_)
+                | crate::resource::ConcreteValue::Duration(_)
+                | crate::resource::ConcreteValue::List(_)
+                | crate::resource::ConcreteValue::StringList(_)
+                | crate::resource::ConcreteValue::Map(_),
+            )
             | Value::Deferred(
-                DeferredValue::ResourceRef { .. }
-                | DeferredValue::BindingRef { .. }
-                | DeferredValue::Coalesce { .. }
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { path: _ }
+                | DeferredValue::BindingRef { binding: _ }
+                | DeferredValue::Coalesce {
+                    value: _,
+                    default: _,
+                }
                 | DeferredValue::IntegerArithmetic(_)
                 | DeferredValue::Interpolation(_)
-                | DeferredValue::FunctionCall { .. }
-                | DeferredValue::ResolvedFunctionCall { .. }
-                | DeferredValue::Unavailable { .. }
+                | DeferredValue::FunctionCall {
+                    name: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::ResolvedFunctionCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::Unavailable {
+                    name: _,
+                    args: _,
+                    reason: _,
+                    source_line: _,
+                }
                 | DeferredValue::Secret(_)
-                | DeferredValue::RedactedSecret { .. }
-                | DeferredValue::Unknown(_),
+                | DeferredValue::RedactedSecret { hash: _ }
+                | DeferredValue::Unknown(
+                    crate::resource::UnknownReason::UpstreamExport { path: _ }
+                    | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                    | crate::resource::UnknownReason::ForKey
+                    | crate::resource::UnknownReason::ForIndex
+                    | crate::resource::UnknownReason::ForValue
+                    | crate::resource::UnknownReason::FnParam { name: _ }
+                    | crate::resource::UnknownReason::ModuleArgument {
+                        name: _,
+                        source_line: _,
+                        diagnostic_name: _,
+                    }
+                    | crate::resource::UnknownReason::FnLocal { name: _ }
+                    | crate::resource::UnknownReason::EmptyInterpolation
+                    | crate::resource::UnknownReason::PendingReRead(_),
+                ),
             ) => None,
         }
     }
@@ -1419,7 +1703,10 @@ impl<B: BindingAddress> std::ops::Deref for ResolvedArgument<B> {
 impl<B: BindingAddress> ResolvedArgument<B> {
     fn source_line(&self, default_line: usize) -> usize {
         match self.origin {
-            ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
+            ArgumentOrigin::Authored {
+                key_span: _,
+                value_span,
+            } => value_span.start_line(),
             ArgumentOrigin::Defaulted => default_line,
         }
     }
@@ -1433,16 +1720,23 @@ impl<B: BindingAddress> ResolvedArgument<B> {
             (ArgumentSubstitutionPosition::Value, StructuralOperandRef::Value(value)) => {
                 Ok(StructuralOperandRef::Value(value))
             }
-            (ArgumentSubstitutionPosition::Value, StructuralOperandRef::Handle { .. }) => {
-                Err(BareStructuralHandle {
-                    binding: name.to_string(),
-                    kind: StructuralHandleKind::ModuleParameter,
-                }
-                .to_string())
-            }
             (
                 ArgumentSubstitutionPosition::Value,
-                operand @ StructuralOperandRef::Parameter { .. },
+                StructuralOperandRef::Handle {
+                    handle: _,
+                    access_base: _,
+                },
+            ) => Err(BareStructuralHandle {
+                binding: name.to_string(),
+                kind: StructuralHandleKind::ModuleParameter,
+            }
+            .to_string()),
+            (
+                ArgumentSubstitutionPosition::Value,
+                operand @ StructuralOperandRef::Parameter {
+                    name: _,
+                    access_base: _,
+                },
             ) => Ok(operand),
             (ArgumentSubstitutionPosition::AccessBase, StructuralOperandRef::Value(value)) => {
                 Ok(StructuralOperandRef::Value(value))
@@ -1517,12 +1811,16 @@ impl ModuleScopeResolver<'_> {
     ) -> Result<Option<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
         if let Some(argument) = self.arguments.arguments.get(binding.as_str()) {
             return match argument.value_ref() {
-                StructuralOperandRef::Handle { handle, .. }
-                    if handle.kind().is_dependency_target() =>
-                {
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base: _,
+                } if handle.kind().is_dependency_target() => {
                     Ok(Some(handle.canonical_binding().clone()))
                 }
-                StructuralOperandRef::Handle { handle, .. } => Err(ArgumentSubstitutionError {
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base: _,
+                } => Err(ArgumentSubstitutionError {
                     source_file: Some(self.arguments.caller_source_file.to_path_buf()),
                     line: argument.source_line(self.arguments.default_line),
                     message: format!(
@@ -1542,7 +1840,10 @@ impl ModuleScopeResolver<'_> {
                     ),
                     parse_error: None,
                 }),
-                StructuralOperandRef::Parameter { .. } => Ok(None),
+                StructuralOperandRef::Parameter {
+                    name: _,
+                    access_base: _,
+                } => Ok(None),
             };
         }
         self.resolve_declared_binding_at(binding, diagnostic_source)
@@ -1573,7 +1874,8 @@ impl ModuleScopeResolver<'_> {
         }
         let expanded = normalized.resolve_module(self.scope);
         let substituted = substitute_arguments_with_position(&expanded, self.arguments, position)?;
-        evaluate_expanded_module_functions(&substituted, self.arguments.config)
+        let evaluated = evaluate_expanded_module_functions(&substituted, self.arguments.config)?;
+        select_expanded_module_ifs(&evaluated)
     }
 
     fn resolve_structural_handle(
@@ -1586,7 +1888,10 @@ impl ModuleScopeResolver<'_> {
         let binding = handle.canonical_binding();
         if let Some(argument) = self.arguments.arguments.get(binding.as_str()) {
             return match argument.value_ref() {
-                StructuralOperandRef::Handle { handle, .. } => Ok(handle.clone()),
+                StructuralOperandRef::Handle {
+                    handle,
+                    access_base: _,
+                } => Ok(handle.clone()),
                 StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError {
                     source_file: Some(self.arguments.caller_source_file.to_path_buf()),
                     line: argument.source_line(self.arguments.default_line),
@@ -1595,7 +1900,10 @@ impl ModuleScopeResolver<'_> {
                     ),
                     parse_error: None,
                 }),
-                StructuralOperandRef::Parameter { name, .. } => Err(ArgumentSubstitutionError {
+                StructuralOperandRef::Parameter {
+                    name,
+                    access_base: _,
+                } => Err(ArgumentSubstitutionError {
                     source_file: Some(self.arguments.caller_source_file.to_path_buf()),
                     line: argument.source_line(self.arguments.default_line),
                     message: format!("unresolved forwarded module parameter '{name}'"),
@@ -1631,6 +1939,298 @@ impl ModuleScopeResolver<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ConditionalBindingOrigin {
+    condition: String,
+    source_file: std::path::PathBuf,
+    source_line: usize,
+}
+
+#[derive(Debug)]
+struct SelectedDeferredIfs {
+    contribution: ParsedFile,
+    forwarded: Vec<DeferredStructuralIf<AbsoluteBindingAddress>>,
+    dropped: HashMap<AbsoluteBindingAddress, (RelativeBindingName, ConditionalBindingOrigin)>,
+}
+
+fn select_deferred_module_ifs(
+    module: &ParsedFile,
+    module_call: &crate::resource::ExpandedCompositionCall,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<SelectedDeferredIfs, ArgumentSubstitutionError> {
+    let mut origins = HashMap::<RelativeBindingName, ConditionalBindingOrigin>::new();
+    for deferred in &module.deferred_module_ifs {
+        let origin = ConditionalBindingOrigin {
+            condition: deferred.condition().source_expression().to_string(),
+            source_file: deferred.condition().source_file().to_path_buf(),
+            source_line: deferred.condition().source_line(),
+        };
+        for branch in deferred.branches() {
+            if let Some(binding) = branch.binding_address() {
+                origins.insert(binding.clone(), origin.clone());
+            }
+        }
+    }
+
+    let mut contribution = ParsedFile::default();
+    let mut forwarded = Vec::new();
+    let mut selected_bindings = HashSet::new();
+    for deferred in &module.deferred_module_ifs {
+        let condition = resolve_module_value(deferred.condition().value(), resolver)
+            .map_err(|error| error.with_source_file(deferred.condition().source_file()))?;
+        let decision = decide_expanded_if_condition(&condition).map_err(|message| {
+            ArgumentSubstitutionError {
+                source_file: Some(deferred.condition().source_file().to_path_buf()),
+                line: deferred.condition().source_line(),
+                message,
+                parse_error: None,
+            }
+        })?;
+
+        let selected = match decision {
+            Some(true) => Some(deferred.then_branch()),
+            Some(false) => deferred.else_branch(),
+            None => {
+                selected_bindings.extend(
+                    deferred
+                        .branches()
+                        .filter_map(DeferredIfBody::binding_address)
+                        .cloned(),
+                );
+                let condition = DeferredIfCondition::new_with_source_expression(
+                    condition,
+                    deferred.condition().source_file().to_path_buf(),
+                    deferred.condition().source_line(),
+                    deferred.condition().source_expression().to_string(),
+                );
+                let then_branch =
+                    expand_forwarded_if_body(deferred.then_branch(), module_call, resolver)?;
+                let else_branch = deferred
+                    .else_branch()
+                    .map(|branch| expand_forwarded_if_body(branch, module_call, resolver))
+                    .transpose()?;
+                forwarded.push(DeferredStructuralIf::new(
+                    condition,
+                    then_branch,
+                    else_branch,
+                ));
+                None
+            }
+        };
+
+        let Some(selected) = selected else {
+            continue;
+        };
+        if let Some(binding) = selected.binding_address() {
+            selected_bindings.insert(binding.clone());
+        }
+        match selected {
+            DeferredIfBody::Resource(resource) => {
+                contribution.resources.push((**resource).clone());
+            }
+            DeferredIfBody::DataSource(data_source) => {
+                contribution.data_sources.push((**data_source).clone());
+            }
+            DeferredIfBody::ModuleCall(call) => contribution.module_calls.push(call.clone()),
+        }
+    }
+
+    let dropped = origins
+        .into_iter()
+        .filter(|(binding, _origin)| !selected_bindings.contains(binding))
+        .map(|(binding, origin)| {
+            let absolute = resolver.scope.resolve(binding.clone());
+            (absolute, (binding, origin))
+        })
+        .collect();
+    Ok(SelectedDeferredIfs {
+        contribution,
+        forwarded,
+        dropped,
+    })
+}
+
+fn expand_forwarded_if_body(
+    body: &DeferredIfBody,
+    module_call: &crate::resource::ExpandedCompositionCall,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<DeferredIfBody<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+    match body {
+        DeferredIfBody::Resource(resource) => Ok(DeferredIfBody::Resource(Box::new(
+            expand_module_resource(resource, None, module_call, resolver)?,
+        ))),
+        DeferredIfBody::DataSource(data_source) => Ok(DeferredIfBody::DataSource(Box::new(
+            expand_module_data_source(data_source, None, resolver)?,
+        ))),
+        DeferredIfBody::ModuleCall(call) => Ok(DeferredIfBody::ModuleCall(
+            resolve_nested_module_call(call, resolver)?,
+        )),
+    }
+}
+
+fn reject_dropped_conditional_references(
+    selected: &SelectedDeferredIfs,
+    expanded: &crate::parser::ExpandedParsedFile,
+) -> Result<(), ModuleError> {
+    if selected.dropped.is_empty() {
+        return Ok(());
+    }
+
+    let dropped_value = |value: &ExpandedValue| {
+        value
+            .root_bindings()
+            .into_iter()
+            .find_map(|binding| selected.dropped.get(&binding))
+    };
+    let dropped_binding = |binding: &AbsoluteBindingAddress| selected.dropped.get(binding);
+    let mut found = None;
+
+    for resource in &expanded.resources {
+        found = resource
+            .attributes
+            .values()
+            .find_map(&dropped_value)
+            .or_else(|| {
+                resource
+                    .dependency_bindings
+                    .iter()
+                    .find_map(&dropped_binding)
+            })
+            .or_else(|| {
+                resource
+                    .directives
+                    .depends_on
+                    .iter()
+                    .find_map(&dropped_binding)
+            });
+        if found.is_some() {
+            break;
+        }
+    }
+    if found.is_none() {
+        for data_source in &expanded.data_sources {
+            found = data_source
+                .attributes
+                .values()
+                .find_map(&dropped_value)
+                .or_else(|| {
+                    data_source
+                        .dependency_bindings
+                        .iter()
+                        .find_map(&dropped_binding)
+                })
+                .or_else(|| {
+                    data_source
+                        .directives
+                        .depends_on
+                        .iter()
+                        .find_map(&dropped_binding)
+                });
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    if found.is_none() {
+        for composition in &expanded.compositions {
+            found = composition
+                .signature
+                .arguments
+                .values()
+                .find_map(|argument| dropped_value(argument.value()))
+                .or_else(|| {
+                    composition
+                        .signature
+                        .attributes
+                        .values()
+                        .find_map(|attribute| dropped_value(&attribute.to_value()))
+                })
+                .or_else(|| {
+                    composition
+                        .dependency_bindings
+                        .iter()
+                        .find_map(&dropped_binding)
+                });
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    if found.is_none() {
+        for wait in &expanded.wait_bindings {
+            found = dropped_binding(&wait.target)
+                .or_else(|| dropped_binding(&wait.until_predicate.root))
+                .or_else(|| wait.depends_on.iter().find_map(&dropped_binding))
+                .or_else(|| dropped_value(&wait.until_predicate.rhs));
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    if found.is_none() {
+        for deferred in expanded.parsed_deferred_for_expressions() {
+            found = dropped_value(&deferred.iterable);
+            if found.is_none() {
+                found = match &deferred.body {
+                    DeferredForBody::Resource(resource) => {
+                        resource.attributes.values().find_map(&dropped_value)
+                    }
+                    DeferredForBody::Read(data_source) => {
+                        data_source.attributes.values().find_map(&dropped_value)
+                    }
+                    DeferredForBody::ModuleCall(call) => {
+                        let mut referenced = None;
+                        let _ = call.try_visit_values_for_module_if_audit(&mut |value| {
+                            if let Some(binding) = dropped_value(value) {
+                                referenced = Some(binding);
+                                Err(())
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        referenced
+                    }
+                };
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    if found.is_none() {
+        let _ = expanded
+            .parser_binding_metadata
+            .try_visit_values(&mut |value| {
+                if let Some(binding) = dropped_value(value) {
+                    found = Some(binding);
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            });
+    }
+    if found.is_none() {
+        let _ = expanded.try_visit_bare_binding_values(&mut |value| {
+            if let Some(binding) = dropped_value(value) {
+                found = Some(binding);
+                Err(())
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    let Some((binding, origin)) = found else {
+        return Ok(());
+    };
+    Err(ModuleError::DroppedConditionalBinding {
+        binding: binding.to_string(),
+        condition: origin.condition.clone(),
+        source_path: origin.source_file.clone(),
+        line: origin.source_line,
+    })
+}
+
 fn resolve_module_binding_uses(
     uses: &ParsedBindingUses,
     resolver: &ModuleScopeResolver<'_>,
@@ -1655,17 +2255,19 @@ fn resolve_module_binding_uses(
                         value: std::sync::Arc::new(value.clone()),
                         declared_type: declared_type.clone(),
                     },
-                    Some(StructuralOperandRef::Handle { handle, .. }) => {
-                        BareBindingSource::Structural(
-                            handle.clone().with_alias(record.authored.name.clone()),
-                        )
-                    }
-                    Some(StructuralOperandRef::Parameter { access_base, .. }) => {
-                        BareBindingSource::Value {
-                            value: std::sync::Arc::new(access_base.clone()),
-                            declared_type: declared_type.clone(),
-                        }
-                    }
+                    Some(StructuralOperandRef::Handle {
+                        handle,
+                        access_base: _,
+                    }) => BareBindingSource::Structural(
+                        handle.clone().with_alias(record.authored.name.clone()),
+                    ),
+                    Some(StructuralOperandRef::Parameter {
+                        name: _,
+                        access_base,
+                    }) => BareBindingSource::Value {
+                        value: std::sync::Arc::new(access_base.clone()),
+                        declared_type: declared_type.clone(),
+                    },
                     None => BareBindingSource::Value {
                         value: std::sync::Arc::new(resolve_module_value(value, resolver)?),
                         declared_type: declared_type.clone(),
@@ -1678,13 +2280,20 @@ fn resolve_module_binding_uses(
                 .get(handle.canonical_binding().as_str())
                 .map(|argument| argument.value_ref())
             {
-                Some(StructuralOperandRef::Parameter { access_base, .. }) => {
-                    BareBindingSource::Value {
-                        value: std::sync::Arc::new(access_base.clone()),
-                        declared_type: None,
-                    }
-                }
-                Some(StructuralOperandRef::Value(_) | StructuralOperandRef::Handle { .. })
+                Some(StructuralOperandRef::Parameter {
+                    name: _,
+                    access_base,
+                }) => BareBindingSource::Value {
+                    value: std::sync::Arc::new(access_base.clone()),
+                    declared_type: None,
+                },
+                Some(
+                    StructuralOperandRef::Value(_)
+                    | StructuralOperandRef::Handle {
+                        handle: _,
+                        access_base: _,
+                    },
+                )
                 | None => {
                     BareBindingSource::Structural(resolver.resolve_structural_handle(handle)?)
                 }
@@ -1946,6 +2555,295 @@ fn resolve_module_value(
     Ok(resolved)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpandedIfDependency {
+    Static,
+    ModuleArgument,
+    Runtime,
+}
+
+impl ExpandedIfDependency {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Runtime, _) | (_, Self::Runtime) => Self::Runtime,
+            (Self::ModuleArgument, _) | (_, Self::ModuleArgument) => Self::ModuleArgument,
+            (Self::Static, Self::Static) => Self::Static,
+        }
+    }
+}
+
+fn expanded_if_dependency(value: &ExpandedValue) -> ExpandedIfDependency {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+
+    match value {
+        Value::Concrete(ConcreteValue::List(values)) => values
+            .iter()
+            .fold(ExpandedIfDependency::Static, |dependency, value| {
+                dependency.combine(expanded_if_dependency(value))
+            }),
+        Value::Concrete(ConcreteValue::Map(values)) => values
+            .values()
+            .fold(ExpandedIfDependency::Static, |dependency, value| {
+                dependency.combine(expanded_if_dependency(value))
+            }),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        ) => ExpandedIfDependency::Static,
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .fold(ExpandedIfDependency::Static, |dependency, value| {
+                dependency.combine(expanded_if_dependency(value))
+            }),
+        Value::Deferred(
+            DeferredValue::FunctionCall {
+                name: _,
+                args,
+                source_line: _,
+            }
+            | DeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args,
+                source_line: _,
+            },
+        ) => args
+            .iter()
+            .fold(ExpandedIfDependency::Static, |dependency, argument| {
+                dependency.combine(expanded_if_dependency(argument.walker_value()))
+            }),
+        Value::Deferred(DeferredValue::Access(access)) => expanded_if_dependency(access.base()),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().fold(
+            ExpandedIfDependency::Static,
+            |dependency, part| match part {
+                InterpolationPart::Literal(_literal) => dependency,
+                InterpolationPart::Expr(value) => dependency.combine(expanded_if_dependency(value)),
+            },
+        ),
+        Value::Deferred(DeferredValue::Secret(inner)) => expanded_if_dependency(inner),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            expanded_if_dependency(value).combine(expanded_if_dependency(default))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            expanded_if_dependency(expression.lhs())
+                .combine(expanded_if_dependency(expression.rhs()))
+        }
+        Value::Deferred(DeferredValue::Unknown(reason)) => expanded_unknown_dependency(reason),
+        Value::Deferred(
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | DeferredValue::RedactedSecret { hash: _ },
+        ) => ExpandedIfDependency::Runtime,
+    }
+}
+
+fn expanded_unknown_dependency<B: BindingAddress>(
+    reason: &crate::resource::UnknownReason<B>,
+) -> ExpandedIfDependency {
+    match reason {
+        crate::resource::UnknownReason::ModuleArgument {
+            name: _,
+            source_line: _,
+            diagnostic_name: _,
+        } => ExpandedIfDependency::ModuleArgument,
+        crate::resource::UnknownReason::UpstreamExport { path: _ }
+        | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+        | crate::resource::UnknownReason::ForKey
+        | crate::resource::UnknownReason::ForIndex
+        | crate::resource::UnknownReason::ForValue
+        | crate::resource::UnknownReason::FnParam { name: _ }
+        | crate::resource::UnknownReason::FnLocal { name: _ }
+        | crate::resource::UnknownReason::EmptyInterpolation
+        | crate::resource::UnknownReason::PendingReRead(_) => ExpandedIfDependency::Runtime,
+    }
+}
+
+fn decide_expanded_if_condition(value: &ExpandedValue) -> Result<Option<bool>, String> {
+    let mut value = value.clone();
+    value.canonicalize_in_place();
+    if let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Bool(condition)) =
+        &value
+    {
+        return Ok(Some(*condition));
+    }
+    match expanded_if_dependency(&value) {
+        ExpandedIfDependency::ModuleArgument => Ok(None),
+        ExpandedIfDependency::Runtime => {
+            Err("if condition depends on a runtime value; condition must be statically known at parse time".to_string())
+        }
+        ExpandedIfDependency::Static => Err(format!(
+            "if condition must be a Bool value, got: {}",
+            crate::ValueDescription::of(&value)
+        )),
+    }
+}
+
+fn select_expanded_module_ifs(
+    value: &ExpandedValue,
+) -> Result<ExpandedValue, ArgumentSubstitutionError> {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+
+    Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let condition = select_expanded_module_ifs(deferred.condition().value())?;
+            match decide_expanded_if_condition(&condition).map_err(|message| {
+                ArgumentSubstitutionError {
+                    source_file: Some(deferred.condition().source_file().to_path_buf()),
+                    line: deferred.condition().source_line(),
+                    message,
+                    parse_error: None,
+                }
+            })? {
+                Some(true) => select_expanded_module_ifs(deferred.then_value())?,
+                Some(false) => select_expanded_module_ifs(deferred.else_value())?,
+                None => Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+                    DeferredIfCondition::new_with_source_expression(
+                        condition,
+                        deferred.condition().source_file().to_path_buf(),
+                        deferred.condition().source_line(),
+                        deferred.condition().source_expression().to_string(),
+                    ),
+                    select_expanded_module_ifs(deferred.then_value())?,
+                    select_expanded_module_ifs(deferred.else_value())?,
+                )))),
+            }
+        }
+        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .map(select_expanded_module_ifs)
+                .collect::<Result<_, _>>()?,
+        )),
+        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), select_expanded_module_ifs(value)?)))
+                .collect::<Result<_, ArgumentSubstitutionError>>()?,
+        )),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(select_expanded_module_ifs(value)?),
+                default: Box::new(select_expanded_module_ifs(default)?),
+            })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = select_expanded_module_ifs(expression.lhs())?;
+            let rhs = select_expanded_module_ifs(expression.rhs())?;
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: expression.operator_span().line().unwrap_or(0),
+                    message: error.to_string(),
+                    parse_error: None,
+                })?
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            let mut selected = Value::Deferred(DeferredValue::Interpolation(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        InterpolationPart::Literal(literal) => {
+                            Ok(InterpolationPart::Literal(literal.clone()))
+                        }
+                        InterpolationPart::Expr(value) => {
+                            Ok(InterpolationPart::Expr(select_expanded_module_ifs(value)?))
+                        }
+                    })
+                    .collect::<Result<_, ArgumentSubstitutionError>>()?,
+            ));
+            selected.canonicalize_in_place();
+            selected
+        }
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::FunctionCall {
+            name: *name,
+            args: args
+                .iter()
+                .map(|argument| argument.try_map_value(select_expanded_module_ifs))
+                .collect::<Result<_, _>>()?,
+            source_line: *source_line,
+        }),
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            args,
+            reason,
+            source_line,
+        }) => Value::Deferred(DeferredValue::Unavailable {
+            name: *name,
+            args: args
+                .iter()
+                .map(|argument| argument.try_map_value(select_expanded_module_ifs))
+                .collect::<Result<_, _>>()?,
+            reason: reason.clone(),
+            source_line: *source_line,
+        }),
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: function.clone(),
+            functions: functions.clone(),
+            args: args
+                .iter()
+                .map(|argument| argument.try_map_value(select_expanded_module_ifs))
+                .collect::<Result<_, _>>()?,
+            source_line: *source_line,
+        }),
+        Value::Deferred(DeferredValue::Access(access)) => access
+            .rebuild_with_base(
+                select_expanded_module_ifs(access.base())?,
+                AccessMissPolicy::Error,
+            )
+            .map_err(|error| ArgumentSubstitutionError {
+                source_file: None,
+                line: access.source_line(),
+                message: error.to_string(),
+                parse_error: None,
+            })?,
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(select_expanded_module_ifs(inner)?),
+        )),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::RedactedSecret { hash: _ },
+        ) => value.clone(),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            let _dependency = expanded_unknown_dependency(reason);
+            value.clone()
+        }
+    })
+}
+
 fn evaluate_expanded_module_functions(
     value: &ExpandedValue,
     config: &crate::parser::ProviderContext,
@@ -1953,6 +2851,18 @@ fn evaluate_expanded_module_functions(
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+                DeferredIfCondition::new_with_source_expression(
+                    evaluate_expanded_module_functions(deferred.condition().value(), config)?,
+                    deferred.condition().source_file().to_path_buf(),
+                    deferred.condition().source_line(),
+                    deferred.condition().source_expression().to_string(),
+                ),
+                evaluate_expanded_module_functions(deferred.then_value(), config)?,
+                evaluate_expanded_module_functions(deferred.else_value(), config)?,
+            ))))
+        }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
                 .iter()
@@ -2003,23 +2913,64 @@ fn evaluate_expanded_module_functions(
                     .collect::<Result<_, ArgumentSubstitutionError>>()?,
             ))
         }
-        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Unavailable { .. }) => {
-            let mut evaluated = value.clone();
-            let Value::Deferred(
-                DeferredValue::FunctionCall { args, .. } | DeferredValue::Unavailable { args, .. },
-            ) = &mut evaluated
-            else {
-                unreachable!("matched a built-in call")
-            };
-            *args = args
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => {
+            let args = args
                 .iter()
                 .map(|argument| {
                     argument
                         .try_map_value(|value| evaluate_expanded_module_functions(value, config))
                 })
-                .collect::<Result<_, _>>()?;
-            evaluated
+                .collect::<Result<Vec<_>, _>>()?;
+            if args.iter().all(|argument| {
+                argument.handle().is_none() && argument.walker_value().is_fully_resolved()
+            }) {
+                let eval_args = args
+                    .iter()
+                    .map(crate::parser::function_argument_as_eval)
+                    .collect::<Vec<_>>();
+                crate::builtins::evaluate_builtin_with_config(name.as_str(), &eval_args, config)
+                    .map_err(|message| ArgumentSubstitutionError {
+                        source_file: None,
+                        line: source_line.get().unwrap_or(0),
+                        message,
+                        parse_error: None,
+                    })?
+                    .into_value()
+                    .map_err(|error| ArgumentSubstitutionError {
+                        source_file: None,
+                        line: source_line.get().unwrap_or(0),
+                        message: error.to_string(),
+                        parse_error: None,
+                    })?
+            } else {
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: *name,
+                    args,
+                    source_line: *source_line,
+                })
+            }
         }
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            args,
+            reason,
+            source_line,
+        }) => Value::Deferred(DeferredValue::Unavailable {
+            name: *name,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument
+                        .try_map_value(|value| evaluate_expanded_module_functions(value, config))
+                })
+                .collect::<Result<_, _>>()?,
+            reason: reason.clone(),
+            source_line: *source_line,
+        }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions: _,
@@ -2062,11 +3013,14 @@ fn evaluate_expanded_module_functions(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::RedactedSecret { hash: _ },
         ) => value.clone(),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            let _dependency = expanded_unknown_dependency(reason);
+            value.clone()
+        }
     })
 }
 
@@ -2084,16 +3038,24 @@ fn function_substitution_error(
 
 fn expand_module_resource(
     resource: &Resource,
+    dependency_values: Option<&IndexMap<String, Value>>,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
 ) -> Result<crate::resource::ExpandedResource, ArgumentSubstitutionError> {
     let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
         .expect("module instance prefix is non-empty");
-    expand_module_resource_with_identity(resource, &instance_identity, module_call, resolver)
+    expand_module_resource_with_identity(
+        resource,
+        dependency_values,
+        &instance_identity,
+        module_call,
+        resolver,
+    )
 }
 
 fn expand_module_resource_with_identity(
     resource: &Resource,
+    dependency_values: Option<&IndexMap<String, Value>>,
     instance_identity: &ResourceIdentity,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
@@ -2167,7 +3129,10 @@ fn expand_module_resource_with_identity(
             .as_ref()
             .map(|binding| resolver.resolve_declared_binding(binding))
             .transpose()?,
-        dependency_bindings: resolve_dependency_bindings(&dependency_bindings, resolver)?,
+        dependency_bindings: match dependency_values {
+            Some(values) => resolve_dependency_values(values.values(), resolver)?,
+            None => resolve_dependency_bindings(&dependency_bindings, resolver)?,
+        },
         module_source: Some(ModuleSource::expanded_module(
             &resolver.call_path.root().module_name,
             &resolver.call_path.root().instance,
@@ -2182,6 +3147,7 @@ fn expand_module_resource_with_identity(
 
 fn expand_module_data_source(
     data_source: &DataSource,
+    dependency_values: Option<&IndexMap<String, Value>>,
     resolver: &ModuleScopeResolver<'_>,
 ) -> Result<crate::resource::ExpandedDataSource, ArgumentSubstitutionError> {
     let instance_prefix = resolver.scope.key();
@@ -2232,7 +3198,10 @@ fn expand_module_data_source(
             .as_ref()
             .map(|binding| resolver.resolve_declared_binding(binding))
             .transpose()?,
-        dependency_bindings: resolve_dependency_bindings(&dependency_bindings, resolver)?,
+        dependency_bindings: match dependency_values {
+            Some(values) => resolve_dependency_values(values.values(), resolver)?,
+            None => resolve_dependency_bindings(&dependency_bindings, resolver)?,
+        },
         module_source: Some(ModuleSource::expanded_module(
             &resolver.call_path.root().module_name,
             &resolver.call_path.root().instance,
@@ -2273,24 +3242,67 @@ fn expand_module_composition(
                 StructuralOperandRef::Value(value) => {
                     let parameter = match value {
                         Value::Deferred(DeferredValue::Unknown(
-                            crate::resource::UnknownReason::ModuleArgument { name, .. },
+                            crate::resource::UnknownReason::ModuleArgument {
+                                name,
+                                source_line: _,
+                                diagnostic_name: _,
+                            },
                         )) => Some(name.as_str()),
                         Value::Deferred(DeferredValue::BindingRef { binding }) => {
                             Some(binding.as_str())
                         }
-                        Value::Concrete(_)
+                        Value::Concrete(
+                            ConcreteValue::String(_)
+                            | ConcreteValue::EnumIdentifier(_)
+                            | ConcreteValue::CanonicalEnum(_)
+                            | ConcreteValue::Int(_)
+                            | ConcreteValue::Float(_)
+                            | ConcreteValue::Bool(_)
+                            | ConcreteValue::Duration(_)
+                            | ConcreteValue::List(_)
+                            | ConcreteValue::StringList(_)
+                            | ConcreteValue::Map(_),
+                        )
                         | Value::Deferred(
-                            DeferredValue::ResourceRef { .. }
-                            | DeferredValue::Coalesce { .. }
+                            DeferredValue::ModuleIf(_)
+                            | DeferredValue::ResourceRef { path: _ }
+                            | DeferredValue::Coalesce {
+                                value: _,
+                                default: _,
+                            }
                             | DeferredValue::IntegerArithmetic(_)
                             | DeferredValue::Interpolation(_)
-                            | DeferredValue::FunctionCall { .. }
-                            | DeferredValue::ResolvedFunctionCall { .. }
-                            | DeferredValue::Unavailable { .. }
+                            | DeferredValue::FunctionCall {
+                                name: _,
+                                args: _,
+                                source_line: _,
+                            }
+                            | DeferredValue::ResolvedFunctionCall {
+                                function: _,
+                                functions: _,
+                                args: _,
+                                source_line: _,
+                            }
+                            | DeferredValue::Unavailable {
+                                name: _,
+                                args: _,
+                                reason: _,
+                                source_line: _,
+                            }
                             | DeferredValue::Access(_)
                             | DeferredValue::Secret(_)
-                            | DeferredValue::RedactedSecret { .. }
-                            | DeferredValue::Unknown(_),
+                            | DeferredValue::RedactedSecret { hash: _ }
+                            | DeferredValue::Unknown(
+                                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                                | crate::resource::UnknownReason::ForKey
+                                | crate::resource::UnknownReason::ForIndex
+                                | crate::resource::UnknownReason::ForValue
+                                | crate::resource::UnknownReason::FnParam { name: _ }
+                                | crate::resource::UnknownReason::FnLocal { name: _ }
+                                | crate::resource::UnknownReason::EmptyInterpolation
+                                | crate::resource::UnknownReason::PendingReRead(_),
+                            ),
                         ) => None,
                     };
                     let forwarded_handle = parameter
@@ -2307,7 +3319,10 @@ fn expand_module_composition(
                                 access_base,
                             } => Some((parameter, handle, access_base)),
                             StructuralOperandRef::Value(_)
-                            | StructuralOperandRef::Parameter { .. } => None,
+                            | StructuralOperandRef::Parameter {
+                                name: _,
+                                access_base: _,
+                            } => None,
                         });
                     match forwarded_handle {
                         Some((parameter, handle, access_base)) => {
@@ -2639,6 +3654,7 @@ fn resolve_module_constraint_expression(
 
 fn expand_parsed_deferred_for_expression(
     deferred: &ParsedDeferredForExpression<RelativeBindingName>,
+    dependency_values: Option<&IndexMap<String, Value>>,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
 ) -> Result<ParsedDeferredForExpression<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
@@ -2691,7 +3707,7 @@ fn expand_parsed_deferred_for_expression(
     // that diagnostic with the expander's first-error-only "unknown binding".
     let iterable = if matches!(
         &iterable_state,
-        ParsedDeferredForIterableState::UndefinedIdentifier { .. }
+        ParsedDeferredForIterableState::UndefinedIdentifier { name: _ }
     ) {
         iterable.clone().resolve_module(resolver.scope)
     } else {
@@ -2701,14 +3717,15 @@ fn expand_parsed_deferred_for_expression(
         DeferredForBody::Resource(resource) => {
             DeferredForBody::Resource(Box::new(expand_module_resource_with_identity(
                 resource,
+                dependency_values,
                 &instance_identity,
                 module_call,
                 resolver,
             )?))
         }
-        DeferredForBody::Read(data_source) => {
-            DeferredForBody::Read(Box::new(expand_module_data_source(data_source, resolver)?))
-        }
+        DeferredForBody::Read(data_source) => DeferredForBody::Read(Box::new(
+            expand_module_data_source(data_source, dependency_values, resolver)?,
+        )),
         DeferredForBody::ModuleCall(call) => {
             DeferredForBody::ModuleCall(resolve_nested_module_call(call, resolver)?)
         }
@@ -2767,10 +3784,10 @@ impl ArgumentSubstitutionError {
 /// caller values are substituted. BindingRef/ResourceRef substitution remains
 /// for pre-expanded or hand-constructed AST values.
 #[cfg(test)]
-pub(super) fn substitute_arguments<B: BindingAddress>(
-    value: &crate::resource::Value<B>,
-    arguments: &HashMap<String, crate::resource::Value<B>>,
-) -> Result<crate::resource::Value<B>, ArgumentSubstitutionError> {
+pub(super) fn substitute_arguments(
+    value: &Value,
+    arguments: &HashMap<String, Value>,
+) -> Result<Value, ArgumentSubstitutionError> {
     let config = crate::parser::ProviderContext::default();
     let arguments = arguments
         .iter()
@@ -2786,7 +3803,7 @@ pub(super) fn substitute_arguments<B: BindingAddress>(
             )
         })
         .collect::<HashMap<_, _>>();
-    substitute_arguments_with_position(
+    let substituted = substitute_arguments_with_position(
         value,
         ArgumentSubstitutions {
             arguments: &arguments,
@@ -2796,7 +3813,96 @@ pub(super) fn substitute_arguments<B: BindingAddress>(
             config: &config,
         },
         ArgumentSubstitutionPosition::Value,
-    )
+    )?;
+    select_authored_module_ifs_for_test(&substituted, &config)
+}
+
+#[cfg(test)]
+fn select_authored_module_ifs_for_test(
+    value: &Value,
+    config: &crate::parser::ProviderContext,
+) -> Result<Value, ArgumentSubstitutionError> {
+    use crate::resource::{ConcreteValue, DeferredValue, Value};
+
+    Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            match crate::parser::decide_if_condition(deferred.condition().value(), config).map_err(
+                |error| ArgumentSubstitutionError {
+                    source_file: Some(deferred.condition().source_file().to_path_buf()),
+                    line: deferred.condition().source_line(),
+                    message: error.to_string(),
+                    parse_error: None,
+                },
+            )? {
+                Some(true) => select_authored_module_ifs_for_test(deferred.then_value(), config)?,
+                Some(false) => select_authored_module_ifs_for_test(deferred.else_value(), config)?,
+                None => value.clone(),
+            }
+        }
+        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .map(|value| select_authored_module_ifs_for_test(value, config))
+                .collect::<Result<_, _>>()?,
+        )),
+        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        select_authored_module_ifs_for_test(value, config)?,
+                    ))
+                })
+                .collect::<Result<_, ArgumentSubstitutionError>>()?,
+        )),
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(select_authored_module_ifs_for_test(inner, config)?),
+        )),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
+            | DeferredValue::IntegerArithmetic(_)
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | DeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | DeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
+            | DeferredValue::Access(_)
+            | DeferredValue::RedactedSecret { hash: _ },
+        ) => value.clone(),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            let _dependency = expanded_unknown_dependency(reason);
+            value.clone()
+        }
+    })
 }
 
 fn substitute_function_argument<B: BindingAddress>(
@@ -2807,13 +3913,19 @@ fn substitute_function_argument<B: BindingAddress>(
         && let Some(substitution) = arguments.arguments.get(name)
     {
         return match substitution.value_ref() {
-            StructuralOperandRef::Handle { handle, .. } => Ok(
-                crate::resource::FunctionArgument::from_handle(handle.clone()),
-            ),
+            StructuralOperandRef::Handle {
+                handle,
+                access_base: _,
+            } => Ok(crate::resource::FunctionArgument::from_handle(
+                handle.clone(),
+            )),
             StructuralOperandRef::Value(value) => {
                 Ok(crate::resource::FunctionArgument::from_value(value.clone()))
             }
-            StructuralOperandRef::Parameter { .. } => substitute_arguments_with_position(
+            StructuralOperandRef::Parameter {
+                name: _,
+                access_base: _,
+            } => substitute_arguments_with_position(
                 argument.walker_value(),
                 arguments,
                 ArgumentSubstitutionPosition::Value,
@@ -2827,6 +3939,170 @@ fn substitute_function_argument<B: BindingAddress>(
     })
 }
 
+fn substitute_module_if_paths_in_secret<B: BindingAddress>(
+    value: &crate::resource::Value<B>,
+    arguments: ArgumentSubstitutions<'_, B>,
+    position: ArgumentSubstitutionPosition,
+) -> Result<crate::resource::Value<B>, ArgumentSubstitutionError> {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+
+    if !super::deferred_if::value_contains_module_if(value) {
+        return Ok(value.clone());
+    }
+    if matches!(value, Value::Deferred(DeferredValue::ModuleIf(_))) {
+        return substitute_arguments_with_position(value, arguments, position);
+    }
+
+    Ok(match value {
+        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+            values
+                .iter()
+                .map(|value| substitute_module_if_paths_in_secret(value, arguments, position))
+                .collect::<Result<_, _>>()?,
+        )),
+        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
+            values
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        substitute_module_if_paths_in_secret(value, arguments, position)?,
+                    ))
+                })
+                .collect::<Result<_, ArgumentSubstitutionError>>()?,
+        )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            Value::Deferred(DeferredValue::Interpolation(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        InterpolationPart::Literal(literal) => {
+                            Ok(InterpolationPart::Literal(literal.clone()))
+                        }
+                        InterpolationPart::Expr(value) => Ok(InterpolationPart::Expr(
+                            substitute_module_if_paths_in_secret(value, arguments, position)?,
+                        )),
+                    })
+                    .collect::<Result<_, ArgumentSubstitutionError>>()?,
+            ))
+        }
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::FunctionCall {
+            name: *name,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| {
+                        substitute_module_if_paths_in_secret(value, arguments, position)
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            source_line: *source_line,
+        }),
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            args,
+            reason,
+            source_line,
+        }) => Value::Deferred(DeferredValue::Unavailable {
+            name: *name,
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| {
+                        substitute_module_if_paths_in_secret(value, arguments, position)
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            reason: reason.clone(),
+            source_line: *source_line,
+        }),
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: function.clone(),
+            functions: functions.clone(),
+            args: args
+                .iter()
+                .map(|argument| {
+                    argument.try_map_value(|value| {
+                        substitute_module_if_paths_in_secret(value, arguments, position)
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+            source_line: *source_line,
+        }),
+        Value::Deferred(DeferredValue::Access(access)) => access
+            .rebuild_with_base(
+                substitute_module_if_paths_in_secret(access.base(), arguments, position)?,
+                AccessMissPolicy::Error,
+            )
+            .map_err(|error| ArgumentSubstitutionError {
+                source_file: None,
+                line: access.source_line(),
+                message: error.to_string(),
+                parse_error: None,
+            })?,
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            Value::Deferred(DeferredValue::Secret(Box::new(
+                substitute_module_if_paths_in_secret(inner, arguments, position)?,
+            )))
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(substitute_module_if_paths_in_secret(
+                    value, arguments, position,
+                )?),
+                default: Box::new(substitute_module_if_paths_in_secret(
+                    default, arguments, position,
+                )?),
+            })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => expression
+            .evaluate_with_operands(
+                substitute_module_if_paths_in_secret(expression.lhs(), arguments, position)?,
+                substitute_module_if_paths_in_secret(expression.rhs(), arguments, position)?,
+            )
+            .map_err(|error| ArgumentSubstitutionError {
+                source_file: None,
+                line: expression
+                    .operator_span()
+                    .line()
+                    .unwrap_or(arguments.default_line),
+                message: error.to_string(),
+                parse_error: None,
+            })?,
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            unreachable!("module-if values return before container traversal")
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::RedactedSecret { hash: _ },
+        ) => value.clone(),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            let _dependency = expanded_unknown_dependency(reason);
+            value.clone()
+        }
+    })
+}
+
 fn substitute_arguments_with_position<B: BindingAddress>(
     value: &crate::resource::Value<B>,
     arguments: ArgumentSubstitutions<'_, B>,
@@ -2835,6 +4111,24 @@ fn substitute_arguments_with_position<B: BindingAddress>(
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
     let substituted = match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let condition = substitute_arguments_with_position(
+                deferred.condition().value(),
+                arguments,
+                ArgumentSubstitutionPosition::Value,
+            )
+            .map_err(|error| error.with_source_file(deferred.condition().source_file()))?;
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+                DeferredIfCondition::new_with_source_expression(
+                    condition,
+                    deferred.condition().source_file().to_path_buf(),
+                    deferred.condition().source_line(),
+                    deferred.condition().source_expression().to_string(),
+                ),
+                substitute_arguments_with_position(deferred.then_value(), arguments, position)?,
+                substitute_arguments_with_position(deferred.else_value(), arguments, position)?,
+            ))))
+        }
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument {
                 name,
@@ -2853,9 +4147,9 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                     let mut substituted = value.clone();
                     if let Value::Deferred(DeferredValue::Unknown(
                         crate::resource::UnknownReason::ModuleArgument {
+                            name: _,
                             source_line: substituted_line,
                             diagnostic_name: substituted_diagnostic,
-                            ..
                         },
                     )) = &mut substituted
                     {
@@ -2864,9 +4158,10 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                     }
                     substituted
                 }
-                StructuralOperandRef::Handle { .. }
-                    if matches!(position, ArgumentSubstitutionPosition::Value) =>
-                {
+                StructuralOperandRef::Handle {
+                    handle: _,
+                    access_base: _,
+                } if matches!(position, ArgumentSubstitutionPosition::Value) => {
                     return Err(ArgumentSubstitutionError {
                         source_file: None,
                         line,
@@ -2878,14 +4173,20 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                         parse_error: None,
                     });
                 }
-                StructuralOperandRef::Handle { access_base, .. } => access_base.clone(),
-                StructuralOperandRef::Parameter { access_base, .. } => {
+                StructuralOperandRef::Handle {
+                    handle: _,
+                    access_base,
+                } => access_base.clone(),
+                StructuralOperandRef::Parameter {
+                    name: _,
+                    access_base,
+                } => {
                     let mut forwarded_value = access_base.clone();
                     if let Value::Deferred(DeferredValue::Unknown(
                         crate::resource::UnknownReason::ModuleArgument {
+                            name: _,
                             source_line: forwarded_line,
                             diagnostic_name: forwarded_diagnostic,
-                            ..
                         },
                     )) = &mut forwarded_value
                     {
@@ -3036,26 +4337,39 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                         ArgumentSubstitutionPosition::Value,
                     )
                     .map(InterpolationPart::Expr),
-                    other => Ok(other.clone()),
+                    InterpolationPart::Literal(literal) => {
+                        Ok(InterpolationPart::Literal(literal.clone()))
+                    }
                 })
                 .collect::<Result<_, _>>()?;
             Value::Deferred(DeferredValue::Interpolation(substituted_parts))
         }
-        Value::Deferred(DeferredValue::FunctionCall { .. } | DeferredValue::Unavailable { .. }) => {
-            let mut substituted = value.clone();
-            let Value::Deferred(
-                DeferredValue::FunctionCall { args, .. } | DeferredValue::Unavailable { args, .. },
-            ) = &mut substituted
-            else {
-                unreachable!("matched a built-in call")
-            };
-            let substituted_args = args
+        Value::Deferred(DeferredValue::FunctionCall {
+            name,
+            args,
+            source_line,
+        }) => Value::Deferred(DeferredValue::FunctionCall {
+            name: *name,
+            args: args
                 .iter()
                 .map(|argument| substitute_function_argument(argument, arguments))
-                .collect::<Result<_, _>>()?;
-            *args = substituted_args;
-            substituted
-        }
+                .collect::<Result<_, _>>()?,
+            source_line: *source_line,
+        }),
+        Value::Deferred(DeferredValue::Unavailable {
+            name,
+            args,
+            reason,
+            source_line,
+        }) => Value::Deferred(DeferredValue::Unavailable {
+            name: *name,
+            args: args
+                .iter()
+                .map(|argument| substitute_function_argument(argument, arguments))
+                .collect::<Result<_, _>>()?,
+            reason: reason.clone(),
+            source_line: *source_line,
+        }),
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -3098,11 +4412,13 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(DeferredValue::RedactedSecret { .. } | DeferredValue::Unknown(_)) => {
+        | Value::Deferred(DeferredValue::RedactedSecret { hash: _ }) => value.clone(),
+        Value::Deferred(DeferredValue::Unknown(reason)) => {
+            let _dependency = expanded_unknown_dependency(reason);
             value.clone()
         }
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(substitute_arguments_with_position(
+            Box::new(substitute_module_if_paths_in_secret(
                 inner,
                 arguments,
                 ArgumentSubstitutionPosition::Value,
@@ -3116,15 +4432,76 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             .arguments
             .get(&argument)
             .and_then(|resolved| resolved.caller_reference.clone())
-        && let RefType::UnknownAttribute(error @ RefTypeError::InvalidAccess { .. }) =
-            binding_index.postfix_ref_type(append_reference_path(reference, &postfix).as_ref())
+        && let RefType::UnknownAttribute(
+            error @ RefTypeError::InvalidAccess {
+                path: _,
+                step: _,
+                actual: _,
+            },
+        ) = binding_index.postfix_ref_type(append_reference_path(reference, &postfix).as_ref())
     {
         let line = match value {
             Value::Deferred(DeferredValue::Access(access)) => access.source_line(),
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument { source_line, .. },
+                crate::resource::UnknownReason::ModuleArgument {
+                    name: _,
+                    source_line,
+                    diagnostic_name: _,
+                },
             )) => source_line.get().unwrap_or(arguments.default_line),
-            _ => arguments.default_line,
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::List(_)
+                | ConcreteValue::StringList(_)
+                | ConcreteValue::Map(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ModuleIf(_)
+                | DeferredValue::ResourceRef { path: _ }
+                | DeferredValue::BindingRef { binding: _ }
+                | DeferredValue::Coalesce {
+                    value: _,
+                    default: _,
+                }
+                | DeferredValue::IntegerArithmetic(_)
+                | DeferredValue::Interpolation(_)
+                | DeferredValue::FunctionCall {
+                    name: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::Unavailable {
+                    name: _,
+                    args: _,
+                    reason: _,
+                    source_line: _,
+                }
+                | DeferredValue::ResolvedFunctionCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
+                | DeferredValue::Secret(_)
+                | DeferredValue::RedactedSecret { hash: _ }
+                | DeferredValue::Unknown(
+                    crate::resource::UnknownReason::UpstreamExport { path: _ }
+                    | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                    | crate::resource::UnknownReason::ForKey
+                    | crate::resource::UnknownReason::ForIndex
+                    | crate::resource::UnknownReason::ForValue
+                    | crate::resource::UnknownReason::FnParam { name: _ }
+                    | crate::resource::UnknownReason::FnLocal { name: _ }
+                    | crate::resource::UnknownReason::EmptyInterpolation
+                    | crate::resource::UnknownReason::PendingReRead(_),
+                ),
+            ) => arguments.default_line,
         };
         return Err(ArgumentSubstitutionError {
             source_file: None,

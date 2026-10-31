@@ -798,6 +798,19 @@ where
     F: Fn(crate::resource::ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 {
     match value {
+        PhaseValue::Deferred(PhaseDeferredValue::ModuleIf(deferred)) => {
+            deferred.values()[1..].iter().find_map(|branch| {
+                deferred_value_mismatch(
+                    branch,
+                    target,
+                    inference_bindings,
+                    schemas,
+                    bindings,
+                    authored_binding,
+                    diagnostic_path,
+                )
+            })
+        }
         PhaseValue::Deferred(PhaseDeferredValue::ResourceRef { path }) => reference_value_mismatch(
             crate::resource::ReferencePathRef::Access(path),
             target,
@@ -1489,6 +1502,13 @@ fn visit_refs_with_sink_inner<'a, B: crate::resource::BindingAddress>(
     ),
 ) {
     match value {
+        PhaseValue::Deferred(PhaseDeferredValue::ModuleIf(deferred)) => {
+            let [condition, then_value, else_value] = deferred.values();
+            visit_refs_with_sink_inner(condition, None, usage, f);
+            for branch in [then_value, else_value] {
+                visit_refs_with_sink_inner(branch, sink, usage, f);
+            }
+        }
         PhaseValue::Deferred(PhaseDeferredValue::ResourceRef { path }) => f(
             crate::resource::ReferencePathRef::<B>::Access(path),
             sink,
@@ -1606,6 +1626,13 @@ fn visit_computed_accesses_with_sink<'a, B: crate::resource::BindingAddress>(
     f: &mut impl FnMut(&crate::resource::Value<B>, Option<RefSink<'a>>),
 ) {
     match value {
+        PhaseValue::Deferred(PhaseDeferredValue::ModuleIf(deferred)) => {
+            let [condition, then_value, else_value] = deferred.values();
+            visit_computed_accesses_with_sink(condition, None, f);
+            for branch in [then_value, else_value] {
+                visit_computed_accesses_with_sink(branch, sink, f);
+            }
+        }
         PhaseValue::Deferred(PhaseDeferredValue::Access(access)) => {
             if crate::resource::module_argument_reference_path(value).is_none() {
                 f(value, sink);
@@ -1903,6 +1930,24 @@ fn prove_integer_operand<B: crate::resource::BindingAddress>(
             prove_integer_operand(value, expression, side, bindings, schemas, binding_index)?;
             return prove_integer_operand(
                 default,
+                expression,
+                side,
+                bindings,
+                schemas,
+                binding_index,
+            );
+        }
+        PhaseValue::Deferred(PhaseDeferredValue::ModuleIf(deferred)) => {
+            prove_integer_operand(
+                deferred.then_value(),
+                expression,
+                side,
+                bindings,
+                schemas,
+                binding_index,
+            )?;
+            return prove_integer_operand(
+                deferred.else_value(),
                 expression,
                 side,
                 bindings,
@@ -2972,6 +3017,20 @@ fn validate_user_function_ref_types_inner<
         }
 
         match value {
+            PhaseValue::Deferred(PhaseDeferredValue::ModuleIf(deferred)) => {
+                let [condition, then_value, else_value] = deferred.values();
+                check_function_calls(condition, None, context, bindings, unknown_policy, errors);
+                for branch in [then_value, else_value] {
+                    check_function_calls(
+                        branch,
+                        result_sink,
+                        context,
+                        bindings,
+                        unknown_policy,
+                        errors,
+                    );
+                }
+            }
             PhaseValue::Deferred(
                 PhaseDeferredValue::FunctionCall { name, args, .. }
                 | PhaseDeferredValue::Unavailable { name, args, .. },
@@ -3939,6 +3998,9 @@ fn deferred_iterable_shape<B: crate::resource::BindingAddress>(
     schemas: &SchemaRegistry,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
     match value {
+        PhaseValue::Deferred(PhaseDeferredValue::ModuleIf(_)) => {
+            infer_type_from_value_to_iterable_shape(value, bindings, schemas)
+        }
         PhaseValue::Concrete(PhaseConcreteValue::List(_items)) => Ok(DeferredIterableShape::List),
         PhaseValue::Concrete(PhaseConcreteValue::Map(_entries)) => Ok(DeferredIterableShape::Map),
         PhaseValue::Concrete(
@@ -5393,7 +5455,8 @@ pub fn value_contains_unresolved_ref<B: crate::resource::BindingAddress>(
     value: &crate::resource::Value<B>,
 ) -> bool {
     match value {
-        crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef {
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::ModuleIf(_))
+        | crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef {
             ..
         })
         | crate::resource::Value::Deferred(crate::resource::DeferredValue::BindingRef { .. })
@@ -6975,6 +7038,7 @@ fn module_call_label(call: &ModuleCall) -> String {
 
 fn module_call_value_is_context_free(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => false,
         Value::Concrete(ConcreteValue::String(_string)) => true,
         Value::Concrete(ConcreteValue::CanonicalEnum(_canonical)) => true,
         Value::Concrete(ConcreteValue::Int(_integer)) => true,

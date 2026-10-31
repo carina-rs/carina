@@ -1012,6 +1012,12 @@ pub fn reconcile_prefixed_names(
 /// so the output is consistent across runs (HashMap iteration order is random).
 fn deterministic_value_string<B: BindingAddress>(value: &Value<B>) -> String {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => format!(
+            "ModuleIf({}, {}, {})",
+            deterministic_value_string(deferred.condition().value()),
+            deterministic_value_string(deferred.then_value()),
+            deterministic_value_string(deferred.else_value())
+        ),
         Value::Concrete(ConcreteValue::String(s)) => {
             format!("String({:?})", s.expose_plaintext())
         }

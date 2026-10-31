@@ -200,6 +200,9 @@ fn public_attributes(
 
 fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err("the value contains an unresolved module-template conditional")
+        }
         Value::Concrete(ConcreteValue::String(value)) => Ok(serde_json::Value::String(
             value.expose_plaintext().to_string(),
         )),

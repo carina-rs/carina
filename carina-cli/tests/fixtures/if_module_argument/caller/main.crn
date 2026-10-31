@@ -1,0 +1,14 @@
+let choice = use { source = "../choice" }
+
+let enabled = choice {
+  flag = true
+}
+
+let disabled = choice {
+  flag = false
+}
+
+exports {
+  enabled: String = enabled.value
+  disabled: String = disabled.value
+}

@@ -4,6 +4,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use super::DeferredStructuralIf;
 use super::ast::{
     AttributePath, AttributePathSegment, BareBindingKind, BareBindingSource, BareBindingUse,
     BindingScopeId, BindingUseOwner, ModuleCallId, ParsedBindingUses, ParsedDeferredForExpression,
@@ -101,6 +102,8 @@ pub(crate) struct ParseContext<'cfg> {
     /// module-resolution seam; parser output has exactly one deferred-loop
     /// source of truth.
     pub(super) parsed_deferred_for_expressions: Vec<ParsedDeferredForExpression>,
+    /// Module-argument-dependent structural `if` templates.
+    pub(super) deferred_module_ifs: Vec<DeferredStructuralIf>,
     /// Names pre-registered via the directory-aware seed pass
     /// (`parse_with_seeded_bindings`). Excluded from local duplicate-
     /// binding checks, so a `let role = ...` in this file does not
@@ -146,6 +149,7 @@ impl<'cfg> ParseContext<'cfg> {
             named_provider_instances: Vec::new(),
             warnings: Vec::new(),
             parsed_deferred_for_expressions: Vec::new(),
+            deferred_module_ifs: Vec::new(),
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,

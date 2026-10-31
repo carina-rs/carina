@@ -326,6 +326,15 @@ pub(crate) fn infer_type_from_value_without_bindings<B: BindingAddress>(
     }
 
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let then_type = infer_type_from_value_without_bindings(deferred.then_value())?;
+            let else_type = infer_type_from_value_without_bindings(deferred.else_value())?;
+            if then_type == else_type {
+                Ok(then_type)
+            } else {
+                Err(heterogeneous_collection_error(&then_type, &else_type).into())
+            }
+        }
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
         | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -459,6 +468,25 @@ fn infer_type_from_value_with_visiting<B: BindingAddress>(
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let then_type = infer_type_from_value_with_visiting(
+                deferred.then_value(),
+                bindings,
+                schemas,
+                visiting,
+            )?;
+            let else_type = infer_type_from_value_with_visiting(
+                deferred.else_value(),
+                bindings,
+                schemas,
+                visiting,
+            )?;
+            if then_type == else_type {
+                Ok(then_type)
+            } else {
+                Err(heterogeneous_collection_error(&then_type, &else_type).into())
+            }
+        }
         Value::Concrete(ConcreteValue::String(_)) => Ok(TypeExpr::String),
         // Enum identifiers infer as `String` for the type-expression
         // layer — the value-layer distinction matters only inside the

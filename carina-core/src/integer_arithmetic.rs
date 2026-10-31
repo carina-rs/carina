@@ -419,6 +419,10 @@ fn validate_operand_shape_at_stage<B: BindingAddress>(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             validate_operand_shape_at_stage(inner, side, admission)
         }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            validate_operand_shape_at_stage(deferred.then_value(), side, admission)?;
+            validate_operand_shape_at_stage(deferred.else_value(), side, admission)
+        }
         Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }

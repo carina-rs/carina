@@ -19,6 +19,7 @@ impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
     pub fn of<B: BindingAddress>(value: &Value<B>) -> Self {
         Self(match value {
+            Value::Deferred(DeferredValue::ModuleIf(_)) => "module conditional".to_string(),
             Value::Concrete(ConcreteValue::String(value)) => value
                 .diagnostic_literal()
                 .map(|value| format!("string {}", display_string_literal(value)))

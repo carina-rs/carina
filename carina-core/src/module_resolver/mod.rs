@@ -25,6 +25,7 @@
 //! diagnostics. Module directories validated standalone enter through the
 //! ordinary `resolve_modules*` APIs and intentionally behave as roots.
 
+mod deferred_if;
 mod error;
 mod expander;
 mod loader;
@@ -42,7 +43,8 @@ pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
     ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
     ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
-    ResolvedModuleConstraintStatus, prepare_root_export_validation, resolve_modules,
+    ResolvedModuleConstraintStatus, ensure_expanded_root_graph, prepare_root_export_validation,
+    resolve_module_template_with_config, resolve_module_template_with_providerless_config,
     resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
     resolve_modules_with_providerless_config, resolve_modules_with_providerless_diagnostics,
 };

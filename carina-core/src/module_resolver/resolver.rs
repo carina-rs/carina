@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 
 use crate::config_loader::{ParsedRootDirectory, RootDirectoryParse};
 use crate::parser::{
-    LoadedProviderContext, ModuleCallDiagnosticSource, ModuleResolvedFile,
+    DeferredIfBody, File, LoadedProviderContext, ModuleCallDiagnosticSource, ModuleResolvedFile,
     ModuleResolvedParsedFile, ParseError, ParsedDeferredForPhase, ParsedFile, ProviderContext,
-    ResolveExportBindingPhase, UseStatement,
+    ResolveExportBindingPhase, StateBlock, UseStatement, ValidateExpr,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, ModuleConstraintId, RelativeBindingName, RootScope,
+    AbsoluteBindingAddress, BindingAddress, ExpandedValue, ModuleConstraintId, RelativeBindingName,
+    RootScope,
 };
 use crate::schema::SchemaRegistry;
 
@@ -150,6 +151,16 @@ impl ResidualModuleResolutionError {
                 source_path,
                 line: *line,
             }),
+            ModuleError::DroppedConditionalBinding {
+                binding: _binding,
+                condition: _condition,
+                source_path,
+                line,
+            } => Some(ResidualModuleResolutionDiagnostic::ArgumentValueAccess {
+                source_path: source_path.to_str().unwrap_or("<module>"),
+                line: *line,
+            }),
+            ModuleError::UnexpandedModuleTemplate { context: _context } => None,
             ModuleError::Parse(error) => match error {
                 ParseError::Located { path, error } => {
                     Some(ResidualModuleResolutionDiagnostic::Parse {
@@ -271,6 +282,13 @@ impl ResidualModuleResolutionError {
                 line: _,
                 message: _,
             } => false,
+            ModuleError::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | ModuleError::UnexpandedModuleTemplate { context: _ } => false,
             ModuleError::Io(_) => false,
             ModuleError::Parse(error) => match error {
                 ParseError::Located { path, error } => {
@@ -452,6 +470,13 @@ fn without_covered_reference_type_members(
             line: _,
             message: _,
         }
+        | ModuleError::DroppedConditionalBinding {
+            binding: _,
+            condition: _,
+            source_path: _,
+            line: _,
+        }
+        | ModuleError::UnexpandedModuleTemplate { context: _ }
         | ModuleError::Io(_)
         | ModuleError::Parse(_)
         | ModuleError::ParseInFile { path: _, error: _ }
@@ -1063,6 +1088,12 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
         }
 
+        // Preserve authored value trees while this file is a reusable
+        // template. Reference resolution may fold a direct reference, but an
+        // argument-dependent `if` must derive dependencies only after its
+        // call-site branch is selected.
+        merged.capture_template_dependency_values();
+
         // Resolve references while the module's own binding namespace is still
         // intact. Besides folding module-local values, this records the direct
         // dependency bindings that expansion subsequently instance-prefixes.
@@ -1146,9 +1177,23 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let original_imported = std::mem::take(&mut self.imported_modules);
         let original_paths = std::mem::take(&mut self.module_paths);
 
-        // Process the module's own imports
+        let conditional_calls = parsed
+            .deferred_module_ifs
+            .iter()
+            .flat_map(|deferred| deferred.branches())
+            .filter_map(|branch| match branch {
+                DeferredIfBody::ModuleCall(call) => Some(call.clone()),
+                DeferredIfBody::Resource(_) | DeferredIfBody::DataSource(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        // Process the module's own imports. Conditional calls participate in
+        // ownership and loading, but stay relative until their branch is
+        // selected under a concrete module-instance scope.
         let imports = parsed.uses.clone();
-        let result = self.process_imports(&imports, &parsed.module_calls);
+        let mut owned_calls = parsed.module_calls.clone();
+        owned_calls.extend(conditional_calls);
+        let result = self.process_imports(&imports, &owned_calls);
 
         if let Err(e) = result {
             // Restore state on error
@@ -1403,12 +1448,42 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase>(
     let mut parsed = parsed.into_parsed();
     let expanded =
         RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+    ensure_expanded_root_graph(&expanded)?;
     finalize_deferred_for_bodies(expanded)
 }
 
 /// Resolve modules in a bootstrap/editor context. Every value check is
 /// classified first, and provider-owned schema types are left unchecked.
 pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase>(
+    parsed: RootDirectoryParse<E>,
+    base_dir: &Path,
+    config: &ProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let mut parsed = parsed.into_parsed();
+    let expanded =
+        RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
+            .expand()?;
+    ensure_expanded_root_graph(&expanded)?;
+    finalize_deferred_for_bodies(expanded)
+}
+
+/// Resolve a loader-owned directory while retaining argument-dependent
+/// templates for lint/editor analysis.
+pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase>(
+    parsed: RootDirectoryParse<E>,
+    base_dir: &Path,
+    config: &LoadedProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let mut parsed = parsed.into_parsed();
+    let expanded =
+        RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(expanded)
+}
+
+/// Providerless/editor form of [`resolve_module_template_with_config`].
+pub fn resolve_module_template_with_providerless_config<E: ResolveExportBindingPhase>(
     parsed: RootDirectoryParse<E>,
     base_dir: &Path,
     config: &ProviderContext,
@@ -1537,6 +1612,193 @@ fn resolve_modules_with_diagnostics_and_resolver<E: ResolveExportBindingPhase + 
         }
     } else {
         ModuleResolutionDiagnosticResult::Unowned { errors }
+    }
+}
+
+/// Reject parser-only module conditionals at the publication boundary.
+pub fn ensure_expanded_root_graph<E, D>(
+    file: &File<E, AbsoluteBindingAddress, D>,
+) -> Result<(), ModuleError>
+where
+    E: crate::parser::ExportParamLike<Binding = AbsoluteBindingAddress>,
+    D: crate::parser::DeferredForPhaseTraversal<AbsoluteBindingAddress>,
+{
+    file.assert_module_if_audit_classifies_every_field();
+    if !file.deferred_module_ifs.is_empty() {
+        return Err(ModuleError::UnexpandedModuleTemplate {
+            context: "deferred module conditionals".to_string(),
+        });
+    }
+
+    let mut audit = |value: &ExpandedValue, context: &'static str| {
+        if super::deferred_if::value_contains_module_if(value) {
+            Err(ModuleError::UnexpandedModuleTemplate {
+                context: context.to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    for provider in &file.providers {
+        for value in provider
+            .attributes
+            .values()
+            .chain(provider.default_tags.values())
+            .chain(provider.unresolved_attributes.values())
+        {
+            audit(value, "provider value")?;
+        }
+    }
+    for resource in &file.resources {
+        for value in resource.attributes.values() {
+            audit(value, "resource attribute")?;
+        }
+    }
+    for data_source in &file.data_sources {
+        for value in data_source.attributes.values() {
+            audit(value, "data-source attribute")?;
+        }
+    }
+    for composition in &file.compositions {
+        for argument in composition.signature.arguments.values() {
+            argument.try_visit_values(&mut |value| audit(value, "composition argument"))?;
+        }
+        for attribute in composition.signature.attributes.values() {
+            audit(&attribute.to_value(), "composition attribute")?;
+        }
+        for constraint in &composition.signature.pending_constraints {
+            audit_validate_expr(
+                constraint.expression(),
+                "composition constraint",
+                &mut audit,
+            )?;
+        }
+    }
+    for value in file.variables.values() {
+        audit(value, "variable")?;
+    }
+    for call in &file.module_calls {
+        call.try_visit_values_for_module_if_audit(&mut |value| {
+            audit(value, "module-call argument")
+        })?;
+    }
+    for argument in &file.arguments {
+        if let Some(value) = &argument.default {
+            audit(value, "argument default")?;
+        }
+        for validation in &argument.validations {
+            audit_validate_expr(
+                validation.condition_for_module_if_audit(),
+                "argument validation",
+                &mut audit,
+            )?;
+        }
+    }
+    for attribute in &file.attribute_params {
+        if let Some(value) = attribute.value_for_module_if_audit() {
+            audit(value, "attribute value")?;
+        }
+    }
+    for export in &file.export_params {
+        if let Some(value) = export.value() {
+            audit(value, "export value")?;
+        }
+    }
+    if let Some(backend) = &file.backend {
+        for value in backend.attributes.values() {
+            audit(value, "backend attribute")?;
+        }
+    }
+    for block in &file.state_blocks {
+        match block {
+            StateBlock::Import {
+                to: _to,
+                to_span: _to_span,
+                id,
+            } => audit(id, "state import id")?,
+            StateBlock::Removed { from: _from } => {}
+            StateBlock::Moved {
+                addresses: _addresses,
+            } => {}
+        }
+    }
+    for function in file.user_functions.values() {
+        for parameter in &function.params {
+            if let Some(value) = &parameter.default {
+                audit(value, "function parameter default")?;
+            }
+        }
+        for (_name, value, _line) in &function.local_lets {
+            audit(value, "function local")?;
+        }
+        audit(&function.body.value, "function body")?;
+    }
+    for wait in &file.wait_bindings {
+        audit(&wait.until_predicate.rhs, "wait predicate")?;
+    }
+    for requirement in &file.requires {
+        audit_validate_expr(
+            requirement.condition_for_module_if_audit(),
+            "require condition",
+            &mut audit,
+        )?;
+    }
+    file.try_visit_deferred_for_values_for_module_if_audit(&mut |value| {
+        audit(value, "deferred-for value")
+    })?;
+    file.parser_binding_metadata
+        .try_visit_values(&mut |value| audit(value, "parser binding metadata"))?;
+    file.try_visit_bare_binding_values(&mut |value| audit(value, "bare binding value"))?;
+    Ok(())
+}
+
+fn audit_validate_expr(
+    expression: &ValidateExpr<AbsoluteBindingAddress>,
+    context: &'static str,
+    audit: &mut impl FnMut(&ExpandedValue, &'static str) -> Result<(), ModuleError>,
+) -> Result<(), ModuleError> {
+    match expression {
+        ValidateExpr::BoundArgument {
+            argument: _argument,
+            operand: _operand,
+            value,
+        } => audit(value, context),
+        ValidateExpr::IntegerArithmetic {
+            lhs,
+            op: _,
+            rhs,
+            operator_span: _,
+        } => {
+            audit_validate_expr(lhs, context, audit)?;
+            audit_validate_expr(rhs, context, audit)
+        }
+        ValidateExpr::Compare { lhs, op: _, rhs } => {
+            audit_validate_expr(lhs, context, audit)?;
+            audit_validate_expr(rhs, context, audit)
+        }
+        ValidateExpr::And(lhs, rhs) | ValidateExpr::Or(lhs, rhs) => {
+            audit_validate_expr(lhs, context, audit)?;
+            audit_validate_expr(rhs, context, audit)
+        }
+        ValidateExpr::Not(inner) => audit_validate_expr(inner, context, audit),
+        ValidateExpr::FunctionCall { name: _name, args } => {
+            for argument in args {
+                audit_validate_expr(argument, context, audit)?;
+            }
+            Ok(())
+        }
+        ValidateExpr::Bool(_)
+        | ValidateExpr::Int(_)
+        | ValidateExpr::Float(_)
+        | ValidateExpr::Duration(_)
+        | ValidateExpr::String(_)
+        | ValidateExpr::Var(_)
+        | ValidateExpr::Access {
+            argument: _,
+            path: _,
+        }
+        | ValidateExpr::Null => Ok(()),
     }
 }
 

@@ -318,6 +318,10 @@ fn function_argument_must_remain_deferred(argument: &FunctionArgument) -> bool {
 
 fn contains_deferred_user_function_call(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .any(contains_deferred_user_function_call),
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             crate::builtins::builtin_arity(name).is_none()
                 || args.iter().any(|argument| {
@@ -393,6 +397,10 @@ pub(crate) fn contains_module_argument_matching<B: crate::resource::BindingAddre
     predicate: &mut impl FnMut(&str) -> bool,
 ) -> bool {
     match value {
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .any(|value| contains_module_argument_matching(value, predicate)),
         GenericValue::Deferred(GenericDeferredValue::Unknown(
             GenericUnknownReason::ModuleArgument { name, .. },
         )) => predicate(name),
@@ -619,16 +627,66 @@ pub(crate) fn validate_schema_custom_type_with_context<B: BindingAddress>(
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     match value {
         GenericValue::Deferred(
-            GenericDeferredValue::ResourceRef { .. }
-            | GenericDeferredValue::FunctionCall { .. }
-            | GenericDeferredValue::ResolvedFunctionCall { .. }
+            GenericDeferredValue::ModuleIf(_)
+            | GenericDeferredValue::ResourceRef { path: _ }
+            | GenericDeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
             | GenericDeferredValue::Access(_)
             | GenericDeferredValue::IntegerArithmetic(_)
             | GenericDeferredValue::Interpolation(_)
             | GenericDeferredValue::Secret(_)
-            | GenericDeferredValue::Unknown(_),
+            | GenericDeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                | crate::resource::UnknownReason::ForKey
+                | crate::resource::UnknownReason::ForIndex
+                | crate::resource::UnknownReason::ForValue
+                | crate::resource::UnknownReason::FnParam { name: _ }
+                | crate::resource::UnknownReason::ModuleArgument {
+                    name: _,
+                    source_line: _,
+                    diagnostic_name: _,
+                }
+                | crate::resource::UnknownReason::FnLocal { name: _ }
+                | crate::resource::UnknownReason::EmptyInterpolation
+                | crate::resource::UnknownReason::PendingReRead(_),
+            ),
         ) => return Ok(()),
-        GenericValue::Concrete(_) | GenericValue::Deferred(_) => {}
+        GenericValue::Concrete(
+            GenericConcreteValue::String(_)
+            | GenericConcreteValue::EnumIdentifier(_)
+            | GenericConcreteValue::CanonicalEnum(_)
+            | GenericConcreteValue::Int(_)
+            | GenericConcreteValue::Float(_)
+            | GenericConcreteValue::Bool(_)
+            | GenericConcreteValue::Duration(_)
+            | GenericConcreteValue::List(_)
+            | GenericConcreteValue::StringList(_)
+            | GenericConcreteValue::Map(_),
+        )
+        | GenericValue::Deferred(
+            GenericDeferredValue::BindingRef { binding: _ }
+            | GenericDeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
+            | GenericDeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::RedactedSecret { hash: _ },
+        ) => {}
     }
     let Some(value) = concrete_validation_value(value) else {
         return Ok(());
@@ -693,16 +751,49 @@ fn concrete_validation_value<B: BindingAddress>(
             GenericValue::Deferred(GenericDeferredValue::RedactedSecret { hash: hash.clone() })
         }
         GenericValue::Deferred(
-            GenericDeferredValue::ResourceRef { .. }
-            | GenericDeferredValue::BindingRef { .. }
-            | GenericDeferredValue::Coalesce { .. }
+            GenericDeferredValue::ModuleIf(_)
+            | GenericDeferredValue::ResourceRef { path: _ }
+            | GenericDeferredValue::BindingRef { binding: _ }
+            | GenericDeferredValue::Coalesce {
+                value: _,
+                default: _,
+            }
             | GenericDeferredValue::IntegerArithmetic(_)
             | GenericDeferredValue::Interpolation(_)
-            | GenericDeferredValue::FunctionCall { .. }
-            | GenericDeferredValue::Unavailable { .. }
-            | GenericDeferredValue::ResolvedFunctionCall { .. }
+            | GenericDeferredValue::FunctionCall {
+                name: _,
+                args: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::Unavailable {
+                name: _,
+                args: _,
+                reason: _,
+                source_line: _,
+            }
+            | GenericDeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args: _,
+                source_line: _,
+            }
             | GenericDeferredValue::Access(_)
-            | GenericDeferredValue::Unknown(_),
+            | GenericDeferredValue::Unknown(
+                crate::resource::UnknownReason::UpstreamExport { path: _ }
+                | crate::resource::UnknownReason::UpstreamAllExports { binding: _ }
+                | crate::resource::UnknownReason::ForKey
+                | crate::resource::UnknownReason::ForIndex
+                | crate::resource::UnknownReason::ForValue
+                | crate::resource::UnknownReason::FnParam { name: _ }
+                | crate::resource::UnknownReason::ModuleArgument {
+                    name: _,
+                    source_line: _,
+                    diagnostic_name: _,
+                }
+                | crate::resource::UnknownReason::FnLocal { name: _ }
+                | crate::resource::UnknownReason::EmptyInterpolation
+                | crate::resource::UnknownReason::PendingReRead(_),
+            ),
         ) => return None,
     })
 }
@@ -977,6 +1068,9 @@ fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseEr
 
 pub fn contains_function_call<B: BindingAddress>(value: &GenericValue<B>) -> bool {
     match value {
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_function_call)
+        }
         GenericValue::Deferred(
             GenericDeferredValue::FunctionCall { .. }
             | GenericDeferredValue::ResolvedFunctionCall { .. },
@@ -1078,6 +1172,11 @@ fn substitute_fn_params_with_position<B: BindingAddress>(
     position: FunctionSubstitutionPosition,
 ) -> Result<GenericValue<B>, ParseError> {
     Ok(match value {
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred
+                .try_map(|value| substitute_fn_params(value, substitutions, source_line))?;
+            GenericValue::Deferred(GenericDeferredValue::ModuleIf(Box::new(deferred)))
+        }
         GenericValue::Deferred(GenericDeferredValue::Unknown(GenericUnknownReason::FnParam {
             name,
         }))
@@ -1372,6 +1471,17 @@ pub(super) fn try_evaluate_fn_value(
     containing_line: usize,
 ) -> Result<Value, ParseError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let mut deferred = *deferred;
+            deferred.condition.value = try_evaluate_fn_value(
+                deferred.condition.value,
+                ctx,
+                deferred.condition.source_line,
+            )?;
+            deferred.then_value = try_evaluate_fn_value(deferred.then_value, ctx, containing_line)?;
+            deferred.else_value = try_evaluate_fn_value(deferred.else_value, ctx, containing_line)?;
+            Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,

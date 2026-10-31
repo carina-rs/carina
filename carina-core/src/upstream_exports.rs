@@ -718,6 +718,12 @@ where
         f: &mut impl FnMut(&crate::resource::AccessPath<B>),
     ) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| visit_possible_iterables(value, f));
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 visit_possible_iterables(value, f);

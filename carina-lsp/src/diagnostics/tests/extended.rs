@@ -13800,6 +13800,59 @@ attributes { o: String = name_with_suffix(r) }
 }
 
 #[test]
+fn module_argument_if_has_no_runtime_condition_diagnostic_when_opened_standalone() {
+    let module = tempfile::tempdir().unwrap();
+    let source = r#"arguments { flag: Bool }
+fn identity(value: Bool): Bool { value }
+attributes {
+  selected: String = if identity(flag) { "yes" } else { "no" }
+}
+"#;
+    std::fs::write(module.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), module.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time",
+            )
+        }),
+        "a standalone module argument is a template dependency, not a runtime condition: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn module_argument_if_validates_both_value_branches_when_opened_standalone() {
+    let module = tempfile::tempdir().unwrap();
+    let source = r#"arguments { flag: Bool }
+attributes {
+  selected: String = if flag { "yes" } else { 42 }
+}
+"#;
+    std::fs::write(module.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), module.path(), "main.crn", source);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains(
+                "if condition depends on a runtime value; condition must be statically known at parse time",
+            )
+        }),
+        "the unresolved module-only condition itself must not be diagnosed: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'selected': type mismatch")
+                || (diagnostic.message.contains("expected String")
+                    && diagnostic.message.contains("got int"))
+        }),
+        "the unselected-at-template-time else branch must still be type-checked: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn nested_forwarded_handle_remains_a_dependency_operand_in_lsp() {
     let root = tempfile::tempdir().unwrap();
     let outer = root.path().join("outer");

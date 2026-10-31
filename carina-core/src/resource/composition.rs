@@ -361,6 +361,13 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
         self.operand.traversal_value()
     }
 
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<B>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.operand.try_visit_values(visit)
+    }
+
     pub fn declared_type(&self) -> &ConsumerStaticType {
         &self.metadata.declared_type
     }

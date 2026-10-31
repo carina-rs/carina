@@ -56,6 +56,10 @@ impl std::fmt::Display for SerializationContext {
 /// message string.
 #[derive(Debug, Error)]
 pub enum SerializationError {
+    /// A parser-only module conditional reached a runtime or persistence
+    /// boundary. Module expansion must select every branch first.
+    #[error("cannot serialize at {context}: unresolved module-template conditional")]
+    UnexpandedModuleIf { context: SerializationContext },
     /// A `Value::Deferred(DeferredValue::Unknown)` reached a serialization boundary. Producers
     /// must strip / resolve it before this point — see
     /// [`crate::resource::value_contains_unknown`] for recursive
@@ -149,6 +153,7 @@ impl SerializationError {
         const MASKED: &str = "(secret)";
 
         match self {
+            Self::UnexpandedModuleIf { context } => Self::UnexpandedModuleIf { context },
             Self::UnresolvedEnumIdentifier { context, .. } => Self::UnresolvedEnumIdentifier {
                 value: MASKED.to_string(),
                 context,
@@ -699,6 +704,9 @@ fn value_to_json_inner(
 ) -> Result<serde_json::Value, SerializationError> {
     let ctx = encoding.context();
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(SerializationError::UnexpandedModuleIf { context: ctx })
+        }
         Value::Concrete(ConcreteValue::String(s)) => {
             // Both serialize as a flat JSON string. The schema-aware
             // state loader re-classifies `EnumIdentifier` from the
@@ -1588,6 +1596,15 @@ fn format_value_into_context<B: BindingAddress>(
     context: FormatContext<'_>,
 ) -> Result<(), Overflow> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            sink.write_token(ValueSpanKind::Other, "if ")?;
+            format_value_into_context(deferred.condition().value(), sink, context)?;
+            sink.write_token(ValueSpanKind::Structure, " { ")?;
+            format_value_into_context(deferred.then_value(), sink, context)?;
+            sink.write_token(ValueSpanKind::Structure, " } else { ")?;
+            format_value_into_context(deferred.else_value(), sink, context)?;
+            sink.write_token(ValueSpanKind::Structure, " }")
+        }
         Value::Concrete(ConcreteValue::String(s)) => sink.write_token(
             ValueSpanKind::StringLiteral,
             &display_string_literal(s.expose_plaintext()),
@@ -1938,6 +1955,9 @@ pub(crate) fn access_chain_unknown_root<B: BindingAddress>(
 /// Check if a Value contains any Secret values at any nesting depth.
 pub fn contains_secret<B: BindingAddress>(value: &Value<B>) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_secret)
+        }
         Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_secret),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_secret),
@@ -1985,6 +2005,12 @@ pub fn contains_secret<B: BindingAddress>(value: &Value<B>) -> bool {
 /// must not be treated as a new desired secret.
 pub fn contains_unredacted_secret<B: BindingAddress>(value: &Value<B>) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred
+                .values()
+                .into_iter()
+                .any(contains_unredacted_secret)
+        }
         Value::Deferred(DeferredValue::Secret(_)) => true,
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -2259,7 +2285,8 @@ fn merge_secrets_into_provider_json_inner(
 fn secret_value_requires_provider_material(value: &Value) -> bool {
     match value {
         Value::Deferred(
-            DeferredValue::ResourceRef { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
@@ -2441,6 +2468,11 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
     }
 
     Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            return Err(SerializationError::UnexpandedModuleIf {
+                context: SerializationContext::SecretRedaction,
+            });
+        }
         Value::Concrete(ConcreteValue::String(value)) => tagged(
             "string",
             JsonValue::String(value.expose_plaintext().to_string()),
@@ -5685,7 +5717,8 @@ fn canonical_map_key_text<B: BindingAddress>(
             | ConcreteValue::Map(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
             | DeferredValue::IntegerArithmetic(_)
@@ -6113,6 +6146,10 @@ fn first_enum_identifier_inner<B: BindingAddress>(
     inside_secret: bool,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
             Some(EnumIdentifierOccurrence { raw, inside_secret })
         }

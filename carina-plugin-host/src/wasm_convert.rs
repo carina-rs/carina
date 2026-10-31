@@ -285,6 +285,11 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// equivalent to the pre-#2387 `ResourceRef` debug-string.
 pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
+        CoreValue::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(SerializationError::UnexpandedModuleIf {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             Ok(wit::Value::StrVal(s.expose_plaintext().to_owned()))
         }
@@ -660,6 +665,11 @@ pub(crate) fn wit_to_core_binding_pattern(
 /// arms unreachable in legitimate desired-normalization flows.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
+        CoreValue::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(SerializationError::UnexpandedModuleIf {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
         }

@@ -43,7 +43,7 @@
 //! ```
 
 use crate::data_source_value::{DataSourceValue, DataSourceValues};
-use crate::parser::{RelativeBindingName, ResourceRef};
+use crate::parser::{DeferredIfBody, RelativeBindingName, ResourceRef};
 use crate::resource::composition::CompositionRuntimeRef;
 use crate::resource::{
     AbsoluteBindingAddress, AccessPath, BindingAddress, LiveComposition, PathSegment,
@@ -569,6 +569,75 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                 continue;
             };
             entries.insert(binding_name.to_string(), BindingEntry { target });
+        }
+        // Structural `if` branches are declarations in the reusable module's
+        // lexical scope even though a caller argument may later remove one of
+        // them. Record every branch binding before validating the template so
+        // references are treated as conditionally available, not as unknown.
+        // Expansion then rebuilds the index from the selected graph, while the
+        // resolver's dropped-binding check owns the false-branch diagnostic.
+        for body in parsed
+            .deferred_module_ifs
+            .iter()
+            .flat_map(|deferred| deferred.branches())
+        {
+            match body {
+                DeferredIfBody::Resource(resource) => {
+                    let Some(binding_name) = resource.binding.as_ref() else {
+                        continue;
+                    };
+                    known_names.insert(binding_name.to_string());
+                    resource_handles.insert(
+                        binding_name.to_string(),
+                        AttributeType::resource_handle(
+                            resource.id.provider.clone(),
+                            resource.id.resource_type.clone(),
+                        ),
+                    );
+                    if let Some(schema) = registry.get_for(resource) {
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::Schema(schema.schema().as_schema()),
+                            });
+                    }
+                }
+                DeferredIfBody::DataSource(data_source) => {
+                    let Some(binding_name) = data_source.binding.as_ref() else {
+                        continue;
+                    };
+                    known_names.insert(binding_name.to_string());
+                    resource_handles.insert(
+                        binding_name.to_string(),
+                        AttributeType::resource_handle(
+                            data_source.id.provider.clone(),
+                            data_source.id.resource_type.clone(),
+                        ),
+                    );
+                    if let Some(schema) = registry.get_for_data_source(data_source) {
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::Schema(schema.schema().as_schema()),
+                            });
+                    }
+                }
+                DeferredIfBody::ModuleCall(call) => {
+                    let Some(binding_name) = call.binding_name.as_ref() else {
+                        continue;
+                    };
+                    known_names.insert(binding_name.to_string());
+                    if let Some(signature) =
+                        module_signatures.and_then(|signatures| signatures.get(&call.module_name))
+                    {
+                        entries
+                            .entry(binding_name.to_string())
+                            .or_insert(BindingEntry {
+                                target: BindingTarget::ModuleCall(signature),
+                            });
+                    }
+                }
+            }
         }
         // Module-call bindings expose the imported module's declared output
         // surface before expansion. Record the binding even when its import

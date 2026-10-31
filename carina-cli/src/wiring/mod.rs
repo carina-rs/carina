@@ -471,6 +471,19 @@ pub(crate) struct ValidationPipelineAccess {
     _private: (),
 }
 
+/// Marker for a configuration that may still contain reusable module-template
+/// nodes. Validation reports and editor/lint paths are allowed to operate in
+/// this state, but planning and serialization entry points are not.
+#[derive(Debug)]
+pub struct TemplateConfig;
+
+/// Marker for a configuration that passed the exhaustive root-graph audit.
+///
+/// The marker is carried by [`ValidatedConfig`] and its value is never exposed;
+/// only this module can construct the owner that planning and apply accept.
+#[derive(Debug)]
+pub struct ExpandedConfig;
+
 impl ValidationPipelineAccess {
     fn new() -> Self {
         Self { _private: () }
@@ -675,14 +688,30 @@ impl<R> std::ops::Deref for ValidationReady<R> {
 ///     };
 /// }
 /// ```
+///
+/// A template-tolerant validated owner is not accepted by a planning boundary
+/// that requires the default [`ExpandedConfig`] state:
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::{TemplateConfig, ValidatedConfig};
+/// use carina_core::parser::InferredFile;
+///
+/// fn planning_boundary(_: ValidatedConfig<InferredFile>) {}
+///
+/// fn cannot_plan_template(template: ValidatedConfig<InferredFile, TemplateConfig>) {
+///     planning_boundary(template);
+/// }
+/// ```
 pub struct ValidatedConfig<
     R = CanonicalResourcePair<carina_core::parser::ExpandedInferredExportParam>,
+    C = ExpandedConfig,
 > {
     wiring: ValidatedWiring,
     resources: ValidationReady<R>,
+    config_state: std::marker::PhantomData<C>,
 }
 
-impl<R: fmt::Debug> fmt::Debug for ValidatedConfig<R> {
+impl<R: fmt::Debug, C> fmt::Debug for ValidatedConfig<R, C> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ValidatedConfig")
@@ -732,6 +761,7 @@ impl NonEmptyValidationErrors {
 pub(crate) struct ValidationReport<'a> {
     result: Result<carina_core::parser::ModuleResolvedInferredFile, NonEmptyValidationErrors>,
     schemas: &'a SchemaRegistry,
+    config_state: std::marker::PhantomData<TemplateConfig>,
 }
 
 impl<'a> ValidationReport<'a> {
@@ -801,6 +831,7 @@ fn validation_report_from<'a>(
     ValidationReport {
         result,
         schemas: context.schemas(),
+        config_state: std::marker::PhantomData,
     }
 }
 
@@ -867,6 +898,18 @@ fn resolve_config_pair_with_context(
 
 fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -> AppError {
     AppError::BindingUseReport(Box::new(report))
+}
+
+fn require_expanded_config<E, D>(
+    file: &carina_core::parser::File<E, AbsoluteBindingAddress, D>,
+    base_dir: &Path,
+) -> Result<(), AppError>
+where
+    E: carina_core::parser::ExportParamLike<Binding = AbsoluteBindingAddress>,
+    D: carina_core::parser::DeferredForPhaseTraversal<AbsoluteBindingAddress>,
+{
+    module_resolver::ensure_expanded_root_graph(file)
+        .map_err(|error| AppError::Config(error.display_relative_to(base_dir)))
 }
 
 fn resolve_file_binding_uses<E>(
@@ -1023,12 +1066,14 @@ impl ProviderLoad {
             }
         }
         let parsed = resolve_file_binding_uses(parsed, base_dir, &self.context)?;
+        require_expanded_config(parsed.as_file(), base_dir)?;
 
         Ok(ValidatedConfig {
             wiring: ValidatedWiring {
                 load: self.into_complete()?,
             },
             resources: ValidationReady::from_resolved_file(parsed),
+            config_state: std::marker::PhantomData,
         })
     }
 
@@ -1073,11 +1118,13 @@ impl ProviderLoad {
         };
         let (parsed, unresolved) =
             resolve_pair_binding_uses(canonical_resources, base_dir, &self.context)?;
+        require_expanded_config(parsed.as_file(), base_dir)?;
         Ok(ValidatedConfig {
             wiring: ValidatedWiring {
                 load: self.into_complete()?,
             },
             resources: ValidationReady::from_resolved_pair(parsed, unresolved),
+            config_state: std::marker::PhantomData,
         })
     }
 
@@ -1155,6 +1202,7 @@ impl CompleteProviderLoad {
         )?;
         let (parsed, unresolved) =
             resolve_pair_binding_uses(canonical_resources, base_dir, &self.context)?;
+        require_expanded_config(parsed.as_file(), base_dir)?;
         Ok(CheckedSavedPlanInputs {
             load: self,
             canonical_resources: Box::new(ValidationReady::from_resolved_pair(parsed, unresolved)),
@@ -1178,6 +1226,7 @@ impl CompleteProviderLoad {
             ValidatedConfig {
                 wiring: ValidatedWiring { load: self },
                 resources: ValidationReady::from_saved_plan_artifact(),
+                config_state: std::marker::PhantomData,
             },
         ))
     }
@@ -1210,6 +1259,7 @@ impl CheckedSavedPlanInputs {
             ValidatedConfig {
                 wiring: validated.wiring,
                 resources: *canonical_resources,
+                config_state: std::marker::PhantomData,
             },
         ))
     }
@@ -1370,6 +1420,7 @@ impl<R> ValidatedConfig<R> {
         Self {
             wiring: ValidatedWiring::for_test(factories, provider_configs),
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1382,6 +1433,7 @@ impl<R> ValidatedConfig<R> {
         Self {
             wiring: ValidatedWiring::for_test_with_provider_phase(factories, provider_configs),
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1418,6 +1470,7 @@ impl<R> ValidatedConfig<R> {
         Self {
             wiring,
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1435,6 +1488,7 @@ impl<R> ValidatedConfig<R> {
                 },
             },
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1452,6 +1506,7 @@ impl<R> ValidatedConfig<R> {
                 additional_schemas,
             ),
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1469,6 +1524,7 @@ impl<R> ValidatedConfig<R> {
                 additional_schemas,
             ),
             resources: ValidationReady::for_fixture(resources),
+            config_state: std::marker::PhantomData,
         }
     }
 
@@ -1495,6 +1551,7 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::ExpandedInferred
         let Self {
             wiring,
             resources: _,
+            config_state: _,
         } = self;
         let resources = resolve_config_pair_with_context(
             wiring.context(),
@@ -1507,9 +1564,11 @@ impl ValidatedConfig<CanonicalResourcePair<carina_core::parser::ExpandedInferred
         )?;
         let (parsed, unresolved) =
             resolve_pair_binding_uses(resources, base_dir, wiring.context())?;
+        require_expanded_config(parsed.as_file(), base_dir)?;
         Ok(ValidatedConfig {
             wiring,
             resources: ValidationReady::from_resolved_pair(parsed, unresolved),
+            config_state: std::marker::PhantomData,
         })
     }
 }
@@ -1526,7 +1585,9 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
                 Binding = carina_core::resource::AbsoluteBindingAddress,
             >,
     {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ctx = wiring.context();
         reconcile_canonical_prefixed_names(&mut resources.inner, state_file);
         let parsed = resources.parsed();
@@ -1557,7 +1618,9 @@ impl<E> ValidatedConfig<CanonicalResourcePair<E>> {
         &mut self,
         providers: &[ExpandedProviderConfig],
     ) -> Result<Vec<AppError>, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         compute_canonical_pair_anonymous_identifiers_with_ctx(
             wiring.context(),
             &mut resources.inner,
@@ -1595,7 +1658,9 @@ impl ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile> {
         state_file: &Option<StateFile>,
         reconcile_modules: bool,
     ) -> StateBlockClaims {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ctx = wiring.context();
         let resources = &mut resources.inner;
         reconcile_prefixed_names(&mut resources.resources, state_file);
@@ -1638,7 +1703,9 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
             PreparedAddressPreservingDeferredForExpansion,
         >,
     ) -> Result<ExpandedRefreshState, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidatedExpandRefreshAndLiftInputs {
             provider,
             comparison_provider,
@@ -1676,7 +1743,9 @@ impl<E> ValidatedConfig<ExpandedCanonicalResources<E>> {
         provider_configs: &[ExpandedProviderConfig],
         normalizer: &dyn ProviderNormalizer,
     ) -> carina_core::provider::ProviderResult<()> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         resources
             .inner
             .prepare_desired_side_for_plan(provider_configs, normalizer, wiring.context().schemas())
@@ -1707,7 +1776,9 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         ),
         AppError,
     > {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let (resources, expansion) = resources
             .try_map_with_output_preserving_binding_use_resolution(|resources| {
                 prepared.expand(
@@ -1718,7 +1789,14 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
                     provider,
                 )
             })?;
-        Ok((ValidatedConfig { wiring, resources }, expansion))
+        Ok((
+            ValidatedConfig {
+                wiring,
+                resources,
+                config_state: std::marker::PhantomData,
+            },
+            expansion,
+        ))
     }
 
     /// Fixture-plan counterpart of [`Self::expand_deferred_for`] that consumes
@@ -1731,7 +1809,9 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>>, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let (resources, ()) =
             resources.try_map_with_output_preserving_binding_use_resolution(|resources| {
                 prepared
@@ -1744,7 +1824,11 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
                     )
                     .map(|expanded| (expanded, ()))
             })?;
-        Ok(ValidatedConfig { wiring, resources })
+        Ok(ValidatedConfig {
+            wiring,
+            resources,
+            config_state: std::marker::PhantomData,
+        })
     }
 }
 
@@ -6146,7 +6230,9 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
         normalizer: &dyn ProviderNormalizer,
         state_file: &StateFile,
     ) -> Result<ValidatedConfig<PostExpansionPlanView<E, PlanChildrenSettled>>, AppError> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidationReady { inner, origin } = resources;
         let settled = inner
             .settle_children_from_cache(CachedExpandedChildrenInputs {
@@ -6162,6 +6248,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
                 inner: settled,
                 origin,
             },
+            config_state: std::marker::PhantomData,
         })
     }
 
@@ -6169,7 +6256,9 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
     pub(crate) fn settle_expanded_children_absent(
         self,
     ) -> ValidatedConfig<PostExpansionPlanView<E, PlanChildrenSettled>> {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidationReady { inner, origin } = resources;
         let settled = inner
             .settle_children_absent(wiring.context().schemas(), None)
@@ -6180,6 +6269,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
                 inner: settled,
                 origin,
             },
+            config_state: std::marker::PhantomData,
         }
     }
 }
@@ -6194,7 +6284,9 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
     where
         S: ChildrenSettledFor<M>,
     {
-        let Self { wiring, resources } = self;
+        let Self {
+            wiring, resources, ..
+        } = self;
         let ValidationReady {
             inner: expansion,
             origin,
@@ -6213,6 +6305,7 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
                     inner: expanded_resources,
                     origin,
                 },
+                config_state: std::marker::PhantomData,
             }),
         )
     }
@@ -6833,6 +6926,7 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
     let ValidatedConfig {
         wiring,
         resources: canonical_resources,
+        config_state: _,
     } = validated;
     let ValidatedCanonicalExpandRefreshAndLiftInputs {
         provider,
@@ -6877,7 +6971,11 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
             })
             .await?
     };
-    Ok(ValidatedConfig { wiring, resources })
+    Ok(ValidatedConfig {
+        wiring,
+        resources,
+        config_state: std::marker::PhantomData,
+    })
 }
 
 async fn settle_expanded_children_live<E>(
@@ -7116,6 +7214,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let ValidatedConfig {
         wiring,
         resources: canonical_resources,
+        config_state: _,
     } = validated;
     let resources = {
         let context = wiring.context();
@@ -7136,7 +7235,11 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             })
             .await?
     };
-    Ok(ValidatedConfig { wiring, resources })
+    Ok(ValidatedConfig {
+        wiring,
+        resources,
+        config_state: std::marker::PhantomData,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

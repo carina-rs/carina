@@ -259,6 +259,18 @@ fn check_type_expr_value_inner_with_mode<B: BindingAddress>(
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> Result<(), TypeExprValueError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for branch in &deferred.values()[1..] {
+                check_type_expr_value_inner_with_mode(
+                    expected,
+                    branch,
+                    config,
+                    inference,
+                    provider_custom_types,
+                )?;
+            }
+            return Ok(());
+        }
         Value::Deferred(DeferredValue::ResourceRef { .. }) => match expected {
             TypeExpr::StringLiteral(_) => return Err(mismatch(expected, value)),
             TypeExpr::Union(_) => {}

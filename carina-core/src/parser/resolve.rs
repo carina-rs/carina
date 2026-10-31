@@ -1075,6 +1075,11 @@ fn collect_reference_roots(
     roots: &mut Vec<String>,
 ) {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for nested in deferred.values() {
+                collect_reference_roots(nested, variables, structural, roots);
+            }
+        }
         Value::Concrete(ConcreteValue::EnumIdentifier(name)) => {
             // Bare-identifier fallback (`EnumIdentifier("B")`) and dotted-access
             // fallback (`EnumIdentifier("B.attr")`) both appear before the parser
@@ -1366,6 +1371,18 @@ fn resolve_value_with_config(
     preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.try_map(|value| {
+                resolve_value_with_config(
+                    value,
+                    binding_map,
+                    fn_ctx,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                )
+            })?;
+            Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
+        }
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
             default,
@@ -1694,7 +1711,8 @@ fn resolve_function_calls_only(
 ) -> Result<Value, ParseError> {
     match value {
         Value::Deferred(
-            DeferredValue::FunctionCall { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
