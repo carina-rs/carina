@@ -41,7 +41,9 @@ use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_fo
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
-use crate::display::print_plan;
+pub use crate::commands::shared::state_writeback::PersistedDirectiveChange;
+use crate::commands::shared::state_writeback::persisted_directive_changes;
+use crate::display::{format_persisted_directive_changes, print_plan};
 use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
@@ -546,7 +548,7 @@ mod provider_scope_evidence_tests {
             ]),
         );
         let plan = contents
-            .record_for_test_with_provider(&wiring, &provider)
+            .record_for_test_with_provider(&wiring, &provider, Vec::new())
             .expect("provider scopes form valid evidence");
         let json = serde_json::to_value(&plan).expect("saved plan serializes");
         assert_eq!(
@@ -645,11 +647,16 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 35 adds typed deferred-for templates, stage-specific
+    /// Plan format 36 adds typed deferred-for templates, stage-specific
     /// placeholder types, and template attributes stored only on
     /// `template_resource`.
     ///
-    /// Plan format 34 adds Int-only integer arithmetic.
+    /// Plan format 35 stores the tri-state `prevent_destroy` directive so an
+    /// explicit `false` remains distinct from an unspecified value, and
+    /// records the exact state-only directive change set approved by the
+    /// operator.
+    ///
+    /// Plan format 34 adds typed deferred integer arithmetic expressions.
     ///
     /// Plan format 33 adds the typed keyed-list release effect.
     ///
@@ -918,10 +925,14 @@ struct ProviderEvidence {
 /// inventory to match every referenced type exactly and the provider-artifact
 /// keys to match the providers implied by the saved provider configurations.
 ///
-/// Format 35 adds typed deferred-for templates, stage-specific placeholder
+/// Format 36 adds typed deferred-for templates, stage-specific placeholder
 /// types, and template attributes stored only on `template_resource`.
 ///
-/// Format 34 adds Int-only integer arithmetic.
+/// Format 35 stores the tri-state `prevent_destroy` directive so an explicit
+/// `false` remains distinct from an unspecified value, and records the exact
+/// state-only directive change set approved at plan time.
+///
+/// Format 34 adds typed deferred integer arithmetic expressions.
 ///
 /// Format 33 adds typed keyed-list release effects.
 ///
@@ -938,12 +949,14 @@ struct ProviderEvidence {
 pub struct PlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 /// Private format-35 wire representation.
 ///
-/// Field order is intentionally identical to the historical `PlanFile`
-/// serialization order. Evidence is mandatory and is never defaulted.
+/// Existing field order remains identical to the historical `PlanFile`
+/// serialization order. Format-35 directive changes and provider evidence are
+/// mandatory and are never defaulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -968,6 +981,7 @@ struct PlanFileWire {
     upstream_sources: Vec<UpstreamSource>,
     #[serde(default)]
     wait_bindings: Vec<PlanWaitBinding>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
     schema_fingerprints: PlanSchemaFingerprints,
     provider_artifacts: PlanProviderArtifacts,
     provider_scopes: Vec<RecordedProviderScope>,
@@ -1319,7 +1333,11 @@ impl ProviderEvidence {
 
 impl From<PlanFile> for PlanFileWire {
     fn from(plan_file: PlanFile) -> Self {
-        let PlanFile { contents, evidence } = plan_file;
+        let PlanFile {
+            contents,
+            evidence,
+            persisted_directive_changes,
+        } = plan_file;
         let PlanFileContents {
             version,
             carina_version,
@@ -1366,6 +1384,7 @@ impl From<PlanFile> for PlanFileWire {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
             provider_scopes: provider_scopes.into_wire(),
@@ -1397,6 +1416,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
             provider_scopes,
@@ -1433,7 +1453,11 @@ impl TryFrom<PlanFileWire> for PlanFile {
             &contents.provider_configs,
             &expected_instances,
         )?;
-        Ok(Self { contents, evidence })
+        Ok(Self {
+            contents,
+            evidence,
+            persisted_directive_changes,
+        })
     }
 }
 
@@ -1451,8 +1475,13 @@ impl PlanFileContents {
     pub fn record<E>(
         self,
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context(), &validated.resources().provider)
+        self.record_with_context(
+            validated.context(),
+            &validated.resources().provider,
+            persisted_directive_changes,
+        )
     }
 
     /// Record hand-built plan contents in unit and integration fixtures.
@@ -1460,6 +1489,7 @@ impl PlanFileContents {
     pub fn record_for_test<R>(
         self,
         validated: &ValidatedConfig<R>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let available_providers = validated
             .context()
@@ -1469,7 +1499,7 @@ impl PlanFileContents {
             .collect();
         let provider =
             test_provider_router(&self.expected_provider_instances(&available_providers));
-        self.record_with_context(validated.context(), &provider)
+        self.record_with_context(validated.context(), &provider, persisted_directive_changes)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1477,14 +1507,16 @@ impl PlanFileContents {
         self,
         validated: &ValidatedConfig<R>,
         provider: &ProviderRouter,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context(), provider)
+        self.record_with_context(validated.context(), provider, persisted_directive_changes)
     }
 
     fn record_with_context(
         self,
         ctx: &WiringContext,
         provider: &ProviderRouter,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let available_providers = ctx.provider_artifacts().keys().cloned().collect();
@@ -1500,6 +1532,7 @@ impl PlanFileContents {
         Ok(PlanFile {
             contents: saved.into(),
             evidence,
+            persisted_directive_changes,
         })
     }
 }
@@ -1509,6 +1542,7 @@ impl UnresolvedPlanFileContents {
     fn record_for_test<R>(
         self,
         validated: &ValidatedConfig<R>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let available_providers = validated
@@ -1529,6 +1563,7 @@ impl UnresolvedPlanFileContents {
         Ok(PlanFile {
             contents: self,
             evidence,
+            persisted_directive_changes,
         })
     }
 }
@@ -1910,7 +1945,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 35;
+    pub const CURRENT_VERSION: u32 = 36;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -1939,6 +1974,7 @@ impl PlanFile {
         let PlanFile {
             mut contents,
             evidence,
+            persisted_directive_changes,
         } = self;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
         let planned_in_flight_origins: HashSet<_> = contents
@@ -2085,6 +2121,7 @@ impl PlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         })
     }
 
@@ -3100,6 +3137,7 @@ pub(crate) struct UnresolvedReloadedPlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 #[derive(Debug)]
@@ -3107,6 +3145,7 @@ pub(crate) struct ReloadedPlanFile {
     contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 #[derive(Debug)]
@@ -3144,6 +3183,7 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         } = self;
         let PlanFileContents {
             version,
@@ -3200,11 +3240,16 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         })
     }
 }
 
 impl ReloadedPlanFile {
+    pub(crate) fn persisted_directive_changes(&self) -> &[PersistedDirectiveChange] {
+        &self.persisted_directive_changes
+    }
+
     pub(crate) fn provider_scopes(&self) -> &RecordedProviderScopes {
         &self.evidence.provider_scopes
     }
@@ -3609,11 +3654,10 @@ mod managed_current_serde_tests {
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
-        .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-            (),
+        .record_for_test(
+            &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
             Vec::new(),
-            &[],
-        ))
+        )
         .expect("test plan provider evidence must be valid")
     }
 
@@ -3896,11 +3940,10 @@ mod managed_current_serde_tests {
             origin: None,
         });
         let plan = contents
-            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-                (),
+            .record_for_test(
+                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
                 Vec::new(),
-                &[],
-            ))
+            )
             .expect("test plan provider evidence must be valid");
 
         let plan = plan
@@ -3955,11 +3998,10 @@ mod managed_current_serde_tests {
             origin: None,
         });
         let plan = contents
-            .record_for_test(&crate::wiring::ValidatedConfig::from_factories_for_test(
-                (),
+            .record_for_test(
+                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
                 Vec::new(),
-                &[],
-            ))
+            )
             .expect("test plan provider evidence must be valid");
 
         let reloaded = plan
@@ -4038,6 +4080,7 @@ fn build_plan_file<E>(
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
+    directive_changes: Vec<PersistedDirectiveChange>,
     validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
 ) -> Result<PlanFile, PlanSaveError> {
     let ctx = validated_plan.resources();
@@ -4050,7 +4093,7 @@ fn build_plan_file<E>(
         state_file,
         ctx,
     )?
-    .record(validated_plan)
+    .record(validated_plan, directive_changes)
     .map_err(PlanSaveError::from)
 }
 
@@ -4065,6 +4108,8 @@ fn build_plan_file_from_parts<E, R>(
     ctx: &crate::wiring::PlanContext,
     validated_config: &ValidatedConfig<R>,
 ) -> Result<PlanFile, PlanSaveError> {
+    let directive_changes =
+        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
     build_plan_file_contents(
         path,
         parsed,
@@ -4073,7 +4118,7 @@ fn build_plan_file_from_parts<E, R>(
         state_file,
         ctx,
     )?
-    .record_for_test(validated_config)
+    .record_for_test(validated_config, directive_changes)
     .map_err(PlanSaveError::from)
 }
 
@@ -4216,11 +4261,14 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
-        // carina#4094: bumped 34→35 — saved plans use typed deferred-for
+        // carina#4094: bumped 35→36 — saved plans use typed deferred-for
         // templates and stage-specific placeholder types, with template
         // attributes stored only on `template_resource`.
-        // carina#4142: bumped 33→34 — saved plans preserve Int-only integer
-        // arithmetic as a structural deferred value.
+        // carina#4150: bumped 34→35 — Directives now retain whether
+        // prevent_destroy was unspecified or explicitly false, and saved
+        // plans bind apply to the exact state-only directive change set.
+        // carina#4142: bumped 33→34 — saved plans can retain typed deferred
+        // integer arithmetic until apply-time reference resolution.
         // carina#4118: bumped 32→33 — keyed partial-update releases add a
         // serialized state-only Effect variant.
         // carina#4067: bumped 29→31 — saved plans retain authored
@@ -4854,7 +4902,14 @@ pub async fn run_plan(
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&checked_exports, &current_exports);
-    let summary = PlanChangeSummary::new(&ctx.plan, &export_changes, &ctx.residual_deferred_for);
+    let directive_changes =
+        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
+    let summary = PlanChangeSummary::new(
+        &ctx.plan,
+        &export_changes,
+        &ctx.residual_deferred_for,
+        &directive_changes,
+    );
     // Preserve the CLI contract from before plan-image summaries existed:
     // detailed exit code 2 means a managed-resource mutation, not merely
     // displayable work such as reads, waits, exports, or deferred loops.
@@ -4878,12 +4933,19 @@ pub async fn run_plan(
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
+            directive_changes.clone(),
             &validated_plan,
         )
         .map_err(|error| map_plan_save_error(error, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
+        // JSON stdout is the versioned saved-plan document and now carries the
+        // exact directive change set as machine-readable format-35 data. Keep
+        // the human-readable rendering on stderr as well.
+        if !directive_changes.is_empty() {
+            eprint!("{}", format_persisted_directive_changes(&directive_changes));
+        }
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -4896,6 +4958,9 @@ pub async fn run_plan(
             Some(&ctx.prev_explicit),
             &ctx.provider,
         )?;
+        if !directive_changes.is_empty() {
+            eprint!("{}", format_persisted_directive_changes(&directive_changes));
+        }
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -4940,6 +5005,7 @@ pub async fn run_plan(
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
+            directive_changes.clone(),
             &validated_plan,
         )
         .map_err(|error| map_plan_save_error(error, "--out"))?;
@@ -6940,7 +7006,7 @@ mod run_plan_out_tests {
             ))));
         }
         let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
-        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred, &[]);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();
@@ -6995,7 +7061,7 @@ mod run_plan_out_tests {
             ))));
         }
         let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
-        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred, &[]);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();

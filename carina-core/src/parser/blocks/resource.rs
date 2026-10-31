@@ -10,7 +10,10 @@ use crate::parser::Rule;
 use crate::parser::context::{
     ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
 };
-use crate::parser::error::ParseError;
+use crate::parser::error::{
+    NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE, ParseError, ParseWarning, ParseWarningSpan,
+    WarningKind,
+};
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
@@ -525,10 +528,44 @@ fn parse_directives(
                 );
             }
             "prevent_destroy" => {
-                directives.prevent_destroy = matches!(
-                    parse_expression(value_pair, ctx)?,
-                    Value::Concrete(ConcreteValue::Bool(true))
-                );
+                let literal = crate::parser::util::unwrap_to_primary(value_pair.clone())
+                    .and_then(|primary| primary.into_inner().next())
+                    .and_then(|value| match value.as_rule() {
+                        Rule::boolean => match value.as_str() {
+                            "true" => Some(true),
+                            "false" => Some(false),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                let warning_span = {
+                    let span = value_pair.as_span();
+                    let (start_line, start_column) = span.start_pos().line_col();
+                    let (end_line, end_column) = span.end_pos().line_col();
+                    ParseWarningSpan {
+                        start_line,
+                        start_column,
+                        end_line,
+                        end_column,
+                    }
+                };
+                let parsed = parse_expression(value_pair, ctx)?;
+                match literal {
+                    Some(value) => directives.set_prevent_destroy(value),
+                    None => {
+                        if matches!(parsed, Value::Concrete(ConcreteValue::Bool(true))) {
+                            directives.set_prevent_destroy(true);
+                        } else {
+                            ctx.push_warning(ParseWarning {
+                                file: None,
+                                line,
+                                kind: WarningKind::NonLiteralPreventDestroy,
+                                span: Some(warning_span),
+                                message: NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE.to_string(),
+                            });
+                        }
+                    }
+                }
             }
             _ => {}
         }

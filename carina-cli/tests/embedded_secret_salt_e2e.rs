@@ -134,6 +134,15 @@ fn downgrade_state_to_v13(state: &mut Value) {
         .remove("exports_version");
     for row in state["resources"].as_array_mut().expect("state resources") {
         let row_object = row.as_object_mut().expect("state resource row");
+        let directives = row_object["directives"]
+            .as_object_mut()
+            .expect("state directives");
+        assert_eq!(
+            directives.get("prevent_destroy"),
+            Some(&serde_json::json!({"kind": "unspecified"})),
+            "legacy-secret fixtures start with unspecified destruction protection"
+        );
+        directives.insert("prevent_destroy".to_string(), Value::Bool(false));
         let current = row_object
             .remove("current")
             .expect("v15 row has a current instance");

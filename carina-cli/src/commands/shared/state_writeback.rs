@@ -18,9 +18,11 @@ use carina_core::provider::{
     ObservedCreate, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
     UnknownCreateOutcome,
 };
+#[cfg(test)]
+use carina_core::resource::PersistedDirectiveField;
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, State, Value,
+    ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange, PersistedDirectives,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -31,6 +33,7 @@ use carina_state::{
     ResourceState, RowBasis, StateBackend, StateFile,
 };
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 
 use crate::commands::plan::MovedOrigins;
 use crate::commands::shared::incremental_state_saver::FinalStateBase;
@@ -63,6 +66,80 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDirectiveChange {
+    pub(crate) resource_id: ResolvedResourceId,
+    pub(crate) fields: Vec<PersistedDirectiveFieldChange>,
+}
+
+/// Describe managed resources whose authored, persisted directives differ
+/// from the row currently in state and have no managed mutation in the plan.
+///
+/// Resources already handled by a mutating effect persist their desired
+/// metadata through normal apply writeback. The remaining state-only set uses
+/// the same full routed identity as planning; a row owned by another provider
+/// instance is infrastructure to create, not metadata to rewrite in place.
+pub(crate) fn persisted_directive_changes<S>(
+    state_file: Option<&StateFile>,
+    resources: &[ResolvedResource<S>],
+    plan: &Plan<S>,
+) -> Vec<PersistedDirectiveChange> {
+    let Some(state_file) = state_file else {
+        return Vec::new();
+    };
+    let mutated_resource_ids = plan
+        .effects()
+        .iter()
+        .filter(|effect| effect.is_mutating())
+        .map(|effect| effect.resource_id().clone())
+        .collect::<HashSet<_>>();
+    resources
+        .iter()
+        .filter_map(|resource| {
+            if mutated_resource_ids.contains(&resource.id) {
+                return None;
+            }
+            let row = state_file.find_resource_for_id(&resource.id)?;
+            let desired = PersistedDirectives::desired_for(resource.as_resource());
+            let fields = row.directives.field_changes_to(&desired);
+
+            (!fields.is_empty()).then(|| PersistedDirectiveChange {
+                resource_id: resource.resolved_id(),
+                fields,
+            })
+        })
+        .collect()
+}
+
+/// Apply a previously computed directive change set without rebuilding any
+/// resource rows. The only mutable bytes are the selected rows' `directives`;
+/// serial/version bookkeeping remains the responsibility of the state writer.
+pub(crate) fn apply_persisted_directive_changes<S>(
+    state: &mut StateFile,
+    resources: &[ResolvedResource<S>],
+    changes: &[PersistedDirectiveChange],
+) -> Result<(), AppError> {
+    let resources_by_id = resources
+        .iter()
+        .map(|resource| (resource.resolved_id(), resource))
+        .collect::<HashMap<_, _>>();
+
+    for change in changes {
+        let resource = resources_by_id.get(&change.resource_id).ok_or_else(|| {
+            AppError::PersistedDirectiveTargetMissingFromDesired {
+                resource_id: Box::new(change.resource_id.clone()),
+            }
+        })?;
+        let desired = PersistedDirectives::desired_for(resource.as_resource());
+        if !state.update_resource_directives(&change.resource_id, desired) {
+            return Err(AppError::PersistedDirectiveTargetMissingFromLockedState {
+                resource_id: Box::new(change.resource_id.clone()),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Queue a state refresh for a resource after a failed operation.
@@ -1994,6 +2071,211 @@ mod apply_state_save_tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn state_with_default_directives() -> StateFile {
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("test.Resource", "main", "mock", "provider-main")
+                    .expect("fixture identifier is valid"),
+            )
+            .expect("fixture row is unique");
+        state
+    }
+
+    #[test]
+    fn persisted_directive_changes_describe_every_persisted_field() {
+        let changed = |resource: Resource, expected_field: PersistedDirectiveField| {
+            let plan = Plan::new();
+            let changes = persisted_directive_changes(
+                Some(&state_with_default_directives()),
+                &[resolved(resource)],
+                &plan,
+            );
+            assert_eq!(changes.len(), 1);
+            assert_eq!(
+                changes[0].resource_id,
+                ResolvedResourceId::with_provider_identity("mock", "test.Resource", "main", None,)
+            );
+            assert_eq!(changes[0].fields.len(), 1);
+            assert_eq!(changes[0].fields[0].name(), expected_field);
+        };
+
+        let mut force_delete = Resource::with_provider("mock", "test.Resource", "main", None);
+        force_delete.directives.force_delete = true;
+        changed(force_delete, PersistedDirectiveField::ForceDelete);
+
+        let mut create_before_destroy =
+            Resource::with_provider("mock", "test.Resource", "main", None);
+        create_before_destroy.directives.create_before_destroy = true;
+        changed(
+            create_before_destroy,
+            PersistedDirectiveField::CreateBeforeDestroy,
+        );
+
+        let mut prevent_destroy = Resource::with_provider("mock", "test.Resource", "main", None);
+        prevent_destroy.directives.set_prevent_destroy(false);
+        changed(prevent_destroy, PersistedDirectiveField::PreventDestroy);
+
+        let mut depends_on = Resource::with_provider("mock", "test.Resource", "main", None);
+        depends_on.directives.depends_on = vec!["dependency".to_string()];
+        changed(depends_on, PersistedDirectiveField::DependsOn);
+
+        let mut provider_instance = Resource::with_provider("mock", "test.Resource", "main", None);
+        provider_instance.directives.provider_instance = Some("secondary".to_string());
+        changed(provider_instance, PersistedDirectiveField::ProviderInstance);
+    }
+
+    #[test]
+    fn persisted_directive_changes_treat_depends_on_as_a_set() {
+        let mut row = ResourceState::try_applied("test.Resource", "main", "mock", "provider-main")
+            .expect("fixture identifier is valid");
+        row.directives.depends_on = vec!["first".to_string(), "second".to_string()];
+        let mut state = StateFile::new();
+        state.upsert_resource(row).expect("fixture row is unique");
+
+        let mut resource = Resource::with_provider("mock", "test.Resource", "main", None);
+        resource.directives.depends_on = vec!["second".to_string(), "first".to_string()];
+
+        assert_eq!(
+            persisted_directive_changes(Some(&state), &[resolved(resource)], &Plan::new()),
+            Vec::new(),
+            "reordering an authored set must not produce a persisted directive change"
+        );
+    }
+
+    #[test]
+    fn persisted_directive_changes_exclude_resources_with_managed_updates() {
+        let mut resource = Resource::with_provider("mock", "test.Resource", "main", None);
+        resource.directives.force_delete = true;
+        let resource = resolved(resource);
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(
+                State::existing(resource.id.clone(), HashMap::new())
+                    .with_identifier("provider-main"),
+            ),
+            identifier: crate::fixture_applied_identifier("provider-main"),
+            to: resource.clone(),
+            changed_attributes: vec!["value".to_string()],
+        });
+        assert_eq!(plan.mutation_count(), 1, "fixture must contain an update");
+
+        assert_eq!(
+            persisted_directive_changes(
+                Some(&state_with_default_directives()),
+                std::slice::from_ref(&resource),
+                &plan,
+            ),
+            Vec::new(),
+            "an updated resource must appear only in the execution plan"
+        );
+    }
+
+    #[test]
+    fn persisted_directive_changes_require_the_exact_provider_route() {
+        let resource = resolved(Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "main",
+            Some("secondary".to_string()),
+        ));
+        let plan = Plan::new();
+        assert!(
+            !plan.has_mutations(),
+            "fixture isolates routed state lookup from effect filtering"
+        );
+
+        assert_eq!(
+            persisted_directive_changes(
+                Some(&state_with_default_directives()),
+                std::slice::from_ref(&resource),
+                &plan,
+            ),
+            Vec::new(),
+            "a row owned by another provider instance is not a state-only directive target"
+        );
+
+        let mut create_plan = Plan::new();
+        create_plan.add(Effect::Create(resource.clone()));
+        assert_eq!(
+            persisted_directive_changes(
+                Some(&state_with_default_directives()),
+                std::slice::from_ref(&resource),
+                &create_plan,
+            ),
+            Vec::new(),
+            "a provider-route change planned as Create must not be state-only"
+        );
+    }
+
+    #[test]
+    fn directive_change_lookup_failures_preserve_typed_resource_ids() {
+        let mut desired = Resource::with_provider("mock", "test.Resource", "main", None);
+        desired.directives.force_delete = true;
+        let desired = resolved(desired);
+        let changes = persisted_directive_changes(
+            Some(&state_with_default_directives()),
+            std::slice::from_ref(&desired),
+            &Plan::new(),
+        );
+        assert_eq!(changes.len(), 1, "fixture must contain a directive change");
+
+        let no_resources: Vec<ResolvedResource> = Vec::new();
+        let error = apply_persisted_directive_changes(
+            &mut state_with_default_directives(),
+            &no_resources,
+            &changes,
+        )
+        .expect_err("missing desired resource must fail");
+        assert!(matches!(
+            error,
+            AppError::PersistedDirectiveTargetMissingFromDesired { resource_id }
+                if *resource_id == desired.resolved_id()
+        ));
+
+        let error = apply_persisted_directive_changes(
+            &mut StateFile::new(),
+            std::slice::from_ref(&desired),
+            &changes,
+        )
+        .expect_err("missing locked row must fail");
+        assert!(matches!(
+            error,
+            AppError::PersistedDirectiveTargetMissingFromLockedState { resource_id }
+                if *resource_id == desired.resolved_id()
+        ));
+    }
+
+    #[test]
+    fn directive_change_equality_includes_provider_routing() {
+        let mut desired = Resource::with_provider("mock", "test.Resource", "main", None);
+        desired.directives.force_delete = true;
+        let desired = resolved(desired);
+        let mut changes = persisted_directive_changes(
+            Some(&state_with_default_directives()),
+            std::slice::from_ref(&desired),
+            &Plan::new(),
+        );
+        let default_route = changes.pop().expect("fixture directive change");
+        let mut secondary_route = default_route.clone();
+        secondary_route.resource_id = ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.Resource",
+            "main",
+            Some("secondary".to_string()),
+        );
+
+        assert_eq!(
+            default_route.resource_id.to_string(),
+            secondary_route.resource_id.to_string(),
+            "the legacy display key omits provider routing"
+        );
+        assert_ne!(
+            default_route, secondary_route,
+            "saved-plan mismatch comparison must use the typed routed ID"
+        );
     }
 
     #[test]

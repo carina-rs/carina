@@ -30,10 +30,11 @@ use carina_provider_protocol::types as protocol;
 use indexmap::IndexMap;
 
 use crate::provider::{
-    AppliedState, PartialReadDiagnostic, PatchOp, ReadOutcome, UpdateOutcome, UpdatePatch,
+    AppliedState, PartialReadDiagnostic, PatchOp, ProviderDirectives, ReadOutcome, UpdateOutcome,
+    UpdatePatch,
 };
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, RedactedSecretHash, Resource, ResourceId,
+    ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
     ResourceIdentity, ResourceIdentityError, ResourceIdentityState, State, Value,
 };
 use crate::schema::{
@@ -470,6 +471,7 @@ pub fn resource_schema_to_protocol(
         unique_name,
         operation_config,
         field_groups,
+        default_prevent_destroy,
         default_wait_timeout,
         default_wait_interval,
         defs,
@@ -520,6 +522,7 @@ pub fn resource_schema_to_protocol(
         operation_config: operation_config.cloned(),
         validators,
         field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
+        default_prevent_destroy,
         defs,
     })
 }
@@ -861,6 +864,7 @@ pub fn protocol_to_resource_schema(
         operation_config,
         validators,
         field_groups,
+        default_prevent_destroy,
         defs,
     } = schema;
 
@@ -870,6 +874,9 @@ pub fn protocol_to_resource_schema(
     }
     if !validators.is_empty() {
         core = core.with_declared_validators(validators.clone());
+    }
+    if *default_prevent_destroy {
+        core = core.default_prevent_destroy();
     }
     core = match kind {
         protocol::SchemaKind::Managed => core,
@@ -1987,50 +1994,36 @@ pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     }
 }
 
-/// Encode the directive subset transported to providers.
-pub fn directives_to_protocol(directives: &Directives) -> protocol::Directives {
-    let Directives {
-        force_delete,
-        create_before_destroy,
-        prevent_destroy,
-        depends_on: _depends_on,
-        // Host-only lifecycle metadata. Providers must never receive authored
-        // ignore paths; the host resolves and enforces them around CRUD calls.
-        ignore_changes: _ignore_changes,
-        provider_instance: _provider_instance,
-    } = directives;
+/// Encode directives that have already been resolved for a provider boundary.
+pub fn directives_to_protocol(directives: &ProviderDirectives) -> protocol::Directives {
     protocol::Directives {
-        force_delete: *force_delete,
-        create_before_destroy: *create_before_destroy,
-        prevent_destroy: *prevent_destroy,
+        force_delete: directives.force_delete(),
+        create_before_destroy: directives.create_before_destroy(),
+        prevent_destroy: directives.prevent_destroy(),
     }
 }
 
-/// Decode provider-visible directives, defaulting every host-only field.
-pub fn protocol_to_directives(directives: &protocol::Directives) -> Directives {
+/// Decode effective provider-visible directives without relabeling the wire
+/// boolean as an authored explicit opt-out.
+#[cfg(test)]
+fn protocol_to_directives(directives: &protocol::Directives) -> ProviderDirectives {
     let protocol::Directives {
         force_delete,
         create_before_destroy,
         prevent_destroy,
     } = directives;
-    Directives {
-        force_delete: *force_delete,
-        create_before_destroy: *create_before_destroy,
-        prevent_destroy: *prevent_destroy,
-        depends_on: Vec::new(),
-        ignore_changes: Vec::new(),
-        provider_instance: None,
-    }
+    ProviderDirectives::from_effective_wire(*force_delete, *create_before_destroy, *prevent_destroy)
 }
 
 /// Encode a managed resource for the ordinary provider boundary.
 pub fn try_resource_to_protocol<S>(
     resource: &Resource<S>,
+    directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let Resource {
         id,
         attributes,
-        directives,
+        directives: _authored_directives,
         // Host-only lifecycle metadata resolved and enforced around provider
         // calls. It is intentionally absent from the WIT resource record.
         resolved_ignore_changes: _resolved_ignore_changes,
@@ -2060,11 +2053,12 @@ pub fn try_resource_to_protocol<S>(
 /// Encode a data source using the protocol's shared Resource record.
 pub fn try_data_source_to_protocol(
     data_source: &DataSource,
+    provider_directives: &ProviderDirectives,
 ) -> Result<protocol::Resource, ProtocolConvertError> {
     let DataSource {
         id,
         attributes,
-        directives,
+        directives: _authored_directives,
         binding: _binding,
         dependency_bindings: _dependency_bindings,
         module_source: _module_source,
@@ -2081,14 +2075,39 @@ pub fn try_data_source_to_protocol(
     Ok(protocol::Resource {
         id: resource_id_to_protocol(id),
         attributes,
-        directives: directives_to_protocol(directives),
+        directives: directives_to_protocol(provider_directives),
     })
 }
 
+/// A decoded provider resource whose effective directives remain separate from
+/// authored core directives.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedProviderResource<T> {
+    value: T,
+    directives: ProviderDirectives,
+}
+
+#[cfg(test)]
+impl<T> DecodedProviderResource<T> {
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub(crate) fn directives(&self) -> &ProviderDirectives {
+        &self.directives
+    }
+
+    pub(crate) fn into_parts(self) -> (T, ProviderDirectives) {
+        (self.value, self.directives)
+    }
+}
+
 /// Decode a protocol Resource as a managed resource.
-pub fn protocol_to_resource(
+#[cfg(test)]
+pub(crate) fn protocol_to_resource(
     resource: &protocol::Resource,
-) -> Result<Resource, ProtocolConvertError> {
+) -> Result<DecodedProviderResource<Resource>, ProtocolConvertError> {
     let protocol::Resource {
         id,
         attributes,
@@ -2103,14 +2122,17 @@ pub fn protocol_to_resource(
                 .map_err(|error| error.context(format!("attribute `{key}`")))
         })
         .collect::<Result<IndexMap<_, _>, _>>()?;
-    core.directives = protocol_to_directives(directives);
-    Ok(core)
+    Ok(DecodedProviderResource {
+        value: core,
+        directives: protocol_to_directives(directives),
+    })
 }
 
 /// Decode a protocol Resource as a data source.
-pub fn protocol_to_data_source(
+#[cfg(test)]
+pub(crate) fn protocol_to_data_source(
     resource: &protocol::Resource,
-) -> Result<DataSource, ProtocolConvertError> {
+) -> Result<DecodedProviderResource<DataSource>, ProtocolConvertError> {
     let protocol::Resource {
         id,
         attributes,
@@ -2127,8 +2149,10 @@ pub fn protocol_to_data_source(
                 .map_err(|error| error.context(format!("attribute `{key}`")))
         })
         .collect::<Result<IndexMap<_, _>, _>>()?;
-    core.directives = protocol_to_directives(directives);
-    Ok(core)
+    Ok(DecodedProviderResource {
+        value: core,
+        directives: protocol_to_directives(directives),
+    })
 }
 
 /// Encode generic state through the ordinary value domain.
@@ -2442,8 +2466,8 @@ pub fn protocol_update_patch_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::UpdatePatch;
-    use crate::resource::{ModuleSource, ProviderResource, RedactedSecretHash};
+    use crate::provider::{ProviderDirectiveSchema, ProviderDirectives, UpdatePatch};
+    use crate::resource::{ModuleSource, PreventDestroy, ProviderResource, RedactedSecretHash};
     use crate::schema::{
         CompletionValue, ProviderSchemaValidationError, ReferenceForm, ReferenceForms,
         ReferenceTemplate, ValidatedProviderSchemaWitness, ValidatorType,
@@ -2684,15 +2708,71 @@ mod tests {
         resource.directives.force_delete = true;
         resource.module_source = Some(ModuleSource::Root);
         let provider_resource = ProviderResource::from(resource.clone());
+        let directives =
+            ProviderDirectives::resolve(&resource.directives, ProviderDirectiveSchema::Unavailable);
 
-        let provider_wire =
-            try_resource_to_protocol(&provider_resource).expect("provider resource must encode");
-        let live_wire = try_resource_to_protocol(&resource).expect("live resource must encode");
+        let provider_wire = try_resource_to_protocol(&provider_resource, &directives)
+            .expect("provider resource must encode");
+        let live_wire =
+            try_resource_to_protocol(&resource, &directives).expect("live resource must encode");
 
         assert_eq!(
             serde_json::to_value(provider_wire).expect("provider protocol resource must serialize"),
             serde_json::to_value(live_wire).expect("live protocol resource must serialize")
         );
+    }
+
+    #[test]
+    fn schema_default_prevent_destroy_is_true_in_provider_protocol_resources() {
+        let schema = ResourceSchema::new("test.Widget").default_prevent_destroy();
+        let resource = Resource::with_provider(
+            "test",
+            "test.Widget",
+            ResourceIdentity::from("example"),
+            None,
+        );
+        let directives = ProviderDirectives::resolve(
+            &resource.directives,
+            ProviderDirectiveSchema::Available(&schema),
+        );
+
+        let wire = try_resource_to_protocol(&resource, &directives)
+            .expect("schema-resolved resource must encode");
+
+        assert!(wire.directives.prevent_destroy);
+    }
+
+    #[test]
+    fn protocol_effective_false_does_not_become_an_authored_opt_out() {
+        let wire = protocol::Resource {
+            id: protocol::ResourceId {
+                provider: "test".to_string(),
+                resource_type: "test.Widget".to_string(),
+                identity: "example".to_string(),
+            },
+            attributes: BTreeMap::new(),
+            directives: protocol::Directives {
+                force_delete: false,
+                create_before_destroy: false,
+                prevent_destroy: false,
+            },
+        };
+
+        let decoded = protocol_to_resource(&wire).expect("provider resource must decode");
+
+        assert_eq!(
+            decoded.value().directives.prevent_destroy_setting(),
+            PreventDestroy::Unspecified,
+        );
+        assert!(!decoded.directives().prevent_destroy());
+
+        let decoded = protocol_to_data_source(&wire).expect("provider data source must decode");
+        assert_eq!(
+            decoded.value().directives.prevent_destroy_setting(),
+            PreventDestroy::Unspecified,
+        );
+        let (_value, directives) = decoded.into_parts();
+        assert!(!directives.prevent_destroy());
     }
 
     #[test]
@@ -3009,6 +3089,7 @@ mod tests {
                 .build(),
             )
             .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
+            .default_prevent_destroy()
             .with_default_wait_timeout(std::time::Duration::from_secs(30))
             .with_default_wait_interval(std::time::Duration::from_secs(2))
             .validate()
@@ -3033,11 +3114,13 @@ mod tests {
         );
 
         let wire = resource_schema_to_protocol(&schema).expect("schema must encode");
+        assert!(wire.default_prevent_destroy);
         let json = serde_json::to_string(&wire).expect("protocol schema must serialize");
         let decoded_wire: protocol::ResourceSchema =
             serde_json::from_str(&json).expect("protocol schema JSON must decode");
         let decoded = protocol_to_resource_schema(&decoded_wire)
             .expect("JSON-decoded schema must regain a validation witness");
+        assert!(decoded.parts().default_prevent_destroy);
 
         let aliases = decoded
             .parts()
@@ -3325,6 +3408,7 @@ mod tests {
             operation_config: None,
             validators: Vec::new(),
             field_groups: Vec::new(),
+            default_prevent_destroy: false,
             defs: Default::default(),
         };
         let json = serde_json::to_string(&wire_schema).unwrap();

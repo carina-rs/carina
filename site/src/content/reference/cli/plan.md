@@ -85,6 +85,42 @@ carina plan --refresh=false
 
 Output the plan as structured JSON instead of human-readable text. The output uses the same format as `--out` (PlanFile), including effects, resource definitions, and current states. Secrets are redacted.
 
+The top-level `persisted_directive_changes` array records directive-only state
+updates. It includes a desired resource only when that resource has no
+mutating execution-plan effect; directives for resources being created,
+updated, replaced, moved, or otherwise mutated are written by the normal
+apply path and are not duplicated here. `resource_id` is the full routed
+identity used for matching. Field names are limited to `force_delete`,
+`create_before_destroy`, `prevent_destroy`, `depends_on`, and
+`provider_instance`. Boolean fields use JSON booleans, `depends_on` uses an
+array, `provider_instance` uses a string or `null`, and `prevent_destroy` uses
+its tagged tri-state object:
+
+```json
+{
+  "persisted_directive_changes": [
+    {
+      "resource_id": {
+        "provider": "mock",
+        "resource_type": "test.default_prevent_destroy",
+        "identity": "account"
+      },
+      "fields": [
+        {
+          "name": "prevent_destroy",
+          "from": { "kind": "unspecified" },
+          "to": { "kind": "explicit", "value": false }
+        }
+      ]
+    }
+  ]
+}
+```
+
+The array is required in saved-plan format 35, even when it is empty. Applying
+a saved plan recomputes it against locked state and refuses the plan if the
+typed IDs or values differ.
+
 ```bash
 carina plan --json
 ```

@@ -7702,6 +7702,7 @@ pub enum UniqueNameSpec {
 ///     unique_name,
 ///     operation_config,
 ///     field_groups,
+///     default_prevent_destroy,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7715,6 +7716,7 @@ pub enum UniqueNameSpec {
 ///     unique_name,
 ///     operation_config,
 ///     field_groups,
+///     default_prevent_destroy,
 ///     default_wait_timeout,
 ///     default_wait_interval,
 ///     defs,
@@ -7738,6 +7740,9 @@ pub struct ResourceSchema {
     pub(crate) operation_config: Option<OperationConfig>,
     /// Declarative cardinality constraints over sibling attributes.
     pub(crate) field_groups: Vec<FieldGroup>,
+    /// Whether resources of this type are protected from destruction unless
+    /// the user explicitly opts out.
+    pub(crate) default_prevent_destroy: bool,
     /// Default total timeout for `wait <target> { ... }` polling against
     /// this resource type. `None` falls back to
     /// [`WAIT_DEFAULT_TIMEOUT`].
@@ -7773,6 +7778,7 @@ pub struct ResourceSchemaParts<'a> {
     pub unique_name: &'a UniqueNameSpec,
     pub operation_config: Option<&'a OperationConfig>,
     pub field_groups: &'a [FieldGroup],
+    pub default_prevent_destroy: bool,
     pub default_wait_timeout: Option<std::time::Duration>,
     pub default_wait_interval: Option<std::time::Duration>,
     pub defs: &'a std::collections::BTreeMap<String, AttributeType>,
@@ -7808,6 +7814,7 @@ pub enum SchemaValidationIssueLocation {
     Definition(String),
     FieldGroup(usize),
     UniqueName,
+    DefaultPreventDestroy,
 }
 
 impl SchemaValidationIssueLocation {
@@ -7815,7 +7822,7 @@ impl SchemaValidationIssueLocation {
         match self {
             Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}")),
             Self::Definition(path) => Self::Definition(format!("{path}{suffix}")),
-            Self::FieldGroup(_) | Self::UniqueName => {
+            Self::FieldGroup(_) | Self::UniqueName | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
         }
@@ -7824,7 +7831,10 @@ impl SchemaValidationIssueLocation {
     pub fn attribute_path(&self) -> Option<&str> {
         match self {
             Self::Attribute(path) => Some(path),
-            Self::Definition(_) | Self::FieldGroup(_) | Self::UniqueName => None,
+            Self::Definition(_)
+            | Self::FieldGroup(_)
+            | Self::UniqueName
+            | Self::DefaultPreventDestroy => None,
         }
     }
 }
@@ -7836,6 +7846,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
             Self::Definition(path) => write!(f, "defs.{path}"),
             Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
+            Self::DefaultPreventDestroy => f.write_str("default_prevent_destroy"),
         }
     }
 }
@@ -10254,6 +10265,7 @@ impl ResourceSchema {
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
             field_groups: Vec::new(),
+            default_prevent_destroy: false,
             default_wait_timeout: None,
             default_wait_interval: None,
             defs: std::collections::BTreeMap::new(),
@@ -10266,6 +10278,14 @@ impl ResourceSchema {
         let mut issues = Vec::new();
         let mut visited_definitions = HashSet::new();
         let mut identified_kinds = HashMap::new();
+
+        if self.kind == SchemaKind::DataSource && self.default_prevent_destroy {
+            push_schema_issue(
+                &mut issues,
+                &SchemaValidationIssueLocation::DefaultPreventDestroy,
+                "data-source schemas cannot set `default_prevent_destroy`".to_string(),
+            );
+        }
 
         for name in &self.duplicate_attributes {
             let location = SchemaValidationIssueLocation::Attribute(name.clone());
@@ -10373,6 +10393,7 @@ impl ResourceSchema {
             unique_name: &self.unique_name,
             operation_config: self.operation_config.as_ref(),
             field_groups: &self.field_groups,
+            default_prevent_destroy: self.default_prevent_destroy,
             default_wait_timeout: self.default_wait_timeout,
             default_wait_interval: self.default_wait_interval,
             defs: &self.defs,
@@ -10409,6 +10430,12 @@ impl ResourceSchema {
 
     pub fn field_groups(&self) -> &[FieldGroup] {
         &self.field_groups
+    }
+
+    /// Return whether this resource type is protected from destruction by
+    /// default when no explicit directive is present.
+    pub fn prevents_destroy_by_default(&self) -> bool {
+        self.default_prevent_destroy
     }
 
     pub fn default_wait_timeout(&self) -> Option<std::time::Duration> {
@@ -10644,6 +10671,13 @@ impl ResourceSchema {
     /// Add a declarative cardinality constraint over top-level attributes.
     pub fn field_group(mut self, group: FieldGroup) -> Self {
         self.field_groups.push(group);
+        self
+    }
+
+    /// Protect resources of this type from destruction unless users write an
+    /// explicit `prevent_destroy = false` directive.
+    pub fn default_prevent_destroy(mut self) -> Self {
+        self.default_prevent_destroy = true;
         self
     }
 
@@ -12552,6 +12586,17 @@ impl<'a> OwnerBoundResourceSchema<'a> {
         self.schema
     }
 
+    /// Resolve provider-visible directives against this registered schema.
+    pub fn resolve_directives(
+        self,
+        directives: &crate::resource::Directives,
+    ) -> crate::provider::ProviderDirectives {
+        crate::provider::ProviderDirectives::resolve(
+            directives,
+            crate::resource::ProviderDirectiveSchema::Available(self.schema.as_schema()),
+        )
+    }
+
     /// Return the complete reference-form table declared by this schema's
     /// owner. Forms are provider-wide rather than per resource occurrence.
     pub fn reference_forms(self) -> &'a ReferenceForms {
@@ -12810,6 +12855,37 @@ impl SchemaRegistry {
             &resource.id.resource_type,
             SchemaKind::Resource,
         )
+    }
+
+    /// Resolve every provider-visible directive with one missing-schema policy.
+    ///
+    /// Registry misses use the named schema-unavailable compatibility path.
+    /// Callers that require a schema must use [`Self::try_resolve_directives`]
+    /// and surface the miss as an error.
+    pub fn resolve_directives(
+        &self,
+        resource_id: &crate::resource::ResourceId,
+        kind: SchemaKind,
+        directives: &crate::resource::Directives,
+    ) -> crate::provider::ProviderDirectives {
+        self.try_resolve_directives(resource_id, kind, directives)
+            .unwrap_or_else(|| {
+                crate::provider::ProviderDirectives::resolve(
+                    directives,
+                    crate::resource::ProviderDirectiveSchema::Unavailable,
+                )
+            })
+    }
+
+    /// Resolve directives only when the explicitly selected schema exists.
+    pub fn try_resolve_directives(
+        &self,
+        resource_id: &crate::resource::ResourceId,
+        kind: SchemaKind,
+        directives: &crate::resource::Directives,
+    ) -> Option<crate::provider::ProviderDirectives> {
+        self.get(&resource_id.provider, &resource_id.resource_type, kind)
+            .map(|schema| schema.resolve_directives(directives))
     }
 
     /// Look up the `DataSource` schema for a given [`DataSource`].

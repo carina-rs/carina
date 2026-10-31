@@ -107,7 +107,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// `ParsedFile.providers` by the top-level parse loop.
     pub(super) named_provider_instances: Vec<ProviderConfig>,
     /// Non-fatal warnings collected during parsing
-    pub(super) warnings: Vec<ParseWarning>,
+    warnings: Rc<RefCell<Vec<ParseWarning>>>,
     /// Deferred for-expressions collected during parsing.
     ///
     /// The resource-only resolved representation is produced later by the
@@ -244,7 +244,7 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
             upstream_states: HashMap::new(),
             wait_bindings: HashMap::new(),
             named_provider_instances: Vec::new(),
-            warnings: Vec::new(),
+            warnings: Rc::new(RefCell::new(Vec::new())),
             parsed_deferred_for_expressions: Vec::new(),
             deferred_module_ifs: Vec::new(),
             seeded_bindings: HashSet::new(),
@@ -271,6 +271,30 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
 
     pub(super) fn take_parsed_binding_uses(&self) -> ParsedBindingUses {
         std::mem::take(&mut *self.parsed_binding_uses.borrow_mut())
+    }
+
+    pub(super) fn push_warning(&self, warning: ParseWarning) {
+        self.warnings.borrow_mut().push(warning);
+    }
+
+    pub(super) fn extend_warnings(&self, warnings: impl IntoIterator<Item = ParseWarning>) {
+        self.warnings.borrow_mut().extend(warnings);
+    }
+
+    pub(super) fn take_warnings(&self) -> Vec<ParseWarning> {
+        let warnings = std::mem::take(&mut *self.warnings.borrow_mut());
+        let mut deduplicated = Vec::with_capacity(warnings.len());
+        for warning in warnings {
+            if !deduplicated.contains(&warning) {
+                deduplicated.push(warning);
+            }
+        }
+        deduplicated
+    }
+
+    pub(super) fn restore_warnings(&self, mut warnings: Vec<ParseWarning>) {
+        warnings.append(&mut self.take_warnings());
+        *self.warnings.borrow_mut() = warnings;
     }
 
     pub(super) fn remap_binding_use_resource(&self, from: &ResourceId, to: &ResourceId) {

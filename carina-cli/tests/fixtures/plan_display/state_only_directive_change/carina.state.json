@@ -1,0 +1,62 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-lineage-state-only-directive",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "vpc",
+      "provider": "awscc",
+      "identifier": "vpc-0123456789abcdef0",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "vpc_id": "vpc-0123456789abcdef0"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "vpc",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        }
+      }
+    },
+    {
+      "resource_type": "ec2.Subnet",
+      "identity": "awscc_ec2_subnet_896cf31f",
+      "provider": "awscc",
+      "identifier": "subnet-0123456789abcdef0",
+      "attributes": {
+        "vpc_id": "vpc-0123456789abcdef0",
+        "cidr_block": "10.0.1.0/24",
+        "subnet_id": "subnet-0123456789abcdef0"
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "awscc_ec2_subnet_896cf31f",
+      "dependency_bindings": [
+        "vpc"
+      ],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "vpc_id": {
+            "kind": "leaf"
+          },
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

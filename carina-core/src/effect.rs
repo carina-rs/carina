@@ -2875,10 +2875,8 @@ mod tests {
     fn explicit_dependencies_derived_from_resource_directives() {
         use crate::resource::Directives;
         let mut bucket = Resource::new("s3.Bucket", "b");
-        bucket.directives = Directives {
-            depends_on: vec!["role".to_string(), "kms".to_string()],
-            ..Directives::default()
-        };
+        bucket.directives =
+            Directives::default().with_depends_on(vec!["role".to_string(), "kms".to_string()]);
         let create = Effect::Create(ResolvedResource::new(bucket.clone()));
         let got = create.explicit_dependencies();
         assert!(got.contains("role") && got.contains("kms"), "got {:?}", got);

@@ -651,6 +651,35 @@ fn authored_binding_regression_schemas() -> SchemaRegistry {
 }
 
 #[test]
+fn prevent_destroy_non_literal_uses_the_shared_parser_warning_in_lsp() {
+    let engine = custom_engine(authored_binding_regression_schemas());
+    let source = r#"provider mock {}
+let allow_destroy = false
+mock.test.resource {
+  name = "example"
+  directives { prevent_destroy = allow_destroy }
+}
+"#;
+
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("only a literal `false` opts out of schema-default protection")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        warnings[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(warnings[0].range.start.line, 4);
+}
+
+#[test]
 fn unused_binding_analysis_matches_validate_for_authored_values() {
     struct Case {
         label: &'static str,
@@ -9150,6 +9179,76 @@ fn single_quoted_interpolation_like_sequence_emits_warning_at_span() {
     assert_eq!(warnings[1].range.start.line, 1);
     assert_eq!(warnings[1].range.start.character, second_start);
     assert_eq!(warnings[1].range.end.character, second_end);
+}
+
+#[test]
+fn non_literal_prevent_destroy_warning_is_directory_scoped() {
+    let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
+    let resource = r#"let account = mock.test.resource {
+  name = "example"
+  directives { prevent_destroy = allow_destroy }
+}
+"#;
+    std::fs::write(
+        fixture.path().join("flags.crn"),
+        "let allow_destroy = false\n",
+    )
+    .expect("write sibling expression input");
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write sibling provider fixture");
+    std::fs::write(fixture.path().join("resources.crn"), resource).expect("write resource fixture");
+
+    let path = fixture.path().join("resources.crn");
+    let diagnostics =
+        test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("only a literal `false` opts out of schema-default protection")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
+    let warning = warnings[0];
+
+    assert_eq!(
+        warning.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(warning.range.start.line, 2);
+}
+
+#[test]
+fn sibling_true_prevent_destroy_expression_does_not_warn() {
+    let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
+    let resource = r#"let account = mock.test.resource {
+  name = "example"
+  directives { prevent_destroy = protect }
+}
+"#;
+    std::fs::write(fixture.path().join("flags.crn"), "let protect = true\n")
+        .expect("write sibling expression input");
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write sibling provider fixture");
+    std::fs::write(fixture.path().join("resources.crn"), resource).expect("write resource fixture");
+
+    let path = fixture.path().join("resources.crn");
+    let diagnostics =
+        test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("only a literal `false` opts out of schema-default protection")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        warnings.is_empty(),
+        "the directory-resolved true value enables protection without an opt-out warning: {diagnostics:#?}"
+    );
 }
 
 #[test]

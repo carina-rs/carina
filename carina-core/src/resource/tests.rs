@@ -1007,7 +1007,83 @@ fn directives_serde_default() {
     let config: Directives = serde_json::from_str(json).unwrap();
     assert!(config.create_before_destroy);
     assert!(!config.force_delete);
-    assert!(!config.prevent_destroy);
+    assert_eq!(
+        config.prevent_destroy_setting(),
+        PreventDestroy::Unspecified
+    );
+}
+
+#[test]
+fn prevent_destroy_setting_round_trips_explicit_false() {
+    let directives = Directives::default().with_prevent_destroy(false);
+    let encoded = serde_json::to_value(&directives).expect("directives must serialize");
+    assert_eq!(
+        encoded["prevent_destroy"],
+        serde_json::json!({"kind": "explicit", "value": false})
+    );
+
+    let decoded: Directives = serde_json::from_value(encoded).expect("directives must decode");
+    assert_eq!(
+        decoded.prevent_destroy_setting(),
+        PreventDestroy::Explicit(false)
+    );
+}
+
+#[test]
+fn persisted_directive_changes_compare_typed_values_not_rendered_labels() {
+    let current = PersistedDirectives::default();
+    let desired = PersistedDirectives {
+        provider_instance: Some("unspecified".to_string()),
+        ..PersistedDirectives::default()
+    };
+
+    let changes = current.field_changes_to(&desired);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].name(), PersistedDirectiveField::ProviderInstance);
+    assert_eq!(changes[0].rendered_from(), "unspecified");
+    assert_eq!(changes[0].rendered_to(), "unspecified");
+
+    let encoded = serde_json::to_value(&changes).expect("typed changes serialize");
+    assert_eq!(
+        encoded,
+        serde_json::json!([{
+            "name": "provider_instance",
+            "from": null,
+            "to": "unspecified"
+        }]),
+        "machine-readable equality must retain values that share a display label"
+    );
+    let decoded: Vec<PersistedDirectiveFieldChange> =
+        serde_json::from_value(encoded).expect("typed changes deserialize");
+    assert_eq!(decoded, changes);
+}
+
+#[test]
+fn prevent_destroy_resolution_reports_source_and_fails_safe_for_expressions() {
+    let ordinary = ResourceSchema::new("test.Ordinary");
+    let protected = ResourceSchema::new("test.Protected").default_prevent_destroy();
+
+    assert_eq!(
+        PreventDestroy::Unspecified.resolve(ProviderDirectiveSchema::Available(&ordinary)),
+        PreventDestroyResolution::NotProtected
+    );
+    assert_eq!(
+        PreventDestroy::Unspecified.resolve(ProviderDirectiveSchema::Available(&protected)),
+        PreventDestroyResolution::Protected(PreventDestroySource::SchemaDefault)
+    );
+    assert_eq!(
+        PreventDestroy::Explicit(true).resolve(ProviderDirectiveSchema::Available(&ordinary)),
+        PreventDestroyResolution::Protected(PreventDestroySource::ExplicitDirective)
+    );
+    assert_eq!(
+        PreventDestroy::Explicit(false).resolve(ProviderDirectiveSchema::Available(&protected)),
+        PreventDestroyResolution::NotProtected
+    );
+    assert_eq!(
+        PreventDestroy::Unspecified.resolve(ProviderDirectiveSchema::Unavailable),
+        PreventDestroyResolution::NotProtected,
+        "an unavailable schema preserves the existing orphan-delete behavior"
+    );
 }
 
 #[test]
@@ -1043,9 +1119,12 @@ fn directives_serialises_without_depends_on_when_empty() {
 
 #[test]
 fn directives_depends_on_deserialises_from_legacy_json_without_field() {
-    let legacy =
-        r#"{ "force_delete": false, "create_before_destroy": false, "prevent_destroy": false }"#;
-    let d: Directives = serde_json::from_str(legacy).unwrap();
+    let without_depends_on = r#"{
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {"kind": "unspecified"}
+    }"#;
+    let d: Directives = serde_json::from_str(without_depends_on).unwrap();
     assert_eq!(d.depends_on, Vec::<String>::new());
 }
 
@@ -1059,7 +1138,10 @@ fn directives_with_force_delete() {
     let deserialized: Directives = serde_json::from_str(&json).unwrap();
     assert!(deserialized.force_delete);
     assert!(!deserialized.create_before_destroy);
-    assert!(!deserialized.prevent_destroy);
+    assert_eq!(
+        deserialized.prevent_destroy_setting(),
+        PreventDestroy::Unspecified
+    );
 }
 
 #[test]
@@ -4053,8 +4135,11 @@ fn directives_serialises_without_provider_instance_when_none() {
 
 #[test]
 fn directives_provider_instance_deserialises_from_legacy_json_without_field() {
-    let legacy =
-        r#"{ "force_delete": false, "create_before_destroy": false, "prevent_destroy": false }"#;
+    let legacy = r#"{
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {"kind": "unspecified"}
+    }"#;
     let d: Directives = serde_json::from_str(legacy).unwrap();
     assert!(d.provider_instance.is_none());
 }

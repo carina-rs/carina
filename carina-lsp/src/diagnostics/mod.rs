@@ -1874,6 +1874,9 @@ impl DiagnosticEngine {
             // context meant for CLI output only and are not elevated here.
             diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
             diagnostics.extend(self.check_single_quoted_interpolation_warnings(parsed));
+            let prevent_destroy_warnings = merged_current_file.unwrap_or(parsed);
+            diagnostics
+                .extend(self.check_non_literal_prevent_destroy_warnings(prevent_destroy_warnings));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(doc, parsed, &binding_index));
@@ -1995,6 +1998,31 @@ impl DiagnosticEngine {
                     end_col,
                     DiagnosticSeverity::WARNING,
                     w.message.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    fn check_non_literal_prevent_destroy_warnings(&self, parsed: &ParsedFile) -> Vec<Diagnostic> {
+        parsed
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == WarningKind::NonLiteralPreventDestroy)
+            .filter_map(|warning| {
+                let span = warning.span.as_ref()?;
+                Some(carina_diagnostic_range(
+                    Range::new(
+                        Position::new(
+                            span.start_line.checked_sub(1)? as u32,
+                            span.start_column.checked_sub(1)? as u32,
+                        ),
+                        Position::new(
+                            span.end_line.checked_sub(1)? as u32,
+                            span.end_column.checked_sub(1)? as u32,
+                        ),
+                    ),
+                    DiagnosticSeverity::WARNING,
+                    warning.message.clone(),
                 ))
             })
             .collect()

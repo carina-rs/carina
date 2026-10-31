@@ -874,7 +874,7 @@ fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
         contents.provider_configs.as_provider_configs(),
     );
     contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect("test plan provider evidence must be valid")
 }
 
@@ -890,7 +890,7 @@ fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry
         additional_schemas,
     );
     contents
-        .record_for_test(&ctx)
+        .record_for_test(&ctx, Vec::new())
         .expect("test plan provider evidence must be valid")
 }
 
@@ -1555,11 +1555,10 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
-    .record_for_test(&ValidatedConfig::from_factories_for_test(
-        (),
+    .record_for_test(
+        &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
         Vec::new(),
-        &[],
-    ))
+    )
     .expect("test plan provider evidence must be valid");
 
     let mut plan_file = plan_file
@@ -1937,7 +1936,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
-    .record_for_test(&planning_context)
+    .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
     let plan_path = project.path().join("plan.json");
     std::fs::write(
@@ -2032,7 +2031,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
-    .record_for_test(&planning_context)
+    .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
     let state_path = project.path().join("state.json");
     let lock_path = state_path.with_extension("lock");
@@ -9569,10 +9568,11 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 35 adds typed
-    //! deferred-for templates and stage-specific placeholder types. Version 34
-    //! adds Int-only integer arithmetic. Version 33 adds typed keyed-list
-    //! release effects. Version 32 adds mandatory
+    //! `carina plan` is the supported migration. Version 36 adds typed
+    //! deferred-for templates and stage-specific placeholder types. Version 35
+    //! stores tri-state prevent-destroy directives and the approved state-only
+    //! directive change set. Version 34 adds Int-only integer arithmetic.
+    //! Version 33 adds typed keyed-list release effects. Version 32 adds mandatory
     //! provider-instance reference scopes and the create-outcome-unknown marker
     //! for provider protocol v13. Version 31 persists authored ignore paths;
     //! version 30 was never emitted. Version 29 persists anonymous loop
@@ -9673,24 +9673,64 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn previous_emitted_plan_version_is_rejected_before_payload_decoding() {
+    async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("previous-plan.json");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            35,
-            "carina#4094 uses saved-plan format 35",
+            36,
+            "carina#4094 uses saved-plan format 36 after carina#4150 format 35",
         );
-        let previous = 34;
+        let previous = 35;
+
+        for older_version in [previous, 34, 33, 32] {
+            let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
+            let old_plan = serde_json::json!({
+                "version": older_version,
+                "timestamp": "2026-10-29T00:00:00Z",
+                "source_path": "infra",
+                "compositions": "intentionally invalid payload",
+            });
+            std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
+                .expect("write older plan");
+
+            let error = crate::commands::apply::run_apply_from_plan(
+                &user_dirs,
+                &plan_path,
+                true,
+                false,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                false,
+                &carina_core::parser::ProviderContext::default(),
+                carina_core::shutdown::ShutdownToken::running(),
+            )
+            .await
+            .expect_err("an older emitted format must be rejected before decoding its payload");
+
+            let crate::error::AppError::UnsupportedPlanVersion {
+                found, expected, ..
+            } = error
+            else {
+                panic!("expected typed unsupported plan version error")
+            };
+            assert_eq!(found, older_version);
+            assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        }
+    }
+
+    #[tokio::test]
+    async fn version_33_plan_is_rejected_with_regeneration_guidance() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("format-33-plan.json");
         let old_plan = serde_json::json!({
-            "version": previous,
-            "timestamp": "2026-10-29T00:00:00Z",
+            "version": 33,
+            "timestamp": "2026-10-30T00:00:00Z",
             "source_path": "infra",
             "compositions": "intentionally invalid payload",
         });
         std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
-            .expect("write previous plan");
+            .expect("write format 33 plan");
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
@@ -9703,16 +9743,21 @@ mod saved_plan_version_tests {
             carina_core::shutdown::ShutdownToken::running(),
         )
         .await
-        .expect_err("the previous emitted format must be rejected before decoding its payload");
+        .expect_err("format 33 must be regenerated before its payload is decoded");
 
         let crate::error::AppError::UnsupportedPlanVersion {
-            found, expected, ..
-        } = error
+            found,
+            expected,
+            replan_command,
+            ..
+        } = &error
         else {
             panic!("expected typed unsupported plan version error")
         };
-        assert_eq!(found, previous);
-        assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        assert_eq!(*found, 33);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        assert!(replan_command.is_some());
+        assert!(error.to_string().contains("Re-run `carina plan"));
     }
 
     #[tokio::test]
@@ -10502,6 +10547,7 @@ mod saved_plan_version_tests {
                         (provider.to_string(), schema.clone())
                     }),
             ),
+            Vec::new(),
         )
         .expect("replacement plan provider evidence must be valid");
         let json = serde_json::to_value(&plan_file).expect("plan file should serialize");
