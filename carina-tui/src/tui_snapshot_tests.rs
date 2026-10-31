@@ -239,14 +239,16 @@ fn build_map_key_diff_plan() -> Plan {
 }
 
 fn build_deferred_for_plan() -> Plan {
-    let template_resource: Resource<ModuleSource, LoopSlot> =
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::new("route53.Record", "validation_records").with_binding("validation_records");
+    template_resource
+        .attributes
+        .extend(deferred_record_attributes());
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: deferred_record_attributes(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
@@ -268,8 +270,11 @@ fn build_deferred_for_plan() -> Plan {
 }
 
 fn build_anonymous_deferred_for_plan() -> Plan {
-    let template_resource: Resource<ModuleSource, LoopSlot> =
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::new("route53.Record", "validation_records");
+    template_resource
+        .attributes
+        .extend(deferred_record_attributes());
     let target = carina_core::parser::parse_file(
         "for opt in cert.domain_validation_options {\n  aws.route53.Record { name = opt }\n}\n",
         std::path::Path::new("main.crn"),
@@ -290,7 +295,6 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: deferred_record_attributes(),
         target,
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
@@ -310,14 +314,16 @@ fn build_anonymous_deferred_for_plan() -> Plan {
 }
 
 fn build_deferred_replace_plan() -> Plan {
-    let template_resource: Resource<ModuleSource, LoopSlot> =
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::new("route53.Record", "validation_records").with_binding("validation_records");
+    template_resource
+        .attributes
+        .extend(deferred_record_attributes());
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: deferred_record_attributes(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },

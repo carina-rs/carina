@@ -1921,8 +1921,8 @@ mod tests {
 
     #[test]
     fn for_body_field_error_reported_once_not_twice() {
-        // Regression: the old code walked both `deferred.template_resource.attributes`
-        // and `deferred.attributes`, potentially reporting the same ref twice.
+        // Regression: the old duplicate display projection could cause the
+        // canonical deferred template attribute to be reported twice.
         let parsed = parse_project(
             r#"
             let orgs = upstream_state { source = "../organizations" }

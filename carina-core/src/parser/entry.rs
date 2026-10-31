@@ -1062,11 +1062,23 @@ fn parse_with_seeded_bindings_inner(
         let ParseBinding::Value {
             value: eval,
             source_line,
-            ..
+            declaration,
+            shared_value: _,
+            declared_type: _,
+            scope: _,
         } = binding
         else {
             continue;
         };
+        // Argument bindings are lexical parser inputs, not authored `let`
+        // variables. Their declaration already lives in `arguments`, and
+        // retaining a second value-shaped copy here makes later boundary
+        // walkers distinguish the two by string name. Keep the typed
+        // declaration provenance as the discriminator and omit the duplicate
+        // from the final AST.
+        if matches!(declaration, crate::schema::BindingKind::Argument) {
+            continue;
+        }
         match (*eval).into_value() {
             Ok(value) => {
                 variables.insert(name, value);

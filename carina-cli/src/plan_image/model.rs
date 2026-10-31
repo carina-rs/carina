@@ -1318,7 +1318,6 @@ mod tests {
             line: 1,
             header: "for item in literal".to_string(),
             resource_type: "test.Widget".to_string(),
-            attributes: Vec::new(),
             target: carina_core::parser::DeferredForTarget::Bound {
                 binding: "widgets".to_string(),
             },
@@ -1378,22 +1377,27 @@ mod tests {
             line,
             header,
             resource_type,
-            attributes,
             target,
             iterable,
             binding,
-            template_resource: _,
+            template_resource,
         } = saved;
+        let mut live_template_resource = Resource::pending_with_provider(
+            template_resource.id.provider.clone(),
+            template_resource.id.resource_type.clone(),
+            template_resource.id.provider_instance.clone(),
+        );
+        live_template_resource.attributes = template_resource.attributes;
+        live_template_resource.binding = template_resource.binding;
         let round_tripped = DeferredForExpression {
             file,
             line,
             header,
             resource_type,
-            attributes,
             target,
             iterable,
             binding,
-            template_resource: Resource::pending_with_provider("mock", "test.Child", None),
+            template_resource: live_template_resource,
         };
 
         let mut plan = Plan::new();

@@ -475,11 +475,6 @@ pub(crate) fn parse_for_expr(
                 source_file,
             )?;
             if let Some(resource) = resource {
-                let attrs: Vec<(String, Value)> = resource
-                    .attributes
-                    .iter()
-                    .map(|(k, value)| (k.clone(), value.clone()))
-                    .collect();
                 ctx.deferred_for_expressions.push(DeferredForExpression {
                     file: None,
                     line: for_line,
@@ -489,7 +484,6 @@ pub(crate) fn parse_for_expr(
                     } else {
                         format!("{}.{}", resource.id.provider, resource.id.resource_type)
                     },
-                    attributes: attrs,
                     target: target.deferred_target(),
                     iterable: iterable.clone(),
                     binding: binding.clone(),
@@ -521,11 +515,6 @@ pub(crate) fn parse_for_expr(
                     source_file,
                 )?;
                 if let Some(resource) = resource {
-                    let attrs: Vec<(String, Value)> = resource
-                        .attributes
-                        .iter()
-                        .map(|(k, value)| (k.clone(), value.clone()))
-                        .collect();
                     ctx.deferred_for_expressions.push(DeferredForExpression {
                         file: None,
                         line: for_line,
@@ -535,7 +524,6 @@ pub(crate) fn parse_for_expr(
                         } else {
                             format!("{}.{}", resource.id.provider, resource.id.resource_type)
                         },
-                        attributes: attrs,
                         target: target.deferred_target(),
                         iterable: Value::Deferred(DeferredValue::BindingRef { binding: s.clone() }),
                         binding: binding.clone(),

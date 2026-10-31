@@ -25,8 +25,9 @@ use crate::parser::ValidateExpr;
 use crate::static_type::ConsumerStaticType;
 
 use super::{
-    AccessPath, DeferredValue, LeftoverPlaceholder, NoPlaceholder, ParserPlaceholder,
-    PlaceholderKind, ResolvedResourceId, StructuralOperand, Value,
+    AccessPath, DeferredValue, LeftoverPlaceholder, LeftoverPlaceholderContext,
+    LeftoverPlaceholderPolicy, NoPlaceholder, ParserPlaceholder, PlaceholderKind,
+    ResolvedResourceId, StructuralOperand, Value,
 };
 
 /// How a composition attribute is produced from the rest of the
@@ -315,10 +316,6 @@ impl<P: PlaceholderKind + PartialEq> LiveCompositionArgument<P> {
 
     pub fn value(&self) -> &Value<P> {
         self.operand.traversal_value()
-    }
-
-    pub(crate) fn visit_values(&self, visitor: &mut impl FnMut(&Value<P>)) {
-        self.operand.visit_values(visitor);
     }
 
     pub fn declared_type(&self) -> &ConsumerStaticType {
@@ -1165,6 +1162,92 @@ impl<P: PlaceholderKind> LiveComposition<P> {
 }
 
 impl LiveComposition<ParserPlaceholder> {
+    pub(crate) fn collect_leftover_placeholders(
+        &self,
+        policy: LeftoverPlaceholderPolicy,
+        errors: &mut Vec<LeftoverPlaceholder>,
+    ) {
+        let Self {
+            id,
+            signature,
+            binding,
+            dependency_bindings,
+            module_name,
+            instance,
+            call_path,
+            quoted_string_attrs,
+        } = self;
+        let _non_value_fields = (
+            binding,
+            dependency_bindings,
+            module_name,
+            call_path,
+            quoted_string_attrs,
+        );
+        let LiveCompositionSignature {
+            arguments,
+            attributes,
+            pending_constraints,
+        } = signature;
+
+        for (argument_name, argument) in arguments {
+            let LiveCompositionArgument { operand, metadata } = argument;
+            let LiveCompositionArgumentMetadata {
+                declared_type,
+                origin,
+            } = metadata;
+            let _validation_metadata = (declared_type, origin);
+            operand.visit_values(&mut |value| {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ModuleCallArgument {
+                        module_call: instance.clone(),
+                        argument: argument_name.clone(),
+                    },
+                    policy,
+                    errors,
+                );
+            });
+        }
+
+        for (attribute_name, attribute) in attributes {
+            let LiveCompositionAttribute {
+                value,
+                declared_type,
+                source_argument,
+            } = attribute;
+            let _validation_metadata = (declared_type, source_argument);
+            match value {
+                CompositionAttributeValue::Forwarded(_path) => {}
+                CompositionAttributeValue::Derived(value) => {
+                    value.collect_leftover_placeholders(
+                        LeftoverPlaceholderContext::ResourceAttribute {
+                            resource: id.to_string(),
+                            attribute: attribute_name.clone(),
+                        },
+                        policy,
+                        errors,
+                    );
+                }
+            }
+        }
+
+        for constraint in pending_constraints {
+            let PendingModuleConstraint {
+                id: constraint_id,
+                expression,
+                message,
+            } = constraint;
+            let _message = message;
+            expression.collect_leftover_placeholders(
+                &LeftoverPlaceholderContext::Require {
+                    label: format!("{} {}", instance, constraint_id.as_str()),
+                },
+                policy,
+                errors,
+            );
+        }
+    }
+
     pub(crate) fn into_expanded(self) -> Result<LiveComposition, LeftoverPlaceholder> {
         let Self {
             id,

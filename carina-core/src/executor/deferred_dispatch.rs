@@ -389,11 +389,6 @@ mod tests {
             line: 1,
             header: "for account in (up.accounts ?? [])".to_string(),
             resource_type: "test.Child".to_string(),
-            attributes: template_resource
-                .attributes
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -447,9 +442,6 @@ mod tests {
     fn deferred_create_resolves_authored_ignore_changes() {
         let mut template = coalesced_template();
         let comment = Value::Concrete(ConcreteValue::String("managed-elsewhere".into()));
-        template
-            .attributes
-            .push(("comment".to_string(), comment.clone()));
         template.template_resource.set_attr("comment", comment);
         template.template_resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
             ParsedIgnorePathSegment::Attribute("comment".to_string()),

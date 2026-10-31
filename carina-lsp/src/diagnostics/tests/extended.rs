@@ -10749,6 +10749,37 @@ fn check_attributes_blocks_still_warns_when_truly_undefined() {
 // =====================================================================
 
 #[test]
+fn module_definition_boundary_reports_unpropagated_argument_from_sibling_file() {
+    let temp = tempfile::tempdir().expect("create multi-file module fixture");
+    std::fs::write(
+        temp.path().join("arguments.crn"),
+        "arguments {\n  input: String\n}\n",
+    )
+    .expect("write module arguments");
+    let source = "let leaked = input\n";
+    let path = temp.path().join("locals.crn");
+    std::fs::write(&path, source).expect("write module local");
+
+    let diagnostics = test_engine().analyze(
+        &create_document_at(source, path.clone()),
+        Some(path.as_path()),
+    );
+    let leftover = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("let `leaked`: unresolved module argument: input")
+        })
+        .unwrap_or_else(|| {
+            panic!("the LSP must report the shared expansion-boundary error: {diagnostics:#?}")
+        });
+
+    assert_eq!(leftover.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(leftover.range.start.line, 0);
+}
+
+#[test]
 fn spaced_interpolation_expression_has_no_error_diagnostic() {
     let engine = test_engine();
     let buffer = "let value = \"x-${join('-', ['a'])}\"\n";

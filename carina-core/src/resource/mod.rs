@@ -4668,9 +4668,50 @@ pub(crate) enum LeftoverPlaceholderContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoopPlaceholderPolicy {
+enum LoopPlaceholderPolicy {
     Reject,
     AllowInDeferredTemplate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleArgumentPolicy {
+    Reject,
+    AllowUntilModuleExpansion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeftoverPlaceholderPolicy {
+    loop_slots: LoopPlaceholderPolicy,
+    module_arguments: ModuleArgumentPolicy,
+}
+
+impl LeftoverPlaceholderPolicy {
+    pub(crate) const REJECT_ALL: Self = Self {
+        loop_slots: LoopPlaceholderPolicy::Reject,
+        module_arguments: ModuleArgumentPolicy::Reject,
+    };
+
+    pub(crate) const fn module_expansion_field(allow_module_arguments: bool) -> Self {
+        Self {
+            loop_slots: LoopPlaceholderPolicy::Reject,
+            module_arguments: if allow_module_arguments {
+                ModuleArgumentPolicy::AllowUntilModuleExpansion
+            } else {
+                ModuleArgumentPolicy::Reject
+            },
+        }
+    }
+
+    pub(crate) const fn deferred_template(allow_module_arguments: bool) -> Self {
+        Self {
+            loop_slots: LoopPlaceholderPolicy::AllowInDeferredTemplate,
+            module_arguments: if allow_module_arguments {
+                ModuleArgumentPolicy::AllowUntilModuleExpansion
+            } else {
+                ModuleArgumentPolicy::Reject
+            },
+        }
+    }
 }
 
 impl fmt::Display for LeftoverPlaceholderContext {
@@ -5152,18 +5193,28 @@ impl Value<ParserPlaceholder> {
     pub(crate) fn collect_leftover_placeholders(
         &self,
         context: LeftoverPlaceholderContext,
-        loop_policy: LoopPlaceholderPolicy,
+        policy: LeftoverPlaceholderPolicy,
         errors: &mut Vec<LeftoverPlaceholder>,
     ) {
         self.visit_placeholders(&mut |placeholder| {
-            if loop_policy == LoopPlaceholderPolicy::Reject
-                || !matches!(placeholder, ParserPlaceholder::Loop(_))
-            {
-                errors.push(LeftoverPlaceholder {
-                    placeholder: placeholder.clone(),
-                    context: context.clone(),
-                });
+            let allowed = match placeholder {
+                ParserPlaceholder::Loop(_) => {
+                    policy.loop_slots == LoopPlaceholderPolicy::AllowInDeferredTemplate
+                }
+                ParserPlaceholder::ModuleArgument { .. } => {
+                    policy.module_arguments == ModuleArgumentPolicy::AllowUntilModuleExpansion
+                }
+                ParserPlaceholder::FnParam { .. }
+                | ParserPlaceholder::FnLocal { .. }
+                | ParserPlaceholder::EmptyInterpolation => false,
+            };
+            if allowed {
+                return;
             }
+            errors.push(LeftoverPlaceholder {
+                placeholder: placeholder.clone(),
+                context: context.clone(),
+            });
         });
     }
 

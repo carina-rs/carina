@@ -133,11 +133,6 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "test.ValidationRecord".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
         target: crate::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },

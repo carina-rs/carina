@@ -191,7 +191,6 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         line: 1,
         header: "for item in pending.items".to_string(),
         resource_type: "mock.test.resource".to_string(),
-        attributes: vec![("name".to_string(), empty())],
         target: DeferredForTarget::Bound {
             binding: "items".to_string(),
         },
@@ -227,6 +226,44 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         );
     }
     assert_eq!(rendered.matches("empty interpolation `${}`").count(), 14);
+}
+
+#[test]
+fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
+    let mut template_resource =
+        Resource::<ModuleSource, ParserPlaceholder>::pending("mock.test.resource");
+    template_resource.attributes.insert(
+        "name".to_string(),
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::EmptyInterpolation,
+        )),
+    );
+    let mut file = ParsedFile::default();
+    file.deferred_for_expressions.push(DeferredForExpression {
+        file: Some("loops.crn".to_string()),
+        line: 1,
+        header: "for item in pending.items".to_string(),
+        resource_type: "mock.test.resource".to_string(),
+        target: DeferredForTarget::Bound {
+            binding: "items".to_string(),
+        },
+        iterable: Value::Deferred(DeferredValue::BindingRef {
+            binding: "pending.items".to_string(),
+        }),
+        binding: ForBinding::Simple("item".to_string()),
+        template_resource,
+    });
+
+    let rendered = file
+        .validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)
+        .expect_err("the canonical template resource must be checked")
+        .to_string();
+
+    assert_eq!(rendered.matches("empty interpolation `${}`").count(), 1);
+    assert!(
+        rendered.contains("deferred `for item in pending.items` attribute `name`:"),
+        "the canonical template attribute must retain its semantic location: {rendered}",
+    );
 }
 
 #[test]

@@ -6348,7 +6348,6 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             line: 7,
             header: "for _, opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.RecordSet".to_string(),
-            attributes: vec![],
             target: DeferredForTarget::Bound {
                 binding: "_domain_validation_options".to_string(),
             },
@@ -6481,7 +6480,6 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
         line: 1,
         header: "for _, account in accounts.items".to_string(),
         resource_type: "awscc.sso.Assignment".to_string(),
-        attributes: Vec::new(),
         target: DeferredForTarget::Bound {
             binding: "assignments".to_string(),
         },
@@ -6544,7 +6542,6 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             line: 3,
             header: "for _, a in accounts.list".to_string(),
             resource_type: "awscc.sso.Assignment".to_string(),
-            attributes: vec![],
             target: DeferredForTarget::Bound {
                 binding: "_list".to_string(),
             },

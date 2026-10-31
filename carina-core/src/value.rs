@@ -2607,14 +2607,12 @@ where
         line: _line,
         header: _header,
         resource_type: _resource_type,
-        attributes,
         target: _target,
         iterable,
         binding: _binding,
         template_resource,
     } = template;
     contains_redacted_secret(iterable)
-        || attributes_contain_redacted_secret(attributes.iter().map(|(_, value)| value))
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
@@ -4019,17 +4017,6 @@ fn redact_deferred_template(
         .iter()
         .map(|(key, value)| redact_secrets_only(value).map(|value| (key.clone(), value)))
         .collect::<Result<_, _>>()?;
-    redacted.attributes = template
-        .attributes
-        .iter()
-        .map(|(key, value)| {
-            if let Some(canonical) = redacted.template_resource.attributes.get(key) {
-                Ok((key.clone(), canonical.clone()))
-            } else {
-                redact_secrets_only(value).map(|value| (key.clone(), value))
-            }
-        })
-        .collect::<Result<_, _>>()?;
     Ok(redacted)
 }
 
@@ -4417,26 +4404,6 @@ fn rehydrate_deferred_template<S: Clone, T>(
             saved_value,
             candidate.template_resource.attributes.get(key),
             format!("deferred resource {}.{key}", saved.target.display_name()),
-            SecretRehydrationCandidate::Evaluated,
-        )? {
-            *saved_value = value;
-        }
-    }
-    for (key, saved_value) in &mut out.attributes {
-        if let Some(canonical) = out.template_resource.attributes.get(key) {
-            *saved_value = canonical.clone();
-            continue;
-        }
-        if let Some(value) = rehydrate_secret_entry(
-            saved_value,
-            candidate
-                .attributes
-                .iter()
-                .find_map(|(candidate_key, value)| (candidate_key == key).then_some(value)),
-            format!(
-                "deferred display resource {}.{key}",
-                saved.target.display_name()
-            ),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -13270,10 +13237,6 @@ mod tests {
                 line: 1,
                 header: "for opt in cert.domain_validation_options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
-                attributes: vec![
-                    ("name".to_string(), placeholder.clone()),
-                    ("comment".to_string(), secret),
-                ],
                 target: crate::parser::DeferredForTarget::Bound {
                     binding: "validation_records".to_string(),
                 },
@@ -13291,15 +13254,6 @@ mod tests {
         else {
             panic!("expected deferred create");
         };
-        assert!(matches!(
-            redacted_template
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "comment").then_some(value)),
-            Some(LoopValue::Deferred(
-                LoopDeferredValue::RedactedSecret { .. }
-            ))
-        ));
         assert!(matches!(
             redacted_template
                 .template_resource
@@ -13328,21 +13282,15 @@ mod tests {
             panic!("expected rehydrated deferred create");
         };
         assert!(matches!(
-            template
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "comment").then_some(value)),
-            Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
-        ));
-        assert!(matches!(
             template.template_resource.attributes.get("comment"),
             Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
         ));
         assert!(
             !template
+                .template_resource
                 .attributes
-                .iter()
-                .any(|(_, value)| contains_redacted_secret(value))
+                .values()
+                .any(contains_redacted_secret)
         );
     }
 
@@ -13372,7 +13320,6 @@ mod tests {
                 line: 1,
                 header: "for opt in cert.options".to_string(),
                 resource_type: "aws.route53.RecordSet".to_string(),
-                attributes: vec![("comment".to_string(), secret("stale-projection"))],
                 target: crate::parser::DeferredForTarget::Bound {
                     binding: "records".to_string(),
                 },
@@ -13386,11 +13333,6 @@ mod tests {
         let Effect::DeferredCreate { template, .. } = redacted else {
             panic!("expected deferred create");
         };
-        let projected = template
-            .attributes
-            .iter()
-            .find_map(|(key, value)| (key == "comment").then_some(value))
-            .expect("projected comment");
         let canonical = template
             .template_resource
             .attributes
@@ -13398,25 +13340,15 @@ mod tests {
             .expect("template resource comment");
 
         let LoopValue::Deferred(LoopDeferredValue::RedactedSecret {
-            hash: projected_hash,
-        }) = projected
-        else {
-            panic!("expected projected placeholder, got {projected:?}");
-        };
-        let LoopValue::Deferred(LoopDeferredValue::RedactedSecret {
-            hash: canonical_hash,
+            hash: _canonical_hash,
         }) = canonical
         else {
             panic!("expected canonical placeholder, got {canonical:?}");
         };
-        assert_eq!(
-            projected_hash, canonical_hash,
-            "the compatibility projection must mirror the canonical template resource"
-        );
     }
 
     #[test]
-    fn deferred_template_preserves_display_only_projection_and_noops_without_placeholders() {
+    fn deferred_template_redaction_noops_without_placeholders() {
         use crate::effect::Effect;
         use crate::parser::{DeferredForExpression, ForBinding};
         use crate::resource::ResourceId;
@@ -13431,15 +13363,12 @@ mod tests {
             LoopSlot,
         > = crate::resource::Resource::new("mock.test.resource", "children");
         template_resource.set_attr("comment", canonical.clone());
+        template_resource.set_attr("identifier", display_only.clone());
         let template = DeferredForExpression {
             file: None,
             line: 1,
             header: "for child in parent.children".to_string(),
             resource_type: "mock.test.resource".to_string(),
-            attributes: vec![
-                ("comment".to_string(), canonical),
-                ("identifier".to_string(), display_only.clone()),
-            ],
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -13463,10 +13392,7 @@ mod tests {
         else {
             panic!("expected deferred create")
         };
-        assert_eq!(
-            redacted_template.attributes, template.attributes,
-            "redaction must retain display-only projection keys",
-        );
+        assert_eq!(redacted_template.as_ref(), &template);
 
         let mut plan = crate::plan::Plan::new();
         plan.add(Effect::DeferredCreate {
@@ -13492,10 +13418,7 @@ mod tests {
         };
         assert_eq!(output.as_ref(), &template);
         assert_eq!(
-            output
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "identifier").then_some(value)),
+            output.template_resource.attributes.get("identifier"),
             Some(&display_only),
         );
     }

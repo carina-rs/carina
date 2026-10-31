@@ -271,7 +271,6 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "mock.test.resource".to_string(),
-        attributes: vec![],
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },

@@ -811,11 +811,6 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
@@ -867,11 +862,6 @@ fn deferred_validation_records_effect() -> Effect {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },

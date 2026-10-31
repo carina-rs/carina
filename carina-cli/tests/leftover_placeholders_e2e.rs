@@ -13,6 +13,42 @@ struct Scenario {
     project: PathBuf,
 }
 
+struct ModuleScenario {
+    _temp: TempDir,
+    module: PathBuf,
+}
+
+impl ModuleScenario {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("create temporary module");
+        let module = temp.path().join("module");
+        fs::create_dir(&module).expect("create module directory");
+        write(
+            &module,
+            "arguments.crn",
+            "arguments {\n  input: String\n}\n",
+        );
+        Self {
+            _temp: temp,
+            module,
+        }
+    }
+
+    fn write(&self, name: &str, source: &str) {
+        write(&self.module, name, source);
+    }
+
+    fn validate(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(&self.module)
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .args(["validate", "."])
+            .output()
+            .expect("run carina validate on module")
+    }
+}
+
 impl Scenario {
     fn new() -> Self {
         let temp = tempfile::tempdir().expect("create temporary project");
@@ -188,5 +224,49 @@ fn destroy_rejects_located_empty_interpolation_without_modifying_state() {
         fs::read(scenario.state_path()).expect("read state after failed destroy"),
         state_before,
         "failed destroy must not rewrite or delete state",
+    );
+}
+
+#[test]
+fn module_definition_rejects_empty_interpolation_in_resource_with_location() {
+    let scenario = ModuleScenario::new();
+    scenario.write(
+        "resources.crn",
+        "mock.test.resource {\n  name = \"${}\"\n}\n",
+    );
+
+    let output = scenario.validate();
+    let text = assert_failure("carina validate module", &output);
+
+    assert!(
+        text.contains("attribute `name`: empty interpolation `${}`"),
+        "the module resource leftover must retain its attribute location:\n{text}",
+    );
+}
+
+#[test]
+fn module_definition_allows_argument_reference_in_resource() {
+    let scenario = ModuleScenario::new();
+    scenario.write("resources.crn", "mock.test.resource {\n  name = input\n}\n");
+
+    let output = scenario.validate();
+    assert!(
+        output.status.success(),
+        "a resource attribute is substituted during module expansion:\n{}",
+        output_text(&output),
+    );
+}
+
+#[test]
+fn module_definition_rejects_argument_reference_in_unpropagated_variable() {
+    let scenario = ModuleScenario::new();
+    scenario.write("locals.crn", "let leaked = input\n");
+
+    let output = scenario.validate();
+    let text = assert_failure("carina validate module", &output);
+
+    assert!(
+        text.contains("let `leaked`: unresolved module argument: input"),
+        "a module argument in a field expansion does not propagate must fail in place:\n{text}",
     );
 }

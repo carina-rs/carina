@@ -15,10 +15,10 @@ use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandle
 use crate::provider_source::ProviderSource;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, ForLoopElement, FunctionArgument,
-    GraphNode, LeafNode, LeftoverPlaceholderContext, LeftoverPlaceholders, LiveComposition,
-    LoopPlaceholderPolicy, LoopSlot, ModuleSource, NoPlaceholder, ParserPlaceholder, PathSegment,
-    PlaceholderKind, Resource, ResourceId, ResourceIdentity, SavedModuleSource, StructuralOperand,
-    StructuralOperandRef, UnboundLoopTemplate, Value,
+    GraphNode, LeafNode, LeftoverPlaceholderContext, LeftoverPlaceholderPolicy,
+    LeftoverPlaceholders, LiveComposition, LoopSlot, ModuleSource, NoPlaceholder,
+    ParserPlaceholder, PathSegment, PlaceholderKind, Resource, ResourceId, ResourceIdentity,
+    SavedModuleSource, StructuralOperand, StructuralOperandRef, UnboundLoopTemplate, Value,
 };
 use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
@@ -120,9 +120,6 @@ pub struct DeferredForExpression<
     pub header: String,
     /// The provider-qualified resource type the loop body would produce (e.g., `awscc.sso.Assignment`).
     pub resource_type: String,
-    /// Attribute template: key → value (concrete values are resolved;
-    /// loop-bound values remain as deferred postfix access expressions).
-    pub attributes: Vec<(String, Value<T>)>,
     /// Typed destination for the generated resources.
     pub target: DeferredForTarget,
     /// Complete iterable expression. This can remain a deferred coalesce until
@@ -147,7 +144,6 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
             line,
             header,
             resource_type,
-            attributes,
             target,
             iterable,
             binding,
@@ -158,7 +154,6 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
             line,
             header,
             resource_type,
-            attributes,
             target,
             iterable,
             binding,
@@ -344,20 +339,25 @@ impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
     fn into_expanded(
         self,
     ) -> Result<DeferredForExpression<S>, crate::resource::LeftoverPlaceholder> {
+        let Self {
+            file,
+            line,
+            header,
+            resource_type,
+            target,
+            iterable,
+            binding,
+            template_resource,
+        } = self;
         Ok(DeferredForExpression {
-            file: self.file,
-            line: self.line,
-            header: self.header,
-            resource_type: self.resource_type,
-            attributes: self
-                .attributes
-                .into_iter()
-                .map(|(name, value)| value.into_loop_template().map(|value| (name, value)))
-                .collect::<Result<_, _>>()?,
-            target: self.target,
-            iterable: self.iterable.into_expanded()?,
-            binding: self.binding,
-            template_resource: self.template_resource.into_loop_template()?,
+            file,
+            line,
+            header,
+            resource_type,
+            target,
+            iterable: iterable.into_expanded()?,
+            binding,
+            template_resource: template_resource.into_loop_template()?,
         })
     }
 }
@@ -966,37 +966,45 @@ pub enum ValidateExpr<P: PlaceholderKind = NoPlaceholder> {
 }
 
 impl ValidateExpr<ParserPlaceholder> {
-    fn collect_leftover_placeholders(
+    pub(crate) fn collect_leftover_placeholders(
         &self,
         context: &LeftoverPlaceholderContext,
+        policy: LeftoverPlaceholderPolicy,
         errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
     ) {
         match self {
-            Self::BoundArgument { value, .. } => {
-                value.collect_leftover_placeholders(
-                    context.clone(),
-                    LoopPlaceholderPolicy::Reject,
-                    errors,
-                );
+            Self::BoundArgument {
+                argument: _argument,
+                operand: _operand,
+                value,
+            } => {
+                value.collect_leftover_placeholders(context.clone(), policy, errors);
             }
-            Self::Compare { lhs, rhs, .. } | Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
-                lhs.collect_leftover_placeholders(context, errors);
-                rhs.collect_leftover_placeholders(context, errors);
+            Self::Compare { lhs, op: _op, rhs } => {
+                lhs.collect_leftover_placeholders(context, policy, errors);
+                rhs.collect_leftover_placeholders(context, policy, errors);
             }
-            Self::Not(value) => value.collect_leftover_placeholders(context, errors),
-            Self::FunctionCall { args, .. } => {
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.collect_leftover_placeholders(context, policy, errors);
+                rhs.collect_leftover_placeholders(context, policy, errors);
+            }
+            Self::Not(value) => value.collect_leftover_placeholders(context, policy, errors),
+            Self::FunctionCall { name: _name, args } => {
                 for argument in args {
-                    argument.collect_leftover_placeholders(context, errors);
+                    argument.collect_leftover_placeholders(context, policy, errors);
                 }
             }
-            Self::Bool(_)
-            | Self::Int(_)
-            | Self::Float(_)
-            | Self::Duration(_)
-            | Self::String(_)
-            | Self::Var(_)
-            | Self::Access { .. }
-            | Self::Null => {}
+            Self::Bool(_value) => {}
+            Self::Int(_value) => {}
+            Self::Float(_value) => {}
+            Self::Duration(_value) => {}
+            Self::String(_value) => {}
+            Self::Var(_name) => {}
+            Self::Access {
+                argument: _argument,
+                path: _path,
+            } => {}
+            Self::Null => {}
         }
     }
 
@@ -1300,23 +1308,49 @@ impl<P: PlaceholderKind + PartialEq> ExportParamLike<P> for ParsedExportParam<P>
 pub trait IntoExpandedExportParam: ExportParamLike<ParserPlaceholder> {
     type Expanded: ExportParamLike<NoPlaceholder>;
 
+    fn collect_leftover_placeholders(&self, errors: &mut Vec<crate::resource::LeftoverPlaceholder>);
+
     fn into_expanded(self) -> Result<Self::Expanded, crate::resource::LeftoverPlaceholder>;
 }
 
 impl IntoExpandedExportParam for ParsedExportParam<ParserPlaceholder> {
     type Expanded = ParsedExportParam<NoPlaceholder>;
 
+    fn collect_leftover_placeholders(
+        &self,
+        errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+    ) {
+        let Self {
+            name,
+            static_type,
+            value,
+            source,
+        } = self;
+        let _non_value_fields = (static_type, source);
+        if let Some(value) = value {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::Export { name: name.clone() },
+                LeftoverPlaceholderPolicy::REJECT_ALL,
+                errors,
+            );
+        }
+    }
+
     fn into_expanded(self) -> Result<Self::Expanded, crate::resource::LeftoverPlaceholder> {
-        let name = self.name;
+        let Self {
+            name,
+            static_type,
+            value,
+            source,
+        } = self;
         Ok(ParsedExportParam {
             name: name.clone(),
-            static_type: self.static_type,
-            value: self
-                .value
+            static_type,
+            value: value
                 .map(Value::into_expanded)
                 .transpose()
                 .map_err(|error| error.in_export(name))?,
-            source: self.source,
+            source,
         })
     }
 }
@@ -2701,6 +2735,35 @@ impl<P: PlaceholderKind> ProviderConfig<P> {
     pub fn is_default(&self) -> bool {
         self.binding.is_none()
     }
+
+    /// Project parser/runtime configuration down to the metadata needed to
+    /// locate and construct a provider factory. Attribute values are
+    /// deliberately excluded: factories read source/version/revision and
+    /// binding identity, while configured values are consumed later by the
+    /// provider instance.
+    pub fn loading_projection(&self) -> ProviderConfig {
+        let Self {
+            name,
+            attributes,
+            default_tags,
+            source,
+            version,
+            revision,
+            unresolved_attributes,
+            binding,
+        } = self;
+        let _configuration_values = (attributes, default_tags, unresolved_attributes);
+        ProviderConfig {
+            name: name.clone(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: source.clone(),
+            version: version.clone(),
+            revision: revision.clone(),
+            unresolved_attributes: IndexMap::new(),
+            binding: binding.clone(),
+        }
+    }
 }
 
 impl ProviderConfig<ParserPlaceholder> {
@@ -2977,13 +3040,35 @@ impl<P: PlaceholderKind + PartialEq> ExportParamLike<P> for InferredExportParam<
 impl IntoExpandedExportParam for InferredExportParam<ParserPlaceholder> {
     type Expanded = InferredExportParam<NoPlaceholder>;
 
+    fn collect_leftover_placeholders(
+        &self,
+        errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+    ) {
+        let Self {
+            name,
+            static_type,
+            value,
+        } = self;
+        let _static_type = static_type;
+        if let Some(value) = value {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::Export { name: name.clone() },
+                LeftoverPlaceholderPolicy::REJECT_ALL,
+                errors,
+            );
+        }
+    }
+
     fn into_expanded(self) -> Result<Self::Expanded, crate::resource::LeftoverPlaceholder> {
-        let name = self.name;
+        let Self {
+            name,
+            static_type,
+            value,
+        } = self;
         Ok(InferredExportParam {
             name: name.clone(),
-            static_type: self.static_type,
-            value: self
-                .value
+            static_type,
+            value: value
                 .map(Value::into_expanded)
                 .transpose()
                 .map_err(|error| error.in_export(name))?,
@@ -3076,8 +3161,8 @@ pub type ParsedFile =
 /// Parser-placeholder policy at the validation/expansion boundary.
 ///
 /// A called root configuration must be fully expanded. A standalone module
-/// definition deliberately remains parser-stage until a caller supplies its
-/// arguments, so its typed module-argument slots are not leftovers yet.
+/// definition may retain typed module-argument slots only in fields that the
+/// module expander substitutes when a caller supplies its arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParserPlaceholderBoundary {
     ExpandedFile,
@@ -3490,240 +3575,391 @@ impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
         &self,
         boundary: ParserPlaceholderBoundary,
     ) -> Vec<crate::resource::LeftoverPlaceholder> {
-        let mut errors = Vec::new();
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            deferred_for_expressions,
+            expansion_trace,
+        } = self;
+        let _non_value_fields = (
+            uses,
+            user_functions,
+            upstream_states,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            expansion_trace,
+        );
 
-        for provider in &self.providers {
-            let provider_name = provider.name.clone();
-            for (attribute, value) in &provider.attributes {
+        let mut errors = Vec::new();
+        let reject_all = LeftoverPlaceholderPolicy::REJECT_ALL;
+        let allow_module_arguments = boundary == ParserPlaceholderBoundary::ModuleDefinition;
+        let module_expansion_field =
+            LeftoverPlaceholderPolicy::module_expansion_field(allow_module_arguments);
+        let deferred_template =
+            LeftoverPlaceholderPolicy::deferred_template(allow_module_arguments);
+
+        for provider in providers {
+            let ProviderConfig {
+                name,
+                attributes,
+                default_tags,
+                source,
+                version,
+                revision,
+                unresolved_attributes,
+                binding,
+            } = provider;
+            let _provider_metadata = (source, version, revision, binding);
+            for (attribute, value) in attributes {
                 value.collect_leftover_placeholders(
                     LeftoverPlaceholderContext::ProviderAttribute {
-                        provider: provider_name.clone(),
+                        provider: name.clone(),
                         attribute: attribute.clone(),
                     },
-                    LoopPlaceholderPolicy::Reject,
+                    reject_all,
                     &mut errors,
                 );
             }
-            for (attribute, value) in &provider.default_tags {
+            for (attribute, value) in default_tags {
                 value.collect_leftover_placeholders(
                     LeftoverPlaceholderContext::ProviderAttribute {
-                        provider: provider_name.clone(),
+                        provider: name.clone(),
                         attribute: format!("default_tags.{attribute}"),
                     },
-                    LoopPlaceholderPolicy::Reject,
+                    reject_all,
                     &mut errors,
                 );
             }
-            for (attribute, value) in &provider.unresolved_attributes {
+            for (attribute, value) in unresolved_attributes {
                 value.collect_leftover_placeholders(
                     LeftoverPlaceholderContext::ProviderAttribute {
-                        provider: provider_name.clone(),
+                        provider: name.clone(),
                         attribute: attribute.clone(),
                     },
-                    LoopPlaceholderPolicy::Reject,
+                    reject_all,
                     &mut errors,
                 );
             }
         }
 
-        {
-            let mut collect_resource_attributes =
-                |resource: String, attributes: &IndexMap<String, Value<ParserPlaceholder>>| {
-                    for (attribute, value) in attributes {
-                        value.collect_leftover_placeholders(
-                            LeftoverPlaceholderContext::ResourceAttribute {
-                                resource: resource.clone(),
-                                attribute: attribute.clone(),
-                            },
-                            LoopPlaceholderPolicy::Reject,
-                            &mut errors,
-                        );
-                    }
-                };
-            for resource in &self.resources {
-                collect_resource_attributes(resource.id.to_string(), &resource.attributes);
-            }
-            for data_source in &self.data_sources {
-                collect_resource_attributes(data_source.id.to_string(), &data_source.attributes);
-            }
-        }
-
-        for composition in &self.compositions {
-            for (argument, value) in &composition.signature.arguments {
-                value.visit_values(&mut |value| {
-                    value.collect_leftover_placeholders(
-                        LeftoverPlaceholderContext::ModuleCallArgument {
-                            module_call: composition.instance.clone(),
-                            argument: argument.clone(),
-                        },
-                        LoopPlaceholderPolicy::Reject,
-                        &mut errors,
-                    );
-                });
-            }
-            for (attribute, value) in &composition.signature.attributes {
-                value.to_value().collect_leftover_placeholders(
+        for resource in resources {
+            let Resource {
+                id,
+                attributes,
+                directives,
+                resolved_ignore_changes,
+                prefixes,
+                binding,
+                dependency_bindings,
+                module_source,
+                default_tag_keys,
+                loop_provenance,
+                quoted_string_attrs,
+            } = resource;
+            let _resource_metadata = (
+                directives,
+                resolved_ignore_changes,
+                prefixes,
+                binding,
+                dependency_bindings,
+                module_source,
+                default_tag_keys,
+                loop_provenance,
+                quoted_string_attrs,
+            );
+            for (attribute, value) in attributes {
+                value.collect_leftover_placeholders(
                     LeftoverPlaceholderContext::ResourceAttribute {
-                        resource: composition.id.to_string(),
+                        resource: id.to_string(),
                         attribute: attribute.clone(),
                     },
-                    LoopPlaceholderPolicy::Reject,
-                    &mut errors,
-                );
-            }
-            for constraint in &composition.signature.pending_constraints {
-                constraint.expression.collect_leftover_placeholders(
-                    &LeftoverPlaceholderContext::Require {
-                        label: format!("{} {}", composition.instance, constraint.id.as_str()),
-                    },
+                    module_expansion_field,
                     &mut errors,
                 );
             }
         }
 
-        for (name, value) in &self.variables {
+        for data_source in data_sources {
+            let DataSource {
+                id,
+                attributes,
+                directives,
+                binding,
+                dependency_bindings,
+                module_source,
+                quoted_string_attrs,
+            } = data_source;
+            let _data_source_metadata = (
+                directives,
+                binding,
+                dependency_bindings,
+                module_source,
+                quoted_string_attrs,
+            );
+            for (attribute, value) in attributes {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ResourceAttribute {
+                        resource: id.to_string(),
+                        attribute: attribute.clone(),
+                    },
+                    module_expansion_field,
+                    &mut errors,
+                );
+            }
+        }
+
+        for composition in compositions {
+            composition.collect_leftover_placeholders(module_expansion_field, &mut errors);
+        }
+
+        for (name, value) in variables {
             value.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::Variable { name: name.clone() },
-                LoopPlaceholderPolicy::Reject,
+                reject_all,
                 &mut errors,
             );
         }
 
-        for module_call in &self.module_calls {
-            let module_call_name = module_call
-                .binding_name
-                .as_ref()
-                .unwrap_or(&module_call.module_name)
-                .clone();
-            for (argument, value) in module_call.arguments() {
-                value.operand.visit_values(&mut |value| {
+        for module_call in module_calls {
+            let ModuleCall {
+                module_name,
+                binding_name,
+                arguments,
+                source,
+                loop_origin,
+            } = module_call;
+            let _module_call_metadata = (source, loop_origin);
+            let module_call_name = binding_name.as_ref().unwrap_or(module_name).clone();
+            for (argument_name, authored_argument) in arguments {
+                let AuthoredModuleArgument {
+                    argument,
+                    key_span,
+                    value_span,
+                } = authored_argument;
+                let _argument_source = (key_span, value_span);
+                let ModuleArgument { operand } = argument;
+                operand.visit_values(&mut |value| {
                     value.collect_leftover_placeholders(
                         LeftoverPlaceholderContext::ModuleCallArgument {
                             module_call: module_call_name.clone(),
-                            argument: argument.to_string(),
+                            argument: argument_name.clone(),
                         },
-                        LoopPlaceholderPolicy::Reject,
+                        module_expansion_field,
                         &mut errors,
                     );
                 });
             }
         }
 
-        for argument in &self.arguments {
-            if let Some(value) = &argument.default {
+        for argument in arguments {
+            let ArgumentParameter {
+                name,
+                static_type,
+                default,
+                description,
+                validations,
+            } = argument;
+            let _argument_metadata = (static_type, description);
+            if let Some(value) = default {
                 value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::ArgumentDefault {
-                        name: argument.name.clone(),
-                    },
-                    LoopPlaceholderPolicy::Reject,
+                    LeftoverPlaceholderContext::ArgumentDefault { name: name.clone() },
+                    module_expansion_field,
                     &mut errors,
                 );
             }
-            for validation in &argument.validations {
-                validation.condition.collect_leftover_placeholders(
-                    &LeftoverPlaceholderContext::ArgumentValidation {
-                        name: argument.name.clone(),
-                    },
+            for validation in validations {
+                let ValidationBlock {
+                    condition,
+                    error_message,
+                    source,
+                } = validation;
+                let _validation_metadata = (error_message, source);
+                condition.collect_leftover_placeholders(
+                    &LeftoverPlaceholderContext::ArgumentValidation { name: name.clone() },
+                    module_expansion_field,
                     &mut errors,
                 );
             }
         }
 
-        for attribute in &self.attribute_params {
-            if let Some(value) = &attribute.value {
+        for attribute in attribute_params {
+            let AttributeParameter {
+                name,
+                static_type,
+                value,
+                source,
+            } = attribute;
+            let _attribute_metadata = (static_type, source);
+            if let Some(value) = value {
                 value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::AttributeDefault {
-                        name: attribute.name.clone(),
-                    },
-                    LoopPlaceholderPolicy::Reject,
+                    LeftoverPlaceholderContext::AttributeDefault { name: name.clone() },
+                    module_expansion_field,
                     &mut errors,
                 );
             }
         }
 
-        for export in &self.export_params {
-            if let Some(value) = export.value() {
-                value.collect_leftover_placeholders(
-                    LeftoverPlaceholderContext::Export {
-                        name: export.name().to_string(),
-                    },
-                    LoopPlaceholderPolicy::Reject,
-                    &mut errors,
-                );
-            }
+        for export in export_params {
+            export.collect_leftover_placeholders(&mut errors);
         }
 
-        if let Some(backend) = &self.backend {
-            for (attribute, value) in &backend.attributes {
+        if let Some(backend) = backend {
+            let BackendConfig {
+                backend_type,
+                attributes,
+                attribute_spans,
+            } = backend;
+            let _attribute_spans = attribute_spans;
+            for (attribute, value) in attributes {
                 value.collect_leftover_placeholders(
                     LeftoverPlaceholderContext::BackendAttribute {
-                        backend: backend.backend_type.clone(),
+                        backend: backend_type.clone(),
                         attribute: attribute.clone(),
                     },
-                    LoopPlaceholderPolicy::Reject,
+                    reject_all,
                     &mut errors,
                 );
             }
         }
 
-        for state_block in &self.state_blocks {
-            if let StateBlock::Import { to, id, .. } = state_block {
-                id.collect_leftover_placeholders(
+        for state_block in state_blocks {
+            match state_block {
+                StateBlock::Import {
+                    to,
+                    to_span: _to_span,
+                    id,
+                } => id.collect_leftover_placeholders(
                     LeftoverPlaceholderContext::StateImport {
                         target: to.to_string(),
                     },
-                    LoopPlaceholderPolicy::Reject,
+                    reject_all,
                     &mut errors,
-                );
+                ),
+                StateBlock::Removed { from: _from } => {}
+                StateBlock::Moved {
+                    addresses: _addresses,
+                } => {}
             }
         }
 
-        for wait in &self.wait_bindings {
-            wait.until_predicate.rhs.collect_leftover_placeholders(
+        for wait in wait_bindings {
+            let WaitBinding {
+                binding,
+                target,
+                until_raw,
+                until_predicate,
+                timeout_secs,
+                depends_on,
+                line,
+            } = wait;
+            let UntilPredicateAst { lhs_segments, rhs } = until_predicate;
+            let _wait_metadata = (
+                target,
+                until_raw,
+                lhs_segments,
+                timeout_secs,
+                depends_on,
+                line,
+            );
+            rhs.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::WaitBinding {
-                    binding: wait.binding.as_str().to_string(),
+                    binding: binding.as_str().to_string(),
                 },
-                LoopPlaceholderPolicy::Reject,
+                reject_all,
                 &mut errors,
             );
         }
 
-        for (index, require) in self.requires.iter().enumerate() {
-            require.condition.collect_leftover_placeholders(
+        for (index, require) in requires.iter().enumerate() {
+            let RequireBlock {
+                condition,
+                error_message,
+                source,
+            } = require;
+            let _require_metadata = (error_message, source);
+            condition.collect_leftover_placeholders(
                 &LeftoverPlaceholderContext::Require {
                     label: (index + 1).to_string(),
                 },
+                module_expansion_field,
                 &mut errors,
             );
         }
 
-        for deferred in &self.deferred_for_expressions {
-            deferred.iterable.collect_leftover_placeholders(
+        for deferred in deferred_for_expressions {
+            let DeferredForExpression {
+                file,
+                line,
+                header,
+                resource_type,
+                target,
+                iterable,
+                binding,
+                template_resource,
+            } = deferred;
+            let _deferred_metadata = (file, line, resource_type, target, binding);
+            iterable.collect_leftover_placeholders(
                 LeftoverPlaceholderContext::DeferredForIterable {
-                    header: deferred.header.clone(),
+                    header: header.clone(),
                 },
-                LoopPlaceholderPolicy::Reject,
+                module_expansion_field,
                 &mut errors,
             );
-            for (attribute, value) in &deferred.attributes {
+            let Resource {
+                id,
+                attributes,
+                directives,
+                resolved_ignore_changes,
+                prefixes,
+                binding,
+                dependency_bindings,
+                module_source,
+                default_tag_keys,
+                loop_provenance,
+                quoted_string_attrs,
+            } = template_resource;
+            let _template_metadata = (
+                id,
+                directives,
+                resolved_ignore_changes,
+                prefixes,
+                binding,
+                dependency_bindings,
+                module_source,
+                default_tag_keys,
+                loop_provenance,
+                quoted_string_attrs,
+            );
+            for (attribute, value) in attributes {
                 value.collect_leftover_placeholders(
                     LeftoverPlaceholderContext::DeferredForAttribute {
-                        header: deferred.header.clone(),
+                        header: header.clone(),
                         attribute: attribute.clone(),
                     },
-                    LoopPlaceholderPolicy::AllowInDeferredTemplate,
+                    deferred_template,
                     &mut errors,
                 );
             }
-        }
-
-        if boundary == ParserPlaceholderBoundary::ModuleDefinition {
-            errors.retain(|error| {
-                !matches!(
-                    error.placeholder(),
-                    ParserPlaceholder::ModuleArgument { .. }
-                )
-            });
         }
 
         errors
@@ -4597,7 +4833,6 @@ mod substitute_placeholder_tests {
             line: 1,
             header: "for opt in cert.options".to_string(),
             resource_type: "mock.Target".to_string(),
-            attributes: Vec::new(),
             target: DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -4635,7 +4870,6 @@ mod substitute_placeholder_tests {
             line: 1,
             header: "for child in source.children".to_string(),
             resource_type: "mock.Target".to_string(),
-            attributes: Vec::new(),
             target: DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -4666,7 +4900,6 @@ mod substitute_placeholder_tests {
             line: 1,
             header: "for child in source.children".to_string(),
             resource_type: "mock.Target".to_string(),
-            attributes: Vec::new(),
             target: DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -4765,7 +4998,6 @@ mod substitute_placeholder_tests {
             line: 42,
             header: "for opt in cert.options".to_string(),
             resource_type: "mock.Target".to_string(),
-            attributes: Vec::new(),
             target: DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },

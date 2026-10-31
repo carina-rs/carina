@@ -292,12 +292,6 @@ impl DiagnosticEngine {
         });
         let current_file_name = current_file_name.as_deref();
 
-        // Empty `${}` interpolation hint. Runs even when other parses
-        // succeeded — and especially before the buffer-only checks
-        // below — so users get an actionable warning right at the
-        // placeholder rather than only learning at apply time.
-        diagnostics.extend(self.check_empty_interpolations(doc));
-
         // Build the directory-scoped merged parse once up-front — it is
         // the authoritative source of truth for every check that needs
         // cross-file context: undefined-identifier (#2132), upstream-
@@ -349,14 +343,12 @@ impl DiagnosticEngine {
         // When the authoritative directory parse succeeds, use its per-file
         // semantic AST for source-oriented checks instead of dropping every
         // check merely because the provisional document parse failed.
-        let merged_current_file = || {
-            current_file_path.and_then(|path| {
-                merged_result
-                    .as_ref()
-                    .and_then(|result| result.directory.semantic_file(path))
-            })
-        };
-        let current_parsed = doc.parsed().or_else(merged_current_file);
+        let merged_current_file = current_file_path.and_then(|path| {
+            merged_result
+                .as_ref()
+                .and_then(|result| result.directory.semantic_file(path))
+        });
+        let current_parsed = doc.parsed().or(merged_current_file);
         // A source parsed in isolation cannot know sibling function
         // declarations. Prefer the successful directory parse over that
         // provisional failure (notably a sibling user function used as a
@@ -423,6 +415,15 @@ impl DiagnosticEngine {
         let merged = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
+        if let Some(boundary_file) = merged_current_file.or(current_parsed) {
+            let boundary =
+                if carina_core::validation::is_module_definition(merged.unwrap_or(boundary_file)) {
+                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+                } else {
+                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+                };
+            diagnostics.extend(self.check_expansion_boundary(doc, boundary_file, boundary));
+        }
         if let Some(current_file) = current_parsed {
             diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
                 doc,

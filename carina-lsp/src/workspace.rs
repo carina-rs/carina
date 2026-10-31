@@ -15,28 +15,7 @@ pub(crate) struct DiscoveredProviderConfig {
 
 impl DiscoveredProviderConfig {
     pub(crate) fn from_parser(provider: ProviderConfig<ParserPlaceholder>) -> Self {
-        fn factory_values(
-            values: indexmap::IndexMap<String, carina_core::resource::Value<ParserPlaceholder>>,
-        ) -> indexmap::IndexMap<String, carina_core::resource::Value> {
-            values
-                .into_iter()
-                .filter_map(|(name, value)| match value.into_expanded() {
-                    Ok(value) => Some((name, value)),
-                    Err(_leftover) => None,
-                })
-                .collect()
-        }
-
-        let factory_config = ProviderConfig {
-            name: provider.name.clone(),
-            attributes: factory_values(provider.attributes.clone()),
-            default_tags: factory_values(provider.default_tags.clone()),
-            source: provider.source.clone(),
-            version: provider.version.clone(),
-            revision: provider.revision.clone(),
-            unresolved_attributes: factory_values(provider.unresolved_attributes.clone()),
-            binding: provider.binding.clone(),
-        };
+        let factory_config = provider.loading_projection();
         Self {
             comparison_key: provider,
             factory_config,

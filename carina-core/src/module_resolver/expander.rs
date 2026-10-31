@@ -1850,9 +1850,9 @@ fn check_composition_argument_type(
 ///   `_domain_validation_options`) → instance-prefixed
 ///   unconditionally, exactly like `Resource.binding`, so each module
 ///   instance's loop resources are uniquely addressed.
-/// - `attributes` and `template_resource` → the full module-resource
-///   treatment via [`prefix_module_resource`] / the same
-///   ref-rewrite + arg-substitute + canonicalize as `module.resources`.
+/// - `template_resource` → the full module-resource treatment via
+///   [`prefix_module_resource`], including the same ref-rewrite +
+///   argument-substitute + canonicalize as `module.resources`.
 /// - `file`/`line`/`header`/`resource_type`/`binding`
 ///   → provenance / display / non-binding / loop-local: pass through.
 fn prefix_deferred_for_expression(
@@ -1869,7 +1869,6 @@ fn prefix_deferred_for_expression(
         line,
         header,
         resource_type,
-        attributes,
         target,
         iterable,
         binding,
@@ -1891,18 +1890,6 @@ fn prefix_deferred_for_expression(
         header: header.clone(),
         // provider-qualified type — not a binding
         resource_type: resource_type.clone(),
-        // The loop body's attrs may reference module-internal bindings
-        // / module arguments — same shared `prefix_attr_value` the
-        // module resource attrs get.
-        attributes: attributes
-            .iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    prefix_attr_value(v, instance_prefix, intra_module_bindings, arguments)?,
-                ))
-            })
-            .collect::<Result<_, ArgumentSubstitutionError>>()?,
         // Generated-resource address prefix — `binding_name` is a name
         // the loop *synthesizes* for its own resources (e.g.
         // `_domain_validation_options`), NOT a reference to a

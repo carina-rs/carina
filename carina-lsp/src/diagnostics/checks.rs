@@ -11,8 +11,8 @@ use carina_core::binding_index::{
 };
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
-    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan,
-    TopLevelBlockSourceSpan, TypeExpr,
+    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, ParserPlaceholderBoundary,
+    SourceSpan, TopLevelBlockSourceSpan, TypeExpr,
 };
 use carina_core::resource::{
     ConcreteValue, DeferredValue, ParserPlaceholder, Value as GenericValue,
@@ -2917,23 +2917,21 @@ impl DiagnosticEngine {
         None
     }
 
-    /// Walk the buffer line-by-line and emit a `WARNING` diagnostic for every
-    /// empty `${}` interpolation inside a double-quoted string. The parser
-    /// accepts the empty form (so the rest of the AST stays intact and other
-    /// diagnostics keep running), but a buffer that ships with literal `${}`
-    /// will produce a meaningless value at apply time — so the user wants a
-    /// hint that the placeholder is unfilled. An empty body only admits spaces
-    /// and tabs, so it cannot cross a line; non-empty expressions use normal
-    /// trivia, including newlines at either edge. See #2480 and #3959.
+    /// Run the same typed parser-placeholder boundary as CLI validation.
     ///
-    /// The shared source lexer is used rather than an AST walk: the parser
-    /// stamps the empty case as
-    /// `Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::EmptyInterpolation))` but discards the
-    /// source span, so the diagnostic range has to come from a source-level
-    /// pass anyway. Sharing this lexer also keeps heredoc boundaries aligned
-    /// with semantic tokens and completion.
-    pub(super) fn check_empty_interpolations(&self, doc: &Document) -> Vec<Diagnostic> {
-        crate::lex::lex(&doc.text())
+    /// `EmptyInterpolation` does not retain a parser span today, so the lexer
+    /// is used only to project already-confirmed boundary errors onto their
+    /// exact `${}` ranges. It is not an independent diagnostic source.
+    pub(super) fn check_expansion_boundary(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        boundary: ParserPlaceholderBoundary,
+    ) -> Vec<Diagnostic> {
+        let Err(leftovers) = parsed.validate_expansion_boundary(boundary) else {
+            return Vec::new();
+        };
+        let mut empty_ranges = crate::lex::lex(&doc.text())
             .interpolations()
             .iter()
             .copied()
@@ -2941,13 +2939,35 @@ impl DiagnosticEngine {
             .filter_map(|span| {
                 let end = span.end?;
                 debug_assert_eq!(span.start.line, end.line);
-                Some(carina_diagnostic(
-                    span.start.line,
-                    span.start.character,
-                    end.character,
-                    DiagnosticSeverity::WARNING,
-                    "empty interpolation `${}` — fill in the expression or remove it".to_string(),
-                ))
+                Some((span.start.line, span.start.character, end.character))
+            })
+            .collect::<VecDeque<_>>();
+        let text = doc.text();
+
+        leftovers
+            .into_errors()
+            .into_iter()
+            .map(|error| {
+                let (line, start_col, end_col, severity) = match error.placeholder() {
+                    ParserPlaceholder::EmptyInterpolation => {
+                        let (line, start_col, end_col) =
+                            empty_ranges.pop_front().unwrap_or((0, 0, 0));
+                        (line, start_col, end_col, DiagnosticSeverity::WARNING)
+                    }
+                    ParserPlaceholder::ModuleArgument { source_line, .. } => {
+                        let line = source_line.get().unwrap_or(1).saturating_sub(1) as u32;
+                        let end_col = text
+                            .lines()
+                            .nth(line as usize)
+                            .map(|line| line.chars().count() as u32)
+                            .unwrap_or(0);
+                        (line, 0, end_col, DiagnosticSeverity::ERROR)
+                    }
+                    ParserPlaceholder::FnParam { .. }
+                    | ParserPlaceholder::FnLocal { .. }
+                    | ParserPlaceholder::Loop(_) => (0, 0, 0, DiagnosticSeverity::ERROR),
+                };
+                carina_diagnostic(line, start_col, end_col, severity, error.to_string())
             })
             .collect()
     }

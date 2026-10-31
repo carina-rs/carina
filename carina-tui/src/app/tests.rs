@@ -112,7 +112,6 @@ fn deferred_create_uses_create_symbol_and_kind() {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: Vec::new(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },

@@ -112,8 +112,8 @@ pub fn deferred_for_detail_rows<S>(
     let mut rows = vec![DetailRow::Text {
         text: format!("<- {}", template.header),
     }];
-    let mut attrs: Vec<_> = template.attributes.iter().collect();
-    attrs.sort_by_key(|(key, _)| key.clone());
+    let mut attrs: Vec<_> = template.template_resource.attributes.iter().collect();
+    attrs.sort_by_key(|(name, _)| *name);
     rows.extend(attrs.into_iter().map(|(key, value)| DetailRow::Attribute {
         key: key.clone(),
         value: render_deferred_for_template_value(value, upstream_binding, verb),
@@ -609,7 +609,6 @@ mod tests {
             line: 1,
             header: "for x in (up.items ?? fallback.items)".to_string(),
             resource_type: "test.Child".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "children".to_string(),
             },
@@ -903,7 +902,6 @@ mod tests {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "validation_records".to_string(),
             },
@@ -979,7 +977,6 @@ mod tests {
             line: 1,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "aws.route53.Record".to_string(),
-            attributes: Vec::new(),
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "validation_records".to_string(),
             },

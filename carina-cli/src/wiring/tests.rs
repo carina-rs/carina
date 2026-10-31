@@ -8812,7 +8812,6 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         line: 4,
         header: "for item in pending.items".to_string(),
         resource_type: "test.thing".to_string(),
-        attributes: vec![("rule".to_string(), rule)],
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "items".to_string(),
         },
@@ -8850,7 +8849,6 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
             .attributes
             .contains_key("rules")
     );
-    assert_eq!(evaluated_deferred.attributes[0].0, "rules");
 
     let unresolved_resources = canonical_unresolved.unresolved();
     assert!(unresolved_resources[0].attributes.contains_key("rules"));
@@ -10142,7 +10140,6 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
         line: 12,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: vec![],
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },

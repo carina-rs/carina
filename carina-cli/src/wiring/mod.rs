@@ -1891,16 +1891,7 @@ pub(crate) fn provider_loading_configs<P: PlaceholderKind>(
 ) -> Vec<ProviderConfig> {
     providers
         .iter()
-        .map(|provider| ProviderConfig {
-            name: provider.name.clone(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
-            source: provider.source.clone(),
-            version: provider.version.clone(),
-            revision: provider.revision.clone(),
-            unresolved_attributes: IndexMap::new(),
-            binding: provider.binding.clone(),
-        })
+        .map(ProviderConfig::loading_projection)
         .collect()
 }
 

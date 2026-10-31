@@ -1505,7 +1505,6 @@ impl EffectWithSource<ModuleSource> {
                         line: 12,
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
                         target: crate::parser::DeferredForTarget::Bound {
                             binding: "validation_records".to_string(),
                         },
@@ -1544,7 +1543,6 @@ impl EffectWithSource<ModuleSource> {
                         line: 12,
                         header: "for opt in cert.domain_validation_options".to_string(),
                         resource_type: "route53.Record".to_string(),
-                        attributes: vec![],
                         target: crate::parser::DeferredForTarget::Bound {
                             binding: "validation_records".to_string(),
                         },
@@ -2257,7 +2255,6 @@ mod tests {
             line: 12,
             header: "for opt in cert.domain_validation_options".to_string(),
             resource_type: "route53.Record".to_string(),
-            attributes: vec![],
             target: crate::parser::DeferredForTarget::Bound {
                 binding: "validation_records".to_string(),
             },

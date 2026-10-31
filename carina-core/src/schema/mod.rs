@@ -11546,12 +11546,6 @@ fn resolve_file_block_names<
             std::slice::from_mut(&mut deferred.template_resource),
             registry,
         ));
-        deferred.attributes = deferred
-            .template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
     }
     conflicts
 }
@@ -11593,12 +11587,6 @@ fn resolve_file_block_names_with_authored<E, A>(
             authored_resources,
             registry,
         ));
-        deferred.attributes = deferred
-            .template_resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
     }
     conflicts
 }

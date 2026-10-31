@@ -780,23 +780,6 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 preserve_failed_user_calls,
             )?;
         }
-        for (key, value) in &mut deferred.attributes {
-            // `attributes` is the display projection of the same template.
-            // Reuse the evaluated resource value so effect serialization is
-            // consistent and side-effecting evaluators such as `decrypt()`
-            // run only once.
-            if let Some(evaluated) = deferred.template_resource.attributes.get(key) {
-                *value = evaluated.clone();
-            } else {
-                *value = resolve_function_calls_only(
-                    value,
-                    &binding_map,
-                    &fn_ctx,
-                    defer_unknown_functions,
-                    preserve_failed_user_calls,
-                )?;
-            }
-        }
     }
 
     // Resolve top-level `let v = ...` bindings that contain
@@ -2226,13 +2209,6 @@ for item in source.arn {
         let template = &parsed.deferred_for_expressions[0].template_resource;
         assert!(matches!(
             template.attributes.get("comment"),
-            Some(Value::Deferred(DeferredValue::Secret(_)))
-        ));
-        assert!(matches!(
-            parsed.deferred_for_expressions[0]
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "comment").then_some(value)),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
     }

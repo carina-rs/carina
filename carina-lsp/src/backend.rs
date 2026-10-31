@@ -165,27 +165,11 @@ pub type ProviderInstallProber = Arc<
 pub type ProviderInstallFingerprint =
     std::result::Result<ProviderArtifactFingerprint, LegacyLockEntryError>;
 
-/// Compute `(provider_name, metadata)` pairs for a list of configs.
+/// Compute `(provider_name, metadata)` pairs for discovered configs.
 /// Ordered to match the input so equality comparisons are stable.
-trait FactoryConfigRef {
-    fn factory_config(&self) -> &carina_core::parser::ProviderConfig;
-}
-
-impl FactoryConfigRef for carina_core::parser::ProviderConfig {
-    fn factory_config(&self) -> &carina_core::parser::ProviderConfig {
-        self
-    }
-}
-
-impl FactoryConfigRef for workspace::DiscoveredProviderConfig {
-    fn factory_config(&self) -> &carina_core::parser::ProviderConfig {
-        workspace::DiscoveredProviderConfig::factory_config(self)
-    }
-}
-
-fn probe_install_fingerprint<C: FactoryConfigRef>(
+fn probe_install_fingerprint(
     prober: &ProviderInstallProber,
-    configs: &[(PathBuf, C)],
+    configs: &[(PathBuf, workspace::DiscoveredProviderConfig)],
 ) -> Vec<(String, ProviderInstallFingerprint)> {
     configs
         .iter()
@@ -893,28 +877,15 @@ async fn load_schemas_impl(
 /// `VersionConstraint` compares its raw DSL form, so two configs parsed from
 /// the same source text compare equal even when their internal
 /// `semver::VersionReq` representation differs.
-trait ProviderConfigMatch {
-    fn matches(&self, other: &Self) -> bool;
-}
-
-impl ProviderConfigMatch for carina_core::parser::ProviderConfig {
-    fn matches(&self, other: &Self) -> bool {
-        self == other
-    }
-}
-
-impl ProviderConfigMatch for workspace::DiscoveredProviderConfig {
-    fn matches(&self, other: &Self) -> bool {
-        self.comparison_key() == other.comparison_key()
-    }
-}
-
-fn configs_match<C: ProviderConfigMatch>(a: &[(PathBuf, C)], b: &[(PathBuf, C)]) -> bool {
+fn configs_match(
+    a: &[(PathBuf, workspace::DiscoveredProviderConfig)],
+    b: &[(PathBuf, workspace::DiscoveredProviderConfig)],
+) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b)
             .all(|((a_dir, a_config), (b_dir, b_config))| {
-                a_dir == b_dir && a_config.matches(b_config)
+                a_dir == b_dir && a_config.comparison_key() == b_config.comparison_key()
             })
 }
 
@@ -1405,20 +1376,12 @@ let duplicate = mock.test.resource {
         })
     }
 
-    /// Stub prober for tests: selects the file named by `_installed_at`, then
-    /// records the same cheap metadata shape as the production resolver.
-    fn test_prober() -> ProviderInstallProber {
-        Arc::new(|dir, cfg| {
-            let artifact = cfg
-                .attributes
-                .get("_installed_at")
-                .and_then(|v| match v {
-                    carina_core::resource::Value::Concrete(
-                        carina_core::resource::ConcreteValue::String(s),
-                    ) => Some(s.expose_plaintext()),
-                    _ => None,
-                })
-                .and_then(|p| test_file_fingerprint(std::path::Path::new(p)));
+    /// Stub prober for tests: records the same cheap metadata shape as the
+    /// production resolver without smuggling resolver inputs through provider
+    /// configuration attributes.
+    fn test_prober(installed_at: Option<PathBuf>) -> ProviderInstallProber {
+        Arc::new(move |dir, _cfg| {
+            let artifact = installed_at.as_deref().and_then(test_file_fingerprint);
             Ok(ProviderArtifactFingerprint {
                 artifact,
                 lock_file: test_file_fingerprint(&dir.join("carina-providers.lock")),
@@ -1435,31 +1398,25 @@ let duplicate = mock.test.resource {
     #[test]
     fn install_fingerprint_flips_when_local_wasm_is_deleted() {
         use carina_core::parser::ProviderConfig;
-        use carina_core::resource::{ConcreteValue, Value};
+        use carina_core::resource::ParserPlaceholder;
 
         let tmp = tempfile::tempdir().unwrap();
         let installed = tmp.path().join("carina-provider-foo.wasm");
         std::fs::write(&installed, b"fake").unwrap();
 
-        let mut attributes = IndexMap::new();
-        attributes.insert(
-            "_installed_at".to_string(),
-            Value::Concrete(ConcreteValue::String(
-                installed.display().to_string().into(),
-            )),
-        );
-        let config = ProviderConfig {
-            name: "foo".into(),
-            source: Some("github.com/carina-rs/stub".parse().unwrap()),
-            version: None,
-            revision: None,
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-            attributes,
-            default_tags: IndexMap::new(),
-        };
+        let config =
+            workspace::DiscoveredProviderConfig::from_parser(ProviderConfig::<ParserPlaceholder> {
+                name: "foo".into(),
+                source: Some("github.com/carina-rs/stub".parse().unwrap()),
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+            });
         let configs = vec![(tmp.path().to_path_buf(), config)];
-        let prober = test_prober();
+        let prober = test_prober(Some(installed.clone()));
 
         let before = probe_install_fingerprint(&prober, &configs);
         assert!(
@@ -1479,19 +1436,21 @@ let duplicate = mock.test.resource {
     #[test]
     fn install_fingerprint_stable_when_nothing_changes() {
         use carina_core::parser::ProviderConfig;
+        use carina_core::resource::ParserPlaceholder;
         let tmp = tempfile::tempdir().unwrap();
-        let config = ProviderConfig {
-            name: "missing".into(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
-        };
+        let config =
+            workspace::DiscoveredProviderConfig::from_parser(ProviderConfig::<ParserPlaceholder> {
+                name: "missing".into(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+            });
         let configs = vec![(tmp.path().to_path_buf(), config)];
-        let prober = test_prober();
+        let prober = test_prober(None);
         assert_eq!(
             probe_install_fingerprint(&prober, &configs),
             probe_install_fingerprint(&prober, &configs),
@@ -1504,10 +1463,10 @@ let duplicate = mock.test.resource {
 mod reload_skip_tests {
     use super::*;
     use carina_core::parser::ProviderConfig;
-    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::resource::{ConcreteValue, ParserPlaceholder, Value};
     use indexmap::IndexMap;
 
-    fn mk_config(name: &str, source: Option<&str>) -> ProviderConfig {
+    fn mk_config(name: &str, source: Option<&str>) -> ProviderConfig<ParserPlaceholder> {
         ProviderConfig {
             name: name.into(),
             attributes: IndexMap::new(),
@@ -1520,6 +1479,12 @@ mod reload_skip_tests {
         }
     }
 
+    fn discovered(
+        config: ProviderConfig<ParserPlaceholder>,
+    ) -> workspace::DiscoveredProviderConfig {
+        workspace::DiscoveredProviderConfig::from_parser(config)
+    }
+
     // #2136: save of a non-provider `.crn` must not trigger a
     // FactoryBuilder rebuild. `configs_match` is the gate that keeps
     // `load_schemas_impl` from re-running the expensive WASM parse when
@@ -1529,11 +1494,17 @@ mod reload_skip_tests {
         let dir = std::path::PathBuf::from("/tmp/x");
         let a = vec![(
             dir.clone(),
-            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+            discovered(mk_config(
+                "awscc",
+                Some("github.com/carina-rs/carina-provider-awscc"),
+            )),
         )];
         let b = vec![(
             dir,
-            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+            discovered(mk_config(
+                "awscc",
+                Some("github.com/carina-rs/carina-provider-awscc"),
+            )),
         )];
         assert!(configs_match(&a, &b));
     }
@@ -1543,9 +1514,15 @@ mod reload_skip_tests {
         let dir = std::path::PathBuf::from("/tmp/x");
         let a = vec![(
             dir.clone(),
-            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+            discovered(mk_config(
+                "awscc",
+                Some("github.com/carina-rs/carina-provider-awscc"),
+            )),
         )];
-        let b = vec![(dir, mk_config("awscc", Some("file:///local/awscc")))];
+        let b = vec![(
+            dir,
+            discovered(mk_config("awscc", Some("file:///local/awscc"))),
+        )];
         assert!(!configs_match(&a, &b));
     }
 
@@ -1554,16 +1531,25 @@ mod reload_skip_tests {
         let dir = std::path::PathBuf::from("/tmp/x");
         let a = vec![(
             dir.clone(),
-            mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+            discovered(mk_config(
+                "awscc",
+                Some("github.com/carina-rs/carina-provider-awscc"),
+            )),
         )];
         let b = vec![
             (
                 dir.clone(),
-                mk_config("awscc", Some("github.com/carina-rs/carina-provider-awscc")),
+                discovered(mk_config(
+                    "awscc",
+                    Some("github.com/carina-rs/carina-provider-awscc"),
+                )),
             ),
             (
                 dir,
-                mk_config("aws", Some("github.com/carina-rs/carina-provider-aws")),
+                discovered(mk_config(
+                    "aws",
+                    Some("github.com/carina-rs/carina-provider-aws"),
+                )),
             ),
         ];
         assert!(!configs_match(&a, &b));
@@ -1582,8 +1568,8 @@ mod reload_skip_tests {
             "region".into(),
             Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
         );
-        let a = vec![(dir.clone(), cfg_a)];
-        let b = vec![(dir, cfg_b)];
+        let a = vec![(dir.clone(), discovered(cfg_a))];
+        let b = vec![(dir, discovered(cfg_b))];
         assert!(!configs_match(&a, &b));
     }
 
@@ -1615,7 +1601,7 @@ mod reload_skip_tests {
     }
 
     #[test]
-    fn discovered_configs_match_keeps_empty_interpolation_in_comparison_key() {
+    fn discovered_provider_factory_projection_is_attribute_free() {
         let fixture = tempfile::tempdir().unwrap();
         let provider_file = fixture.path().join("provider.crn");
         let discover = || {
@@ -1630,23 +1616,31 @@ mod reload_skip_tests {
         std::fs::write(&provider_file, "provider awscc {}\n").unwrap();
         let missing = discover();
 
-        std::fs::write(&provider_file, "provider awscc { region = \"${}\" }\n").unwrap();
+        std::fs::write(
+            &provider_file,
+            "provider awscc { region = 'ap-northeast-1' profile = \"${}\" }\n",
+        )
+        .unwrap();
         let placeholder = discover();
         assert!(
             placeholder[0]
                 .1
                 .comparison_key()
                 .attributes
-                .contains_key("region"),
+                .contains_key("profile"),
             "the discovery key must retain the parser-stage placeholder",
         );
         assert!(
-            !placeholder[0]
+            placeholder[0]
                 .1
-                .factory_config()
+                .comparison_key()
                 .attributes
                 .contains_key("region"),
-            "the provider factory must receive only expanded attributes",
+            "the discovery key must retain concrete attributes too",
+        );
+        assert!(
+            placeholder[0].1.factory_config().attributes.is_empty(),
+            "provider loading reads only identity/source metadata and must receive no attributes",
         );
 
         std::fs::write(
@@ -1689,8 +1683,8 @@ mod reload_skip_tests {
             "region".into(),
             Value::Concrete(ConcreteValue::String("us-east-1".into())),
         );
-        let a = vec![(dir.clone(), cfg_a)];
-        let b = vec![(dir, cfg_b)];
+        let a = vec![(dir.clone(), discovered(cfg_a))];
+        let b = vec![(dir, discovered(cfg_b))];
         assert!(configs_match(&a, &b));
     }
 }
