@@ -209,7 +209,13 @@ There are two expiry clocks, and each side owns one:
 
 - **Base credentials** (SSO role credentials, env keys, ECS/IMDS) belong
   to the host. The host's identity cache refreshes them near expiry, using
-  the SSO token cache for SSO. The guest sees them through
+  the SSO token cache for SSO. The host never starts an interactive
+  login: no browser, no device-code prompt, and no `aws sso login`
+  subprocess. It only reads the token cache and refreshes the token with
+  the SSO OIDC refresh token when one is present, which is how
+  `aws_config`'s SSO provider already behaves. A test with an expired,
+  non-refreshable token asserts a prompt `provider-failed` error that names
+  `aws sso login`, and no child process. The guest sees them through
   `HostCredentialsProvider`, whose `expires-at` makes the guest's identity
   cache ask the host again before expiry. If the SSO session itself has
   ended, the refresh fails as `provider-failed` with the SDK's message (for
