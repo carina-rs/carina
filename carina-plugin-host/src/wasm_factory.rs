@@ -10373,13 +10373,13 @@ mod tests {
         };
         let closed_address = socket.local_addr().unwrap();
 
-        let resolver = StubResolver {
-            addresses: HashMap::from([("closed.amazonaws.com".to_string(), vec![closed_address])]),
-        };
-        let mut hooks = AllowListHttpHooks::with_resolver(
+        let mut hooks = AllowListHttpHooks::with_test_route(
             local_provider_label("mock_http"),
             amazonaws_network(ProviderKind::Untrusted),
-            Arc::new(resolver),
+            Some(HttpTestRoute::new(
+                "closed.amazonaws.com".to_string(),
+                closed_address,
+            )),
         );
         let request = hyper::Request::builder()
             .uri(format!(
