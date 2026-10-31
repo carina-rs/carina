@@ -3031,8 +3031,15 @@ mod tests {
         // metadata. Round-trip here so the display path proves that desired
         // default-tag provenance survives serialization without being copied
         // into ReplaceDisplayMetadata.
-        let plan =
-            serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let saved = SavedPlan::from(plan);
+        let encoded = serde_json::to_value(crate::plan::UnresolvedSavedPlan::from(saved)).unwrap();
+        let plan = crate::plan::UnresolvedSavedPlan::decode_format_37(
+            encoded,
+            &crate::dependency::ResolvedDependencyScope::empty(),
+        )
+        .unwrap()
+        .resolve_with_schemas(&crate::schema::SchemaRegistry::new())
+        .unwrap();
         let Effect::Create(saved_to) = &plan.effects()[0] else {
             panic!("replacement create effect must survive saved-plan round trip");
         };

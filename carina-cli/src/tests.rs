@@ -137,6 +137,84 @@ fn saved_plan_load_preserves_dependency_on_unchanged_resource() {
 }
 
 #[test]
+fn saved_plan_load_rejects_tampered_dependency_identity() {
+    let role = Resource::with_provider("mock", "test.Role", "role", None).with_binding("role");
+    let mut bucket =
+        Resource::with_provider("mock", "test.Bucket", "bucket", None).with_binding("bucket");
+    bucket.directives.depends_on.push("role".to_string());
+    let resources = vec![role, bucket.clone()];
+    let scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        &resources,
+        &[] as &[DataSource],
+        std::iter::empty(),
+    );
+    let dependencies = scope
+        .resolve_resource(&bucket)
+        .expect("plan-time dependency resolves");
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(ResolvedResource::new_with_dependencies(
+        bucket,
+        dependencies,
+    )));
+
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-31T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: resources.clone(),
+            unresolved_resources: resources,
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
+    let encoded = serde_json::to_value(plan_file).expect("serialize format-37 plan");
+    let mut tampered_effect = encoded.clone();
+    tampered_effect["plan"]["effects"][0]["Create"]["explicit_dependencies"][0]["identity"] =
+        serde_json::json!("forged-role-identity");
+
+    let error = serde_json::from_value::<PlanFile>(tampered_effect)
+        .expect_err("saved-plan load must reject a dependency identity not owned by its binding");
+
+    assert!(
+        error.to_string().contains("role")
+            && error.to_string().contains("forged-role-identity")
+            && error.to_string().contains("does not match"),
+        "unexpected saved-plan error: {error}",
+    );
+
+    let mut tampered_resource_evidence = encoded;
+    tampered_resource_evidence["resource_dependency_evidence"][1]["explicit_dependencies"][0]["identity"] =
+        serde_json::json!("forged-role-identity");
+
+    let error = serde_json::from_value::<PlanFile>(tampered_resource_evidence).expect_err(
+        "saved resource dependency evidence must reject an identity not owned by its binding",
+    );
+
+    assert!(
+        error.to_string().contains("role")
+            && error.to_string().contains("forged-role-identity")
+            && error.to_string().contains("does not match"),
+        "unexpected saved resource evidence error: {error}",
+    );
+}
+
+#[test]
 fn skip_resource_validation_cannot_bypass_pending_bare_binding_uses() {
     let fixture = tempfile::tempdir().expect("pending binding fixture");
     std::fs::write(

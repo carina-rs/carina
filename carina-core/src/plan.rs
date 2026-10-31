@@ -9,8 +9,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
-    UnresolvedSavedEffect,
+    ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, PersistedUnresolvedSavedEffect,
+    SavedEffect, TemporaryName, UnresolvedSavedEffect,
 };
 use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
@@ -617,11 +617,8 @@ impl IgnoredChangeSummary {
 }
 
 /// Plan containing Effects to be executed
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "S: Serialize + Clone",
-    deserialize = "S: Deserialize<'de>"
-))]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(bound(serialize = "S: Serialize + Clone"))]
 pub struct Plan<S = ModuleSource> {
     effects: Vec<EffectWithSource<S>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -656,7 +653,7 @@ pub type SavedPlan = Plan<SavedModuleSource>;
 
 /// Deserialized saved-plan effects before managed resources have crossed the
 /// fingerprint-checked schema-resolution boundary.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnresolvedSavedPlan {
     effects: Vec<UnresolvedSavedEffect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -668,6 +665,21 @@ pub struct UnresolvedSavedPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<PlanError>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    abandoned_deposed: Vec<AbandonedDeposedGeneration>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PersistedUnresolvedSavedPlan {
+    effects: Vec<PersistedUnresolvedSavedEffect>,
+    #[serde(default)]
+    ignored_change_summaries: Vec<IgnoredChangeSummary>,
+    #[serde(default)]
+    replace_display: Vec<ReplaceDisplayMetadata>,
+    #[serde(default)]
+    permanent_name_overrides: Vec<PermanentNameOverride>,
+    #[serde(default)]
+    errors: Vec<PlanError>,
+    #[serde(default)]
     abandoned_deposed: Vec<AbandonedDeposedGeneration>,
 }
 
@@ -696,6 +708,31 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
 }
 
 impl UnresolvedSavedPlan {
+    /// Decode format-37 saved effects and promote persisted dependency pairs
+    /// only after they match the saved plan's own binding/identity scope.
+    #[doc(hidden)]
+    pub fn decode_format_37(
+        value: serde_json::Value,
+        dependency_scope: &crate::dependency::ResolvedDependencyScope,
+    ) -> Result<Self, String> {
+        let persisted = serde_json::from_value::<PersistedUnresolvedSavedPlan>(value)
+            .map_err(|error| error.to_string())?;
+        let effects = persisted
+            .effects
+            .into_iter()
+            .map(|effect| effect.promote_dependencies(dependency_scope))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            effects,
+            ignored_change_summaries: persisted.ignored_change_summaries,
+            replace_display: persisted.replace_display,
+            permanent_name_overrides: persisted.permanent_name_overrides,
+            errors: persisted.errors,
+            abandoned_deposed: persisted.abandoned_deposed,
+        })
+    }
+
     pub fn add(&mut self, effect: UnresolvedSavedEffect) {
         self.effects.push(effect);
     }
@@ -1307,11 +1344,17 @@ mod tests {
     }
 
     fn deserialize_plan(json: &str) -> SavedPlan {
-        serde_json::from_str::<SavedPlan>(json).unwrap()
+        deserialize_plan_value(serde_json::from_str(json).unwrap())
     }
 
     fn deserialize_plan_value(value: serde_json::Value) -> SavedPlan {
-        serde_json::from_value::<SavedPlan>(value).unwrap()
+        UnresolvedSavedPlan::decode_format_37(
+            value,
+            &crate::dependency::ResolvedDependencyScope::empty(),
+        )
+        .unwrap()
+        .resolve_with_schemas(&crate::schema::SchemaRegistry::new())
+        .unwrap()
     }
 
     #[test]
@@ -1332,9 +1375,9 @@ mod tests {
         )));
 
         let unresolved = UnresolvedSavedPlan::from(SavedPlan::from(plan));
-        let wire = serde_json::to_vec(&unresolved).expect("saved plan serializes");
-        let decoded: UnresolvedSavedPlan =
-            serde_json::from_slice(&wire).expect("saved plan deserializes");
+        let wire = serde_json::to_value(&unresolved).expect("saved plan serializes");
+        let decoded = UnresolvedSavedPlan::decode_format_37(wire, &scope)
+            .expect("saved plan dependencies match the fixture scope");
         let resolved = decoded
             .resolve_with_schemas(&crate::schema::SchemaRegistry::new())
             .expect("unchanged dependency target must not be needed as an effect owner");
@@ -1744,7 +1787,8 @@ mod tests {
         )])));
         let expected_replace_display = plan.replace_display.clone();
 
-        let json = serde_json::to_string(&plan).unwrap();
+        let unresolved = UnresolvedSavedPlan::from(SavedPlan::from(plan));
+        let json = serde_json::to_string(&unresolved).unwrap();
         let deserialized = deserialize_plan(&json);
 
         assert_eq!(deserialized.effects().len(), 2);
@@ -1954,10 +1998,11 @@ mod tests {
         let mut plan = Plan::new();
         plan.add_replacement(group);
 
-        let json = serde_json::to_string(&plan).unwrap();
+        let expected = SavedPlan::from(plan);
+        let json = serde_json::to_string(&UnresolvedSavedPlan::from(expected.clone())).unwrap();
         let deserialized = deserialize_plan(&json);
 
-        assert_eq!(deserialized, SavedPlan::from(plan));
+        assert_eq!(deserialized, expected);
     }
 
     #[test]
@@ -1975,7 +2020,8 @@ mod tests {
             },
         ));
 
-        let mut json = serde_json::to_value(&plan).unwrap();
+        let mut json =
+            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan))).unwrap();
         let object = json.as_object_mut().unwrap();
         object.remove("permanent_name_overrides");
         assert!(!object.contains_key("permanent_name_overrides"));
@@ -2001,7 +2047,8 @@ mod tests {
             },
         ));
 
-        let mut json = serde_json::to_value(&plan).unwrap();
+        let mut json =
+            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan))).unwrap();
         let object = json.as_object_mut().unwrap();
         object.remove("replace_display");
         assert!(!object.contains_key("replace_display"));
@@ -2032,10 +2079,10 @@ mod tests {
             blocked_by_updates: std::collections::HashSet::new(),
         });
 
-        let json = serde_json::to_string(&plan).unwrap();
-        let deserialized = deserialize_plan(&json);
-        assert_eq!(plan.effects().len(), deserialized.effects().len());
         let saved = SavedPlan::from(plan);
+        let json = serde_json::to_string(&UnresolvedSavedPlan::from(saved.clone())).unwrap();
+        let deserialized = deserialize_plan(&json);
+        assert_eq!(saved.effects().len(), deserialized.effects().len());
         assert_eq!(saved.effects(), deserialized.effects());
     }
 }

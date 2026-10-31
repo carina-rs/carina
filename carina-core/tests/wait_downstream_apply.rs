@@ -56,6 +56,22 @@ fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
     carina_core::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
 }
 
+fn resolve_wait_bindings(
+    resources: &[ResolvedResource],
+    waits: &[carina_core::parser::WaitBinding],
+) -> Vec<carina_core::dependency::ResolvedWaitBinding> {
+    let scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        resources,
+        &[] as &[carina_core::resource::DataSource],
+        std::iter::empty(),
+    );
+    waits
+        .iter()
+        .cloned()
+        .map(|wait| scope.resolve_wait(wait).expect("wait dependency resolves"))
+        .collect()
+}
+
 fn managed_current(states: HashMap<ResourceId, State>) -> HashMap<ResourceId, Current> {
     states
         .into_iter()
@@ -379,6 +395,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let provider = fixture_provider(&resources_for_plan);
     let resolved_resources_for_plan =
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let resolved_wait_bindings =
+        resolve_wait_bindings(&resolved_resources_for_plan, &parsed.wait_bindings);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -395,7 +413,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_wait_bindings,
     )
     .expect("test provider hints should succeed");
 
@@ -557,6 +575,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let provider = fixture_provider(&resources_for_plan);
     let resolved_resources_for_plan =
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let resolved_wait_bindings =
+        resolve_wait_bindings(&resolved_resources_for_plan, &parsed.wait_bindings);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -573,7 +593,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_wait_bindings,
     )
     .expect("test provider hints should succeed");
     assert!(
@@ -743,6 +763,8 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let provider = fixture_provider(&resources_for_plan);
     let resolved_resources_for_plan =
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let resolved_wait_bindings =
+        resolve_wait_bindings(&resolved_resources_for_plan, &parsed.wait_bindings);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -759,7 +781,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_wait_bindings,
     )
     .expect("test provider hints should succeed");
     assert!(

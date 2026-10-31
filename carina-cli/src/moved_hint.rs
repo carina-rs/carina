@@ -474,7 +474,7 @@ mod tests {
 
     use carina_core::effect::{Effect, EffectGeneration};
     use carina_core::parser::{ProviderContext, StateBlock, parse_file};
-    use carina_core::plan::Plan;
+    use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
     use carina_core::provider::AppliedIdentifier;
     use carina_core::resource::{
         ApplyTimeUnknown, ConcreteValue, Current, DeferredValue, DeposedKey, Directives,
@@ -907,7 +907,8 @@ mod tests {
             EffectGeneration::Current,
         );
         add_create(&mut plan, id("vpcs[0]", None), concrete_string(CIDR));
-        let mut encoded = serde_json::to_value(&plan).expect("test plan must serialize");
+        let mut encoded = serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
+            .expect("test plan must serialize");
         let previous_attributes =
             HashMap::from([(CREATE_ONLY_ATTRIBUTE.to_string(), concrete_string(CIDR))]);
         encoded["replace_display"] = serde_json::json!([{
@@ -919,8 +920,13 @@ mod tests {
             "temporary_name": null,
             "previous_attributes": previous_attributes,
         }]);
-        let plan: carina_core::plan::SavedPlan =
-            serde_json::from_value(encoded).expect("replacement plan must deserialize");
+        let plan = UnresolvedSavedPlan::decode_format_37(
+            encoded,
+            &carina_core::dependency::ResolvedDependencyScope::empty(),
+        )
+        .expect("replacement plan must decode")
+        .resolve_with_schemas(&schemas(true))
+        .expect("replacement plan must resolve");
 
         let hints = detect_moved_block_hints(&plan, &prior, &schemas(true));
 

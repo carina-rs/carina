@@ -305,7 +305,10 @@ impl<'a, S> FailureView<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::EffectGeneration;
+    use crate::effect::{
+        DeferredReplaceDelete, DeferredReplacePayload, EffectGeneration, NonEmptyDeletes,
+    };
+    use crate::resource::{DataSource, Directives, ResolvedResource, Resource};
 
     #[test]
     fn cross_phase_unbound_failure_uses_source_location_not_scheduler_key() {
@@ -355,5 +358,78 @@ mod tests {
             .expect("the cross-phase dependency must be recognized");
 
         assert!(matches!(failed, FailedDependency::Labeled(label) if label == "main.crn:2"));
+    }
+
+    #[test]
+    fn failed_explicit_dependency_pre_skips_deferred_children() {
+        let gate = Resource::new("test.Gate", "gate").with_binding("gate");
+        let parsed = crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             let children = for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("deferred-loop fixture parses")
+        .into_expanded()
+        .expect("deferred-loop fixture contains no parser placeholders");
+        let mut template = parsed.deferred_for_expressions()[0].clone();
+        template
+            .template_resource
+            .directives
+            .depends_on
+            .push("gate".to_string());
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            std::slice::from_ref(&gate),
+            &[] as &[DataSource],
+            std::iter::empty(),
+        );
+        let explicit_dependencies = scope
+            .resolve_resource(&template.template_resource)
+            .expect("template dependency resolves in the complete planning scope");
+        let deferred_id = crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "children",
+        ));
+        let effects = vec![
+            Effect::Create(ResolvedResource::new(gate)),
+            Effect::DeferredCreate {
+                id: deferred_id.clone(),
+                template: Box::new(template.clone()),
+                explicit_dependencies: explicit_dependencies.clone(),
+            },
+            Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "test.Child",
+                        "children[0]",
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("child-0"),
+                    directives: Directives::default(),
+                    binding: Some("children[0]".to_string()),
+                    dependencies: HashSet::new(),
+                    explicit_dependencies: HashSet::new(),
+                    blocked_by_updates: HashSet::new(),
+                }])
+                .expect("fixture has one delete"),
+                id: deferred_id,
+                template: Box::new(template),
+                explicit_dependencies,
+            })),
+        ];
+        let deps_of = HashMap::new();
+        let failed_indices = HashSet::from([0]);
+        let view = FailureView::new(&effects, &deps_of, &failed_indices);
+
+        for deferred_idx in [1, 2] {
+            assert!(
+                matches!(
+                    view.find_failed_dependency(deferred_idx),
+                    Some(FailedDependency::Labeled(label)) if label == "gate"
+                ),
+                "deferred effect {deferred_idx} must be pre-skipped after gate fails",
+            );
+        }
     }
 }

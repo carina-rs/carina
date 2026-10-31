@@ -1,0 +1,22 @@
+{
+  "version": 3,
+  "serial": 1,
+  "lineage": "state-show-composition-dependency",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "test.resource",
+      "identity": "consumer",
+      "provider": "mock",
+      "identifier": "consumer-id",
+      "attributes": { "name": "consumer" },
+      "protected": false,
+      "directives": { "depends_on": ["module_call"] },
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["name"],
+      "binding": "consumer",
+      "dependency_bindings": []
+    }
+  ]
+}

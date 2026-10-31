@@ -3,7 +3,8 @@
 //! Parser types retain authored strings. Live planning crosses this module
 //! once: every name is matched against the managed bindings in scope and
 //! lowered to [`ResolvedDependencyTarget`]. Format-37 saved plans persist that
-//! resolver-produced proof and decode it here without re-resolving names.
+//! resolver-produced proof and promote it only after every recorded pair
+//! matches the saved plan's binding-to-identity scope.
 //! The target's fields are private so scheduling code cannot manufacture an
 //! edge from an unchecked runtime string.
 
@@ -48,9 +49,20 @@ impl ResolvedDependencyTarget {
 
 /// Deduplicated explicit dependency targets.
 ///
-/// Non-empty values can only be created by this module's resolver or decoded
-/// from its persisted format-37 proof. Empty is public because effects with no
+/// Non-empty values can only be created by this module's resolver or promoted
+/// by the format-37 loader after its persisted binding/identity pairs match the
+/// saved plan's own dependency scope. Empty is public because effects with no
 /// authored ordering edges need no authority.
+///
+/// Raw serde input cannot mint resolver evidence:
+///
+/// ```compile_fail
+/// use carina_core::dependency::ResolvedDependencies;
+///
+/// let _: ResolvedDependencies = serde_json::from_str(
+///     r#"[{"binding":"gate","identity":"forged"}]"#,
+/// ).unwrap();
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedDependencies(HashMap<String, ResolvedDependencyTarget>);
 
@@ -113,34 +125,15 @@ impl Serialize for ResolvedDependencies {
     }
 }
 
-impl<'de> Deserialize<'de> for ResolvedDependencies {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct PersistedDependencyTarget {
-            binding: String,
-            identity: ResourceIdentity,
-        }
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct PersistedDependencies(Vec<PersistedDependencyTarget>);
 
-        let raw = Vec::<PersistedDependencyTarget>::deserialize(deserializer)?;
-        let mut targets = HashMap::with_capacity(raw.len());
-        for target in raw {
-            let binding = target.binding;
-            let resolved = ResolvedDependencyTarget {
-                binding: binding.clone(),
-                identity: target.identity,
-            };
-            if targets.insert(binding.clone(), resolved).is_some() {
-                return Err(serde::de::Error::custom(format!(
-                    "duplicate persisted dependency target '{binding}'"
-                )));
-            }
-        }
-        Ok(Self(targets))
-    }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedDependencyTarget {
+    binding: String,
+    identity: ResourceIdentity,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -199,6 +192,21 @@ pub enum DependencyResolutionError {
     PendingTargetIdentity { binding: String },
     #[error("resolved dependency metadata does not match authored depends_on on {owner}")]
     MetadataMismatch { owner: String },
+    #[error("{owner}: duplicate persisted dependency binding '{binding}'")]
+    DuplicatePersistedTarget { owner: String, binding: String },
+    #[error(
+        "{owner}: persisted dependency binding '{binding}' is not a resolved managed target in this saved plan"
+    )]
+    PersistedTargetMissing { owner: String, binding: String },
+    #[error(
+        "{owner}: persisted dependency binding '{binding}' identity '{recorded}' does not match saved-plan identity '{expected}'"
+    )]
+    PersistedIdentityMismatch {
+        owner: String,
+        binding: String,
+        recorded: ResourceIdentity,
+        expected: ResourceIdentity,
+    },
     #[error(
         "provider satisfier hint named binding '{dependency}', which is not declared in this scope"
     )]
@@ -396,6 +404,48 @@ impl ResolvedDependencyScope {
             }
         }
         self
+    }
+
+    pub(crate) fn promote_persisted(
+        &self,
+        owner: impl Into<String>,
+        persisted: PersistedDependencies,
+    ) -> Result<ResolvedDependencies, DependencyResolutionError> {
+        let owner = owner.into();
+        let mut resolved = HashMap::with_capacity(persisted.0.len());
+        for target in persisted.0 {
+            let binding = target.binding;
+            if resolved.contains_key(&binding) {
+                return Err(DependencyResolutionError::DuplicatePersistedTarget { owner, binding });
+            }
+            let Some(expected) = self.managed.get(&binding) else {
+                return Err(DependencyResolutionError::PersistedTargetMissing { owner, binding });
+            };
+            if target.identity != expected.identity {
+                return Err(DependencyResolutionError::PersistedIdentityMismatch {
+                    owner,
+                    binding,
+                    recorded: target.identity,
+                    expected: expected.identity.clone(),
+                });
+            }
+            resolved.insert(binding, expected.clone());
+        }
+        Ok(ResolvedDependencies(resolved))
+    }
+
+    /// Decode one format-37 dependency field and validate it against this
+    /// saved plan's binding-to-identity scope before producing resolver proof.
+    #[doc(hidden)]
+    pub fn decode_format_37_dependencies(
+        &self,
+        owner: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<ResolvedDependencies, String> {
+        let persisted = serde_json::from_value::<PersistedDependencies>(value)
+            .map_err(|error| error.to_string())?;
+        self.promote_persisted(owner, persisted)
+            .map_err(|error| error.to_string())
     }
 
     fn resolve(

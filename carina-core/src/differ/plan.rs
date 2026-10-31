@@ -7,6 +7,7 @@ use crate::deps::get_resolved_dependencies;
 use crate::dependency::{ResolvedDependencyScope, ResolvedWaitBinding};
 use crate::effect::{ChangedCreateOnly, Effect, OutcomeUnknownImportReplacement, TemporaryName};
 use crate::identifier::generate_random_suffix;
+#[cfg(any(test, feature = "test-utils"))]
 use crate::parser::WaitBinding;
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
@@ -14,9 +15,11 @@ use crate::plan::{
     SchemaNotRegisteredError,
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderError, ProviderResult, ProviderRouter};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::resource::DataSource;
 use crate::resource::{
-    ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    ConcreteValue, Current, Directives, PlanInputCurrent, ResolvedDataSource, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
@@ -36,6 +39,55 @@ fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListK
             key_field: release.key_field,
             keys: release.keys,
         });
+    }
+}
+
+#[cfg(test)]
+mod dependency_boundary_tests {
+    use super::*;
+    use crate::differ::{Orphans, PlanPriorStates};
+
+    #[test]
+    fn create_plan_uses_pre_resolved_dependencies_outside_differ_scope() {
+        let composition: Resource =
+            Resource::new("test.Composition", "module_call").with_binding("module_call");
+        let mut lookup: DataSource =
+            DataSource::new("test.Lookup", "lookup").with_binding("lookup");
+        lookup.directives.depends_on.push("module_call".to_string());
+        let current_states = HashMap::new();
+        let orphans = Orphans::new();
+        let registry = SchemaRegistry::new();
+        let saved_attrs = crate::provider::RawSavedAttrs::default().lift(&registry);
+        let scope = ResolvedDependencyScope::from_resources(
+            &[] as &[Resource],
+            std::slice::from_ref(&lookup),
+            std::iter::empty(),
+        )
+        .with_declared_targets(std::slice::from_ref(&composition));
+        let dependencies = scope
+            .resolve_data_source(&lookup)
+            .expect("the caller's complete scope contains the module call");
+        let lookup = ResolvedDataSource::new_with_dependencies(lookup, dependencies)
+            .expect("resolved data source retains caller-owned dependency evidence");
+
+        let result = create_plan(
+            &[],
+            std::slice::from_ref(&lookup),
+            &ProviderRouter::new(),
+            PlanPriorStates::new(&current_states, &orphans),
+            &HashMap::new(),
+            &registry,
+            &saved_attrs,
+            &HashMap::new(),
+            &[],
+        );
+
+        assert!(
+            result.is_ok(),
+            "create_plan must consume dependency evidence resolved in the caller's complete scope (including {}): {:?}",
+            composition.id,
+            result.err(),
+        );
     }
 }
 
@@ -201,7 +253,40 @@ pub fn generate_temporary_name(
     }))
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+fn resolve_raw_planning_dependencies(
+    managed: &[ResolvedResource],
+    data_sources: &[DataSource],
+    wait_bindings: &[WaitBinding],
+) -> ProviderResult<(Vec<ResolvedDataSource>, Vec<ResolvedWaitBinding>)> {
+    let scope = ResolvedDependencyScope::from_resources(managed, data_sources, std::iter::empty());
+    let data_sources = data_sources
+        .iter()
+        .cloned()
+        .map(|data_source| {
+            let dependencies = scope
+                .resolve_data_source(&data_source)
+                .map_err(|error| ProviderError::internal(error.to_string()))?;
+            ResolvedDataSource::new_with_dependencies(data_source, dependencies)
+                .map_err(|error| ProviderError::internal(error.to_string()))
+        })
+        .collect::<ProviderResult<Vec<_>>>()?;
+    let wait_bindings = wait_bindings
+        .iter()
+        .cloned()
+        .map(|wait| {
+            scope
+                .resolve_wait(wait)
+                .map_err(|error| ProviderError::internal(error.to_string()))
+        })
+        .collect::<ProviderResult<Vec<_>>>()?;
+    Ok((data_sources, wait_bindings))
+}
+
 /// Compute Diff for multiple resources and generate a Plan
+///
+/// Data sources and wait bindings must carry dependency evidence resolved by
+/// the caller against the complete configuration scope.
 ///
 /// The `directives_map` provides prior directives for desired resources so
 /// update-before-delete ordering can recover removed `depends_on` edges.
@@ -307,52 +392,22 @@ pub fn generate_temporary_name(
 ///     &[],
 /// );
 /// ```
-fn resolve_raw_planning_dependencies(
-    managed: &[ResolvedResource],
-    data_sources: &[DataSource],
-    wait_bindings: &[WaitBinding],
-) -> ProviderResult<(Vec<ResolvedDataSource>, Vec<ResolvedWaitBinding>)> {
-    let scope = ResolvedDependencyScope::from_resources(managed, data_sources, std::iter::empty());
-    let data_sources = data_sources
-        .iter()
-        .cloned()
-        .map(|data_source| {
-            let dependencies = scope
-                .resolve_data_source(&data_source)
-                .map_err(|error| ProviderError::internal(error.to_string()))?;
-            ResolvedDataSource::new_with_dependencies(data_source, dependencies)
-                .map_err(|error| ProviderError::internal(error.to_string()))
-        })
-        .collect::<ProviderResult<Vec<_>>>()?;
-    let wait_bindings = wait_bindings
-        .iter()
-        .cloned()
-        .map(|wait| {
-            scope
-                .resolve_wait(wait)
-                .map_err(|error| ProviderError::internal(error.to_string()))
-        })
-        .collect::<ProviderResult<Vec<_>>>()?;
-    Ok((data_sources, wait_bindings))
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
     managed: &[ResolvedResource],
-    data_sources: &[DataSource],
+    data_sources: &[ResolvedDataSource],
     provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-    wait_bindings: &[WaitBinding],
+    wait_bindings: &[ResolvedWaitBinding],
 ) -> ProviderResult<Plan> {
-    let (data_sources, wait_bindings) =
-        resolve_raw_planning_dependencies(managed, data_sources, wait_bindings)?;
     create_plan_with_provider(
         managed,
-        &data_sources,
+        data_sources,
         provider,
         provider,
         prior_states,
@@ -360,7 +415,7 @@ pub fn create_plan(
         registry,
         saved_attrs,
         prev_explicit,
-        &wait_bindings,
+        wait_bindings,
     )
 }
 

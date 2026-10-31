@@ -1103,20 +1103,22 @@ fn build_plan_from_state(
             resource
         })
         .collect::<Vec<_>>();
-    // State rows describe managed resources even though this display-only
-    // projection renders them as Read effects. Resolve their persisted
-    // depends_on names against that complete managed scope before wrapping.
-    let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
-        &resources,
-        &[] as &[carina_core::resource::DataSource],
-        std::iter::empty(),
-    );
     let mut plan = Plan::new();
-    for resource in resources {
-        let dependencies = dependency_scope.resolve_data_source(&resource)?;
-        plan.add(Effect::Read {
-            resource: ResolvedDataSource::new_with_dependencies(resource, dependencies)?,
-        });
+    for mut resource in resources {
+        // This is a display-only projection, not a planning boundary. State
+        // rows do not contain module-call/composition targets, so retaining
+        // authored depends_on here would require resolving against a partial
+        // scope. The persisted dependency bindings above remain available to
+        // the TUI as historical display metadata.
+        resource.directives.depends_on.clear();
+        let binding = resource
+            .binding
+            .clone()
+            .unwrap_or_else(|| resource.id.to_string());
+        let resource = ResolvedDataSource::try_new(resource).ok_or(
+            carina_core::dependency::DependencyResolutionError::PendingTargetIdentity { binding },
+        )?;
+        plan.add(Effect::Read { resource });
     }
     Ok(plan)
 }
@@ -7035,7 +7037,7 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_from_state_preserves_resolved_explicit_dependencies() {
+    fn build_plan_from_state_strips_explicit_dependencies_from_display_projection() {
         let mut role = ResourceState::try_applied("iam.Role", "role", "aws", "role-id")
             .expect("fixture identifier is non-empty");
         role.binding = Some("role".to_string());
@@ -7061,7 +7063,29 @@ mod tests {
                 _ => None,
             })
             .expect("bucket read effect");
-        assert!(bucket.explicit_dependencies().contains("role"));
+        assert!(bucket.explicit_dependencies().is_empty());
+        assert!(bucket.directives.depends_on.is_empty());
+    }
+
+    #[test]
+    fn build_plan_from_state_ignores_non_state_dependency_binding_for_display() {
+        let mut bucket = ResourceState::try_applied("s3.Bucket", "bucket", "aws", "bucket-id")
+            .expect("fixture identifier is non-empty");
+        bucket.binding = Some("bucket".to_string());
+        bucket.directives.depends_on.push("module_call".to_string());
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(bucket)
+            .expect("bucket state is valid");
+
+        let plan = build_plan_from_state(&state)
+            .expect("display projection must not resolve persisted dependency names");
+
+        let Effect::Read { resource } = &plan.effects()[0] else {
+            panic!("state display must project rows as reads")
+        };
+        assert!(resource.explicit_dependencies().is_empty());
+        assert!(resource.directives.depends_on.is_empty());
     }
 
     #[test]

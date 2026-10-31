@@ -957,10 +957,124 @@ pub struct PlanFile {
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PlanResourceDependencyEvidence {
     id: ResourceId,
     explicit_dependencies: carina_core::dependency::ResolvedDependencies,
+}
+
+#[derive(Debug, Clone)]
+enum Format37PlanWire {
+    Validated(UnresolvedSavedPlan),
+    Persisted(serde_json::Value),
+}
+
+impl Serialize for Format37PlanWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Validated(plan) => plan.serialize(serializer),
+            Self::Persisted(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Format37PlanWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde_json::Value::deserialize(deserializer).map(Self::Persisted)
+    }
+}
+
+impl Format37PlanWire {
+    fn promote(
+        self,
+        scope: &carina_core::dependency::ResolvedDependencyScope,
+    ) -> Result<UnresolvedSavedPlan, ProviderEvidenceError> {
+        match self {
+            Self::Validated(plan) => Ok(plan),
+            Self::Persisted(value) => {
+                UnresolvedSavedPlan::decode_format_37(value, scope).map_err(|message| {
+                    ProviderEvidenceError::InvalidPlanDependencyEvidence { message }
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Format37DependenciesWire {
+    Validated(carina_core::dependency::ResolvedDependencies),
+    Persisted(serde_json::Value),
+}
+
+impl Serialize for Format37DependenciesWire {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Validated(dependencies) => dependencies.serialize(serializer),
+            Self::Persisted(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Format37DependenciesWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde_json::Value::deserialize(deserializer).map(Self::Persisted)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanResourceDependencyEvidenceWire {
+    id: ResourceId,
+    explicit_dependencies: Format37DependenciesWire,
+}
+
+impl From<PlanResourceDependencyEvidence> for PlanResourceDependencyEvidenceWire {
+    fn from(evidence: PlanResourceDependencyEvidence) -> Self {
+        Self {
+            id: evidence.id,
+            explicit_dependencies: Format37DependenciesWire::Validated(
+                evidence.explicit_dependencies,
+            ),
+        }
+    }
+}
+
+impl PlanResourceDependencyEvidenceWire {
+    fn promote(
+        self,
+        scope: &carina_core::dependency::ResolvedDependencyScope,
+    ) -> Result<PlanResourceDependencyEvidence, ProviderEvidenceError> {
+        let id = self.id;
+        let explicit_dependencies = match self.explicit_dependencies {
+            Format37DependenciesWire::Validated(dependencies) => dependencies,
+            Format37DependenciesWire::Persisted(value) => scope
+                .decode_format_37_dependencies(
+                    format!("saved-plan dependency evidence for '{id}'"),
+                    value,
+                )
+                .map_err(
+                    |message| ProviderEvidenceError::InvalidResourceDependencyEvidence {
+                        id: id.clone(),
+                        message,
+                    },
+                )?,
+        };
+        Ok(PlanResourceDependencyEvidence {
+            id,
+            explicit_dependencies,
+        })
+    }
 }
 
 impl PlanResourceDependencyEvidence {
@@ -1048,7 +1162,7 @@ struct PlanFileWire {
     state_serial: Option<u64>,
     provider_configs: SavedProviderConfigs,
     backend_config: Option<BackendConfig>,
-    plan: UnresolvedSavedPlan,
+    plan: Format37PlanWire,
     sorted_resources: Vec<SavedResource>,
     unresolved_resources: Vec<SavedResource>,
     compositions: Vec<SavedComposition>,
@@ -1062,7 +1176,7 @@ struct PlanFileWire {
     upstream_sources: Vec<UpstreamSource>,
     #[serde(default)]
     wait_bindings: Vec<PlanWaitBinding>,
-    resource_dependency_evidence: Vec<PlanResourceDependencyEvidence>,
+    resource_dependency_evidence: Vec<PlanResourceDependencyEvidenceWire>,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
     schema_fingerprints: PlanSchemaFingerprints,
     provider_artifacts: PlanProviderArtifacts,
@@ -1125,6 +1239,9 @@ pub enum ProviderEvidenceError {
     },
     InvalidResourceDependencyEvidence {
         id: ResourceId,
+        message: String,
+    },
+    InvalidPlanDependencyEvidence {
         message: String,
     },
 }
@@ -1220,6 +1337,9 @@ impl std::fmt::Display for ProviderEvidenceError {
                 formatter,
                 "resource_dependency_evidence for `{id}` is invalid: {message}"
             ),
+            Self::InvalidPlanDependencyEvidence { message } => {
+                write!(formatter, "plan dependency evidence is invalid: {message}")
+            }
         }
     }
 }
@@ -1450,6 +1570,10 @@ impl From<PlanFile> for PlanFileWire {
             resource_dependency_evidence,
             persisted_directive_changes,
         } = plan_file;
+        let resource_dependency_evidence = resource_dependency_evidence
+            .into_iter()
+            .map(PlanResourceDependencyEvidenceWire::from)
+            .collect();
         let PlanFileContents {
             version,
             carina_version,
@@ -1485,7 +1609,7 @@ impl From<PlanFile> for PlanFileWire {
             state_serial,
             provider_configs,
             backend_config,
-            plan,
+            plan: Format37PlanWire::Validated(plan),
             sorted_resources,
             unresolved_resources,
             compositions,
@@ -1535,6 +1659,23 @@ impl TryFrom<PlanFileWire> for PlanFile {
             provider_artifacts,
             provider_scopes,
         } = wire;
+        let (plan, resource_dependency_evidence) = {
+            let dependency_scope =
+                carina_core::dependency::ResolvedDependencyScope::from_resources(
+                    &sorted_resources,
+                    &data_sources,
+                    upstream_sources
+                        .iter()
+                        .map(|upstream| upstream.binding.clone()),
+                )
+                .with_declared_targets(&compositions);
+            let plan = plan.promote(&dependency_scope)?;
+            let resource_dependency_evidence = resource_dependency_evidence
+                .into_iter()
+                .map(|evidence| evidence.promote(&dependency_scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            (plan, resource_dependency_evidence)
+        };
         let contents = PlanFileContents {
             version,
             carina_version,

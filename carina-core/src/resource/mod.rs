@@ -652,7 +652,10 @@ impl ResolvedResourceId {
         Self(id)
     }
 
-    /// Try to construct; returns `None` if identity is pending.
+    /// Try to construct without schema or dependency resolution.
+    ///
+    /// Returns `None` when identity is pending, ignore metadata is unresolved,
+    /// or authored `depends_on` requires resolver evidence.
     pub fn try_new(id: ResourceId) -> Option<Self> {
         match id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
@@ -790,12 +793,9 @@ impl Borrow<ResourceId> for ResolvedResourceId {
 /// let resource = Resource::pending("test");
 /// let _: ResolvedResource = resource.into();
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "S: Serialize + Clone",
-    deserialize = "S: Deserialize<'de>"
-))]
-#[serde(try_from = "Resource<S>", into = "Resource<S>")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(bound(serialize = "S: Serialize + Clone"))]
+#[serde(into = "Resource<S>")]
 pub struct ResolvedResource<S = ModuleSource> {
     inner: Resource<S>,
     explicit_dependencies: crate::dependency::ResolvedDependencies,
@@ -984,24 +984,55 @@ impl<S> ResolvedResource<S> {
 
     /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(resource: Resource<S>) -> Option<Self> {
-        match resource.id.identity_state() {
-            ResourceIdentityState::Pending(_) => None,
-            ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
+        if matches!(
+            resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) || !resolved_ignore_changes_match(&resource)
+            || !resource.directives.depends_on.is_empty()
+        {
+            return None;
         }
+        Some(Self::from_resolved_parts(
+            resource,
+            crate::dependency::ResolvedDependencies::empty(),
+        ))
     }
 
     /// Convert a whole resource collection at the pipeline boundary where
-    /// identity assignment is complete.
+    /// identity assignment is complete. Dependency-free and schema-resolved
+    /// metadata is required; violations are returned as typed errors.
     pub fn collect_resolved(
         resources: impl IntoIterator<Item = Resource<S>>,
-    ) -> Result<Vec<Self>, PendingResourceIdentityError> {
+    ) -> Result<Vec<Self>, ResolvedResourceError> {
         resources
             .into_iter()
-            .map(|resource| match resource.id.identity_state() {
-                ResourceIdentityState::Pending(_) => {
-                    Err(PendingResourceIdentityError { id: resource.id })
+            .map(|resource| {
+                if matches!(
+                    resource.id.identity_state(),
+                    ResourceIdentityState::Pending(_)
+                ) {
+                    return Err(PendingResourceIdentityError {
+                        id: resource.id.clone(),
+                    }
+                    .into());
                 }
-                ResourceIdentityState::Resolved(_) => Ok(Self::new(resource)),
+                crate::dependency::validate_dependency_metadata(
+                    format!(
+                        "directives.depends_on on '{}'",
+                        resource.binding.as_deref().unwrap_or("(anonymous)")
+                    ),
+                    &resource.directives.depends_on,
+                    &crate::dependency::ResolvedDependencies::empty(),
+                )?;
+                if !resolved_ignore_changes_match(&resource) {
+                    return Err(ResolvedResourceError::MissingSchema {
+                        id: resource.id.clone(),
+                    });
+                }
+                Ok(Self::from_resolved_parts(
+                    resource,
+                    crate::dependency::ResolvedDependencies::empty(),
+                ))
             })
             .collect()
     }

@@ -2058,7 +2058,7 @@ mod apply_state_save_tests {
     };
     use carina_core::explicit::ExplicitFields;
     use carina_core::parser::{DeferredForExpression, ForBinding};
-    use carina_core::plan::Plan;
+    use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
     use carina_core::provider::ProviderRouter;
     use carina_core::resource::{
         ApplyTimeUnknown, ConcreteValue, DeferredValue, Directives, ResolvedResourceId, Resource,
@@ -2088,6 +2088,16 @@ mod apply_state_save_tests {
             .resolve_resource(&resource)
             .expect("fixture dependencies must resolve");
         ResolvedResource::new_with_dependencies(resource, dependencies)
+    }
+
+    fn decode_saved_plan(plan_json: serde_json::Value) -> SavedPlan {
+        UnresolvedSavedPlan::decode_format_37(
+            plan_json,
+            &carina_core::dependency::ResolvedDependencyScope::empty(),
+        )
+        .expect("replacement metadata should decode")
+        .resolve_with_schemas(&SchemaRegistry::new())
+        .expect("replacement metadata should resolve")
     }
 
     fn state_with_default_directives() -> StateFile {
@@ -5560,7 +5570,9 @@ mod apply_state_save_tests {
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
-        let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
+        let mut plan_json =
+            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
+                .expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
             {
                 "create_idx": 1,
@@ -5572,8 +5584,7 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let plan = decode_saved_plan(plan_json);
         let saved_desired =
             carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
         let successfully_deleted =
@@ -5736,7 +5747,9 @@ mod apply_state_save_tests {
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
-        let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
+        let mut plan_json =
+            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
+                .expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
             {
                 "create_idx": 1,
@@ -5748,8 +5761,7 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let plan = decode_saved_plan(plan_json);
         let saved_desired =
             carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
 
@@ -5859,7 +5871,9 @@ mod apply_state_save_tests {
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
-        let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
+        let mut plan_json =
+            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
+                .expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
             {
                 "create_idx": 1,
@@ -5871,8 +5885,7 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let plan = decode_saved_plan(plan_json);
         let saved_desired =
             carina_core::resource::SavedResolvedResource::from(resolved(desired.clone()));
         let successfully_deleted =

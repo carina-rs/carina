@@ -16,9 +16,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use crate::dependency::ResolvedDependencyScope;
-use crate::dependency::{ResolvedDependencies, ResolvedDependencyTarget};
+use crate::dependency::{
+    PersistedDependencies, ResolvedDependencies, ResolvedDependencyScope, ResolvedDependencyTarget,
+};
 use crate::non_empty::NonEmptyVec;
 use crate::parser::{DeferredForExpression, MovedAddresses, StateBlockAddress};
 use crate::provider::AppliedIdentifier;
@@ -295,8 +295,8 @@ impl From<NonEmptyDeletes> for Vec<DeferredReplaceDelete> {
 }
 
 /// Payload for [`Effect::DeferredReplace`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(bound(serialize = "S: Serialize"))]
 pub struct DeferredReplacePayload<S = ModuleSource> {
     /// Pre-apply iterations being destroyed.
     pub deletes: NonEmptyDeletes,
@@ -631,11 +631,8 @@ impl ResolvedMove {
 }
 
 /// Effect representing an operation on a resource
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "S: Serialize + Clone",
-    deserialize = "S: Deserialize<'de>"
-))]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(bound(serialize = "S: Serialize + Clone"))]
 pub enum EffectWithSource<S> {
     /// Read the current state of a resource (data source)
     Read { resource: ResolvedDataSource<S> },
@@ -803,7 +800,7 @@ pub type SavedEffect = EffectWithSource<SavedModuleSource>;
 
 /// Saved-plan effect payload before authored resource directives have been
 /// resolved against the fingerprint-checked provider schemas.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum UnresolvedSavedEffect {
     Read {
         resource: DataSource<SavedModuleSource>,
@@ -878,6 +875,248 @@ pub enum UnresolvedSavedEffect {
         explicit_dependencies: ResolvedDependencies,
     },
     DeferredReplace(Box<DeferredReplacePayload<SavedModuleSource>>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedDeferredReplacePayload {
+    deletes: NonEmptyDeletes,
+    id: ResolvedResourceId,
+    template: Box<DeferredForExpression<SavedModuleSource>>,
+    explicit_dependencies: PersistedDependencies,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) enum PersistedUnresolvedSavedEffect {
+    Read {
+        resource: DataSource<SavedModuleSource>,
+        explicit_dependencies: PersistedDependencies,
+    },
+    Create {
+        resource: Resource<SavedModuleSource>,
+        explicit_dependencies: PersistedDependencies,
+    },
+    ResumeCreate {
+        resource: Resource<SavedModuleSource>,
+        started_at: crate::provider::Timestamp,
+        explicit_dependencies: PersistedDependencies,
+    },
+    Update {
+        from: Box<State>,
+        identifier: AppliedIdentifier,
+        to: Resource<SavedModuleSource>,
+        changed_attributes: Vec<String>,
+        explicit_dependencies: PersistedDependencies,
+    },
+    Delete {
+        id: ResolvedResourceId,
+        identifier: AppliedIdentifier,
+        #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
+        generation: EffectGeneration,
+        #[serde(default)]
+        directives: Directives,
+        #[serde(default)]
+        binding: Option<String>,
+        #[serde(default)]
+        dependencies: HashSet<String>,
+        #[serde(default)]
+        explicit_dependencies: HashSet<String>,
+        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        blocked_by_updates: HashSet<ResourceIdentity>,
+    },
+    Import {
+        id: ResolvedResourceId,
+        identifier: crate::resource::Value,
+    },
+    Remove {
+        id: ResolvedResourceId,
+    },
+    Move {
+        from: ResolvedResourceId,
+        to: ResolvedResourceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<LoopElementOrigin>,
+    },
+    ReleaseListKeys {
+        id: ResolvedResourceId,
+        attribute: String,
+        key_field: FieldName,
+        keys: ReleasedListKeys,
+    },
+    Wait {
+        identity: ResourceIdentity,
+        target_id: ManagedWaitTarget,
+        until: WaitPredicate,
+        until_surface: String,
+        #[serde(with = "crate::resource::duration_secs")]
+        timeout: std::time::Duration,
+        #[serde(with = "crate::resource::duration_secs")]
+        interval: std::time::Duration,
+        #[serde(default)]
+        explicit_dependencies: PersistedDependencies,
+    },
+    DeferredCreate {
+        id: ResolvedResourceId,
+        template: Box<DeferredForExpression<SavedModuleSource>>,
+        explicit_dependencies: PersistedDependencies,
+    },
+    DeferredReplace(Box<PersistedDeferredReplacePayload>),
+}
+
+fn saved_resource_dependency_owner<S, P: crate::resource::PlaceholderKind>(
+    resource: &Resource<S, P>,
+) -> String {
+    format!(
+        "saved-plan dependencies for '{}'",
+        resource.binding.as_deref().unwrap_or("(anonymous)")
+    )
+}
+
+fn saved_data_source_dependency_owner<S, P: crate::resource::PlaceholderKind>(
+    resource: &DataSource<S, P>,
+) -> String {
+    format!(
+        "saved-plan dependencies for '{}'",
+        resource.binding.as_deref().unwrap_or("(anonymous)")
+    )
+}
+
+impl PersistedUnresolvedSavedEffect {
+    pub(crate) fn promote_dependencies(
+        self,
+        scope: &ResolvedDependencyScope,
+    ) -> Result<UnresolvedSavedEffect, crate::dependency::DependencyResolutionError> {
+        Ok(match self {
+            Self::Read {
+                resource,
+                explicit_dependencies,
+            } => {
+                let owner = saved_data_source_dependency_owner(&resource);
+                UnresolvedSavedEffect::Read {
+                    resource,
+                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                }
+            }
+            Self::Create {
+                resource,
+                explicit_dependencies,
+            } => {
+                let owner = saved_resource_dependency_owner(&resource);
+                UnresolvedSavedEffect::Create {
+                    resource,
+                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                }
+            }
+            Self::ResumeCreate {
+                resource,
+                started_at,
+                explicit_dependencies,
+            } => {
+                let owner = saved_resource_dependency_owner(&resource);
+                UnresolvedSavedEffect::ResumeCreate {
+                    resource,
+                    started_at,
+                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                }
+            }
+            Self::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+                explicit_dependencies,
+            } => {
+                let owner = saved_resource_dependency_owner(&to);
+                UnresolvedSavedEffect::Update {
+                    from,
+                    identifier,
+                    to,
+                    changed_attributes,
+                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                }
+            }
+            Self::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            } => UnresolvedSavedEffect::Delete {
+                id,
+                identifier,
+                generation,
+                directives,
+                binding,
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+            },
+            Self::Import { id, identifier } => UnresolvedSavedEffect::Import { id, identifier },
+            Self::Remove { id } => UnresolvedSavedEffect::Remove { id },
+            Self::Move { from, to, origin } => UnresolvedSavedEffect::Move { from, to, origin },
+            Self::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            } => UnresolvedSavedEffect::ReleaseListKeys {
+                id,
+                attribute,
+                key_field,
+                keys,
+            },
+            Self::Wait {
+                identity,
+                target_id,
+                until,
+                until_surface,
+                timeout,
+                interval,
+                explicit_dependencies,
+            } => {
+                let owner = format!("saved wait '{}' dependencies", identity.as_str());
+                UnresolvedSavedEffect::Wait {
+                    identity,
+                    target_id,
+                    until,
+                    until_surface,
+                    timeout,
+                    interval,
+                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                }
+            }
+            Self::DeferredCreate {
+                id,
+                template,
+                explicit_dependencies,
+            } => {
+                let owner = saved_resource_dependency_owner(&template.template_resource);
+                UnresolvedSavedEffect::DeferredCreate {
+                    id,
+                    template,
+                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                }
+            }
+            Self::DeferredReplace(payload) => {
+                let PersistedDeferredReplacePayload {
+                    deletes,
+                    id,
+                    template,
+                    explicit_dependencies,
+                } = *payload;
+                let owner = saved_resource_dependency_owner(&template.template_resource);
+                UnresolvedSavedEffect::DeferredReplace(Box::new(DeferredReplacePayload {
+                    deletes,
+                    id,
+                    template,
+                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                }))
+            }
+        })
+    }
 }
 
 impl From<SavedEffect> for UnresolvedSavedEffect {
@@ -2172,12 +2411,24 @@ impl<S> EffectWithSource<S> {
                 deps.extend(self.explicit_dependencies());
                 deps.into_iter().collect()
             }
-            Effect::DeferredCreate { template, .. } => {
-                template.root_bindings().into_iter().collect()
+            Effect::DeferredCreate {
+                template,
+                explicit_dependencies,
+                ..
+            } => {
+                let mut deps = template.root_bindings();
+                deps.extend(explicit_dependencies.binding_names().map(str::to_string));
+                deps.into_iter().collect()
             }
             Effect::DeferredReplace(payload) => {
                 let mut deps = deferred_replace_delete_dependencies(&payload.deletes);
                 deps.extend(payload.template.root_bindings());
+                deps.extend(
+                    payload
+                        .explicit_dependencies
+                        .binding_names()
+                        .map(str::to_string),
+                );
                 deps.into_iter().collect()
             }
         }
@@ -2378,11 +2629,24 @@ mod tests {
     const EFFECT_VARIANT_COUNT: usize = 12;
 
     fn deserialize_effect(json: &str) -> SavedEffect {
-        serde_json::from_str::<SavedEffect>(json).expect("deserialize saved effect")
+        let value = serde_json::from_str(json).expect("deserialize saved effect JSON");
+        deserialize_effect_value(value)
     }
 
     fn deserialize_effect_value(value: serde_json::Value) -> SavedEffect {
-        serde_json::from_value::<SavedEffect>(value).expect("deserialize saved effect")
+        deserialize_effect_value_with_scope(value, &ResolvedDependencyScope::empty())
+    }
+
+    fn deserialize_effect_value_with_scope(
+        value: serde_json::Value,
+        scope: &ResolvedDependencyScope,
+    ) -> SavedEffect {
+        serde_json::from_value::<PersistedUnresolvedSavedEffect>(value)
+            .expect("deserialize persisted saved effect")
+            .promote_dependencies(scope)
+            .expect("persisted dependency evidence matches fixture scope")
+            .resolve_with_schemas(&crate::schema::SchemaRegistry::new())
+            .expect("resolve saved effect fixture")
     }
 
     #[test]
@@ -3028,7 +3292,8 @@ mod tests {
         ];
 
         for effect in effects {
-            let json = serde_json::to_string(&effect).unwrap();
+            let unresolved = UnresolvedSavedEffect::from(SavedEffect::from(effect.clone()));
+            let json = serde_json::to_string(&unresolved).unwrap();
             let deserialized = deserialize_effect(&json);
             assert_eq!(
                 SavedEffect::from(effect.clone()),
@@ -3405,13 +3670,16 @@ mod tests {
             json["Wait"]["explicit_dependencies"][0]["binding"],
             serde_json::json!("other")
         );
-        let decoded: UnresolvedSavedEffect = serde_json::from_value(json).unwrap();
+        let other = Resource::new("mock.test.Resource", "other").with_binding("other");
+        let scope = ResolvedDependencyScope::from_resources(
+            &[target, other],
+            &[] as &[DataSource],
+            std::iter::empty(),
+        );
         let Effect::Wait {
             explicit_dependencies,
             ..
-        } = decoded
-            .resolve_with_schemas(&crate::schema::SchemaRegistry::new())
-            .unwrap()
+        } = deserialize_effect_value_with_scope(json, &scope)
         else {
             panic!("expected wait effect")
         };

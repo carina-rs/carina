@@ -816,6 +816,22 @@ fn resolved_resource_try_new_returns_some_with_identity() {
 }
 
 #[test]
+fn resolved_resource_try_new_returns_none_with_unresolved_depends_on() {
+    let mut resource = Resource::new("s3.Bucket", "logs");
+    resource.directives.depends_on.push("gate".to_string());
+
+    assert!(ResolvedResource::try_new(resource).is_none());
+}
+
+#[test]
+fn resolved_resource_collect_resolved_rejects_unresolved_depends_on() {
+    let mut resource = Resource::new("s3.Bucket", "logs");
+    resource.directives.depends_on.push("gate".to_string());
+
+    assert!(ResolvedResource::collect_resolved([resource]).is_err());
+}
+
+#[test]
 fn resolved_resource_error_preserves_typed_ignore_errors() {
     let mut resource = Resource::new("Widget", "example");
     resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
@@ -845,25 +861,23 @@ fn resolved_resource_error_preserves_typed_ignore_errors() {
 }
 
 #[test]
-fn resolved_resource_serde_round_trips_as_resource() {
+fn resolved_resource_serializes_as_resource() {
     let resolved = ResolvedResource::new(Resource::with_provider(
         "aws",
         "s3.Bucket",
         "logs",
         Some("primary".to_string()),
     ));
-    let json = serde_json::to_string(&resolved).unwrap();
-    let decoded = serde_json::from_str::<SavedResolvedResource>(&json).unwrap();
-    assert_eq!(decoded, SavedResolvedResource::from(resolved));
-    assert_eq!(decoded.id.identity_str(), Some("logs"));
+    let encoded = serde_json::to_value(&resolved).unwrap();
+    let raw: Resource = resolved.into_inner();
+
+    assert_eq!(encoded, serde_json::to_value(raw).unwrap());
 }
 
 #[test]
-fn resolved_resource_deserialize_rejects_absent_identity() {
-    let mut value = serde_json::to_value(Resource::new("s3.Bucket", "logs")).unwrap();
-    value["id"].as_object_mut().unwrap().remove("identity");
-    let err = serde_json::from_value::<SavedResolvedResource>(value).unwrap_err();
-    assert!(err.to_string().contains("identity is required"));
+fn resolved_resource_try_from_rejects_absent_identity() {
+    let err = ResolvedResource::try_from(Resource::pending("s3.Bucket")).unwrap_err();
+    assert!(err.contains("identity is required"));
 }
 
 #[test]
@@ -909,25 +923,31 @@ fn resolved_data_source_try_new_returns_some_with_identity() {
 }
 
 #[test]
-fn resolved_data_source_serde_round_trips_as_data_source() {
+fn resolved_data_source_try_new_returns_none_with_unresolved_depends_on() {
+    let mut resource = DataSource::new("aws_ami", "ubuntu");
+    resource.directives.depends_on.push("gate".to_string());
+
+    assert!(ResolvedDataSource::try_new(resource).is_none());
+}
+
+#[test]
+fn resolved_data_source_serializes_as_data_source() {
     let resolved = ResolvedDataSource::new(DataSource::with_provider(
         "aws",
         "ami",
         "ubuntu",
         Some("primary".to_string()),
     ));
-    let json = serde_json::to_string(&resolved).unwrap();
-    let decoded = serde_json::from_str::<SavedResolvedDataSource>(&json).unwrap();
-    assert_eq!(decoded, SavedResolvedDataSource::from(resolved));
-    assert_eq!(decoded.id.identity_str(), Some("ubuntu"));
+    let encoded = serde_json::to_value(&resolved).unwrap();
+    let raw: DataSource = resolved.into_inner();
+
+    assert_eq!(encoded, serde_json::to_value(raw).unwrap());
 }
 
 #[test]
-fn resolved_data_source_deserialize_rejects_absent_identity() {
-    let mut value = serde_json::to_value(DataSource::new("aws_ami", "ubuntu")).unwrap();
-    value["id"].as_object_mut().unwrap().remove("identity");
-    let err = serde_json::from_value::<SavedResolvedDataSource>(value).unwrap_err();
-    assert!(err.to_string().contains("identity is required"));
+fn resolved_data_source_try_from_rejects_absent_identity() {
+    let err = ResolvedDataSource::try_from(DataSource::pending("aws_ami")).unwrap_err();
+    assert!(err.contains("identity is required"));
 }
 
 #[test]

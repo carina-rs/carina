@@ -1,0 +1,5 @@
+let component_source = use {
+  source = "./component"
+}
+
+let module_call = component_source {}

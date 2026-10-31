@@ -288,12 +288,9 @@ impl<S, P: PlaceholderKind> DataSource<S, P> {
 /// let resource = DataSource::pending("test");
 /// let _: ResolvedDataSource = resource.into();
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "S: Serialize + Clone",
-    deserialize = "S: Deserialize<'de>"
-))]
-#[serde(try_from = "DataSource<S>", into = "DataSource<S>")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(bound(serialize = "S: Serialize + Clone"))]
+#[serde(into = "DataSource<S>")]
 pub struct ResolvedDataSource<S = ModuleSource> {
     inner: DataSource<S>,
     explicit_dependencies: crate::dependency::ResolvedDependencies,
@@ -364,12 +361,22 @@ impl<S> ResolvedDataSource<S> {
         Ok(Self::from_resolved_parts(resource, explicit_dependencies))
     }
 
-    /// Try to construct; returns `None` if identity is pending.
+    /// Try to construct without dependency resolution.
+    ///
+    /// Returns `None` when identity is pending or authored `depends_on`
+    /// requires resolver evidence.
     pub fn try_new(resource: DataSource<S>) -> Option<Self> {
-        match resource.id.identity_state() {
-            ResourceIdentityState::Pending(_) => None,
-            ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
+        if matches!(
+            resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) || !resource.directives.depends_on.is_empty()
+        {
+            return None;
         }
+        Some(Self::from_resolved_parts(
+            resource,
+            crate::dependency::ResolvedDependencies::empty(),
+        ))
     }
 
     /// Borrow the inner [`DataSource`].
