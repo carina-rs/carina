@@ -196,7 +196,9 @@ The caller can instantiate the module with either value. Resource attributes are
 
 ### Combining for and if
 
-You can use `if` expressions inside `for` bodies and vice versa. An `if` condition must be a `Bool` value; comparison operators such as `==` are not part of the expression language (they are only available in `validation`, `require`, and `wait` conditions), so carry the flag in the data you iterate over:
+You can use `if` value expressions inside `for` bodies. To conditionally create every resource from a `for`, put the `if` in the iterable, such as `for item in (if enabled { items } else { [] }) { ... }`. A resource-producing `for` cannot be used directly as an `if` branch.
+
+An `if` condition must be a `Bool` value; comparison operators such as `==` are not part of the expression language (they are only available in `validation`, `require`, and `wait` conditions), so carry the flag in the data you iterate over:
 
 ```crn
 let environments = {

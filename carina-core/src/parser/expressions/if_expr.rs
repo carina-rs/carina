@@ -35,7 +35,44 @@ enum IfBodyKind {
     Value,
 }
 
-fn if_body_kind(pair: &pest::iterators::Pair<Rule>) -> Result<IfBodyKind, ParseError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IfBodyForm {
+    Resource,
+    DataSource,
+    ModuleCall,
+    Value,
+    ResourceProducingFor,
+    UnsupportedStructuralExpression,
+}
+
+struct ClassifiedIfBody<'i> {
+    pair: pest::iterators::Pair<'i, Rule>,
+    form: IfBodyForm,
+}
+
+impl ClassifiedIfBody<'_> {
+    fn kind(&self) -> IfBodyKind {
+        match self.form {
+            IfBodyForm::Value => IfBodyKind::Value,
+            IfBodyForm::Resource
+            | IfBodyForm::DataSource
+            | IfBodyForm::ModuleCall
+            | IfBodyForm::ResourceProducingFor
+            | IfBodyForm::UnsupportedStructuralExpression => IfBodyKind::Structural,
+        }
+    }
+
+    fn reject_resource_producing_for(&self, condition_line: usize) -> Result<(), ParseError> {
+        if self.form == IfBodyForm::ResourceProducingFor {
+            return Err(resource_producing_for_if_branch_error(condition_line));
+        }
+        Ok(())
+    }
+}
+
+fn classify_if_body<'i>(
+    pair: pest::iterators::Pair<'i, Rule>,
+) -> Result<ClassifiedIfBody<'i>, ParseError> {
     let tail = pair
         .clone()
         .into_inner()
@@ -44,18 +81,44 @@ fn if_body_kind(pair: &pest::iterators::Pair<Rule>) -> Result<IfBodyKind, ParseE
             expected: "resource expression, module call, or value expression".to_string(),
             context: "if body classification".to_string(),
         })?;
-    match tail.as_rule() {
-        Rule::resource_expr | Rule::read_resource_expr | Rule::module_call => {
-            Ok(IfBodyKind::Structural)
+    let form = match tail.as_rule() {
+        Rule::resource_expr => IfBodyForm::Resource,
+        Rule::read_resource_expr => IfBodyForm::DataSource,
+        Rule::module_call => IfBodyForm::ModuleCall,
+        Rule::expression if expression_root_rule(&tail) == Some(Rule::for_expr) => {
+            IfBodyForm::ResourceProducingFor
         }
         Rule::expression if expression_contains_structural_declaration(&tail) => {
-            Ok(IfBodyKind::Structural)
+            IfBodyForm::UnsupportedStructuralExpression
         }
-        Rule::expression => Ok(IfBodyKind::Value),
+        Rule::expression => IfBodyForm::Value,
         _ => Err(ParseError::InternalError {
             expected: "resource expression, module call, or value expression".to_string(),
             context: "if body classification".to_string(),
-        }),
+        })?,
+    };
+    Ok(ClassifiedIfBody { pair, form })
+}
+
+fn expression_root_rule(pair: &pest::iterators::Pair<Rule>) -> Option<Rule> {
+    let mut current = pair.clone();
+    loop {
+        match current.as_rule() {
+            Rule::expression
+            | Rule::coalesce_expr
+            | Rule::pipe_expr
+            | Rule::compose_expr
+            | Rule::postfix_expr => current = current.into_inner().next()?,
+            Rule::primary => {
+                let inner = current.into_inner().next()?;
+                if inner.as_rule() == Rule::expression {
+                    current = inner;
+                } else {
+                    return Some(inner.as_rule());
+                }
+            }
+            rule => return Some(rule),
+        }
     }
 }
 
@@ -69,12 +132,16 @@ fn expression_contains_structural_declaration(pair: &pest::iterators::Pair<Rule>
 }
 
 fn validate_if_body_shapes(
-    then_body: &pest::iterators::Pair<Rule>,
-    else_body: Option<&pest::iterators::Pair<Rule>>,
+    then_body: &ClassifiedIfBody<'_>,
+    else_body: Option<&ClassifiedIfBody<'_>>,
     condition_line: usize,
 ) -> Result<(), ParseError> {
-    let then_kind = if_body_kind(then_body)?;
-    let else_kind = else_body.map(if_body_kind).transpose()?;
+    then_body.reject_resource_producing_for(condition_line)?;
+    if let Some(else_body) = else_body {
+        else_body.reject_resource_producing_for(condition_line)?;
+    }
+    let then_kind = then_body.kind();
+    let else_kind = else_body.map(ClassifiedIfBody::kind);
     match (then_kind, else_kind) {
         (IfBodyKind::Value, None) => Err(ParseError::InvalidExpression {
             line: condition_line,
@@ -94,6 +161,14 @@ fn validate_if_body_shapes(
         (IfBodyKind::Structural, None)
         | (IfBodyKind::Value, Some(IfBodyKind::Value))
         | (IfBodyKind::Structural, Some(IfBodyKind::Structural)) => Ok(()),
+    }
+}
+
+fn resource_producing_for_if_branch_error(line: usize) -> ParseError {
+    ParseError::InvalidExpression {
+        line,
+        message: "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead, for example `for item in (if flag { items } else { [] }) { ... }`"
+            .to_string(),
     }
 }
 
@@ -136,8 +211,9 @@ pub(crate) fn parse_if_expr(
     if matches!(condition_value, EvalValue::ProvisionalReference { .. })
         && ctx.defer_provisional_static_conditions
     {
-        let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
-        return parse_if_body_to_rhs(if_body_pair, ctx, &target, preprocessed_file, source_file);
+        let if_body = classify_if_body(next_pair(&mut inner, "if body", "if expression")?)?;
+        if_body.reject_resource_producing_for(condition_line)?;
+        return parse_if_body_to_rhs(if_body, ctx, &target, preprocessed_file, source_file);
     }
     let condition_value = condition_value
         .into_value()
@@ -145,17 +221,18 @@ pub(crate) fn parse_if_expr(
 
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
-    let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
-    let else_body_pair = inner
+    let if_body = classify_if_body(next_pair(&mut inner, "if body", "if expression")?)?;
+    let else_body = inner
         .next()
         .map(|else_pair| first_inner(else_pair, "else body", "else clause"))
+        .transpose()?
+        .map(classify_if_body)
         .transpose()?;
-    validate_if_body_shapes(&if_body_pair, else_body_pair.as_ref(), condition_line)?;
+    validate_if_body_shapes(&if_body, else_body.as_ref(), condition_line)?;
 
     if decision.is_none() {
-        let then_branch =
-            parse_if_body(if_body_pair, ctx, &target, preprocessed_file, source_file)?;
-        let else_branch = else_body_pair
+        let then_branch = parse_if_body(if_body, ctx, &target, preprocessed_file, source_file)?;
+        let else_branch = else_body
             .map(|else_body| parse_if_body(else_body, ctx, &target, preprocessed_file, source_file))
             .transpose()?;
         let condition = DeferredIfCondition::new_with_source_expression(
@@ -169,8 +246,8 @@ pub(crate) fn parse_if_expr(
 
     if decision.expect("module-dependent decision returned above") {
         // Use the if branch
-        parse_if_body_to_rhs(if_body_pair, ctx, &target, preprocessed_file, source_file)
-    } else if let Some(else_body) = else_body_pair {
+        parse_if_body_to_rhs(if_body, ctx, &target, preprocessed_file, source_file)
+    } else if let Some(else_body) = else_body {
         // Use the else branch
         parse_if_body_to_rhs(else_body, ctx, &target, preprocessed_file, source_file)
     } else {
@@ -243,14 +320,14 @@ fn structural_if_body(body: IfBodyResult) -> Result<DeferredIfBody, ParseError> 
 }
 
 /// Parse an if/else body and convert the result to a LetBindingRhs
-pub(crate) fn parse_if_body_to_rhs(
-    pair: pest::iterators::Pair<Rule>,
+fn parse_if_body_to_rhs(
+    body: ClassifiedIfBody<'_>,
     ctx: &ParseContext,
     target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<LetBindingRhs, ParseError> {
-    let result = parse_if_body(pair, ctx, target, preprocessed_file, source_file)?;
+    let result = parse_if_body(body, ctx, target, preprocessed_file, source_file)?;
     match result {
         IfBodyResult::Resource(r) => Ok((
             if_structural_handle(target.scheduler_key()),
@@ -291,29 +368,33 @@ pub(crate) fn parse_if_body_to_rhs(
 }
 
 /// Parse the body of an if expression and produce a resource, module call, or value
-pub(crate) fn parse_if_body(
-    pair: pest::iterators::Pair<Rule>,
+fn parse_if_body(
+    body: ClassifiedIfBody<'_>,
     ctx: &ParseContext,
     target: &LoopParseTarget,
     preprocessed_file: &PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<IfBodyResult, ParseError> {
+    let ClassifiedIfBody { pair, form } = body;
+    let body_line = pair.line_col().0;
     let mut local_ctx = ctx.child_scope();
 
     for inner in pair.into_inner() {
-        match inner.as_rule() {
-            Rule::if_local_binding => {
-                let mut binding_inner = inner.into_inner();
-                let name = next_pair(&mut binding_inner, "binding name", "if local binding")?
-                    .as_str()
-                    .to_string();
-                let value = parse_expression(
-                    next_pair(&mut binding_inner, "binding value", "if local binding")?,
-                    &local_ctx,
-                )?;
-                local_ctx.set_variable(name, value);
-            }
-            Rule::resource_expr => {
+        if inner.as_rule() == Rule::if_local_binding {
+            let mut binding_inner = inner.into_inner();
+            let name = next_pair(&mut binding_inner, "binding name", "if local binding")?
+                .as_str()
+                .to_string();
+            let value = parse_expression(
+                next_pair(&mut binding_inner, "binding value", "if local binding")?,
+                &local_ctx,
+            )?;
+            local_ctx.set_variable(name, value);
+            continue;
+        }
+
+        return match (form, inner.as_rule()) {
+            (IfBodyForm::Resource, Rule::resource_expr) => {
                 let resource = parse_resource_for_target(
                     inner,
                     &local_ctx,
@@ -321,9 +402,9 @@ pub(crate) fn parse_if_body(
                     preprocessed_file,
                     source_file,
                 )?;
-                return Ok(IfBodyResult::Resource(Box::new(resource)));
+                Ok(IfBodyResult::Resource(Box::new(resource)))
             }
-            Rule::read_resource_expr => {
+            (IfBodyForm::DataSource, Rule::read_resource_expr) => {
                 target.reject_unbound_read(LoopKind::If)?;
                 let data_source = parse_read_resource_expr(
                     inner,
@@ -332,9 +413,9 @@ pub(crate) fn parse_if_body(
                     preprocessed_file,
                     source_file,
                 )?;
-                return Ok(IfBodyResult::DataSource(Box::new(data_source)));
+                Ok(IfBodyResult::DataSource(Box::new(data_source)))
             }
-            Rule::module_call => {
+            (IfBodyForm::ModuleCall, Rule::module_call) => {
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match target {
@@ -342,14 +423,23 @@ pub(crate) fn parse_if_body(
                     LoopParseTarget::Unbound(_) => None,
                 };
                 call.set_loop_origin(target.if_origin());
-                return Ok(IfBodyResult::ModuleCall(call));
+                Ok(IfBodyResult::ModuleCall(call))
             }
-            Rule::expression => {
+            (IfBodyForm::Value, Rule::expression) => {
                 let value = parse_expression(inner, &local_ctx)?;
-                return Ok(IfBodyResult::Value(value));
+                Ok(IfBodyResult::Value(value))
             }
-            _ => {}
-        }
+            (IfBodyForm::ResourceProducingFor, Rule::expression) => {
+                Err(resource_producing_for_if_branch_error(body_line))
+            }
+            (IfBodyForm::UnsupportedStructuralExpression, Rule::expression) => {
+                Err(structural_if_value_error(body_line))
+            }
+            _ => Err(ParseError::InternalError {
+                expected: "the classified if body form to match its parsed tail".to_string(),
+                context: "if body".to_string(),
+            }),
+        };
     }
 
     Err(ParseError::InternalError {
@@ -380,8 +470,9 @@ pub(crate) fn parse_if_value_expr_with_mode(
     if matches!(condition_value, EvalValue::ProvisionalReference { .. })
         && ctx.defer_provisional_static_conditions
     {
-        let if_body_pair = next_pair(&mut inner, "if body", "if value expression")?;
-        return parse_if_body_value_with_mode(if_body_pair, ctx, mode);
+        let if_body = classify_if_body(next_pair(&mut inner, "if body", "if value expression")?)?;
+        if_body.reject_resource_producing_for(condition_line)?;
+        return parse_if_body_value_with_mode(if_body, ctx, mode);
     }
     let condition_value = condition_value
         .into_value()
@@ -392,19 +483,22 @@ pub(crate) fn parse_if_value_expr_with_mode(
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
 
-    let if_body_pair = next_pair(&mut inner, "if body", "if value expression")?;
+    let if_body = classify_if_body(next_pair(&mut inner, "if body", "if value expression")?)?;
     let else_body = inner
         .next()
         .map(|else_pair| first_inner(else_pair, "else body", "else clause"))
+        .transpose()?
+        .map(classify_if_body)
         .transpose()?;
-    if if_body_kind(&if_body_pair)? == IfBodyKind::Structural && else_body.is_none() {
+    if_body.reject_resource_producing_for(condition_line)?;
+    if if_body.kind() == IfBodyKind::Structural && else_body.is_none() {
         return Err(structural_if_value_error(condition_line));
     }
-    validate_if_body_shapes(&if_body_pair, else_body.as_ref(), condition_line)?;
+    validate_if_body_shapes(&if_body, else_body.as_ref(), condition_line)?;
     let else_body = else_body.expect("value if branch shape requires an else branch");
 
     if decision.is_none() {
-        let then_value = parse_if_body_value_with_mode(if_body_pair, ctx, mode)?
+        let then_value = parse_if_body_value_with_mode(if_body, ctx, mode)?
             .into_value()
             .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
         let else_value = parse_if_body_value_with_mode(else_body, ctx, mode)?
@@ -427,49 +521,63 @@ pub(crate) fn parse_if_value_expr_with_mode(
     let condition = decision.expect("module-dependent decision returned above");
 
     if condition {
-        parse_if_body_value_with_mode(if_body_pair, ctx, mode)
+        parse_if_body_value_with_mode(if_body, ctx, mode)
     } else {
         parse_if_body_value_with_mode(else_body, ctx, mode)
     }
 }
 
 fn parse_if_body_value_with_mode(
-    pair: pest::iterators::Pair<Rule>,
+    body: ClassifiedIfBody<'_>,
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
 ) -> Result<EvalValue, ParseError> {
+    let ClassifiedIfBody { pair, form } = body;
+    let body_line = pair.line_col().0;
     let mut local_ctx = ctx.child_scope();
 
     for inner in pair.into_inner() {
-        match inner.as_rule() {
-            Rule::if_local_binding => {
-                let mut binding_inner = inner.into_inner();
-                let name = next_pair(&mut binding_inner, "binding name", "if local binding")?
-                    .as_str()
-                    .to_string();
-                let value = parse_expression(
-                    next_pair(&mut binding_inner, "binding value", "if local binding")?,
-                    &local_ctx,
-                )?;
-                local_ctx.set_variable(name, value);
-            }
-            Rule::expression => {
+        if inner.as_rule() == Rule::if_local_binding {
+            let mut binding_inner = inner.into_inner();
+            let name = next_pair(&mut binding_inner, "binding name", "if local binding")?
+                .as_str()
+                .to_string();
+            let value = parse_expression(
+                next_pair(&mut binding_inner, "binding value", "if local binding")?,
+                &local_ctx,
+            )?;
+            local_ctx.set_variable(name, value);
+            continue;
+        }
+
+        return match (form, inner.as_rule()) {
+            (IfBodyForm::Value, Rule::expression) => {
                 let line = inner.line_col().0;
                 let value =
                     crate::parser::parse_expression_eval_with_mode(inner, &local_ctx, mode)?;
                 if matches!(value, EvalValue::PendingValue(_)) {
                     return Ok(value);
                 }
-                return value
+                value
                     .into_value()
                     .map(EvalValue::from_value)
-                    .map_err(|error| ParseError::from_eval_value(error, line));
+                    .map_err(|error| ParseError::from_eval_value(error, line))
             }
-            Rule::resource_expr | Rule::read_resource_expr | Rule::module_call => {
-                return Err(structural_if_value_error(0));
+            (IfBodyForm::ResourceProducingFor, Rule::expression) => {
+                Err(resource_producing_for_if_branch_error(body_line))
             }
-            _ => {}
-        }
+            (
+                IfBodyForm::Resource
+                | IfBodyForm::DataSource
+                | IfBodyForm::ModuleCall
+                | IfBodyForm::UnsupportedStructuralExpression,
+                _,
+            ) => Err(structural_if_value_error(body_line)),
+            _ => Err(ParseError::InternalError {
+                expected: "the classified if value body form to match its parsed tail".to_string(),
+                context: "if value expression body".to_string(),
+            }),
+        };
     }
 
     Err(ParseError::InternalError {

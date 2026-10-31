@@ -87,7 +87,7 @@ let networks = for name, cidr in cidrs {
 
 ## If Expression
 
-The `if` expression conditionally produces a resource or value. Its condition must be a `Bool` known without reading runtime resource attributes. Literal and other fully static conditions are evaluated immediately. In a module template, a `Bool` module argument—or a pure built-in or user-defined function of module arguments—is selected separately for each module instance.
+The `if` expression conditionally produces a resource or value. Its condition must be a `Bool` known without reading runtime resource attributes. Literal and other fully static conditions are evaluated immediately. In a module template, a `Bool` module argument—or a pure user-defined function of module arguments—is selected separately for each module instance.
 
 ### Conditional Resource Creation
 

@@ -546,15 +546,13 @@ pub(crate) fn parse_for_expr(
         // not collapse to the default before the reference snapshot is known
         // to be complete.
         (_, Value::Deferred(_)) => {
-            let iterable_surface =
-                if let Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-                    ..
-                })) = &iterable
-                {
-                    iterable_surface.clone()
-                } else {
-                    crate::value::format_value(&iterable)
-                };
+            let iterable_surface = match &iterable {
+                Value::Deferred(
+                    DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })
+                    | DeferredValue::ModuleIf(_),
+                ) => iterable_surface.clone(),
+                _ => crate::value::format_value(&iterable),
+            };
             let header = deferred_for_header(&binding, &iterable_surface);
             record_deferred_for_expression(
                 body_pair.clone(),

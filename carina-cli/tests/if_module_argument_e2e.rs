@@ -418,6 +418,48 @@ fn standalone_module_and_caller_validate() {
 }
 
 #[test]
+fn validate_rejects_resource_producing_for_if_branches_for_both_call_values() {
+    let temp = tempfile::tempdir().expect("create resource-for if fixture");
+    let module = temp.path().join("choice");
+    std::fs::create_dir(&module).expect("create module directory");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+} else {
+  for name in ["else"] { mock.test.resource { name = name } }
+}
+"#,
+    )
+    .expect("write module");
+
+    let expected = "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead";
+    for flag in [true, false] {
+        let caller = temp.path().join(format!("caller-{flag}"));
+        std::fs::create_dir(&caller).expect("create caller directory");
+        std::fs::write(caller.join("backend.crn"), "provider mock {}\n").expect("write provider");
+        std::fs::write(
+            caller.join("main.crn"),
+            format!(
+                "let choice = use {{ source = \"../choice\" }}\nlet selected = choice {{ flag = {flag} }}\n"
+            ),
+        )
+        .expect("write caller");
+
+        let output = run(&caller, &["validate", "."]);
+        assert!(
+            !output.status.success(),
+            "flag={flag} unexpectedly validated:\n{}",
+            combined_output(&output),
+        );
+        let output = combined_output(&output);
+        assert!(output.contains(expected), "flag={flag}: {output}");
+        assert!(!output.contains("Internal parser error"), "{output}");
+    }
+}
+
+#[test]
 fn standalone_module_plan_rejects_unexpanded_template() {
     let fixture = Fixture::copy();
     assert_success(

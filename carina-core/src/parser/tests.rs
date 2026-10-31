@@ -6063,6 +6063,84 @@ let nested = if flag {
 }
 
 #[test]
+fn parse_if_rejects_resource_producing_for_branches_for_static_conditions() {
+    let expected = "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead, for example `for item in (if flag { items } else { [] }) { ... }`";
+
+    for condition in ["true", "false"] {
+        let source = format!(
+            r#"let selected = if {condition} {{
+  for name in ["one", "two"] {{
+    mock.test.resource {{ name = name }}
+  }}
+}} else {{
+  mock.test.resource {{ name = "fallback" }}
+}}
+"#,
+        );
+        let error = parse(&source, &ProviderContext::default())
+            .expect_err("a resource-producing for cannot be an if branch");
+        assert!(
+            matches!(
+                error,
+                ParseError::InvalidExpression { line: 1, ref message }
+                    if message == expected
+            ),
+            "static `{condition}` reported the wrong diagnostic: {error}",
+        );
+        assert!(!error.to_string().contains("Internal parser error"));
+    }
+}
+
+#[test]
+fn parse_if_rejects_every_resource_producing_for_module_branch_shape() {
+    let expected = "resource-producing `for` expressions cannot be used directly as `if` branches; condition the `for` iterable instead, for example `for item in (if flag { items } else { [] }) { ... }`";
+    let cases = [
+        (
+            "for expressions in both branches",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+} else {
+  for name in ["else"] { mock.test.resource { name = name } }
+}
+"#,
+        ),
+        (
+            "a for expression paired with a resource",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+} else {
+  mock.test.resource { name = "else" }
+}
+"#,
+        ),
+        (
+            "a for expression without an else branch",
+            r#"arguments { flag: Bool }
+let selected = if flag {
+  for name in ["then"] { mock.test.resource { name = name } }
+}
+"#,
+        ),
+    ];
+
+    for (label, source) in cases {
+        let error = parse(source, &ProviderContext::default())
+            .expect_err("a resource-producing for cannot be an if branch");
+        assert!(
+            matches!(
+                error,
+                ParseError::InvalidExpression { line: 2, ref message }
+                    if message == expected
+            ),
+            "{label} reported the wrong diagnostic: {error}",
+        );
+        assert!(!error.to_string().contains("Internal parser error"));
+    }
+}
+
+#[test]
 fn parse_if_with_module_call() {
     let input = r#"
         let web = use { source = "modules/web" }
@@ -10547,6 +10625,30 @@ let resources = for x in (
         panic!("expected one deferred loop")
     };
     assert_eq!(deferred.header, "for x in src.list ?? []");
+}
+
+#[test]
+fn deferred_for_header_uses_authored_module_if_iterable_expression() {
+    let parsed = parse(
+        r#"arguments {
+  flag: Bool
+  enabled: list(String)
+  disabled: list(String)
+}
+let names = if flag { enabled } else { disabled }
+let resources = for name in names {
+  mock.test.resource { name = name }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("a module-if iterable must remain a deferred for expression");
+
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert_eq!(deferred.header, "for name in names");
+    assert!(!deferred.header.contains("unresolved module argument"));
 }
 
 #[test]
