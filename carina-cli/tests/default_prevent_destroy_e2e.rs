@@ -49,6 +49,19 @@ impl Scenario {
         .expect("write resource configuration");
     }
 
+    fn write_resources_with_peer(&self, name: &str, setting: Option<bool>) {
+        let directives = setting.map_or_else(String::new, |value| {
+            format!("  directives {{ prevent_destroy = {value} }}\n")
+        });
+        fs::write(
+            self.project.join("resources.crn"),
+            format!(
+                "let account = mock.test.default_prevent_destroy {{\n  name = \"{name}\"\n{directives}}}\n\nlet peer = mock.test.resource {{\n  name = \"peer\"\n}}\n"
+            ),
+        )
+        .expect("write resource configuration with peer");
+    }
+
     fn remove_resource(&self) {
         fs::write(self.project.join("resources.crn"), "").expect("remove resource configuration");
     }
@@ -239,7 +252,20 @@ fn directive_only_false_is_persisted_before_removed_resource_delete() {
 
     let json_plan = scenario.run(&["plan", "--json", "."]);
     assert_success("directive-only JSON plan", &json_plan);
-    serde_json::from_slice::<Value>(&json_plan.stdout).expect("JSON plan stdout must remain valid");
+    let json_plan_value = serde_json::from_slice::<Value>(&json_plan.stdout)
+        .expect("JSON plan stdout must remain valid");
+    assert_eq!(
+        json_plan_value["persisted_directive_changes"],
+        json!([{
+            "address": "mock.test.default_prevent_destroy.account",
+            "fields": [{
+                "name": "prevent_destroy",
+                "from": "unspecified",
+                "to": "false"
+            }]
+        }]),
+        "JSON plan output must expose the state-only directive change set"
+    );
     let json_stderr = String::from_utf8_lossy(&json_plan.stderr);
     assert!(
         json_stderr.contains("mock.test.default_prevent_destroy.account")
@@ -299,6 +325,23 @@ fn saved_plan_apply_persists_directive_only_false() {
             && saved_plan_text.contains("prevent_destroy: unspecified -> false"),
         "plan must disclose the exact state-only directive update:\n{saved_plan_text}"
     );
+    let saved_plan_json: Value = serde_json::from_slice(
+        &fs::read(scenario.project.join("directive-only.plan.json"))
+            .expect("read directive-only saved plan"),
+    )
+    .expect("parse directive-only saved plan");
+    assert_eq!(
+        saved_plan_json["persisted_directive_changes"],
+        json!([{
+            "address": "mock.test.default_prevent_destroy.account",
+            "fields": [{
+                "name": "prevent_destroy",
+                "from": "unspecified",
+                "to": "false"
+            }]
+        }]),
+        "saved plan must record the exact directive change set it displayed"
+    );
     assert_success(
         "directive-only saved-plan apply",
         &scenario.run(&[
@@ -324,6 +367,42 @@ fn saved_plan_apply_persists_directive_only_false() {
         "saved-plan opted-out removal apply",
         &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
     );
+}
+
+#[test]
+fn stale_saved_plan_refuses_a_different_directive_change_set() {
+    let scenario = Scenario::new();
+    scenario.write_resource_with_prevent_destroy("account-v1", None);
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    assert_success(
+        "unchanged saved plan",
+        &scenario.run(&["plan", "--out", "stale.plan.json", "."]),
+    );
+
+    scenario.write_resource_with_prevent_destroy("account-v1", Some(true));
+    assert_success(
+        "intervening directive-only apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+    assert_persisted_prevent_destroy(&scenario.state_json(), true);
+
+    let stale_apply = scenario.run(&["apply", "--auto-approve", "--lock=false", "stale.plan.json"]);
+    let rendered = output_text(&stale_apply);
+    assert!(
+        !stale_apply.status.success(),
+        "a saved plan whose directive change set became stale must be refused:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("saved plan's resource directive changes no longer match")
+            && rendered.contains("Re-run `carina plan --out"),
+        "the typed refusal must explain the mismatch and tell the user to re-run plan:\n{rendered}"
+    );
+    assert_persisted_prevent_destroy(&scenario.state_json(), true);
 }
 
 #[test]
@@ -412,5 +491,61 @@ fn export_only_apply_preserves_resource_rows_byte_for_byte() {
     assert_eq!(
         after, normalized_before,
         "only exports and the state serial may change on an export-only apply"
+    );
+}
+
+#[test]
+fn directive_only_apply_changes_only_directives_on_selected_rows() {
+    let scenario = Scenario::new();
+    scenario.write_resources_with_peer("account-v1", None);
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    let mut seeded = scenario.state_json();
+    for row in seeded["resources"].as_array_mut().expect("state resources") {
+        row["dependency_bindings"] = json!(["historical-only"]);
+    }
+    fs::write(
+        scenario.project.join("carina.state.json"),
+        serde_json::to_vec_pretty(&seeded).expect("serialize seeded state"),
+    )
+    .expect("seed historical row metadata");
+
+    let before = scenario.state_json();
+    scenario.write_resources_with_peer("account-v1", Some(false));
+    let apply = scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]);
+    assert_success("directive-only apply", &apply);
+    let after = scenario.state_json();
+
+    let row = |state: &Value, identity: &str| {
+        state["resources"]
+            .as_array()
+            .expect("state resources")
+            .iter()
+            .find(|row| row["identity"] == identity)
+            .unwrap_or_else(|| panic!("missing state row {identity}"))
+            .clone()
+    };
+    let peer_before = row(&before, "peer");
+    let peer_after = row(&after, "peer");
+    assert_eq!(
+        serde_json::to_vec(&peer_after).expect("serialize peer after"),
+        serde_json::to_vec(&peer_before).expect("serialize peer before"),
+        "rows outside the directive change set must remain byte-identical"
+    );
+
+    let account_before = row(&before, "account");
+    let mut account_after = row(&after, "account");
+    assert_ne!(
+        account_after["directives"], account_before["directives"],
+        "the selected row must persist the new directives"
+    );
+    account_after["directives"] = account_before["directives"].clone();
+    assert_eq!(
+        account_after, account_before,
+        "the selected row may differ only in its directives"
     );
 }

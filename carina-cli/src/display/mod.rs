@@ -289,7 +289,7 @@ pub(crate) fn format_persisted_directive_changes(
     changes: &[crate::commands::shared::state_writeback::PersistedDirectiveChange],
 ) -> String {
     let mut out = String::new();
-    writeln!(out, "{}", "State-only updates:".cyan().bold()).unwrap();
+    writeln!(out, "{}", "State-only directive updates:".cyan().bold()).unwrap();
     writeln!(out).unwrap();
     for (index, change) in changes.iter().enumerate() {
         if index > 0 {
@@ -297,12 +297,7 @@ pub(crate) fn format_persisted_directive_changes(
         }
         writeln!(out, "  {} {}", "~".yellow(), change.address.cyan().bold()).unwrap();
         for field in &change.fields {
-            writeln!(
-                out,
-                "    {}: {} -> {}",
-                field.name, field.before, field.after
-            )
-            .unwrap();
+            writeln!(out, "    {}: {} -> {}", field.name, field.from, field.to).unwrap();
         }
     }
     out

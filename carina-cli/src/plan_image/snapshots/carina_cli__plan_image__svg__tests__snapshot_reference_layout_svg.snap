@@ -13,7 +13,7 @@ expression: "fixture_svg(\"plan_image_reference_layout\")"
   </defs>
   <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
     <text x="28" y="36" font-size="22" font-weight="700" fill="#1f2328">carina plan</text>
-    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#1a7f37" font-weight="600">1 to create</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#0969da" font-weight="600">3 to update</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#8250df" font-weight="700">1 to replace</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#cf222e" font-weight="700">2 to destroy</tspan></text>
+    <text x="28" y="65" font-size="12.5" fill="#57606a"><tspan fill="#1a7f37" font-weight="600">1 to create</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#0969da" font-weight="600">3 to update</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#8250df" font-weight="700">1 to replace</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#cf222e" font-weight="700">2 to destroy</tspan><tspan fill="#8c959f"> · </tspan><tspan fill="#57606a" font-weight="600">1 resource directive change</tspan></text>
     <text x="28" y="90" font-size="10.5" fill="#6e7781">state test-plan-image-reference-layout · serial 12</text>
     <rect x="336.0" y="714.0" width="252.0" height="335.0" rx="12" fill="#f6f8fa" stroke="#d0d7de"/>
     <path d="M248.0,208.0 C257.4,208.0 257.4,208.0 266.7,208.0 C300.0,208.0 300.0,167.0 333.3,167.0 C342.6,167.0 342.6,167.0 352.0,167.0" fill="none" stroke="#cf222e" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-delete)"/>

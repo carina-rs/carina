@@ -167,6 +167,10 @@ impl PlanChangeSummary {
         self.residual_deferred_for.len()
     }
 
+    pub(crate) fn persisted_directive_change_count(&self) -> usize {
+        self.persisted_directive_changes.len()
+    }
+
     pub(crate) fn export_changes(&self) -> &[ExportChange] {
         &self.export_changes
     }

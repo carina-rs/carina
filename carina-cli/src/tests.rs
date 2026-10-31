@@ -4334,7 +4334,7 @@ fn builtin_mock_recording_context() -> ValidatedConfig<()> {
 }
 
 #[test]
-fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
+fn recorded_builtin_only_plan_round_trips_with_format_36_top_level_keys() {
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents
@@ -4361,6 +4361,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
         "data_source_values",
         "data_sources",
         "plan",
+        "persisted_directive_changes",
         "provider_artifacts",
         "provider_configs",
         "provider_scopes",
@@ -4426,6 +4427,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_27_top_level_keys() {
             "upstream_snapshot",
             "upstream_sources",
             "wait_bindings",
+            "persisted_directive_changes",
             "schema_fingerprints",
             "provider_artifacts",
             "provider_scopes",

@@ -467,6 +467,22 @@ fn render_header(out: &mut String, model: &GraphModel, render_style: RenderStyle
             )
             .unwrap();
         }
+        let directive_count = model.summary.persisted_directive_change_count();
+        if directive_count > 0 {
+            write_summary_separator(out, &mut has_part, render_style);
+            let label = if directive_count == 1 {
+                "resource directive change"
+            } else {
+                "resource directive changes"
+            };
+            write!(
+                out,
+                r#"<tspan{} fill="{}" font-weight="600">{directive_count} {label}</tspan>"#,
+                render_style.class("fill-muted"),
+                palette.muted_text,
+            )
+            .unwrap();
+        }
         let deferred_count = model.summary.residual_deferred_for_count();
         if deferred_count > 0 {
             write_summary_separator(out, &mut has_part, render_style);
@@ -1196,6 +1212,15 @@ mod tests {
 
         assert!(svg.contains("1 deferred loop pending"));
         assert!(!svg.contains("No changes"));
+    }
+
+    #[test]
+    fn snapshot_state_only_directive_change_svg() {
+        let svg = fixture_svg("state_only_directive_change");
+
+        assert!(svg.contains("1 resource directive change"));
+        assert!(!svg.contains(">No changes</tspan>"));
+        insta::assert_snapshot!(svg);
     }
 
     #[test]

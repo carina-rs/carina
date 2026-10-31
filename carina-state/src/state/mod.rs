@@ -1025,6 +1025,31 @@ impl StateFile {
         })
     }
 
+    /// Replace only the persisted directives on the routing-agnostic row
+    /// identified by `id`.
+    ///
+    /// Provider-instance routing is row metadata and may itself be changing,
+    /// so lookup intentionally uses only provider kind, resource type, and
+    /// identity. No other row field is reconstructed or rewritten.
+    pub fn update_resource_directives(
+        &mut self,
+        id: &ResourceId,
+        directives: PersistedDirectives,
+    ) -> bool {
+        let Some(identity) = id.identity_str() else {
+            return false;
+        };
+        let Some(row) = self.resources.iter_mut().find(|row| {
+            row.provider == id.provider
+                && row.resource_type == id.resource_type
+                && row.identity.as_str() == identity
+        }) else {
+            return false;
+        };
+        row.directives = directives;
+        true
+    }
+
     /// Find the persisted row identified by a routing-agnostic state-block
     /// address. Matching delegates to the same typed rule used by planning.
     pub fn find_resource_by_state_block_address(
@@ -3240,10 +3265,7 @@ impl ResourceState {
             self.protected = existing.protected;
             self.name_overrides = existing.name_overrides.clone();
         }
-        self.directives = PersistedDirectives::from(&resource.directives);
-        if self.directives.provider_instance.is_none() {
-            self.directives.provider_instance = resource.id.provider_instance.clone();
-        }
+        self.directives = PersistedDirectives::desired_for(resource.as_resource());
         self.prefixes = resource.prefixes.clone();
         self.explicit = match authoring_basis {
             DesiredAuthoringBasis::Sent(sent_desired) => {

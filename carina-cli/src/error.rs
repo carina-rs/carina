@@ -9,6 +9,8 @@ use carina_core::provider::{ProviderError, ProviderInstanceKey, ReferenceScope};
 use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
 
+use crate::commands::shared::state_writeback::PersistedDirectiveChange;
+
 /// State encoding failure annotated with the resource row being written.
 #[derive(Debug)]
 pub struct LocatedResourceStateEncodingError {
@@ -290,6 +292,54 @@ fn reference_scope_summary(scope: &ReferenceScope) -> String {
 }
 
 impl std::error::Error for SavedPlanProviderScopeMismatchError {}
+
+/// The state-locked directive diff no longer matches the exact set recorded
+/// in a saved plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPlanDirectiveChangesMismatchError {
+    pub(crate) recorded: Vec<PersistedDirectiveChange>,
+    pub(crate) recomputed: Vec<PersistedDirectiveChange>,
+    pub(crate) replan_command: String,
+}
+
+impl std::fmt::Display for SavedPlanDirectiveChangesMismatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "The saved plan's resource directive changes no longer match the locked state.",
+        )?;
+        write_directive_changes(formatter, "Recorded by the plan", &self.recorded)?;
+        write_directive_changes(formatter, "Recomputed from locked state", &self.recomputed)?;
+        write!(
+            formatter,
+            "\nRe-run `{}` to produce a new saved plan before applying.",
+            self.replan_command
+        )
+    }
+}
+
+fn write_directive_changes(
+    formatter: &mut std::fmt::Formatter<'_>,
+    label: &str,
+    changes: &[PersistedDirectiveChange],
+) -> std::fmt::Result {
+    write!(formatter, "\n{label}:")?;
+    if changes.is_empty() {
+        return formatter.write_str(" none");
+    }
+    for change in changes {
+        write!(formatter, "\n  - {}", change.address)?;
+        for field in &change.fields {
+            write!(
+                formatter,
+                "\n      {}: {} -> {}",
+                field.name, field.from, field.to
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl std::error::Error for SavedPlanDirectiveChangesMismatchError {}
 
 /// A backend-selection failure annotated with the upstream project whose
 /// state was being resolved.
@@ -995,6 +1045,11 @@ pub enum AppError {
     /// A saved plan was computed under a different initialized instance scope.
     #[error("{0}")]
     SavedPlanProviderScopeMismatch(Box<SavedPlanProviderScopeMismatchError>),
+
+    /// Locked state implies a different state-only directive update set than
+    /// the one approved in the saved plan.
+    #[error(transparent)]
+    SavedPlanDirectiveChangesMismatch(Box<SavedPlanDirectiveChangesMismatchError>),
 
     /// Apply completed with one or more partial create results.
     #[error("{0}")]

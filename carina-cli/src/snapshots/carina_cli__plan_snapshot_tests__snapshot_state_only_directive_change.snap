@@ -2,7 +2,7 @@
 source: carina-cli/src/plan_snapshot_tests.rs
 expression: output
 ---
-State-only updates:
+State-only directive updates:
 
   ~ awscc.ec2.Vpc.vpc
     prevent_destroy: unspecified -> false

@@ -19,8 +19,8 @@ use carina_core::provider::{
     UnknownCreateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, PersistedDirectives, PreventDestroy, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, ModuleSource, PersistedDirectiveFieldChange, PersistedDirectives,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -31,6 +31,7 @@ use carina_state::{
     ResourceState, RowBasis, StateBackend, StateFile,
 };
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 
 use crate::commands::plan::MovedOrigins;
 use crate::commands::shared::incremental_state_saver::FinalStateBase;
@@ -65,33 +66,10 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PersistedDirectiveFieldChange {
-    pub(crate) name: &'static str,
-    pub(crate) before: String,
-    pub(crate) after: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PersistedDirectiveChange {
     pub(crate) address: String,
     pub(crate) fields: Vec<PersistedDirectiveFieldChange>,
-}
-
-fn prevent_destroy_label(value: PreventDestroy) -> &'static str {
-    match value {
-        PreventDestroy::Unspecified => "unspecified",
-        PreventDestroy::Explicit(false) => "false",
-        PreventDestroy::Explicit(true) => "true",
-    }
-}
-
-fn bindings_label(bindings: &[String]) -> String {
-    format!("[{}]", bindings.join(", "))
-}
-
-fn provider_instance_label(provider_instance: Option<&str>) -> String {
-    provider_instance.unwrap_or("unspecified").to_string()
 }
 
 /// Describe managed resources whose authored, persisted directives differ
@@ -116,48 +94,8 @@ pub(crate) fn persisted_directive_changes<S>(
                 &resource.id.resource_type,
                 identity,
             )?;
-            let mut desired = PersistedDirectives::from(&resource.directives);
-            if desired.provider_instance.is_none() {
-                desired.provider_instance = resource.id.provider_instance.clone();
-            }
-
-            let current = &row.directives;
-            let mut fields = Vec::new();
-            if current.force_delete != desired.force_delete {
-                fields.push(PersistedDirectiveFieldChange {
-                    name: "force_delete",
-                    before: current.force_delete.to_string(),
-                    after: desired.force_delete.to_string(),
-                });
-            }
-            if current.create_before_destroy != desired.create_before_destroy {
-                fields.push(PersistedDirectiveFieldChange {
-                    name: "create_before_destroy",
-                    before: current.create_before_destroy.to_string(),
-                    after: desired.create_before_destroy.to_string(),
-                });
-            }
-            if current.prevent_destroy_setting() != desired.prevent_destroy_setting() {
-                fields.push(PersistedDirectiveFieldChange {
-                    name: "prevent_destroy",
-                    before: prevent_destroy_label(current.prevent_destroy_setting()).to_string(),
-                    after: prevent_destroy_label(desired.prevent_destroy_setting()).to_string(),
-                });
-            }
-            if current.depends_on != desired.depends_on {
-                fields.push(PersistedDirectiveFieldChange {
-                    name: "depends_on",
-                    before: bindings_label(&current.depends_on),
-                    after: bindings_label(&desired.depends_on),
-                });
-            }
-            if current.provider_instance != desired.provider_instance {
-                fields.push(PersistedDirectiveFieldChange {
-                    name: "provider",
-                    before: provider_instance_label(current.provider_instance.as_deref()),
-                    after: provider_instance_label(desired.provider_instance.as_deref()),
-                });
-            }
+            let desired = PersistedDirectives::desired_for(resource.as_resource());
+            let fields = row.directives.field_changes_to(&desired);
 
             (!fields.is_empty()).then(|| PersistedDirectiveChange {
                 address: resource.id.to_string(),
@@ -165,6 +103,37 @@ pub(crate) fn persisted_directive_changes<S>(
             })
         })
         .collect()
+}
+
+/// Apply a previously computed directive change set without rebuilding any
+/// resource rows. The only mutable bytes are the selected rows' `directives`;
+/// serial/version bookkeeping remains the responsibility of the state writer.
+pub(crate) fn apply_persisted_directive_changes<S>(
+    state: &mut StateFile,
+    resources: &[ResolvedResource<S>],
+    changes: &[PersistedDirectiveChange],
+) -> Result<(), AppError> {
+    let resources_by_address = resources
+        .iter()
+        .map(|resource| (resource.id.to_string(), resource))
+        .collect::<HashMap<_, _>>();
+
+    for change in changes {
+        let resource = resources_by_address.get(&change.address).ok_or_else(|| {
+            AppError::Config(format!(
+                "directive change target '{}' is absent from desired resources",
+                change.address
+            ))
+        })?;
+        let desired = PersistedDirectives::desired_for(resource.as_resource());
+        if !state.update_resource_directives(&resource.id, desired) {
+            return Err(AppError::Config(format!(
+                "directive change target '{}' is absent from locked state",
+                change.address
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Queue a state refresh for a resource after a failed operation.
@@ -355,35 +324,6 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
                 plan: &self.plan,
                 successfully_deleted: &result.successfully_deleted,
                 failed_refreshes: &result.failed_refreshes,
-                schemas: &self.schemas,
-            },
-            self.planned_secret_hashes.as_ref(),
-            &self.comparisons,
-        )
-    }
-
-    /// Rebuild unchanged current rows through the same carried-state path used
-    /// after provider execution. This persists desired metadata without
-    /// inventing an applied provider result.
-    pub(crate) fn build_state_only(
-        &self,
-        state: StateFile,
-        managed_current: &HashMap<ResourceId, Current>,
-    ) -> Result<StateFile, AppError> {
-        let runtime_synthesized_resources: Vec<ResolvedResource<S>> = Vec::new();
-        let applied_states = HashMap::new();
-        let successfully_deleted = HashSet::new();
-        let failed_refreshes = HashSet::new();
-        build_state_after_apply_with_comparisons(
-            ApplyStateSave {
-                state_file: state,
-                sorted_resources: &self.sorted_resources,
-                runtime_synthesized_resources: &runtime_synthesized_resources,
-                managed_current,
-                applied_states: &applied_states,
-                plan: &self.plan,
-                successfully_deleted: &successfully_deleted,
-                failed_refreshes: &failed_refreshes,
                 schemas: &self.schemas,
             },
             self.planned_secret_hashes.as_ref(),
@@ -2175,6 +2115,24 @@ mod apply_state_save_tests {
             Some("secondary".to_string()),
         );
         changed(provider_instance, "provider");
+    }
+
+    #[test]
+    fn persisted_directive_changes_treat_depends_on_as_a_set() {
+        let mut row = ResourceState::try_applied("test.Resource", "main", "mock", "provider-main")
+            .expect("fixture identifier is valid");
+        row.directives.depends_on = vec!["first".to_string(), "second".to_string()];
+        let mut state = StateFile::new();
+        state.upsert_resource(row).expect("fixture row is unique");
+
+        let mut resource = Resource::with_provider("mock", "test.Resource", "main", None);
+        resource.directives.depends_on = vec!["second".to_string(), "first".to_string()];
+
+        assert_eq!(
+            persisted_directive_changes(Some(&state), &[resolved(resource)]),
+            Vec::new(),
+            "reordering an authored set must not produce a persisted directive change"
+        );
     }
 
     #[test]

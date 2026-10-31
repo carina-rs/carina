@@ -131,6 +131,7 @@ pub(crate) struct StateSummary {
 pub(crate) struct GraphChangeSummary {
     effect_parts: Vec<PlanEffectSummaryPart>,
     export_change_count: usize,
+    persisted_directive_change_count: usize,
     residual_deferred_for_count: usize,
     has_changes: bool,
 }
@@ -140,6 +141,7 @@ impl GraphChangeSummary {
         Self {
             effect_parts: summary.effect_parts().to_vec(),
             export_change_count: summary.export_change_count(),
+            persisted_directive_change_count: summary.persisted_directive_change_count(),
             residual_deferred_for_count: summary.residual_deferred_for_count(),
             has_changes: summary.has_changes(),
         }
@@ -155,6 +157,10 @@ impl GraphChangeSummary {
 
     pub(crate) fn export_change_count(&self) -> usize {
         self.export_change_count
+    }
+
+    pub(crate) fn persisted_directive_change_count(&self) -> usize {
+        self.persisted_directive_change_count
     }
 
     pub(crate) fn residual_deferred_for_count(&self) -> usize {

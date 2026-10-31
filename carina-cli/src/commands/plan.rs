@@ -41,7 +41,9 @@ use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_fo
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
-use crate::commands::shared::state_writeback::persisted_directive_changes;
+use crate::commands::shared::state_writeback::{
+    PersistedDirectiveChange, persisted_directive_changes,
+};
 use crate::display::{format_persisted_directive_changes, print_plan};
 use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
@@ -599,7 +601,9 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
     /// Plan format 36 stores the tri-state `prevent_destroy` directive so an
-    /// explicit `false` remains distinct from an unspecified value.
+    /// explicit `false` remains distinct from an unspecified value, and
+    /// records the exact state-only directive change set approved by the
+    /// operator.
     /// Plan format 33 adds the typed keyed-list release effect.
     ///
     /// Plan format 32 records provider-instance reference-scope evidence and
@@ -868,7 +872,8 @@ struct ProviderEvidence {
 /// keys to match the providers implied by the saved provider configurations.
 ///
 /// Format 36 stores the tri-state `prevent_destroy` directive so an explicit
-/// `false` remains distinct from an unspecified value.
+/// `false` remains distinct from an unspecified value, and records the exact
+/// state-only directive change set approved at plan time.
 ///
 /// Format 33 adds typed keyed-list release effects.
 ///
@@ -885,12 +890,14 @@ struct ProviderEvidence {
 pub struct PlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 /// Private format-36 wire representation.
 ///
-/// Field order is intentionally identical to the historical `PlanFile`
-/// serialization order. Evidence is mandatory and is never defaulted.
+/// Existing field order remains identical to the historical `PlanFile`
+/// serialization order. Format-36 directive changes and provider evidence are
+/// mandatory and are never defaulted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -915,6 +922,7 @@ struct PlanFileWire {
     upstream_sources: Vec<UpstreamSource>,
     #[serde(default)]
     wait_bindings: Vec<PlanWaitBinding>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
     schema_fingerprints: PlanSchemaFingerprints,
     provider_artifacts: PlanProviderArtifacts,
     provider_scopes: Vec<RecordedProviderScope>,
@@ -1266,7 +1274,11 @@ impl ProviderEvidence {
 
 impl From<PlanFile> for PlanFileWire {
     fn from(plan_file: PlanFile) -> Self {
-        let PlanFile { contents, evidence } = plan_file;
+        let PlanFile {
+            contents,
+            evidence,
+            persisted_directive_changes,
+        } = plan_file;
         let PlanFileContents {
             version,
             carina_version,
@@ -1313,6 +1325,7 @@ impl From<PlanFile> for PlanFileWire {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
             provider_scopes: provider_scopes.into_wire(),
@@ -1344,6 +1357,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
             provider_scopes,
@@ -1380,7 +1394,11 @@ impl TryFrom<PlanFileWire> for PlanFile {
             &contents.provider_configs,
             &expected_instances,
         )?;
-        Ok(Self { contents, evidence })
+        Ok(Self {
+            contents,
+            evidence,
+            persisted_directive_changes,
+        })
     }
 }
 
@@ -1447,6 +1465,7 @@ impl PlanFileContents {
         Ok(PlanFile {
             contents: saved.into(),
             evidence,
+            persisted_directive_changes: Vec::new(),
         })
     }
 }
@@ -1476,6 +1495,7 @@ impl UnresolvedPlanFileContents {
         Ok(PlanFile {
             contents: self,
             evidence,
+            persisted_directive_changes: Vec::new(),
         })
     }
 }
@@ -1859,6 +1879,11 @@ impl UnresolvedPlanFileContents {
 impl PlanFile {
     pub const CURRENT_VERSION: u32 = 36;
 
+    fn with_persisted_directive_changes(mut self, changes: Vec<PersistedDirectiveChange>) -> Self {
+        self.persisted_directive_changes = changes;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
         self.contents
@@ -1886,6 +1911,7 @@ impl PlanFile {
         let PlanFile {
             mut contents,
             evidence,
+            persisted_directive_changes,
         } = self;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
         let planned_in_flight_origins: HashSet<_> = contents
@@ -2032,6 +2058,7 @@ impl PlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         })
     }
 
@@ -3047,6 +3074,7 @@ pub(crate) struct UnresolvedReloadedPlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 #[derive(Debug)]
@@ -3054,6 +3082,7 @@ pub(crate) struct ReloadedPlanFile {
     contents: PlanFileContents<SavedModuleSource>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
 #[derive(Debug)]
@@ -3091,6 +3120,7 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         } = self;
         let PlanFileContents {
             version,
@@ -3147,11 +3177,16 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            persisted_directive_changes,
         })
     }
 }
 
 impl ReloadedPlanFile {
+    pub(crate) fn persisted_directive_changes(&self) -> &[PersistedDirectiveChange] {
+        &self.persisted_directive_changes
+    }
+
     pub(crate) fn provider_scopes(&self) -> &RecordedProviderScopes {
         &self.evidence.provider_scopes
     }
@@ -3989,7 +4024,8 @@ fn build_plan_file<E>(
 ) -> Result<PlanFile, PlanSaveError> {
     let ctx = validated_plan.resources();
     let parsed = ctx.parsed();
-    build_plan_file_contents(
+    let directive_changes = persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources);
+    let plan_file = build_plan_file_contents(
         path,
         parsed,
         provider_configs,
@@ -3998,7 +4034,8 @@ fn build_plan_file<E>(
         ctx,
     )?
     .record(validated_plan)
-    .map_err(PlanSaveError::from)
+    .map_err(PlanSaveError::from)?;
+    Ok(plan_file.with_persisted_directive_changes(directive_changes))
 }
 
 #[cfg(test)]
@@ -4012,7 +4049,8 @@ fn build_plan_file_from_parts<E, R>(
     ctx: &crate::wiring::PlanContext,
     validated_config: &ValidatedConfig<R>,
 ) -> Result<PlanFile, PlanSaveError> {
-    build_plan_file_contents(
+    let directive_changes = persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources);
+    let plan_file = build_plan_file_contents(
         path,
         parsed,
         provider_configs,
@@ -4021,7 +4059,8 @@ fn build_plan_file_from_parts<E, R>(
         ctx,
     )?
     .record_for_test(validated_config)
-    .map_err(PlanSaveError::from)
+    .map_err(PlanSaveError::from)?;
+    Ok(plan_file.with_persisted_directive_changes(directive_changes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4164,7 +4203,8 @@ fn build_plan_file_contents<E>(
 
     let contents = PlanFileContents {
         // carina#4150: bumped 33→36 — Directives now retain whether
-        // prevent_destroy was unspecified or explicitly false.
+        // prevent_destroy was unspecified or explicitly false, and saved
+        // plans bind apply to the exact state-only directive change set.
         // carina#4118: bumped 32→33 — keyed partial-update releases add a
         // serialized state-only Effect variant.
         // carina#4067: bumped 29→31 — saved plans retain authored
@@ -4830,9 +4870,9 @@ pub async fn run_plan(
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
-        // JSON stdout is the versioned saved-plan document. Persisting this
-        // display-only diff there would require a plan-format schema bump, so
-        // keep the human-readable detail on stderr.
+        // JSON stdout is the versioned saved-plan document and now carries the
+        // exact directive change set as machine-readable format-36 data. Keep
+        // the human-readable rendering on stderr as well.
         if !directive_changes.is_empty() {
             eprint!("{}", format_persisted_directive_changes(&directive_changes));
         }

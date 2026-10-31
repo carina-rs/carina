@@ -74,9 +74,11 @@ and its `started_at` timestamp, never an identifier or continuation token.
 Apply reloads that marker under the state lock and rejects any lifecycle or
 timestamp change before provider effects run.
 
-Saved-plan format 36 stores the same tri-state directive shape. Format 33 plans
-cannot distinguish explicit false from an unspecified value and must be
-regenerated.
+Saved-plan format 36 stores the same tri-state directive shape and the exact
+state-only directive change set (resource address plus per-field `from`/`to`)
+shown during planning. Saved-plan apply recomputes that set against locked
+state and refuses a mismatch with re-plan guidance. Format 33 plans cannot
+distinguish explicit false from an unspecified value and must be regenerated.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host

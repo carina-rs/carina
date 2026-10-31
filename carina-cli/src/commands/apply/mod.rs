@@ -65,13 +65,15 @@ use crate::commands::shared::progress::{
 };
 use crate::commands::shared::state_writeback::{
     ApplyStateSaveInputs, ExportResolutionInputs, FinalizeApplyInput, PostApplyStates,
-    ResolveExportValuesPostApplyInput, SkippedExports, materialize_exports,
-    persisted_directive_changes, resolve_export_values_post_apply,
+    ResolveExportValuesPostApplyInput, SkippedExports, apply_persisted_directive_changes,
+    materialize_exports, persisted_directive_changes, resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
-use crate::error::{AppError, SavedPlanSecretVerificationError};
+use crate::error::{
+    AppError, SavedPlanDirectiveChangesMismatchError, SavedPlanSecretVerificationError,
+};
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
     AddressedDataSourceReadInputs, ProjectedPhase1RefreshInputs, ProviderLoad, ValidatedConfig,
@@ -2204,7 +2206,7 @@ async fn run_apply_locked_owned(
                     carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
                 let summary =
                     PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for)
-                        .with_persisted_directive_changes(directive_changes);
+                        .with_persisted_directive_changes(directive_changes.clone());
                 print_plan(
                     &plan,
                     &summary,
@@ -2248,17 +2250,13 @@ async fn run_apply_locked_owned(
                     );
                 }
                 let state_file = if directive_change_count > 0 {
-                    let state_save_inputs = ApplyStateSaveInputs::new(
-                        resolved_resources.clone(),
-                        plan.clone(),
-                        ctx.schemas().clone(),
-                        None,
-                        &provider,
+                    let mut state = state_file.unwrap_or_default();
+                    apply_persisted_directive_changes(
+                        &mut state,
+                        &resolved_resources,
+                        &directive_changes,
                     )?;
-                    Some(
-                        state_save_inputs
-                            .build_state_only(state_file.unwrap_or_default(), &managed_current)?,
-                    )
+                    Some(state)
                 } else {
                     state_file
                 };
@@ -3541,6 +3539,18 @@ async fn run_apply_from_plan_locked_owned(
                 .map_err(|error| AppError::Config(error.to_string()))?;
             let directive_changes =
                 persisted_directive_changes(state_file.as_ref(), &resolved_sorted_resources);
+            let recorded_directive_changes = rehydrated_plan_file
+                .reloaded_plan_file()
+                .persisted_directive_changes();
+            if directive_changes != recorded_directive_changes {
+                return Err(AppError::SavedPlanDirectiveChangesMismatch(Box::new(
+                    SavedPlanDirectiveChangesMismatchError {
+                        recorded: recorded_directive_changes.to_vec(),
+                        recomputed: directive_changes,
+                        replan_command: apply_target.replan_command().to_string(),
+                    },
+                )));
+            }
 
             if can_use_export_only_fast_path(plan, &executable_data_source_values) {
                 // Saved plans serialize every `Effect::Read` produced by the
@@ -3612,15 +3622,12 @@ async fn run_apply_from_plan_locked_owned(
                     )
                     .cyan()
                 );
-                let state_save_inputs = ApplyStateSaveInputs::new(
-                    resolved_sorted_resources.clone(),
-                    (*plan).clone(),
-                    wiring.schemas().clone(),
-                    Some(rehydrated_plan_file.planned_secret_hashes().clone()),
-                    &provider,
+                let mut state = state_file.take().unwrap_or_default();
+                apply_persisted_directive_changes(
+                    &mut state,
+                    &resolved_sorted_resources,
+                    &directive_changes,
                 )?;
-                let state = state_save_inputs
-                    .build_state_only(state_file.take().unwrap_or_default(), &managed_current)?;
                 return Ok(SavedPlanApplyAfterHeartbeat::PersistStateOnly(Box::new(
                     SavedPlanPersistStateOnly {
                         state,
