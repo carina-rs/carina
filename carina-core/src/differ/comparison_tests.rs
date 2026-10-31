@@ -2,20 +2,423 @@ use super::comparison::SavedAttr;
 use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
+use crate::provider::ReferenceScope;
 use crate::resource::{
     CanonicalEnumValue, ExpandedConcreteValue as ConcreteValue,
     ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource, ExpandedValue as Value,
     ValueString,
 };
-use crate::schema::{ResourceSchema, TypeIdentity};
+use crate::schema::{
+    ReferenceForm, ReferenceForms, ReferenceTemplate, ResourceSchema, TypeIdentity,
+};
 use crate::value::value_to_json;
 use indexmap::IndexMap;
+use std::sync::LazyLock;
+
+static EXACT_SCOPE: ReferenceScope = ReferenceScope::Unavailable;
+static NO_REFERENCE_FORMS: LazyLock<ReferenceForms> = LazyLock::new(ReferenceForms::new);
+
+fn exact_comparison_context() -> ComparisonContext<'static> {
+    ComparisonContext::for_test(&EXACT_SCOPE, &NO_REFERENCE_FORMS)
+}
+
+fn type_aware_equal(
+    a: &Value,
+    b: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    super::type_aware_equal(a, b, attr_type, defs, &exact_comparison_context())
+}
+
+fn find_changed_attributes(
+    desired: &HashMap<String, Value>,
+    current: &HashMap<String, Value>,
+    saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
+    prev_explicit: Option<&ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Vec<String> {
+    super::comparison::find_changed_attributes(
+        desired,
+        current,
+        saved,
+        nested_write_only,
+        prev_explicit,
+        schema,
+        &exact_comparison_context(),
+    )
+}
+
+fn key_should_enter_patch(
+    key: &str,
+    schema: Option<&ResourceSchema>,
+    leaf_provenance: LeafProvenance<'_>,
+    cmp: AttrComparison<'_>,
+) -> bool {
+    super::key_should_enter_patch(
+        key,
+        schema,
+        leaf_provenance,
+        cmp,
+        &exact_comparison_context(),
+    )
+}
+
+fn diff_test(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    super::diff_test(
+        desired,
+        current,
+        saved,
+        prev_explicit,
+        schema,
+        &exact_comparison_context(),
+    )
+}
+
+fn resolved_ignored_resource(
+    mut resource: Resource,
+    schema: ResourceSchema,
+    path: &[&str],
+) -> (ResolvedResource, SchemaRegistry) {
+    resource.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(
+        path.iter()
+            .map(|part| crate::resource::ParsedIgnorePathSegment::Attribute((*part).to_string()))
+            .collect(),
+    )];
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        resource.id.provider.clone(),
+        schema.validate().expect("ignore_changes schema is valid"),
+    );
+    let resource = ResolvedResource::resolve_with_schemas(resource, &registry)
+        .expect("ignore_changes path resolves");
+    (resource, registry)
+}
+
+#[test]
+fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
+    use crate::schema::AttributeSchema;
+
+    let schema = ResourceSchema::new("Widget")
+        .attribute(
+            AttributeSchema::optional("function_version", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build());
+    let desired = Resource::with_provider("test", "Widget", "alias", None)
+        .with_attribute(
+            "function_version",
+            Value::Concrete(ConcreteValue::String("1".into())),
+        )
+        .with_attribute(
+            "comment",
+            Value::Concrete(ConcreteValue::String("same".into())),
+        );
+    let (desired, registry) = resolved_ignored_resource(desired, schema, &["function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([
+            (
+                "function_version".to_string(),
+                Value::Concrete(ConcreteValue::String("42".into())),
+            ),
+            (
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String("same".into())),
+            ),
+        ]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+    let schema = registry
+        .get_for(desired.as_resource())
+        .expect("schema")
+        .schema()
+        .as_schema();
+
+    assert!(matches!(
+        diff(
+            &desired,
+            &current,
+            &saved,
+            None,
+            Some(schema),
+            &exact_comparison_context(),
+        ),
+        Diff::NoChange(_)
+    ));
+}
+
+#[test]
+fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
+    use crate::schema::{AttributeSchema, StructField};
+
+    let schema = ResourceSchema::new("Widget").attribute(
+        AttributeSchema::optional(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("function_version", AttributeType::string()).build(),
+                    StructField::optional("memory", AttributeType::int()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+    let config = |version: &str, memory: i64| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "function_version".to_string(),
+                Value::Concrete(ConcreteValue::String(version.into())),
+            ),
+            (
+                "memory".to_string(),
+                Value::Concrete(ConcreteValue::Int(memory)),
+            ),
+        ])))
+    };
+    let desired = Resource::with_provider("test", "Widget", "function", None)
+        .with_attribute("config", config("recorded", 256));
+    let (desired, registry) =
+        resolved_ignored_resource(desired, schema, &["config", "function_version"]);
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([("config".to_string(), config("external", 128))]),
+    );
+    let saved = crate::provider::RawSavedAttrs::default().lift(&registry);
+    let schema = registry
+        .get_for(desired.as_resource())
+        .expect("schema")
+        .schema()
+        .as_schema();
+
+    let Diff::Update {
+        changed_attributes, ..
+    } = diff(
+        &desired,
+        &current,
+        &saved,
+        None,
+        Some(schema),
+        &exact_comparison_context(),
+    )
+    else {
+        panic!("memory change must still produce an update")
+    };
+    assert_eq!(changed_attributes, ["config"]);
+}
 
 fn persisted_secret(encoded: &serde_json::Value) -> Value {
     crate::value::PersistedValue::from_serialized_json(encoded.clone())
         .expect("valid persisted secret")
         .decode()
         .expect("persisted secret decodes to a typed value")
+}
+
+fn lambda_function_reference_fixture(
+    scope: ReferenceScope,
+) -> (ReferenceScope, ReferenceForms, AttributeType) {
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let forms = ReferenceForms::from([(
+        identity.clone(),
+        ReferenceForm::Template {
+            long: ReferenceTemplate::new(
+                "arn:{partition}:lambda:{region}:{account}:function:{name}",
+            )
+            .expect("valid reference template"),
+        },
+    )]);
+    let attr_type = AttributeType::refined_string(Some(identity), None, None, None);
+    (scope, forms, attr_type)
+}
+
+fn available_reference_scope() -> ReferenceScope {
+    ReferenceScope::available("aws", "us-east-1", "123456789012").expect("fixture scope is valid")
+}
+
+fn string_value(value: &str) -> Value {
+    Value::Concrete(ConcreteValue::String(value.into()))
+}
+
+#[test]
+fn refined_string_reference_form_equates_bare_name_and_local_arn() {
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
+    let context = ComparisonContext::for_test(&scope, &forms);
+
+    assert!(super::type_aware_equal(
+        &string_value("processor"),
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
+fn refined_string_applies_to_dsl_before_reference_form_canonicalization() {
+    let (scope, forms, _) = lambda_function_reference_fixture(available_reference_scope());
+    let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+    let attr_type = AttributeType::refined_string(
+        Some(identity),
+        None,
+        None,
+        Some(crate::schema::DslTransform::StripSuffix("_api".to_string())),
+    );
+    let context = ComparisonContext::for_test(&scope, &forms);
+
+    assert!(super::type_aware_equal(
+        &string_value("processor_api"),
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:processor_api"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
+fn reference_scope_rejects_placeholder_text() {
+    assert_eq!(
+        ReferenceScope::available("aws{name}", "us-east-1", "123456789012").unwrap_err(),
+        crate::provider::ReferenceScopeError::ContainsBrace {
+            field: crate::provider::ReferenceScopeField::Partition,
+        }
+    );
+}
+
+#[test]
+fn refined_string_reference_form_rejects_cross_account_arn_for_local_name() {
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
+    let context = ComparisonContext::for_test(&scope, &forms);
+
+    assert!(!super::type_aware_equal(
+        &string_value("processor"),
+        &string_value("arn:aws:lambda:us-east-1:999999999999:function:processor"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
+fn refined_string_reference_form_rejects_qualified_arn_for_bare_name() {
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
+    let context = ComparisonContext::for_test(&scope, &forms);
+
+    assert!(!super::type_aware_equal(
+        &string_value("processor"),
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:processor:prod"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
+fn refined_string_reference_form_keeps_different_names_and_arns_distinct() {
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
+    let context = ComparisonContext::for_test(&scope, &forms);
+
+    assert!(!super::type_aware_equal(
+        &string_value("processor"),
+        &string_value("consumer"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+    assert!(!super::type_aware_equal(
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:consumer"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
+fn refined_string_reference_form_is_exact_when_scope_is_unavailable() {
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(ReferenceScope::Unavailable);
+    let context = ComparisonContext::for_test(&scope, &forms);
+
+    assert!(!super::type_aware_equal(
+        &string_value("processor"),
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+        Some(&attr_type),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
+fn union_uses_refined_string_reference_form_member() {
+    let (scope, forms, string_type) =
+        lambda_function_reference_fixture(available_reference_scope());
+    let context = ComparisonContext::for_test(&scope, &forms);
+    let union = AttributeType::union(vec![AttributeType::int(), string_type]);
+
+    assert!(super::type_aware_equal(
+        &string_value("processor"),
+        &string_value("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+        Some(&union),
+        crate::schema::empty_defs_for_schema_walks(),
+        &context,
+    ));
+}
+
+#[test]
+fn create_only_reference_form_equivalence_suppresses_replace() {
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
+    let context = ComparisonContext::for_test(&scope, &forms);
+    let schema = ResourceSchema::new("lambda.Permission").attribute(
+        crate::schema::AttributeSchema::optional("function_name", attr_type)
+            .create_only()
+            .build(),
+    );
+    let desired = Resource::with_provider("aws", "lambda.Permission", "invoke", None)
+        .with_attribute("function_name", string_value("processor"));
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "function_name".to_string(),
+            string_value("arn:aws:lambda:us-east-1:123456789012:function:processor"),
+        )]),
+    )
+    .with_identifier("permission-id");
+
+    let result = super::diff_test(&desired, &current, None, None, Some(&schema), &context);
+
+    assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
+}
+
+#[test]
+fn apply_time_patch_omits_reference_form_equivalent_key() {
+    let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
+    let context = ComparisonContext::for_test(&scope, &forms);
+    let current = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");
+    let desired = string_value("processor");
+
+    assert!(!super::key_should_enter_patch(
+        "function_name",
+        None,
+        LeafProvenance::DecidedByPlan { key_changed: false },
+        AttrComparison {
+            from: Some(&current),
+            to: &desired,
+            saved: None,
+            type_info: Some(TypedAttr {
+                attr_type: &attr_type,
+                defs: crate::schema::empty_defs_for_schema_walks(),
+            }),
+        },
+        &context,
+    ));
 }
 
 #[test]
@@ -2355,6 +2758,9 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(&resources[0], current, None, None, Some(&schema));
@@ -2448,6 +2854,9 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(
@@ -2808,6 +3217,9 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(
@@ -2946,6 +3358,9 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
         Current::CreateInFlight(_pending) => panic!("test fixture cannot be in flight"),
+        Current::CreateOutcomeUnknown(_unknown) => {
+            panic!("test fixture cannot have an unknown create outcome")
+        }
         Current::MissingIdentifier(state) => state.state(),
     };
     let result = diff_test(

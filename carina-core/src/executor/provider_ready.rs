@@ -113,7 +113,7 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// use indexmap::IndexMap;
 ///
 /// fn bypass(factory: &dyn ProviderFactory, attributes: &IndexMap<String, Value>) {
-///     let _ = factory.create_provider(None, attributes);
+///     let _ = factory.create_initialized_provider(None, attributes);
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
@@ -399,9 +399,17 @@ pub enum ProviderPreparationError {
     /// A pending module argument constraint became decidable and failed.
     #[error(transparent)]
     ModuleConstraint(#[from] ModuleConstraintGateError),
+    /// Authored lifecycle metadata could not be resolved against the managed
+    /// schema before constructing the provider-ready resource.
+    #[error(transparent)]
+    ResolvedResource(#[from] crate::resource::ResolvedResourceError),
     /// The managed resource has no schema to classify write-only attributes.
     #[error("{resource}: no managed schema is registered")]
     MissingManagedSchema { resource: ResourceId },
+    /// An ignored write-only value would have to be resent even though its
+    /// current provider value is unobservable.
+    #[error(transparent)]
+    IgnoredWriteOnly(#[from] crate::provider::IgnoredWriteOnlyValueError),
     /// Provider-specific normalization failed before dispatch.
     #[error("{0}")]
     Provider(crate::provider::ProviderError),
@@ -744,9 +752,9 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
     .await?;
     let resource = normalized.into_resource();
     crate::resource::assert_resource_fully_resolved(&resource)?;
-    Ok(ProviderReady(ResolvedResource::new(
-        resource.into_provider_resource(),
-    )))
+    let resource =
+        ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
+    Ok(ProviderReady(resource))
 }
 
 /// Validate and prepare a data source for provider dispatch.
@@ -853,7 +861,7 @@ pub async fn prepare_update_request(
         changed_attributes,
         &resource,
         schema,
-    ))
+    )?)
 }
 
 fn validate_known_provider_values(
@@ -926,9 +934,48 @@ mod provider_config_tests {
 
     use super::*;
     use crate::parser::ResolvedProviderConfigs;
-    use crate::provider::{Provider, ProviderError, ProviderResult};
-    use crate::resource::ConcreteValue;
-    use crate::schema::{AttributeType, RootlessType, TypeIdentity, legacy_validator};
+    use crate::provider::{ProviderError, ProviderResult};
+    use crate::resource::{ConcreteValue, ParsedIgnorePath, ParsedIgnorePathSegment};
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, RootlessType, TypeIdentity,
+        legacy_validator,
+    };
+
+    #[tokio::test]
+    async fn prepare_create_request_resolves_authored_ignore_changes() {
+        let mut resource = Resource::with_provider("test", "widget", "example", None)
+            .with_attribute(
+                "comment",
+                Value::Concrete(ConcreteValue::String("managed-elsewhere".into())),
+            );
+        resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+            ParsedIgnorePathSegment::Attribute("comment".to_string()),
+        ])];
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            ResourceSchema::new("widget")
+                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+                .validate()
+                .expect("valid test schema"),
+        );
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            &[],
+            &crate::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+
+        let request = prepare_create_request(resource, &context)
+            .await
+            .expect("provider preparation must use schema resolution");
+
+        assert_eq!(request.resource().ignore_changes().iter().len(), 1);
+    }
 
     #[tokio::test]
     async fn prepare_update_request_rejects_a_missing_managed_schema() {
@@ -1012,8 +1059,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -1090,8 +1147,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("routing tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -1808,8 +1875,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
@@ -1912,8 +1989,18 @@ mod provider_config_tests {
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: crate::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+            crate::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {

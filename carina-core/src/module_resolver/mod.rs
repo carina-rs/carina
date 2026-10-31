@@ -32,15 +32,16 @@ pub use loader::{
     LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
     load_module_from_directory, load_module_with_diagnostics,
 };
-#[cfg(test)]
-pub(crate) use resolver::resolve_modules_authored_for_test;
-pub(crate) use resolver::resolve_upstream_modules_with_config;
 pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
     RefCheckedModuleGraph, ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
     ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, expand_root_directory_file, resolve_modules,
-    resolve_modules_with_config, resolve_modules_with_diagnostics,
+    resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
+    resolve_modules_with_providerless_config, resolve_modules_with_providerless_diagnostics,
+};
+pub(crate) use resolver::{
+    resolve_upstream_modules_with_config, resolve_upstream_modules_with_providerless_config,
 };
 pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,

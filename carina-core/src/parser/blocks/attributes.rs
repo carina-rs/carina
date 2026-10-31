@@ -141,7 +141,7 @@ pub(in crate::parser) fn parse_arguments_block(
             type_sources.push((name.clone(), type_span));
             arguments.push(ArgumentParameter {
                 name,
-                type_expr,
+                static_type: type_expr,
                 default,
                 description,
                 validations,

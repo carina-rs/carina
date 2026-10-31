@@ -11,6 +11,23 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
 }
 
+fn diff_test(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    super::diff_test(
+        desired,
+        current,
+        saved,
+        prev_explicit,
+        schema,
+        &super::exact_comparison_context_for_tests(),
+    )
+}
+
 fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
     let identifier = id
         .identity_str()
@@ -27,6 +44,42 @@ fn replacement_metadata<'a>(
         .iter()
         .find(|metadata| plan.effects()[metadata.create_idx].resource_id() == id)
         .unwrap_or_else(|| panic!("replacement metadata for {id} not found"))
+}
+
+#[test]
+fn keyed_partial_update_release_requires_the_element_key_to_be_authored() {
+    let mut fields = IndexMap::new();
+    fields.insert(
+        "key".to_string(),
+        Value::Concrete(ConcreteValue::String("b".into())),
+    );
+    fields.insert(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String("2".into())),
+    );
+    let saved = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::Map(fields),
+    )]));
+    let value_only = crate::explicit::ExplicitFields::ListElements {
+        elements: vec![crate::explicit::ExplicitFields::Struct {
+            children: HashMap::from([("value".to_string(), crate::explicit::ExplicitFields::Leaf)]),
+        }],
+    };
+
+    assert!(authored_saved_keys(&saved, &value_only, "key").is_empty());
+
+    let keyed = crate::explicit::ExplicitFields::ListElements {
+        elements: vec![crate::explicit::ExplicitFields::Struct {
+            children: HashMap::from([
+                ("key".to_string(), crate::explicit::ExplicitFields::Leaf),
+                ("value".to_string(), crate::explicit::ExplicitFields::Leaf),
+            ]),
+        }],
+    };
+    assert_eq!(
+        authored_saved_keys(&saved, &keyed, "key"),
+        std::collections::BTreeSet::from(["b".to_string()])
+    );
 }
 
 #[test]

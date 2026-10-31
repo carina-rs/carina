@@ -1,0 +1,1064 @@
+{
+  "version": 33,
+  "carina_version": "0.9.0",
+  "timestamp": "2026-10-31T02:45:54.981009+00:00",
+  "source_path": "carina-cli/tests/fixtures/module_binding_wire_compat",
+  "state_lineage": null,
+  "state_serial": null,
+  "provider_configs": [
+    {
+      "name": "mock",
+      "attributes": {}
+    }
+  ],
+  "backend_config": {
+    "backend_type": "local",
+    "attributes": {
+      "path": {
+        "String": "carina.state.json"
+      }
+    }
+  },
+  "plan": {
+    "effects": [
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "root"
+          },
+          "attributes": {
+            "name": {
+              "String": "root"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false
+          },
+          "prefixes": {},
+          "binding": "root",
+          "dependency_bindings": [],
+          "module_source": null
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.seed"
+          },
+          "attributes": {
+            "name": {
+              "String": "direct-seed"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false
+          },
+          "prefixes": {},
+          "binding": "direct.seed",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "direct"
+            }
+          }
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          },
+          "attributes": {
+            "name": {
+              "String": "direct-consumer"
+            },
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$2CG1E8vWLrlldxSb9rt5qQ$1gSFvSymd91BNGkYjiYO9gMK4PBo907JRQ04+OZvU1k"
+              }
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false,
+            "depends_on": [
+              "direct.seed",
+              "root"
+            ]
+          },
+          "prefixes": {},
+          "binding": "direct.consumer",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "direct"
+            }
+          }
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.nested.leaf"
+          },
+          "attributes": {
+            "name": {
+              "String": "direct-nested"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false,
+            "depends_on": [
+              "direct.consumer"
+            ]
+          },
+          "prefixes": {},
+          "binding": "direct.nested.leaf",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "direct",
+              "scope_key": "direct.nested",
+              "scope_description": "module instance 'direct.nested'"
+            }
+          }
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].seed"
+          },
+          "attributes": {
+            "name": {
+              "String": "loop-seed"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false
+          },
+          "prefixes": {},
+          "binding": "looped[0].seed",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "looped[0]"
+            }
+          }
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          },
+          "attributes": {
+            "name": {
+              "String": "loop-consumer"
+            },
+            "comment": {
+              "RedactedSecret": {
+                "hash": "$argon2id$v=19$m=19456,t=2,p=1$uiQ81gWgU8nemLzjY1a+tg$XR/JVpngvERugPyswjBeFytIzNGfj1F5hK4EVCHfepA"
+              }
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false,
+            "depends_on": [
+              "looped[0].seed",
+              "root"
+            ]
+          },
+          "prefixes": {},
+          "binding": "looped[0].consumer",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "looped[0]"
+            }
+          }
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].nested.leaf"
+          },
+          "attributes": {
+            "name": {
+              "String": "loop-nested"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": false,
+            "depends_on": [
+              "looped[0].consumer"
+            ]
+          },
+          "prefixes": {},
+          "binding": "looped[0].nested.leaf",
+          "dependency_bindings": [],
+          "module_source": {
+            "Module": {
+              "name": "app_module",
+              "instance": "looped[0]",
+              "scope_key": "looped[0].nested",
+              "scope_description": "module instance 'looped[0].nested'"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "root"
+      },
+      "attributes": {
+        "name": {
+          "String": "root"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "root",
+      "dependency_bindings": [],
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "direct.seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-consumer"
+        },
+        "comment": {
+          "RedactedSecret": {
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$2CG1E8vWLrlldxSb9rt5qQ$1gSFvSymd91BNGkYjiYO9gMK4PBo907JRQ04+OZvU1k"
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "direct.seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "direct.consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.nested.leaf"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-nested"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "direct.consumer"
+        ]
+      },
+      "prefixes": {},
+      "binding": "direct.nested.leaf",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct",
+          "scope_key": "direct.nested",
+          "scope_description": "module instance 'direct.nested'"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "looped[0].seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-consumer"
+        },
+        "comment": {
+          "RedactedSecret": {
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$uiQ81gWgU8nemLzjY1a+tg$XR/JVpngvERugPyswjBeFytIzNGfj1F5hK4EVCHfepA"
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "looped[0].seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "looped[0].consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].nested.leaf"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-nested"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "looped[0].consumer"
+        ]
+      },
+      "prefixes": {},
+      "binding": "looped[0].nested.leaf",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]",
+          "scope_key": "looped[0].nested",
+          "scope_description": "module instance 'looped[0].nested'"
+        }
+      }
+    }
+  ],
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "root"
+      },
+      "attributes": {
+        "name": {
+          "String": "root"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "root",
+      "dependency_bindings": [],
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "direct.seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-consumer"
+        },
+        "comment": {
+          "RedactedSecret": {
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$e3Tg7aa3EtyZAt1sAhZ6xQ$H9DDTeC1BzE1qFccLX7P/jH6moQoRnu7z77N/BUVr6E"
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "direct.seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "direct.consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.nested.leaf"
+      },
+      "attributes": {
+        "name": {
+          "String": "direct-nested"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "direct.consumer"
+        ]
+      },
+      "prefixes": {},
+      "binding": "direct.nested.leaf",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "direct",
+          "scope_key": "direct.nested",
+          "scope_description": "module instance 'direct.nested'"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-seed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
+      "prefixes": {},
+      "binding": "looped[0].seed",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-consumer"
+        },
+        "comment": {
+          "RedactedSecret": {
+            "hash": "$argon2id$v=19$m=19456,t=2,p=1$qwm7DdqM2epzy9WTUiHTtA$HsGEp2EfFM3v7iUcXvSbXGmCRszhy8qu+wQ/LWXJpvs"
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "looped[0].seed",
+          "root"
+        ]
+      },
+      "prefixes": {},
+      "binding": "looped[0].consumer",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]"
+        }
+      }
+    },
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].nested.leaf"
+      },
+      "attributes": {
+        "name": {
+          "String": "loop-nested"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false,
+        "depends_on": [
+          "looped[0].consumer"
+        ]
+      },
+      "prefixes": {},
+      "binding": "looped[0].nested.leaf",
+      "dependency_bindings": [],
+      "module_source": {
+        "Module": {
+          "name": "app_module",
+          "instance": "looped[0]",
+          "scope_key": "looped[0].nested",
+          "scope_description": "module instance 'looped[0].nested'"
+        }
+      }
+    }
+  ],
+  "compositions": [
+    {
+      "id": {
+        "provider": "",
+        "resource_type": "_virtual",
+        "identity": "direct.nested"
+      },
+      "arguments": {
+        "label": {
+          "String": "direct"
+        },
+        "upstream": {
+          "BindingRef": {
+            "binding": "direct.consumer"
+          }
+        }
+      },
+      "attributes": {},
+      "pending_constraints": [],
+      "binding": "direct.nested",
+      "dependency_bindings": [],
+      "module_name": "child_module",
+      "instance": "direct.nested",
+      "origin_id": {
+        "root": {
+          "source_file": {
+            "location": "source_root_relative",
+            "path": "main.crn"
+          },
+          "call_span": {
+            "start_byte": 117,
+            "end_byte": 171,
+            "start_line": 9,
+            "start_column": 14,
+            "end_line": 12,
+            "end_column": 2
+          },
+          "expansion": {
+            "kind": "direct"
+          }
+        },
+        "descendants": [
+          {
+            "source_file": {
+              "location": "source_root_relative",
+              "path": "modules/app/nested.crn"
+            },
+            "call_span": {
+              "start_byte": 63,
+              "end_byte": 120,
+              "start_line": 5,
+              "start_column": 14,
+              "end_line": 8,
+              "end_column": 2
+            },
+            "expansion": {
+              "kind": "direct"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": {
+        "provider": "",
+        "resource_type": "_virtual",
+        "identity": "direct"
+      },
+      "arguments": {
+        "label": {
+          "String": "direct"
+        },
+        "upstream": {
+          "BindingRef": {
+            "binding": "root"
+          }
+        }
+      },
+      "attributes": {},
+      "pending_constraints": [],
+      "binding": "direct",
+      "dependency_bindings": [],
+      "module_name": "app_module",
+      "instance": "direct",
+      "origin_id": {
+        "root": {
+          "source_file": {
+            "location": "source_root_relative",
+            "path": "main.crn"
+          },
+          "call_span": {
+            "start_byte": 117,
+            "end_byte": 171,
+            "start_line": 9,
+            "start_column": 14,
+            "end_line": 12,
+            "end_column": 2
+          },
+          "expansion": {
+            "kind": "direct"
+          }
+        },
+        "descendants": []
+      }
+    },
+    {
+      "id": {
+        "provider": "",
+        "resource_type": "_virtual",
+        "identity": "looped[0].nested"
+      },
+      "arguments": {
+        "label": {
+          "String": "loop"
+        },
+        "upstream": {
+          "BindingRef": {
+            "binding": "looped[0].consumer"
+          }
+        }
+      },
+      "attributes": {},
+      "pending_constraints": [],
+      "binding": "looped[0].nested",
+      "dependency_bindings": [],
+      "module_name": "child_module",
+      "instance": "looped[0].nested",
+      "origin_id": {
+        "root": {
+          "source_file": {
+            "location": "source_root_relative",
+            "path": "main.crn"
+          },
+          "call_span": {
+            "start_byte": 212,
+            "end_byte": 269,
+            "start_line": 15,
+            "start_column": 3,
+            "end_line": 18,
+            "end_column": 4
+          },
+          "expansion": {
+            "kind": "expanded",
+            "key": "looped[0]"
+          }
+        },
+        "descendants": [
+          {
+            "source_file": {
+              "location": "source_root_relative",
+              "path": "modules/app/nested.crn"
+            },
+            "call_span": {
+              "start_byte": 63,
+              "end_byte": 120,
+              "start_line": 5,
+              "start_column": 14,
+              "end_line": 8,
+              "end_column": 2
+            },
+            "expansion": {
+              "kind": "direct"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": {
+        "provider": "",
+        "resource_type": "_virtual",
+        "identity": "looped[0]"
+      },
+      "arguments": {
+        "label": {
+          "String": "loop"
+        },
+        "upstream": {
+          "BindingRef": {
+            "binding": "root"
+          }
+        }
+      },
+      "attributes": {},
+      "pending_constraints": [],
+      "binding": "looped[0]",
+      "dependency_bindings": [],
+      "module_name": "app_module",
+      "instance": "looped[0]",
+      "origin_id": {
+        "root": {
+          "source_file": {
+            "location": "source_root_relative",
+            "path": "main.crn"
+          },
+          "call_span": {
+            "start_byte": 212,
+            "end_byte": 269,
+            "start_line": 15,
+            "start_column": 3,
+            "end_line": 18,
+            "end_column": 4
+          },
+          "expansion": {
+            "kind": "expanded",
+            "key": "looped[0]"
+          }
+        },
+        "descendants": []
+      }
+    }
+  ],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.nested.leaf"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.nested.leaf"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.seed"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.seed"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "direct.consumer"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].nested.leaf"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].nested.leaf"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].seed"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].seed"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "root"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "root"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "looped[0].consumer"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "schema_fingerprints": {
+    "providers": {
+      "mock": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.resource",
+            "fingerprint": {
+              "present": "d88d11aac1f85c1bd922b4407e3a4c145665c750e04d3e80e58ee0579c44d91c"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {
+    "mock": {
+      "kind": "built_in"
+    }
+  },
+  "provider_scopes": [
+    {
+      "instance": {
+        "provider": "mock",
+        "provider_instance": null
+      },
+      "scope": {
+        "kind": "unavailable"
+      }
+    }
+  ]
+}

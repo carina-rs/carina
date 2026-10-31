@@ -9,6 +9,35 @@ fn analyze_rejects_a_mismatched_document_source_path() {
 }
 
 #[test]
+fn provider_instance_routing_is_reported_once_for_multifile_directory() {
+    let fixture = tempfile::tempdir().expect("provider-routing fixture");
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+        .expect("provider declaration");
+    let source = r#"mock.test.resource {
+  name = "example"
+  directives { provider = typo }
+}
+"#;
+    let main_path = fixture.path().join("main.crn");
+    std::fs::write(&main_path, source).expect("routed resource");
+
+    let diagnostics = test_engine().analyze(
+        &create_document_at(source, main_path.clone()),
+        Some(&main_path),
+    );
+    let routing_error = "`typo` is not a known provider instance";
+    let occurrences = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains(routing_error))
+        .count();
+
+    assert_eq!(
+        occurrences, 1,
+        "LSP must report the routing error exactly once: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn provider_config_enum_accepts_identity_or_configured_provider_namespace_only() {
     for (provider_name, raw) in [
         ("awscc", "awscc.Region.ap_northeast_1"),
@@ -79,6 +108,69 @@ fn reserved_resource_attribute_surfaces_parser_diagnostic() {
     assert_eq!(diagnostic.range.start.character, 2);
     assert_eq!(diagnostic.range.end.line, 1);
     assert_eq!(diagnostic.range.end.character, 6);
+}
+
+#[test]
+fn deferred_for_unsupported_bodies_surface_parser_diagnostics() {
+    for (body, body_name) in [
+        ("child { item = x }", "child"),
+        ("read mock.iam.Roles { name_regex = x }", "mock.iam.Roles"),
+    ] {
+        let fixture = tempfile::tempdir().expect("fixture");
+        std::fs::create_dir(fixture.path().join("child")).expect("child module directory");
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("providers fixture");
+        std::fs::write(
+            fixture.path().join("backend.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .expect("backend fixture");
+        std::fs::write(
+            fixture.path().join("child/main.crn"),
+            "arguments { item: String }\nmock.test.resource { name = item }\n",
+        )
+        .expect("child module fixture");
+        let source = format!(
+            "let child = use {{ source = './child' }}\n\
+             let src = mock.test.resource {{ name = 'src' }}\n\
+             let items = for x in src.list {{ {body} }}\n"
+        );
+        let main_path = fixture.path().join("main.crn");
+        std::fs::write(&main_path, &source).expect("main fixture");
+
+        let diagnostics = test_engine().analyze(
+            &create_document_at(&source, main_path.clone()),
+            Some(&main_path),
+        );
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message.contains("for x in src.list")
+                    && diagnostic.message.contains(body_name)
+            })
+            .unwrap_or_else(|| panic!("missing deferred-for diagnostic: {diagnostics:#?}"));
+
+        assert_eq!(diagnostic.range.start.line, 2);
+        let loop_line = source.lines().nth(2).expect("loop source line");
+        assert_eq!(
+            diagnostic.range.start.character,
+            loop_line.find("for").expect("for column") as u32,
+            "diagnostic must start at the authored for-expression: {diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.range.end.character,
+            loop_line.chars().count() as u32,
+            "diagnostic must end at the authored for-expression: {diagnostic:#?}"
+        );
+        assert!(diagnostic.message.contains("managed resource"));
+        assert!(
+            diagnostic
+                .message
+                .contains("still unresolved after module expansion"),
+            "{}",
+            diagnostic.message
+        );
+    }
 }
 
 #[test]
@@ -1032,8 +1124,8 @@ fn arguments_literal_union_type_does_not_surface_parser_error() {
     );
 }
 
-/// carina#3239 LSP parity: when a project has at least one provider
-/// registered (`provider_names` non-empty), an unknown bare custom-type
+/// carina#3239 LSP parity: when a project has loaded provider schemas,
+/// an unknown bare custom-type
 /// name in an `arguments { ... }` declaration must surface as an
 /// editor diagnostic — the same finding the CLI's `carina validate`
 /// produces. Without this coverage the bug-headline case
@@ -1107,12 +1199,11 @@ fn arguments_dotted_custom_type_suggests_nearest_identity_for_distance1_typo() {
     );
 }
 
-/// Companion to the test above: when no provider is registered
-/// (`provider_names` empty — the LSP's orphaned-file fallback), the
+/// Companion to the test above: when no provider schemas are loaded (the
+/// LSP's orphaned-file fallback), the
 /// strict check must *not* fire, otherwise every user-defined custom
-/// type in an orphaned file would redline. This pins the
-/// `has_loaded_providers = !provider_names.is_empty()` guard in
-/// `DiagnosticEngine::new`.
+/// type in an orphaned file would redline. This pins the separately named
+/// `DiagnosticEngine::without_loaded_provider_schemas` path.
 #[test]
 fn arguments_unknown_custom_type_silent_without_providers() {
     let engine = test_engine();

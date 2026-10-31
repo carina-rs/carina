@@ -15,6 +15,13 @@ By default, state is stored locally as `carina.state.json`. Use `backend local {
 
 ### State format upgrades
 
+State format v20 records a token-less `create_outcome_unknown` row when an
+initial create fails after a request may have reached the cloud but before the
+provider returns an identifier or continuation. Carina does not refresh,
+destroy, or re-create that address automatically. If the resource exists, add
+the import block shown by `carina plan`. If it does not exist, remove only that
+recovery row with `carina state forget <TYPE> <IDENTITY>` and then plan again.
+
 State format v17 adds a top-level `exports_version` that versions the exports
 encoding separately from the rest of the state file. Readers that only need
 exports (`upstream_state` and `carina export`) check `exports_version` instead

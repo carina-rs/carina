@@ -22,25 +22,32 @@ pub use crate::resource::RelativeBindingName;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingScopeId,
-    BindingUseOwner, CallExpansion, DeferredForExpansionError, DeferredForExpression,
-    DeferredForTarget, ExpandedBackendConfig, ExpandedDeferredForExpression,
+    BindingUseOwner, CallExpansion, ConsumerArgumentParameter, ConsumerAttributeParameter,
+    DeferredForBody, DeferredForExpansionError, DeferredForExpression, DeferredForPhaseTraversal,
+    DeferredForSite, DeferredForTarget, ExpandedBackendConfig, ExpandedDeferredForExpression,
     ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedExportParam,
     ExpandedParsedFile, ExpandedProviderConfig, ExpandedStateBlock, ExpandedUpstreamState,
     ExpansionKey, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
     InferredFile, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource, ModuleCallId,
-    MovedAddresses, ParsedBindingUses, ParsedExportParam, ParsedFile, ParserBindingMetadata,
-    PendingValueSlot, ProviderConfig, RequireBlock, ResolveExportBindingPhase, ResourceAddress,
-    ResourceContext, ResourceRef, ResourceTypePath, SavedDeferredForExpression, ShapeMismatch,
-    SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
-    UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
-    WaitBinding, expand_deferred_children,
+    ModuleResolvedFile, ModuleResolvedInferredFile, ModuleResolvedParsedFile, MovedAddresses,
+    ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedExportParam,
+    ParsedFile, ParserBindingMetadata, PendingValueSlot, ProviderConfig, RequireBlock,
+    ResolveExportBindingPhase, ResolvedDeferredForExpressions, ResolvedDeferredForPhase,
+    ResourceAddress, ResourceContext, ResourceMut, ResourceRef, ResourceTypePath,
+    SavedDeferredForExpression, ShapeMismatch, SourceFileId, SourceSpan, StateBlock,
+    StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction,
+    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
-pub(crate) use ast::{BareBindingSource, ParsedBareBindingUse};
+pub(crate) use ast::{
+    BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
+    ParsedDeferredForIterableState,
+};
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
-    CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, NonEmptySchemaTypeOwners,
-    OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, SchemaTypeOwner,
+    CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, LoadedProviderContext,
+    NonEmptySchemaTypeOwners, OwnedTypeIdentity, ProviderContext, ProviderCustomTypes,
+    SchemaTypeOwner,
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
@@ -60,6 +67,7 @@ pub(crate) use entry::{
     parse_expression_in_sink,
 };
 pub use error::{
+    DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     UnresolvedTypeToken, WarningKind,
 };
@@ -72,7 +80,8 @@ pub use functions::{
     validate_schema_custom_type,
 };
 pub(crate) use functions::{
-    custom_type_lookup_for_schema, function_argument_as_eval, substitute_fn_params,
+    contains_module_argument_matching, custom_type_lookup_for_schema, function_argument_as_eval,
+    substitute_fn_params, validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
@@ -90,7 +99,7 @@ pub(crate) use resolve::{
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::BUILTIN_BARE_CUSTOM_TYPES;
 pub use types::parse_type_expr_str;
-pub(crate) use types::{resolve_known_bare_custom_type, unknown_custom_type_message};
+pub(crate) use types::{resolve_known_bare_custom_type, unknown_custom_type_error};
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 

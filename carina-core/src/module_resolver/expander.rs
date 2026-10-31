@@ -9,8 +9,9 @@ use crate::binding_index::{BindingIndex, RefType, RefTypeError};
 use crate::eval_value::{BareStructuralHandle, StructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
-    ArgumentOrigin, BareBindingSource, DeferredForExpression, ModuleArgument, ModuleCall,
-    ParseError, ParsedBindingUses, ParsedFile, RelativeBindingName, WaitBinding,
+    ArgumentOrigin, BareBindingSource, DeferredForBody, ModuleArgument, ModuleCall, ParseError,
+    ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForIterableState, ParsedFile,
+    RelativeBindingName, WaitBinding,
 };
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, AuthoredDataSource as DataSource,
@@ -55,17 +56,24 @@ fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingNam
                 .iter()
                 .filter_map(|composition| composition.binding.clone()),
         )
-        .chain(module.deferred_for_expressions.iter().filter_map(
-            |deferred| match &deferred.target {
-                crate::parser::DeferredForTarget::Bound { binding } => Some(binding.clone()),
-                crate::parser::DeferredForTarget::Unbound { template: _ } => None,
-            },
-        ))
         .chain(
             module
-                .deferred_for_expressions
+                .parsed_deferred_for_expressions()
                 .iter()
-                .filter_map(|deferred| deferred.template_resource.binding.clone()),
+                .filter_map(|deferred| match &deferred.target {
+                    crate::parser::DeferredForTarget::Bound { binding } => Some(binding.clone()),
+                    crate::parser::DeferredForTarget::Unbound { template: _ } => None,
+                }),
+        )
+        .chain(
+            module
+                .parsed_deferred_for_expressions()
+                .iter()
+                .filter_map(|deferred| match &deferred.body {
+                    DeferredForBody::Resource(resource) => resource.binding.clone(),
+                    DeferredForBody::Read(data_source) => data_source.binding.clone(),
+                    DeferredForBody::ModuleCall(call) => call.binding_name.clone(),
+                }),
         )
         .collect()
 }
@@ -133,15 +141,55 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         match ref_check {
             super::resolver::RefCheckWitness(()) => {}
         }
-        self.expand_module_call_inner(
-            authored_call,
-            call,
-            instance_prefix,
-            binding_index,
-            resolved_bindings,
-            ModuleExpansionSource::imported(),
-        )
-        .map_err(|error| error.with_failing_call(call.id().clone()))
+        let expanded = self
+            .expand_module_call_inner(
+                authored_call,
+                call,
+                instance_prefix,
+                binding_index,
+                resolved_bindings,
+                ModuleExpansionSource::imported(),
+            )
+            .map_err(|error| error.with_failing_call(call.id().clone()))?;
+        if let Some(error) =
+            ModuleError::from_errors(super::resolver::deferred_for_body_errors(&expanded))
+        {
+            return Err(error.with_failing_call(call.id().clone()));
+        }
+        Ok(expanded)
+    }
+
+    pub(super) fn expand_module_call_checked_collecting(
+        &self,
+        authored_call: &ModuleCall,
+        call: &crate::parser::ModuleCall<AbsoluteBindingAddress>,
+        instance_prefix: &str,
+        ref_check: &super::resolver::RefCheckWitness,
+        binding_index: Option<&BindingIndex<'_>>,
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    ) -> Result<crate::parser::ExpandedParsedFile, Vec<ModuleError>> {
+        match ref_check {
+            super::resolver::RefCheckWitness(()) => {}
+        }
+        let expanded = self
+            .expand_module_call_inner(
+                authored_call,
+                call,
+                instance_prefix,
+                binding_index,
+                resolved_bindings,
+                ModuleExpansionSource::imported(),
+            )
+            .map_err(|error| vec![error.with_failing_call(call.id().clone())])?;
+        let errors = super::resolver::deferred_for_body_errors(&expanded)
+            .into_iter()
+            .map(|error| error.with_failing_call(call.id().clone()))
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(expanded)
+        } else {
+            Err(errors)
+        }
     }
 
     fn expand_module_call_inner(
@@ -254,6 +302,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut resolved_arguments: HashMap<String, ResolvedArgument> = HashMap::new();
         let call_line = call.source_span().start_line();
         for arg in &module.arguments {
+            let forwarded_from_enclosing_parameter = authored_call
+                .authored_argument(&arg.name)
+                .is_some_and(|authored| {
+                    crate::parser::contains_module_argument_matching(
+                        authored.argument().walker_value(),
+                        &mut |_| true,
+                    )
+                });
             let argument = match call.authored_argument(&arg.name) {
                 Some(authored) => ResolvedArgument {
                     argument: authored.argument().clone(),
@@ -262,6 +318,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         value_span: authored.value_span(),
                     },
                     caller_reference: authored_argument_references.get(&arg.name).cloned(),
+                    forwarded_from_enclosing_parameter,
                 },
                 None => ResolvedArgument {
                     argument: ModuleArgument::new(
@@ -272,6 +329,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     ),
                     origin: ArgumentOrigin::Defaulted,
                     caller_reference: None,
+                    forwarded_from_enclosing_parameter: false,
                 },
             };
             resolved_arguments.insert(arg.name.clone(), argument);
@@ -291,7 +349,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 default_line: call_line,
                 caller_source_file: call_source_file,
                 binding_index,
-                config: self.config,
+                config: self.config(),
             };
             for arg in &module.arguments {
                 // Call-site expressions are evaluated in the caller's scope,
@@ -347,13 +405,27 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         },
                     )
                 });
-                if next != current.argument || caller_reference != current.caller_reference {
+                let forwarded_from_enclosing_parameter = current.forwarded_from_enclosing_parameter
+                    || crate::parser::contains_module_argument_matching(
+                        current.walker_value(),
+                        &mut |name| {
+                            snapshot
+                                .get(name)
+                                .is_some_and(|argument| argument.forwarded_from_enclosing_parameter)
+                        },
+                    );
+                if next != current.argument
+                    || caller_reference != current.caller_reference
+                    || forwarded_from_enclosing_parameter
+                        != current.forwarded_from_enclosing_parameter
+                {
                     resolved_arguments.insert(
                         arg.name.clone(),
                         ResolvedArgument {
                             argument: next,
                             origin: current.origin,
                             caller_reference,
+                            forwarded_from_enclosing_parameter,
                         },
                     );
                     changed = true;
@@ -368,7 +440,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             default_line: call_line,
             caller_source_file: call_source_file,
             binding_index,
-            config: self.config,
+            config: self.config(),
         };
         let argument_values: HashMap<String, ExpandedValue> = resolved_arguments
             .iter()
@@ -385,10 +457,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 ArgumentOrigin::Authored { value_span, .. } => value_span.start_line(),
                 ArgumentOrigin::Defaulted => call_line,
             };
+            let static_type = P::resolve_static_type(&arg.static_type, self.config());
+            let Some(type_expr) = static_type.known() else {
+                continue;
+            };
             let Some(resolved_parameter) =
-                crate::validation::resolve_parameter_type_for_check(&arg.type_expr, self.config)
-                    .map_err(|message| {
-                        ModuleError::Parse(ParseError::InvalidExpression { line, message })
+                crate::validation::resolve_parameter_type_for_check(type_expr, self.config())
+                    .map_err(|error| {
+                        ModuleError::Parse(ParseError::InvalidExpression {
+                            line,
+                            message: error.to_string(),
+                        })
                     })?
             else {
                 continue;
@@ -415,17 +494,17 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .value()
                 .expect("value-shaped module argument was matched above");
             let resolved_type = resolved_parameter.as_type_expr();
-            crate::validation::typecheck::check_type_expr_value(
-                &resolved_type,
-                value,
-                self.config,
-                crate::validation::typecheck::TypecheckInference::Unavailable,
-            )
-            .map_err(|mismatch| ModuleError::InvalidArgumentType {
-                module: call.module_name.clone(),
-                argument: arg.name.clone(),
-                mismatch,
-            })?;
+            self.provider_context
+                .check(
+                    &resolved_type,
+                    value,
+                    crate::validation::typecheck::TypecheckInference::Unavailable,
+                )
+                .map_err(|mismatch| ModuleError::InvalidArgumentType {
+                    module: call.module_name.clone(),
+                    argument: arg.name.clone(),
+                    mismatch,
+                })?;
         }
 
         // Collect and evaluate argument-local validations and module-level
@@ -639,10 +718,23 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .compositions
             .iter()
             .map(|composition| {
-                expand_module_composition(composition, &expanded_call, &module_scope_resolver)
+                expand_module_composition(
+                    composition,
+                    &expanded_call,
+                    &module_scope_resolver,
+                    self.provider_context,
+                )
             })
             .collect::<Result<_, _>>()
             .map_err(contextualize_access_error)?;
+        for composition in &mut compositions {
+            if let Some(report) = settle_prefixed_composition_constraints(
+                composition,
+                self.records_constraint_reports(),
+            )? {
+                self.record_constraint_report(report);
+            }
+        }
 
         // Every call becomes a composition, including calls with no outputs
         // and anonymous calls. Besides exposing outputs for bound calls, the
@@ -660,15 +752,21 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             for attr_param in &module.attribute_params {
                 if let Some(value) = &attr_param.value {
                     let source_argument = source_argument_name(value, &argument_values);
-                    let declared_type = attr_param.type_expr.clone().or_else(|| {
-                        source_argument.as_deref().and_then(|source_argument| {
-                            module
-                                .arguments
-                                .iter()
-                                .find(|argument| argument.name == source_argument)
-                                .map(|argument| argument.type_expr.clone())
-                        })
-                    });
+                    let declared_type = attr_param
+                        .static_type
+                        .as_ref()
+                        .map(|type_expr| P::resolve_static_type(type_expr, self.config()))
+                        .or_else(|| {
+                            source_argument.as_deref().and_then(|source_argument| {
+                                module
+                                    .arguments
+                                    .iter()
+                                    .find(|argument| argument.name == source_argument)
+                                    .map(|argument| {
+                                        P::resolve_static_type(&argument.static_type, self.config())
+                                    })
+                            })
+                        });
                     let substituted =
                         resolve_module_value(value, &module_scope_resolver).map_err(|error| {
                             contextualize_access_error(
@@ -677,7 +775,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                         })?;
                     composition_attrs.insert(
                         attr_param.name.clone(),
-                        crate::resource::LiveCompositionAttribute::from_value(
+                        crate::resource::LiveCompositionAttribute::from_value_with_static_type(
                             substituted,
                             declared_type,
                         )
@@ -697,27 +795,30 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             > = IndexMap::new();
             for arg in &module.arguments {
                 if let Some(argument) = resolved_arguments.get(&arg.name) {
+                    let static_type = P::resolve_static_type(&arg.static_type, self.config());
                     let recorded = match argument.value_ref() {
                         StructuralOperandRef::Value(value) => {
-                            crate::resource::LiveCompositionArgument::from_value(
+                            crate::resource::LiveCompositionArgument::from_value_with_static_type(
                                 value.clone(),
-                                arg.type_expr.clone(),
+                                static_type.clone(),
                                 argument.origin,
                             )
                         }
                         StructuralOperandRef::Handle {
                             handle,
                             access_base,
-                        } => crate::resource::LiveCompositionArgument::from_handle(
-                            access_base.clone(),
-                            arg.type_expr.clone(),
-                            handle.clone(),
-                            argument.origin,
-                        ),
-                        StructuralOperandRef::Parameter { access_base, .. } => {
-                            crate::resource::LiveCompositionArgument::from_value(
+                        } => {
+                            crate::resource::LiveCompositionArgument::from_handle_with_static_type(
                                 access_base.clone(),
-                                arg.type_expr.clone(),
+                                static_type.clone(),
+                                handle.clone(),
+                                argument.origin,
+                            )
+                        }
+                        StructuralOperandRef::Parameter { access_base, .. } => {
+                            crate::resource::LiveCompositionArgument::from_value_with_static_type(
+                                access_base.clone(),
+                                static_type.clone(),
                                 argument.origin,
                             )
                         }
@@ -763,19 +864,30 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // the loop resolves against the prefixed module bindings and
         // its generated resources are isolated per module instance
         // (carina#3126 PR-B).
-        let expanded_deferred_for_expressions: Vec<crate::parser::ExpandedDeferredForExpression> =
-            module
-                .deferred_for_expressions
-                .iter()
-                .map(|d| {
-                    let source_file = module
+        let expanded_parsed_deferred_for_expressions: Vec<
+            ParsedDeferredForExpression<AbsoluteBindingAddress>,
+        > = module
+            .parsed_deferred_for_expressions()
+            .iter()
+            .map(|deferred| {
+                let source_file = match &deferred.body {
+                    DeferredForBody::Resource(resource) => module
                         .parser_binding_metadata
-                        .resource_source_file(&d.template_resource.id);
-                    expand_deferred_for_expression(d, &expanded_call, &module_scope_resolver)
-                        .map_err(|error| error.with_optional_source_file(source_file))
-                })
-                .collect::<Result<_, _>>()
-                .map_err(contextualize_access_error)?;
+                        .resource_source_file(&resource.id),
+                    DeferredForBody::Read(data_source) => module
+                        .parser_binding_metadata
+                        .resource_source_file(&data_source.id),
+                    DeferredForBody::ModuleCall(_) => None,
+                };
+                expand_parsed_deferred_for_expression(
+                    deferred,
+                    &expanded_call,
+                    &module_scope_resolver,
+                )
+                .map_err(|error| error.with_optional_source_file(source_file))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(contextualize_access_error)?;
 
         // carina#3181: managed resources, data sources, and composition
         // resources are collected into separate typed `Vec`s above —
@@ -819,7 +931,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         contribution.data_sources = data_sources;
         contribution.compositions = compositions;
         contribution.wait_bindings = expanded_wait_bindings;
-        contribution.deferred_for_expressions = expanded_deferred_for_expressions;
+        *contribution.parsed_deferred_for_expressions_mut() =
+            expanded_parsed_deferred_for_expressions;
         contribution.parser_binding_metadata = expanded_parser_metadata;
         contribution.warnings = module.warnings.clone();
         for nested in nested_contributions {
@@ -1243,6 +1356,7 @@ struct ResolvedArgument<B: BindingAddress = AbsoluteBindingAddress> {
     argument: ModuleArgument<B>,
     origin: ArgumentOrigin,
     caller_reference: Option<crate::resource::AuthoredReferencePath>,
+    forwarded_from_enclosing_parameter: bool,
 }
 
 impl<B: BindingAddress> std::ops::Deref for ResolvedArgument<B> {
@@ -1420,6 +1534,7 @@ impl ModuleScopeResolver<'_> {
                         argument: ModuleArgument::new(placeholder),
                         origin: ArgumentOrigin::Defaulted,
                         caller_reference: None,
+                        forwarded_from_enclosing_parameter: false,
                     },
                 )
             })
@@ -1952,6 +2067,7 @@ fn expand_module_resource_with_identity(
         id,
         attributes,
         directives,
+        resolved_ignore_changes,
         prefixes,
         binding,
         dependency_bindings,
@@ -1966,6 +2082,7 @@ fn expand_module_resource_with_identity(
         prevent_destroy,
         depends_on,
         provider_instance,
+        ignore_changes,
     } = directives;
 
     Ok(crate::resource::Resource {
@@ -1980,7 +2097,9 @@ fn expand_module_resource_with_identity(
             prevent_destroy,
             depends_on: resolve_directive_dependencies(&depends_on, resolver)?,
             provider_instance,
+            ignore_changes,
         },
+        resolved_ignore_changes,
         prefixes,
         binding: binding
             .as_ref()
@@ -2025,6 +2144,7 @@ fn expand_module_data_source(
         prevent_destroy,
         depends_on,
         provider_instance,
+        ignore_changes,
     } = directives;
     Ok(crate::resource::DataSource {
         id,
@@ -2038,6 +2158,7 @@ fn expand_module_data_source(
             prevent_destroy,
             depends_on: resolve_directive_dependencies(&depends_on, resolver)?,
             provider_instance,
+            ignore_changes,
         },
         binding: binding
             .as_ref()
@@ -2058,6 +2179,7 @@ fn expand_module_composition(
     composition: &crate::resource::AuthoredLiveComposition,
     root_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
+    provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
 ) -> Result<crate::resource::ExpandedLiveComposition, ArgumentSubstitutionError> {
     let crate::resource::LiveComposition {
         id,
@@ -2079,48 +2201,49 @@ fn expand_module_composition(
         .iter()
         .map(|(name, argument)| {
             let (declared_type, origin) = argument.metadata();
-            let resolved = match argument.operand_ref() {
-                StructuralOperandRef::Value(value) => {
-                    let parameter = match value {
-                        Value::Deferred(DeferredValue::Unknown(
-                            crate::resource::UnknownReason::ModuleArgument { name, .. },
-                        )) => Some(name.as_str()),
-                        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-                            Some(binding.as_str())
-                        }
-                        Value::Concrete(_)
-                        | Value::Deferred(
-                            DeferredValue::ResourceRef { .. }
-                            | DeferredValue::Coalesce { .. }
-                            | DeferredValue::Interpolation(_)
-                            | DeferredValue::FunctionCall { .. }
-                            | DeferredValue::ResolvedFunctionCall { .. }
-                            | DeferredValue::Unavailable { .. }
-                            | DeferredValue::Access(_)
-                            | DeferredValue::Secret(_)
-                            | DeferredValue::RedactedSecret { .. }
-                            | DeferredValue::Unknown(_),
-                        ) => None,
-                    };
-                    let forwarded_handle = parameter
-                        .and_then(|parameter| {
-                            resolver
-                                .arguments
-                                .arguments
-                                .get(parameter)
-                                .map(|argument| (parameter, argument))
-                        })
-                        .and_then(|(parameter, argument)| match argument.value_ref() {
-                            StructuralOperandRef::Handle {
-                                handle,
-                                access_base,
-                            } => Some((parameter, handle, access_base)),
-                            StructuralOperandRef::Value(_)
-                            | StructuralOperandRef::Parameter { .. } => None,
-                        });
-                    match forwarded_handle {
+            let resolved =
+                match argument.operand_ref() {
+                    StructuralOperandRef::Value(value) => {
+                        let parameter = match value {
+                            Value::Deferred(DeferredValue::Unknown(
+                                crate::resource::UnknownReason::ModuleArgument { name, .. },
+                            )) => Some(name.as_str()),
+                            Value::Deferred(DeferredValue::BindingRef { binding }) => {
+                                Some(binding.as_str())
+                            }
+                            Value::Concrete(_)
+                            | Value::Deferred(
+                                DeferredValue::ResourceRef { .. }
+                                | DeferredValue::Coalesce { .. }
+                                | DeferredValue::Interpolation(_)
+                                | DeferredValue::FunctionCall { .. }
+                                | DeferredValue::ResolvedFunctionCall { .. }
+                                | DeferredValue::Unavailable { .. }
+                                | DeferredValue::Access(_)
+                                | DeferredValue::Secret(_)
+                                | DeferredValue::RedactedSecret { .. }
+                                | DeferredValue::Unknown(_),
+                            ) => None,
+                        };
+                        let forwarded_handle = parameter
+                            .and_then(|parameter| {
+                                resolver
+                                    .arguments
+                                    .arguments
+                                    .get(parameter)
+                                    .map(|argument| (parameter, argument))
+                            })
+                            .and_then(|(parameter, argument)| match argument.value_ref() {
+                                StructuralOperandRef::Handle {
+                                    handle,
+                                    access_base,
+                                } => Some((parameter, handle, access_base)),
+                                StructuralOperandRef::Value(_)
+                                | StructuralOperandRef::Parameter { .. } => None,
+                            });
+                        match forwarded_handle {
                         Some((parameter, handle, access_base)) => {
-                            crate::resource::LiveCompositionArgument::from_handle(
+                            crate::resource::LiveCompositionArgument::from_handle_with_static_type(
                                 access_base.clone(),
                                 declared_type.clone(),
                                 handle.clone().with_alias(parameter),
@@ -2133,27 +2256,27 @@ fn expand_module_composition(
                             origin,
                         ),
                     }
-                }
-                StructuralOperandRef::Handle {
-                    handle,
-                    access_base,
-                } => crate::resource::LiveCompositionArgument::from_handle(
-                    resolver
-                        .resolve_value(access_base, ArgumentSubstitutionPosition::AccessBase)?,
-                    declared_type.clone(),
-                    resolver.resolve_structural_handle(handle)?,
-                    origin,
-                ),
-                StructuralOperandRef::Parameter {
-                    name: parameter,
-                    access_base: _access_base,
-                } => {
-                    let substituted = resolver
-                        .arguments
-                        .arguments
-                        .get(parameter)
-                        .ok_or_else(|| resolver.unknown_binding(parameter))?;
-                    match substituted.value_ref() {
+                    }
+                    StructuralOperandRef::Handle {
+                        handle,
+                        access_base,
+                    } => crate::resource::LiveCompositionArgument::from_handle_with_static_type(
+                        resolver
+                            .resolve_value(access_base, ArgumentSubstitutionPosition::AccessBase)?,
+                        declared_type.clone(),
+                        resolver.resolve_structural_handle(handle)?,
+                        origin,
+                    ),
+                    StructuralOperandRef::Parameter {
+                        name: parameter,
+                        access_base: _access_base,
+                    } => {
+                        let substituted = resolver
+                            .arguments
+                            .arguments
+                            .get(parameter)
+                            .ok_or_else(|| resolver.unknown_binding(parameter))?;
+                        match substituted.value_ref() {
                         StructuralOperandRef::Value(value) => {
                             crate::resource::LiveCompositionArgument::from_value(
                                 value.clone(),
@@ -2164,7 +2287,7 @@ fn expand_module_composition(
                         StructuralOperandRef::Handle {
                             handle,
                             access_base,
-                        } => crate::resource::LiveCompositionArgument::from_handle(
+                        } => crate::resource::LiveCompositionArgument::from_handle_with_static_type(
                             access_base.clone(),
                             declared_type.clone(),
                             handle.clone().with_alias(parameter),
@@ -2182,8 +2305,14 @@ fn expand_module_composition(
                             )
                         }
                     }
-                }
-            };
+                    }
+                };
+            check_composition_argument_type(
+                name,
+                &resolved,
+                provider_context,
+                resolver.arguments.default_line,
+            )?;
             Ok((name.clone(), resolved))
         })
         .collect::<Result<IndexMap<_, _>, ArgumentSubstitutionError>>()?;
@@ -2248,6 +2377,136 @@ fn expand_module_composition(
     })
 }
 
+/// Re-evaluate a nested composition after its outer caller has supplied the
+/// arguments that were unavailable during the nested module's first
+/// expansion.
+fn settle_prefixed_composition_constraints(
+    composition: &mut crate::resource::ExpandedLiveComposition,
+    record_outcomes: bool,
+) -> Result<Option<ModuleCallConstraintReport>, ModuleError> {
+    if composition.signature.pending_constraints.is_empty() {
+        return Ok(None);
+    }
+
+    let argument_values = composition
+        .signature
+        .arguments
+        .iter()
+        .map(|(name, argument)| (name.clone(), argument.value().clone()))
+        .collect::<HashMap<_, _>>();
+    let constraints = std::mem::take(&mut composition.signature.pending_constraints);
+    let evaluated =
+        evaluate_module_constraints(ModuleConstraints::pending(&constraints), &argument_values);
+    let mut pending = Vec::new();
+    let mut outcomes = Vec::new();
+    for evaluated in evaluated {
+        let id = evaluated.constraint().id().clone();
+        match evaluated.evaluation() {
+            ConstraintEvaluation::Satisfied => outcomes.push(ResolvedModuleConstraintOutcome {
+                id,
+                status: ResolvedModuleConstraintStatus::Satisfied,
+            }),
+            ConstraintEvaluation::Pending => {
+                outcomes.push(ResolvedModuleConstraintOutcome {
+                    id,
+                    status: ResolvedModuleConstraintStatus::Pending,
+                });
+                pending.push(evaluated.into_constraint());
+            }
+            ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
+                let binding = composition.binding.as_ref().map(BindingAddress::as_str);
+                if record_outcomes {
+                    let diagnostic = evaluated
+                        .module_diagnostic(
+                            &composition.module_name,
+                            &composition.instance,
+                            binding,
+                            Some(&composition.call_path.immediate().id),
+                        )
+                        .expect("concrete nested constraint outcome has a diagnostic");
+                    outcomes.push(ResolvedModuleConstraintOutcome {
+                        id,
+                        status: ResolvedModuleConstraintStatus::Failed {
+                            diagnostic: Box::new(diagnostic),
+                            origin: ResolvedModuleConstraintOrigin::Call,
+                        },
+                    });
+                } else {
+                    return Err(evaluated
+                        .module_error(
+                            &composition.module_name,
+                            &composition.instance,
+                            binding,
+                            Some(&composition.call_path.immediate().id),
+                        )
+                        .expect("concrete nested constraint outcome has a diagnostic"));
+                }
+            }
+        }
+    }
+    composition.signature.pending_constraints = pending;
+    if record_outcomes {
+        Ok(Some(ModuleCallConstraintReport::new(
+            crate::parser::ModuleCallDiagnosticSource {
+                id: composition.call_path.immediate().id.clone(),
+            },
+            composition.instance.clone(),
+            outcomes,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+fn check_composition_argument_type(
+    parameter: &str,
+    argument: &crate::resource::LiveCompositionArgument,
+    config: crate::validation::typecheck::TypecheckProviderContext<'_>,
+    line: usize,
+) -> Result<(), ArgumentSubstitutionError> {
+    let Some(declared_type) = argument.declared_type().known() else {
+        return Ok(());
+    };
+    let Some(resolved_parameter) = crate::validation::resolve_parameter_type_for_check(
+        declared_type,
+        config.as_provider_context(),
+    )
+    .map_err(|error| ArgumentSubstitutionError {
+        source_file: None,
+        line,
+        message: error.to_string(),
+        parse_error: None,
+    })?
+    else {
+        return Ok(());
+    };
+
+    if let StructuralOperandRef::Handle { handle, .. } = argument.operand_ref() {
+        if let Err(error) = crate::validation::check_handle_sink(handle, &resolved_parameter) {
+            return Err(ArgumentSubstitutionError {
+                source_file: None,
+                line,
+                message: format!("parameter '{parameter}': {error}"),
+                parse_error: None,
+            });
+        }
+        return Ok(());
+    }
+
+    config
+        .check(
+            &resolved_parameter.as_type_expr(),
+            argument.value(),
+            crate::validation::typecheck::TypecheckInference::Unavailable,
+        )
+        .map_err(|mismatch| ArgumentSubstitutionError {
+            source_file: None,
+            line,
+            message: format!("parameter '{parameter}': {mismatch}"),
+            parse_error: None,
+        })
+}
+
 fn resolve_module_constraint_expression(
     expression: &crate::parser::ValidateExpr,
     resolver: &ModuleScopeResolver<'_>,
@@ -2301,76 +2560,93 @@ fn resolve_module_constraint_expression(
     })
 }
 
-fn expand_deferred_for_expression(
-    d: &DeferredForExpression,
+fn expand_parsed_deferred_for_expression(
+    deferred: &ParsedDeferredForExpression<RelativeBindingName>,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<crate::parser::ExpandedDeferredForExpression, ArgumentSubstitutionError> {
-    let DeferredForExpression {
+) -> Result<ParsedDeferredForExpression<AbsoluteBindingAddress>, ArgumentSubstitutionError> {
+    let ParsedDeferredForExpression {
         file,
         line,
+        span,
         header,
-        resource_type,
-        attributes,
         target,
         iterable,
+        iterable_state,
         binding,
-        template_resource,
-    } = d;
+        body,
+    } = deferred;
     let instance_identity = ResourceIdentity::try_from(resolver.scope.key().to_string())
         .expect("module instance prefix is non-empty");
     let legacy_parent = module_call
         .loop_origin()
         .map(|origin| origin.legacy_address().clone())
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
+    let target = match target {
+        crate::parser::DeferredForTarget::Bound { binding } => {
+            crate::parser::DeferredForTarget::Bound {
+                binding: resolver.resolve_declared_binding(binding)?,
+            }
+        }
+        crate::parser::DeferredForTarget::Unbound { template } => {
+            let mut template = template.clone();
+            template.prefix_for_module(&instance_identity, &legacy_parent);
+            crate::parser::DeferredForTarget::Unbound { template }
+        }
+    };
+    let iterable_state = if matches!(iterable_state, ParsedDeferredForIterableState::Deferred)
+        && crate::parser::contains_module_argument_matching(iterable, &mut |name| {
+            resolver
+                .arguments
+                .arguments
+                .get(name)
+                .is_some_and(|argument| argument.forwarded_from_enclosing_parameter)
+        }) {
+        ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
+    } else {
+        iterable_state.clone()
+    };
 
-    Ok(crate::parser::DeferredForExpression {
-        // provenance — pass through (like WaitBinding.line)
+    // A bare, unbound iterable is retained specifically so the finalization
+    // seam can emit the parser's source-owned UndefinedIdentifier diagnostic
+    // and collect every such error in the module. It must still cross this
+    // phase as an absolute value, but checking membership here would replace
+    // that diagnostic with the expander's first-error-only "unknown binding".
+    let iterable = if matches!(
+        &iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { .. }
+    ) {
+        iterable.clone().resolve_module(resolver.scope)
+    } else {
+        resolve_module_value(iterable, resolver)?
+    };
+    let body = match body {
+        DeferredForBody::Resource(resource) => {
+            DeferredForBody::Resource(Box::new(expand_module_resource_with_identity(
+                resource,
+                &instance_identity,
+                module_call,
+                resolver,
+            )?))
+        }
+        DeferredForBody::Read(data_source) => {
+            DeferredForBody::Read(Box::new(expand_module_data_source(data_source, resolver)?))
+        }
+        DeferredForBody::ModuleCall(call) => {
+            DeferredForBody::ModuleCall(resolve_nested_module_call(call, resolver)?)
+        }
+    };
+
+    Ok(ParsedDeferredForExpression {
         file: file.clone(),
         line: *line,
-        // verbatim user-surface display text — pass through
-        // (like WaitBinding.until_raw)
+        span: *span,
         header: header.clone(),
-        // provider-qualified type — not a binding
-        resource_type: resource_type.clone(),
-        // The loop body's attrs may reference module-internal bindings or
-        // module arguments; the shared scope resolver handles both.
-        attributes: attributes
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), resolve_module_value(v, resolver)?)))
-            .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        // Generated-resource address prefix — `binding_name` is a name
-        // the loop *synthesizes* for its own resources (e.g.
-        // `_domain_validation_options`), NOT a reference to a
-        // pre-existing binding, so the caller-collision concern does
-        // not apply: prefix it unconditionally (same as
-        // `Resource.binding`) to isolate each module instance's loop
-        // resources.
-        target: match target {
-            crate::parser::DeferredForTarget::Bound { binding } => {
-                crate::parser::DeferredForTarget::Bound {
-                    binding: resolver.resolve_declared_binding(binding)?,
-                }
-            }
-            crate::parser::DeferredForTarget::Unbound { template } => {
-                let mut template = template.clone();
-                template.prefix_for_module(&instance_identity, &legacy_parent);
-                crate::parser::DeferredForTarget::Unbound { template }
-            }
-        },
-        // The full iterable is a value expression: rewrite every reference
-        // and substitute module arguments in both coalesce operands.
-        iterable: resolve_module_value(iterable, resolver)?,
-        // loop-var pattern kind — loop-local, not a module binding
+        target,
+        iterable,
+        iterable_state,
         binding: binding.clone(),
-        // Full module-resource treatment — identical to a
-        // `module.resources` entry.
-        template_resource: expand_module_resource_with_identity(
-            template_resource,
-            &instance_identity,
-            module_call,
-            resolver,
-        )?,
+        body,
     })
 }
 
@@ -2428,6 +2704,7 @@ pub(super) fn substitute_arguments<B: BindingAddress>(
                     argument: ModuleArgument::new(value.clone()),
                     origin: ArgumentOrigin::Defaulted,
                     caller_reference: None,
+                    forwarded_from_enclosing_parameter: false,
                 },
             )
         })

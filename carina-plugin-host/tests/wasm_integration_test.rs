@@ -1,7 +1,7 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -148,7 +148,11 @@ where
         id: &'a ResourceId,
         request: CreateRequest,
     ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
-        Box::pin(carina_core::executor::dispatch_create(self, id, request))
+        let (create, cancellation) = carina_core::executor::dispatch_create(self, id, request);
+        Box::pin(async move {
+            let _cancellation = cancellation;
+            create.await
+        })
     }
 }
 
@@ -330,6 +334,14 @@ fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str)
     resource
 }
 
+fn with_http_create_behavior(mut resource: Resource, behavior: &str) -> Resource {
+    resource.attributes.insert(
+        "create_behavior".to_string(),
+        Value::Concrete(ConcreteValue::String(behavior.to_string().into())),
+    );
+    resource
+}
+
 fn http_probe_body() -> String {
     // Exceed the two-chunk host body buffer so the closed-port case can close
     // the receiver while the guest is still writing, exercising the
@@ -346,12 +358,219 @@ fn http_probe_outcome(state: &State) -> &str {
     outcome.expose_plaintext()
 }
 
+fn spawn_http_ok_server() -> Option<(SocketAddr, std::thread::JoinHandle<usize>)> {
+    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+            return None;
+        }
+    };
+    let address = listener
+        .local_addr()
+        .expect("bound loopback listener has an address");
+    listener
+        .set_nonblocking(true)
+        .expect("set loopback listener nonblocking");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "server accept timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("server accept failed: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set server read timeout");
+        let mut request = vec![0_u8; 32 * 1024];
+        let bytes_read = stream
+            .read(&mut request)
+            .expect("read dispatched request bytes");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("write successful HTTP response");
+        bytes_read
+    });
+    Some((address, server))
+}
+
 fn create_failure_error(failure: CreateFailure) -> ProviderError {
     match failure.into_kind() {
         CreateFailureKind::Untracked(error) => error,
+        CreateFailureKind::OutcomeUnknown { unknown: _, error } => error,
         CreateFailureKind::InFlight { pending: _, error } => error,
         CreateFailureKind::Created { created: _, error } => error,
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_create_trap_after_dispatched_egress_is_outcome_unknown() {
+    let path = skip_if_no_http_wasm!();
+    let Some((server_address, server)) = spawn_http_ok_server() else {
+        return;
+    };
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "trap-after-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "trap-after-egress",
+            &format!("http://phase-test.invalid:{}/", server_address.port()),
+            "POST",
+            &http_probe_body(),
+        ),
+        "trap_after_send",
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the guest must trap after the request completes");
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the request must actually leave the guest");
+    let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+        panic!("a trap after dispatched egress must not be classified untracked")
+    };
+    assert_eq!(unknown.id(), &id);
+    assert!(error.to_string().contains("WASM guest trapped"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_create_unencodable_pending_token_after_egress_is_outcome_unknown() {
+    let path = skip_if_no_http_wasm!();
+    let Some((server_address, server)) = spawn_http_ok_server() else {
+        return;
+    };
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "unencodable-pending-after-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "unencodable-pending-after-egress",
+            &format!("http://phase-test.invalid:{}/", server_address.port()),
+            "POST",
+            &http_probe_body(),
+        ),
+        "pending_nan_after_send",
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the guest must trap while encoding the NaN continuation token");
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the request must actually leave the guest");
+    let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+        panic!("a continuation encode failure after egress must never be untracked")
+    };
+    assert_eq!(unknown.id(), &id);
+    let rendered = error.to_string();
+    assert!(rendered.contains("WASM guest trapped"), "{rendered}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_create_trap_without_egress_is_untracked() {
+    let path = skip_if_no_http_wasm!();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "trap-before-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "trap-before-egress",
+            "http://phase-test.invalid:1/",
+            "POST",
+            &http_probe_body(),
+        ),
+        "trap_before_send",
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the guest must trap before issuing the request");
+
+    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        panic!("a trap with no dispatched egress must remain untracked")
+    };
+    assert!(error.to_string().contains("WASM guest trapped"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_declared_untracked_remains_untracked_after_egress() {
+    let path = skip_if_no_http_wasm!();
+    let Some((server_address, server)) = spawn_http_ok_server() else {
+        return;
+    };
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "declared-untracked-after-egress",
+        None,
+    );
+    let resource = with_http_create_behavior(
+        http_send_phase_resource(
+            "declared-untracked-after-egress",
+            &format!("http://phase-test.invalid:{}/", server_address.port()),
+            "POST",
+            &http_probe_body(),
+        ),
+        "untracked_after_send",
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the provider must return its declared verdict");
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0, "the request must actually leave the guest");
+    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        panic!("a decoded provider-declared untracked verdict must remain authoritative")
+    };
+    assert!(error.to_string().contains("provider declared untracked"));
 }
 
 fn persisted_create_for_resume(
@@ -395,6 +614,9 @@ fn persisted_create_for_resume(
         }
         carina_core::resource::Current::MissingIdentifier(state) => {
             panic!("resume fixture loaded without an identifier: {state:?}")
+        }
+        carina_core::resource::Current::CreateOutcomeUnknown(unknown) => {
+            panic!("resume fixture loaded as outcome unknown: {unknown:?}")
         }
     }
 }
@@ -455,6 +677,57 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn initialized_reference_scope_is_kept_per_provider_instance() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let tokyo_attributes = indexmap::IndexMap::from([(
+        "__mock_reference_scope_region__".to_string(),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+    )]);
+    let virginia_attributes = indexmap::IndexMap::from([(
+        "__mock_reference_scope_region__".to_string(),
+        Value::Concrete(ConcreteValue::String("us-east-1".into())),
+    )]);
+
+    let _tokyo = factory
+        .create_initialized_provider(None, &ready_config(&factory, &tokyo_attributes))
+        .await
+        .expect("default provider should initialize");
+    let _virginia = factory
+        .create_initialized_provider(
+            Some("virginia"),
+            &ready_config(&factory, &virginia_attributes),
+        )
+        .await
+        .expect("named provider should initialize");
+
+    assert_eq!(
+        factory.initialized_reference_scope_for_test(None).await,
+        Some(
+            carina_provider_protocol::types::ReferenceScope::available(
+                "mock",
+                "ap-northeast-1",
+                "test-account",
+            )
+            .expect("fixture scope is valid"),
+        )
+    );
+    assert_eq!(
+        factory
+            .initialized_reference_scope_for_test(Some("virginia"))
+            .await,
+        Some(
+            carina_provider_protocol::types::ReferenceScope::available(
+                "mock",
+                "us-east-1",
+                "test-account",
+            )
+            .expect("fixture scope is valid"),
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_override() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -490,7 +763,7 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -506,12 +779,14 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
         "denied",
     );
 
-    let error = create_failure_error(
-        provider
-            .create_for_test(&id, create_request_for_test(resource).await)
-            .await
-            .expect_err("the host egress policy must trap the guest"),
-    );
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the host egress policy must trap the guest");
+    let CreateFailureKind::Untracked(error) = failure.into_kind() else {
+        panic!("a policy-denied request must not count as dispatched egress")
+    };
     let rendered = error.to_string();
 
     assert!(
@@ -539,7 +814,7 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -558,6 +833,7 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
 
     let started = Instant::now();
     let failure = provider
+        .provider()
         .create_for_test(&id, request)
         .await
         .expect_err("an untrusted provider must trap on an IMDS request");
@@ -594,6 +870,7 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
     );
     let followup_started = Instant::now();
     let followup_error = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the trapping metadata denial must poison the shared instance");
@@ -619,7 +896,7 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
     let metadata_address = SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 80));
     let factory = factory.with_http_test_route("resolved-metadata.invalid", metadata_address);
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -637,6 +914,7 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
 
     let started = Instant::now();
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("post-resolution metadata policy must trap the guest");
@@ -675,6 +953,7 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
     );
     let followup_started = Instant::now();
     let followup_error = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the post-resolution metadata trap must poison the shared instance");
@@ -714,7 +993,7 @@ async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", closed_address);
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -732,6 +1011,7 @@ async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("the mock transport probe should report its phase"),
@@ -769,7 +1049,7 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -813,6 +1093,7 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("the mock transport probe should report its phase"),
@@ -844,7 +1125,7 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -893,6 +1174,7 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
     });
 
     let outcome = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await;
     release_server
@@ -917,7 +1199,7 @@ async fn test_wasm_pending_create_polls_until_success() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-create", None);
@@ -930,6 +1212,7 @@ async fn test_wasm_pending_create_polls_until_success() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("pending create should settle"),
@@ -952,13 +1235,14 @@ async fn test_wasm_pending_update_polls_until_success() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-update", None);
     let mut resource = resource_with_int_attribute("test.resource", "pending-update", "value", 1);
     let created = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource.clone()).await)
             .await
             .expect("setup create should succeed"),
@@ -976,6 +1260,7 @@ async fn test_wasm_pending_update_polls_until_success() {
     .await;
 
     let state = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("pending update should settle")
@@ -1000,7 +1285,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-delete", None);
@@ -1011,12 +1296,14 @@ async fn test_wasm_pending_delete_polls_until_success() {
         i64::from(PENDING_POLLS),
     );
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("setup create should succeed");
 
     let delete_started = Instant::now();
     provider
+        .provider()
         .delete(&id, &mock_identifier(), DeleteRequest::default())
         .await
         .expect("pending delete should settle");
@@ -1026,6 +1313,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
     );
 
     let state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("provider should remain usable")
@@ -1040,7 +1328,7 @@ async fn test_wasm_pending_create_can_settle_on_final_poll_at_deadline() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1058,6 +1346,7 @@ async fn test_wasm_pending_create_can_settle_on_final_poll_at_deadline() {
 
     let state = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource).await)
             .await
             .expect("the final poll at the schema deadline should be allowed"),
@@ -1076,7 +1365,7 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let pending_id =
@@ -1090,7 +1379,9 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
 
     tokio::time::timeout(
         Duration::from_millis(750),
-        provider.create_for_test(&pending_id, create_request_for_test(pending).await),
+        provider
+            .provider()
+            .create_for_test(&pending_id, create_request_for_test(pending).await),
     )
     .await
     .expect_err("the caller timeout should drop the operation between polls");
@@ -1099,6 +1390,7 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
         ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
     let healthy = resource_with_int_attribute("test.resource", "after-cancel", "value", 1);
     provider
+        .provider()
         .create_for_test(&healthy_id, create_request_for_test(healthy).await)
         .await
         .expect("cancellation between polls must not poison the WASM instance");
@@ -1109,7 +1401,7 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.short_budget", "over-budget", None);
@@ -1121,6 +1413,7 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
     );
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("pending create should exhaust its schema budget")
@@ -1133,6 +1426,10 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
         CreateFailureKind::Untracked(error) => {
             panic!("pending create was downgraded to untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "pending create outcome became unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "pending create was classified as created for {}: {error}",
             created.identifier()
@@ -1143,6 +1440,7 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
         ResourceId::with_provider_identity("mock", "test.resource", "after-timeout", None);
     let healthy = resource_with_int_attribute("test.resource", "after-timeout", "value", 1);
     provider
+        .provider()
         .create_for_test(&healthy_id, create_request_for_test(healthy).await)
         .await
         .expect("budget exhaustion must not poison the WASM instance");
@@ -1153,7 +1451,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -1166,6 +1464,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         "untracked",
     );
     let untracked = provider
+        .provider()
         .create_for_test(&untracked_id, create_request_for_test(untracked).await)
         .await
         .expect_err("untracked mode must return a classified failure")
@@ -1185,6 +1484,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         Value::Concrete(ConcreteValue::String("name".into())),
     );
     let created = provider
+        .provider()
         .create_for_test(&created_id, create_request_for_test(created).await)
         .await
         .expect_err("created mode must preserve its observed resource")
@@ -1218,6 +1518,7 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         "malformed_pending",
     );
     let malformed = provider
+        .provider()
         .create_for_test(&malformed_id, create_request_for_test(malformed).await)
         .await
         .expect_err("an undecodable poll token must remain in flight")
@@ -1230,6 +1531,10 @@ async fn wasm_mock_exercises_untracked_created_and_malformed_pending_verdicts() 
         CreateFailureKind::Untracked(error) => {
             panic!("undecodable token was downgraded to untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "undecodable token became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "undecodable token was classified as created for {}: {error}",
             created.identifier()
@@ -1242,7 +1547,7 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id =
@@ -1255,6 +1560,7 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
     );
 
     let failure = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("guest encoding failure must remain classified")
@@ -1267,6 +1573,10 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
         CreateFailureKind::Untracked(error) => {
             panic!("issued create was lost as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "issued create lost its identifier as outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("finished create unexpectedly remained in flight {pending:?}: {error}")
         }
@@ -1274,11 +1584,11 @@ async fn initial_issued_encode_failure_is_created_never_untracked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_unissued_pending_token_encode_failure_is_untracked() {
+async fn initial_unissued_pending_token_encode_failure_without_egress_is_untracked() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1295,17 +1605,22 @@ async fn initial_unissued_pending_token_encode_failure_is_untracked() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
-        .expect_err("an unissued unencodable continuation cannot be tracked")
+        .expect_err("an unissued unencodable continuation must trap")
         .into_kind()
     {
         CreateFailureKind::Untracked(error) => {
-            assert!(error.to_string().contains("pending token"));
+            assert!(error.to_string().contains("WASM guest trapped"));
         }
         CreateFailureKind::Created { created, error } => panic!(
             "unissued create unexpectedly retained identifier {}: {error}",
             created.identifier()
+        ),
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "pre-dispatch token encoding failure became outcome unknown for {}: {error}",
+            unknown.id()
         ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("unencodable token entered in-flight state {pending:?}: {error}")
@@ -1318,7 +1633,7 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1335,6 +1650,7 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("an issued create with no encodable continuation must be retained")
@@ -1363,6 +1679,10 @@ async fn initial_issued_pending_token_encode_failure_is_created() {
         CreateFailureKind::Untracked(error) => {
             panic!("issued create was lost as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "issued create lost its identifier as outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::InFlight { pending, error } => {
             panic!("unencodable token entered in-flight state {pending:?}: {error}")
         }
@@ -1374,7 +1694,7 @@ async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id =
@@ -1387,6 +1707,7 @@ async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("an unissued poll with no replacement token must remain in flight")
@@ -1402,6 +1723,10 @@ async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
         CreateFailureKind::Untracked(error) => {
             panic!("poll token encoding failure lost the previous continuation: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "poll token encoding failure became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "unissued poll unexpectedly retained identifier {}: {error}",
             created.identifier()
@@ -1414,7 +1739,7 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1431,6 +1756,7 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
     );
 
     match provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("an issued poll with no encodable replacement must remain in flight")
@@ -1450,6 +1776,10 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
         CreateFailureKind::Untracked(error) => {
             panic!("issued poll was lost as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "issued poll became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "issued poll ended the in-flight operation for {}: {error}",
             created.identifier()
@@ -1462,7 +1792,7 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1488,6 +1818,7 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
         .expect("resume fixture route must match");
 
     match provider
+        .provider()
         .resume_create(request)
         .await
         .map(ResumeOutcome::into_kind)
@@ -1526,7 +1857,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -1558,6 +1889,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
                 .expect("resume fixture route must match");
         let result = provider
+            .provider()
             .resume_create(request)
             .await
             .map(ResumeOutcome::into_kind)
@@ -1613,6 +1945,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
         ResumeCreateRequest::for_test(malformed, create_request_for_test(malformed_resource).await)
             .expect("malformed-token fixture route must match");
     match provider
+        .provider()
         .resume_create(malformed_request)
         .await
         .map(ResumeOutcome::into_kind)
@@ -1644,7 +1977,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let canonical = "part-a|part-b";
@@ -1658,6 +1991,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
         canonical,
     );
     let finished = provider
+        .provider()
         .create_for_test(&finished_id, create_request_for_test(finished).await)
         .await
         .expect("canonicalized finished create should succeed")
@@ -1689,6 +2023,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resumed).await)
         .expect("resume fixture route must match");
     match provider
+        .provider()
         .resume_create(request)
         .await
         .map(ResumeOutcome::into_kind)
@@ -1715,7 +2050,7 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id =
@@ -1732,6 +2067,7 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     );
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the slow initial guest call should exhaust the schema budget");
@@ -1747,6 +2083,10 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
         CreateFailureKind::Untracked(error) => {
             panic!("slow initial call was classified as untracked: {error}")
         }
+        CreateFailureKind::OutcomeUnknown { unknown, error } => panic!(
+            "slow initial call became outcome unknown for {}: {error}",
+            unknown.id()
+        ),
         CreateFailureKind::Created { created, error } => panic!(
             "slow initial call was classified as created for {}: {error}",
             created.identifier()
@@ -1760,7 +2100,7 @@ async fn test_wasm_production_budget_allows_25s_host_wait() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-25s", None);
@@ -1772,6 +2112,7 @@ async fn test_wasm_production_budget_allows_25s_host_wait() {
     );
 
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("a host wait below the compute budget should succeed");
@@ -1783,7 +2124,7 @@ async fn test_wasm_production_budget_allows_35s_host_wait() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-35s", None);
@@ -1795,6 +2136,7 @@ async fn test_wasm_production_budget_allows_35s_host_wait() {
     );
 
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("time parked in a host import must not consume guest compute budget");
@@ -1810,7 +2152,7 @@ async fn test_wasm_short_compute_budget_excludes_5s_host_wait() {
         Duration::from_secs(30),
     ));
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-5s", None);
@@ -1818,6 +2160,7 @@ async fn test_wasm_short_compute_budget_excludes_5s_host_wait() {
         resource_with_int_attribute("test.resource", "host-wait-5s", "call_delay_millis", 5_000);
 
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("host wait longer than the compute budget should succeed");
@@ -1833,7 +2176,7 @@ async fn test_wasm_short_compute_budget_interrupts_busy_loop() {
         Duration::from_secs(60),
     ));
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "spin-forever", None);
@@ -1845,6 +2188,7 @@ async fn test_wasm_short_compute_budget_interrupts_busy_loop() {
     let started = Instant::now();
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("busy guest computation should exhaust its compute budget");
@@ -1874,7 +2218,7 @@ async fn test_wasm_short_compute_budget_interrupts_spin_with_host_calls() {
         Duration::from_secs(60),
     ));
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1893,7 +2237,9 @@ async fn test_wasm_short_compute_budget_interrupts_spin_with_host_calls() {
 
     let error = tokio::time::timeout(
         Duration::from_secs(10),
-        provider.create_for_test(&id, create_request_for_test(resource).await),
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await),
     )
     .await
     .expect("compute timeout should fire within 10s even when the guest calls host imports")
@@ -1924,7 +2270,7 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
         Duration::from_secs(2),
     ));
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "wall-timeout", None);
@@ -1933,6 +2279,7 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
     let started = Instant::now();
 
     let error = provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect_err("the whole guest call should be bounded by its wall budget");
@@ -1975,7 +2322,7 @@ async fn test_wasm_queued_sibling_observes_poison_before_dead_store() {
         Duration::from_secs(1),
     ));
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let slow_id =
@@ -1990,10 +2337,11 @@ async fn test_wasm_queued_sibling_observes_poison_before_dead_store() {
     let sibling_id =
         ResourceId::with_provider_identity("mock", "test.resource", "queued-sibling", None);
 
-    let timed_out = provider.create_for_test(&slow_id, slow);
+    let timed_out = provider.provider().create_for_test(&slow_id, slow);
     let sibling = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         provider
+            .provider()
             .read(&sibling_id, &mock_identifier(), ReadRequest)
             .await
     };
@@ -2024,7 +2372,7 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
         Duration::from_secs(30),
     ));
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let slow_id =
@@ -2039,7 +2387,7 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
 
     tokio::time::timeout(
         Duration::from_millis(500),
-        provider.create_for_test(&slow_id, slow),
+        provider.provider().create_for_test(&slow_id, slow),
     )
     .await
     .expect_err("the outer timeout must cancel the in-flight guest call");
@@ -2047,6 +2395,7 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-cancel", None);
     let followup = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("cancelling an in-flight call must poison the configured instance");
@@ -2067,7 +2416,7 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let pending_id =
@@ -2078,12 +2427,14 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
     let sibling_id =
         ResourceId::with_provider_identity("mock", "test.resource", "sibling-read", None);
 
-    let pending_operation = provider.create_for_test(&pending_id, request);
+    let pending_operation = provider.provider().create_for_test(&pending_id, request);
     let sibling_operation = async {
         tokio::time::sleep(Duration::from_millis(100)).await;
         tokio::time::timeout(
             Duration::from_millis(500),
-            provider.read(&sibling_id, &mock_identifier(), ReadRequest),
+            provider
+                .provider()
+                .read(&sibling_id, &mock_identifier(), ReadRequest),
         )
         .await
         .expect("sibling read must not wait for the provider's poll sleep")
@@ -2424,7 +2775,7 @@ async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
         Duration::from_secs(1),
     ));
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let first_id = ResourceId::with_provider_identity("mock", "test.resource", "slow-one", None);
@@ -2452,15 +2803,18 @@ async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
     ))
     .await;
 
-    let first_operation = provider.create_for_test(&first_id, first);
+    let first_operation = provider.provider().create_for_test(&first_id, first);
     let second_operation = async {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        provider.create_for_test(&second_id, second).await
+        provider
+            .provider()
+            .create_for_test(&second_id, second)
+            .await
     };
     let fast_operation = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let queued_at = Instant::now();
-        let result = provider.create_for_test(&fast_id, fast).await;
+        let result = provider.provider().create_for_test(&fast_id, fast).await;
         (result, queued_at.elapsed())
     };
     let (first_result, second_result, (fast_result, fast_elapsed)) =
@@ -2480,15 +2834,16 @@ async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
-    assert_eq!(provider.name(), "mock");
+    assert_eq!(provider.provider().name(), "mock");
 
     // Read before create - should return a state with no identifier and empty attributes
     let id = ResourceId::with_provider_identity("mock", "test.resource", "my-resource", None);
     let state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2512,6 +2867,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     let created = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource.clone()).await)
             .await
             .expect("create should succeed"),
@@ -2534,6 +2890,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 
     // Read back - should return the created state
     let read_state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2560,7 +2917,7 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2571,6 +2928,7 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
     );
 
     let error = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("guest output containing nested NaN must be a provider error");
@@ -2585,7 +2943,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -2611,6 +2969,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     let created = create_state_for_writeback(
         provider
+            .provider()
             .create_for_test(&id, create_request_for_test(resource.clone()).await)
             .await
             .expect("create should succeed"),
@@ -2639,6 +2998,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     .await;
 
     let updated = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("update should succeed")
@@ -2686,6 +3046,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Read to verify update persisted in memory
     let read_state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2697,12 +3058,14 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     // Delete
     provider
+        .provider()
         .delete(&id, &mock_identifier(), DeleteRequest::default())
         .await
         .expect("delete should succeed");
 
     // Read after delete - should return empty state (no identifier, no attributes)
     let deleted_state = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read should not error")
@@ -2716,7 +3079,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-update", None);
@@ -2745,6 +3108,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
     .await;
 
     let updated = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("persisted current-state secrets must cross the update boundary")
@@ -2765,7 +3129,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-carry", None);
@@ -2789,6 +3153,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
 
     let updated = provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("unchanged persisted secrets must cross the update outcome boundary")
@@ -2810,7 +3175,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "nested-secret", None);
@@ -2827,6 +3192,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
         ("payload".into(), cloud_payload.clone()),
     ]);
     provider
+        .provider()
         .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should seed the mock cloud store");
@@ -2855,11 +3221,13 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     );
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
     provider
+        .provider()
         .update(&id, &mock_identifier(), request)
         .await
         .expect("update should preserve the unchanged persisted attribute");
 
     let read = provider
+        .provider()
         .read(&id, &mock_identifier(), ReadRequest)
         .await
         .expect("read after update should succeed")
@@ -3078,6 +3446,68 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
         vec!["tags", "pending"],
         "ref/Unknown-bearing attributes must be restored unchanged after the guest call"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_normalize_desired_rejects_absent_required_together_attribute() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let mut resource = Resource::with_provider(
+        "mock",
+        "test.normalize_required_together",
+        "absent-companion",
+        None,
+    );
+    resource.set_attr(
+        "primary",
+        Value::Concrete(ConcreteValue::String("configured".into())),
+    );
+    let mut resources = provider_resources(vec![resource]);
+
+    let error = normalizer
+        .normalize_desired(&mut resources)
+        .await
+        .expect_err("an absent companion must fail during desired normalization");
+
+    assert_eq!(error.variant_name(), "invalid_input");
+    assert_eq!(
+        error.detail().context(),
+        "test.normalize_required_together companion is required when primary is present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_normalize_desired_accepts_and_restores_deferred_required_together_attribute() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("normalizer should initialize");
+    let mut resource = Resource::with_provider(
+        "mock",
+        "test.normalize_required_together",
+        "deferred-companion",
+        None,
+    );
+    resource.set_attr(
+        "primary",
+        Value::Concrete(ConcreteValue::String("configured".into())),
+    );
+    let deferred = root_resource_ref("upstream", "identifier");
+    resource.set_attr("companion", deferred.clone());
+    let mut resources = provider_resources(vec![resource]);
+
+    normalizer
+        .normalize_desired(&mut resources)
+        .await
+        .expect("a deferred companion must postpone the required-together check");
+
+    assert_eq!(resources[0].get_attr("companion"), Some(&deferred));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3615,6 +4045,7 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
         &saved_attrs,
         None,
         None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
     );
     assert!(
         !diff.is_change(),
@@ -3628,7 +4059,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::new();
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &attributes))
+        .create_initialized_provider(None, &ready_config(&factory, &attributes))
         .await
         .expect("provider should initialize");
     let normalizer = factory
@@ -3663,6 +4094,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let create_id = ResourceId::with_provider_identity("mock", "test.resource", "after-trap", None);
     let resource = Resource::with_provider("mock", "test.resource", "after-trap", None);
     let error = provider
+        .provider()
         .create_for_test(&create_id, create_request_for_test(resource).await)
         .await
         .expect_err("the shared provider instance must remain poisoned after a normalizer trap");
@@ -3690,7 +4122,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let trap_id =
@@ -3699,6 +4131,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
         Resource::with_provider("mock", "test.resource", "__mock_create_trap__", None);
 
     let initial_error = provider
+        .provider()
         .create_for_test(&trap_id, create_request_for_test(trap_resource).await)
         .await
         .expect_err("the mock create hook must trap");
@@ -3717,6 +4150,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-create-trap", None);
     let followup_error = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the shared instance must remain poisoned after a CRUD trap");
@@ -3740,7 +4174,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let error_id =
@@ -3749,6 +4183,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
         Resource::with_provider("mock", "test.resource", "__mock_create_error__", None);
 
     let error = provider
+        .provider()
         .create_for_test(&error_id, create_request_for_test(error_resource).await)
         .await
         .expect_err("the mock create hook must return a provider error");
@@ -3766,6 +4201,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-create-error", None);
     let state = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect("a provider-returned error must not poison the shared instance")
@@ -3778,13 +4214,14 @@ async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instanc
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let error_id =
         ResourceId::with_provider_identity("mock", "test.resource", "__mock_read_error__", None);
 
     let error = provider
+        .provider()
         .read(&error_id, &mock_identifier(), ReadRequest)
         .await
         .expect_err("the mock read hook must return a WIT provider-error");
@@ -3794,6 +4231,7 @@ async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instanc
     let followup_id =
         ResourceId::with_provider_identity("mock", "test.resource", "after-read-error", None);
     let state = provider
+        .provider()
         .read(&followup_id, &mock_identifier(), ReadRequest)
         .await
         .expect("a provider-returned WIT error must not poison the FailFast instance")
@@ -3807,7 +4245,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::new();
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &attributes))
+        .create_initialized_provider(None, &ready_config(&factory, &attributes))
         .await
         .expect("provider should initialize");
     let normalizer = factory
@@ -3939,6 +4377,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         None,
     );
     let state = provider
+        .provider()
         .read(&read_id, &mock_identifier(), ReadRequest)
         .await
         .expect("provider-returned normalizer errors must not poison a later CRUD call")
@@ -4126,7 +4565,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -4157,6 +4596,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
             .expect("data-source request should pass the checked host boundary");
 
     let state = provider
+        .provider()
         .read_data_source(&resource)
         .await
         .expect("read_data_source should dispatch to the plugin override");
@@ -4187,13 +4627,14 @@ async fn test_wasm_mock_provider_required_permissions_dispatches_through_wit() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
 
     assert_eq!(
         provider
+            .provider()
             .required_permissions(&id, PlanOp::Create)
             .expect("required_permissions should succeed"),
         Vec::<String>::new()
@@ -4205,7 +4646,7 @@ async fn test_wasm_required_permissions_trap_is_not_an_empty_permission_set() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -4216,6 +4657,7 @@ async fn test_wasm_required_permissions_trap_is_not_an_empty_permission_set() {
     );
 
     let error = provider
+        .provider()
         .required_permissions(&id, PlanOp::Create)
         .expect_err("a guest trap must be returned to the caller");
 
@@ -4230,7 +4672,7 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -4241,6 +4683,7 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
     );
 
     let error = provider
+        .provider()
         .satisfier_hint(
             &id,
             &carina_core::wait::predicate::AttrPath::single("status"),

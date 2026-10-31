@@ -866,7 +866,7 @@ fn evaluate_runtime_user_function(
             } else if argument.pending_parameter().is_none()
                 && let Some(value) = argument.value()
             {
-                crate::validation::typecheck::check_type_expr_value(
+                crate::validation::typecheck::check_type_expr_value_providerless(
                     &resolved_parameter
                         .map_or_else(|| expected.clone(), |resolved| resolved.as_type_expr()),
                     value,
@@ -909,7 +909,7 @@ fn evaluate_runtime_user_function(
     let result = resolve_ref_value_inner(&substituted, bindings, config)
         .map_err(|error| error.in_file(function.body.source_file.as_deref()))?;
     if let Some(expected) = &function.return_type {
-        crate::validation::typecheck::check_type_expr_value(
+        crate::validation::typecheck::check_type_expr_value_providerless(
             expected,
             &result,
             provider_config,

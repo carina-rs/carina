@@ -41,13 +41,86 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
         .collect()
 }
 
-fn mixed_tag_key_style_warnings_for_population<E, B: carina_core::resource::BindingAddress>(
+fn mixed_tag_key_style_warnings_for_population<E, B: carina_core::resource::BindingAddress, D>(
     root_inputs: &[(PathBuf, String)],
-    parsed: &carina_core::parser::File<E, B>,
+    parsed: &carina_core::parser::File<E, B, D>,
     base_dir: &Path,
 ) -> Vec<LintWarning> {
     let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
     mixed_tag_key_style_warnings(&tag_keys)
+}
+
+enum LintFile {
+    Blocked(carina_core::parser::InferredFile),
+    Resolved(carina_core::parser::ModuleResolvedInferredFile),
+}
+
+fn collect_list_struct_schema_metadata<E, B: carina_core::resource::BindingAddress, D>(
+    parsed: &carina_core::parser::File<E, B, D>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    all_list_struct_attrs: &mut HashSet<String>,
+    block_name_suggestions: &mut HashMap<String, String>,
+) {
+    for rref in parsed.iter_top_level_resources() {
+        let schema = match rref {
+            carina_core::parser::ResourceRef::Resource(resource) => schemas.get_for(resource),
+            carina_core::parser::ResourceRef::DataSource(data_source) => {
+                schemas.get_for_data_source(data_source)
+            }
+            carina_core::parser::ResourceRef::LiveComposition(_) => None,
+            carina_core::parser::ResourceRef::Deferred { resource, .. } => {
+                schemas.get_for(resource)
+            }
+        };
+        if let Some(schema) = schema {
+            let schema = schema.as_schema();
+            all_list_struct_attrs.extend(list_struct_attr_names(schema));
+            for (attr_name, attr_schema) in schema.attributes() {
+                if let Some(block_name) = attr_schema.block_name() {
+                    block_name_suggestions.insert(attr_name.clone(), block_name.to_string());
+                }
+            }
+        }
+    }
+}
+
+impl LintFile {
+    fn collect_list_struct_schema_metadata(
+        &self,
+        schemas: &carina_core::schema::SchemaRegistry,
+        all_list_struct_attrs: &mut HashSet<String>,
+        block_name_suggestions: &mut HashMap<String, String>,
+    ) {
+        match self {
+            Self::Blocked(parsed) => collect_list_struct_schema_metadata(
+                parsed,
+                schemas,
+                all_list_struct_attrs,
+                block_name_suggestions,
+            ),
+            Self::Resolved(parsed) => collect_list_struct_schema_metadata(
+                parsed,
+                schemas,
+                all_list_struct_attrs,
+                block_name_suggestions,
+            ),
+        }
+    }
+
+    fn mixed_tag_key_style_warnings(
+        &self,
+        root_inputs: &[(PathBuf, String)],
+        base_dir: &Path,
+    ) -> Vec<LintWarning> {
+        match self {
+            Self::Blocked(parsed) => {
+                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+            }
+            Self::Resolved(parsed) => {
+                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+            }
+        }
+    }
 }
 
 pub fn run_lint(
@@ -73,6 +146,11 @@ pub fn run_lint(
 
     let (providers, provider_factory_error) =
         ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+    let loaded_provider_context = if provider_factory_error.is_none() {
+        providers.loaded_provider_context()
+    } else {
+        None
+    };
     let provider_factory_error = provider_factory_error.map(|error| error.to_string());
     let schemas = providers.schemas();
 
@@ -87,15 +165,29 @@ pub fn run_lint(
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
     let parsed = if module_boundary_findings.is_empty() {
-        module_resolver::resolve_modules_with_config(parsed, base_dir, provider_context, schemas)
-            .map_err(|e| {
-                format!(
-                    "Module resolution error: {}",
-                    e.display_relative_to(base_dir)
-                )
-            })?
+        let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
+            module_resolver::resolve_modules_with_config(
+                parsed,
+                base_dir,
+                loaded_provider_context,
+                schemas,
+            )
+        } else {
+            module_resolver::resolve_modules_with_providerless_config(
+                parsed,
+                base_dir,
+                provider_context,
+                schemas,
+            )
+        };
+        LintFile::Resolved(resolution.map_err(|e| {
+            format!(
+                "Module resolution error: {}",
+                e.display_relative_to(base_dir)
+            )
+        })?)
     } else {
-        module_resolver::expand_root_directory_file(parsed)
+        LintFile::Blocked(parsed)
     };
 
     // Collect source texts for each .crn file
@@ -115,27 +207,13 @@ pub fn run_lint(
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
     let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
     // carina#3181: walk every top-level resource — managed and data
-    // source schemas can both carry List<Struct> attributes. compositions
-    // have no schema, so `get_for` returns `None` for them.
-    for rref in parsed.iter_top_level_resources() {
-        let schema = match rref {
-            carina_core::parser::ResourceRef::Resource(m) => schemas.get_for(m),
-            carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
-            carina_core::parser::ResourceRef::LiveComposition(_) => None,
-            carina_core::parser::ResourceRef::Deferred { resource, .. } => {
-                schemas.get_for(resource)
-            }
-        };
-        if let Some(schema) = schema {
-            let schema = schema.as_schema();
-            all_list_struct_attrs.extend(list_struct_attr_names(schema));
-            for (attr_name, attr_schema) in schema.attributes() {
-                if let Some(block_name) = attr_schema.block_name() {
-                    block_name_suggestions.insert(attr_name.clone(), block_name.to_string());
-                }
-            }
-        }
-    }
+    // source schemas can both carry List<Struct> attributes. Compositions
+    // have no provider schema.
+    parsed.collect_list_struct_schema_metadata(
+        schemas,
+        &mut all_list_struct_attrs,
+        &mut block_name_suggestions,
+    );
 
     // Scan each source file for list literal usage of List<Struct> attributes
     let mut warnings: Vec<LintWarning> = module_boundary_findings
@@ -241,11 +319,7 @@ pub fn run_lint(
         }
     }
 
-    warnings.extend(mixed_tag_key_style_warnings_for_population(
-        &source_texts,
-        &parsed,
-        base_dir,
-    ));
+    warnings.extend(parsed.mixed_tag_key_style_warnings(&source_texts, base_dir));
 
     if warnings.is_empty() {
         println!("{}", "No lint warnings found.".green().bold());

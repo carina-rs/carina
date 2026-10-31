@@ -1,0 +1,8 @@
+let child_module = use {
+  source = "../child"
+}
+
+let nested = child_module {
+  label    = label
+  upstream = consumer
+}

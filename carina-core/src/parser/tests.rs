@@ -28,6 +28,23 @@ fn resolve_remote_bindings(
         .collect()
 }
 
+fn cross_deferred_for_resolution_seam(parsed: ParsedFile) -> ModuleResolvedParsedFile {
+    crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+        .expect("deferred fixture crosses the module-resolution seam")
+}
+
+fn known(type_expr: TypeExpr) -> TypeExpr {
+    type_expr
+}
+
+fn known_opt(type_expr: TypeExpr) -> Option<TypeExpr> {
+    Some(known(type_expr))
+}
+
+fn expect_known(static_type: &TypeExpr) -> &TypeExpr {
+    static_type
+}
+
 #[test]
 fn parse_and_resolve_returns_value_only_no_closure() {
     // Issue #2230 acceptance criterion 3: `parse_and_resolve` must
@@ -90,7 +107,8 @@ fn iter_all_resources_yields_direct_then_deferred() {
             }
         }
     "#;
-    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let parsed =
+        cross_deferred_for_resolution_seam(parse(src, &ProviderContext::default()).unwrap());
 
     let items: Vec<_> = parsed.iter_all_resources().collect();
     assert_eq!(items.len(), 2, "expected one direct + one deferred");
@@ -100,12 +118,40 @@ fn iter_all_resources_yields_direct_then_deferred() {
     assert!(matches!(items[0].context(), ResourceContext::Direct));
     assert_eq!(
         items[0].attributes().get("name"),
-        Some(&Value::Concrete(ConcreteValue::String("direct".into())))
+        Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+            "direct".into()
+        )))
     );
 
     // The for-expression template body comes last as a Deferred arm.
-    assert!(matches!(items[1], ResourceRef::Deferred { .. }));
+    let ResourceRef::Deferred { resource, deferred } = items[1] else {
+        panic!("expected a resolved deferred resource, got {:?}", items[1]);
+    };
+    assert_eq!(resource.id, deferred.template_resource.id);
     assert!(matches!(items[1].context(), ResourceContext::Deferred(_)));
+}
+
+#[test]
+fn resolved_resource_iterator_is_phase_exhaustive() {
+    let resolved = cross_deferred_for_resolution_seam(ParsedFile::default());
+
+    let kinds = resolved
+        .iter_all_resources()
+        .map(|resource| match resource {
+            ResourceRef::Resource(resource) => resource.id.resource_type.as_str(),
+            ResourceRef::LiveComposition(composition) => composition.id.resource_type.as_str(),
+            ResourceRef::DataSource(data_source) => data_source.id.resource_type.as_str(),
+            ResourceRef::Deferred { resource, deferred } => {
+                assert_eq!(
+                    resource.id.resource_type,
+                    deferred.template_resource.id.resource_type
+                );
+                resource.id.resource_type.as_str()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert!(kinds.is_empty());
 }
 
 /// carina#3181: `iter_all_resources` yields each resource exactly once
@@ -956,11 +1002,11 @@ fn parse_directory_module() {
     // Check arguments
     assert_eq!(result.arguments.len(), 2);
     assert_eq!(result.arguments[0].name, "vpc_id");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
     assert!(result.arguments[0].default.is_none());
 
     assert_eq!(result.arguments[1].name, "enable_https");
-    assert_eq!(result.arguments[1].type_expr, TypeExpr::Bool);
+    assert_eq!(result.arguments[1].static_type, known(TypeExpr::Bool));
     assert_eq!(
         result.arguments[1].default,
         Some(Value::Concrete(ConcreteValue::Bool(true)))
@@ -969,7 +1015,10 @@ fn parse_directory_module() {
     // Check attribute params
     assert_eq!(result.attribute_params.len(), 1);
     assert_eq!(result.attribute_params[0].name, "sg_id");
-    assert_eq!(result.attribute_params[0].type_expr, Some(TypeExpr::String));
+    assert_eq!(
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::String)
+    );
 
     // Check resource has argument reference (lexically scoped)
     assert_eq!(result.resources.len(), 1);
@@ -1111,20 +1160,20 @@ fn parse_generic_type_expressions() {
     let result = parse(input, &ProviderContext::default()).unwrap();
 
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::List(Box::new(TypeExpr::Int))
+        result.arguments[0].static_type,
+        known(TypeExpr::List(Box::new(TypeExpr::Int)))
     );
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Map(Box::new(TypeExpr::String))
+        result.arguments[1].static_type,
+        known(TypeExpr::Map(Box::new(TypeExpr::String)))
     );
     assert_eq!(
-        result.arguments[2].type_expr,
-        TypeExpr::List(Box::new(TypeExpr::String))
+        result.arguments[2].static_type,
+        known(TypeExpr::List(Box::new(TypeExpr::String)))
     );
     assert_eq!(
-        result.attribute_params[0].type_expr,
-        Some(TypeExpr::List(Box::new(TypeExpr::String)))
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::List(Box::new(TypeExpr::String)))
     );
     assert!(result.attribute_params[0].value.is_some());
 }
@@ -1152,16 +1201,18 @@ fn parse_ref_type_expression() {
     // Check ref type argument
     assert_eq!(result.arguments[0].name, "vpc");
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "vpc"))
+        result.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws", "vpc"
+        )))
     );
     assert!(result.arguments[0].default.is_none());
 
     // Check ref type attribute param
     assert_eq!(result.attribute_params[0].name, "security_group_id");
     assert_eq!(
-        result.attribute_params[0].type_expr,
-        Some(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::DottedUnresolved(ResourceTypePath::new(
             "aws",
             "security_group"
         )))
@@ -1185,14 +1236,20 @@ fn parse_ref_type_with_nested_resource_type() {
 
     // Single-level resource type
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "security_group"))
+        result.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws",
+            "security_group"
+        )))
     );
 
     // Nested resource type (security_group.ingress_rule)
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "security_group.ingress_rule"))
+        result.arguments[1].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws",
+            "security_group.ingress_rule"
+        )))
     );
 }
 
@@ -1226,7 +1283,7 @@ fn parse_struct_type_expression() {
             ),
         ],
     };
-    assert_eq!(ep.type_expr, Some(expected));
+    assert_eq!(ep.static_type, known_opt(expected));
 }
 
 #[test]
@@ -1240,22 +1297,22 @@ fn parse_struct_type_nested_in_list_and_map() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::List(Box::new(TypeExpr::Struct {
+        result.arguments[0].static_type,
+        known(TypeExpr::List(Box::new(TypeExpr::Struct {
             fields: vec![
                 ("name".to_string(), TypeExpr::String),
                 ("value".to_string(), TypeExpr::Int),
             ],
-        }))
+        })))
     );
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Map(Box::new(TypeExpr::Struct {
+        result.arguments[1].static_type,
+        known(TypeExpr::Map(Box::new(TypeExpr::Struct {
             fields: vec![
                 ("arn".to_string(), TypeExpr::String),
                 ("id".to_string(), TypeExpr::String),
             ],
-        }))
+        })))
     );
 }
 
@@ -1317,7 +1374,7 @@ fn parse_attributes_without_type_annotation() {
 
     assert_eq!(result.attribute_params.len(), 1);
     assert_eq!(result.attribute_params[0].name, "security_group");
-    assert_eq!(result.attribute_params[0].type_expr, None);
+    assert_eq!(result.attribute_params[0].static_type, None);
     assert!(result.attribute_params[0].value.is_some());
 }
 
@@ -1349,19 +1406,19 @@ fn parse_attributes_mixed_typed_and_untyped() {
 
     // Explicit type
     assert_eq!(result.attribute_params[0].name, "vpc_id");
-    assert!(result.attribute_params[0].type_expr.is_some());
+    assert!(result.attribute_params[0].static_type.is_some());
     assert!(result.attribute_params[0].value.is_some());
 
     // No type annotation
     assert_eq!(result.attribute_params[1].name, "security_group");
-    assert_eq!(result.attribute_params[1].type_expr, None);
+    assert_eq!(result.attribute_params[1].static_type, None);
     assert!(result.attribute_params[1].value.is_some());
 
     // Explicit type
     assert_eq!(result.attribute_params[2].name, "subnet_ids");
     assert_eq!(
-        result.attribute_params[2].type_expr,
-        Some(TypeExpr::List(Box::new(TypeExpr::String)))
+        result.attribute_params[2].static_type,
+        known_opt(TypeExpr::List(Box::new(TypeExpr::String)))
     );
     assert!(result.attribute_params[2].value.is_some());
 }
@@ -6062,8 +6119,9 @@ fn unbound_if_read_requires_let() {
 
 #[test]
 fn deferred_unbound_target_round_trips() {
-    let parsed = parse(
-        r#"
+    let parsed = cross_deferred_for_resolution_seam(
+        parse(
+            r#"
         let orgs = upstream_state { source = "../orgs" }
         for account_id in orgs.accounts {
             awscc.sso.Assignment {
@@ -6071,14 +6129,16 @@ fn deferred_unbound_target_round_trips() {
             }
         }
     "#,
-        &ProviderContext::default(),
-    )
-    .unwrap();
+            &ProviderContext::default(),
+        )
+        .unwrap(),
+    );
 
-    let target = &parsed.deferred_for_expressions[0].target;
+    let target = &parsed.deferred_for_expressions()[0].target;
     assert!(matches!(target, DeferredForTarget::Unbound { .. }));
     let json = serde_json::to_string(target).unwrap();
-    let decoded: DeferredForTarget = serde_json::from_str(&json).unwrap();
+    let decoded: DeferredForTarget<crate::resource::AbsoluteBindingAddress> =
+        serde_json::from_str(&json).unwrap();
     assert_eq!(&decoded, target);
 }
 
@@ -6222,10 +6282,12 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         }
     "#;
 
-    let result = parse(input, &ProviderContext::default()).unwrap();
+    let result =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
-    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions[0].target else {
+    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions()[0].target
+    else {
         panic!("top-level deferred loop must remain unbound")
     };
     assert_eq!(template.legacy_base().exact_state_name(), "_accounts");
@@ -6293,8 +6355,10 @@ fn parse_arguments_block_form_description_only() {
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "vpc");
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("awscc", "ec2.Vpc"))
+        result.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "awscc", "ec2.Vpc"
+        )))
     );
     assert!(result.arguments[0].default.is_none());
     assert_eq!(
@@ -6317,7 +6381,7 @@ fn parse_arguments_block_form_description_and_default() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "port");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::Int);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::Int));
     assert_eq!(
         result.arguments[0].default,
         Some(Value::Concrete(ConcreteValue::Int(8080)))
@@ -6350,7 +6414,7 @@ fn parse_arguments_mixed_simple_and_block_form() {
 
     // Simple form (unchanged)
     assert_eq!(result.arguments[0].name, "enable_https");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::Bool);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::Bool));
     assert_eq!(
         result.arguments[0].default,
         Some(Value::Concrete(ConcreteValue::Bool(true)))
@@ -6360,8 +6424,10 @@ fn parse_arguments_mixed_simple_and_block_form() {
     // Block form with description only
     assert_eq!(result.arguments[1].name, "vpc");
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("awscc", "ec2.Vpc"))
+        result.arguments[1].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "awscc", "ec2.Vpc"
+        )))
     );
     assert!(result.arguments[1].default.is_none());
     assert_eq!(
@@ -6371,7 +6437,7 @@ fn parse_arguments_mixed_simple_and_block_form() {
 
     // Block form with description and default
     assert_eq!(result.arguments[2].name, "port");
-    assert_eq!(result.arguments[2].type_expr, TypeExpr::Int);
+    assert_eq!(result.arguments[2].static_type, known(TypeExpr::Int));
     assert_eq!(
         result.arguments[2].default,
         Some(Value::Concrete(ConcreteValue::Int(8080)))
@@ -6408,10 +6474,10 @@ fn parse_accepts_pascal_case_primitives() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
-    assert_eq!(result.arguments[1].type_expr, TypeExpr::Int);
-    assert_eq!(result.arguments[2].type_expr, TypeExpr::Bool);
-    assert_eq!(result.arguments[3].type_expr, TypeExpr::Float);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
+    assert_eq!(result.arguments[1].static_type, known(TypeExpr::Int));
+    assert_eq!(result.arguments[2].static_type, known(TypeExpr::Bool));
+    assert_eq!(result.arguments[3].static_type, known(TypeExpr::Float));
 }
 
 #[test]
@@ -6425,10 +6491,10 @@ fn parse_still_accepts_lowercase_primitives_during_transition() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
-    assert_eq!(result.arguments[1].type_expr, TypeExpr::Int);
-    assert_eq!(result.arguments[2].type_expr, TypeExpr::Bool);
-    assert_eq!(result.arguments[3].type_expr, TypeExpr::Float);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
+    assert_eq!(result.arguments[1].static_type, known(TypeExpr::Int));
+    assert_eq!(result.arguments[2].static_type, known(TypeExpr::Bool));
+    assert_eq!(result.arguments[3].static_type, known(TypeExpr::Float));
 }
 
 #[test]
@@ -6442,16 +6508,16 @@ fn parse_accepts_pascal_case_custom_types() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::Simple("aws_account_id".to_string())
+        result.arguments[0].static_type,
+        known(TypeExpr::Simple("aws_account_id".to_string()))
     );
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Simple("ipv4_cidr".to_string())
+        result.arguments[1].static_type,
+        known(TypeExpr::Simple("ipv4_cidr".to_string()))
     );
     assert_eq!(
-        result.arguments[2].type_expr,
-        TypeExpr::Simple("arn".to_string())
+        result.arguments[2].static_type,
+        known(TypeExpr::Simple("arn".to_string()))
     );
 }
 
@@ -6464,14 +6530,14 @@ fn parse_three_segment_resource_path_is_ref() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    match &result.arguments[0].type_expr {
+    match expect_known(&result.arguments[0].static_type) {
         TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "aws");
             assert_eq!(path.resource_type, "ec2.Vpc");
         }
         other => panic!("expected DottedUnresolved, got {other:?}"),
     }
-    match &result.arguments[1].type_expr {
+    match expect_known(&result.arguments[1].static_type) {
         TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "aws");
             assert_eq!(path.resource_type, "s3.Bucket");
@@ -6489,7 +6555,7 @@ fn parse_four_segment_path_with_pascal_tail_is_dotted_unresolved() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert!(matches!(
-        result.arguments[0].type_expr,
+        result.arguments[0].static_type,
         TypeExpr::DottedUnresolved(_)
     ));
 }
@@ -6502,8 +6568,10 @@ fn type_expr_ref_display_roundtrips_three_segment_path() {
     let input = format!(r#"arguments {{ v: {} }}"#, ty);
     let parsed = parse(&input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        parsed.arguments[0].type_expr,
-        TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc"))
+        parsed.arguments[0].static_type,
+        known(TypeExpr::DottedUnresolved(ResourceTypePath::new(
+            "aws", "ec2.Vpc"
+        )))
     );
 }
 
@@ -6600,7 +6668,7 @@ fn parse_arguments_block_form_string_default_not_confused_with_description() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.arguments.len(), 1);
     assert_eq!(result.arguments[0].name, "name");
-    assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+    assert_eq!(result.arguments[0].static_type, known(TypeExpr::String));
     assert_eq!(
         result.arguments[0].description.as_deref(),
         Some("Name of the resource")
@@ -6630,7 +6698,7 @@ fn parse_arguments_block_form_validation_block() {
     assert_eq!(result.arguments.len(), 1);
     let arg = &result.arguments[0];
     assert_eq!(arg.name, "port");
-    assert_eq!(arg.type_expr, TypeExpr::Int);
+    assert_eq!(arg.static_type, known(TypeExpr::Int));
     assert_eq!(arg.default, Some(Value::Concrete(ConcreteValue::Int(8080))));
     assert_eq!(arg.description.as_deref(), Some("Web server port"));
     assert_eq!(arg.validations.len(), 1);
@@ -7751,13 +7819,13 @@ fn parse_custom_type_in_module_arguments() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.arguments[0].name, "vpc_cidr");
     assert_eq!(
-        result.arguments[0].type_expr,
-        TypeExpr::Simple("ipv4_cidr".to_string())
+        result.arguments[0].static_type,
+        known(TypeExpr::Simple("ipv4_cidr".to_string()))
     );
     assert_eq!(result.arguments[1].name, "server_ip");
     assert_eq!(
-        result.arguments[1].type_expr,
-        TypeExpr::Simple("ipv4_address".to_string())
+        result.arguments[1].static_type,
+        known(TypeExpr::Simple("ipv4_address".to_string()))
     );
 }
 
@@ -7775,8 +7843,8 @@ fn parse_custom_type_in_attributes() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
-        result.attribute_params[0].type_expr,
-        Some(TypeExpr::Simple("ipv4_cidr".to_string()))
+        result.attribute_params[0].static_type,
+        known_opt(TypeExpr::Simple("ipv4_cidr".to_string()))
     );
 }
 
@@ -8684,29 +8752,24 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
 }
 
 #[test]
-fn unloaded_provider_custom_types_report_the_typed_state_error() {
+fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
     let owned = crate::parser::OwnedTypeIdentity::provider(
         "test",
         TypeIdentity::from_dotted("test.Widget.Id"),
     );
 
-    let error = validate_schema_custom_type(
+    validate_schema_custom_type(
         &owned,
         &Value::Concrete(ConcreteValue::String("widget-1".into())),
-        &ProviderContext::default(),
+        &crate::parser::LoadedProviderContext::empty_for_test(),
     )
-    .expect_err("provider annotations cannot be validated before providers are loaded");
-
-    assert!(matches!(
-        error,
-        crate::parser::CustomTypeValidationError::ProvidersNotLoaded
-    ));
+    .expect("the loaded fixture resolver accepts the annotation");
 }
 
 #[test]
 fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     let identity = TypeIdentity::from_dotted("test.Widget.SecretId");
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8715,7 +8778,7 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             Box::new(|_target, _value| panic!("secret plaintext reached provider validation")),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("test", identity),
@@ -8734,7 +8797,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
     let identity = TypeIdentity::bare("NumericBridge");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&seen);
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8760,7 +8823,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     for value in [
         Value::Concrete(ConcreteValue::Int(-42)),
@@ -8827,7 +8890,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
         .expect("two value")
         .attr_type()
         .clone();
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([
                 crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
@@ -8860,7 +8923,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
@@ -8900,7 +8963,7 @@ fn parse_custom_validator_rejects_invalid() {
     // Actually, let's test validate_custom_type directly to avoid grammar issues.
     let identity = TypeIdentity::bare("CustomType");
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
@@ -8931,7 +8994,7 @@ fn parse_custom_validator_rejects_invalid() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     // Test validate_custom_type directly since the grammar may not accept
     // arbitrary type names. This verifies the custom validator is called.
@@ -9000,7 +9063,7 @@ arguments {
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "vpc_id");
-    match &arg.type_expr {
+    match expect_known(&arg.static_type) {
         TypeExpr::DottedUnresolved(path) => {
             assert_eq!(path.provider, "awscc");
             assert_eq!(path.resource_type, "ec2.VpcId");
@@ -9046,7 +9109,7 @@ arguments {
     let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
-    match &arg.type_expr {
+    match expect_known(&arg.static_type) {
         TypeExpr::List(inner) => match inner.as_ref() {
             TypeExpr::DottedUnresolved(path) => {
                 assert_eq!(path.provider, "awscc");
@@ -9906,7 +9969,7 @@ exports {
     let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.export_params.len(), 1);
     assert_eq!(parsed.export_params[0].name, "vpc_id");
-    assert!(parsed.export_params[0].type_expr.is_none());
+    assert!(parsed.export_params[0].static_type.is_none());
     assert!(parsed.export_params[0].value.is_some());
 }
 
@@ -9929,7 +9992,7 @@ exports {
     let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.export_params.len(), 2);
     assert_eq!(parsed.export_params[0].name, "vpc_id");
-    assert!(parsed.export_params[0].type_expr.is_some());
+    assert!(parsed.export_params[0].static_type.is_some());
     assert_eq!(parsed.export_params[1].name, "cidr");
 }
 
@@ -10076,10 +10139,10 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
     "#;
 
     let parsed = parse(input, &ProviderContext::default()).unwrap();
-    let [deferred] = parsed.deferred_for_expressions.as_slice() else {
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!(
             "coalesced unresolved iterable must produce one deferred for-expression: {:?}",
-            parsed.deferred_for_expressions
+            parsed.parsed_deferred_for_expressions()
         );
     };
     let Value::Deferred(DeferredValue::Coalesce { value, default }) = &deferred.iterable else {
@@ -10094,6 +10157,181 @@ fn coalesced_resource_ref_for_iterable_is_deferred_as_a_complete_expression() {
         default.as_ref(),
         &Value::Concrete(ConcreteValue::List(Vec::new())),
     );
+}
+
+#[test]
+fn deferred_for_parser_retains_every_typed_body_kind() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let src = mock.test.resource { name = "src" }
+let resources = for x in src.list { mock.test.resource { name = x } }
+let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
+let calls = for x in src.list { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the parser must classify deferred bodies without rejecting them");
+
+    let bodies = &parsed.parsed_deferred_for_expressions();
+    assert_eq!(bodies.len(), 3);
+    assert!(matches!(bodies[0].body, DeferredForBody::Resource(_)));
+    assert!(matches!(bodies[1].body, DeferredForBody::Read(_)));
+    assert!(matches!(bodies[2].body, DeferredForBody::ModuleCall(_)));
+}
+
+#[test]
+fn iter_all_resources_yields_parser_side_deferred_resource_bodies_only() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let src = mock.test.resource { name = "src" }
+let resources = for x in src.list { mock.test.resource { name = x } }
+let reads = for x in src.list { read mock.iam.Roles { name_regex = x } }
+let calls = for x in src.list { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the parser must retain all deferred body kinds");
+
+    let resources = parsed.iter_all_resources().collect::<Vec<_>>();
+    assert_eq!(
+        resources.len(),
+        2,
+        "the direct resource and parser-side deferred resource body must be yielded; \
+         read and module-call bodies must not be resources"
+    );
+    assert!(
+        resources
+            .iter()
+            .all(|resource| resource.id().resource_type == "test.resource")
+    );
+    assert!(matches!(resources[0], ResourceRef::Resource(_)));
+    let ResourceRef::Deferred { resource, deferred } = resources[1] else {
+        panic!(
+            "expected a parser-side deferred resource, got {:?}",
+            resources[1]
+        );
+    };
+    assert_eq!(resource.id.resource_type, "test.resource");
+    assert_eq!(deferred.header, "for x in src.list");
+    assert!(matches!(deferred.body, DeferredForBody::Resource(_)));
+    let ResourceContext::Deferred(context) = resources[1].context() else {
+        panic!("expected parser-side deferred context");
+    };
+    assert_eq!(context.header, "for x in src.list");
+}
+
+#[test]
+fn deferred_for_header_formats_multiline_iterable_without_comments() {
+    let parsed = parse(
+        r#"let src = mock.test.resource { name = "src" }
+let resources = for x in (
+  src.list
+  // fall back while the provider value is absent
+  ?? []
+) { mock.test.resource { name = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("the multiline deferred iterable must parse");
+
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert_eq!(deferred.header, "for x in src.list ?? []");
+}
+
+#[test]
+fn deferred_for_module_call_body_with_bare_unbound_iterable_records_finalization_error() {
+    let parsed = parse(
+        r#"let child = use { source = "./child" }
+let mod_items = for x in items { child { item = x } }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("body classification must retain the undefined iterable");
+
+    let errors = check_identifier_scope(&parsed);
+    assert!(matches!(
+        errors.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "items"
+    ));
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert!(matches!(
+        &deferred.iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
+    ));
+    assert!(matches!(
+        &deferred.body,
+        DeferredForBody::ModuleCall(call) if call.module_name == "child"
+    ));
+}
+
+#[test]
+fn deferred_for_read_body_with_bare_unbound_iterable_records_finalization_error() {
+    let parsed = parse(
+        r#"let read_items = for x in items {
+  read mock.iam.Roles { name_regex = x }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("body classification must retain the undefined iterable");
+
+    let errors = check_identifier_scope(&parsed);
+    assert!(matches!(
+        errors.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "items"
+    ));
+    let [deferred] = parsed.parsed_deferred_for_expressions() else {
+        panic!("expected one deferred loop")
+    };
+    assert!(matches!(
+        &deferred.iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
+    ));
+    assert!(matches!(
+        &deferred.body,
+        DeferredForBody::Read(data_source)
+            if data_source.id.resource_type == "iam.Roles"
+    ));
+}
+
+#[test]
+fn deferred_for_resource_body_propagates_reserved_attribute_error() {
+    let error = parse(
+        r#"let src = mock.test.resource { name = "src" }
+let items = for x in src.list {
+  mock.test.resource {
+    name = x
+    "_invalid" = x
+  }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a genuine parser error in a deferred resource body must be preserved");
+
+    let ParseError::DeferredForBodyTemplate {
+        line,
+        header,
+        error,
+        ..
+    } = error
+    else {
+        panic!("expected deferred body template error")
+    };
+    assert_eq!(line, 2);
+    assert_eq!(header, "for x in src.list");
+    assert!(matches!(
+        error.as_ref(),
+        ParseError::ReservedResourceAttribute {
+            attribute,
+            line: 5,
+            ..
+        } if attribute == "_invalid"
+    ));
 }
 
 #[test]
@@ -10214,10 +10452,10 @@ fn expand_deferred_for_with_remote_bindings() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
     assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
-    let mut parsed = parsed.resolve_root(&RootScope::new());
 
     // Simulate loading upstream_state with actual values
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10240,7 +10478,7 @@ fn expand_deferred_for_with_remote_bindings() {
 
     // Deferred should be resolved
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         0,
         "deferred should be empty after expansion"
     );
@@ -10293,9 +10531,9 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
-    let mut parsed = parsed.resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     // Empty remote_bindings — upstream hasn't been applied yet
     let remote_bindings: HashMap<String, HashMap<String, ExpandedValue>> = HashMap::new();
@@ -10305,7 +10543,7 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
 
     // Should remain deferred
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "should stay deferred when remote data not available"
     );
@@ -10329,9 +10567,9 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
-    let mut parsed = parsed.resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10356,7 +10594,7 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         ))
         .unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 2); // allow: direct — fixture test inspection
 
     // Verify both key and value are substituted.
@@ -10402,9 +10640,9 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
-    let mut parsed = parsed.resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10475,9 +10713,9 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 3);
-    let mut parsed = parsed.resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    assert_eq!(parsed.deferred_for_expressions().len(), 3);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10504,7 +10742,7 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         ))
         .unwrap();
 
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 3); // allow: direct — fixture test inspection
     for resource in &parsed.resources {
         assert!(
@@ -10537,9 +10775,9 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
-    let mut parsed = parsed.resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10563,7 +10801,7 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
             remote_bindings.clone(),
         ))
         .unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 0);
+    assert_eq!(parsed.deferred_for_expressions().len(), 0);
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
     let bindings = ResolvedBindings::pre_data_source_read_live(LivePreDataSourceReadInputs {
@@ -10606,9 +10844,9 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
-    let mut parsed = parsed.resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10714,9 +10952,8 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default())
-        .unwrap()
-        .resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10742,7 +10979,7 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         0,
         "simple binding with map iterable should not silently expand"
     );
-    assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    assert_eq!(parsed.deferred_for_expressions().len(), 1);
     assert!(
         parsed
             .warnings
@@ -10769,9 +11006,8 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default())
-        .unwrap()
-        .resolve_root(&RootScope::new());
+    let mut parsed =
+        cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10797,7 +11033,7 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         "map binding with list iterable should not silently expand"
     );
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "should remain deferred on shape mismatch"
     );
@@ -11050,10 +11286,9 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     // `iterable is string "org" (expected map)`, calling the identifier
     // a string and leaving the user with no did-you-mean.
     //
-    // The fix records these as `DeferredForExpression` so
-    // `check_identifier_scope` validates them against the merged
-    // directory-wide binding set (mirrors the dotted-form path). That
-    // gives us cross-file visibility for the did-you-mean candidates.
+    // The parser records these as an explicitly undefined iterable so both
+    // static scope validation and final module resolution read the same typed
+    // error source.
     let input = r#"
         let orgs = upstream_state { source = "../a" }
         for _, id in org {
@@ -11065,12 +11300,21 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     let parsed = parse(input, &ProviderContext::default())
         .expect("single-file parse must not reject bare-iterable identifiers; the cross-file check runs later");
     let errs = check_identifier_scope(&parsed);
-    assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
-    let err = &errs[0];
+    assert!(matches!(
+        errs.as_slice(),
+        [ParseError::UndefinedDeferredIterable { name, .. }] if name == "org"
+    ));
+    let err =
+        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+            .expect_err("finalization must reject the bare undefined iterable");
+    let crate::module_resolver::ModuleError::Parse(parse_error) = err.root_cause() else {
+        panic!("expected a typed parse error, got {err:?}");
+    };
+    let err = parse_error;
     let msg = err.to_string();
     assert!(
-        matches!(err, ParseError::UndefinedIdentifier { .. }),
-        "expected UndefinedIdentifier, got: {err:?}"
+        matches!(err, ParseError::UndefinedDeferredIterable { .. }),
+        "expected UndefinedDeferredIterable, got: {err:?}"
     );
     assert!(
         msg.contains("`org`"),
@@ -11665,23 +11909,10 @@ fn nested_block_value_map_preserves_insertion_order() {
 }
 
 #[test]
-fn type_expr_unknown_displays_as_unknown_marker() {
-    let u = TypeExpr::Unknown;
-    assert_eq!(format!("{}", u), "<unknown>");
-}
-
-#[test]
-fn type_expr_unknown_serde_round_trips() {
-    let u = TypeExpr::Unknown;
-    let json = serde_json::to_string(&u).unwrap();
-    let back: TypeExpr = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, u);
-}
-
-#[test]
 fn parsed_export_param_keeps_optional_type_expr() {
-    let p: ParsedExportParam = ParsedExportParam::dummy("vpc_id".to_string(), None, None);
-    assert!(p.type_expr.is_none());
+    let p: ParsedExportParam<RelativeBindingName> =
+        ParsedExportParam::dummy("vpc_id".to_string(), None, None);
+    assert!(p.static_type.is_none());
 }
 
 #[test]
@@ -11698,14 +11929,17 @@ fn parsed_file_is_file_of_parsed_export_param() {
 fn inferred_file_holds_inferred_export_param() {
     let one = InferredExportParam {
         name: "vpc_id".to_string(),
-        type_expr: TypeExpr::String,
+        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::String),
         value: None,
     };
     let f: InferredFile = InferredFile {
         export_params: vec![one],
         ..Default::default()
     };
-    assert_eq!(f.export_params[0].type_expr, TypeExpr::String);
+    assert_eq!(
+        f.export_params[0].static_type,
+        crate::static_type::ExportStaticType::Declared(known(TypeExpr::String))
+    );
 }
 
 #[test]
@@ -12094,7 +12328,7 @@ fn parse_directory_files_preserves_sibling_resource_ref_rhs() {
 #[test]
 fn parse_directory_preserves_module_arg_dotted_string_literal() {
     use crate::config_loader::parse_directory;
-    use crate::module_resolver::resolve_modules;
+    use crate::module_resolver::resolve_modules_providerless as resolve_modules;
 
     let tmp = tempfile::tempdir().unwrap();
     let module_dir = tmp.path().join("uc");
@@ -12850,7 +13084,10 @@ arguments {
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(arg.name, "env");
-    assert_eq!(arg.type_expr, TypeExpr::StringLiteral("dev".to_string()));
+    assert_eq!(
+        arg.static_type,
+        known(TypeExpr::StringLiteral("dev".to_string()))
+    );
 }
 
 #[test]
@@ -12864,11 +13101,11 @@ arguments {
     assert_eq!(parsed.arguments.len(), 1);
     let arg = &parsed.arguments[0];
     assert_eq!(
-        arg.type_expr,
-        TypeExpr::Union(vec![
+        arg.static_type,
+        known(TypeExpr::Union(vec![
             TypeExpr::StringLiteral("dev".to_string()),
             TypeExpr::StringLiteral("prod".to_string()),
-        ])
+        ]))
     );
 }
 
@@ -12904,7 +13141,10 @@ arguments {
 "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
     let arg = &parsed.arguments[0];
-    assert_eq!(arg.type_expr.to_string(), "'tokyo' | 'osaka' | 'oregon'");
+    assert_eq!(
+        expect_known(&arg.static_type).to_string(),
+        "'tokyo' | 'osaka' | 'oregon'"
+    );
 }
 
 #[test]
@@ -12931,7 +13171,7 @@ arguments {
 "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
     let arg = &parsed.arguments[0];
-    let inner = match &arg.type_expr {
+    let inner = match expect_known(&arg.static_type) {
         TypeExpr::List(inner) => inner.as_ref(),
         other => panic!("expected list type, got {:?}", other),
     };
@@ -12970,6 +13210,51 @@ fn extract_directives_reads_depends_on_list() {
     assert_eq!(
         bucket.directives.depends_on,
         vec!["role".to_string(), "key".to_string()]
+    );
+}
+
+#[test]
+fn extract_directives_reads_ignore_changes_attribute_paths() {
+    let src = r#"
+        let function = awscc.lambda.Function {
+            code = { image_uri = "registry.example.test/image:tag" }
+            tags = { Owner = "platform" }
+            directives {
+                ignore_changes = [code.image_uri, tags["Owner"]]
+            }
+        }
+    "#;
+    let parsed = parse(src, &ProviderContext::default()).unwrap();
+    let function = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.identity_str() == Some("function"))
+        .expect("function binding");
+    let paths = function
+        .directives
+        .ignore_changes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, ["code.image_uri", "tags[\"Owner\"]"]);
+}
+
+#[test]
+fn extract_directives_rejects_string_literal_ignore_changes_paths() {
+    let src = r#"
+        let function = awscc.lambda.Function {
+            code = { image_uri = "registry.example.test/image:tag" }
+            directives { ignore_changes = ["code.image_uri"] }
+        }
+    "#;
+    let error = parse(src, &ProviderContext::default())
+        .expect_err("ignore_changes paths must not be string literals")
+        .to_string();
+
+    assert!(
+        error.contains("bare attribute path") && error.contains("code.image_uri"),
+        "unexpected error: {error}"
     );
 }
 
@@ -13252,11 +13537,13 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         }
     "#;
     let parsed = parse(src, &ProviderContext::default()).unwrap();
-    let template = &parsed
-        .deferred_for_expressions
+    let deferred = parsed
+        .parsed_deferred_for_expressions()
         .first()
-        .expect("for expression present")
-        .template_resource;
+        .expect("for expression present");
+    let DeferredForBody::Resource(template) = &deferred.body else {
+        panic!("deferred fixture body must be a resource")
+    };
     assert_eq!(
         template.directives.depends_on,
         vec!["role".to_string()],
@@ -15659,11 +15946,8 @@ mod loop_var_field_access_matrix {
 
     fn first_name(src: &str) -> Value {
         let p = parse(src, &ProviderContext::default()).expect("parse");
-        assert_eq!(
-            p.deferred_for_expressions.len(),
-            0,
-            "inline-list loop must fully expand at parse time"
-        );
+        // Raw parser output cannot expose finalized deferred loops; the
+        // concrete resource below proves this inline list expanded eagerly.
         p.resources
             .first()
             .expect("one resource")
@@ -15736,20 +16020,22 @@ mod loop_var_field_access_matrix {
                 aws.ec2.Subnet { name = o.k }
             }
         "#;
-        let p = parse(src, &ProviderContext::default()).expect("parse");
-        assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
+        let mut p = cross_deferred_for_resolution_seam(
+            parse(src, &ProviderContext::default()).expect("parse"),
+        );
+        assert_eq!(p.deferred_for_expressions().len(), 1, "loop deferred");
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
         // not a bare ForValue (which would lose the `.k`).
-        let tmpl = &p.deferred_for_expressions[0].template_resource;
+        let tmpl = &p.deferred_for_expressions()[0].template_resource;
         assert!(
             matches!(
                 tmpl.get_attr("name"),
-                Some(Value::Deferred(DeferredValue::Access(access)))
+                Some(ExpandedValue::Deferred(ExpandedDeferredValue::Access(access)))
                     if matches!(
                         access.base(),
-                        Value::Deferred(DeferredValue::Unknown(
-                            crate::resource::UnknownReason::ForValue
+                        ExpandedValue::Deferred(ExpandedDeferredValue::Unknown(
+                            ExpandedUnknownReason::ForValue
                         ))
                     ) && matches!(
                         access.step(),
@@ -15759,8 +16045,6 @@ mod loop_var_field_access_matrix {
             "deferred template must carry postfix Access; got {:?}",
             tmpl.get_attr("name")
         );
-        let mut p = p.resolve_root(&RootScope::new());
-
         let mut items = IndexMap::new();
         items.insert(
             "k".to_string(),
@@ -15780,7 +16064,7 @@ mod loop_var_field_access_matrix {
         ))
         .unwrap();
 
-        assert_eq!(p.deferred_for_expressions.len(), 0, "loop expanded");
+        assert_eq!(p.deferred_for_expressions().len(), 0, "loop expanded");
         assert_eq!(
             p.resources.first().expect("one resource").get_attr("name"),
             Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
@@ -15798,9 +16082,9 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = item["missing"] }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default())
-            .expect("parse deferred loop")
-            .resolve_root(&RootScope::new());
+        let mut parsed = cross_deferred_for_resolution_seam(
+            parse(src, &ProviderContext::default()).expect("parse deferred loop"),
+        );
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
             Value::Concrete(ConcreteValue::String("value".into())),
@@ -15832,9 +16116,9 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = r.missing }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default())
-            .expect("parse deferred loop")
-            .resolve_root(&RootScope::new());
+        let mut parsed = cross_deferred_for_resolution_seam(
+            parse(src, &ProviderContext::default()).expect("parse deferred loop"),
+        );
         let item = ExpandedValue::Concrete(ExpandedConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
             ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),

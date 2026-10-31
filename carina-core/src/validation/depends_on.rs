@@ -76,9 +76,11 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<'a, B: BindingAddress>(
-    rref: ResourceRef<'a, crate::resource::ModuleSource, B>,
-) -> &'a [B] {
+fn depends_on_of<'a, B, D>(rref: ResourceRef<'a, crate::resource::ModuleSource, B, D>) -> &'a [B]
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<B>,
+{
     rref.directives()
         .map_or(&[][..], |d| d.depends_on.as_slice())
 }
@@ -86,24 +88,29 @@ fn depends_on_of<'a, B: BindingAddress>(
 /// Run all depends_on checks against a parsed file. Returns the full
 /// list of diagnostics (errors + warnings); callers decide how to surface
 /// them.
-pub fn validate_depends_on<E, B: BindingAddress>(parsed: &File<E, B>) -> Vec<DependsOnDiagnostic> {
+pub fn validate_depends_on<E, B, D>(parsed: &File<E, B, D>) -> Vec<DependsOnDiagnostic>
+where
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<B>,
+{
     // Common-case fast path: the vast majority of resources will have
     // no `depends_on` set, and the checks below allocate per-resource.
     // Walk top-level + for-body template resources so loops are covered
     // (per the carina-core "directory-scoped, never single-file" rule).
-    if parsed
+    let resources_have_no_depends_on = parsed
         .iter_all_resources()
-        .all(|rref| depends_on_of(rref).is_empty())
-    {
+        .all(|rref| depends_on_of(rref).is_empty());
+    if resources_have_no_depends_on {
         return Vec::new();
     }
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, ResourceRef<'_, crate::resource::ModuleSource, B>> = parsed
-        .iter_all_resources()
-        .filter_map(|rref| rref.binding().map(|n| (n, rref)))
-        .collect();
+    let bindings_by_name: HashMap<&str, ResourceRef<'_, crate::resource::ModuleSource, B, D>> =
+        parsed
+            .iter_all_resources()
+            .filter_map(|rref| rref.binding().map(|n| (n, rref)))
+            .collect();
     let upstream_names: HashSet<&str> = parsed
         .upstream_states
         .iter()
@@ -121,104 +128,117 @@ pub fn validate_depends_on<E, B: BindingAddress>(parsed: &File<E, B>) -> Vec<Dep
         .map(|argument| argument.name.as_str())
         .collect();
 
-    for resource in parsed.iter_all_resources() {
-        let depends_on = depends_on_of(resource);
-        if depends_on.is_empty() {
-            continue;
-        }
-        // `self_name` is only needed for self-reference detection; an
-        // anonymous resource cannot self-reference (no name to point
-        // back to), so an unbound resource just gets the other checks.
-        let self_name = resource.binding().unwrap_or("(anonymous)");
+    let mut check_resource =
+        |binding: Option<&str>,
+         attributes: &indexmap::IndexMap<String, crate::resource::Value<B>>,
+         dependency_bindings: &std::collections::BTreeSet<B>,
+         depends_on: &[B]| {
+            if depends_on.is_empty() {
+                return;
+            }
+            // `self_name` is only needed for self-reference detection; an
+            // anonymous resource cannot self-reference (no name to point
+            // back to), so an unbound resource just gets the other checks.
+            let self_name = binding.unwrap_or("(anonymous)");
 
-        let mut value_ref_deps: HashSet<B> = HashSet::new();
-        for value in resource.attributes().values() {
-            collect_dependencies(value, &mut value_ref_deps);
-        }
-        for name in resource.dependency_bindings() {
-            value_ref_deps.insert(name.clone());
-        }
+            let mut value_ref_deps: HashSet<B> = HashSet::new();
+            for value in attributes.values() {
+                collect_dependencies(value, &mut value_ref_deps);
+            }
+            for name in dependency_bindings {
+                value_ref_deps.insert(name.clone());
+            }
 
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut duplicate_warned: HashSet<&str> = HashSet::new();
-        for dep_name in depends_on {
-            if !seen.insert(dep_name.as_str()) {
-                if duplicate_warned.insert(dep_name.as_str()) {
-                    diags.push(
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut duplicate_warned: HashSet<&str> = HashSet::new();
+            for dep_name in depends_on {
+                if !seen.insert(dep_name.as_str()) {
+                    if duplicate_warned.insert(dep_name.as_str()) {
+                        diags.push(
                         DependsOnDiagnostic::warning(format!(
                             "directives.depends_on on '{}': binding '{}' is listed multiple times",
                             self_name, dep_name
                         ))
                         .at_element(self_name, dep_name.as_str()),
                     );
-                }
-                continue;
-            }
-
-            if dep_name.as_str() == self_name {
-                diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "directives.depends_on on '{}': self-reference is not allowed \
-                         (binding '{}' depends on itself)",
-                        self_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name.as_str()),
-                );
-                continue;
-            }
-
-            if upstream_names.contains(dep_name.as_str()) {
-                diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "directives.depends_on on '{}': upstream_state binding '{}' \
-                         is not a valid depends_on target",
-                        self_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name.as_str()),
-                );
-                continue;
-            }
-
-            let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
-                if module_parameter_names.contains(dep_name.as_str()) {
+                    }
                     continue;
                 }
-                diags.push(
+
+                if dep_name.as_str() == self_name {
+                    diags.push(
+                        DependsOnDiagnostic::error(format!(
+                            "directives.depends_on on '{}': self-reference is not allowed \
+                         (binding '{}' depends on itself)",
+                            self_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                    continue;
+                }
+
+                if upstream_names.contains(dep_name.as_str()) {
+                    diags.push(
+                        DependsOnDiagnostic::error(format!(
+                            "directives.depends_on on '{}': upstream_state binding '{}' \
+                         is not a valid depends_on target",
+                            self_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                    continue;
+                }
+
+                let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
+                    if module_parameter_names.contains(dep_name.as_str()) {
+                        continue;
+                    }
+                    diags.push(
                     DependsOnDiagnostic::error(format!(
                         "directives.depends_on on '{}': binding '{}' is not declared in this scope",
                         self_name, dep_name
                     ))
                     .at_element(self_name, dep_name.as_str()),
                 );
-                continue;
-            };
+                    continue;
+                };
 
-            if matches!(target, ResourceRef::DataSource(_)) {
-                diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "directives.depends_on on '{}': data sources cannot be \
+                if matches!(target, ResourceRef::DataSource(_)) {
+                    diags.push(
+                        DependsOnDiagnostic::error(format!(
+                            "directives.depends_on on '{}': data sources cannot be \
                          depends_on targets (binding '{}')",
-                        self_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name.as_str()),
-                );
-                continue;
-            }
+                            self_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                    continue;
+                }
 
-            if value_ref_deps
-                .iter()
-                .any(|dependency| dependency.as_str() == dep_name.as_str())
-            {
-                diags.push(
-                    DependsOnDiagnostic::warning(format!(
-                        "directives.depends_on on '{}': edge to '{}' is redundant; \
+                if value_ref_deps
+                    .iter()
+                    .any(|dependency| dependency.as_str() == dep_name.as_str())
+                {
+                    diags.push(
+                        DependsOnDiagnostic::warning(format!(
+                            "directives.depends_on on '{}': edge to '{}' is redundant; \
                          '{}' is already referenced by value",
-                        self_name, dep_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name.as_str()),
-                );
+                            self_name, dep_name, dep_name
+                        ))
+                        .at_element(self_name, dep_name.as_str()),
+                    );
+                }
             }
-        }
+        };
+
+    for resource in parsed.iter_all_resources() {
+        let attributes = resource.attributes();
+        check_resource(
+            resource.binding(),
+            &attributes,
+            resource.dependency_bindings(),
+            depends_on_of(resource),
+        );
     }
 
     // Cycle detection over the unioned graph (value-refs ∪ depends_on).
@@ -270,6 +290,32 @@ mod tests {
                 .any(|m| m.contains("non_existent") && m.contains("not declared")),
             "expected 'not declared' error mentioning non_existent, got {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn parser_side_deferred_resource_depends_on_is_diagnosed() {
+        let parsed = parse(
+            r#"
+                let pending = upstream_state { source = "../pending" }
+                let buckets = for item in pending.items {
+                    aws.s3.Bucket {
+                        bucket_name = item
+                        directives { depends_on = [non_existent] }
+                    }
+                }
+            "#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+        assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
+
+        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("non_existent") && message.contains("not declared")),
+            "expected deferred body depends_on diagnostic, got {errors:?}",
         );
     }
 
@@ -487,9 +533,8 @@ mod tests {
 
     #[test]
     fn unknown_binding_in_for_body_is_diagnosed() {
-        // `for` template resources must be walked too — without
-        // `iter_all_resources`, depends_on inside loops is silently
-        // skipped at validate time.
+        // Parser-side `for` templates must be walked explicitly; they do not
+        // enter the resource-only iterator until module resolution.
         let src = r#"
             provider test {
                 source = 'x/y'

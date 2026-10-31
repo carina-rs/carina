@@ -4,12 +4,15 @@
 //! No side effects occur until the Plan is applied.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
     ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
+    UnresolvedSavedEffect,
 };
+use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
@@ -20,6 +23,22 @@ use crate::resource::{
 pub use crate::resource::{ModuleSource, SavedModuleSource};
 
 /// Error detected while constructing a plan.
+///
+/// Rendering requires the project directory because some variants contain a
+/// project-scoped recovery command:
+///
+/// ```compile_fail
+/// use carina_core::plan::PlanError;
+/// use carina_core::resource::ResourceId;
+///
+/// let error = PlanError::create_outcome_unknown(ResourceId::with_provider_identity(
+///     "awscc",
+///     "ec2.Vpc",
+///     "main",
+///     None,
+/// ));
+/// let _ = error.to_string();
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanError {
     /// The resource that triggered the error.
@@ -81,6 +100,11 @@ pub enum PlanErrorKind {
     CreateInFlightOrphan,
     /// Destroy cannot identify an unfinished create yet; apply must resume it.
     DestroyCreateInFlight,
+    /// The initial create may have reached the provider, but returned neither
+    /// an identifier nor a continuation that could classify its outcome.
+    CreateOutcomeUnknown {
+        resource: ResourceId,
+    },
     /// Desired provider routing no longer matches the route that issued the
     /// persisted create.
     ResumeCreateRoutingMismatch {
@@ -118,8 +142,46 @@ pub enum PlanErrorKind {
         /// Schema or provider-validator diagnostic.
         message: String,
     },
+    /// An update would have to resend an ignored write-only value that the
+    /// provider cannot return on read.
+    IgnoredWriteOnlyValueUnavailable {
+        attribute: String,
+        path: String,
+    },
     /// A module argument constraint failed after its inputs became known.
     ModuleConstraint(ModuleConstraintDiagnostic),
+}
+
+/// The sole resolution seam for a resource that is confirmed absent after an
+/// outcome-unknown create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcomeUnknownAbsentResolution {
+    StateForget,
+}
+
+pub const fn create_outcome_unknown_absent_resolution() -> CreateOutcomeUnknownAbsentResolution {
+    CreateOutcomeUnknownAbsentResolution::StateForget
+}
+
+impl CreateOutcomeUnknownAbsentResolution {
+    fn hint(self, resource: &ResourceId, project_dir: &Path) -> String {
+        match self {
+            Self::StateForget => {
+                let resource_type = resource.display_type().to_string();
+                let identity = resource.identity_display().to_string();
+                ProjectCommand::new("state forget", project_dir)
+                    .with_argument(&resource_type)
+                    .with_argument(&identity)
+                    .to_string()
+            }
+        }
+    }
+}
+
+fn create_outcome_unknown_address(resource: &ResourceId) -> String {
+    let identity =
+        crate::parser::display_double_quoted_literal_part(&resource.identity_display().to_string());
+    format!("{} \"{identity}\"", resource.display_type())
 }
 
 impl PlanError {
@@ -129,6 +191,15 @@ impl PlanError {
 
     pub fn prevent_destroy(resource_id: ResourceId, action: PreventDestroyAction) -> Self {
         Self::new(resource_id, PlanErrorKind::PreventDestroy { action })
+    }
+
+    pub fn create_outcome_unknown(resource_id: ResourceId) -> Self {
+        Self::new(
+            resource_id.clone(),
+            PlanErrorKind::CreateOutcomeUnknown {
+                resource: resource_id,
+            },
+        )
     }
 
     /// Validate the provider identifier for one deposed generation.
@@ -162,6 +233,15 @@ impl From<CreateBeforeDestroyError> for PlanErrorKind {
     }
 }
 
+impl From<crate::provider::IgnoredWriteOnlyValueError> for PlanErrorKind {
+    fn from(error: crate::provider::IgnoredWriteOnlyValueError) -> Self {
+        Self::IgnoredWriteOnlyValueUnavailable {
+            attribute: error.attribute().to_string(),
+            path: error.path().to_string(),
+        }
+    }
+}
+
 impl PlanErrorKind {
     fn prevent_destroy_message(action: PreventDestroyAction) -> &'static str {
         match action {
@@ -181,8 +261,12 @@ impl PlanErrorKind {
     }
 }
 
-impl std::fmt::Display for PlanErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl PlanErrorKind {
+    fn fmt_with_project_dir(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        project_dir: &Path,
+    ) -> std::fmt::Result {
         match self {
             Self::PreventDestroy { action } => f.write_str(Self::prevent_destroy_message(*action)),
             Self::SchemaNotRegistered(err) => write!(f, "{err}"),
@@ -196,6 +280,15 @@ impl std::fmt::Display for PlanErrorKind {
             Self::DestroyCreateInFlight => f.write_str(
                 "saved state contains a create still in progress; run apply first to resume it before destroying",
             ),
+            Self::CreateOutcomeUnknown { resource } => {
+                let address = create_outcome_unknown_address(resource);
+                let absent =
+                    create_outcome_unknown_absent_resolution().hint(resource, project_dir);
+                write!(
+                    f,
+                    "the create may have reached the cloud, but its outcome is unknown; if it exists: import {{ to = {address} id = \"…\" }}; if it doesn't: {absent}"
+                )
+            }
             Self::ResumeCreateRoutingMismatch { persisted } => {
                 let route = persisted.provider_instance.as_deref().unwrap_or("default");
                 write!(
@@ -271,20 +364,68 @@ impl std::fmt::Display for PlanErrorKind {
                     (true, true) => write!(f, "resolved value constraint failed: {message}"),
                 }
             }
-            Self::ModuleConstraint(diagnostic) => diagnostic.fmt(f),
+            Self::ModuleConstraint(diagnostic) => std::fmt::Display::fmt(diagnostic, f),
+            Self::IgnoredWriteOnlyValueUnavailable { attribute, path } => write!(
+                f,
+                "cannot send attribute `{attribute}` because ignored write-only path `{path}` must be preserved, but its current value cannot be known"
+            ),
         }
     }
 }
 
-impl std::fmt::Display for PlanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl PlanError {
+    fn fmt_with_project_dir(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        project_dir: &Path,
+    ) -> std::fmt::Result {
         match &self.kind {
             // A module constraint already names its module and authored call.
             // The synthetic `_virtual` id is internal correlation metadata,
             // not a second user-facing resource identity.
             PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
-            kind => write!(f, "{}: {kind}", self.resource_id),
+            kind @ (PlanErrorKind::PreventDestroy { .. }
+            | PlanErrorKind::SchemaNotRegistered(_)
+            | PlanErrorKind::ReplacementCannotCoexist(_)
+            | PlanErrorKind::MissingProviderIdentifier
+            | PlanErrorKind::CreateInFlightOrphan
+            | PlanErrorKind::DestroyCreateInFlight
+            | PlanErrorKind::CreateOutcomeUnknown { .. }
+            | PlanErrorKind::ResumeCreateRoutingMismatch { .. }
+            | PlanErrorKind::InvalidImportProviderIdentifier
+            | PlanErrorKind::MissingDeposedProviderIdentifier { .. }
+            | PlanErrorKind::WaitTargetMissing { .. }
+            | PlanErrorKind::WaitTargetIsDataSource { .. }
+            | PlanErrorKind::WaitPredicateInvalid { .. }
+            | PlanErrorKind::IgnoredWriteOnlyValueUnavailable { .. }
+            | PlanErrorKind::ResolvedValueConstraint { .. }) => {
+                write!(f, "{}: ", self.resource_id)?;
+                kind.fmt_with_project_dir(f, project_dir)
+            }
         }
+    }
+
+    /// Render this error with project-scoped remediation commands targeting
+    /// the project that produced the plan.
+    pub fn display_with_project_dir<'a>(
+        &'a self,
+        project_dir: &'a Path,
+    ) -> impl std::fmt::Display + 'a {
+        PlanErrorDisplay {
+            error: self,
+            project_dir,
+        }
+    }
+}
+
+struct PlanErrorDisplay<'a> {
+    error: &'a PlanError,
+    project_dir: &'a Path,
+}
+
+impl std::fmt::Display for PlanErrorDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt_with_project_dir(f, self.project_dir)
     }
 }
 
@@ -419,6 +560,23 @@ struct AbandonedDeposedGeneration {
     key: DeposedKey,
 }
 
+/// Display-only count of readable drift hidden by `ignore_changes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgnoredChangeSummary {
+    resource_id: ResourceId,
+    count: usize,
+}
+
+impl IgnoredChangeSummary {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
 /// Plan containing Effects to be executed
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
@@ -427,6 +585,8 @@ struct AbandonedDeposedGeneration {
 ))]
 pub struct Plan<S = ModuleSource> {
     effects: Vec<EffectWithSource<S>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignored_change_summaries: Vec<IgnoredChangeSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) replace_display: Vec<ReplaceDisplayMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -444,6 +604,7 @@ impl<S> Default for Plan<S> {
     fn default() -> Self {
         Self {
             effects: Vec::new(),
+            ignored_change_summaries: Vec::new(),
             replace_display: Vec::new(),
             permanent_name_overrides: Vec::new(),
             errors: Vec::new(),
@@ -454,10 +615,124 @@ impl<S> Default for Plan<S> {
 
 pub type SavedPlan = Plan<SavedModuleSource>;
 
+/// Deserialized saved-plan effects before managed resources have crossed the
+/// fingerprint-checked schema-resolution boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnresolvedSavedPlan {
+    effects: Vec<UnresolvedSavedEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignored_change_summaries: Vec<IgnoredChangeSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    replace_display: Vec<ReplaceDisplayMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    permanent_name_overrides: Vec<PermanentNameOverride>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<PlanError>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    abandoned_deposed: Vec<AbandonedDeposedGeneration>,
+}
+
+impl From<SavedPlan> for UnresolvedSavedPlan {
+    fn from(plan: SavedPlan) -> Self {
+        let Plan {
+            effects,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        } = plan;
+        Self {
+            effects: effects
+                .into_iter()
+                .map(UnresolvedSavedEffect::from)
+                .collect(),
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        }
+    }
+}
+
+impl UnresolvedSavedPlan {
+    pub fn add(&mut self, effect: UnresolvedSavedEffect) {
+        self.effects.push(effect);
+    }
+
+    pub fn effects(&self) -> &[UnresolvedSavedEffect] {
+        &self.effects
+    }
+
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    pub fn move_authority(&self, from: &ResourceId, to: &ResourceId) -> Option<MoveAuthority<'_>> {
+        self.effects.iter().find_map(|effect| {
+            let authority = effect.move_authority()?;
+            (authority.from() == from && authority.to() == to).then_some(authority)
+        })
+    }
+
+    pub fn contains_redacted_secret_placeholders(&self) -> bool {
+        self.effects
+            .iter()
+            .any(crate::value::unresolved_effect_contains_redacted_secret)
+            || self.replace_display.iter().any(|metadata| {
+                metadata
+                    .previous_attributes
+                    .values()
+                    .any(crate::value::contains_redacted_secret)
+            })
+    }
+
+    pub fn replace_display_info(&self) -> impl Iterator<Item = ReplaceDisplayInfo<'_>> {
+        self.replace_display
+            .iter()
+            .map(ReplaceDisplayInfo::from_metadata)
+    }
+
+    pub fn abandoned_deposed_generations(
+        &self,
+    ) -> impl Iterator<Item = (&ResolvedResourceId, &DeposedKey)> {
+        self.abandoned_deposed
+            .iter()
+            .map(|generation| (&generation.id, &generation.key))
+    }
+
+    pub fn resolve_with_schemas(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<SavedPlan, crate::resource::ResolvedResourceError> {
+        let Self {
+            effects,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        } = self;
+        Ok(Plan {
+            effects: effects
+                .into_iter()
+                .map(|effect| effect.resolve_with_schemas(schemas))
+                .collect::<Result<Vec<_>, _>>()?,
+            ignored_change_summaries,
+            replace_display,
+            permanent_name_overrides,
+            errors,
+            abandoned_deposed,
+        })
+    }
+}
+
 impl From<Plan> for SavedPlan {
     fn from(plan: Plan) -> Self {
         let Plan {
             effects,
+            ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
             errors,
@@ -465,6 +740,7 @@ impl From<Plan> for SavedPlan {
         } = plan;
         Self {
             effects: effects.into_iter().map(SavedEffect::from).collect(),
+            ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
             errors,
@@ -539,6 +815,49 @@ impl<S> Plan<S> {
         &self.effects
     }
 
+    pub fn ignored_change_summaries(&self) -> &[IgnoredChangeSummary] {
+        &self.ignored_change_summaries
+    }
+
+    /// Refresh update inputs for ignored paths from the apply-time read.
+    ///
+    /// Other updates keep their plan-time source after drift verification;
+    /// ignored updates must use the fresh source so a value changed between
+    /// plan and apply is never written back accidentally.
+    pub fn rebase_ignored_update_sources(
+        &mut self,
+        actual_states: &HashMap<ResourceId, crate::resource::State>,
+    ) {
+        for effect in &mut self.effects {
+            if let Effect::Update { from, to, .. } = effect
+                && !to.ignore_changes().is_empty()
+                && let Some(actual) = actual_states.get(&to.id)
+            {
+                **from = actual.clone();
+            }
+        }
+    }
+
+    pub(crate) fn record_ignored_readable_differences(
+        &mut self,
+        resource_id: ResourceId,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        if let Some(summary) = self
+            .ignored_change_summaries
+            .iter_mut()
+            .find(|summary| summary.resource_id == resource_id)
+        {
+            summary.count = count;
+        } else {
+            self.ignored_change_summaries
+                .push(IgnoredChangeSummary { resource_id, count });
+        }
+    }
+
     /// Return the move capability for an exact route pair present in this
     /// plan.
     pub fn move_authority(&self, from: &ResourceId, to: &ResourceId) -> Option<MoveAuthority<'_>> {
@@ -557,6 +876,7 @@ impl<S> Plan<S> {
     pub fn contains_redacted_secret_placeholders(&self) -> bool {
         let Plan {
             effects,
+            ignored_change_summaries: _ignored_change_summaries,
             replace_display,
             permanent_name_overrides: _permanent_name_overrides,
             errors: _errors,
@@ -784,6 +1104,7 @@ impl<S> Plan<S> {
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
+                Effect::ReleaseListKeys { keys, .. } => summary.release += keys.len(),
                 Effect::Wait { .. } => summary.wait += 1,
                 Effect::DeferredCreate { .. } => {}
             }
@@ -804,6 +1125,8 @@ pub struct PlanSummary {
     pub import: usize,
     pub remove: usize,
     pub moved: usize,
+    /// Number of keyed list entries released from authored state.
+    pub release: usize,
     pub wait: usize,
 }
 
@@ -830,6 +1153,7 @@ pub enum PlanSummaryPart {
     Delete { count: usize },
     Remove { count: usize },
     Move { count: usize },
+    Release { count: usize },
     Wait { count: usize },
 }
 
@@ -856,6 +1180,11 @@ impl PlanSummary {
         if self.moved > 0 {
             parts.push(PlanSummaryPart::Move { count: self.moved });
         }
+        if self.release > 0 {
+            parts.push(PlanSummaryPart::Release {
+                count: self.release,
+            });
+        }
         if self.wait > 0 {
             parts.push(PlanSummaryPart::Wait { count: self.wait });
         }
@@ -878,6 +1207,7 @@ impl PlanSummary {
                 PlanSummaryPart::Delete { count } => format!("{count} to delete"),
                 PlanSummaryPart::Remove { count } => format!("{count} to remove from state"),
                 PlanSummaryPart::Move { count } => format!("{count} to move"),
+                PlanSummaryPart::Release { count } => format!("{count} to release"),
                 PlanSummaryPart::Wait { count } => format!("{count} to wait"),
             })
             .collect::<Vec<_>>()
@@ -915,6 +1245,20 @@ mod tests {
         DataSource, RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource,
         ResourceIdentity, RootScope,
     };
+
+    fn render_plan_error_kind(kind: PlanErrorKind) -> String {
+        let error = PlanError::new(
+            ResourceId::with_provider_identity("test", "Resource", "fixture", None),
+            kind,
+        );
+        let prefix = format!("{}: ", error.resource_id);
+        error
+            .display_with_project_dir(Path::new("."))
+            .to_string()
+            .strip_prefix(&prefix)
+            .expect("ordinary plan errors include their resource address")
+            .to_string()
+    }
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
@@ -1384,7 +1728,7 @@ mod tests {
 
         for (action, expected) in cases {
             assert_eq!(
-                PlanErrorKind::PreventDestroy { action }.to_string(),
+                render_plan_error_kind(PlanErrorKind::PreventDestroy { action }),
                 expected
             );
         }
@@ -1399,7 +1743,7 @@ mod tests {
         let expected = error.to_string();
 
         assert_eq!(
-            PlanErrorKind::SchemaNotRegistered(error).to_string(),
+            render_plan_error_kind(PlanErrorKind::SchemaNotRegistered(error)),
             expected
         );
         assert_eq!(
@@ -1417,7 +1761,7 @@ mod tests {
         let expected = error.to_string();
 
         assert_eq!(
-            PlanErrorKind::ReplacementCannotCoexist(error).to_string(),
+            render_plan_error_kind(PlanErrorKind::ReplacementCannotCoexist(error)),
             expected
         );
         assert_eq!(
@@ -1427,29 +1771,71 @@ mod tests {
     }
 
     #[test]
+    fn create_outcome_unknown_error_has_parseable_import_and_forget_hint() {
+        let resource = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Vpc",
+            "main-vpc",
+            Some("management".to_string()),
+        );
+        let error = PlanError::create_outcome_unknown(resource);
+        let rendered = error.display_with_project_dir(Path::new(".")).to_string();
+
+        assert_eq!(
+            rendered,
+            "awscc.ec2.Vpc.main-vpc: the create may have reached the cloud, but its outcome is unknown; if it exists: import { to = awscc.ec2.Vpc \"main-vpc\" id = \"…\" }; if it doesn't: carina state forget awscc.ec2.Vpc main-vpc"
+        );
+        let import = rendered
+            .split_once("if it exists: ")
+            .and_then(|(_prefix, resolutions)| resolutions.split_once("; if it doesn't:"))
+            .map(|(import, _forget)| import)
+            .expect("the rendered hint must contain both resolution branches");
+
+        crate::parser::parse(import, &crate::parser::ProviderContext::default())
+            .expect("the rendered single-line import form must parse");
+    }
+
+    #[test]
+    fn create_outcome_unknown_forget_hint_keeps_the_project_dir() {
+        let resource = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Vpc",
+            "main vpc",
+            Some("management".to_string()),
+        );
+        let error = PlanError::create_outcome_unknown(resource);
+
+        assert!(
+            error
+                .display_with_project_dir(std::path::Path::new("infra/production project"))
+                .to_string()
+                .ends_with(
+                    "if it doesn't: carina state forget awscc.ec2.Vpc 'main vpc' 'infra/production project'"
+                )
+        );
+    }
+
+    #[test]
     fn plan_error_kind_display_pins_wait_errors() {
         assert_eq!(
-            PlanErrorKind::WaitTargetMissing {
+            render_plan_error_kind(PlanErrorKind::WaitTargetMissing {
                 wait_binding: "cert_issued".to_string(),
                 target: "cert".to_string(),
-            }
-            .to_string(),
+            }),
             "wait `cert_issued`: target binding `cert` is not a known resource"
         );
         assert_eq!(
-            PlanErrorKind::WaitTargetIsDataSource {
+            render_plan_error_kind(PlanErrorKind::WaitTargetIsDataSource {
                 wait_binding: "roles_ready".to_string(),
                 target: "roles".to_string(),
-            }
-            .to_string(),
+            }),
             "wait `roles_ready`: target binding `roles` is a data source; wait targets must be managed resources"
         );
         assert_eq!(
-            PlanErrorKind::WaitPredicateInvalid {
+            render_plan_error_kind(PlanErrorKind::WaitPredicateInvalid {
                 wait_binding: "cert_issued".to_string(),
                 reason: "invalid predicate attribute path: empty attribute path".to_string(),
-            }
-            .to_string(),
+            }),
             "wait `cert_issued`: invalid predicate attribute path: empty attribute path"
         );
     }

@@ -376,51 +376,72 @@ fn function_argument_awaits_module_substitution(argument: &FunctionArgument) -> 
         || argument.value().is_some_and(contains_module_argument)
 }
 
-fn contains_module_argument(value: &Value) -> bool {
+pub(super) fn contains_module_argument<B: crate::resource::BindingAddress>(
+    value: &GenericValue<B>,
+) -> bool {
+    contains_module_argument_matching(value, &mut |_| true)
+}
+
+pub(crate) fn contains_module_argument_matching<B: crate::resource::BindingAddress>(
+    value: &GenericValue<B>,
+    predicate: &mut impl FnMut(&str) -> bool,
+) -> bool {
     match value {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })) => true,
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_module_argument),
-        Value::Concrete(ConcreteValue::Map(entries)) => {
-            entries.values().any(contains_module_argument)
+        GenericValue::Deferred(GenericDeferredValue::Unknown(
+            GenericUnknownReason::ModuleArgument { name, .. },
+        )) => predicate(name),
+        GenericValue::Concrete(GenericConcreteValue::List(items)) => {
+            items
+                .iter()
+                .any(|item| contains_module_argument_matching(item, predicate))
         }
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+        GenericValue::Concrete(GenericConcreteValue::Map(entries)) => {
+            entries
+                .values()
+                .any(|entry| contains_module_argument_matching(entry, predicate))
+        }
+        GenericValue::Deferred(
+            GenericDeferredValue::FunctionCall { args, .. }
+            | GenericDeferredValue::Unavailable { args, .. }
+            | GenericDeferredValue::ResolvedFunctionCall { args, .. },
         ) => args.iter().any(|argument| {
-            argument.pending_parameter().is_some()
+            argument.pending_parameter().is_some_and(&mut *predicate)
                 || argument
                     .value()
-                    .is_some_and(contains_module_argument)
+                    .is_some_and(|value| contains_module_argument_matching(value, predicate))
                 || argument.handle().is_some_and(|handle| {
                     matches!(handle.kind(), StructuralHandleKind::ModuleParameter)
+                        && predicate(handle.canonical_binding().as_str())
                 })
         }),
-        Value::Deferred(DeferredValue::Access(access)) => {
-            contains_module_argument(access.base())
+        GenericValue::Deferred(GenericDeferredValue::Access(access)) => {
+            contains_module_argument_matching(access.base(), predicate)
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument(value))
+        GenericValue::Deferred(GenericDeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+            matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument_matching(value, predicate))
         }),
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_module_argument(inner),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            contains_module_argument(value) || contains_module_argument(default)
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => {
+            contains_module_argument_matching(inner, predicate)
         }
-        Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+        GenericValue::Deferred(GenericDeferredValue::Coalesce { value, default }) => {
+            contains_module_argument_matching(value, predicate)
+                || contains_module_argument_matching(default, predicate)
+        }
+        GenericValue::Deferred(
+            GenericDeferredValue::ResourceRef { .. }
+            | GenericDeferredValue::BindingRef { .. }
+            | GenericDeferredValue::RedactedSecret { .. }
+            | GenericDeferredValue::Unknown(_),
         )
-        | Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
+        | GenericValue::Concrete(
+            GenericConcreteValue::String(_)
+            | GenericConcreteValue::EnumIdentifier(_)
+            | GenericConcreteValue::CanonicalEnum(_)
+            | GenericConcreteValue::Int(_)
+            | GenericConcreteValue::Float(_)
+            | GenericConcreteValue::Bool(_)
+            | GenericConcreteValue::Duration(_)
+            | GenericConcreteValue::StringList(_),
         ) => false,
     }
 }
@@ -561,7 +582,27 @@ pub fn validate_custom_type<B: BindingAddress>(
 
 /// Validate an authored provider schema annotation against every owner that
 /// declares its semantic identity.
+///
+/// ```compile_fail
+/// use carina_core::parser::{
+///     OwnedTypeIdentity, ProviderContext, validate_schema_custom_type,
+/// };
+/// use carina_core::resource::{ConcreteValue, Value};
+/// use carina_core::schema::TypeIdentity;
+///
+/// let owned = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Id"));
+/// let value = Value::Concrete(ConcreteValue::String("id".into()));
+/// let _ = validate_schema_custom_type(&owned, &value, &ProviderContext::default());
+/// ```
 pub fn validate_schema_custom_type<B: BindingAddress>(
+    owned: &crate::parser::OwnedTypeIdentity,
+    value: &GenericValue<B>,
+    config: &crate::parser::LoadedProviderContext,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    validate_schema_custom_type_with_context(owned, value, config)
+}
+
+pub(crate) fn validate_schema_custom_type_with_context<B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
     value: &GenericValue<B>,
     config: &ProviderContext,
@@ -677,7 +718,7 @@ fn check_fn_arg_type(
             Ok(None) => {
                 return Ok(FunctionArgumentTypeCheck::DeferredUntilSchemasAreLoaded);
             }
-            Err(message) => return Err(ParseError::UserFunctionError(message)),
+            Err(error) => return Err(ParseError::UserFunctionError(error.to_string())),
         };
 
     if let Some(handle) = argument.handle() {
@@ -698,7 +739,7 @@ fn check_fn_arg_type(
     let value = argument.value().expect("non-handle function argument");
     let type_expr = resolved_type.as_type_expr();
 
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
         &type_expr,
         value,
         ctx.config,
@@ -833,7 +874,7 @@ fn check_fn_return_type(
     value: &Value,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value(
+    if let Err(mismatch) = crate::validation::typecheck::check_type_expr_value_with_context(
         type_expr,
         value,
         config,

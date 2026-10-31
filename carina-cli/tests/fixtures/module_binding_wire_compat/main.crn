@@ -1,0 +1,19 @@
+let root = mock.test.resource {
+  name = "root"
+}
+
+let app_module = use {
+  source = "./modules/app"
+}
+
+let direct = app_module {
+  label    = "direct"
+  upstream = root
+}
+
+let looped = for label in ["loop"] {
+  app_module {
+    label    = label
+    upstream = root
+  }
+}

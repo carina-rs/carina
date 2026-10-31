@@ -21,7 +21,8 @@ use std::path::{Component, Path, PathBuf};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::parser::{TypeExpr, ValidateExpr};
+use crate::parser::ValidateExpr;
+use crate::static_type::ConsumerStaticType;
 
 use super::{
     AbsoluteBindingAddress, AccessPath, BindingAddress, DeferredValue, ModuleInstanceScope,
@@ -80,7 +81,7 @@ enum CompositionAttributeValue<B: BindingAddress = AbsoluteBindingAddress> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveCompositionAttribute<B: BindingAddress = AbsoluteBindingAddress> {
     value: CompositionAttributeValue<B>,
-    declared_type: Option<TypeExpr>,
+    declared_type: Option<ConsumerStaticType>,
     /// The module argument directly forwarded by this output before call-site
     /// substitution. Validation checks that declaration in the module's own
     /// scope; retaining the provenance prevents an expanded caller value from
@@ -119,7 +120,14 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
     /// Every other `Value` shape is multi-source (literal,
     /// interpolation, function call, etc.) and lifts into
     /// classified as derived.
-    pub fn from_value(value: Value<B>, declared_type: Option<TypeExpr>) -> Self {
+    pub fn from_value(value: Value<B>, declared_type: Option<ConsumerStaticType>) -> Self {
+        Self::from_value_with_static_type(value, declared_type)
+    }
+
+    pub fn from_value_with_static_type(
+        value: Value<B>,
+        declared_type: Option<ConsumerStaticType>,
+    ) -> Self {
         let value = match value {
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 CompositionAttributeValue::Forwarded(path)
@@ -134,7 +142,7 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
     }
 
     /// The module-boundary annotation carried from `attributes {}`.
-    pub fn declared_type(&self) -> Option<&TypeExpr> {
+    pub fn declared_type(&self) -> Option<&ConsumerStaticType> {
         self.declared_type.as_ref()
     }
 
@@ -157,7 +165,7 @@ impl<B: BindingAddress> LiveCompositionAttribute<B> {
 
     /// Reclassify a rewritten value while preserving its declaration.
     pub fn with_value(&self, value: Value<B>) -> Self {
-        Self::from_value(value, self.declared_type.clone())
+        Self::from_value_with_static_type(value, self.declared_type.clone())
             .with_source_argument(self.source_argument.clone())
     }
 
@@ -282,7 +290,7 @@ pub type ExpandedLiveCompositionArgument = LiveCompositionArgument<AbsoluteBindi
 
 #[derive(Debug, Clone, PartialEq)]
 struct LiveCompositionArgumentMetadata {
-    declared_type: TypeExpr,
+    declared_type: ConsumerStaticType,
     origin: crate::parser::ArgumentOrigin,
 }
 
@@ -303,7 +311,15 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
 
     pub fn from_value(
         value: Value<B>,
-        declared_type: TypeExpr,
+        declared_type: ConsumerStaticType,
+        origin: crate::parser::ArgumentOrigin,
+    ) -> Self {
+        Self::from_value_with_static_type(value, declared_type, origin)
+    }
+
+    pub fn from_value_with_static_type(
+        value: Value<B>,
+        declared_type: ConsumerStaticType,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
         Self {
@@ -315,9 +331,9 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
         }
     }
 
-    pub(crate) fn from_handle(
+    pub(crate) fn from_handle_with_static_type(
         value: Value<B>,
-        declared_type: TypeExpr,
+        declared_type: ConsumerStaticType,
         handle: crate::eval_value::StructuralHandle<B>,
         origin: crate::parser::ArgumentOrigin,
     ) -> Self {
@@ -334,15 +350,17 @@ impl<B: BindingAddress> LiveCompositionArgument<B> {
         self.operand.traversal_value()
     }
 
-    pub fn declared_type(&self) -> &TypeExpr {
+    pub fn declared_type(&self) -> &ConsumerStaticType {
         &self.metadata.declared_type
     }
 
-    pub fn metadata(&self) -> (&TypeExpr, crate::parser::ArgumentOrigin) {
+    pub fn metadata(&self) -> (&ConsumerStaticType, crate::parser::ArgumentOrigin) {
         (&self.metadata.declared_type, self.metadata.origin)
     }
 
-    pub(crate) fn validation_metadata(&self) -> (&TypeExpr, crate::parser::ArgumentOrigin) {
+    pub(crate) fn validation_metadata(
+        &self,
+    ) -> (&ConsumerStaticType, crate::parser::ArgumentOrigin) {
         self.metadata()
     }
 
@@ -517,7 +535,7 @@ pub struct LiveCompositionSignature<B: BindingAddress = AbsoluteBindingAddress> 
     /// Module-output values classified by how they are produced
     /// (#3294): forwarded values are single-hop aliases and derived values are
     /// multi-source expressions. Each entry also carries its optional declared
-    /// [`TypeExpr`] for validation.
+    /// [`crate::parser::TypeExpr`] for validation.
     pub attributes: IndexMap<String, LiveCompositionAttribute<B>>,
     /// Constraints deferred until all referenced argument values are known.
     pub pending_constraints: Vec<PendingModuleConstraint<B>>,
@@ -1564,12 +1582,19 @@ impl<'a> Iterator for CompositionRuntimeAttributes<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{CompareOp, ValidateExpr};
+    use crate::parser::{CompareOp, TypeExpr, ValidateExpr};
     use crate::resource::{
         ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
         ExpandedInterpolationPart as InterpolationPart, ExpandedValue as Value, ResourceId,
         RootScope,
     };
+
+    fn resolved_type(type_expr: TypeExpr) -> ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type_for_signature(
+            &type_expr,
+            &crate::parser::ProviderContext::default(),
+        )
+    }
 
     #[test]
     fn equality_compares_call_path_identity_but_ignores_call_display() {
@@ -1718,12 +1743,17 @@ mod tests {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::root("svc", "endpoint"),
             }),
-            Some(declared.clone()),
+            Some(resolved_type(declared.clone())),
         );
 
         let rewritten = attr.with_value(Value::Concrete(ConcreteValue::String("x".into())));
 
-        assert_eq!(rewritten.declared_type(), Some(&declared));
+        assert_eq!(
+            rewritten
+                .declared_type()
+                .and_then(|static_type| static_type.known()),
+            Some(&declared)
+        );
     }
 
     #[test]
@@ -1751,13 +1781,13 @@ mod tests {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::root("vpc", "vpc_id"),
             }),
-            declared.clone(),
+            resolved_type(declared.clone()),
             crate::parser::ArgumentOrigin::Defaulted,
         );
 
         let rewritten = argument.with_value(Value::Concrete(ConcreteValue::String("x".into())));
 
-        assert_eq!(rewritten.declared_type(), &declared);
+        assert_eq!(rewritten.declared_type().known(), Some(&declared));
     }
 
     #[test]
@@ -1800,7 +1830,7 @@ mod tests {
                         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                             ConcreteValue::String("plaintext-secret".into()),
                         )))),
-                        TypeExpr::String,
+                        resolved_type(TypeExpr::String),
                         crate::parser::ArgumentOrigin::Defaulted,
                     ),
                 )]),

@@ -10,8 +10,7 @@ use carina_core::effect::deps::UnresolvedResource;
 use carina_core::name_override::{
     ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
 };
-use carina_core::parser::ExpandedDeferredForExpression;
-use carina_core::parser::File;
+use carina_core::parser::{ExpandedDeferredForExpression, ModuleResolvedFile};
 use carina_core::resource::{AbsoluteBindingAddress, ConcreteValue, Resource, ResourceId, Value};
 use carina_core::schema::{BlockNameConflict, SchemaRegistry};
 
@@ -60,7 +59,7 @@ use super::ProjectedStateRead;
 /// ```
 #[derive(Debug, Clone)]
 pub struct CanonicalResourcePair<E> {
-    parsed: File<E, AbsoluteBindingAddress>,
+    parsed: ModuleResolvedFile<E>,
     unresolved: Vec<Resource>,
     /// Generated prefix values captured before persisted state can replace
     /// them with a pending re-read unknown. A post-refresh reconciliation
@@ -93,7 +92,7 @@ pub enum CanonicalResourceIdentityError {
 }
 
 impl<E> CanonicalResourcePair<E> {
-    pub(super) fn new(parsed: File<E, AbsoluteBindingAddress>, unresolved: Vec<Resource>) -> Self {
+    pub(super) fn new(parsed: ModuleResolvedFile<E>, unresolved: Vec<Resource>) -> Self {
         Self {
             parsed,
             unresolved,
@@ -101,9 +100,19 @@ impl<E> CanonicalResourcePair<E> {
         }
     }
 
+    pub(super) fn from_resolved_file(
+        parsed: carina_core::validation::ResolvedFile<E>,
+        unresolved: Vec<Resource>,
+    ) -> Self {
+        Self::new(parsed.into_file(), unresolved)
+    }
+
+    pub(super) fn into_parts(self) -> (ModuleResolvedFile<E>, Vec<Resource>) {
+        (self.parsed, self.unresolved)
+    }
     pub(super) fn resolve_block_names(
         _access: &super::ValidationPipelineAccess,
-        parsed: File<E, AbsoluteBindingAddress>,
+        parsed: ModuleResolvedFile<E>,
         unresolved: UnresolvedConfigSnapshot,
         registry: &SchemaRegistry,
     ) -> Result<Self, Vec<BlockNameConflict>> {
@@ -115,7 +124,7 @@ impl<E> CanonicalResourcePair<E> {
     /// The canonical evaluated configuration. Callers borrow every non-resource
     /// input from this file so it cannot drift from the resources consumed by
     /// [`OverrideAwareResources`].
-    pub fn parsed(&self) -> &File<E, AbsoluteBindingAddress> {
+    pub fn parsed(&self) -> &ModuleResolvedFile<E> {
         &self.parsed
     }
 
@@ -240,24 +249,29 @@ impl<E> CanonicalResourcePair<E> {
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         mut classify: F,
-    ) -> Result<Vec<ExpandedDeferredForExpression>, carina_core::parser::DeferredForExpansionError>
+    ) -> Result<
+        carina_core::parser::ResolvedDeferredForExpressions,
+        carina_core::parser::DeferredForExpansionError,
+    >
     where
         F: FnMut(&ExpandedDeferredForExpression) -> DeferredForExpansionChoice,
     {
-        let (selected, retained): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.parsed.deferred_for_expressions)
-                .into_iter()
-                .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        let (selected, retained) = self
+            .parsed
+            .take_deferred_for_expressions()
+            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
         self.parsed.warnings.retain(|warning| {
             warning.kind != carina_core::parser::WarningKind::DeferredFor
                 || !retained
                     .iter()
                     .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
         });
-        self.parsed.deferred_for_expressions = selected;
+        self.parsed.replace_deferred_for_expressions(selected);
         self.parsed.expand_deferred_for_expressions(bindings)?;
-        let residual = self.parsed.deferred_for_expressions.clone();
-        self.parsed.deferred_for_expressions.extend(retained);
+        let residual = self.parsed.deferred_for_expressions().clone();
+        self.parsed
+            .deferred_for_expressions_mut()
+            .append_finalized(retained);
         Ok(residual)
     }
 
@@ -746,7 +760,7 @@ mod tests {
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
-        let mut parsed = carina_core::parser::ExpandedParsedFile::default();
+        let mut parsed = carina_core::parser::ModuleResolvedParsedFile::default();
         parsed.resources = resources.clone();
         let canonical = CanonicalResourcePair::new(parsed, resources);
         let state = ProjectedStateRead::for_test_name_overrides(overrides);

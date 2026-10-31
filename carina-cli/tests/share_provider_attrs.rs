@@ -33,10 +33,9 @@ fn share_provider_attrs_resolves_default_tags() {
     // the built-in provider catalog.
     let parsed = carina_cli::commands::validate_and_resolve_with_provider_load_for_test(
         &user_dirs,
-        config.parsed,
+        &config.parsed,
         &fixture,
         true,
-        &config.inference_errors,
         &config.duplicate_declarations,
     )
     .expect("validate_and_resolve must succeed");

@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
-use carina_core::provider::ProviderError;
+use carina_core::plan::PlanError;
+use carina_core::provider::{ProviderError, ProviderInstanceKey, ReferenceScope};
 use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
 
@@ -79,6 +80,112 @@ impl std::fmt::Display for ProjectBackendError {
 // command, so exposing the backend error again would repeat the diagnostic.
 impl std::error::Error for ProjectBackendError {}
 
+/// Typed failure while reloading state-owned create status under the apply
+/// lock. This type deliberately has no plain `Display`: the plan-error branch
+/// can contain a project-scoped recovery command.
+#[derive(Debug)]
+pub(crate) enum LockedStateReloadError {
+    Config(String),
+    Plan(Box<PlanError>),
+}
+
+impl From<String> for LockedStateReloadError {
+    fn from(message: String) -> Self {
+        Self::Config(message)
+    }
+}
+
+impl From<PlanError> for LockedStateReloadError {
+    fn from(error: PlanError) -> Self {
+        Self::Plan(Box::new(error))
+    }
+}
+
+impl LockedStateReloadError {
+    pub(crate) fn display_with_project_dir<'a>(
+        &'a self,
+        project_dir: &'a Path,
+    ) -> impl std::fmt::Display + 'a {
+        LockedStateReloadErrorDisplay {
+            error: self,
+            project_dir,
+        }
+    }
+}
+
+struct LockedStateReloadErrorDisplay<'a> {
+    error: &'a LockedStateReloadError,
+    project_dir: &'a Path,
+}
+
+impl std::fmt::Display for LockedStateReloadErrorDisplay<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.error {
+            LockedStateReloadError::Config(message) => formatter.write_str(message),
+            LockedStateReloadError::Plan(error) => {
+                std::fmt::Display::fmt(&error.display_with_project_dir(self.project_dir), formatter)
+            }
+        }
+    }
+}
+
+/// A locked-state reload failure rendered with the concrete project directory
+/// available at the apply boundary.
+#[derive(Debug)]
+pub struct ProjectLockedStateReloadError {
+    project_dir: PathBuf,
+    source: LockedStateReloadError,
+}
+
+impl ProjectLockedStateReloadError {
+    fn new(source: LockedStateReloadError, project_dir: &Path) -> Self {
+        Self {
+            project_dir: project_dir.to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectLockedStateReloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(
+            &self.source.display_with_project_dir(&self.project_dir),
+            formatter,
+        )
+    }
+}
+
+// This is the terminal rendering surface: the typed source cannot be exposed
+// without re-rendering a project-scoped command without its project path.
+impl std::error::Error for ProjectLockedStateReloadError {}
+
+/// A `state forget` rejection rendered with the concrete project directory
+/// available at the CLI boundary.
+#[derive(Debug)]
+pub struct ProjectStateForgetError {
+    project_dir: PathBuf,
+    source: carina_state::NotOutcomeUnknown,
+}
+
+impl ProjectStateForgetError {
+    fn new(source: carina_state::NotOutcomeUnknown, project_dir: &Path) -> Self {
+        Self {
+            project_dir: project_dir.to_path_buf(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectStateForgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source.display_with_project_dir(&self.project_dir), f)
+    }
+}
+
+// Like `ProjectBackendError`, this project-aware wrapper is the terminal
+// rendering surface. Exposing its source would print the rejection twice.
+impl std::error::Error for ProjectStateForgetError {}
+
 /// All provider-schema differences that invalidate one saved plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlanSchemaMismatchError {
@@ -141,6 +248,48 @@ impl std::fmt::Display for SavedPlanProviderArtifactMismatchError {
 }
 
 impl std::error::Error for SavedPlanProviderArtifactMismatchError {}
+
+/// Saved and newly initialized scopes for one provider instance differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPlanProviderScopeMismatchError {
+    pub instance: ProviderInstanceKey,
+    pub recorded: ReferenceScope,
+    pub initialized: Option<ReferenceScope>,
+    pub replan_command: String,
+}
+
+impl std::fmt::Display for SavedPlanProviderScopeMismatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let instance = match self.instance.provider_instance() {
+            Some(binding) => format!("{}.{}", self.instance.provider(), binding),
+            None => format!("{} (default)", self.instance.provider()),
+        };
+        write!(
+            formatter,
+            "Provider scope mismatch for `{instance}`: recorded {}; initialized {}.\nRe-run `{}` to produce a new saved plan before applying.",
+            reference_scope_summary(&self.recorded),
+            self.initialized
+                .as_ref()
+                .map(reference_scope_summary)
+                .unwrap_or_else(|| "missing".to_string()),
+            self.replan_command,
+        )
+    }
+}
+
+fn reference_scope_summary(scope: &ReferenceScope) -> String {
+    match scope {
+        ReferenceScope::Available(values) => format!(
+            "{}/{}/{}",
+            values.partition(),
+            values.region(),
+            values.account()
+        ),
+        ReferenceScope::Unavailable => "unavailable".to_string(),
+    }
+}
+
+impl std::error::Error for SavedPlanProviderScopeMismatchError {}
 
 /// A backend-selection failure annotated with the upstream project whose
 /// state was being resolved.
@@ -557,6 +706,11 @@ pub enum AppError {
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
 
+    /// A resource's authored lifecycle paths could not cross the
+    /// schema-resolved planning boundary.
+    #[error(transparent)]
+    ResolvedResource(Box<carina_core::resource::ResolvedResourceError>),
+
     /// Persisted current state did not agree with the validated move source.
     #[error(transparent)]
     CurrentMoveRouting(#[from] carina_core::differ::CurrentMoveRoutingMismatch),
@@ -589,6 +743,15 @@ pub enum AppError {
     #[error(transparent)]
     Backend(#[from] BackendError),
 
+    /// `state forget` was asked to remove anything other than an
+    /// outcome-unknown create row.
+    #[error(transparent)]
+    StateForget(Box<ProjectStateForgetError>),
+
+    /// Locked state no longer agrees with the saved plan's create status.
+    #[error(transparent)]
+    LockedStateReload(Box<ProjectLockedStateReloadError>),
+
     /// A provider or desired value could not be encoded into one resource row.
     #[error(transparent)]
     ResourceStateEncoding(Box<LocatedResourceStateEncodingError>),
@@ -604,6 +767,11 @@ pub enum AppError {
     /// Provider errors (AWS API failures, timeouts, etc.)
     #[error(transparent)]
     Provider(#[from] ProviderError),
+
+    /// A resource's initialized provider and owner schema could not be paired
+    /// for type-aware comparison.
+    #[error(transparent)]
+    ComparisonResolution(#[from] carina_core::provider::ComparisonResolutionError),
 
     /// A module argument constraint became decidable during an operation.
     #[error(transparent)]
@@ -698,6 +866,10 @@ pub enum AppError {
     /// Plan dependency-graph image construction or output failed.
     #[error(transparent)]
     PlanImage(#[from] crate::plan_image::PlanImageError),
+
+    /// Interactive terminal setup, display preparation, or I/O failed.
+    #[error(transparent)]
+    Tui(#[from] carina_tui::TuiError),
 
     /// One schema-aware bare-binding failure at its authored source token.
     #[error(transparent)]
@@ -820,6 +992,10 @@ pub enum AppError {
     #[error("{0}")]
     SavedPlanProviderArtifactMismatch(SavedPlanProviderArtifactMismatchError),
 
+    /// A saved plan was computed under a different initialized instance scope.
+    #[error("{0}")]
+    SavedPlanProviderScopeMismatch(Box<SavedPlanProviderScopeMismatchError>),
+
     /// Apply completed with one or more partial create results.
     #[error("{0}")]
     PartialSuccess(String),
@@ -834,6 +1010,23 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub(crate) fn from_locked_state_reload(
+        source: LockedStateReloadError,
+        project_dir: &Path,
+    ) -> Self {
+        Self::LockedStateReload(Box::new(ProjectLockedStateReloadError::new(
+            source,
+            project_dir,
+        )))
+    }
+
+    pub(crate) fn from_state_forget(
+        source: carina_state::NotOutcomeUnknown,
+        project_dir: &Path,
+    ) -> Self {
+        Self::StateForget(Box::new(ProjectStateForgetError::new(source, project_dir)))
+    }
+
     pub(crate) fn from_resource_state_encoding(
         resource: ResourceId,
         source: carina_state::ResourceStateEncodingError,
@@ -900,6 +1093,12 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
         source = current.source();
     }
     messages.join("\n")
+}
+
+impl From<carina_core::resource::ResolvedResourceError> for AppError {
+    fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
+        Self::ResolvedResource(Box::new(error))
+    }
 }
 
 impl From<String> for AppError {
@@ -1122,7 +1321,7 @@ mod tests {
         }
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
         let provider_context = carina_core::parser::ProviderContext::default();
-        let context = carina_core::validation::ValidationTypeContext::new(
+        let context = carina_core::validation::ValidationTypeContext::new_providerless(
             &parsed,
             &schemas,
             &provider_context,
@@ -1186,6 +1385,27 @@ mod tests {
         let app_error = AppError::from(plan_image_error);
 
         assert!(matches!(app_error, AppError::PlanImage(_)));
+    }
+
+    #[test]
+    fn tui_error_keeps_the_typed_provider_failure_in_the_app_error_chain() {
+        let app_error = AppError::from(carina_tui::TuiError::PlanDisplay(
+            ProviderError::internal_caused_by(
+                "comparison resolution failed",
+                std::io::Error::other("typed leaf"),
+            ),
+        ));
+
+        assert_eq!(app_error.to_string(), "Failed to prepare TUI plan details");
+        let provider_error = std::error::Error::source(&app_error)
+            .and_then(|source| source.downcast_ref::<ProviderError>())
+            .expect("transparent AppError must retain the typed TUI provider source");
+        assert!(
+            provider_error
+                .detail()
+                .cause()
+                .is_some_and(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        );
     }
 
     #[test]

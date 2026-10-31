@@ -405,9 +405,9 @@ pub fn collect_tag_keys_for_file(source: &str, file: &Path) -> Vec<TagKeyEntry> 
 /// symlink aliases, repeated imports, and multiple aliases to one module. When
 /// canonicalization fails, the original path is the identity, matching the
 /// module walk's cycle-guard convention.
-pub fn collect_all_tag_keys<E, B: crate::resource::BindingAddress, S: AsRef<str>>(
+pub fn collect_all_tag_keys<E, B: crate::resource::BindingAddress, D, S: AsRef<str>>(
     root_inputs: &[(PathBuf, S)],
-    parsed: &crate::parser::File<E, B>,
+    parsed: &crate::parser::File<E, B, D>,
     base_dir: &Path,
 ) -> Vec<TagKeyEntry> {
     fn canonical_guard_path(path: &Path) -> PathBuf {
@@ -1938,7 +1938,7 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("net", "./modules/network")], vec!["net"]);
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, _, String>(&[], &parsed, temp.path());
         assert!(
             results.iter().any(|entry| entry.key == "Name"),
             "tag key 'Name' must be collected from the module's main.crn; got {:?}",
@@ -1959,7 +1959,7 @@ tags = {
 
         let parsed = parsed_with_uses(vec![("unused", "./unused")], vec![]);
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, _, String>(&[], &parsed, temp.path());
         assert!(
             results.is_empty(),
             "tag keys from uncalled imports must not be collected; got {:?}",
@@ -1972,7 +1972,7 @@ tags = {
         let temp = tempfile::tempdir().unwrap();
         let parsed = parsed_with_uses(vec![("missing", "./does-not-exist")], vec!["missing"]);
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, _, String>(&[], &parsed, temp.path());
 
         assert!(results.is_empty());
     }
@@ -1998,7 +1998,7 @@ tags = {
             vec!["real", "alias"],
         );
 
-        let results = collect_all_tag_keys::<_, _, String>(&[], &parsed, temp.path());
+        let results = collect_all_tag_keys::<_, _, _, String>(&[], &parsed, temp.path());
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "Name");

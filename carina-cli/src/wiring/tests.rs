@@ -6,7 +6,7 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::PlanOp;
 use carina_core::executor::{
     ExecutionEvent, ExecutionObserver, ExecutionOutcome, LiveExecutionInput, ProviderCheckInputs,
-    UnresolvedResource, execute_live_plan,
+    UnresolvedResource,
 };
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
@@ -26,6 +26,95 @@ fn root_resource_ref(binding: &str, attribute: &str) -> Value {
     Value::resource_ref(binding, attribute, Vec::new()).resolve_root_for_test()
 }
 
+fn comparison_provider_for_resources(
+    schemas: &SchemaRegistry,
+    resources: &[Resource],
+) -> ProviderRouter {
+    carina_core::provider::comparison_fixture_for_test(
+        schemas,
+        resources.iter().map(|resource| &resource.id),
+    )
+    .1
+}
+
+fn reconcile_anonymous_identifiers_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    data_sources: &[DataSource],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+) -> Vec<ResolvedMove> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::reconcile_anonymous_identifiers_with_ctx(
+        ctx,
+        &comparison_provider,
+        resources,
+        data_sources,
+        state_view,
+        claims,
+    )
+    .expect("anonymous reconciliation comparison fixture must resolve")
+}
+
+fn detect_legacy_loop_moves_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+    reserved_moves: &[ResolvedMove],
+) -> Vec<ResolvedMove> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::detect_legacy_loop_moves_with_ctx(
+        ctx,
+        &comparison_provider,
+        resources,
+        state_view,
+        claims,
+        reserved_moves,
+    )
+    .expect("legacy-loop comparison fixture must resolve")
+}
+
+fn detect_anonymous_to_named_moves_with_ctx<B: carina_core::resource::BindingAddress>(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    candidates: &HashSet<ResourceId>,
+    providers: &[ProviderConfig<B>],
+    state_view: &AnonymousReconciliationStateView,
+    claims: &StateBlockClaims,
+    claimed_origins: &identifier::AnonymousToNamedClaimedOrigins,
+) -> Result<identifier::AnonymousToNamedRenameDetection, AppError> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::detect_anonymous_to_named_moves_with_ctx(
+        ctx,
+        &comparison_provider,
+        identifier::AnonymousToNamedCandidates::new(resources, candidates, claimed_origins),
+        providers,
+        state_view,
+        claims,
+    )
+}
+
+fn detect_anonymous_to_named_moves_to_fixed_point<B: carina_core::resource::BindingAddress>(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    providers: &[ProviderConfig<B>],
+    state_file: &StateFile,
+    initial_moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
+    claims: &StateBlockClaims,
+) -> Result<Vec<ResolvedMove>, AppError> {
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), resources);
+    super::detect_anonymous_to_named_moves_to_fixed_point(
+        ctx,
+        &comparison_provider,
+        resources,
+        providers,
+        state_file,
+        initial_moved_pairs,
+        claims,
+    )
+}
+
 #[test]
 fn saved_plan_validation_ready_constructor_is_unit_typed() {
     let ready: ValidationReady<()> = ValidationReady::from_saved_plan_artifact();
@@ -41,6 +130,12 @@ fn missing_identifier_plan_error(identity: &str) -> carina_core::plan::PlanError
     )
 }
 
+fn render_plan_error(error: &carina_core::plan::PlanError) -> String {
+    error
+        .display_with_project_dir(std::path::Path::new("."))
+        .to_string()
+}
+
 #[test]
 fn non_empty_plan_errors_reject_empty_and_preserve_order() {
     assert!(NonEmptyPlanErrors::try_from(Vec::new()).is_err());
@@ -53,12 +148,33 @@ fn non_empty_plan_errors_reject_empty_and_preserve_order() {
     assert_eq!(errors.as_slice(), &[first, second]);
 }
 
+#[test]
+fn successful_validation_report_returns_the_resolved_file_as_a_result() {
+    let providers = ProviderLoad::for_test(Vec::new(), &[]);
+    let parsed = carina_core::parser::InferredFile::default();
+    let report = providers.validation_report(&parsed, Path::new("."), true, &[]);
+
+    let resolved = report
+        .into_result()
+        .unwrap_or_else(|errors| panic!("empty configuration must validate: {errors:?}"));
+    assert!(resolved.resources.is_empty());
+}
+
+#[test]
+fn validation_failure_type_rejects_an_empty_error_vector() {
+    assert!(NonEmptyValidationErrors::try_from(Vec::new()).is_err());
+}
+
 #[tokio::test]
 async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let context = WiringContext::new_for_test(Vec::new(), &[]);
     let expanded_resources = ExpandedCanonicalResources {
         resources: canonical_unresolved(Vec::new(), context.schemas()),
     };
+    let residual_deferred_for = expanded_resources
+        .parsed()
+        .deferred_for_expressions()
+        .empty_like();
     let expansion = PostExpansionPlanView {
         data: PostExpansionPlanData {
             expanded_resources,
@@ -72,7 +188,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
             },
             data_source_values: DataSourceValues::empty(),
             wait_aliases: Vec::new(),
-            residual_deferred_for: Vec::new(),
+            residual_deferred_for,
             deferred_create_targets: Vec::new(),
         },
         children: AbsentChildrenSettled,
@@ -143,8 +259,12 @@ impl ProviderFactory for RawEnumStateFactory {
         &self,
         _binding: Option<&str>,
         _config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(RawEnumStateProvider) as Box<dyn Provider>) })
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(RawEnumStateProvider)))
+        })
     }
 
     fn create_normalizer(
@@ -160,17 +280,59 @@ impl ProviderFactory for RawEnumStateFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let mode = AttributeType::enum_(
             carina_core::schema::enum_identity("Mode", Some("test.thing")),
-            Some(vec!["Allow".to_string()]),
-            vec![("Allow".to_string(), "allow".to_string())],
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+            None,
+            None,
+        );
+        let collection_mode = AttributeType::enum_(
+            carina_core::schema::enum_identity("Mode", Some("test.collection.Identity")),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
             None,
             None,
         );
         vec![
             ResourceSchema::new("thing")
-                .attribute(AttributeSchema::required("mode", mode).build())
+                .attribute(
+                    AttributeSchema::required("mode", mode)
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("priority", AttributeType::int())
+                        .create_only()
+                        .build(),
+                )
                 .validate()
                 .expect("raw enum test schema is valid"),
+            ResourceSchema::new("collection.Identity")
+                .attribute(
+                    AttributeSchema::optional(
+                        "modes",
+                        AttributeType::unordered_list(collection_mode),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .expect("collection enum test schema is valid"),
         ]
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .expect("raw enum test provider schema must be valid")
     }
 }
 
@@ -328,6 +490,527 @@ let item = test.thing {
     }
 }
 
+#[tokio::test]
+async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const ANONYMOUS_NAME: &str = "test_thing_22222222";
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(
+        project.path().join("resource.crn"),
+        r#"let typed = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#,
+    )
+    .expect("write typed resource fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = resolve_file_for_test(loaded.parsed);
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        vec![Box::new(RawEnumStateFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let canonical_resources = canonical_pair_from_resolved(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    let mut row = carina_state::state::ResourceState::try_applied(
+        "thing",
+        ANONYMOUS_NAME,
+        "test",
+        "provider-id",
+    )
+    .expect("typed state identifier is non-empty")
+    .with_attribute("mode", serde_json::json!("Allow"))
+    .with_attribute("priority", serde_json::json!(7));
+    row.binding = None;
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(row)
+        .expect("typed anonymous state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build enum/int rename plan");
+    let effects = planned.resources().plan.effects();
+
+    assert_eq!(effects.len(), 1, "expected a pure move plan: {effects:#?}");
+    let Effect::Move { from, to, .. } = &effects[0] else {
+        panic!("expected enum/int anonymous rename to be a move: {effects:#?}")
+    };
+    assert_eq!(from.identity_str(), ANONYMOUS_NAME);
+    assert_eq!(to.identity_str(), "typed");
+}
+
+#[tokio::test]
+async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_state() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const ANONYMOUS_NAME: &str = "test_collection_identity_22222222";
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(
+        project.path().join("resource.crn"),
+        r#"let typed = test.collection.Identity {
+  modes = [
+    test.collection.Identity.Mode.allow,
+    test.collection.Identity.Mode.deny,
+  ]
+}
+"#,
+    )
+    .expect("write unordered enum resource fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = resolve_file_for_test(loaded.parsed);
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        vec![Box::new(RawEnumStateFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    let mut row = carina_state::state::ResourceState::try_applied(
+        "collection.Identity",
+        ANONYMOUS_NAME,
+        "test",
+        "provider-id",
+    )
+    .expect("collection state identifier is non-empty")
+    .with_attribute("modes", serde_json::json!(["Deny", "Allow"]));
+    row.binding = None;
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(row)
+        .expect("unordered anonymous state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build unordered enum rename plan");
+    let effects = planned.resources().plan.effects();
+
+    assert_eq!(effects.len(), 1, "expected a pure move plan: {effects:#?}");
+    let Effect::Move { from, to, .. } = &effects[0] else {
+        panic!("expected unordered enum anonymous rename to be a move: {effects:#?}")
+    };
+    assert_eq!(from.identity_str(), ANONYMOUS_NAME);
+    assert_eq!(to.identity_str(), "typed");
+}
+
+#[test]
+fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projection() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const STATE_ORIGIN: &str = "legacy_thing";
+    const PROJECTED_HASH: &str = "test_thing_22222222";
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(
+        project.path().join("moves.crn"),
+        format!(
+            r#"moved {{
+  from = test.thing '{STATE_ORIGIN}'
+  to   = test.thing '{PROJECTED_HASH}'
+}}
+"#,
+        ),
+    )
+    .expect("write explicit move fixture");
+    std::fs::write(
+        project.path().join("resource.crn"),
+        r#"let typed = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#,
+    )
+    .expect("write named resource fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution");
+    assert_eq!(parsed.state_blocks.len(), 1, "fixture must parse one move");
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        vec![Box::new(RawEnumStateFactory)],
+        provider_configs.as_provider_configs(),
+    );
+
+    let mut row = carina_state::state::ResourceState::try_applied(
+        "thing",
+        STATE_ORIGIN,
+        "test",
+        "provider-id",
+    )
+    .expect("typed state identifier is non-empty")
+    .with_attribute("mode", serde_json::json!("Allow"))
+    .with_attribute("priority", serde_json::json!(7));
+    row.binding = None;
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(row)
+        .expect("typed state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = carina_state::state::check_and_migrate(
+        &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+    )
+    .expect("decode real state fixture")
+    .into_state();
+    let state_origin =
+        ResolvedResourceId::with_provider_identity("test", "thing", STATE_ORIGIN, None);
+    let projected_hash =
+        ResolvedResourceId::with_provider_identity("test", "thing", PROJECTED_HASH, None);
+
+    let detected = detect_anonymous_to_named_moves_to_fixed_point(
+        wiring.context(),
+        &parsed.resources,
+        provider_configs.as_provider_configs(),
+        &state_file,
+        &[(state_origin.clone(), projected_hash)],
+        &StateBlockClaims::empty(),
+    )
+    .expect("projected anonymous-to-named detection must converge");
+
+    assert_eq!(detected.len(), 1, "expected one final rename: {detected:?}");
+    assert_eq!(detected[0].from(), &state_origin);
+    assert_eq!(detected[0].to().identity_str(), "typed");
+}
+
+#[tokio::test]
+async fn anonymous_to_named_two_destinations_for_one_orphan_are_ambiguous() {
+    use carina_core::config_loader::load_configuration_with_config;
+
+    const ANONYMOUS_NAME: &str = "test_thing_33333333";
+    let first_then_second = r#"let first = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+
+let second = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#;
+    let second_then_first = r#"let second = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+
+let first = test.thing {
+  mode = test.thing.Mode.allow
+  priority = 7
+}
+"#;
+
+    for resources in [first_then_second, second_then_first] {
+        let project = tempfile::tempdir().expect("create temporary project");
+        std::fs::write(project.path().join("providers.crn"), "provider test {}\n")
+            .expect("write provider fixture");
+        std::fs::write(
+            project.path().join("main.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
+        )
+        .expect("write backend fixture");
+        std::fs::write(project.path().join("resources.crn"), resources)
+            .expect("write competing resources fixture");
+
+        let loaded = load_configuration_with_config(
+            project.path(),
+            &carina_core::parser::ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load multi-file fixture");
+        let parsed = resolve_file_for_test(loaded.parsed);
+        let provider_configs = resolved_provider_configs(&parsed);
+        let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+            vec![Box::new(RawEnumStateFactory)],
+            provider_configs.as_provider_configs(),
+        );
+        let canonical_resources = canonical_pair(
+            &parsed,
+            parsed.resources.clone(), // allow: direct — plan-time reconciliation
+            wiring.context().schemas(),
+        );
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+        let mut row = carina_state::state::ResourceState::try_applied(
+            "thing",
+            ANONYMOUS_NAME,
+            "test",
+            "provider-id",
+        )
+        .expect("typed state identifier is non-empty")
+        .with_attribute("mode", serde_json::json!("Allow"))
+        .with_attribute("priority", serde_json::json!(7));
+        row.binding = None;
+        let mut persisted = StateFile::new();
+        persisted
+            .upsert_resource(row)
+            .expect("anonymous state row is unique");
+        let state_path = project.path().join("carina.state.json");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+        )
+        .expect("write real state fixture");
+        let state_file = Some(
+            carina_state::state::check_and_migrate(
+                &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+            )
+            .expect("decode real state fixture")
+            .into_state(),
+        );
+
+        let planned = create_plan_from_parsed_with_upstream_with_ctx(
+            validated,
+            &provider_configs,
+            &state_file,
+            false,
+            ProgressSink::Human,
+            &HashMap::new(),
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+        )
+        .await
+        .expect("a contested orphan must fall back to delete and create");
+
+        assert!(
+            planned
+                .resources()
+                .plan
+                .effects()
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Move { .. })),
+            "neither resource may claim the contested row: {:#?}",
+            planned.resources().plan.effects(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn anonymous_to_named_cross_pass_contest_withdraws_all_moves_in_both_orders() {
+    use carina_core::config_loader::load_configuration_with_config;
+    use std::hash::{Hash, Hasher};
+
+    const MATCHING_ORPHAN: &str = "awscc_ec2_route_11111111";
+    let simhash_only_orphan = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "route_table_id=ResourceRef(direct.id)".hash(&mut hasher);
+        format!("awscc_ec2_route_{:016x}", hasher.finish())
+    };
+    let direct_then_deferred = r#"let direct = awscc.ec2.Route {
+  route_table_id = "rtb-private"
+}
+
+let deferred = awscc.ec2.Route {
+  route_table_id = direct.id
+}
+"#;
+    let deferred_then_direct = r#"let deferred = awscc.ec2.Route {
+  route_table_id = direct.id
+}
+
+let direct = awscc.ec2.Route {
+  route_table_id = "rtb-private"
+}
+"#;
+
+    for resources in [direct_then_deferred, deferred_then_direct] {
+        let project = tempfile::tempdir().expect("create temporary project");
+        std::fs::write(project.path().join("providers.crn"), "provider awscc {}\n")
+            .expect("write provider fixture");
+        std::fs::write(
+            project.path().join("main.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
+        )
+        .expect("write backend fixture");
+        std::fs::write(project.path().join("resources.crn"), resources)
+            .expect("write competing resources fixture");
+
+        let loaded = load_configuration_with_config(
+            project.path(),
+            &carina_core::parser::ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load multi-file fixture");
+        let parsed = resolve_file_for_test(loaded.parsed);
+        let provider_configs = resolved_provider_configs(&parsed);
+        let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+            vec![Box::new(AssociationCreateOnlyFactory)],
+            provider_configs.as_provider_configs(),
+        );
+        let canonical_resources = canonical_pair(
+            &parsed,
+            parsed.resources.clone(), // allow: direct — plan-time reconciliation
+            wiring.context().schemas(),
+        );
+        let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+        let mut matching = carina_state::state::ResourceState::try_applied(
+            "ec2.Route",
+            MATCHING_ORPHAN,
+            "awscc",
+            "matching-provider-id",
+        )
+        .expect("matching state identifier is non-empty")
+        .with_attribute("route_table_id", serde_json::json!("rtb-private"))
+        .with_attribute("id", serde_json::json!("rtb-private"));
+        matching.binding = None;
+        let mut simhash_only = carina_state::state::ResourceState::try_applied(
+            "ec2.Route",
+            test_identity(simhash_only_orphan.clone()),
+            "awscc",
+            "simhash-provider-id",
+        )
+        .expect("fallback state identifier is non-empty")
+        .with_attribute("legacy_marker", serde_json::json!(true));
+        simhash_only.binding = None;
+        let mut persisted = StateFile::new();
+        persisted
+            .upsert_resource(matching)
+            .expect("matching anonymous row is unique");
+        persisted
+            .upsert_resource(simhash_only)
+            .expect("fallback anonymous row is unique");
+        let state_path = project.path().join("carina.state.json");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+        )
+        .expect("write real state fixture");
+        let state_file = Some(
+            carina_state::state::check_and_migrate(
+                &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+            )
+            .expect("decode real state fixture")
+            .into_state(),
+        );
+
+        let planned = create_plan_from_parsed_with_upstream_with_ctx(
+            validated,
+            &provider_configs,
+            &state_file,
+            false,
+            ProgressSink::Human,
+            &HashMap::new(),
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+        )
+        .await
+        .expect("a cross-pass contest must fall back to delete and create");
+        let effects = planned.resources().plan.effects();
+
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Move { .. })),
+            "neither named resource may move a row after the later contest: {effects:#?}",
+        );
+    }
+}
+
 #[test]
 fn data_source_reads_select_only_the_owning_identical_anonymous_call() {
     let tmp = tempfile::tempdir().expect("temporary project");
@@ -363,7 +1046,7 @@ query {}
     let config = carina_core::parser::ProviderContext::default();
     let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    let parsed = carina_core::module_resolver::resolve_modules_with_config(
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         parsed,
         &root_dir,
         &config,
@@ -452,7 +1135,7 @@ outer {{}}
     let config = carina_core::parser::ProviderContext::default();
     let parsed = carina_core::parser::parse_file(&root_body, &root_file, &config)
         .expect("root fixture must parse");
-    let parsed = carina_core::module_resolver::resolve_modules_with_config(
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         parsed,
         &root_dir,
         &config,
@@ -517,7 +1200,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         parsed.providers = provider_configs();
         parsed.arguments = vec![carina_core::parser::ArgumentParameter {
             name: "unrelated".to_string(),
-            type_expr: carina_core::parser::TypeExpr::String,
+            static_type: carina_core::parser::TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
@@ -530,7 +1213,6 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         Path::new("."),
         true,
         &[],
-        &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
@@ -541,7 +1223,6 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         Path::new("."),
         true,
-        &[],
         &[],
     ) {
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
@@ -574,7 +1255,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     parsed.providers = vec![provider];
     parsed.arguments = vec![carina_core::parser::ArgumentParameter {
         name: "unrelated".to_string(),
-        type_expr: carina_core::parser::TypeExpr::String,
+        static_type: carina_core::parser::TypeExpr::String,
         default: None,
         description: None,
         validations: Vec::new(),
@@ -583,15 +1264,170 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let error =
-        match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[], &[]) {
-            Ok(_) => panic!("plan-style validation must reject both independent errors"),
-            Err(error) => error,
-        };
+    let error = match providers.validate_config_pair(parsed, unresolved, Path::new("."), false, &[])
+    {
+        Ok(_) => panic!("plan-style validation must reject both independent errors"),
+        Err(error) => error,
+    };
     let message = error.to_string();
 
     assert!(message.contains("broken provider failed"), "{message}");
     assert!(message.contains("arguments blocks"), "{message}");
+}
+
+#[test]
+fn plan_style_config_pair_rejects_undefined_deferred_for_iterable() {
+    let project = tempfile::tempdir().expect("undefined iterable plan fixture");
+    let child = project.path().join("child");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::write(
+        child.join("main.crn"),
+        "arguments { item: String }\nattributes { value = item }\n",
+    )
+    .expect("write child module");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let child = use { source = './child' }\n\
+         let items = ['one']\n\
+         let mods = for n in itmes { child { item = n } }\n",
+    )
+    .expect("write root configuration");
+
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load plan fixture");
+    let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+    let error = match providers.validate_config_pair(
+        loaded.parsed,
+        loaded.unresolved_parsed,
+        project.path(),
+        false,
+        &loaded.duplicate_declarations,
+    ) {
+        Ok(_) => panic!("plan-style validation must reject the undefined loop iterable"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(
+        message.contains("Undefined identifier `itmes`"),
+        "{message}"
+    );
+    assert!(message.contains("Did you mean `items`"), "{message}");
+    assert!(message.contains("main.crn"), "{message}");
+}
+
+#[test]
+fn plan_style_config_pair_rejects_module_internal_undefined_deferred_for_iterable() {
+    let project = tempfile::tempdir().expect("module undefined iterable plan fixture");
+    let parent = project.path().join("parent");
+    std::fs::create_dir(&parent).expect("create parent module");
+    std::fs::write(
+        parent.join("main.crn"),
+        "let items = ['one']\n\
+         let resources = for item in itmes {\n\
+           mock.test.resource { name = item }\n\
+         }\n\
+         attributes { value = 'parent' }\n",
+    )
+    .expect("write parent module");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let parent = use { source = './parent' }\nparent {}\n",
+    )
+    .expect("write root configuration");
+
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load plan fixture");
+    let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+    let error = match providers.validate_config_pair(
+        loaded.parsed,
+        loaded.unresolved_parsed,
+        project.path(),
+        false,
+        &loaded.duplicate_declarations,
+    ) {
+        Ok(_) => panic!("plan-style validation must reject the module-internal typo"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(
+        message.contains("Undefined identifier `itmes`"),
+        "{message}"
+    );
+    assert!(message.contains("parent/main.crn"), "{message}");
+    assert!(
+        message.contains("module call in main.crn at line 2"),
+        "{message}"
+    );
+}
+
+#[test]
+fn plan_style_config_pair_reports_every_undefined_deferred_for_iterable() {
+    let project = tempfile::tempdir().expect("multiple undefined iterable plan fixture");
+    let child = project.path().join("child");
+    let parent = project.path().join("parent");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::create_dir(&parent).expect("create parent module");
+    std::fs::write(
+        child.join("main.crn"),
+        "let first_resources = for item in frist_items {\n\
+           mock.test.resource { name = item }\n\
+         }\n\
+         let second_resources = for item in secnd_items {\n\
+           mock.test.resource { name = item }\n\
+         }\n\
+         attributes { value = 'child' }\n",
+    )
+    .expect("write child module");
+    std::fs::write(
+        parent.join("main.crn"),
+        "let child = use { source = '../child' }\n\
+         child {}\n\
+         attributes { value = 'parent' }\n",
+    )
+    .expect("write parent module");
+    std::fs::write(
+        project.path().join("main.crn"),
+        "let parent = use { source = './parent' }\nparent {}\n",
+    )
+    .expect("write root configuration");
+
+    let loaded = carina_core::config_loader::load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load plan fixture");
+    let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+    let error = match providers.validate_config_pair(
+        loaded.parsed,
+        loaded.unresolved_parsed,
+        project.path(),
+        false,
+        &loaded.duplicate_declarations,
+    ) {
+        Ok(_) => panic!("plan-style validation must reject both undefined loop iterables"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(
+        message.contains("Undefined identifier `frist_items`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Undefined identifier `secnd_items`"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -617,8 +1453,8 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
         "fixture must exercise the hard loader failure"
     );
 
-    let mut parsed = carina_core::parser::InferredFile::default();
-    let report = providers.validation_report(&mut parsed, base.path(), true, &[], &[]);
+    let parsed = carina_core::parser::InferredFile::default();
+    let report = providers.validation_report(&parsed, base.path(), true, &[]);
 
     assert!(report.errors().is_empty());
     assert!(report.schemas().iter().next().is_none());
@@ -826,9 +1662,13 @@ fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
 fn parse(
     input: &str,
     config: &carina_core::parser::ProviderContext,
-) -> Result<carina_core::parser::ExpandedParsedFile, carina_core::parser::ParseError> {
-    carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
-        .map(|parsed| parsed.resolve_root_for_test())
+) -> Result<carina_core::parser::ModuleResolvedParsedFile, Box<dyn std::error::Error>> {
+    let parsed =
+        carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)?;
+    Ok(carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )?)
 }
 
 fn pathless_test_type(attr_type: AttributeType) -> carina_core::schema::RootlessType {
@@ -878,13 +1718,25 @@ fn test_data_source_values(
     })
 }
 
+fn resolve_file_for_test<E: carina_core::parser::ResolveExportBindingPhase>(
+    parsed: carina_core::parser::File<E>,
+) -> carina_core::parser::ModuleResolvedFile<E::Absolute> {
+    carina_core::module_resolver::resolve_modules_with_providerless_config(
+        parsed,
+        std::path::Path::new("."),
+        &carina_core::parser::ProviderContext::default(),
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution")
+}
+
 fn canonical_unresolved(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam> {
-    let mut unresolved = carina_core::parser::ExpandedParsedFile::default();
-    unresolved.resources = resources;
-    resolve_expanded_config_block_names_for_test(unresolved.clone(), unresolved, schemas)
+    let mut parsed = carina_core::parser::ModuleResolvedParsedFile::default();
+    parsed.resources = resources;
+    resolve_expanded_config_block_names_for_test(parsed.clone(), parsed, schemas)
         .expect("test block-name resolution must succeed")
 }
 
@@ -900,7 +1752,7 @@ fn test_artifact_id(value: u64) -> carina_provider_resolver::ArtifactId {
 }
 
 fn canonical_pair<E: Clone>(
-    evaluated: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
+    evaluated: &carina_core::parser::ModuleResolvedFile<E>,
     unresolved_resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<E> {
@@ -908,6 +1760,14 @@ fn canonical_pair<E: Clone>(
     unresolved.resources = unresolved_resources;
     resolve_expanded_config_block_names_for_test(evaluated.clone(), unresolved, schemas)
         .expect("test block-name resolution must succeed")
+}
+
+fn canonical_pair_from_resolved<E: Clone>(
+    evaluated: &carina_core::parser::ModuleResolvedFile<E>,
+    unresolved_resources: Vec<Resource>,
+    schemas: &SchemaRegistry,
+) -> CanonicalResourcePair<E> {
+    canonical_pair(evaluated, unresolved_resources, schemas)
 }
 
 fn build_override_aware_pair_for_test(
@@ -925,8 +1785,11 @@ fn build_override_aware_pair_for_test(
     )
 }
 
-fn resolved_provider_configs<E>(
-    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
+fn resolved_provider_configs<
+    E,
+    D: carina_core::parser::DeferredForPhaseTraversal<carina_core::resource::AbsoluteBindingAddress>,
+>(
+    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress, D>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
     resolved_provider_configs_with_remote(parsed, &HashMap::new())
 }
@@ -1084,8 +1947,18 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             &self,
             _binding: Option<&str>,
             _config: &ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             unreachable!("plan canonicalization test does not create providers")
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1411,8 +2284,11 @@ async fn unverified_official_factory_load_case() {
     );
 }
 
-fn resolved_provider_configs_with_remote<E>(
-    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
+fn resolved_provider_configs_with_remote<
+    E,
+    D: carina_core::parser::DeferredForPhaseTraversal<carina_core::resource::AbsoluteBindingAddress>,
+>(
+    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress, D>,
     remote: &HashMap<String, HashMap<String, Value>>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
     carina_core::parser::resolve_provider_attributes_with_remote(
@@ -1428,12 +2304,12 @@ fn validated_provider_configs(
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let mut parsed = carina_core::parser::InferredFile::default();
     parsed.providers = configs;
-    resolved_provider_configs(&parsed.resolve_root_for_test())
+    resolved_provider_configs(&resolve_file_for_test(parsed))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
-    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     provider_configs: &carina_core::parser::ResolvedProviderConfigs,
     unresolved_resources: &[Resource],
     state_file: &Option<StateFile>,
@@ -1441,14 +2317,16 @@ async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
+    fixture_factories: Vec<Box<dyn ProviderFactory>>,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     let user_dirs = carina_core::TestUserDirs::new();
-    let (factories, _) = build_factories_from_providers(
+    let (mut factories, _) = build_factories_from_providers(
         &user_dirs,
         provider_configs.as_provider_configs(),
         base_dir,
     )?;
+    factories.extend(LoadedProviderFactory::for_test(fixture_factories));
     let wiring = ValidatedWiring::for_test_with_provider_phase(
         factories,
         provider_configs.as_provider_configs(),
@@ -1490,7 +2368,7 @@ fn create_plan(
     >],
 ) -> Plan {
     let managed = ResolvedResource::collect_resolved(managed.iter().cloned()).unwrap();
-    carina_core::differ::create_plan(
+    carina_core::differ::create_plan_for_test(
         &managed,
         data_sources,
         provider,
@@ -1715,6 +2593,9 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         Current::CreateInFlight(pending) => {
             panic!("test orphan unexpectedly has an in-flight create: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
+        }
     };
     let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
         present,
@@ -1877,6 +2758,9 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         Current::CreateInFlight(pending) => {
             panic!("orphan unexpectedly remained in flight: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("orphan unexpectedly became outcome unknown: {unknown:?}")
+        }
     };
     assert_eq!(state.partial_read, None);
 
@@ -1904,6 +2788,9 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         Current::MissingIdentifier(state) => state.state(),
         Current::CreateInFlight(pending) => {
             panic!("orphan unexpectedly remained in flight: {pending:?}")
+        }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("orphan unexpectedly became outcome unknown: {unknown:?}")
         }
     };
     assert_eq!(state.partial_read, Some(marker));
@@ -1954,8 +2841,12 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-            Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+            Box::pin(async {
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(MockProvider::new())))
+            })
         }
 
         fn create_normalizer(
@@ -1964,6 +2855,15 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2061,16 +2961,27 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async move {
                 if self.lines.is_empty() {
-                    Ok(Box::new(MockProvider::new()) as Box<dyn Provider>)
+                    Ok(carina_core::provider::InitializeOutcome::unavailable()
+                        .with_provider(Box::new(MockProvider::new())))
                 } else {
                     Err(ProviderError::internal(
                         "provider progress was emitted before initialization",
                     ))
                 }
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2137,7 +3048,8 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
                 Err(
                     carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
@@ -2145,6 +3057,15 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
                     ),
                 )
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2230,9 +3151,22 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         self.creates.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
+        })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2311,7 +3245,7 @@ fn resolved_invalid_provider_config() -> (
             Value::Concrete(ConcreteValue::String("not-an-arn".into())),
         )]),
     )]);
-    let parsed = parsed.resolve_root_for_test();
+    let parsed = resolve_file_for_test(parsed);
     let configs = resolved_provider_configs_with_remote(&parsed, &remote);
     (parsed, configs)
 }
@@ -2408,8 +3342,21 @@ impl ProviderFactory for CascadeAwsccFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        Box::pin(async { Ok(Box::new(CascadeCreateProvider::default()) as Box<dyn Provider>) })
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(CascadeCreateProvider::default())))
+        })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2737,9 +3684,11 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(Box::new(ReadWithRetryProvider::new(ReadBehavior::Success)) as Box<dyn Provider>)
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(ReadWithRetryProvider::new(ReadBehavior::Success))))
         })
     }
 
@@ -2751,6 +3700,15 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         Box::pin(async {
             Ok(Box::new(SavedAttrsHydratingNormalizer) as Box<dyn ProviderNormalizer>)
         })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -2859,6 +3817,9 @@ let shared = read test.shared.Type {}
         Current::CreateInFlight(pending) => {
             panic!("managed orphan unexpectedly has an in-flight create: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("managed orphan unexpectedly has an unknown create outcome: {unknown:?}")
+        }
     };
     assert_eq!(
         orphan_state.attributes.get("managed_saved"),
@@ -2917,6 +3878,49 @@ async fn read_with_retry_does_not_retry_not_found() {
     assert_eq!(state.id, id);
     assert_eq!(state.identifier, None);
     assert_eq!(provider.read_calls(), 1);
+}
+
+#[tokio::test]
+async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provider_read() {
+    let provider = ReadWithRetryProvider::new(ReadBehavior::Success);
+    let id = ResourceId::with_provider_identity("test", "test.Resource", "unknown", None);
+    let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
+        carina_core::provider::EgressSent::for_test(),
+        ProviderError::api_error("guest trapped"),
+    );
+    let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
+        failure.into_kind()
+    else {
+        panic!("the egress witness must mint an unknown outcome")
+    };
+
+    let refreshed = refresh_loaded_resource_with_retry(
+        &provider,
+        Current::create_outcome_unknown(unknown.clone()),
+        None,
+        &SchemaRegistry::new(),
+    )
+    .await
+    .expect("an outcome-unknown managed row must be carried without a read");
+    let Current::CreateOutcomeUnknown(refreshed_unknown) = refreshed else {
+        panic!("managed refresh changed the outcome-unknown lifecycle")
+    };
+    assert_eq!(refreshed_unknown, unknown);
+
+    let orphan = Orphan::create_outcome_unknown(
+        unknown.clone(),
+        Some(absolute_binding("unknown")),
+        Directives::default(),
+    );
+    let refreshed_orphan =
+        refresh_loaded_orphan_with_retry(&provider, orphan, None, &SchemaRegistry::new())
+            .await
+            .expect("an outcome-unknown orphan must be carried without a read");
+    assert!(matches!(
+        refreshed_orphan.current(),
+        Current::CreateOutcomeUnknown(refreshed_unknown) if refreshed_unknown == &unknown
+    ));
+    assert_eq!(provider.read_calls(), 0);
 }
 
 use carina_core::parser::ParsedFile;
@@ -3057,8 +4061,18 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async { unreachable!("state normalization does not create providers") })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -3169,8 +4183,18 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             unreachable!("config selection test does not construct a provider")
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -3501,6 +4525,9 @@ fn same_type_moved_block_parses_and_materializes_state() {
         Current::CreateInFlight(pending) => {
             panic!("moved test state unexpectedly remained in flight: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("moved test state unexpectedly became outcome unknown: {unknown:?}")
+        }
     };
     assert_eq!(moved.id, to);
     assert_eq!(moved.identifier.as_deref(), Some("bucket-123"));
@@ -3535,8 +4562,15 @@ fn moved_in_flight_rebinds_resume_to_destination() {
     ));
     let pending =
         crate::fixture_in_flight_create(&from, "opaque-token", None, Sent::AllRequestAttributes);
-    let row = ResourceState::from_in_flight(&old_resource, &pending, None, None, None)
-        .expect("in-flight fixture must encode");
+    let row = ResourceState::from_in_flight(
+        &old_resource,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(row)
@@ -3861,8 +4895,15 @@ fn removed_suppresses_in_flight_orphan_error_and_keeps_deposed() {
         None,
         Sent::AllRequestAttributes,
     );
-    let mut row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
-        .expect("in-flight fixture must encode");
+    let mut row = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let deposed_key = DeposedKey::new_unique();
     row.deposed.push(DeposedInstance::from_persisted_json(
         deposed_key.clone(),
@@ -3959,7 +5000,7 @@ fn deposed_delete_without_provider_identifier_becomes_plan_error() {
             current_identifier: None,
         }
     );
-    let message = plan.errors()[0].to_string();
+    let message = render_plan_error(&plan.errors()[0]);
     assert!(message.contains("mock.example.Widget.broken"), "{message}");
     assert!(message.contains("`removed` block"), "{message}");
     assert!(!message.contains("`import` block"), "{message}");
@@ -3989,7 +5030,7 @@ fn malformed_deposed_generation_with_healthy_current_instance_recommends_reimpor
 
     add_deposed_delete_effects(&mut plan, &Some(state_file), &[]);
 
-    let message = plan.errors()[0].to_string();
+    let message = render_plan_error(&plan.errors()[0]);
     assert!(message.contains("`removed` block"), "{message}");
     assert!(message.contains("`import` block"), "{message}");
     assert!(message.contains("current-id"), "{message}");
@@ -4091,8 +5132,15 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
     ));
     let pending =
         crate::fixture_in_flight_create(&resource.id, "opaque", None, Sent::AllRequestAttributes);
-    let mut row = ResourceState::from_in_flight(&resource, &pending, None, None, None)
-        .expect("in-flight fixture must encode");
+    let mut row = ResourceState::from_in_flight(
+        &resource,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let key = DeposedKey::new_unique();
     row.deposed.push(DeposedInstance::from_persisted_json(
         key.clone(),
@@ -4195,6 +5243,178 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
 }
 
 #[test]
+fn import_replaces_only_a_create_outcome_unknown_row() {
+    use carina_core::effect::Effect;
+    use carina_core::plan::{Plan, PlanError};
+
+    let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
+    let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
+    let state = carina_state::check_and_migrate(
+        &serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 1,
+            "lineage": "import-unknown",
+            "carina_version": "test",
+            "resources": [{
+                "resource_type": "test.Resource",
+                "identity": "unknown",
+                "provider": "mock",
+                "current": {
+                    "kind": "create_outcome_unknown",
+                    "started_at": "2026-10-23T08:00:00Z"
+                }
+            }],
+            "exports": {}
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .into_state();
+    let state_file = Some(state);
+    let state_blocks = vec![StateBlock::Import {
+        to: address.clone(),
+        to_span: None,
+        id: Value::Concrete(ConcreteValue::String("provider-id".to_string().into())),
+    }];
+
+    let resolution = resolve_state_blocks(
+        &state_blocks,
+        &state_file,
+        std::slice::from_ref(&resource),
+        &SchemaRegistry::new(),
+    );
+    assert!(resolution.claims.claims_to(&resource.id));
+    let replacements = outcome_unknown_import_replacements(
+        &state_blocks,
+        &state_file,
+        std::slice::from_ref(&resource),
+    );
+    assert_eq!(replacements.len(), 1);
+    assert_eq!(
+        replacements.iter().next().unwrap().resource_id(),
+        &resource.id
+    );
+
+    let mut plan = Plan::new();
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &state_file,
+        &[],
+        std::slice::from_ref(&resource),
+        &bindings,
+        &no_upstreams,
+    );
+
+    assert!(matches!(plan.effects(), [Effect::Import { .. }]));
+    assert!(plan.errors().is_empty());
+
+    let removed_blocks = vec![StateBlock::Removed { from: address }];
+    let mut removed_plan = Plan::new();
+    removed_plan.add_error(PlanError::create_outcome_unknown(resource.id.clone()));
+    add_state_block_effects(
+        &mut removed_plan,
+        &removed_blocks,
+        &state_file,
+        &[],
+        std::slice::from_ref(&resource),
+        &bindings,
+        &no_upstreams,
+    );
+    assert!(matches!(removed_plan.effects(), [Effect::Remove { .. }]));
+    assert!(matches!(
+        removed_plan.errors(),
+        [PlanError {
+            kind: carina_core::plan::PlanErrorKind::CreateOutcomeUnknown { .. },
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
+    use carina_core::effect::Effect;
+    use carina_core::plan::{Plan, PlanError, PlanErrorKind};
+
+    let imported = Resource::with_provider(
+        "mock",
+        "test.Resource",
+        "shared",
+        Some("imported".to_string()),
+    );
+    let unknown_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.Resource",
+        "shared",
+        Some("unknown".to_string()),
+    );
+    let state = carina_state::check_and_migrate(
+        &serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 1,
+            "lineage": "import-other-instance",
+            "carina_version": "test",
+            "resources": [{
+                "resource_type": "test.Resource",
+                "identity": "shared",
+                "provider": "mock",
+                "current": {
+                    "kind": "create_outcome_unknown",
+                    "started_at": "2026-10-23T08:00:00Z"
+                },
+                "directives": { "provider_instance": "unknown" }
+            }],
+            "exports": {}
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .into_state();
+    let state_file = Some(state);
+    let state_blocks = vec![StateBlock::Import {
+        to: StateBlockAddress::new("mock", "test.Resource", "shared"),
+        to_span: None,
+        id: Value::Concrete(ConcreteValue::String("provider-id".to_string().into())),
+    }];
+
+    assert!(
+        outcome_unknown_import_replacements(
+            &state_blocks,
+            &state_file,
+            std::slice::from_ref(&imported),
+        )
+        .is_empty(),
+        "the import target is vacant on its selected provider instance",
+    );
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resolved(imported.clone())));
+    plan.add_error(PlanError::create_outcome_unknown(unknown_id.clone()));
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &state_file,
+        &[],
+        std::slice::from_ref(&imported),
+        &carina_core::binding_index::ResolvedBindings::default(),
+        &std::collections::HashSet::new(),
+    );
+
+    assert!(matches!(plan.effects(), [Effect::Import { id, .. }] if id.as_inner() == &imported.id));
+    assert!(matches!(
+        plan.errors(),
+        [PlanError {
+            resource_id,
+            kind: PlanErrorKind::CreateOutcomeUnknown { resource },
+        }] if resource_id == &unknown_id && resource == &unknown_id
+    ));
+}
+
+#[test]
 fn test_materialize_moved_states_warns_on_missing_from() {
     use carina_state::state::{ResourceState, StateFile};
 
@@ -4252,7 +5472,8 @@ fn bucket_resource(name: &str) -> Resource {
 }
 
 fn resolved_desired_ids(resources: &[Resource]) -> ResolvedDesiredIds {
-    ResolvedDesiredIds::from_resources(resources).expect("test desired identities must be resolved")
+    ResolvedDesiredIds::from_resources(resources, &SchemaRegistry::new())
+        .expect("test desired identities must be resolved")
 }
 
 fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
@@ -4311,7 +5532,6 @@ moved {
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let provider_configs = resolved_provider_configs(&parsed);
-
     let err = match create_plan_from_parsed_with_upstream_for_test(
         &parsed,
         &provider_configs,
@@ -4321,6 +5541,7 @@ moved {
         &HashMap::new(),
         &state_block_claims,
         &resolved_state_block_targets,
+        Vec::new(),
         tmp.path(),
     )
     .await
@@ -4347,6 +5568,8 @@ async fn test_plan_fails_on_removed_from_colliding_with_expanded_loop_child() {
     use carina_state::state::{ResourceState, StateFile};
 
     let source = r#"
+provider aws {}
+
 let cert = aws.acm.Certificate {
     domain_name       = "r.example.com"
     validation_method = "DNS"
@@ -4370,6 +5593,8 @@ removed {
         sf.upsert_resource(
             ResourceState::try_applied("acm.Certificate", "cert", "aws", "cert-arn")
                 .expect("fixture identifier is non-empty")
+                .with_attribute("domain_name", serde_json::json!("r.example.com"))
+                .with_attribute("validation_method", serde_json::json!("DNS"))
                 .with_attribute(
                     "domain_validation_options",
                     serde_json::json!([
@@ -4411,6 +5636,7 @@ removed {
         &HashMap::new(),
         &state_block_claims,
         &resolved_state_block_targets,
+        vec![Box::new(DeferredForCollisionFactory)],
         tmp.path(),
     )
     .await
@@ -4441,18 +5667,13 @@ fn detected_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)>
         .collect()
 }
 
-fn test_detected_bucket_move(from: &str, to: &str) -> ResolvedMove {
-    ResolvedMove::from_moved_block(
-        &MovedAddresses::new(
-            "awscc",
-            "s3.Bucket",
-            test_identity(from.to_string()),
-            test_identity(to.to_string()),
-        ),
-        bucket_id(from),
-        bucket_id(to),
+fn test_detected_bucket_move(origin: &str, projected_from: &str, to: &str) -> ResolvedMove {
+    AnonymousIdStateInfo::try_without_comparable_attributes(
+        bucket_id(origin),
+        Some(bucket_id(projected_from)),
     )
-    .expect("test move addresses must match their resolved ids")
+    .expect("test move source and projection have the same provider and resource type")
+    .move_to(bucket_id(to))
 }
 
 #[test]
@@ -4467,7 +5688,7 @@ fn resource_move_invariants_missing_detected_source_is_an_error() {
 
     let result = apply_detected_resource_moves(
         &mut addressed,
-        vec![test_detected_bucket_move("missing", "target")],
+        vec![test_detected_bucket_move("missing", "missing", "target")],
         None,
         MoveOverlapPolicy::ComposeForward,
     );
@@ -4574,7 +5795,11 @@ fn detected_move_accepts_deposed_only_source_that_is_present_in_state() {
 
     apply_detected_resource_moves(
         &mut addressed,
-        vec![test_detected_bucket_move("old_bucket", "new_bucket")],
+        vec![test_detected_bucket_move(
+            "old_bucket",
+            "old_bucket",
+            "new_bucket",
+        )],
         Some(&state_file),
         MoveOverlapPolicy::ComposeForward,
     )
@@ -4602,8 +5827,8 @@ fn resource_move_invariants_chained_moves_are_composed() {
     apply_detected_resource_moves(
         &mut addressed,
         vec![
-            test_detected_bucket_move("source", "intermediate"),
-            test_detected_bucket_move("intermediate", "target"),
+            test_detected_bucket_move("source", "source", "intermediate"),
+            test_detected_bucket_move("source", "intermediate", "target"),
         ],
         None,
         MoveOverlapPolicy::ComposeForward,
@@ -4639,6 +5864,7 @@ fn resource_move_invariants_detected_target_cannot_be_an_explicit_source() {
     };
 
     let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
+        "detected_source",
         "detected_source",
         "explicit_source",
     )]);
@@ -4694,6 +5920,7 @@ fn resource_move_invariants_detected_source_cannot_be_an_explicit_target() {
 
     let detected = DetectedAutomaticMoves::from_moves(vec![test_detected_bucket_move(
         "explicit_target",
+        "explicit_target",
         "detected_target",
     )]);
     let result = detected.apply_after_explicit(&mut addressed, None);
@@ -4748,7 +5975,11 @@ fn resource_move_invariants_late_move_can_extend_an_early_chain() {
 
     apply_detected_resource_moves(
         &mut addressed,
-        vec![test_detected_bucket_move("intermediate", "target")],
+        vec![test_detected_bucket_move(
+            "source",
+            "intermediate",
+            "target",
+        )],
         None,
         MoveOverlapPolicy::ComposeForward,
     )
@@ -4976,6 +6207,127 @@ fn test_plan_fails_on_rotation_shape() {
     );
 }
 
+struct DeferredForCollisionFactory;
+
+impl ProviderFactory for DeferredForCollisionFactory {
+    fn name(&self) -> &str {
+        "aws"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWS deferred-for collision test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> carina_core::provider::ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "us-east-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+    > {
+        Box::pin(async {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
+        })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
+    > {
+        Box::pin(async {
+            Ok(Box::new(carina_core::provider::NoopNormalizer)
+                as Box<dyn carina_core::provider::ProviderNormalizer>)
+        })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .expect("deferred-for collision schemas must be valid")
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let resource_record = AttributeType::struct_(
+            "ResourceRecord",
+            vec![
+                StructField::provider_populated("name", AttributeType::string()).build(),
+                StructField::provider_populated("value", AttributeType::string()).build(),
+            ],
+        );
+        let schemas = vec![
+            ResourceSchema::new("acm.Certificate")
+                .attribute(
+                    AttributeSchema::optional("domain_name", AttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional("validation_method", AttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::provider_populated(
+                        "domain_validation_options",
+                        AttributeType::list(AttributeType::struct_(
+                            "DomainValidation",
+                            vec![
+                                StructField::provider_populated("resource_record", resource_record)
+                                    .build(),
+                            ],
+                        )),
+                    )
+                    .build(),
+                ),
+            ResourceSchema::new("route53.RecordSet")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "resource_records",
+                        AttributeType::list(AttributeType::string()),
+                    )
+                    .build(),
+                ),
+        ];
+        schemas
+            .into_iter()
+            .map(|schema| {
+                schema
+                    .validate()
+                    .expect("deferred-for collision schema must be valid")
+            })
+            .collect()
+    }
+}
+
 struct AssociationCreateOnlyFactory;
 
 impl ProviderFactory for AssociationCreateOnlyFactory {
@@ -5006,12 +6358,14 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         Box::pin(async {
-            Ok(Box::new(MockProvider::new()) as Box<dyn carina_core::provider::Provider>)
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
         })
     }
 
@@ -5027,6 +6381,15 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
             Ok(Box::new(carina_core::provider::NoopNormalizer)
                 as Box<dyn carina_core::provider::ProviderNormalizer>)
         })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -5051,6 +6414,18 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
                         AttributeSchema::optional("subnet_id", AttributeType::string())
                             .create_only()
                             .build(),
+                    ),
+                ResourceSchema::new("ec2.RouteTable").attribute(
+                    AttributeSchema::provider_populated("id", AttributeType::string()).build(),
+                ),
+                ResourceSchema::new("ec2.Route")
+                    .attribute(
+                        AttributeSchema::optional("route_table_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::provider_populated("id", AttributeType::string()).build(),
                     ),
             ]
         };
@@ -5094,6 +6469,16 @@ fn association_state(
     state
 }
 
+fn route_state(name: &str, route_table_id: &str) -> carina_state::state::ResourceState {
+    let mut state =
+        carina_state::state::ResourceState::new("ec2.Route", test_identity(name), "awscc");
+    state.set_persisted_attribute(
+        "route_table_id".to_string(),
+        serde_json::Value::String(route_table_id.to_string()),
+    );
+    state
+}
+
 fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -> Resource {
     let mut resource = Resource::with_provider(
         "awscc",
@@ -5110,6 +6495,671 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
         Value::Concrete(ConcreteValue::String(subnet_id.to_string().into())),
     );
     resource
+}
+
+fn desired_route(name: &str, route_table_binding: &str) -> Resource {
+    use carina_core::resource::AccessPath;
+
+    Resource::with_provider("awscc", "ec2.Route", test_identity(name), None).with_attribute(
+        "route_table_id",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new(route_table_binding, "id").resolve_root_for_test(),
+        }),
+    )
+}
+
+#[test]
+fn legacy_loop_detector_resolves_ref_only_ambiguity_through_state_view() {
+    use carina_core::config_loader::load_configuration_with_config;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(project.path().join("providers.crn"), "provider awscc {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("inputs.crn"),
+        "let xs = ['only']\n\
+         let private_rtb = awscc.ec2.RouteTable {}\n\
+         let public_rtb = awscc.ec2.RouteTable {}\n",
+    )
+    .expect("write input fixture");
+    std::fs::write(
+        project.path().join("loop_private.crn"),
+        "for _ in xs {\n\
+           awscc.ec2.Route { route_table_id = private_rtb.id }\n\
+         }\n",
+    )
+    .expect("write private loop fixture");
+    std::fs::write(
+        project.path().join("loop_public.crn"),
+        "for _ in xs {\n\
+           awscc.ec2.Route { route_table_id = public_rtb.id }\n\
+         }\n",
+    )
+    .expect("write public loop fixture");
+
+    let mut parsed = resolve_file_for_test(
+        load_configuration_with_config(
+            project.path(),
+            &carina_core::parser::ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load multi-file fixture")
+        .parsed,
+    );
+    let providers = resolved_provider_configs(&parsed);
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let canonical = canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas())
+        .expect("fixture resources canonicalize");
+    let errors =
+        compute_anonymous_identifiers_with_ctx(&ctx, canonical, providers.as_provider_configs());
+    assert!(errors.is_empty(), "fixture identities resolve: {errors:?}");
+    let public_destination = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.id.resource_type == "ec2.Route"
+                && matches!(
+                    resource.get_attr("route_table_id"),
+                    Some(Value::Deferred(DeferredValue::ResourceRef { path }))
+                        if path.binding() == "public_rtb"
+                )
+        })
+        .and_then(|resource| resource.id.identity_str())
+        .expect("public route has a resolved anonymous identity")
+        .to_string();
+
+    let mut state_file = StateFile::new();
+    for (binding, route_table_id) in [("private_rtb", "rtb-private"), ("public_rtb", "rtb-public")]
+    {
+        let mut row = ResourceState::try_applied(
+            "ec2.RouteTable",
+            test_identity(binding),
+            "awscc",
+            route_table_id,
+        )
+        .expect("route-table provider id is non-empty")
+        .with_attribute("id", serde_json::json!(route_table_id));
+        row.binding = Some(absolute_binding(binding));
+        state_file
+            .upsert_resource(row)
+            .expect("route-table state row is unique");
+    }
+    state_file
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.Route",
+                test_identity("_xs[0]"),
+                "awscc",
+                "legacy-route-id",
+            )
+            .expect("legacy route provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-public")),
+        )
+        .expect("legacy route state row is unique");
+    let claims = StateBlockClaims::empty();
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+
+    let moves =
+        detect_legacy_loop_moves_with_ctx(&ctx, &parsed.resources, &state_view, &claims, &[]);
+
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![("_xs[0]".to_string(), public_destination)],
+        "the concrete dependency state must select the one ref-valued owner",
+    );
+}
+
+#[tokio::test]
+async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
+    use carina_core::config_loader::load_configuration_with_config;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(
+        project.path().join("backend.crn"),
+        "backend local { path = 'carina.state.json' }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(project.path().join("providers.crn"), "provider awscc {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("loop.crn"),
+        "for _ in ['route'] {\n\
+           awscc.ec2.Route { route_table_id = 'rtb-loop' }\n\
+         }\n",
+    )
+    .expect("write loop fixture");
+    std::fs::write(
+        project.path().join("named.crn"),
+        "let named = awscc.ec2.SubnetRouteTableAssociation {\n\
+           route_table_id = 'rtb-named'\n\
+           subnet_id = 'subnet-named'\n\
+         }\n",
+    )
+    .expect("write named fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution");
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        provider_configs.as_provider_configs(),
+    );
+
+    let mut resolved_resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let canonical =
+        canonicalize_resources_with_schemas(&mut resolved_resources, wiring.context().schemas())
+            .expect("fixture resources canonicalize");
+    let identity_errors = compute_anonymous_identifiers_with_ctx(
+        wiring.context(),
+        canonical,
+        provider_configs.as_provider_configs(),
+    );
+    assert!(
+        identity_errors.is_empty(),
+        "fixture identities must resolve: {identity_errors:?}"
+    );
+    let loop_destination = resolved_resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "ec2.Route")
+        .and_then(|resource| resource.id.identity_str())
+        .expect("loop route has a resolved anonymous identity")
+        .to_string();
+
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.Route",
+                test_identity("_for0[0]"),
+                "awscc",
+                "loop-route-id",
+            )
+            .expect("legacy route provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-loop")),
+        )
+        .expect("legacy route state row is unique");
+    let named_orphan = "awscc_ec2_subnet_route_table_association_11111111";
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.SubnetRouteTableAssociation",
+                test_identity(named_orphan),
+                "awscc",
+                "named-association-id",
+            )
+            .expect("association provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-named"))
+            .with_attribute("subnet_id", serde_json::json!("subnet-named")),
+        )
+        .expect("named orphan state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let canonical_resources = canonical_pair_from_resolved(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build mixed automatic-move plan");
+    let plan = &planned.resources().plan;
+    let summary = plan.summary();
+    assert_eq!(
+        summary.create,
+        0,
+        "plan must not create: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.delete,
+        0,
+        "plan must not delete: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.update,
+        0,
+        "plan must not update: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.replace,
+        0,
+        "plan must not replace: {:#?}",
+        plan.effects()
+    );
+    let mut moves = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Move { from, to, .. } => Some((
+                from.identity_str().to_string(),
+                to.identity_str().to_string(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    moves.sort();
+    let mut expected = vec![
+        ("_for0[0]".to_string(), loop_destination),
+        (named_orphan.to_string(), "named".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(moves, expected, "plan must contain exactly the two moves");
+    assert_eq!(summary.moved, 2);
+}
+
+#[tokio::test]
+async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
+    use carina_core::config_loader::load_configuration_with_config;
+    use carina_core::parser::DeferredForTarget;
+    use carina_state::state::{ResourceState, StateFile};
+
+    let project = tempfile::tempdir().expect("create temporary project");
+    std::fs::write(
+        project.path().join("backend.crn"),
+        "backend local { path = 'carina.state.json' }\n",
+    )
+    .expect("write backend fixture");
+    std::fs::write(project.path().join("providers.crn"), "provider awscc {}\n")
+        .expect("write provider fixture");
+    std::fs::write(
+        project.path().join("upstream.crn"),
+        "let upstream = upstream_state { source = '../upstream' }\n",
+    )
+    .expect("write upstream fixture");
+    std::fs::write(
+        project.path().join("loops.crn"),
+        "for _ in (upstream.routes) {\n\
+           awscc.ec2.Route { route_table_id = 'rtb-loop' }\n\
+         }\n\n\
+         let named = for _ in (upstream.named) {\n\
+           awscc.ec2.SubnetRouteTableAssociation {\n\
+             route_table_id = 'rtb-named'\n\
+             subnet_id = 'subnet-named'\n\
+           }\n\
+         }\n",
+    )
+    .expect("write deferred-loop fixture");
+
+    let loaded = load_configuration_with_config(
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load multi-file fixture");
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("test fixture crosses module resolution");
+    assert_eq!(
+        parsed.deferred_for_expressions().len(),
+        2,
+        "both resources must materialize after prelude detection",
+    );
+    let remote_bindings = HashMap::from([(
+        "upstream".to_string(),
+        HashMap::from([
+            (
+                "routes".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("route".into()),
+                )])),
+            ),
+            (
+                "named".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("named".into()),
+                )])),
+            ),
+        ]),
+    )]);
+    let provider_configs = resolved_provider_configs_with_remote(&parsed, &remote_bindings);
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        provider_configs.as_provider_configs(),
+    );
+
+    let anonymous_loop = parsed
+        .deferred_for_expressions()
+        .iter()
+        .find(|deferred| matches!(deferred.target, DeferredForTarget::Unbound { .. }))
+        .expect("fixture has one unbound deferred loop");
+    let mut loop_children = carina_core::parser::expand_deferred_children(
+        anonymous_loop,
+        &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("route".into()),
+        )])),
+        carina_core::resource::AccessMissPolicy::Error,
+    )
+    .expect("deferred route loop expands");
+    let canonical =
+        canonicalize_resources_with_schemas(&mut loop_children, wiring.context().schemas())
+            .expect("expanded route canonicalizes");
+    let identity_errors = compute_anonymous_identifiers_with_ctx(
+        wiring.context(),
+        canonical,
+        provider_configs.as_provider_configs(),
+    );
+    assert!(
+        identity_errors.is_empty(),
+        "expanded route identity resolves: {identity_errors:?}"
+    );
+    let loop_destination = loop_children[0]
+        .id
+        .identity_str()
+        .expect("expanded route has an anonymous identity")
+        .to_string();
+
+    let mut persisted = StateFile::new();
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.Route",
+                test_identity("_for0[0]"),
+                "awscc",
+                "loop-route-id",
+            )
+            .expect("legacy route provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-loop")),
+        )
+        .expect("legacy route state row is unique");
+    let named_orphan = "awscc_ec2_subnet_route_table_association_11111111";
+    persisted
+        .upsert_resource(
+            ResourceState::try_applied(
+                "ec2.SubnetRouteTableAssociation",
+                test_identity(named_orphan),
+                "awscc",
+                "named-association-id",
+            )
+            .expect("association provider id is non-empty")
+            .with_attribute("route_table_id", serde_json::json!("rtb-named"))
+            .with_attribute("subnet_id", serde_json::json!("subnet-named")),
+        )
+        .expect("named orphan state row is unique");
+    let state_path = project.path().join("carina.state.json");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
+    )
+    .expect("write real state fixture");
+    let state_file = Some(
+        carina_state::state::check_and_migrate(
+            &std::fs::read_to_string(&state_path).expect("read real state fixture"),
+        )
+        .expect("decode real state fixture")
+        .into_state(),
+    );
+
+    let canonical_resources = canonical_pair_from_resolved(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &remote_bindings,
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+    )
+    .await
+    .expect("build late mixed automatic-move plan");
+    let plan = &planned.resources().plan;
+    let summary = plan.summary();
+    assert_eq!(
+        summary.create,
+        0,
+        "plan must not create: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.delete,
+        0,
+        "plan must not delete: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.update,
+        0,
+        "plan must not update: {:#?}",
+        plan.effects()
+    );
+    assert_eq!(
+        summary.replace,
+        0,
+        "plan must not replace: {:#?}",
+        plan.effects()
+    );
+    let mut moves = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Move { from, to, .. } => Some((
+                from.identity_str().to_string(),
+                to.identity_str().to_string(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    moves.sort();
+    let mut expected = vec![
+        ("_for0[0]".to_string(), loop_destination),
+        (named_orphan.to_string(), "named[0]".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(
+        moves, expected,
+        "plan must contain exactly the two late moves"
+    );
+    assert_eq!(summary.moved, 2);
+}
+
+#[test]
+fn projected_moved_binding_resolves_for_anonymous_to_named_detection() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let old_binding = "old_rtb";
+    let projected_binding = "private_rtb";
+    let anonymous_name = "awscc_ec2_route_11111111";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state(old_binding, "rtb-private"))
+        .expect("insert moved route-table state");
+    state_file
+        .upsert_resource(route_state(anonymous_name, "rtb-private"))
+        .expect("insert anonymous route state");
+
+    let source = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(old_binding),
+        None,
+    );
+    let target = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(projected_binding),
+        None,
+    );
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.RouteTable",
+            old_binding,
+        )]
+        .into_iter()
+        .collect(),
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.RouteTable",
+            projected_binding,
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut desired = desired_route("nat", projected_binding);
+    desired.binding = Some(absolute_binding("nat"));
+    let resources = vec![desired];
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[(source, target)]);
+
+    let detection =
+        detect_anonymous_to_named_moves_with_ctx::<carina_core::resource::AbsoluteBindingAddress>(
+            &ctx,
+            &resources,
+            &candidates,
+            &[],
+            &state_view,
+            &claims,
+            &identifier::AnonymousToNamedClaimedOrigins::default(),
+        )
+        .expect("empty provider configuration is valid");
+    let (moves, contests) = detection.into_parts();
+    assert!(contests.is_empty());
+
+    assert_eq!(
+        detected_move_identity_pairs(&moves),
+        vec![(anonymous_name.to_string(), "nat".to_string())],
+        "a moved dependency row must resolve under its projected binding",
+    );
+}
+
+#[test]
+fn projected_removed_origin_is_hidden_from_type_candidates_and_binding_resolution() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let origin_binding = "old_rtb";
+    let projected_binding = "private_rtb";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state(origin_binding, "rtb-private"))
+        .expect("insert projected route-table state");
+
+    let origin = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(origin_binding),
+        None,
+    );
+    let projected = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.RouteTable",
+        test_identity(projected_binding),
+        None,
+    );
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.RouteTable",
+            origin_binding,
+        )]
+        .into_iter()
+        .collect(),
+        HashSet::new(),
+    );
+    let state_view =
+        AnonymousReconciliationStateView::new(&ctx, &state_file, &[(origin, projected)]);
+
+    assert!(
+        state_view
+            .entries_by_type(&claims, "awscc", "ec2.RouteTable")
+            .candidates()
+            .next()
+            .is_none(),
+        "a projected row claimed by removed.from must not be a type candidate",
+    );
+    assert!(
+        state_view
+            .entries_by_binding(&claims, projected_binding)
+            .is_empty(),
+        "the same removed row must not resolve a projected binding",
+    );
+}
+
+#[test]
+fn claimed_dependency_binding_is_hidden_from_anonymous_reconciliation() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let binding = "old_rtb";
+    let anonymous_name = "awscc_ec2_route_11111111";
+    let desired_name = "awscc_ec2_route_aaaaaaaa";
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(route_table_state(binding, "rtb-private"))
+        .expect("insert claimed route-table state");
+    state_file
+        .upsert_resource(route_state(anonymous_name, "rtb-private"))
+        .expect("insert anonymous route state");
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new("awscc", "ec2.RouteTable", binding)]
+            .into_iter()
+            .collect(),
+        HashSet::new(),
+    );
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+
+    let moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        &[desired_route(desired_name, binding)],
+        &[],
+        &state_view,
+        &claims,
+    );
+
+    assert!(
+        moves.is_empty(),
+        "a claimed-from dependency row must not resolve under its persisted binding: {moves:#?}",
+    );
 }
 
 #[test]
@@ -5177,15 +7227,25 @@ fn resource_move_invariants_named_match_uses_state_row_routing() {
         Value::Concrete(ConcreteValue::String("logs".into())),
     );
 
+    let resources = vec![desired];
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
     let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
-    let moves = detect_anonymous_to_named_moves_with_ctx(
-        &ctx,
-        &[desired],
-        &[] as &[carina_core::parser::ExpandedProviderConfig],
-        &state_view,
-        &StateBlockClaims::empty(),
-    )
-    .expect("empty provider configuration is valid for this create-only match");
+    let detection =
+        detect_anonymous_to_named_moves_with_ctx::<carina_core::resource::AbsoluteBindingAddress>(
+            &ctx,
+            &resources,
+            &candidates,
+            &[],
+            &state_view,
+            &StateBlockClaims::empty(),
+            &identifier::AnonymousToNamedClaimedOrigins::default(),
+        )
+        .expect("empty provider configuration is valid for this create-only match");
+    let (moves, contests) = detection.into_parts();
+    assert!(contests.is_empty());
 
     assert_eq!(moves.len(), 1);
     assert_eq!(
@@ -5277,9 +7337,15 @@ fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
         None,
         Sent::AllRequestAttributes,
     );
-    let in_flight =
-        ResourceState::from_in_flight(&resolved_persisted_target, &pending, None, None, None)
-            .expect("in-flight fixture must encode");
+    let in_flight = ResourceState::from_in_flight(
+        &resolved_persisted_target,
+        &pending,
+        None,
+        None,
+        None,
+        &carina_core::differ::exact_comparison_context_for_tests(),
+    )
+    .expect("in-flight fixture must encode");
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -5329,9 +7395,16 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let state = Some(state_file);
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.resources = resources;
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), &parsed.resources);
     let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
         .expect("build expansion prelude")
-        .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
+        .detect_moves(
+            &ctx,
+            &comparison_provider,
+            &[],
+            &[],
+            &StateBlockClaims::empty(),
+        )
         .expect("the automatic move projection must resolve");
     let (loaded_id, loaded) = detected.build_current(&parsed.resources[0].id);
     let saved = detected.saved_dependency_bindings();
@@ -5350,7 +7423,7 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
     use carina_state::state::{ResourceState, StateFile};
 
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
-    let mut parsed = parse(
+    let parsed = parse(
         "for subnet in ['subnet-a'] {\n\
            awscc.ec2.SubnetRouteTableAssociation {\n\
              route_table_id = 'rtb-private'\n\
@@ -5360,6 +7433,7 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("legacy-loop fixture parses");
+    let mut parsed = parsed;
     let canonical = carina_core::value::canonicalize_resources_with_schemas(
         &mut parsed.resources,
         ctx.schemas(),
@@ -5388,10 +7462,17 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
         .upsert_resource(association_state(heuristic_name, "rtb-private", "subnet-a"))
         .expect("heuristic candidate state row");
     let state = Some(state_file);
+    let comparison_provider = comparison_provider_for_resources(ctx.schemas(), &parsed.resources);
 
     let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
         .expect("build expansion prelude")
-        .detect_moves(&ctx, &[], &[], &StateBlockClaims::empty())
+        .detect_moves(
+            &ctx,
+            &comparison_provider,
+            &[],
+            &[],
+            &StateBlockClaims::empty(),
+        )
         .expect("automatic move detection succeeds");
 
     assert_eq!(
@@ -5884,7 +7965,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     fn compute_initial_anonymous_ids(
         ctx: &WiringContext,
-        parsed: &mut carina_core::parser::ExpandedParsedFile,
+        parsed: &mut carina_core::parser::ModuleResolvedParsedFile,
     ) {
         let canonical =
             canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas()).unwrap();
@@ -6067,7 +8148,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         precompleted_success_count: 0,
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
-    let outcome = execute_live_plan(
+    let outcome = carina_core::executor::execute_live_plan_for_test(
         &provider,
         input,
         &NoopExecutionObserver,
@@ -6105,7 +8186,7 @@ async fn moved_blocks_plan_level_fixture_emits_five_moves_only() {
     // emission at the `create_plan_from_parsed_with_upstream_with_ctx` seam. The
     // claims-precedence ordering itself is covered by
     // `moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames`.
-    let mut source = String::new();
+    let mut source = "provider awscc {}\n".to_string();
     let mut state_file = StateFile::new();
     for idx in 0..5 {
         let old_name = format!("old_assoc_{idx}");
@@ -6163,6 +8244,7 @@ moved {{
         &HashMap::new(),
         &state_block_claims,
         &resolved_state_block_targets,
+        vec![Box::new(AssociationCreateOnlyFactory)],
         tmp.path(),
     )
     .await
@@ -6809,9 +8891,10 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
     let r2 = Resource::new("bar.nothing", "second");
     let mut parsed = ParsedFile::default();
     parsed.resources = vec![r1, r2];
+    let parsed = resolve_file_for_test(parsed);
 
-    let provider_ctx = carina_core::parser::ProviderContext::default();
-    let errors = validate_resources_with_ctx(&ctx, &parsed, &provider_ctx);
+    let provider_ctx = ctx.provider_context();
+    let errors = validate_resources_with_ctx(&ctx, &parsed, provider_ctx);
     assert_eq!(errors.len(), 2, "got {errors:?}");
     for err in &errors {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -6861,37 +8944,20 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
         &[],
         [("test".to_string(), schema)],
     );
-    let rule: carina_core::resource::AuthoredValue =
-        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
-                "action".to_string(),
-                Value::Concrete(ConcreteValue::String("allow".into())),
-            )])),
-        )]));
-    let resource: carina_core::resource::AuthoredResource =
-        Resource::with_provider("test", "thing", "direct", None)
-            .with_attribute("rule", rule.clone());
-    let template_resource: carina_core::resource::AuthoredResource =
-        Resource::with_provider("test", "thing", "deferred", None)
-            .with_attribute("rule", rule.clone());
-    let deferred = carina_core::parser::DeferredForExpression {
-        file: Some("main.crn".to_string()),
-        line: 4,
-        header: "for item in pending.items".to_string(),
-        resource_type: "test.thing".to_string(),
-        attributes: vec![("rule".to_string(), rule)],
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: carina_core::resource::RelativeBindingName::new("items"),
-        },
-        iterable: Value::resource_ref("pending", "items", Vec::new()),
-        binding: carina_core::parser::ForBinding::Simple("item".to_string()),
-        template_resource,
-    };
-    let mut evaluated = carina_core::parser::ParsedFile::default();
-    evaluated.resources = vec![resource];
-    evaluated.deferred_for_expressions = vec![deferred];
+    let evaluated = carina_core::parser::parse_file(
+        r#"
+            let direct = test.thing { rule = [{ action = "allow" }] }
+            let pending = upstream_state { source = "../pending" }
+            let items = for item in pending.items {
+                test.thing { rule = [{ action = "allow" }] }
+            }
+        "#,
+        std::path::Path::new("main.crn"),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("block-name deferred fixture parses");
     let unresolved = evaluated.clone();
-    let evaluated = evaluated.resolve_root_for_test();
+    let evaluated = resolve_file_for_test(evaluated);
 
     let canonical_unresolved = resolve_config_names_with_ctx(
         &ValidationPipelineAccess::new(),
@@ -6911,7 +8977,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
             .attributes
             .contains_key("rule")
     );
-    let evaluated_deferred = &canonical_unresolved.parsed().deferred_for_expressions[0];
+    let evaluated_deferred = &canonical_unresolved.parsed().deferred_for_expressions()[0];
     assert!(
         evaluated_deferred
             .template_resource
@@ -6955,7 +9021,7 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     let mut evaluated = carina_core::parser::ParsedFile::default();
     evaluated.resources = vec![resource];
     let unresolved = evaluated.clone();
-    let evaluated = evaluated.resolve_root_for_test();
+    let evaluated = resolve_file_for_test(evaluated);
 
     let errors = resolve_config_names_with_ctx(
         &ValidationPipelineAccess::new(),
@@ -6992,7 +9058,7 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
             ),
     ];
     let unresolved = evaluated.clone();
-    let evaluated = evaluated.resolve_root_for_test();
+    let evaluated = resolve_file_for_test(evaluated);
 
     let canonical = resolve_config_names_with_ctx(
         &ValidationPipelineAccess::new(),
@@ -7258,12 +9324,14 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         &self,
         _binding: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
-        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         Box::pin(async {
-            Ok(Box::new(MockProvider::new()) as Box<dyn carina_core::provider::Provider>)
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(MockProvider::new())))
         })
     }
 
@@ -7279,6 +9347,15 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
             Ok(Box::new(carina_core::provider::NoopNormalizer)
                 as Box<dyn carina_core::provider::ProviderNormalizer>)
         })
+    }
+
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -7336,7 +9413,7 @@ fn anonymous_route_resource() -> Resource {
     resource
 }
 
-fn two_anonymous_loop_collision_file() -> carina_core::parser::ExpandedParsedFile {
+fn two_anonymous_loop_collision_file() -> carina_core::parser::ParsedFile {
     carina_core::parser::parse_file(
         "for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-a' subnet_id = subnet }\n}\n\
          for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-b' subnet_id = subnet }\n}\n",
@@ -7344,7 +9421,6 @@ fn two_anonymous_loop_collision_file() -> carina_core::parser::ExpandedParsedFil
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("two-loop identity fixture parses")
-    .resolve_root_for_test()
 }
 
 fn assert_two_loop_identity_aggregate(error: AppError) {
@@ -7365,9 +9441,9 @@ fn assert_two_loop_identity_aggregate(error: AppError) {
 #[test]
 fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
-    let mut parsed = two_anonymous_loop_collision_file();
+    let mut parsed = resolve_file_for_test(two_anonymous_loop_collision_file());
 
-    let error = <carina_core::parser::ExpandedParsedFile as DeferredExpansionTarget<
+    let error = <carina_core::parser::ModuleResolvedParsedFile as DeferredExpansionTarget<
         carina_core::parser::ExpandedParsedExportParam,
     >>::compute_anonymous_identifiers(&mut parsed, &ctx, &[])
     .expect_err("both loop collisions must fail identity assignment");
@@ -7378,7 +9454,7 @@ fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
 #[test]
 fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_errors() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
-    let parsed = two_anonymous_loop_collision_file();
+    let parsed = resolve_file_for_test(two_anonymous_loop_collision_file());
     let mut pair = canonical_pair(
         &parsed,
         parsed.resources.clone(), // allow: direct — plan-time reconciliation
@@ -7396,7 +9472,7 @@ fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_error
 #[test]
 fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
-    let parsed = two_anonymous_loop_collision_file();
+    let parsed = resolve_file_for_test(two_anonymous_loop_collision_file());
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(parsed.resources, ctx.schemas()),
         None::<&StateFile>,
@@ -7418,6 +9494,8 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
         prev_explicit: HashMap::new(),
         moved_pairs: Vec::new(),
     };
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     let result = reconcile_late_anonymous_identities(
         &ctx,
@@ -7428,6 +9506,7 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
             state_file: None,
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     );
     let error = match result {
@@ -7469,6 +9548,8 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
         prev_explicit: HashMap::new(),
         moved_pairs: Vec::new(),
     };
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     let result = reconcile_late_anonymous_identities(
         &ctx,
@@ -7479,6 +9560,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             state_file: None,
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     );
 
@@ -7600,6 +9682,8 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
     let early_pair = (early_source_id, desired_id.clone());
     assert_eq!(addressed.moved_pairs, vec![early_pair.clone()]);
     assert!(addressed.orphans.contains_key(other_orphan_id.as_inner()));
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     reconcile_late_anonymous_identities(
         &ctx,
@@ -7610,6 +9694,7 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
             state_file: Some(&state_file),
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     )
     .expect("late anonymous identity must resolve");
@@ -7623,6 +9708,112 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
         addressed.orphans.contains_key(other_orphan_id.as_inner()),
         "the other matching row must remain an orphan and therefore a Delete candidate",
     );
+}
+
+#[test]
+fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
+    use carina_state::state::StateFile;
+
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let origin_name = "ec2_subnet_route_table_association_11111111";
+    let early_name = "ec2_subnet_route_table_association_22222222";
+    let late_name = "ec2_subnet_route_table_association_33333333";
+    let desired = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(early_name),
+        None,
+    )
+    .with_attribute(
+        "route_table_id",
+        Value::Concrete(ConcreteValue::String("rtb-private".into())),
+    )
+    .with_attribute(
+        "subnet_id",
+        Value::Concrete(ConcreteValue::String("subnet-a".into())),
+    );
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(vec![desired], ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("late-reconciliation fixture has no unresolved live references");
+
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(association_state(origin_name, "rtb-private", "subnet-a"))
+        .expect("test state setup must be valid");
+
+    let origin_id = ResolvedResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(origin_name),
+        None,
+    );
+    let early_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
+    let desired_ids = HashSet::from([early_id.as_inner().clone()]);
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: state_file.build_orphans(&desired_ids).into_plan_orphans(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+    let claims = StateBlockClaims::empty();
+    let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
+    let early_moves = reconcile_anonymous_identifiers_with_ctx(
+        &ctx,
+        resources.resources(),
+        &[],
+        &state_view,
+        &claims,
+    );
+    apply_detected_resource_moves(
+        &mut addressed,
+        early_moves,
+        Some(&state_file),
+        MoveOverlapPolicy::ComposeForward,
+    )
+    .expect("early move must re-key its orphan state");
+    assert_eq!(
+        addressed.moved_pairs,
+        vec![(origin_id.clone(), early_id.clone())]
+    );
+
+    resources.resources_mut()[0].id = ResourceId::with_provider_identity(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(late_name),
+        None,
+    );
+    let late_id = ResolvedResourceId::new(resources.resources()[0].id.clone());
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
+
+    reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: Some(&state_file),
+            state_block_claims: &claims,
+            providers: &[],
+            comparison_provider: &comparison_provider,
+        },
+    )
+    .expect("late reconciliation must extend the early move chain");
+
+    assert_eq!(addressed.moved_pairs, vec![(origin_id, late_id.clone())]);
+    assert!(addressed.managed_current.contains_key(late_id.as_inner()));
+    assert!(!addressed.managed_current.contains_key(early_id.as_inner()));
 }
 
 #[test]
@@ -7642,7 +9833,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
     )
     .expect("deferred map loop parses");
     let children = carina_core::parser::expand_deferred_children(
-        &parsed.deferred_for_expressions[0],
+        &parsed.deferred_for_expressions()[0],
         &Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "alpha".to_string(),
             Value::Concrete(ConcreteValue::String("subnet-a".into())),
@@ -7687,6 +9878,8 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         moved_pairs: Vec::new(),
     };
     let claims = StateBlockClaims::empty();
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
 
     reconcile_late_anonymous_identities(
         &ctx,
@@ -7697,6 +9890,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
             state_file: Some(&state_file),
             state_block_claims: &claims,
             providers: &[],
+            comparison_provider: &comparison_provider,
         },
     )
     .expect("late anonymous identity and exact migration resolve");
@@ -7778,6 +9972,10 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
     named.id = ResourceId::with_provider_identity("awscc", "ec2.Route", "route", None);
     named.binding = Some(absolute_binding("route"));
     let resources = vec![named.clone()];
+    let candidates = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
 
     let mut state_file = StateFile::new();
     state_file
@@ -7795,14 +9993,18 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
         moved_pairs: Vec::new(),
     };
     let state_view = AnonymousReconciliationStateView::new(&ctx, &state_file, &[]);
-    let moves = detect_anonymous_to_named_moves_with_ctx(
+    let detection = detect_anonymous_to_named_moves_with_ctx(
         &ctx,
         &resources,
+        &candidates,
         &providers_aws,
         &state_view,
         &carina_core::identifier::StateBlockClaims::empty(),
+        &identifier::AnonymousToNamedClaimedOrigins::default(),
     )
     .unwrap();
+    let (moves, contests) = detection.into_parts();
+    assert!(contests.is_empty());
     apply_detected_resource_moves(
         &mut addressed,
         moves,
@@ -7836,6 +10038,9 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
         Current::CreateInFlight(pending) => {
             panic!("renamed test state unexpectedly remained in flight: {pending:?}")
         }
+        Current::CreateOutcomeUnknown(unknown) => {
+            panic!("renamed test state unexpectedly became outcome unknown: {unknown:?}")
+        }
     };
     assert_eq!(state.identifier.as_deref(), Some("route-123"));
 }
@@ -7845,34 +10050,35 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
 #[test]
 fn module_checker_and_provider_wrappers_accept_empty_input() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
-    let parsed = ParsedFile::default();
-    let provider_ctx = carina_core::parser::ProviderContext::default();
+    let authored = ParsedFile::default();
+    let parsed = resolve_file_for_test(authored.clone());
+    let provider_ctx = ctx.provider_context();
 
-    let errors = validate_provider_region_with_ctx(&ctx, &parsed);
+    let errors = validate_provider_region_with_ctx(&ctx, &authored);
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
 
     let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
-        &parsed,
+        &authored,
         &carina_core::validation::ValidationTypeContext::new(
-            &parsed,
+            &authored,
             ctx.schemas(),
-            &provider_ctx,
+            provider_ctx,
             &module_signatures,
         ),
     );
     let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
-        &parsed,
+        &authored,
         ctx.schemas(),
         &module_signatures,
     );
     let findings = carina_core::validation::check_module_calls(
         carina_core::validation::ModuleCallCheckInput {
-            authored: &parsed,
-            semantic: Some(&parsed),
+            authored: &authored,
+            semantic: Some(&authored),
             base_dir: Some(std::path::Path::new(".")),
             imported_signatures: &module_signatures,
-            provider_context: &provider_ctx,
+            provider_context: provider_ctx,
             schemas: ctx.schemas(),
             binding_use_report: &binding_use_report,
             bindings: &bindings,
@@ -7881,8 +10087,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
     );
     assert!(findings.is_empty(), "module_calls: got {findings:?}");
 
-    let expanded = parsed.clone().resolve_root_for_test();
-    let errors = validate_composition_ref_types_with_ctx(&ctx, &expanded);
+    let errors = validate_composition_ref_types_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "composition_ref_types: got {errors:?}");
 }
 
@@ -7898,12 +10103,12 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
 fn parsed_with_attr(
     attr_name: &str,
     attr_value: carina_core::resource::AuthoredValue,
-) -> ParsedFile {
+) -> carina_core::parser::ModuleResolvedParsedFile {
     let mut r: carina_core::resource::AuthoredResource = Resource::new("foo.bar", "x");
     r.attributes.insert(attr_name.to_string(), attr_value);
     let mut parsed = ParsedFile::default();
     parsed.resources = vec![r];
-    parsed
+    resolve_file_for_test(parsed)
 }
 
 #[test]
@@ -8076,7 +10281,6 @@ fn validate_rejects_empty_interpolation_in_export_value() {
     )
     .expect("authored export fixture must parse");
     parsed.export_params[0].value = Some(bad);
-
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
         errors.len(),
@@ -8108,7 +10312,6 @@ fn validate_rejects_empty_interpolation_in_attribute_param_default() {
     )
     .expect("authored attribute fixture must parse");
     parsed.attribute_params[0].value = Some(bad);
-
     let errors = validate_no_empty_interpolations(&parsed);
     assert_eq!(
         errors.len(),
@@ -8427,7 +10630,7 @@ fn unbound_deferred_test_target() -> DeferredCreateTarget {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses");
-    DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions[0])
+    DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions()[0])
         .expect("deferred target has a system identity")
 }
 
@@ -8647,8 +10850,11 @@ mod expand_same_config_deferred_for_tests {
     use carina_core::resource::{ConcreteValue, DeferredValue, State, UnknownReason, Value};
     use std::collections::{HashMap, HashSet};
 
-    fn parse_expanded(source: &str) -> carina_core::parser::ExpandedParsedFile {
-        parse(source, &ProviderContext::default()).expect("fixture parses")
+    fn parse_resolved(
+        input: &str,
+        config: &ProviderContext,
+    ) -> Result<carina_core::parser::ModuleResolvedParsedFile, Box<dyn std::error::Error>> {
+        parse(input, config)
     }
 
     /// `let cert` (same-config) + a `for` over its provider-read
@@ -8684,7 +10890,7 @@ mod expand_same_config_deferred_for_tests {
     /// `cert` resource's own id → an existing State carrying the
     /// provider-read list attribute the loop iterates.
     fn states_with_cert(
-        parsed: &carina_core::parser::ExpandedParsedFile,
+        parsed: &carina_core::parser::ModuleResolvedParsedFile,
         attr: &str,
         value: Value,
     ) -> HashMap<ResourceId, State> {
@@ -8717,8 +10923,8 @@ mod expand_same_config_deferred_for_tests {
     #[test]
     fn deferred_for_warning_filter_preserves_single_quoted_warning_on_same_line() {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
-        let parsed = parse_expanded(src);
-        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("fixture parses");
+        assert_eq!(parsed.deferred_for_expressions().len(), 1);
         assert!(
             parsed
                 .warnings
@@ -8752,7 +10958,7 @@ mod expand_same_config_deferred_for_tests {
     #[test]
     fn saved_plan_expansion_suppresses_duplicate_warning_output_but_keeps_candidate_state() {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
-        let mut parsed = parse_expanded(src);
+        let mut parsed = parse_resolved(src, &ProviderContext::default()).expect("fixture parses");
         let state_file = None;
         let schemas = SchemaRegistry::new();
         let identity_context = WiringContext::new_for_test(Vec::new(), &[]);
@@ -8772,6 +10978,7 @@ mod expand_same_config_deferred_for_tests {
                 &schemas,
                 &HashMap::new(),
                 DeferredForWarningPolicy::Suppress,
+                &ProviderRouter::new(),
                 &identity_context,
             )
             .expect("deferred-for expansion should succeed");
@@ -8782,7 +10989,7 @@ mod expand_same_config_deferred_for_tests {
 
         let expanded = out.into_expanded_file(parsed);
         assert_eq!(
-            expanded.deferred_for_expressions.len(),
+            expanded.deferred_for_expressions().len(),
             1,
             "a DeferredCreate template remains available for secret rehydration"
         );
@@ -8856,6 +11063,9 @@ mod expand_same_config_deferred_for_tests {
             Current::CreateInFlight(pending) => {
                 panic!("test orphan unexpectedly has an in-flight create: {pending:?}")
             }
+            Current::CreateOutcomeUnknown(unknown) => {
+                panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
+            }
         };
         let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(
             present,
@@ -8875,9 +11085,9 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn same_config_read_iterable_materializes_in_plan_resources() {
-        let parsed = parse_expanded(SRC);
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         assert_eq!(
-            parsed.deferred_for_expressions.len(),
+            parsed.deferred_for_expressions().len(),
             1,
             "loop must be deferred at parse time (iterable is a same-config provider-read)"
         );
@@ -8943,14 +11153,14 @@ mod expand_same_config_deferred_for_tests {
         );
         let expanded = out.into_expanded_file(parsed);
         assert!(
-            expanded.deferred_for_expressions.is_empty(),
+            expanded.deferred_for_expressions().is_empty(),
             "materialized loops must not remain in the candidate parser view"
         );
     }
 
     #[test]
     fn expand_same_config_emits_deferred_create_when_iterable_is_unresolved() {
-        let parsed = parse_expanded(SRC);
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
 
@@ -8991,7 +11201,7 @@ mod expand_same_config_deferred_for_tests {
         );
         let expanded = out.into_expanded_file(parsed);
         assert_eq!(
-            expanded.deferred_for_expressions.len(),
+            expanded.deferred_for_expressions().len(),
             1,
             "deferred effect templates must remain in the candidate parser view"
         );
@@ -8999,7 +11209,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_pre_expands_when_iterable_is_concrete() {
-        let parsed = parse_expanded(SRC);
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
 
@@ -9033,7 +11243,7 @@ mod expand_same_config_deferred_for_tests {
 
     #[test]
     fn expand_same_config_passes_through_pr3558_dependency_bindings_on_pre_expanded_children() {
-        let parsed = parse_expanded(SRC);
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
 
@@ -9074,7 +11284,7 @@ mod expand_same_config_deferred_for_tests {
         // carina#3132 highest-risk requirement: appending loop children
         // and re-sorting must not reorder already-planned resources
         // (SimHash / moved-matching stability).
-        let parsed = parse_expanded(SRC);
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let pre_order: Vec<String> = sorted.iter().map(|r| r.id.to_string()).collect();
         let states = states_with_cert(&parsed, "account_ids", account_ids());
@@ -9105,6 +11315,12 @@ mod expand_same_config_deferred_for_tests {
             post_filtered, pre_order,
             "re-sort must preserve the relative order of already-planned resources"
         );
+        assert!(
+            out.sorted_resources
+                .iter()
+                .any(|resource| resource.id.to_string() == "aws.ec2.Vpc.<pending>"),
+            "comparison-only fixture schemas must not resolve or drop a pre-existing pending id"
+        );
         // The two materialized Assignment children — and only those —
         // are reported as new (none of the pre-expansion ids leak in).
         assert_eq!(
@@ -9124,7 +11340,7 @@ mod expand_same_config_deferred_for_tests {
     fn unresolvable_iterable_stays_deferred_no_misexpansion() {
         // No cert state → iterable genuinely unknowable. The loop must
         // stay in residual (carina#3128 placeholder), NOT mis-expand.
-        let parsed = parse_expanded(SRC);
+        let parsed = parse_resolved(SRC, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty_states: HashMap<ResourceId, State> = HashMap::new();
 
@@ -9185,8 +11401,8 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse_expanded(src);
-        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
+        assert_eq!(parsed.deferred_for_expressions().len(), 1);
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let mut orgs_attrs = HashMap::new();
@@ -9251,7 +11467,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse_expanded(src);
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let mut rr = indexmap::IndexMap::new();
@@ -9356,7 +11572,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse_expanded(src);
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let mut rr = indexmap::IndexMap::new();
@@ -9471,7 +11687,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse_expanded(src);
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let make_entry = |name: &str, value: &str| {
@@ -9593,7 +11809,7 @@ mod expand_same_config_deferred_for_tests {
                 }
             }
         "#;
-        let parsed = parse_expanded(src);
+        let parsed = parse_resolved(src, &ProviderContext::default()).expect("parse");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
         let make_entry = |name: &str, value: &str| {
@@ -10366,7 +12582,7 @@ mod resolved_value_constraint_gate {
     use super::super::*;
     use super::{
         absolute_binding, build_override_aware_pair_for_test, canonical_pair, canonical_unresolved,
-        root_resource_ref,
+        render_plan_error, root_resource_ref,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10433,8 +12649,12 @@ mod resolved_value_constraint_gate {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-            Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+            Box::pin(async {
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(MockProvider::new())))
+            })
         }
 
         fn create_normalizer(
@@ -10445,6 +12665,15 @@ mod resolved_value_constraint_gate {
             Box::pin(async {
                 Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -10534,11 +12763,22 @@ mod resolved_value_constraint_gate {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
             Box::pin(async move {
-                Ok(Box::new(RecordingDataSourceProvider { reads }) as Box<dyn Provider>)
+                Ok(carina_core::provider::InitializeOutcome::unavailable()
+                    .with_provider(Box::new(RecordingDataSourceProvider { reads })))
             })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -10753,7 +12993,10 @@ mod resolved_value_constraint_gate {
                             name.to_string(),
                             carina_core::resource::LiveCompositionArgument::from_value(
                                 value,
-                                carina_core::parser::TypeExpr::String,
+                                carina_core::validation::resolve_consumer_static_type_for_signature(
+                                    &carina_core::parser::TypeExpr::String,
+                                    &carina_core::parser::ProviderContext::default(),
+                                ),
                                 carina_core::parser::ArgumentOrigin::Defaulted,
                             ),
                         )
@@ -10853,7 +13096,7 @@ mod resolved_value_constraint_gate {
             }
             other => panic!("unexpected plan error: {other:?}"),
         }
-        let rendered = errors[0].to_string();
+        let rendered = render_plan_error(&errors[0]);
         assert!(rendered.contains(expected_type), "{rendered}");
         assert!(rendered.contains(expected_attribute), "{rendered}");
         assert!(rendered.contains("producer.value"), "{rendered}");
@@ -10881,7 +13124,7 @@ mod resolved_value_constraint_gate {
             .expect_err("resolved secret must fail its authored-value constraint");
         let rendered = errors
             .iter()
-            .map(ToString::to_string)
+            .map(render_plan_error)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -11016,7 +13259,7 @@ mod resolved_value_constraint_gate {
             }
             other => panic!("unexpected plan error: {other:?}"),
         }
-        let rendered = errors[0].to_string();
+        let rendered = render_plan_error(&errors[0]);
         for expected in [
             "module 'checked_module' (call 'checked')",
             "value",
@@ -11324,7 +13567,7 @@ exports { team_prefix: String = "x" }"#,
         let errors = prepare_composition(vec![("value", secret)], &mut composition)
             .await
             .expect_err("invalid secret value must fail without disclosure");
-        let rendered = errors[0].to_string();
+        let rendered = render_plan_error(&errors[0]);
 
         assert!(rendered.contains("(secret)"), "{rendered}");
         assert!(!rendered.contains("\"bad\""), "{rendered}");

@@ -78,22 +78,43 @@ impl ProviderState {
                     .any(|factory| factory.name() == provider_name)
             },
         );
-        let mut schemas = provider_mod::collect_schemas(&factories);
         let mut provider_names: Vec<String> =
             factories.iter().map(|f| f.name().to_string()).collect();
         let mut known_provider_names = HashSet::new();
+        let mut supplemental_schemas = SchemaRegistry::new();
         if use_builtin_mock {
-            for schema in carina_provider_mock::builtin_schemas() {
-                schemas.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME, schema);
-            }
+            supplemental_schemas
+                .insert_provider_witness(
+                    carina_provider_mock::BUILTIN_PROVIDER_NAME,
+                    &carina_provider_mock::builtin_schema_witness(),
+                )
+                .expect("the built-in mock exposes one consistent schema witness");
             provider_names.push(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
             known_provider_names.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
         }
-        let schemas = Arc::new(schemas);
         let region_completions: Vec<CompletionValue> = factories
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
             .collect();
+        let factories = Arc::new(factories);
+        let (schemas, diagnostic_engine) = if provider_names.is_empty() {
+            (
+                Arc::new(SchemaRegistry::new()),
+                DiagnosticEngine::without_loaded_provider_schemas(),
+            )
+        } else {
+            let loaded_providers = Arc::new(provider_mod::loaded_provider_snapshot_from_factories(
+                Arc::clone(&factories),
+                supplemental_schemas,
+            ));
+            let schemas = loaded_providers.schemas().schemas_arc();
+            let engine = DiagnosticEngine::new_with_known_providers(
+                loaded_providers,
+                provider_names.clone(),
+                known_provider_names,
+            );
+            (schemas, engine)
+        };
         // Extract custom type names from provider schemas for completion.
         // The structured identities render to their dotted display form
         // (`aws.iam.Role.Arn`, `Ipv4Cidr`), which is also the spelling a
@@ -102,16 +123,10 @@ impl ProviderState {
             .iter()
             .map(|id| id.to_string())
             .collect();
-        let factories_arc = Arc::new(factories);
+        let diagnostic_engine = diagnostic_engine.with_provider_errors(provider_errors);
         Self {
             schemas: Arc::clone(&schemas),
-            diagnostic_engine: DiagnosticEngine::new_with_known_providers(
-                Arc::clone(&schemas),
-                provider_names.clone(),
-                factories_arc,
-                known_provider_names,
-            )
-            .with_provider_errors(provider_errors),
+            diagnostic_engine,
             completion_provider: CompletionProvider::new(
                 Arc::clone(&schemas),
                 provider_names,
@@ -887,7 +902,7 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::provider::{BoxFuture, Provider, ProviderResult};
+    use carina_core::provider::{BoxFuture, ProviderResult};
     use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
@@ -924,8 +939,18 @@ mod tests {
             &self,
             _binding: Option<&str>,
             _config: &carina_core::provider::ProviderReadyConfig,
-        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async { unreachable!("formatting tests do not instantiate providers") })
+        }
+
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                self.schemas(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+            )
+            .unwrap()
         }
 
         fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
@@ -1048,6 +1073,92 @@ mock.test.Thing {
             }),
             "LSP must run attribute-derived identity conflict checks with mock schemas: {messages:#?}",
         );
+    }
+
+    #[test]
+    fn ignore_changes_validation_matches_core_in_directory_scoped_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let providers = "provider mock {}\n";
+        let backend = "backend local { path = \"carina.state.json\" }\n";
+        let main = r#"let missing = mock.test.resource {
+  name = "missing"
+  directives { ignore_changes = [does_not_exist] }
+}
+
+let read_only = mock.test.resource {
+  name = "read-only"
+  directives { ignore_changes = [identifier] }
+}
+
+let indexed = mock.test.resource {
+  name = "indexed"
+  rule { action = "allow" }
+  directives { ignore_changes = [rule[0].action] }
+}
+
+let union_path = mock.test.resource {
+  name = "union"
+  choice = { value = "selected" }
+  directives { ignore_changes = [choice.value] }
+}
+
+let unwritten = mock.test.resource {
+  name = "unwritten"
+  directives { ignore_changes = [comment] }
+}
+
+let duplicate = mock.test.resource {
+  name = "duplicate"
+  comment = "recorded"
+  directives { ignore_changes = [comment, comment] }
+}
+"#;
+        std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
+        std::fs::write(temp.path().join("backend.crn"), backend).unwrap();
+        std::fs::write(temp.path().join("main.crn"), main).unwrap();
+
+        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let configs = discovered[temp.path()]
+            .iter()
+            .cloned()
+            .map(|config| (temp.path().to_path_buf(), config))
+            .collect();
+        let state = ProviderState::new(
+            vec![],
+            HashMap::new(),
+            configs,
+            None,
+            vec![(
+                "mock".to_string(),
+                Ok(ProviderArtifactFingerprint::default()),
+            )],
+        );
+        let main_path = temp.path().join("main.crn");
+        let document = Document::new_with_path(
+            main.to_string(),
+            main_path.clone(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+        let messages = state
+            .diagnostic_engine
+            .analyze(&document, Some(&main_path))
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "ignore_changes path `does_not_exist` does not exist in the resource schema",
+            "ignore_changes path `identifier` reaches a read-only or provider-populated node",
+            "ignore_changes path `rule[0].action` contains a list index, which is not supported",
+            "ignore_changes path `choice.value` passes through a union",
+            "ignore_changes path `comment` is not written in this resource block",
+            "ignore_changes path `comment` is listed more than once",
+        ] {
+            assert!(
+                messages.iter().any(|message| message.ends_with(expected)),
+                "missing `{expected}` from {messages:#?}",
+            );
+        }
     }
 
     #[test]

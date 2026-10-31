@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::{InferredFile, ProviderConfig, ProviderContext, UpstreamState};
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
 use carina_core::resource::{AuthoredResource as Resource, RelativeBindingName, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_state::StateFile;
@@ -41,15 +41,26 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         &self,
         _binding: Option<&str>,
         config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         *self.received_role_arn.lock().unwrap() = config.attributes().get("role_arn").cloned();
         Box::pin(async {
-            Ok(Box::new(carina_provider_mock::MockProvider::new()) as Box<dyn Provider>)
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
         })
     }
 
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
-        let schema_drafts: Vec<carina_core::schema::ResourceSchema> = Vec::new();
+        let schema_drafts = vec![carina_core::schema::ResourceSchema::new("test.resource")];
         schema_drafts
             .into_iter()
             .map(|schema| {

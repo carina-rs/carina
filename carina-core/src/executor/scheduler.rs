@@ -40,7 +40,8 @@ impl<'a, S> PureMetaStep<'a, S> {
             | Effect::Read { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
-            | Effect::Move { .. } => None,
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. } => None,
         }
     }
 }
@@ -77,7 +78,16 @@ pub(super) fn failure_dependency_key<S>(effect: &Effect<S>) -> Option<String> {
         Effect::DeferredReplace(payload) => {
             Some(payload.template.target.scheduler_key().to_string())
         }
-        _ => effect.binding_name(),
+        Effect::ReleaseListKeys { .. } => None,
+        Effect::Read { .. }
+        | Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. } => effect.binding_name(),
     }
 }
 
@@ -86,7 +96,16 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
         Effect::DeferredCreate { template, .. } => Some(template.target.display_name()),
         Effect::DeferredReplace(payload) => Some(payload.template.target.display_name()),
-        _ => effect.binding_name(),
+        Effect::ReleaseListKeys { .. } => None,
+        Effect::Read { .. }
+        | Effect::Create(_)
+        | Effect::ResumeCreate { .. }
+        | Effect::Update { .. }
+        | Effect::Delete { .. }
+        | Effect::Import { .. }
+        | Effect::Remove { .. }
+        | Effect::Move { .. }
+        | Effect::Wait { .. } => effect.binding_name(),
     }
 }
 
@@ -283,8 +302,10 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred loop parses");
-        let parsed = parsed.resolve_root(&crate::resource::RootScope::new());
-        let template = parsed.deferred_for_expressions[0].clone();
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        let template = parsed.deferred_for_expressions()[0].clone();
         let scheduler_key = template.target.scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));
 

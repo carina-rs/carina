@@ -2,12 +2,14 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 //!
-//! `TypeExpr::Unknown` is one of several "not determined yet" forms.
-//! `notes/specs/2026-10-29-unknown-forms-current-state.md` explains each form,
-//! which stage produces and consumes it, and how validation treats it.
+//! Static-type states that cannot be represented by a sound [`TypeExpr`] live
+//! in [`crate::static_type`] rather than as a sentinel variant here.
 
 use super::display_string_literal;
-use super::error::{ParseWarning, WarningKind};
+use super::error::{
+    DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
+    ParseError, ParseWarning, WarningKind,
+};
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
@@ -21,6 +23,7 @@ use crate::resource::{
     RootScope, SavedModuleSource, StructuralOperand, StructuralOperandRef, UnboundLoopTemplate,
     UnknownReason, Value,
 };
+use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -99,6 +102,10 @@ impl<B: BindingAddress> DeferredForTarget<B> {
 }
 
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
+///
+/// Parser-side deferred loops use [`ParsedDeferredForExpression`] instead.
+/// This resource-only shape is the resolved typestate consumed by planning,
+/// execution, display, and state persistence.
 /// Captures the structural shape of the loop body so the plan can show what
 /// resources *would* be created once the iterable becomes available.
 /// Also stores enough information to expand the loop later when the iterable
@@ -135,6 +142,262 @@ pub struct DeferredForExpression<S = ModuleSource, B: BindingAddress = RelativeB
     /// Template resource for expansion (the for body parsed with placeholders).
     #[serde(with = "deferred_template_resource_serde")]
     pub template_resource: Resource<S, B>,
+}
+
+impl<S, B: BindingAddress> DeferredForExpression<S, B> {
+    pub fn site(&self) -> DeferredForSite<'_, B> {
+        DeferredForSite {
+            file: self.file.as_deref(),
+            line: self.line,
+            header: &self.header,
+            binding: &self.binding,
+            iterable: &self.iterable,
+        }
+    }
+}
+
+/// Typed parser-side body of a deferred `for` expression.
+///
+/// Every grammar-supported body kind is retained until module expansion has
+/// substituted caller arguments. Only the [`Self::Resource`] arm can cross
+/// the final resolution seam into [`DeferredForExpression`].
+#[derive(Debug, Clone)]
+pub enum DeferredForBody<B: BindingAddress = RelativeBindingName> {
+    Resource(Box<Resource<ModuleSource, B>>),
+    Read(Box<DataSource<ModuleSource, B>>),
+    ModuleCall(ModuleCall<B>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedDeferredForIterableState {
+    Deferred,
+    DependsOnEnclosingModuleArgument,
+    UndefinedIdentifier { name: String },
+}
+
+#[derive(Debug)]
+pub(crate) enum DeferredForResourceExpressionError {
+    UndefinedIterable(ParseError),
+    Unsupported {
+        file: Option<String>,
+        error: Box<DeferredForBodyUnsupportedError>,
+    },
+}
+
+/// Parser-side typestate for a deferred `for` expression.
+///
+/// Unlike [`DeferredForExpression`], this representation is deliberately not
+/// serializable and may contain a read or module-call template. The module
+/// resolver consumes it after all module argument substitution and produces
+/// the resource-only resolved representation.
+#[derive(Debug, Clone)]
+pub struct ParsedDeferredForExpression<B: BindingAddress = RelativeBindingName> {
+    /// Full source path, stamped by the directory loader.
+    pub file: Option<String>,
+    /// Source line of the `for` keyword.
+    pub line: usize,
+    /// Exact authored span of the complete `for` expression.
+    pub span: SourceSpan,
+    /// Canonically rendered loop header, for example `for item in names`.
+    pub header: String,
+    pub target: DeferredForTarget<B>,
+    pub iterable: Value<B>,
+    pub(crate) iterable_state: ParsedDeferredForIterableState,
+    pub binding: ForBinding,
+    pub body: DeferredForBody<B>,
+}
+
+impl<B: BindingAddress> ParsedDeferredForExpression<B> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
+        self.site().root_bindings()
+    }
+
+    pub fn site(&self) -> DeferredForSite<'_, B> {
+        DeferredForSite {
+            file: self.file.as_deref(),
+            line: self.line,
+            header: &self.header,
+            binding: &self.binding,
+            iterable: &self.iterable,
+        }
+    }
+
+    /// The one typed construction point for a bare undefined deferred
+    /// iterable diagnostic. Static identifier validation and the final
+    /// module-resolution conversion both consume this value, so they cannot
+    /// drift in variant, suggestion, source path, or authored span.
+    pub(crate) fn undefined_iterable_error(&self, known_bindings: &[String]) -> Option<ParseError> {
+        let ParsedDeferredForIterableState::UndefinedIdentifier { name } = &self.iterable_state
+        else {
+            return None;
+        };
+        let error = ParseError::undefined_deferred_iterable(
+            name.clone(),
+            self.line,
+            known_bindings.to_vec(),
+            self.span,
+        );
+        Some(match &self.file {
+            Some(path) => error.in_file(path),
+            None => error,
+        })
+    }
+
+    pub(crate) fn into_resource_expression(
+        self,
+        known_bindings: &[String],
+    ) -> Result<DeferredForExpression<ModuleSource, B>, DeferredForResourceExpressionError> {
+        if let Some(error) = self.undefined_iterable_error(known_bindings) {
+            return Err(DeferredForResourceExpressionError::UndefinedIterable(error));
+        }
+        let Self {
+            file,
+            line,
+            span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        } = self;
+        debug_assert!(matches!(
+            iterable_state,
+            ParsedDeferredForIterableState::Deferred
+                | ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
+        ));
+        let iterable_resolution = if matches!(
+            iterable_state,
+            ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
+        ) || super::functions::contains_module_argument(&iterable)
+        {
+            DeferredForIterableResolution::DependsOnEnclosingModuleArgument
+        } else {
+            match &iterable {
+                Value::Concrete(_) => {
+                    DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+                }
+                Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
+            }
+        };
+        let template_resource = match body {
+            DeferredForBody::Resource(resource) => *resource,
+            DeferredForBody::Read(data_source) => {
+                return Err(DeferredForResourceExpressionError::Unsupported {
+                    file,
+                    error: Box::new(DeferredForBodyUnsupportedError {
+                        line,
+                        header,
+                        body: DeferredForBodyKind::Read {
+                            resource_type: data_source.id.display_type(),
+                        },
+                        span,
+                        iterable_resolution,
+                    }),
+                });
+            }
+            DeferredForBody::ModuleCall(call) => {
+                return Err(DeferredForResourceExpressionError::Unsupported {
+                    file,
+                    error: Box::new(DeferredForBodyUnsupportedError {
+                        line,
+                        header,
+                        body: DeferredForBodyKind::ModuleCall {
+                            name: call.module_name,
+                        },
+                        span,
+                        iterable_resolution,
+                    }),
+                });
+            }
+        };
+        let resource_type = if template_resource.id.provider.is_empty() {
+            template_resource.id.resource_type.clone()
+        } else {
+            format!(
+                "{}.{}",
+                template_resource.id.provider, template_resource.id.resource_type
+            )
+        };
+        let attributes = template_resource.attributes.clone().into_iter().collect();
+        Ok(DeferredForExpression {
+            file,
+            line,
+            header,
+            resource_type,
+            attributes,
+            target,
+            iterable,
+            binding,
+            template_resource,
+        })
+    }
+}
+
+impl ParsedDeferredForExpression<RelativeBindingName> {
+    pub(crate) fn resolve_bindings(
+        self,
+        resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
+    ) -> ParsedDeferredForExpression<AbsoluteBindingAddress> {
+        let Self {
+            file,
+            line,
+            span,
+            header,
+            target,
+            iterable,
+            iterable_state,
+            binding,
+            body,
+        } = self;
+        ParsedDeferredForExpression {
+            file,
+            line,
+            span,
+            header,
+            target: match target {
+                DeferredForTarget::Bound { binding } => DeferredForTarget::Bound {
+                    binding: resolve(binding),
+                },
+                DeferredForTarget::Unbound { template } => DeferredForTarget::Unbound { template },
+            },
+            iterable: iterable.resolve_bindings(resolve),
+            iterable_state,
+            binding,
+            body: match body {
+                DeferredForBody::Resource(resource) => {
+                    DeferredForBody::Resource(Box::new(resource.resolve_bindings(resolve)))
+                }
+                DeferredForBody::Read(data_source) => {
+                    DeferredForBody::Read(Box::new(data_source.resolve_bindings(resolve)))
+                }
+                DeferredForBody::ModuleCall(call) => {
+                    DeferredForBody::ModuleCall(call.resolve_bindings(resolve))
+                }
+            },
+        }
+    }
+}
+
+/// Phase-neutral, read-only metadata for a deferred `for` expression.
+///
+/// Before module resolution this borrows the parser-side typed entry; after
+/// the resolution seam it borrows the resource-only entry. The loop body is
+/// intentionally absent so downstream crates cannot bypass the resolved body
+/// typestate.
+#[derive(Debug, Clone, Copy)]
+pub struct DeferredForSite<'a, B: BindingAddress> {
+    pub file: Option<&'a str>,
+    pub line: usize,
+    pub header: &'a str,
+    pub binding: &'a ForBinding,
+    pub iterable: &'a Value<B>,
+}
+
+impl<B: BindingAddress> DeferredForSite<'_, B> {
+    pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
+        self.iterable.root_bindings()
+    }
 }
 
 pub type SavedDeferredForExpression =
@@ -302,6 +565,7 @@ mod deferred_template_resource_serde {
             id,
             attributes,
             directives,
+            resolved_ignore_changes: Default::default(),
             prefixes,
             binding,
             dependency_bindings,
@@ -317,7 +581,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, B> {
     /// Every binding that can affect the iterable, including references in a
     /// coalesce fallback.
     pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
-        self.iterable.root_bindings()
+        self.site().root_bindings()
     }
 
     /// Every direct reference spelling that may contribute the iterable.
@@ -408,65 +672,100 @@ impl ShapeMismatch {
     }
 }
 
-/// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
+/// Origin of a resource yielded by [`File::iter_all_resources`].
 ///
 /// `Direct` means the resource was declared at top-level and its iterable
-/// (if any) resolved at parse time. `Deferred` means the resource is the
-/// template body of a `for` expression whose iterable resolves later;
-/// consumers that care about loop-variable placeholders need the
-/// `DeferredForExpression` reference to filter them out.
+/// (if any) resolved at parse time. `Deferred` carries the phase-specific
+/// loop expression: parser files expose [`ParsedDeferredForExpression`], and
+/// module-resolved files expose [`DeferredForExpression`].
 #[derive(Debug)]
-pub enum ResourceContext<'a, S = ModuleSource, B: BindingAddress = RelativeBindingName> {
+pub enum ResourceContext<
+    'a,
+    S: 'a = ModuleSource,
+    B: BindingAddress = AbsoluteBindingAddress,
+    D: DeferredForPhaseTraversal<B> = ResolvedDeferredForPhase<B>,
+> {
     Direct,
-    Deferred(&'a DeferredForExpression<S, B>),
+    Deferred(D::DeferredRef<'a, S>),
 }
 
 /// A resource yielded by [`File::iter_all_resources`], discriminated by
 /// its typestate arm.
 ///
-/// Part of the carina#3181 resource typestate split. The three typed
-/// arms borrow from `File`'s typed slices ([`File::resources`] managed
-/// rows, [`File::compositions`], [`File::data_sources`]); the
-/// `Deferred` arm is a `for`-expression template body that still lives
-/// as a legacy [`Resource`] in [`File::deferred_for_expressions`].
+/// Part of the carina#3181 resource typestate split. The top-level arms borrow
+/// from [`File::resources`], [`File::compositions`], and
+/// [`File::data_sources`]. The deferred arm borrows the managed-resource
+/// template and the phase-specific loop expression.
 ///
-/// Read-only consumers reach the shared accessors via
-/// [`ResourceRef::as_resource_like`] (or the `id` / `attributes` /
-/// `binding` passthroughs); callers that branch on the kind match the
-/// enum arm directly.
+/// Read-only consumers use the `id`, `attributes`, and `binding` passthroughs;
+/// callers that branch on the kind match the enum arm directly.
 #[derive(Debug)]
-pub enum ResourceRef<'a, S = ModuleSource, B: BindingAddress = RelativeBindingName> {
+pub enum ResourceRef<
+    'a,
+    S: 'a = ModuleSource,
+    B: BindingAddress = AbsoluteBindingAddress,
+    D: DeferredForPhaseTraversal<B> = ResolvedDeferredForPhase<B>,
+> {
     /// A top-level resource.
     Resource(&'a Resource<S, B>),
     /// A top-level composition (module-expansion synthetic node).
     LiveComposition(&'a LiveComposition<B>),
     /// A top-level data source (`read`-keyword resource).
     DataSource(&'a DataSource<S, B>),
-    /// The template body of a deferred `for` expression — always a
-    /// resource (`for` bodies never carry `read` / composition).
+    /// The managed-resource body of a deferred `for` expression. The
+    /// `deferred` field's type is selected by `D`, so a resolved file cannot
+    /// name or yield a parser-side loop body.
     Deferred {
         resource: &'a Resource<S, B>,
-        deferred: &'a DeferredForExpression<S, B>,
+        deferred: D::DeferredRef<'a, S>,
     },
 }
 
-impl<S, B: BindingAddress> Copy for ResourceContext<'_, S, B> {}
+/// Mutable counterpart of [`ResourceRef`] used by whole-file resource
+/// transformations. The resolved deferred arm also exposes its denormalized
+/// attribute projection so callers can keep it synchronized after mutation.
+#[derive(Debug)]
+pub enum ResourceMut<
+    'a,
+    B: BindingAddress = AbsoluteBindingAddress,
+    D: DeferredForPhaseTraversal<B> = ResolvedDeferredForPhase<B>,
+> {
+    Resource(&'a mut Resource<ModuleSource, B>),
+    LiveComposition(&'a mut LiveComposition<B>),
+    DataSource(&'a mut DataSource<ModuleSource, B>),
+    Deferred {
+        resource: &'a mut Resource<ModuleSource, B>,
+        attributes: D::DeferredAttributesMut<'a>,
+    },
+}
 
-impl<S, B: BindingAddress> Clone for ResourceContext<'_, S, B> {
+impl<'a, S: 'a, B: BindingAddress, D: DeferredForPhaseTraversal<B>> Copy
+    for ResourceContext<'a, S, B, D>
+{
+}
+
+impl<'a, S: 'a, B: BindingAddress, D: DeferredForPhaseTraversal<B>> Clone
+    for ResourceContext<'a, S, B, D>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<S, B: BindingAddress> Copy for ResourceRef<'_, S, B> {}
+impl<'a, S: 'a, B: BindingAddress, D: DeferredForPhaseTraversal<B>> Copy
+    for ResourceRef<'a, S, B, D>
+{
+}
 
-impl<S, B: BindingAddress> Clone for ResourceRef<'_, S, B> {
+impl<'a, S: 'a, B: BindingAddress, D: DeferredForPhaseTraversal<B>> Clone
+    for ResourceRef<'a, S, B, D>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
+impl<'a, S: 'a, B: BindingAddress, D: DeferredForPhaseTraversal<B>> ResourceRef<'a, S, B, D> {
     pub(crate) fn managed_resource(&self) -> Option<&'a Resource<S, B>> {
         match self {
             Self::Resource(resource) | Self::Deferred { resource, .. } => Some(resource),
@@ -480,14 +779,16 @@ impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
             Self::Resource(_) | Self::LiveComposition(_) | Self::Deferred { .. } => None,
         }
     }
-
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
         match self {
             ResourceRef::Resource(r) => &r.id,
             ResourceRef::LiveComposition(v) => &v.id,
             ResourceRef::DataSource(d) => &d.id,
-            ResourceRef::Deferred { resource, .. } => &resource.id,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.id,
         }
     }
 
@@ -497,10 +798,9 @@ impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
     /// [`LiveComposition`] stores its attributes typed as
     /// [`LiveCompositionAttribute`](crate::resource::LiveCompositionAttribute)
     /// since #3294, and must materialize a `Value`-typed view on
-    /// demand. The other three variants ([`Resource`],
-    /// [`DataSource`], [`Deferred`](Self::Deferred)) return a borrowed
-    /// reference. Callers `.iter()` / `.contains_key()` / `.get()`
-    /// through the `Cow` directly via `Deref`.
+    /// demand. Every other variant returns a borrowed reference. Callers
+    /// `.iter()` / `.contains_key()` / `.get()` through the `Cow` directly
+    /// via `Deref`.
     pub fn attributes(&self) -> std::borrow::Cow<'a, IndexMap<String, Value<B>>> {
         match self {
             ResourceRef::Resource(r) => std::borrow::Cow::Borrowed(&r.attributes),
@@ -512,9 +812,10 @@ impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
                     .collect(),
             ),
             ResourceRef::DataSource(d) => std::borrow::Cow::Borrowed(&d.attributes),
-            ResourceRef::Deferred { resource, .. } => {
-                std::borrow::Cow::Borrowed(&resource.attributes)
-            }
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => std::borrow::Cow::Borrowed(&resource.attributes),
         }
     }
 
@@ -530,6 +831,16 @@ impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
         }
     }
 
+    /// Typed `let` binding address, preserving the file's binding phase.
+    pub(crate) fn binding_address(&self) -> Option<&'a B> {
+        match self {
+            ResourceRef::Resource(r) => r.binding.as_ref(),
+            ResourceRef::LiveComposition(v) => v.binding.as_ref(),
+            ResourceRef::DataSource(d) => d.binding.as_ref(),
+            ResourceRef::Deferred { resource, .. } => resource.binding.as_ref(),
+        }
+    }
+
     /// Binding names this resource depends on (via `ResourceRef` /
     /// `BindingRef` values in its attribute tree).
     ///
@@ -541,7 +852,10 @@ impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
             ResourceRef::Resource(r) => &r.dependency_bindings,
             ResourceRef::LiveComposition(v) => &v.dependency_bindings,
             ResourceRef::DataSource(d) => &d.dependency_bindings,
-            ResourceRef::Deferred { resource, .. } => &resource.dependency_bindings,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.dependency_bindings,
         }
     }
 
@@ -553,7 +867,10 @@ impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
             ResourceRef::Resource(r) => Some(&r.directives),
             ResourceRef::LiveComposition(_) => None,
             ResourceRef::DataSource(d) => Some(&d.directives),
-            ResourceRef::Deferred { resource, .. } => Some(&resource.directives),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => Some(&resource.directives),
         }
     }
 
@@ -563,17 +880,24 @@ impl<'a, S, B: BindingAddress> ResourceRef<'a, S, B> {
             ResourceRef::Resource(r) => &r.quoted_string_attrs,
             ResourceRef::LiveComposition(v) => &v.quoted_string_attrs,
             ResourceRef::DataSource(d) => &d.quoted_string_attrs,
-            ResourceRef::Deferred { resource, .. } => &resource.quoted_string_attrs,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.quoted_string_attrs,
         }
     }
 
-    /// The [`ResourceContext`] an old `iter_all_resources` caller would
-    /// have seen — `Deferred` for a for-expression template, `Direct`
-    /// otherwise.
-    pub fn context(&self) -> ResourceContext<'a, S, B> {
+    /// Source context for this resource: top-level, resolved deferred, or
+    /// parser-side deferred.
+    pub fn context(&self) -> ResourceContext<'a, S, B, D> {
         match self {
-            ResourceRef::Deferred { deferred, .. } => ResourceContext::Deferred(deferred),
-            _ => ResourceContext::Direct,
+            ResourceRef::Deferred {
+                resource: _resource,
+                deferred,
+            } => ResourceContext::Deferred(*deferred),
+            ResourceRef::Resource(_)
+            | ResourceRef::LiveComposition(_)
+            | ResourceRef::DataSource(_) => ResourceContext::Direct,
         }
     }
 
@@ -672,53 +996,9 @@ pub enum TypeExpr {
     /// additions (`String | Int`, nullable types via `T | none`) drop
     /// in without another structural change. See carina-rs/carina#2611.
     Union(Vec<TypeExpr>),
-    /// Sentinel used when no sound static type is available.
-    ///
-    /// Export type inference in `infer_export_params` produces this for both
-    /// non-inferable exports and failed inferences. Failures are reported
-    /// separately with the export's index, while non-inferable values retain
-    /// this sentinel for later existence-only validation.
-    /// `resolve_file_type_exprs_or_unknown` also produces it when upstream
-    /// export discovery encounters a type the consumer's provider context
-    /// cannot name. Deferred-iterable validation uses `List(Unknown)` /
-    /// `Map(Unknown)` as an element-type placeholder.
-    ///
-    /// Consumers treat it as "do not type-check": value type checking accepts
-    /// any value when `Unknown` is expected, `inferred_type_fits` treats it as
-    /// a wildcard in the expected position, and export-reference validation
-    /// checks existence without comparing types. It does not satisfy a
-    /// concrete expectation when it is the inferred actual type. Accessing
-    /// `.` or `[]` on an unknown base is still an inference error. See #2360
-    /// stage 2. #4093 tracks removing this variant.
-    Unknown,
 }
 
 impl TypeExpr {
-    /// Project away the [`TypeExpr::Unknown`] sentinel: returns
-    /// `Some(self)` for any concrete type, `None` for `Unknown`. Used
-    /// when a downstream consumer has no use for sentinel-bearing
-    /// entries (plan display, upstream-export forwarding) and prefers
-    /// the legacy "no static type" `None` shape.
-    pub fn into_known(self) -> Option<TypeExpr> {
-        match self {
-            TypeExpr::Unknown => None,
-            TypeExpr::String
-            | TypeExpr::Bool
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Duration
-            | TypeExpr::Simple(_)
-            | TypeExpr::List(_)
-            | TypeExpr::Map(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Struct { .. }
-            | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_) => Some(self),
-        }
-    }
-
     /// True when this `TypeExpr` represents a string-shaped value at
     /// runtime: bare `String`, a `Simple` named identity (typically a
     /// string-base custom like `AwsAccountId`), or a `SchemaType`
@@ -777,7 +1057,6 @@ impl std::fmt::Display for TypeExpr {
                 }
                 Ok(())
             }
-            TypeExpr::Unknown => write!(f, "<unknown>"),
         }
     }
 }
@@ -797,15 +1076,18 @@ mod type_expr_display_tests {
 
 /// Argument parameter definition (in `arguments { ... }` block)
 #[derive(Debug, Clone)]
-pub struct ArgumentParameter<B: BindingAddress = RelativeBindingName> {
+pub struct ArgumentParameter<T = TypeExpr, B: BindingAddress = RelativeBindingName> {
     pub name: String,
-    pub type_expr: TypeExpr,
+    pub static_type: T,
     pub default: Option<Value<B>>,
     /// Optional description (from block form)
     pub description: Option<String>,
     /// Optional validation blocks (from block form). Multiple blocks are allowed.
     pub validations: Vec<ValidationBlock<B>>,
 }
+
+pub type ConsumerArgumentParameter<B = RelativeBindingName> =
+    ArgumentParameter<ConsumerStaticType, B>;
 
 /// A validate block: `validation { condition = <expr> error_message = "..." }`
 #[derive(Debug, Clone)]
@@ -995,14 +1277,14 @@ impl<B: BindingAddress> RequireBlock<B> {
 
 /// Attribute parameter definition (in `attributes { ... }` block)
 #[derive(Debug, Clone)]
-pub struct AttributeParameter<B: BindingAddress = RelativeBindingName> {
+pub struct AttributeParameter<T = TypeExpr, B: BindingAddress = RelativeBindingName> {
     pub name: String,
-    pub type_expr: Option<TypeExpr>,
+    pub static_type: Option<T>,
     pub value: Option<Value<B>>,
     source: DeclarationSource,
 }
 
-impl<B: BindingAddress> AttributeParameter<B> {
+impl<B: BindingAddress> AttributeParameter<TypeExpr, B> {
     pub(crate) fn new_in_source(
         name: String,
         type_expr: Option<TypeExpr>,
@@ -1012,7 +1294,7 @@ impl<B: BindingAddress> AttributeParameter<B> {
     ) -> Self {
         Self {
             name,
-            type_expr,
+            static_type: type_expr,
             value,
             source: DeclarationSource::authored(source_span, source_file),
         }
@@ -1042,17 +1324,31 @@ impl<B: BindingAddress> AttributeParameter<B> {
     }
 }
 
+impl<T, B: BindingAddress> AttributeParameter<T, B> {
+    pub(crate) fn map_type_expr<U>(self, map: impl FnOnce(T) -> U) -> AttributeParameter<U, B> {
+        AttributeParameter {
+            name: self.name,
+            static_type: self.static_type.map(map),
+            value: self.value,
+            source: self.source,
+        }
+    }
+}
+
+pub type ConsumerAttributeParameter<B = RelativeBindingName> =
+    AttributeParameter<ConsumerStaticType, B>;
+
 /// An export parameter in an `exports { }` block, as produced by the
 /// parser before any inference runs.
 ///
-/// `type_expr` is `Option<TypeExpr>` here because the user may have
+/// `static_type` is optional here because the user may have
 /// omitted the annotation. The loader then runs `apply_inference`
 /// (#2360 stage 2) to resolve the effective type and emits
 /// [`InferredExportParam`] downstream.
 #[derive(Debug, Clone)]
 pub struct ParsedExportParam<B: BindingAddress = RelativeBindingName> {
     pub name: String,
-    pub type_expr: Option<TypeExpr>,
+    pub static_type: Option<TypeExpr>,
     pub value: Option<Value<B>>,
     source: DeclarationSource,
 }
@@ -1067,7 +1363,7 @@ impl<B: BindingAddress> ParsedExportParam<B> {
     ) -> Self {
         Self {
             name,
-            type_expr,
+            static_type: type_expr,
             value,
             source: DeclarationSource::authored(source_span, source_file),
         }
@@ -1101,17 +1397,17 @@ impl<B: BindingAddress> PartialEq for ParsedExportParam<B> {
     fn eq(&self, other: &Self) -> bool {
         let Self {
             name,
-            type_expr,
+            static_type,
             value,
             source: _,
         } = self;
         let Self {
             name: other_name,
-            type_expr: other_type_expr,
+            static_type: other_static_type,
             value: other_value,
             source: _,
         } = other;
-        name == other_name && type_expr == other_type_expr && value == other_value
+        name == other_name && static_type == other_static_type && value == other_value
     }
 }
 
@@ -1146,6 +1442,7 @@ pub trait ExportParamLike {
     /// the same trait.
     fn type_expr_opt(&self) -> Option<&TypeExpr>;
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr>;
+    fn inference_failed(&self) -> bool;
 }
 
 impl<B: BindingAddress> ExportParamLike for ParsedExportParam<B> {
@@ -1161,10 +1458,13 @@ impl<B: BindingAddress> ExportParamLike for ParsedExportParam<B> {
         self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
-        self.type_expr.as_ref()
+        self.static_type.as_ref()
     }
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
-        self.type_expr.as_mut()
+        self.static_type.as_mut()
+    }
+    fn inference_failed(&self) -> bool {
+        false
     }
 }
 
@@ -2722,17 +3022,12 @@ pub struct WaitBinding<B: BindingAddress = RelativeBindingName> {
 
 /// An export parameter as seen post-inference (#2360 stage 2).
 ///
-/// `type_expr` is bare `TypeExpr` because every export carries a
-/// definitive type by construction: the loader runs `apply_inference`
-/// after parse + resolve, which fills in either the user's annotation,
-/// the rhs-inferred type, or the [`TypeExpr::Unknown`] sentinel for
-/// failed or deferred inference (paired with an entry in
-/// `LoadedConfig.inference_errors` when inference produced a reportable
-/// failure).
+/// `static_type` retains whether the effective type came from an annotation or
+/// rhs inference, plus any typed reason why checking is unavailable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferredExportParam<B: BindingAddress = RelativeBindingName> {
     pub name: String,
-    pub type_expr: TypeExpr,
+    pub static_type: ExportStaticType,
     pub value: Option<Value<B>>,
 }
 
@@ -2757,10 +3052,24 @@ impl<B: BindingAddress> ExportParamLike for InferredExportParam<B> {
         self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
-        Some(&self.type_expr)
+        self.static_type.known()
     }
     fn type_expr_opt_mut(&mut self) -> Option<&mut TypeExpr> {
-        Some(&mut self.type_expr)
+        match &mut self.static_type {
+            ExportStaticType::Declared(type_expr) => Some(type_expr),
+            ExportStaticType::Inferred(crate::static_type::StaticType::Known(type_expr)) => {
+                Some(type_expr)
+            }
+            ExportStaticType::Inferred(crate::static_type::StaticType::Unchecked(_reason)) => None,
+        }
+    }
+    fn inference_failed(&self) -> bool {
+        matches!(
+            self.static_type,
+            ExportStaticType::Inferred(crate::static_type::StaticType::Unchecked(
+                crate::static_type::InferredUncheckedReason::InferenceFailed(_)
+            ))
+        )
     }
 }
 
@@ -2787,13 +3096,13 @@ impl ResolveExportBindingPhase for ParsedExportParam<RelativeBindingName> {
     ) -> Self::Absolute {
         let Self {
             name,
-            type_expr,
+            static_type,
             value,
             source,
         } = self;
         ParsedExportParam {
             name,
-            type_expr,
+            static_type,
             value: value.map(|value| value.resolve_bindings(resolve)),
             source,
         }
@@ -2822,12 +3131,12 @@ impl ResolveExportBindingPhase for InferredExportParam<RelativeBindingName> {
     ) -> Self::Absolute {
         let Self {
             name,
-            type_expr,
+            static_type,
             value,
         } = self;
         InferredExportParam {
             name,
-            type_expr,
+            static_type,
             value: value.map(|value| value.resolve_bindings(resolve)),
         }
     }
@@ -3083,20 +3392,321 @@ impl ParsedBindingUses<RelativeBindingName> {
     }
 }
 
-/// Parse result, generic over the export-parameter shape.
+/// Deferred-loop bodies before the module-resolution seam.
+#[derive(Debug, Clone)]
+pub struct ParsedDeferredForPhase<B: BindingAddress = RelativeBindingName> {
+    pub(crate) expressions: Vec<ParsedDeferredForExpression<B>>,
+}
+
+impl<B: BindingAddress> Default for ParsedDeferredForPhase<B> {
+    fn default() -> Self {
+        Self {
+            expressions: Vec::new(),
+        }
+    }
+}
+
+/// Resource-only deferred loops carried by a finalized file.
+///
+/// This collection can contain only [`DeferredForExpression`] values, so its
+/// public transformations cannot reintroduce parser-side module-call, data
+/// source, or invalid bodies. Module resolution creates it while finalizing a
+/// [`File`] into [`ResolvedDeferredForPhase`]; later phases may move, filter,
+/// or append already-finalized expressions.
+///
+/// Production callers outside `carina-core` cannot append an arbitrary loop
+/// and thereby bypass the finalization seam:
+///
+/// ```compile_fail,E0599
+/// use carina_core::parser::{DeferredForExpression, ResolvedDeferredForExpressions};
+///
+/// fn bypass_finalization(
+///     expressions: &mut ResolvedDeferredForExpressions,
+///     unchecked: DeferredForExpression,
+/// ) {
+///     expressions.push(unchecked);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ResolvedDeferredForExpressions<B: BindingAddress = AbsoluteBindingAddress>(
+    Vec<DeferredForExpression<ModuleSource, B>>,
+);
+
+impl<B: BindingAddress> ResolvedDeferredForExpressions<B> {
+    pub fn as_slice(&self) -> &[DeferredForExpression<ModuleSource, B>] {
+        &self.0
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, DeferredForExpression<ModuleSource, B>> {
+        self.0.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, DeferredForExpression<ModuleSource, B>> {
+        self.0.iter_mut()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn empty_like(&self) -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn partition(
+        self,
+        mut predicate: impl FnMut(&DeferredForExpression<ModuleSource, B>) -> bool,
+    ) -> (Self, Self) {
+        let (selected, retained) = self.0.into_iter().partition(|item| predicate(item));
+        (Self(selected), Self(retained))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn from_expressions_for_test(
+        expressions: impl IntoIterator<Item = DeferredForExpression<ModuleSource, B>>,
+    ) -> Self {
+        Self(expressions.into_iter().collect())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn pop(&mut self) -> Option<DeferredForExpression<ModuleSource, B>> {
+        self.0.pop()
+    }
+
+    pub(crate) fn remove(&mut self, index: usize) -> DeferredForExpression<ModuleSource, B> {
+        self.0.remove(index)
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// Move an already-finalized collection into this finalized collection.
+    ///
+    /// External crates cannot construct either collection or append an
+    /// individual expression, so this operation preserves the module-
+    /// resolution finalization proof carried by both values.
+    pub fn append_finalized(&mut self, other: Self) {
+        self.extend(other);
+    }
+}
+
+impl<B: BindingAddress> std::ops::Index<usize> for ResolvedDeferredForExpressions<B> {
+    type Output = DeferredForExpression<ModuleSource, B>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl<B: BindingAddress> std::ops::Deref for ResolvedDeferredForExpressions<B> {
+    type Target = [DeferredForExpression<ModuleSource, B>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<B: BindingAddress> IntoIterator for ResolvedDeferredForExpressions<B> {
+    type Item = DeferredForExpression<ModuleSource, B>;
+    type IntoIter = std::vec::IntoIter<DeferredForExpression<ModuleSource, B>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, B: BindingAddress> IntoIterator for &'a ResolvedDeferredForExpressions<B> {
+    type Item = &'a DeferredForExpression<ModuleSource, B>;
+    type IntoIter = std::slice::Iter<'a, DeferredForExpression<ModuleSource, B>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+/// Deferred-loop phase reached only by module-resolution finalization.
+///
+/// A [`File`] can change from [`ParsedDeferredForPhase`] to
+/// `ResolvedDeferredForPhase` only through the finalization seam, which
+/// converts every supported resource body and rejects every unsupported or
+/// invalid body. The resulting collection remains mutable, but its element
+/// type permits only resource deferred loops.
+#[derive(Debug, Clone)]
+pub struct ResolvedDeferredForPhase<B: BindingAddress = AbsoluteBindingAddress> {
+    pub(crate) expressions: ResolvedDeferredForExpressions<B>,
+}
+
+impl<B: BindingAddress> Default for ResolvedDeferredForPhase<B> {
+    fn default() -> Self {
+        Self {
+            expressions: ResolvedDeferredForExpressions(Vec::new()),
+        }
+    }
+}
+
+mod deferred_for_phase_private {
+    pub trait Sealed {}
+}
+
+/// Sealed traversal implemented by the two deferred-loop phases.
+///
+/// The explicit phase implementations keep whole-file resource walks
+/// exhaustive while allowing phase-agnostic validators to preserve the
+/// caller's typestate.
+#[doc(hidden)]
+pub trait DeferredForPhaseTraversal<B: BindingAddress>: deferred_for_phase_private::Sealed {
+    type DeferredRef<'a, S: 'a>: Copy;
+    type DeferredAttributesMut<'a>;
+
+    fn resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, B, Self>> + '_>
+    where
+        Self: Sized;
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, B, Self>> + '_>
+    where
+        Self: Sized;
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, B>> + '_>;
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str;
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize;
+
+    fn sync_deferred_attributes(
+        attributes: Self::DeferredAttributesMut<'_>,
+        resource: &Resource<ModuleSource, B>,
+    );
+}
+
+impl<B: BindingAddress> deferred_for_phase_private::Sealed for ParsedDeferredForPhase<B> {}
+
+impl<B: BindingAddress> DeferredForPhaseTraversal<B> for ParsedDeferredForPhase<B> {
+    type DeferredRef<'a, S: 'a> = &'a ParsedDeferredForExpression<B>;
+    type DeferredAttributesMut<'a> = ();
+
+    fn resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, B, Self>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .filter_map(|deferred| match &deferred.body {
+                    DeferredForBody::Resource(resource) => {
+                        Some(ResourceRef::Deferred { resource, deferred })
+                    }
+                    DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+    }
+
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, B, Self>> + '_> {
+        Box::new(
+            self.expressions
+                .iter_mut()
+                .filter_map(|deferred| match &mut deferred.body {
+                    DeferredForBody::Resource(resource) => Some(ResourceMut::Deferred {
+                        resource,
+                        attributes: (),
+                    }),
+                    DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
+                }),
+        )
+    }
+
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, B>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .map(ParsedDeferredForExpression::site),
+        )
+    }
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str {
+        &deferred.header
+    }
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize {
+        deferred.line
+    }
+
+    fn sync_deferred_attributes(
+        _attributes: Self::DeferredAttributesMut<'_>,
+        _resource: &Resource<ModuleSource, B>,
+    ) {
+    }
+}
+
+impl<B: BindingAddress> deferred_for_phase_private::Sealed for ResolvedDeferredForPhase<B> {}
+
+impl<B: BindingAddress> DeferredForPhaseTraversal<B> for ResolvedDeferredForPhase<B> {
+    type DeferredRef<'a, S: 'a> = &'a DeferredForExpression<S, B>;
+    type DeferredAttributesMut<'a> = &'a mut Vec<(String, Value<B>)>;
+
+    fn resource_refs(
+        &self,
+    ) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, B, Self>> + '_> {
+        Box::new(
+            self.expressions
+                .iter()
+                .map(|deferred| ResourceRef::Deferred {
+                    resource: &deferred.template_resource,
+                    deferred,
+                }),
+        )
+    }
+
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, B, Self>> + '_> {
+        Box::new(
+            self.expressions
+                .iter_mut()
+                .map(|deferred| ResourceMut::Deferred {
+                    resource: &mut deferred.template_resource,
+                    attributes: &mut deferred.attributes,
+                }),
+        )
+    }
+
+    fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_, B>> + '_> {
+        Box::new(self.expressions.iter().map(DeferredForExpression::site))
+    }
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str {
+        &deferred.header
+    }
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize {
+        deferred.line
+    }
+
+    fn sync_deferred_attributes(
+        attributes: Self::DeferredAttributesMut<'_>,
+        resource: &Resource<ModuleSource, B>,
+    ) {
+        *attributes = resource.attributes.clone().into_iter().collect();
+    }
+}
+
+/// Parse result, generic over the export-parameter and deferred-loop phases.
 ///
 /// Two phases share this struct via aliases (see [`ParsedFile`] and
 /// [`InferredFile`]): the parser produces `File<ParsedExportParam>`
-/// where `type_expr` is `Option<TypeExpr>`; the loader runs
-/// `apply_inference` and yields `File<InferredExportParam>` where every
-/// export's `type_expr` is bare. Every other field is identical between
+/// where `static_type` is an optional [`TypeExpr`]; the loader runs `apply_inference` and
+/// yields `File<InferredExportParam>` where every export carries its origin
+/// and unchecked reason. Every other field is identical between
 /// phases. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
 ///
 /// Bare-binding provenance is read-only outside the parser pipeline in
 /// production builds, so callers cannot erase it to bypass
 /// [`crate::validation::resolve_bare_binding_uses`].
 #[derive(Debug, Clone)]
-pub struct File<E, B: BindingAddress = RelativeBindingName> {
+pub struct File<E, B: BindingAddress = RelativeBindingName, D = ParsedDeferredForPhase<B>> {
     pub providers: Vec<ProviderConfig<B>>,
     /// Top-level managed infrastructure resources.
     pub resources: Vec<Resource<ModuleSource, B>>,
@@ -3110,9 +3720,9 @@ pub struct File<E, B: BindingAddress = RelativeBindingName> {
     /// Module calls (instantiations)
     pub module_calls: Vec<ModuleCall<B>>,
     /// Top-level argument parameters (directory-based module style)
-    pub arguments: Vec<ArgumentParameter<B>>,
+    pub arguments: Vec<ArgumentParameter<TypeExpr, B>>,
     /// Top-level attribute parameters (directory-based module style)
-    pub attribute_params: Vec<AttributeParameter<B>>,
+    pub attribute_params: Vec<AttributeParameter<TypeExpr, B>>,
     /// Top-level export parameters (published to upstream_state consumers).
     /// Element type varies by phase — see [`ParsedExportParam`] / [`InferredExportParam`].
     pub export_params: Vec<E>,
@@ -3145,8 +3755,10 @@ pub struct File<E, B: BindingAddress = RelativeBindingName> {
     pub(crate) parsed_binding_uses: ParsedBindingUses<B>,
     /// Non-fatal warnings collected during parsing.
     pub warnings: Vec<ParseWarning>,
-    /// For-expressions whose iterables are unresolved; displayed as deferred in plan.
-    pub deferred_for_expressions: Vec<DeferredForExpression<ModuleSource, B>>,
+    /// Deferred-loop storage for this file's phase. Parser files carry
+    /// [`ParsedDeferredForExpression`] bodies; module-resolved files carry
+    /// only [`DeferredForExpression`] resource templates.
+    pub(crate) deferred_for_phase: D,
     /// Plan-scoped lineage of leaf nodes back to the composition call
     /// sites that produced them (#3306).
     ///
@@ -3161,20 +3773,46 @@ pub struct File<E, B: BindingAddress = RelativeBindingName> {
     pub expansion_trace: crate::resource::ExpansionTrace,
 }
 
-/// Parse-phase file: exports retain their `Option<TypeExpr>` shape.
-pub type ParsedFile = File<ParsedExportParam<RelativeBindingName>, RelativeBindingName>;
+/// Parse-phase file: exports retain their optional annotation shape.
+pub type ParsedFile = File<
+    ParsedExportParam<RelativeBindingName>,
+    RelativeBindingName,
+    ParsedDeferredForPhase<RelativeBindingName>,
+>;
 
-/// Parsed-export phase after every binding has crossed scope expansion.
-pub type ExpandedParsedFile = File<ExpandedParsedExportParam, AbsoluteBindingAddress>;
+/// Post-inference file: every export carries origin and unchecked provenance.
+pub type InferredFile = File<
+    InferredExportParam<RelativeBindingName>,
+    RelativeBindingName,
+    ParsedDeferredForPhase<RelativeBindingName>,
+>;
 
-/// Post-inference file: every export carries a bare [`TypeExpr`]
-/// (possibly [`TypeExpr::Unknown`] for inference failures).
-pub type InferredFile = File<InferredExportParam<RelativeBindingName>, RelativeBindingName>;
+/// A file that has crossed module resolution and whose deferred-loop bodies
+/// are resource-only by construction.
+pub type ModuleResolvedFile<E, B = AbsoluteBindingAddress> =
+    File<E, B, ResolvedDeferredForPhase<B>>;
 
-/// Inferred-export phase after every binding has crossed scope expansion.
-pub type ExpandedInferredFile = File<ExpandedInferredExportParam, AbsoluteBindingAddress>;
+/// Parse-export file after module resolution.
+pub type ModuleResolvedParsedFile =
+    ModuleResolvedFile<ExpandedParsedExportParam, AbsoluteBindingAddress>;
 
-impl<E, B: BindingAddress> Default for File<E, B> {
+/// Inferred-export file after module resolution.
+pub type ModuleResolvedInferredFile =
+    ModuleResolvedFile<ExpandedInferredExportParam, AbsoluteBindingAddress>;
+
+/// Parsed-export phase after every binding slot has crossed module/root
+/// expansion but before deferred-loop body finalization.
+pub type ExpandedParsedFile = File<
+    ExpandedParsedExportParam,
+    AbsoluteBindingAddress,
+    ParsedDeferredForPhase<AbsoluteBindingAddress>,
+>;
+
+/// Inferred-export phase after every binding and deferred body has crossed
+/// module/root expansion.
+pub type ExpandedInferredFile = ModuleResolvedInferredFile;
+
+impl<E> Default for File<E, RelativeBindingName, ParsedDeferredForPhase<RelativeBindingName>> {
     fn default() -> Self {
         Self {
             providers: Vec::new(),
@@ -3197,29 +3835,65 @@ impl<E, B: BindingAddress> Default for File<E, B> {
             parser_binding_metadata: ParserBindingMetadata::default(),
             parsed_binding_uses: ParsedBindingUses::default(),
             warnings: Vec::new(),
-            deferred_for_expressions: Vec::new(),
+            deferred_for_phase: ParsedDeferredForPhase::default(),
             expansion_trace: crate::resource::ExpansionTrace::new(),
         }
     }
 }
 
-impl<E: ResolveExportBindingPhase> File<E, RelativeBindingName> {
+impl<E, D: Default> Default for File<E, AbsoluteBindingAddress, D> {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            resources: Vec::new(),
+            data_sources: Vec::new(),
+            compositions: Vec::new(),
+            variables: IndexMap::new(),
+            uses: Vec::new(),
+            module_calls: Vec::new(),
+            arguments: Vec::new(),
+            attribute_params: Vec::new(),
+            export_params: Vec::new(),
+            backend: None,
+            state_blocks: Vec::new(),
+            user_functions: HashMap::new(),
+            upstream_states: Vec::new(),
+            wait_bindings: Vec::new(),
+            requires: Vec::new(),
+            structural_bindings: HashSet::new(),
+            parser_binding_metadata: ParserBindingMetadata::default(),
+            parsed_binding_uses: ParsedBindingUses::default(),
+            warnings: Vec::new(),
+            deferred_for_phase: D::default(),
+            expansion_trace: crate::resource::ExpansionTrace::new(),
+        }
+    }
+}
+
+impl<E: ResolveExportBindingPhase>
+    File<E, RelativeBindingName, ParsedDeferredForPhase<RelativeBindingName>>
+{
     pub(crate) fn resolve_root(
         self,
         scope: &crate::resource::RootScope,
-    ) -> File<E::Absolute, AbsoluteBindingAddress> {
+    ) -> File<E::Absolute, AbsoluteBindingAddress, ParsedDeferredForPhase<AbsoluteBindingAddress>>
+    {
         self.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
     #[cfg(feature = "test-support")]
-    pub fn resolve_root_for_test(self) -> File<E::Absolute, AbsoluteBindingAddress> {
+    pub fn resolve_root_for_test(
+        self,
+    ) -> File<E::Absolute, AbsoluteBindingAddress, ParsedDeferredForPhase<AbsoluteBindingAddress>>
+    {
         self.resolve_root(&crate::resource::RootScope::new())
     }
 
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> File<E::Absolute, AbsoluteBindingAddress> {
+    ) -> File<E::Absolute, AbsoluteBindingAddress, ParsedDeferredForPhase<AbsoluteBindingAddress>>
+    {
         let File {
             providers,
             resources,
@@ -3241,7 +3915,7 @@ impl<E: ResolveExportBindingPhase> File<E, RelativeBindingName> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
             expansion_trace,
         } = self;
 
@@ -3309,14 +3983,14 @@ impl<E: ResolveExportBindingPhase> File<E, RelativeBindingName> {
                 .map(|argument| {
                     let ArgumentParameter {
                         name,
-                        type_expr,
+                        static_type,
                         default,
                         description,
                         validations,
                     } = argument;
                     ArgumentParameter {
                         name,
-                        type_expr,
+                        static_type,
                         default: default.map(|value| value.resolve_bindings(resolve)),
                         description,
                         validations: validations
@@ -3342,13 +4016,13 @@ impl<E: ResolveExportBindingPhase> File<E, RelativeBindingName> {
                 .map(|attribute| {
                     let AttributeParameter {
                         name,
-                        type_expr,
+                        static_type,
                         value,
                         source,
                     } = attribute;
                     AttributeParameter {
                         name,
-                        type_expr,
+                        static_type,
                         value: value.map(|value| value.resolve_bindings(resolve)),
                         source,
                     }
@@ -3450,16 +4124,58 @@ impl<E: ResolveExportBindingPhase> File<E, RelativeBindingName> {
             parser_binding_metadata: parser_binding_metadata.resolve_bindings(resolve),
             parsed_binding_uses: parsed_binding_uses.resolve_bindings(resolve),
             warnings,
-            deferred_for_expressions: deferred_for_expressions
-                .into_iter()
-                .map(|deferred| deferred.resolve_bindings(resolve))
-                .collect(),
+            deferred_for_phase: ParsedDeferredForPhase {
+                expressions: deferred_for_phase
+                    .expressions
+                    .into_iter()
+                    .map(|deferred| deferred.resolve_bindings(resolve))
+                    .collect(),
+            },
             expansion_trace,
         }
     }
 }
 
-impl<E, B: BindingAddress> File<E, B> {
+impl<E, B: BindingAddress> File<E, B, ParsedDeferredForPhase<B>> {
+    /// Parser-side deferred loops awaiting the module-resolution body seam.
+    ///
+    /// This slice is empty after successful resolution. Body-specific
+    /// consumers must match every [`DeferredForBody`] variant explicitly;
+    /// resource consumers should use [`Self::iter_all_resources`].
+    pub fn parsed_deferred_for_expressions(&self) -> &[ParsedDeferredForExpression<B>] {
+        &self.deferred_for_phase.expressions
+    }
+
+    /// Deferred iterable sites whose identifier roots still require ordinary
+    /// scope checking. Bare undefined iterables are excluded by their private
+    /// parser state; their distinct typed diagnostic is owned by
+    /// [`crate::parser::check_identifier_scope`] or finalization, depending on
+    /// the pipeline.
+    pub fn deferred_for_scope_reference_sites(
+        &self,
+    ) -> impl Iterator<Item = DeferredForSite<'_, B>> {
+        self.deferred_for_phase
+            .expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    expression.iterable_state,
+                    ParsedDeferredForIterableState::Deferred
+                )
+            })
+            .map(ParsedDeferredForExpression::site)
+    }
+
+    pub(crate) fn parsed_deferred_for_expressions_mut(
+        &mut self,
+    ) -> &mut Vec<ParsedDeferredForExpression<B>> {
+        &mut self.deferred_for_phase.expressions
+    }
+
+    pub fn into_parsed_deferred_for_expressions(self) -> Vec<ParsedDeferredForExpression<B>> {
+        self.deferred_for_phase.expressions
+    }
+
     pub(crate) fn set_loop_binding_scope(
         &mut self,
         binding_scope: std::collections::BTreeSet<String>,
@@ -3475,27 +4191,45 @@ impl<E, B: BindingAddress> File<E, B> {
                 origin.set_binding_scope(std::sync::Arc::clone(&binding_scope));
             }
         }
-        for deferred in &mut self.deferred_for_expressions {
+        for deferred in &mut self.deferred_for_phase.expressions {
             deferred
                 .target
                 .set_loop_binding_scope(std::sync::Arc::clone(&binding_scope));
-            deferred
-                .template_resource
-                .loop_provenance
-                .set_binding_scope(std::sync::Arc::clone(&binding_scope));
+            match &mut deferred.body {
+                DeferredForBody::Resource(resource) => resource
+                    .loop_provenance
+                    .set_binding_scope(std::sync::Arc::clone(&binding_scope)),
+                DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => {}
+            }
         }
-    }
-
-    pub fn bare_binding_uses(&self) -> &ParsedBindingUses<B> {
-        &self.parsed_binding_uses
     }
 
     pub(crate) fn empty_with_parsed_binding_uses(
         parsed_binding_uses: ParsedBindingUses<B>,
     ) -> Self {
         Self {
+            providers: Vec::new(),
+            resources: Vec::new(),
+            data_sources: Vec::new(),
+            compositions: Vec::new(),
+            variables: IndexMap::new(),
+            uses: Vec::new(),
+            module_calls: Vec::new(),
+            arguments: Vec::new(),
+            attribute_params: Vec::new(),
+            export_params: Vec::new(),
+            backend: None,
+            state_blocks: Vec::new(),
+            user_functions: HashMap::new(),
+            upstream_states: Vec::new(),
+            wait_bindings: Vec::new(),
+            requires: Vec::new(),
+            structural_bindings: HashSet::new(),
+            parser_binding_metadata: ParserBindingMetadata::default(),
             parsed_binding_uses,
-            ..Self::default()
+            warnings: Vec::new(),
+            deferred_for_phase: ParsedDeferredForPhase::default(),
+            expansion_trace: crate::resource::ExpansionTrace::new(),
         }
     }
 
@@ -3524,7 +4258,7 @@ impl<E, B: BindingAddress> File<E, B> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
             expansion_trace,
         } = source;
 
@@ -3547,8 +4281,9 @@ impl<E, B: BindingAddress> File<E, B> {
         self.parser_binding_metadata.extend(parser_binding_metadata);
         self.parsed_binding_uses.extend(parsed_binding_uses);
         self.warnings.extend(warnings);
-        self.deferred_for_expressions
-            .extend(deferred_for_expressions);
+        self.deferred_for_phase
+            .expressions
+            .extend(deferred_for_phase.expressions);
         for (leaf, call_sites) in expansion_trace.leaf_to_call_sites {
             self.expansion_trace.record(leaf, call_sites);
         }
@@ -3557,20 +4292,18 @@ impl<E, B: BindingAddress> File<E, B> {
         }
     }
 
-    /// Transform only the export-param phase (`File<E>` → `File<B>`),
-    /// applying `f` to the export params and moving every other field
-    /// through unchanged.
+    /// Consume the parser-side deferred-loop phase and replace it with the
+    /// resource-only phase produced by module finalization.
     ///
-    /// This is the **single** place the "every non-export field passes
-    /// a phase change untouched" knowledge lives. The struct is
-    /// **destructured exhaustively** — the carina#3126 / carina#3061
-    /// compile-time forcing function for the *phase axis*: a new
-    /// `File<E>` field cannot compile until it is moved through here
-    /// too. Both [`relabel_export_phase`](crate::config_loader) (module
-    /// contribution → caller phase, export params asserted empty) and
-    /// `apply_inference` (parser → inferred, export params type-inferred)
-    /// delegate here instead of hand-listing every field each.
-    pub fn map_export_params<C>(self, f: impl FnOnce(Vec<E>) -> Vec<C>) -> File<C, B> {
+    /// This crate-private constructor is called only by the module resolver's
+    /// finalization seam. Returning an auxiliary value lets that seam collect
+    /// typed errors while constructing its scratch graph.
+    pub(crate) fn map_deferred_for_phase<T>(
+        self,
+        map: impl FnOnce(
+            Vec<ParsedDeferredForExpression<B>>,
+        ) -> (Vec<DeferredForExpression<ModuleSource, B>>, T),
+    ) -> (ModuleResolvedFile<E, B>, T) {
         let File {
             providers,
             resources,
@@ -3592,7 +4325,73 @@ impl<E, B: BindingAddress> File<E, B> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
+            expansion_trace,
+        } = self;
+        let (expressions, auxiliary) = map(deferred_for_phase.expressions);
+        (
+            File {
+                providers,
+                resources,
+                data_sources,
+                compositions,
+                variables,
+                uses,
+                module_calls,
+                arguments,
+                attribute_params,
+                export_params,
+                backend,
+                state_blocks,
+                user_functions,
+                upstream_states,
+                wait_bindings,
+                requires,
+                structural_bindings,
+                parser_binding_metadata,
+                parsed_binding_uses,
+                warnings,
+                deferred_for_phase: ResolvedDeferredForPhase {
+                    expressions: ResolvedDeferredForExpressions(expressions),
+                },
+                expansion_trace,
+            },
+            auxiliary,
+        )
+    }
+}
+
+impl<E, B: BindingAddress, D> File<E, B, D> {
+    pub fn bare_binding_uses(&self) -> &ParsedBindingUses<B> {
+        &self.parsed_binding_uses
+    }
+
+    /// Transform only the export-param phase (`File<E, B, D>` →
+    /// `File<C, B, D>`),
+    /// moving the deferred-loop phase through unchanged.
+    pub fn map_export_params<C>(self, f: impl FnOnce(Vec<E>) -> Vec<C>) -> File<C, B, D> {
+        let File {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            deferred_for_phase,
             expansion_trace,
         } = self;
 
@@ -3617,41 +4416,9 @@ impl<E, B: BindingAddress> File<E, B> {
             parser_binding_metadata,
             parsed_binding_uses,
             warnings,
-            deferred_for_expressions,
+            deferred_for_phase,
             expansion_trace,
         }
-    }
-
-    /// Iterate every resource reachable from the parsed file — the
-    /// top-level managed resources, composition resources, data sources, and
-    /// the `template_resource` of each deferred for-expression — each
-    /// wrapped in a typed [`ResourceRef`].
-    ///
-    /// Per-attribute checkers (type, enum, required, ref validity, etc.)
-    /// should prefer this over `self.resources.iter()` so they stay in sync
-    /// with for-body code. See
-    /// `notes/specs/2026-04-19-unify-resource-walk-design.md` for the
-    /// rationale.
-    ///
-    /// **carina#3181 PR C:** `self.resources` is now managed-only — the
-    /// parser, module expander, and deferred-for expansion write each
-    /// resource into exactly one of `resources` / `data_sources` /
-    /// `compositions`. The iterator chains the three typed slices
-    /// plus the deferred for-expression templates.
-    pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, B>> {
-        self.resources
-            .iter()
-            .map(ResourceRef::Resource)
-            .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
-            .chain(self.data_sources.iter().map(ResourceRef::DataSource))
-            .chain(
-                self.deferred_for_expressions
-                    .iter()
-                    .map(|d| ResourceRef::Deferred {
-                        resource: &d.template_resource,
-                        deferred: d,
-                    }),
-            )
     }
 
     /// Iterate the top-level resources — managed, composition, and data
@@ -3664,7 +4431,7 @@ impl<E, B: BindingAddress> File<E, B> {
     /// template would be a spurious entry.
     pub fn iter_top_level_resources(
         &self,
-    ) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, B>> {
+    ) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, B, ResolvedDeferredForPhase<B>>> {
         self.resources
             .iter()
             .map(ResourceRef::Resource)
@@ -3680,7 +4447,68 @@ impl<E, B: BindingAddress> File<E, B> {
             .map(|upstream| upstream.binding.as_str())
             .collect()
     }
+}
 
+impl<E, B: BindingAddress, D: DeferredForPhaseTraversal<B>> File<E, B, D> {
+    /// Iterate every resource reachable from the file, preserving the
+    /// deferred-loop phase in each deferred resource arm.
+    pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, B, D>> {
+        self.resources
+            .iter()
+            .map(ResourceRef::Resource)
+            .chain(self.compositions.iter().map(ResourceRef::LiveComposition))
+            .chain(self.data_sources.iter().map(ResourceRef::DataSource))
+            .chain(self.deferred_for_phase.resource_refs())
+    }
+
+    pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_, B, D>> {
+        self.resources
+            .iter_mut()
+            .map(ResourceMut::Resource)
+            .chain(
+                self.compositions
+                    .iter_mut()
+                    .map(ResourceMut::LiveComposition),
+            )
+            .chain(self.data_sources.iter_mut().map(ResourceMut::DataSource))
+            .chain(self.deferred_for_phase.resource_muts())
+    }
+
+    pub fn deferred_for_sites(&self) -> impl Iterator<Item = DeferredForSite<'_, B>> {
+        self.deferred_for_phase.sites()
+    }
+}
+
+impl<E, B: BindingAddress> File<E, B, ResolvedDeferredForPhase<B>> {
+    /// Resource-only deferred loops finalized by module resolution.
+    pub fn deferred_for_expressions(&self) -> &ResolvedDeferredForExpressions<B> {
+        &self.deferred_for_phase.expressions
+    }
+
+    /// Mutable resource-only deferred loops. The receiver's phase proves that
+    /// unsupported parser bodies have already been rejected.
+    pub fn deferred_for_expressions_mut(&mut self) -> &mut ResolvedDeferredForExpressions<B> {
+        &mut self.deferred_for_phase.expressions
+    }
+
+    pub fn take_deferred_for_expressions(&mut self) -> ResolvedDeferredForExpressions<B> {
+        let empty = self.deferred_for_phase.expressions.empty_like();
+        std::mem::replace(&mut self.deferred_for_phase.expressions, empty)
+    }
+
+    pub fn replace_deferred_for_expressions(
+        &mut self,
+        expressions: ResolvedDeferredForExpressions<B>,
+    ) -> ResolvedDeferredForExpressions<B> {
+        std::mem::replace(&mut self.deferred_for_phase.expressions, expressions)
+    }
+
+    pub fn into_deferred_for_expressions(self) -> ResolvedDeferredForExpressions<B> {
+        self.deferred_for_phase.expressions
+    }
+}
+
+impl<E, B: BindingAddress, D> File<E, B, D> {
     /// Every non-variable binding name declared in the file.
     ///
     /// This intentionally excludes `variables`: parser-side variables
@@ -3760,7 +4588,7 @@ impl<E, B: BindingAddress> File<E, B> {
     }
 }
 
-impl<E> File<E, AbsoluteBindingAddress> {
+impl<E> File<E, AbsoluteBindingAddress, ResolvedDeferredForPhase<AbsoluteBindingAddress>> {
     /// Expand deferred for-expressions against the resolved binding view.
     ///
     /// For each deferred for-expression whose iterable can now be resolved
@@ -3790,7 +4618,7 @@ impl<E> File<E, AbsoluteBindingAddress> {
         let mut mismatched_indices: Vec<usize> = Vec::new();
         let mut new_warnings: Vec<ParseWarning> = Vec::new();
 
-        for (idx, deferred) in self.deferred_for_expressions.iter().enumerate() {
+        for (idx, deferred) in self.deferred_for_phase.expressions.iter().enumerate() {
             let iterable_value =
                 match bindings
                     .resolve_value(&deferred.iterable)
@@ -3873,16 +4701,16 @@ impl<E> File<E, AbsoluteBindingAddress> {
         // Remove parse-time warnings for mismatched entries (the new
         // shape-mismatch warning replaces the generic "not yet available" one).
         for idx in &mismatched_indices {
-            let deferred = &self.deferred_for_expressions[*idx];
+            let deferred = &self.deferred_for_phase.expressions[*idx];
             retain_non_matching_deferred_for_warnings(&mut self.warnings, deferred);
         }
 
         // Remove resolved deferred entries (reverse order to preserve indices)
         for idx in resolved_indices.into_iter().rev() {
             // Also remove the corresponding warning
-            let deferred = &self.deferred_for_expressions[idx];
+            let deferred = &self.deferred_for_phase.expressions[idx];
             retain_non_matching_deferred_for_warnings(&mut self.warnings, deferred);
-            self.deferred_for_expressions.remove(idx);
+            self.deferred_for_phase.expressions.remove(idx);
         }
 
         // carina#3181: a deferred for-expression's `template_resource` is
@@ -4422,7 +5250,7 @@ mod substitute_placeholder_tests {
 
         parsed.arguments.push(ArgumentParameter {
             name: "argument_name".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: TypeExpr::String,
             default: None,
             description: None,
             validations: Vec::new(),
@@ -4533,7 +5361,7 @@ mod substitute_placeholder_tests {
             parser_binding_metadata: _,
             parsed_binding_uses: _,
             warnings: _,
-            deferred_for_expressions: _,
+            deferred_for_phase: _,
             expansion_trace: _,
         } = parsed;
     }
@@ -4643,13 +5471,22 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let deferred = &parsed.deferred_for_expressions[0];
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        let deferred = &parsed.deferred_for_expressions()[0];
         let children = expand_deferred_children(
             deferred,
-            &Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("alpha".into())),
-                Value::Concrete(ConcreteValue::String("beta".into())),
-            ])),
+            &crate::resource::ExpandedValue::Concrete(
+                crate::resource::ExpandedConcreteValue::List(vec![
+                    crate::resource::ExpandedValue::Concrete(
+                        crate::resource::ExpandedConcreteValue::String("alpha".into()),
+                    ),
+                    crate::resource::ExpandedValue::Concrete(
+                        crate::resource::ExpandedConcreteValue::String("beta".into()),
+                    ),
+                ]),
+            ),
             crate::resource::AccessMissPolicy::Error,
         )
         .expect("deferred children expand");
@@ -4720,7 +5557,10 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("deferred unbound loop parses");
-        let target = &parsed.deferred_for_expressions[0].target;
+        let parsed =
+            crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
+                .expect("deferred fixture crosses the module-resolution seam");
+        let target = &parsed.deferred_for_expressions()[0].target;
         let mut json = serde_json::to_value(target).expect("serialize deferred target");
         json["template"]["source"]
             .as_object_mut()

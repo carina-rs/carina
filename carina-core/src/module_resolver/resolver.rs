@@ -7,10 +7,13 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{
-    ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext, ResolveExportBindingPhase,
-    UseStatement,
+    LoadedProviderContext, ModuleCallDiagnosticSource, ModuleResolvedFile,
+    ModuleResolvedParsedFile, ParseError, ParsedDeferredForPhase, ParsedFile, ProviderContext,
+    ResolveExportBindingPhase, UseStatement,
 };
-use crate::resource::{AbsoluteBindingAddress, ModuleConstraintId, RelativeBindingName, RootScope};
+use crate::resource::{
+    AbsoluteBindingAddress, BindingAddress, ModuleConstraintId, RelativeBindingName, RootScope,
+};
 use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
@@ -74,7 +77,7 @@ pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 /// scratch graph that produced them.
 pub enum ModuleResolutionDiagnosticResult<E> {
     Expanded {
-        graph: Box<crate::parser::File<E, AbsoluteBindingAddress>>,
+        graph: Box<ModuleResolvedFile<E>>,
     },
     ConstraintFailed {
         findings: Vec<crate::validation::ModuleCallFinding>,
@@ -92,10 +95,18 @@ pub struct ResidualModuleResolutionError(Box<ModuleError>);
 /// Source-routing shape of a residual resolver error. Core classifies every
 /// [`ModuleError`] variant; editor adapters only map the resulting location.
 pub enum ResidualModuleResolutionDiagnostic<'a> {
-    Constraint { origin: &'a ConstraintOrigin },
-    ArgumentValueAccess { source_path: &'a str, line: usize },
+    Constraint {
+        origin: &'a ConstraintOrigin,
+    },
+    ArgumentValueAccess {
+        source_path: &'a str,
+        line: usize,
+    },
     ModuleCall,
-    Parse,
+    Parse {
+        source_path: Option<&'a Path>,
+        error: &'a ParseError,
+    },
 }
 
 impl ResidualModuleResolutionError {
@@ -123,6 +134,7 @@ impl ResidualModuleResolutionError {
 
     pub fn diagnostic(&self) -> Option<ResidualModuleResolutionDiagnostic<'_>> {
         match self.0.root_cause() {
+            ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::Constraint(diagnostic) => {
                 Some(ResidualModuleResolutionDiagnostic::Constraint {
                     origin: &diagnostic.origin,
@@ -137,11 +149,24 @@ impl ResidualModuleResolutionError {
                 source_path,
                 line: *line,
             }),
-            ModuleError::Parse(_error) => Some(ResidualModuleResolutionDiagnostic::Parse),
-            ModuleError::ParseInFile {
-                path: _path,
-                error: _error,
-            } => Some(ResidualModuleResolutionDiagnostic::Parse),
+            ModuleError::Parse(error) => match error {
+                ParseError::Located { path, error } => {
+                    Some(ResidualModuleResolutionDiagnostic::Parse {
+                        source_path: Some(path),
+                        error,
+                    })
+                }
+                error => Some(ResidualModuleResolutionDiagnostic::Parse {
+                    source_path: None,
+                    error,
+                }),
+            },
+            ModuleError::ParseInFile { path, error } => {
+                Some(ResidualModuleResolutionDiagnostic::Parse {
+                    source_path: Some(path),
+                    error,
+                })
+            }
             ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::CircularImport(_module) => None,
             ModuleError::Io(_error) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
@@ -205,6 +230,7 @@ impl ResidualModuleResolutionError {
     ) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
+            ModuleError::Multiple(_errors) => false,
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
                 self.finding_owns_error(finding)
                     && finding.message().covers_missing_argument(module, argument)
@@ -265,6 +291,13 @@ impl ResidualModuleResolutionError {
                     line: _,
                     span: _,
                 }
+                | ParseError::DeferredForBodyUnsupported(_)
+                | ParseError::DeferredForBodyTemplate {
+                    line: _,
+                    header: _,
+                    span: _,
+                    error: _,
+                }
                 | ParseError::UnresolvedDeclarationType {
                     token: _,
                     line: _,
@@ -298,6 +331,14 @@ impl ResidualModuleResolutionError {
                 | ParseError::UndefinedIdentifier {
                     name: _,
                     line: _,
+                    span: _,
+                    suggestion: _,
+                    in_scope: _,
+                }
+                | ParseError::UndefinedDeferredIterable {
+                    name: _,
+                    line: _,
+                    span: _,
                     suggestion: _,
                     in_scope: _,
                 }
@@ -354,6 +395,13 @@ fn without_covered_reference_type_members(
     findings: &[crate::validation::ModuleCallFinding],
 ) -> Option<ModuleError> {
     match error {
+        ModuleError::Multiple(errors) => ModuleError::from_errors(
+            errors
+                .into_vec()
+                .into_iter()
+                .filter_map(|error| without_covered_reference_type_members(error, findings))
+                .collect(),
+        ),
         ModuleError::OwnedByCalls { calls, error } => {
             without_covered_reference_type_members(*error, findings).map(|error| {
                 ModuleError::OwnedByCalls {
@@ -457,8 +505,13 @@ mod diagnostic_status_tests {
         let schemas = SchemaRegistry::new();
         let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
             .expect("parse directory fixture");
-        let result =
-            resolve_modules_with_diagnostics(&parsed, fixture.path(), &config, &schemas, &[]);
+        let result = resolve_modules_with_providerless_diagnostics(
+            &parsed,
+            fixture.path(),
+            &config,
+            &schemas,
+            &[],
+        );
 
         match result {
             ModuleResolutionDiagnosticResult::Expanded { graph } => panic!(
@@ -496,7 +549,10 @@ mod diagnostic_status_tests {
             crate::module_resolver::ResolvedModuleSignature {
                 arguments: vec![crate::parser::ArgumentParameter {
                     name: "required".to_string(),
-                    type_expr: crate::parser::TypeExpr::String,
+                    static_type: crate::validation::resolve_consumer_static_type_for_signature(
+                        &crate::parser::TypeExpr::String,
+                        &ProviderContext::default(),
+                    ),
                     default: None,
                     description: None,
                     validations: Vec::new(),
@@ -509,7 +565,7 @@ mod diagnostic_status_tests {
         let provider_context = ProviderContext::default();
         let binding_use_report = crate::validation::check_bare_binding_uses(
             &parsed,
-            &crate::validation::ValidationTypeContext::new(
+            &crate::validation::ValidationTypeContext::new_providerless(
                 &parsed,
                 &schemas,
                 &provider_context,
@@ -521,8 +577,8 @@ mod diagnostic_status_tests {
             &schemas,
             &signatures,
         );
-        let findings =
-            crate::validation::check_module_calls(crate::validation::ModuleCallCheckInput {
+        let findings = crate::validation::check_module_calls_providerless(
+            crate::validation::ModuleCallCheckInput {
                 authored: &parsed,
                 semantic: Some(&parsed),
                 base_dir: None,
@@ -532,7 +588,8 @@ mod diagnostic_status_tests {
                 binding_use_report: &binding_use_report,
                 bindings: &bindings,
                 reference_checks: crate::validation::ModuleCallReferenceChecks::Skipped,
-            });
+            },
+        );
         let error = ModuleError::MissingArgument {
             module: "child".to_string(),
             argument: "required".to_string(),
@@ -623,6 +680,11 @@ pub(crate) trait TypeResolutionPolicy {
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError>;
+
+    fn resolve_static_type(
+        type_expr: &crate::parser::TypeExpr,
+        config: &ProviderContext,
+    ) -> crate::static_type::ConsumerStaticType;
 }
 
 /// Normal module resolution requires every declared type to resolve.
@@ -644,6 +706,13 @@ impl TypeResolutionPolicy for StrictTypeResolution {
         }
         Ok(())
     }
+
+    fn resolve_static_type(
+        type_expr: &crate::parser::TypeExpr,
+        config: &ProviderContext,
+    ) -> crate::static_type::ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type_for_signature(type_expr, config)
+    }
 }
 
 /// Upstream projects are interpreted with the consumer's incomplete provider
@@ -655,8 +724,15 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
         parsed: &mut crate::parser::File<E>,
         config: &ProviderContext,
     ) -> Result<(), ModuleError> {
-        crate::validation::resolve_file_type_exprs_or_unknown(parsed, config);
+        crate::validation::resolve_file_type_exprs_best_effort(parsed, config);
         Ok(())
+    }
+
+    fn resolve_static_type(
+        type_expr: &crate::parser::TypeExpr,
+        config: &ProviderContext,
+    ) -> crate::static_type::ConsumerStaticType {
+        crate::validation::resolve_consumer_static_type(type_expr, config)
     }
 }
 
@@ -680,7 +756,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// group with `module "<binding>" (<source_path>)` (carina#3322).
     pub(super) module_paths: HashMap<String, String>,
     /// Parser configuration (decryptor, custom validators)
-    pub(super) config: &'cfg ProviderContext,
+    pub(super) provider_context: crate::validation::typecheck::TypecheckProviderContext<'cfg>,
     /// Schema authority used by the mandatory pre-expansion reference check.
     pub(super) schemas: &'cfg SchemaRegistry,
     /// Present only for the editor-facing resolution entry point. Expansion
@@ -699,31 +775,57 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
             std::sync::LazyLock::new(ProviderContext::default);
         static EMPTY_SCHEMAS: std::sync::LazyLock<SchemaRegistry> =
             std::sync::LazyLock::new(SchemaRegistry::new);
-        Self::with_config_and_schemas(base_dir, &DEFAULT_CONFIG, &EMPTY_SCHEMAS)
+        Self::with_providerless_config_and_schemas(base_dir, &DEFAULT_CONFIG, &EMPTY_SCHEMAS)
     }
 
     /// Create a new resolver with the given base directory and parser configuration
     pub(crate) fn with_config_and_schemas(
         base_dir: impl AsRef<Path>,
+        config: &'cfg LoadedProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Self {
+        Self::with_type_resolution(
+            base_dir,
+            crate::validation::typecheck::TypecheckProviderContext::loaded(config),
+            schemas,
+        )
+    }
+
+    fn with_providerless_config_and_schemas(
+        base_dir: impl AsRef<Path>,
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
-        Self::with_type_resolution(base_dir, config, schemas)
+        Self::with_type_resolution(
+            base_dir,
+            crate::validation::typecheck::TypecheckProviderContext::providerless(config),
+            schemas,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn with_config(base_dir: impl AsRef<Path>, config: &'cfg ProviderContext) -> Self {
         static EMPTY_SCHEMAS: std::sync::LazyLock<SchemaRegistry> =
             std::sync::LazyLock::new(SchemaRegistry::new);
-        Self::with_config_and_schemas(base_dir, config, &EMPTY_SCHEMAS)
+        Self::with_providerless_config_and_schemas(base_dir, config, &EMPTY_SCHEMAS)
     }
 
     fn with_constraint_reports(
         base_dir: impl AsRef<Path>,
-        config: &'cfg ProviderContext,
+        config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
         let resolver = Self::with_config_and_schemas(base_dir, config, schemas);
+        *resolver.constraint_reports.borrow_mut() = Some(Vec::new());
+        resolver
+    }
+
+    fn with_providerless_constraint_reports(
+        base_dir: impl AsRef<Path>,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Self {
+        let resolver = Self::with_providerless_config_and_schemas(base_dir, config, schemas);
         *resolver.constraint_reports.borrow_mut() = Some(Vec::new());
         resolver
     }
@@ -732,17 +834,33 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
 impl<'cfg> ModuleResolver<'cfg, DeferredUpstreamTypeResolution> {
     fn for_upstream(
         base_dir: impl AsRef<Path>,
+        config: &'cfg LoadedProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Self {
+        Self::with_type_resolution(
+            base_dir,
+            crate::validation::typecheck::TypecheckProviderContext::loaded(config),
+            schemas,
+        )
+    }
+
+    fn for_providerless_upstream(
+        base_dir: impl AsRef<Path>,
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
-        Self::with_type_resolution(base_dir, config, schemas)
+        Self::with_type_resolution(
+            base_dir,
+            crate::validation::typecheck::TypecheckProviderContext::providerless(config),
+            schemas,
+        )
     }
 }
 
 impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     fn with_type_resolution(
         base_dir: impl AsRef<Path>,
-        config: &'cfg ProviderContext,
+        provider_context: crate::validation::typecheck::TypecheckProviderContext<'cfg>,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
         let base_dir = base_dir.as_ref().to_path_buf();
@@ -753,11 +871,15 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             resolving: HashSet::new(),
             imported_modules: HashMap::new(),
             module_paths: HashMap::new(),
-            config,
+            provider_context,
             schemas,
             constraint_reports: RefCell::new(None),
             type_resolution: PhantomData,
         }
+    }
+
+    pub(super) fn config(&self) -> &'cfg ProviderContext {
+        self.provider_context.as_provider_context()
     }
 
     pub(super) fn record_constraint_report(&self, report: ModuleCallConstraintReport) {
@@ -803,7 +925,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             .map(|(alias, module)| {
                 (
                     alias.clone(),
-                    super::signature::resolved_signature(module, self.config),
+                    super::signature::resolved_signature_with_policy::<P>(module, self.config()),
                 )
             })
             .collect()
@@ -918,7 +1040,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         }
         let parsed_files = crate::config_loader::parse_directory_files_located_from_root(
             &files,
-            self.config,
+            self.config(),
             &self.configuration_root,
         )
         .map_err(|located| match located.source_file {
@@ -938,10 +1060,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // intact. Besides folding module-local values, this records the direct
         // dependency bindings that expansion subsequently instance-prefixes.
         // Argument bindings remain deferred for call-site substitution.
-        crate::parser::resolve_resource_refs_with_config(&mut merged, self.config)
+        crate::parser::resolve_resource_refs_with_config(&mut merged, self.config())
             .map_err(ModuleError::Parse)?;
 
-        P::resolve_file_type_exprs(&mut merged, self.config)?;
+        P::resolve_file_type_exprs(&mut merged, self.config())?;
         Ok(merged)
     }
 
@@ -1056,10 +1178,23 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingN
     pub fn check(
         parsed: &'parsed mut crate::parser::File<E>,
         base_dir: &Path,
-        config: &'cfg ProviderContext,
+        config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
         let resolver = ModuleResolver::with_config_and_schemas(base_dir, config, schemas);
+        Self::check_with_resolver(parsed, resolver)
+    }
+
+    /// Bootstrap/editor variant that retains structural value checks while
+    /// skipping provider-owned custom-type leaves.
+    pub fn check_providerless(
+        parsed: &'parsed mut crate::parser::File<E>,
+        base_dir: &Path,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Result<Self, ModuleError> {
+        let resolver =
+            ModuleResolver::with_providerless_config_and_schemas(base_dir, config, schemas);
         Self::check_with_resolver(parsed, resolver)
     }
 
@@ -1103,7 +1238,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingN
     fn check(
         parsed: &'parsed mut crate::parser::File<E>,
         base_dir: &Path,
-        config: &'cfg ProviderContext,
+        config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
         let mut resolver = ModuleResolver::<DeferredUpstreamTypeResolution>::for_upstream(
@@ -1118,9 +1253,35 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<Binding = RelativeBindingN
         })
     }
 
+    fn check_providerless(
+        parsed: &'parsed mut crate::parser::File<E>,
+        base_dir: &Path,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Result<Self, ModuleError> {
+        let mut resolver =
+            ModuleResolver::<DeferredUpstreamTypeResolution>::for_providerless_upstream(
+                base_dir, config, schemas,
+            );
+        resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
+        let root_witness = resolver.validate_reference_types(parsed)?;
+        Ok(Self {
+            parsed,
+            resolver,
+            root_witness,
+        })
+    }
+
     fn expand(
         mut self,
-    ) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError>
+    ) -> Result<
+        crate::parser::File<
+            E::Absolute,
+            AbsoluteBindingAddress,
+            ParsedDeferredForPhase<AbsoluteBindingAddress>,
+        >,
+        ModuleError,
+    >
     where
         E: ResolveExportBindingPhase,
     {
@@ -1171,8 +1332,8 @@ pub fn expand_root_directory_file<E: ResolveExportBindingPhase>(
 pub fn resolve_modules(
     parsed: crate::parser::ParsedFile,
     base_dir: &Path,
-) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
-    resolve_modules_with_config(
+) -> Result<ModuleResolvedParsedFile, ModuleError> {
+    resolve_modules_with_providerless_config(
         parsed,
         base_dir,
         &ProviderContext::default(),
@@ -1180,27 +1341,12 @@ pub fn resolve_modules(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn resolve_modules_authored_for_test(
-    parsed: &mut crate::parser::ParsedFile,
+/// Resolve all modules without a loaded provider catalog.
+pub fn resolve_modules_providerless(
+    parsed: crate::parser::ParsedFile,
     base_dir: &Path,
-) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
-    resolve_modules_authored_with_config_for_test(
-        parsed,
-        base_dir,
-        &ProviderContext::default(),
-        &SchemaRegistry::new(),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn resolve_modules_authored_with_config_for_test(
-    parsed: &mut crate::parser::ParsedFile,
-    base_dir: &Path,
-    config: &ProviderContext,
-    schemas: &SchemaRegistry,
-) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
-    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+) -> Result<ModuleResolvedParsedFile, ModuleError> {
+    resolve_modules(parsed, base_dir)
 }
 
 /// Resolve all modules in a parsed file with the given parser configuration.
@@ -1211,23 +1357,53 @@ pub(crate) fn resolve_modules_authored_with_config_for_test(
 pub fn resolve_modules_with_config<E: ResolveExportBindingPhase>(
     mut parsed: crate::parser::File<E>,
     base_dir: &Path,
+    config: &LoadedProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let expanded =
+        RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(expanded)
+}
+
+/// Resolve modules in a bootstrap/editor context. Every value check is
+/// classified first, and provider-owned schema types are left unchecked.
+pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase>(
+    mut parsed: crate::parser::File<E>,
+    base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError> {
-    RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let expanded =
+        RefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
+            .expand()?;
+    finalize_deferred_for_bodies(expanded)
 }
 
 /// Expand an upstream project's modules using the consumer's necessarily
 /// partial provider context. Unresolvable custom type names remain unchecked;
 /// all concrete value and liftable boundary mismatches still use the normal
 /// witness and shared value checker.
-pub(crate) fn resolve_upstream_modules_with_config<E: ResolveExportBindingPhase>(
+pub(crate) fn resolve_upstream_modules_with_providerless_config<E: ResolveExportBindingPhase>(
     mut parsed: crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<crate::parser::File<E::Absolute, AbsoluteBindingAddress>, ModuleError> {
-    UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let expanded =
+        UpstreamRefCheckedModuleGraph::check_providerless(&mut parsed, base_dir, config, schemas)?
+            .expand()?;
+    finalize_deferred_for_bodies(expanded)
+}
+
+pub(crate) fn resolve_upstream_modules_with_config<E: ResolveExportBindingPhase>(
+    mut parsed: crate::parser::File<E>,
+    base_dir: &Path,
+    config: &LoadedProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    let expanded =
+        UpstreamRefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas)?.expand()?;
+    finalize_deferred_for_bodies(expanded)
 }
 
 /// Resolve modules while retaining the expander's own per-call constraint
@@ -1239,12 +1415,39 @@ pub(crate) fn resolve_upstream_modules_with_config<E: ResolveExportBindingPhase>
 pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase + Clone>(
     parsed: &crate::parser::File<E>,
     base_dir: &Path,
+    config: &LoadedProviderContext,
+    schemas: &SchemaRegistry,
+    covered_findings: &[crate::validation::ModuleCallFinding],
+) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+    let resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+    resolve_modules_with_diagnostics_and_resolver(
+        parsed,
+        resolver,
+        config.as_provider_context(),
+        covered_findings,
+    )
+}
+
+/// Editor/bootstrap diagnostic expansion with provider-owned value checks
+/// unavailable by construction.
+pub fn resolve_modules_with_providerless_diagnostics<E: ResolveExportBindingPhase + Clone>(
+    parsed: &crate::parser::File<E>,
+    base_dir: &Path,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+    let resolver = ModuleResolver::with_providerless_constraint_reports(base_dir, config, schemas);
+    resolve_modules_with_diagnostics_and_resolver(parsed, resolver, config, covered_findings)
+}
+
+fn resolve_modules_with_diagnostics_and_resolver<E: ResolveExportBindingPhase + Clone>(
+    parsed: &crate::parser::File<E>,
+    mut resolver: ModuleResolver<'_, StrictTypeResolution>,
+    config: &ProviderContext,
+    covered_findings: &[crate::validation::ModuleCallFinding],
+) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let graph = parsed.clone();
-    let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
     let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
     let mut contributions = Vec::new();
@@ -1261,11 +1464,13 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase + Clone>(
         }
         Err(error) => errors.push(error),
     }
+    let graph = finish_root_expansion(graph, contributions, &root);
+    let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
+    errors.extend(deferred_for_errors);
     let constraint_reports = resolver
         .constraint_reports
         .into_inner()
         .expect("diagnostic resolver always records constraint reports");
-    let graph = finish_root_expansion(graph, contributions, &root);
     let findings = crate::validation::check_expanded_module_calls(
         crate::validation::ExpandedModuleCallCheckInput::Constraints {
             compositions: &graph.compositions,
@@ -1286,6 +1491,99 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase + Clone>(
     } else {
         ModuleResolutionDiagnosticResult::Unowned { errors }
     }
+}
+
+/// Convert parser-side deferred-loop bodies into the resource-only typestate
+/// consumed by every post-resolution subsystem.
+///
+/// This runs only after root and module-expanded loops have crossed argument
+/// substitution. A read or module-call template therefore reaches exactly one
+/// typed rejection seam, with enough information to distinguish a genuinely
+/// residual iterable from one that became concrete during module expansion.
+fn finalize_deferred_for_bodies<E, B: BindingAddress>(
+    parsed: crate::parser::File<E, B, ParsedDeferredForPhase<B>>,
+) -> Result<ModuleResolvedFile<E, B>, ModuleError> {
+    let (resolved, errors) = finalize_deferred_for_bodies_collecting(parsed);
+    match ModuleError::from_errors(errors) {
+        Some(error) => Err(error),
+        None => Ok(resolved),
+    }
+}
+
+fn finalize_deferred_for_bodies_collecting<E, B: BindingAddress>(
+    parsed: crate::parser::File<E, B, ParsedDeferredForPhase<B>>,
+) -> (ModuleResolvedFile<E, B>, Vec<ModuleError>) {
+    let known_bindings = deferred_for_known_bindings(&parsed);
+    parsed.map_deferred_for_phase(|pending| {
+        let mut resolved = Vec::with_capacity(pending.len());
+        let mut errors = Vec::new();
+        for expression in pending {
+            match expression.into_resource_expression(&known_bindings) {
+                Ok(expression) => resolved.push(expression),
+                Err(error) => {
+                    errors.push(deferred_for_resource_expression_error(error));
+                }
+            }
+        }
+        (resolved, errors)
+    })
+}
+
+fn deferred_for_resource_expression_error(
+    error: crate::parser::DeferredForResourceExpressionError,
+) -> ModuleError {
+    match error {
+        crate::parser::DeferredForResourceExpressionError::UndefinedIterable(error) => {
+            parse_error_to_module_error(error)
+        }
+        crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
+            let error = ParseError::DeferredForBodyUnsupported(error);
+            match file {
+                Some(path) => ModuleError::ParseInFile {
+                    path: std::path::PathBuf::from(path),
+                    error: Box::new(error),
+                },
+                None => ModuleError::Parse(error),
+            }
+        }
+    }
+}
+
+fn parse_error_to_module_error(error: ParseError) -> ModuleError {
+    match error {
+        ParseError::Located { path, error } => ModuleError::ParseInFile { path, error },
+        error => ModuleError::Parse(error),
+    }
+}
+
+fn deferred_for_known_bindings<E, B: BindingAddress>(
+    parsed: &crate::parser::File<E, B, ParsedDeferredForPhase<B>>,
+) -> Vec<String> {
+    let mut known = parsed
+        .structural_binding_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    known.extend(parsed.variables.keys().cloned());
+    known.sort_unstable();
+    known.dedup();
+    known
+}
+
+pub(super) fn deferred_for_body_errors<E, B: BindingAddress>(
+    parsed: &crate::parser::File<E, B, ParsedDeferredForPhase<B>>,
+) -> Vec<ModuleError> {
+    let known_bindings = deferred_for_known_bindings(parsed);
+    parsed
+        .parsed_deferred_for_expressions()
+        .iter()
+        .filter_map(|expression| {
+            match expression.clone().into_resource_expression(&known_bindings) {
+                Ok(_) => None,
+                Err(error) => Some(deferred_for_resource_expression_error(error)),
+            }
+        })
+        .collect()
 }
 
 fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
@@ -1318,7 +1616,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         let expanded_call = call
             .clone()
             .resolve_bindings(&mut |binding| root.resolve(binding));
-        match resolver.expand_module_call_checked(
+        match resolver.expand_module_call_checked_collecting(
             call,
             &expanded_call,
             &instance_prefix,
@@ -1327,7 +1625,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
             Some(&resolved_bindings),
         ) {
             Ok(expanded) => expanded_calls.push(expanded),
-            Err(error) => errors.push(error),
+            Err(call_errors) => errors.extend(call_errors),
         }
     }
     (expanded_calls, errors)
@@ -1380,9 +1678,10 @@ mod type_resolution_policy_tests {
         let config = ProviderContext::default();
         let schemas = SchemaRegistry::new();
 
-        let strict = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
-        let upstream =
-            ModuleResolver::<DeferredUpstreamTypeResolution>::for_upstream(".", &config, &schemas);
+        let strict = ModuleResolver::with_providerless_config_and_schemas(".", &config, &schemas);
+        let upstream = ModuleResolver::<DeferredUpstreamTypeResolution>::for_providerless_upstream(
+            ".", &config, &schemas,
+        );
 
         assert_strict(&strict);
         assert_upstream(&upstream);

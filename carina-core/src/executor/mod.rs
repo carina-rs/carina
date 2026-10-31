@@ -115,7 +115,8 @@ use crate::provider::{
     AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
     InFlightCreate, ObservedCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
     ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
-    ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UpdateRequest,
+    ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UnknownCreateOutcome,
+    UpdateRequest,
 };
 use crate::resource::{
     ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
@@ -128,12 +129,31 @@ use parallel::execute_effects_sequential;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 
-/// Dispatch an already checked create request while minting the unforgeable
-/// initial-attempt witness inside core.
-pub async fn dispatch_create<P: Provider + ?Sized>(
+/// Prepare dispatch of an already checked create request while minting the
+/// unforgeable initial-attempt witness and its cancellation receiver inside
+/// core. The supervising caller must retain the receiver until the returned
+/// future settles. Executor-owned abandonment paths drain it before saving
+/// the cancellation classification.
+pub fn dispatch_create<'a, P: Provider + ?Sized>(
+    provider: &'a P,
+    id: &'a ResourceId,
+    request: CreateRequest,
+) -> (
+    impl std::future::Future<Output = Result<CreateOutcome, CreateFailure>> + 'a,
+    crate::provider::CreateCallCancellationReceiver,
+) {
+    let (attempt, cancellation) = crate::provider::CreateAttempt::new(id.clone());
+    (
+        dispatch_create_with_attempt(provider, id, request, attempt),
+        cancellation,
+    )
+}
+
+async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
     provider: &P,
     id: &ResourceId,
     request: CreateRequest,
+    attempt: crate::provider::CreateAttempt,
 ) -> Result<CreateOutcome, CreateFailure> {
     let request_attributes: BTreeSet<_> = request
         .resource()
@@ -142,26 +162,13 @@ pub async fn dispatch_create<P: Provider + ?Sized>(
         .keys()
         .cloned()
         .collect();
-    match provider
-        .create(id, request, crate::provider::CreateAttempt::new(id.clone()))
-        .await
-    {
-        Ok(outcome) if outcome.id() == id => Ok(outcome),
-        Ok(_outcome) => Err(CreateFailure::untracked_at_dispatch(
-            ProviderError::internal("provider returned a create outcome for another resource")
-                .for_resource(id.clone()),
-        )),
+    match provider.create(id, request, attempt).await {
+        Ok(outcome) => Ok(outcome),
         Err(failure) => match failure.into_kind() {
+            CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                Err(CreateFailure::outcome_unknown_at_dispatch(unknown, error))
+            }
             CreateFailureKind::Created { created, error } => {
-                if created.id() != id {
-                    return Err(CreateFailure::untracked_at_dispatch(
-                        ProviderError::internal_caused_by(
-                            "provider returned a created failure for another resource",
-                            error,
-                        )
-                        .for_resource(id.clone()),
-                    ));
-                }
                 let (created, valid) = created.validate_request_sent(&request_attributes);
                 let error = if valid {
                     error
@@ -175,15 +182,6 @@ pub async fn dispatch_create<P: Provider + ?Sized>(
                 Err(CreateFailure::created(created, error))
             }
             CreateFailureKind::InFlight { pending, error } => {
-                if pending.id() != id {
-                    return Err(CreateFailure::untracked_at_dispatch(
-                        ProviderError::internal_caused_by(
-                            "provider returned an in-flight create for another resource",
-                            error,
-                        )
-                        .for_resource(id.clone()),
-                    ));
-                }
                 let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
                 let error = if valid {
                     error
@@ -423,6 +421,7 @@ pub enum Applied {
     },
     Observed(Arc<ObservedCreate>),
     CreateInFlight(InFlightCreate),
+    CreateOutcomeUnknown(UnknownCreateOutcome),
     CreateEnded,
     Imported(State),
     DataSource(State),
@@ -1009,6 +1008,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
             }
             | Applied::Observed(_)
             | Applied::CreateInFlight(_)
+            | Applied::CreateOutcomeUnknown(_)
             | Applied::CreateEnded
             | Applied::Imported(_)
             | Applied::WaitSnapshot(_) => {
@@ -1131,6 +1131,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     EffectFailed {
         effect: &'a Effect<S>,
         error: &'a str,
+        recovery: Option<&'a crate::plan::PlanError>,
         duration: Duration,
         progress: ProgressInfo,
     },
@@ -1205,12 +1206,25 @@ pub trait ExecutionObserver<S = ModuleSource>: Send + Sync {
 /// - Dependency skip
 /// - Pending state refreshes
 pub async fn execute_live_plan(
+    provider: &crate::provider::ProviderRouter,
+    input: LiveExecutionInput<'_>,
+    observer: &dyn ExecutionObserver,
+    shutdown: ShutdownToken,
+) -> ExecutionOutcome {
+    execute_runtime_plan(provider, provider, input.into(), observer, shutdown).await
+}
+
+/// Test-only execution entry point for focused provider fixtures without an
+/// initialized provider instance. Comparisons use an unavailable scope.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn execute_live_plan_for_test(
     provider: &dyn Provider,
     input: LiveExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    execute_runtime_plan(provider, input.into(), observer, shutdown).await
+    execute_test_runtime_plan(provider, input, observer, shutdown).await
 }
 
 #[cfg(test)]
@@ -1223,31 +1237,54 @@ async fn execute_plan(
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    execute_live_plan(provider, input, observer, shutdown).await
+    execute_test_runtime_plan(provider, input, observer, shutdown).await
 }
 
 pub async fn execute_saved_plan(
-    provider: &dyn Provider,
+    provider: &crate::provider::ProviderRouter,
     input: SavedExecutionInput<'_>,
     observer: &dyn ExecutionObserver<SavedModuleSource>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<SavedModuleSource> {
-    execute_runtime_plan(provider, input.into(), observer, shutdown).await
+    execute_runtime_plan(provider, provider, input.into(), observer, shutdown).await
 }
 
 async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     provider: &dyn Provider,
+    comparison_provider: &crate::provider::ProviderRouter,
     mut input: RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<S> {
-    let (result, was_cancelled) =
-        execute_effects_sequential(provider, &mut input, observer, &shutdown).await;
+    let (result, was_cancelled) = execute_effects_sequential(
+        provider,
+        comparison_provider,
+        &mut input,
+        observer,
+        &shutdown,
+    )
+    .await;
     if was_cancelled {
         ExecutionOutcome::Cancelled(result)
     } else {
         ExecutionOutcome::Completed(result)
     }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn execute_test_runtime_plan(
+    provider: &dyn Provider,
+    input: LiveExecutionInput<'_>,
+    observer: &dyn ExecutionObserver,
+    shutdown: ShutdownToken,
+) -> ExecutionOutcome {
+    let (schemas, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        input.schemas,
+        input.plan.effects().iter().map(Effect::resource_id),
+    );
+    let mut input: RuntimeExecutionInput<'_> = input.into();
+    input.schemas = &schemas;
+    execute_runtime_plan(provider, &comparison_provider, input, observer, shutdown).await
 }
 
 #[cfg(test)]

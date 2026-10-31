@@ -34,10 +34,10 @@ use carina_core::binding_index::ResolvedBindings;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::data_source_value::ExecutableDataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{Orphans, create_plan};
+use carina_core::differ::Orphans;
 use carina_core::executor::{
     ExecutionObserver, ExecutionOutcome, ExecutionResult, LiveExecutionInput, ProviderCheckInputs,
-    UnresolvedResource, execute_live_plan,
+    UnresolvedResource,
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -93,11 +93,16 @@ impl ProviderFactory for AwsStub {
         &self,
         _b: Option<&str>,
         _config: &carina_core::provider::ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(Box::new(NoopProvider {
-                cert_publishes_arn: true,
-            }) as Box<dyn Provider>)
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    NoopProvider {
+                        cert_publishes_arn: true,
+                    },
+                )),
+            )
         })
     }
     fn create_normalizer(
@@ -107,6 +112,15 @@ impl ProviderFactory for AwsStub {
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
             vec![
@@ -311,8 +325,6 @@ fn apply_path_propagates_module_wait_binding() {
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load_configuration_with_config should succeed");
-
-    let inference_errors = loaded.inference_errors;
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
@@ -322,26 +334,24 @@ fn apply_path_propagates_module_wait_binding() {
         &parsed.providers,
     );
 
-    let wiring = providers
-        .validate_evaluated_config(
-            parsed,
-            base_dir,
-            // `skip_resource_validation = true` is a real apply-path mode
-            // (run_apply's backend-seed re-load uses it,
-            // apply/mod.rs:635). It still runs the *same* module
-            // expansion — `resolve_modules_with_config` at
-            // commands/mod.rs:285 is gated only on the non-resource
-            // checks, not on this flag. Using it here isolates
-            // wait-binding propagation from full nested-schema
-            // validation (we are not testing the awscc Distribution
-            // schema, only that the module's `wait` survives apply
-            // expansion).
-            true,
-            &inference_errors,
-            &[],
-        )
-        .expect("apply-path validate/resolve must succeed for the valid module fixture");
-    let parsed = wiring.evaluated_resources_for_test();
+    let parsed = carina_cli::commands::validate_and_resolve_with_config(
+        &parsed,
+        base_dir,
+        &providers,
+        // `skip_resource_validation = true` is a real apply-path mode
+        // (run_apply's backend-seed re-load uses it,
+        // apply/mod.rs:635). It still runs the *same* module
+        // expansion — `resolve_modules_with_config` at
+        // commands/mod.rs:285 is gated only on the non-resource
+        // checks, not on this flag. Using it here isolates
+        // wait-binding propagation from full nested-schema
+        // validation (we are not testing the awscc Distribution
+        // schema, only that the module's `wait` survives apply
+        // expansion).
+        true,
+        &[],
+    )
+    .expect("apply-path validate/resolve must succeed for the valid module fixture");
 
     // The module's `wait cert` lives two levels in. After the apply
     // path's expansion it MUST reach the caller, instance-prefixed.
@@ -437,8 +447,6 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load_configuration_with_config should succeed");
-
-    let inference_errors = loaded.inference_errors;
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test(
@@ -447,12 +455,16 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         ]),
         &parsed.providers,
     );
-    let wiring = providers
-        .validate_evaluated_config(parsed, base_dir, false, &inference_errors, &[])
-        .expect(
-            "full validation must accept a module-internal wait after expansion prefixes its managed-resource target",
-        );
-    let parsed = wiring.evaluated_resources_for_test();
+    let parsed = carina_cli::commands::validate_and_resolve_with_config(
+        &parsed,
+        base_dir,
+        &providers,
+        false,
+        &[],
+    )
+    .expect(
+        "full validation must accept a module-internal wait after expansion prefixes its managed-resource target",
+    );
     assert!(
         parsed.wait_bindings.iter().any(|wait| {
             wait.binding.as_str() == "r.cert_issued" && wait.target.as_str() == "r.cert"
@@ -506,7 +518,6 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load should succeed");
-    let inference_errors = loaded.inference_errors;
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
@@ -517,7 +528,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &parsed.providers,
     );
     let wiring = providers
-        .validate_evaluated_config(parsed, base_dir, true, &inference_errors, &[])
+        .validate_evaluated_config(parsed, base_dir, true, &[])
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();
@@ -551,9 +562,9 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("resolve_refs");
 
     let resource_origins = sorted_resources.clone();
-    let mut unresolved_for_plan = carina_core::parser::ExpandedParsedFile::default();
-    unresolved_for_plan.resources = resources_for_plan.clone();
-    let canonical_for_plan = unresolved_for_plan.clone();
+    let mut canonical_for_plan = parsed.clone();
+    canonical_for_plan.resources = resources_for_plan.clone();
+    let unresolved_for_plan = canonical_for_plan.clone();
     let canonical_unresolved = resolve_expanded_config_block_names_for_test(
         canonical_for_plan,
         unresolved_for_plan,
@@ -608,7 +619,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
 
     let saved_attrs = carina_core::provider::RawSavedAttrs::default().lift(ctx.schemas());
-    let plan = create_plan(
+    let plan = carina_core::differ::create_plan_for_test(
         &resolved_resources_for_plan,
         &parsed.data_sources,
         &provider,
@@ -672,7 +683,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
     let result = completed_result(
-        execute_live_plan(
+        carina_core::executor::execute_live_plan_for_test(
             &provider,
             input,
             &observer,

@@ -2557,6 +2557,40 @@ fn deferred_template_contains_redacted_secret<S>(
         || attributes_contain_redacted_secret(template_resource.attributes.values())
 }
 
+pub(crate) fn unresolved_effect_contains_redacted_secret(
+    effect: &crate::effect::UnresolvedSavedEffect,
+) -> bool {
+    use crate::effect::UnresolvedSavedEffect;
+
+    match effect {
+        UnresolvedSavedEffect::Read { resource } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Create(resource)
+        | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
+            attributes_contain_redacted_secret(resource.attributes.values())
+        }
+        UnresolvedSavedEffect::Update { from, to, .. } => {
+            attributes_contain_redacted_secret(from.attributes.values())
+                || attributes_contain_redacted_secret(to.attributes.values())
+        }
+        UnresolvedSavedEffect::Import { identifier, .. } => contains_redacted_secret(identifier),
+        UnresolvedSavedEffect::ReleaseListKeys { keys, .. } => keys
+            .iter()
+            .any(|key| contains_redacted_secret(key.retained_value())),
+        UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
+        UnresolvedSavedEffect::DeferredCreate { template, .. } => {
+            deferred_template_contains_redacted_secret(template)
+        }
+        UnresolvedSavedEffect::DeferredReplace(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
+        }
+        UnresolvedSavedEffect::Delete { .. }
+        | UnresolvedSavedEffect::Remove { .. }
+        | UnresolvedSavedEffect::Move { .. } => false,
+    }
+}
+
 pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<S>) -> bool {
     use crate::effect::Effect;
 
@@ -2599,6 +2633,14 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             to: _to,
             origin: _origin,
         } => false,
+        Effect::ReleaseListKeys {
+            id: _id,
+            attribute: _attribute,
+            key_field: _key_field,
+            keys,
+        } => keys
+            .iter()
+            .any(|key| contains_redacted_secret(key.retained_value())),
         Effect::Wait {
             identity: _identity,
             target_id: _target_id,
@@ -3997,6 +4039,26 @@ pub fn redact_secrets_in_effect(
             to: to.clone(),
             origin: origin.clone(),
         },
+        Effect::ReleaseListKeys {
+            id,
+            attribute,
+            key_field,
+            keys,
+        } => Effect::ReleaseListKeys {
+            id: id.clone(),
+            attribute: attribute.clone(),
+            key_field: key_field.clone(),
+            keys: crate::effect::ReleasedListKeys::try_new(
+                keys.iter()
+                    .map(|key| {
+                        redact_secrets_in_value(key.retained_value()).map(|retained| {
+                            crate::effect::ReleasedListKey::new(key.key(), retained)
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .expect("redaction preserves non-empty unique release keys"),
+        },
         // Wait effects carry no secret-bearing fields — `until` is a
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
@@ -4027,7 +4089,17 @@ fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resour
         .iter()
         .map(|effect| match effect {
             crate::effect::Effect::Create(resource) => Some(resource.id.clone()),
-            _ => None,
+            crate::effect::Effect::Read { .. }
+            | crate::effect::Effect::ResumeCreate { .. }
+            | crate::effect::Effect::Update { .. }
+            | crate::effect::Effect::Delete { .. }
+            | crate::effect::Effect::Import { .. }
+            | crate::effect::Effect::Remove { .. }
+            | crate::effect::Effect::Move { .. }
+            | crate::effect::Effect::ReleaseListKeys { .. }
+            | crate::effect::Effect::Wait { .. }
+            | crate::effect::Effect::DeferredCreate { .. }
+            | crate::effect::Effect::DeferredReplace(_) => None,
         })
         .collect()
 }
@@ -4074,7 +4146,16 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                     },
                     changed_attributes: changed_attributes.clone(),
                 },
-                _ => redact_secrets_in_effect(effect)?,
+                crate::effect::Effect::Read { .. }
+                | crate::effect::Effect::ResumeCreate { .. }
+                | crate::effect::Effect::Delete { .. }
+                | crate::effect::Effect::Import { .. }
+                | crate::effect::Effect::Remove { .. }
+                | crate::effect::Effect::Move { .. }
+                | crate::effect::Effect::ReleaseListKeys { .. }
+                | crate::effect::Effect::Wait { .. }
+                | crate::effect::Effect::DeferredCreate { .. }
+                | crate::effect::Effect::DeferredReplace(_) => redact_secrets_in_effect(effect)?,
             };
             if let crate::effect::Effect::Update { from, .. } = &mut effect {
                 if let Some(state) = historical.get(&from.id) {
@@ -4139,10 +4220,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
     resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
-    deferred_templates: &[crate::parser::DeferredForExpression<
-        crate::resource::ModuleSource,
-        AbsoluteBindingAddress,
-    >],
+    deferred_templates: &crate::parser::ResolvedDeferredForExpressions<AbsoluteBindingAddress>,
 ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     use crate::effect::{DeferredReplacePayload, Effect};
 
@@ -4232,7 +4310,13 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     template: Box::new(template),
                 })))
             }
-            _ => Ok(effect.clone()),
+            Effect::ResumeCreate { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. } => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;
@@ -4460,7 +4544,18 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<S: Clone>(
                     changed_attributes: changed_attributes.clone(),
                 })
             }
-            _ => Ok(effect.clone()),
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;
@@ -5104,6 +5199,78 @@ fn canonicalize_desired_with_type_and_ancestry(
         return Err(error);
     }
     Ok(canonical)
+}
+
+/// Canonicalize one authored desired attribute through its resource schema.
+///
+/// Identity and reconciliation seams use this before reducing a value to a
+/// comparison string, so parser-surface enum identifiers and already
+/// canonical enum values share the same API-value representation.
+pub(crate) fn canonicalize_desired_attribute_value_with_schema(
+    mut value: Value,
+    schema: &crate::schema::ResourceSchema,
+    attribute: &str,
+) -> Result<Value, crate::schema::TypeError> {
+    // Already-canonical enums may carry an equivalent historical provider
+    // namespace. Their API spelling is the comparison identity at this seam,
+    // so only parser-surface EnumIdentifier values need schema resolution.
+    if first_enum_identifier(&value).is_none() {
+        return Ok(value);
+    }
+    reparse_canonical_enum_leaves(&mut value);
+    let Some(attribute_schema) = schema.attributes.get(attribute) else {
+        return Ok(value);
+    };
+    canonicalize_desired_with_type_and_ancestry(
+        value,
+        &attribute_schema.attr_type,
+        &schema.defs,
+        crate::schema::FieldAncestry::from_input_mode(attribute_schema.input_mode()),
+        DesiredValueSource::AuthoredDsl,
+    )
+}
+
+/// Re-enter already-canonical enum leaves through their API spelling when a
+/// container also contains parser-surface enum identifiers. This keeps the
+/// identity/reconciliation seam's documented API-value identity rule stable
+/// for mixed List/Map values, including historical provider namespaces.
+fn reparse_canonical_enum_leaves(value: &mut Value) {
+    match value {
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
+            *value = Value::Concrete(ConcreteValue::enum_identifier(
+                canonical.api_value().to_string(),
+            ));
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                reparse_canonical_enum_leaves(item);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for item in map.values_mut() {
+                reparse_canonical_enum_leaves(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Canonicalize one provider or persisted-state attribute through its resource
+/// schema while preserving the attribute's effective input ancestry.
+pub(crate) fn canonicalize_state_attribute_value_with_schema(
+    value: Value,
+    schema: &crate::schema::ResourceSchema,
+    attribute: &str,
+) -> Value {
+    let Some(attribute_schema) = schema.attributes.get(attribute) else {
+        return value;
+    };
+    canonicalize_state_with_type_and_ancestry(
+        value,
+        &attribute_schema.attr_type,
+        &schema.defs,
+        crate::schema::FieldAncestry::from_input_mode(attribute_schema.input_mode()),
+    )
 }
 
 /// Canonicalize provider or persisted state. Unrecognized enum-positioned
@@ -6274,6 +6441,7 @@ pub fn canonicalize_states_with_schemas(
             crate::resource::Current::Absent(state) => state.state(),
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => continue,
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => continue,
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         let kind = if state.id.resource_type.is_empty() {
@@ -6307,6 +6475,13 @@ mod tests {
     fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
         crate::resource::RootScope::new()
             .resolve(crate::resource::RelativeBindingName::new(binding))
+    }
+
+    fn resolved_deferred_templates(
+        expressions: impl IntoIterator<Item = crate::parser::ExpandedDeferredForExpression>,
+    ) -> crate::parser::ResolvedDeferredForExpressions<crate::resource::AbsoluteBindingAddress>
+    {
+        crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test(expressions)
     }
 
     #[test]
@@ -12286,6 +12461,7 @@ mod tests {
             id: ResourceId::with_provider_identity("aws", "iam.policy", "p1", None),
             attributes,
             directives: Default::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some(absolute_binding("p1")),
             dependency_bindings: BTreeSet::new(),
@@ -12477,6 +12653,9 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -12504,6 +12683,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12534,6 +12716,9 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
         assert_eq!(
@@ -12557,6 +12742,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12595,6 +12783,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -12657,9 +12848,19 @@ mod tests {
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
             }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
+            }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
-        let result = diff_test(&desired[0], current, None, None, Some(&schema));
+        let result = diff_test(
+            &desired[0],
+            current,
+            None,
+            None,
+            Some(&schema),
+            &crate::differ::exact_comparison_context_for_tests(),
+        );
         assert!(
             matches!(result, Diff::NoChange(_)),
             "dynamic AZ enum API spelling in state must canonicalize to DSL spelling; got {result:?}"
@@ -12729,6 +12930,9 @@ mod tests {
             crate::resource::Current::Present(present) => present.state(),
             crate::resource::Current::CreateInFlight(_pending) => {
                 panic!("test fixture cannot be in flight")
+            }
+            crate::resource::Current::CreateOutcomeUnknown(_unknown) => {
+                panic!("test fixture cannot have an unknown create outcome")
             }
             crate::resource::Current::MissingIdentifier(state) => state.state(),
         };
@@ -13048,12 +13252,13 @@ mod tests {
         let Effect::DeferredCreate { template, .. } = &effect else {
             unreachable!();
         };
+        let deferred_templates = resolved_deferred_templates([template.as_ref().clone()]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &redacted_plan,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            std::slice::from_ref(template.as_ref()),
+            &deferred_templates,
         )
         .expect("unchanged deferred template secret should rehydrate");
         let Effect::DeferredCreate { template, .. } = &rehydrated.effects()[0] else {
@@ -13201,12 +13406,13 @@ mod tests {
             )),
             template: redacted_template,
         });
+        let deferred_templates = resolved_deferred_templates([]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &plan,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &[],
+            &deferred_templates,
         )
         .expect("placeholder-free template must not need a candidate");
         let Effect::DeferredCreate {

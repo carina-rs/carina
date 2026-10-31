@@ -132,22 +132,24 @@ fn plan_for(
         .expect("cascade test resources must have resolved identities");
     let resolved = ResolvedResource::collect_resolved(managed)
         .expect("cascade test resources must have resolved identities");
-    let plan_input_states = crate::resource::into_plan_input_current_map_from_states(
-        current_states,
-        &crate::schema::SchemaRegistry::new(),
-        &[],
+    let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+        schemas,
+        resolved.iter().map(|resource| &resource.id),
     );
+    let plan_input_states =
+        crate::resource::into_plan_input_current_map_from_states(current_states, &schemas, &[]);
     create_plan_with_cascades(
         &resolved,
         &unresolved,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &provider,
         crate::differ::PlanPriorStates::new(&plan_input_states, &crate::differ::Orphans::new()),
         &HashMap::new(),
-        schemas,
+        &schemas,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &[],
+        &HashSet::new(),
     )
     .expect("test provider hints should succeed")
 }
@@ -491,7 +493,9 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
         })
     );
     assert_eq!(
-        plan.errors()[0].to_string(),
+        plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string(),
         "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
     );
 }

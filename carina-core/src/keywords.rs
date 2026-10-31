@@ -40,6 +40,7 @@ pub const KEYWORDS: &[(&str, KeywordKind)] = &[
     ("if", KeywordKind::Control),
     ("in", KeywordKind::Control),
     ("depends_on", KeywordKind::Other),
+    ("ignore_changes", KeywordKind::Other),
     ("import", KeywordKind::Other),
     ("read", KeywordKind::Other),
     ("require", KeywordKind::Other),
@@ -102,6 +103,11 @@ mod tests {
     #[test]
     fn depends_on_is_a_keyword() {
         assert!(is_keyword("depends_on"));
+    }
+
+    #[test]
+    fn ignore_changes_is_a_keyword() {
+        assert!(is_keyword("ignore_changes"));
     }
 
     #[test]

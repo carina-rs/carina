@@ -569,8 +569,9 @@ where
 ///
 /// let _ = ProviderCustomTypes { state: unreachable!() };
 /// ```
+#[derive(Clone)]
 pub struct ProviderCustomTypes {
-    state: ProviderCustomTypeState,
+    state: std::sync::Arc<ProviderCustomTypeState>,
 }
 
 enum ProviderCustomTypeState {
@@ -585,7 +586,7 @@ enum ProviderCustomTypeState {
 impl Default for ProviderCustomTypes {
     fn default() -> Self {
         Self {
-            state: ProviderCustomTypeState::Unloaded,
+            state: std::sync::Arc::new(ProviderCustomTypeState::Unloaded),
         }
     }
 }
@@ -599,11 +600,11 @@ impl ProviderCustomTypes {
         resolver: CustomTypeValidatorFn,
     ) -> Self {
         Self {
-            state: ProviderCustomTypeState::Loaded {
+            state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
                 resolver,
                 enum_lookup: Box::new(|_| Ok(None)),
-            },
+            }),
         }
     }
 
@@ -612,20 +613,27 @@ impl ProviderCustomTypes {
         let source = std::sync::Arc::new(source);
         let validation_source = std::sync::Arc::clone(&source);
         Self {
-            state: ProviderCustomTypeState::Loaded {
+            state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
                 resolver: Box::new(move |target, value| validation_source.validate(target, value)),
                 enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
-            },
+            }),
         }
     }
 
     pub fn is_loaded(&self) -> bool {
-        matches!(self.state, ProviderCustomTypeState::Loaded { .. })
+        matches!(
+            self.state.as_ref(),
+            ProviderCustomTypeState::Loaded {
+                known: _known,
+                resolver: _resolver,
+                enum_lookup: _enum_lookup,
+            }
+        )
     }
 
     pub fn known(&self) -> &BTreeSet<OwnedTypeIdentity> {
-        match &self.state {
+        match self.state.as_ref() {
             ProviderCustomTypeState::Unloaded => {
                 static EMPTY: std::sync::LazyLock<BTreeSet<OwnedTypeIdentity>> =
                     std::sync::LazyLock::new(BTreeSet::new);
@@ -646,7 +654,7 @@ impl CustomTypeResolver for ProviderCustomTypes {
         target: CustomTypeValidationTarget<'a>,
         value: &'a Value,
     ) -> Result<(), CustomTypeValidationError> {
-        match &self.state {
+        match self.state.as_ref() {
             ProviderCustomTypeState::Loaded {
                 known: _known,
                 resolver,
@@ -660,8 +668,12 @@ impl CustomTypeResolver for ProviderCustomTypes {
         &self,
         owned: &OwnedTypeIdentity,
     ) -> Result<Option<AttributeType>, CustomTypeValidationError> {
-        match &self.state {
-            ProviderCustomTypeState::Loaded { enum_lookup, .. } => enum_lookup(owned),
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Loaded {
+                known: _known,
+                resolver: _resolver,
+                enum_lookup,
+            } => enum_lookup(owned),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
         }
     }
@@ -731,6 +743,88 @@ impl ProviderContext {
     }
 }
 
+/// Proof that a [`ProviderContext`] carries a loaded provider custom-type
+/// catalog.
+///
+/// Production code can obtain this witness only through
+/// [`crate::provider::loaded_provider_snapshot_from_factories`], which retains
+/// it together with schema evidence from one provider-factory snapshot.
+/// Value-checking APIs that can reach provider custom types accept this type
+/// so a bootstrap [`ProviderContext`] cannot be passed accidentally.
+///
+/// ```compile_fail
+/// use carina_core::parser::{LoadedProviderContext, ProviderContext};
+///
+/// let _ = LoadedProviderContext(std::sync::Arc::new(ProviderContext::default()));
+/// ```
+#[derive(Clone)]
+pub struct LoadedProviderContext(std::sync::Arc<ProviderContext>);
+
+impl LoadedProviderContext {
+    pub(crate) fn new(context: ProviderContext) -> Self {
+        assert!(
+            context.custom_types_loaded(),
+            "LoadedProviderContext requires loaded provider custom types"
+        );
+        Self(std::sync::Arc::new(context))
+    }
+
+    pub fn as_provider_context(&self) -> &ProviderContext {
+        &self.0
+    }
+
+    /// Test-only constructor for fixtures that deliberately inject a loaded
+    /// custom-type resolver without a provider factory.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(context: ProviderContext) -> Self {
+        assert!(
+            context.custom_types_loaded(),
+            "LoadedProviderContext test fixtures must use loaded custom types"
+        );
+        Self::new(context)
+    }
+
+    /// Loaded context with no registered custom types, for tests whose value
+    /// checks use only built-in types.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn empty_for_test() -> Self {
+        Self::new(ProviderContext {
+            custom_types: ProviderCustomTypes {
+                state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
+                    known: BTreeSet::new(),
+                    resolver: Box::new(|_target, _value| Ok(())),
+                    enum_lookup: Box::new(|_owned| Ok(None)),
+                }),
+            },
+            ..ProviderContext::default()
+        })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_decryptor_for_test(&mut self, decryptor: DecryptorFn) {
+        std::sync::Arc::get_mut(&mut self.0)
+            .expect("test fixture must not mutate a cloned LoadedProviderContext")
+            .decryptor = Some(decryptor);
+    }
+}
+
+impl std::ops::Deref for LoadedProviderContext {
+    type Target = ProviderContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_provider_context()
+    }
+}
+
+impl std::fmt::Debug for LoadedProviderContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LoadedProviderContext")
+            .field(self.as_provider_context())
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for ProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderContext")
@@ -743,7 +837,7 @@ impl std::fmt::Debug for ProviderContext {
 
 impl std::fmt::Debug for ProviderCustomTypes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.state {
+        match self.state.as_ref() {
             ProviderCustomTypeState::Unloaded => formatter.write_str("Unloaded"),
             ProviderCustomTypeState::Loaded {
                 known,

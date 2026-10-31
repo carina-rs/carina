@@ -23,7 +23,7 @@ use carina_core::executor::{
 };
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
-use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{
@@ -35,7 +35,8 @@ use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, RowBasis, StateBackend, StateFile};
 
 use carina_core::parser::{
-    ExpandedInferredFile, ExpandedProviderConfig, ProviderContext, ResolvedProviderConfigs,
+    ExpandedInferredFile, ExpandedProviderConfig, LoadedProviderContext, ProviderContext,
+    ResolvedProviderConfigs,
 };
 
 use super::{DriftCommand, verify_for_mutation};
@@ -91,7 +92,7 @@ use saved_plan::{
 pub type ApplyResult = ExecutionResult;
 
 type ObserverFactory<'a, S = ModuleSource> =
-    dyn Fn(&carina_core::plan::Plan<S>) -> Box<dyn ExecutionObserver<S>> + 'a;
+    dyn Fn(&carina_core::plan::Plan<S>, &Path) -> Box<dyn ExecutionObserver<S>> + 'a;
 
 #[derive(serde::Deserialize)]
 struct PlanFileHeader {
@@ -158,6 +159,16 @@ fn saved_plan_secret_evaluation_error(source: AppError, apply_target: ApplyTarge
     ))
 }
 
+fn saved_plan_secret_preparation_error(
+    source: AppError,
+    apply_target: ApplyTarget<'_>,
+) -> AppError {
+    match source {
+        error @ AppError::SavedPlanProviderScopeMismatch(_) => error,
+        error => saved_plan_secret_evaluation_error(error, apply_target),
+    }
+}
+
 fn saved_plan_secret_orphan_vanished_error(
     resource: impl Into<String>,
     apply_target: ApplyTarget<'_>,
@@ -173,8 +184,9 @@ fn saved_plan_secret_orphan_vanished_error(
 
 fn cli_observer_factory<S: Send + Sync + 'static>(
     plan: &carina_core::plan::Plan<S>,
+    project_dir: &Path,
 ) -> Box<dyn ExecutionObserver<S>> {
-    Box::new(CliObserver::new(plan))
+    Box::new(CliObserver::new(plan, project_dir))
 }
 
 fn format_total_apply_line(elapsed: Duration) -> String {
@@ -191,7 +203,8 @@ struct BootstrapCreateContext<'a> {
 }
 
 async fn create_checked_bootstrap_resource(
-    provider: &dyn Provider,
+    operation_provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     resource: Resource,
     context: BootstrapCreateContext<'_>,
 ) -> Result<(), AppError> {
@@ -218,9 +231,19 @@ async fn create_checked_bootstrap_resource(
     let request = carina_core::executor::prepare_create_request(resource, &preparation)
         .await
         .map_err(AppError::from_state_bucket_preparation)?;
-    let resolved = ResolvedResource::new(request.resource().as_resource().clone());
+    let resolved = request.resource().as_inner().clone();
+    let resolved_comparison = comparison_provider.comparison_for(schemas, &resolved.id)?;
+    let owner_schema = resolved_comparison.owner_schema();
+    let comparison = resolved_comparison.context();
+    let schema = Some(owner_schema.schema().as_schema());
     let accepted_request = AcceptedRequest::from_create_request(&request);
-    match carina_core::executor::dispatch_create(provider, &id, request).await {
+    let (create, create_cancellation) =
+        carina_core::executor::dispatch_create(operation_provider, &id, request);
+    let outcome = create.await;
+    // Bootstrap creates are not part of the parallel executor, but they still
+    // retain the reporter until the guest call has settled.
+    drop(create_cancellation);
+    match outcome {
         Ok(outcome) => {
             let identifier = outcome.identifier().as_str().to_string();
             let (state, accepted_request, diagnostic) =
@@ -229,11 +252,10 @@ async fn create_checked_bootstrap_resource(
                 &resolved,
                 &state,
                 None,
-                schemas
-                    .get_for(resolved.as_resource())
-                    .map(|schema| schema.schema().as_schema()),
+                schema,
                 RowBasis::Applied(&accepted_request),
                 None,
+                comparison,
             )
             .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source))?;
             seed_protected_bootstrap_resource(backend, row)
@@ -261,17 +283,19 @@ async fn create_checked_bootstrap_resource(
         Err(error) => {
             let row = match error.kind() {
                 carina_core::provider::CreateFailureKind::Untracked(_error) => Ok(None),
+                carina_core::provider::CreateFailureKind::OutcomeUnknown {
+                    unknown,
+                    error: _provider_error,
+                } => Ok(Some(
+                    carina_state::ResourceState::from_unknown_create_outcome(
+                        &resolved, unknown, None, schema, comparison,
+                    ),
+                )),
                 carina_core::provider::CreateFailureKind::Created {
                     created,
                     error: _provider_error,
                 } => carina_state::ResourceState::from_observation(
-                    &resolved,
-                    created,
-                    None,
-                    schemas
-                        .get_for(resolved.as_resource())
-                        .map(|schema| schema.schema().as_schema()),
-                    None,
+                    &resolved, created, None, schema, None, comparison,
                 )
                 .map(Some)
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
@@ -279,13 +303,7 @@ async fn create_checked_bootstrap_resource(
                     pending,
                     error: _provider_error,
                 } => carina_state::ResourceState::from_in_flight(
-                    &resolved,
-                    pending,
-                    None,
-                    schemas
-                        .get_for(resolved.as_resource())
-                        .map(|schema| schema.schema().as_schema()),
-                    None,
+                    &resolved, pending, None, schema, None, comparison,
                 )
                 .map(Some)
                 .map_err(|source| AppError::from_resource_state_encoding(id.clone(), source)),
@@ -303,6 +321,40 @@ async fn create_checked_bootstrap_resource(
             ))
         }
     }
+}
+
+#[cfg(test)]
+async fn create_checked_bootstrap_resource_for_test(
+    operation_provider: &dyn Provider,
+    resource: Resource,
+    context: BootstrapCreateContext<'_>,
+) -> Result<(), AppError> {
+    let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
+        context.schemas,
+        std::iter::once(&resource.id),
+    );
+    let BootstrapCreateContext {
+        backend,
+        parsed,
+        provider_configs,
+        normalizer,
+        factories,
+        schemas: _schemas,
+    } = context;
+    create_checked_bootstrap_resource(
+        operation_provider,
+        &comparison_provider,
+        resource,
+        BootstrapCreateContext {
+            backend,
+            parsed,
+            provider_configs,
+            normalizer,
+            factories,
+            schemas: &schemas,
+        },
+    )
+    .await
 }
 
 async fn seed_protected_bootstrap_resource(
@@ -564,7 +616,7 @@ fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn execute_effects_with_observer(
     plan: &Plan,
-    provider: &dyn Provider,
+    provider: &ProviderRouter,
     normalizer: &dyn ProviderNormalizer,
     provider_configs: &[ExpandedProviderConfig],
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
@@ -619,7 +671,7 @@ async fn execute_effects_with_observer(
 #[allow(clippy::too_many_arguments)]
 async fn execute_rehydrated_saved_plan(
     plan_file: &ExecutablePlanFile,
-    provider: &dyn Provider,
+    provider: &ProviderRouter,
     normalizer: &dyn ProviderNormalizer,
     provider_configs: &[ExpandedProviderConfig],
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
@@ -902,7 +954,7 @@ pub(crate) async fn finalize_apply<S: Clone>(
             post_apply_states: &post_apply_states,
             schemas: input.state_save_inputs.schemas(),
             wait_aliases: input.wait_aliases,
-            provider_context: input.provider_context,
+            provider_context: export_inputs.provider_context,
         })
         .and_then(|values| materialize_exports(&values))
         .map(|resolution| resolution.write_into(&mut state))
@@ -1086,7 +1138,7 @@ pub(crate) async fn persist_exports_only(
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
     managed_current: &HashMap<ResourceId, Current>,
-    provider_context: &ProviderContext,
+    provider_context: &LoadedProviderContext,
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
     let post_apply_states =
@@ -1144,11 +1196,13 @@ impl DriftCheckResult {
 
 /// Detect infrastructure drift and retain the single historical-secret
 /// verification pass for the saved-plan gate.
-pub(crate) async fn detect_drift<S>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn detect_drift<S: Clone>(
     sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
-    provider: &dyn Provider,
+    operation_provider: &dyn Provider,
+    comparison_provider: &ProviderRouter,
     state_file: Option<&StateFile>,
     schemas: &carina_core::schema::SchemaRegistry,
     apply_target: ApplyTarget<'_>,
@@ -1167,21 +1221,25 @@ pub(crate) async fn detect_drift<S>(
         .collect();
 
     for resource in sorted_resources {
+        let resolved_resource = ResolvedResource::resolve_with_schemas(resource.clone(), schemas)?;
         // carina#3181: `sorted_resources` is managed-only — drift
         // detection only operates over provider-backed managed
         // resources.
+        let typed_comparison = comparison_provider.comparison_for(schemas, &resource.id)?;
         let planned_snapshot = planned_states.get(&resource.id).copied();
         let planned_current = planned_snapshot.map(|snapshot| snapshot.as_ref());
         let planned_state = planned_current.and_then(|current| match current {
             Current::Absent(state) => Some(state.state()),
             Current::Present(present) => Some(present.state()),
             Current::CreateInFlight(_pending) => None,
+            Current::CreateOutcomeUnknown(_unknown) => None,
             Current::MissingIdentifier(state) => Some(state.state()),
         });
         let planned_exists = planned_current.and_then(|current| match current {
             Current::Absent(_absent) => Some(false),
             Current::Present(_present) => Some(true),
             Current::CreateInFlight(_pending) => None,
+            Current::CreateOutcomeUnknown(_unknown) => None,
             Current::MissingIdentifier(_unidentified) => Some(true),
         });
         let historical_id = planned_current
@@ -1190,7 +1248,7 @@ pub(crate) async fn detect_drift<S>(
 
         let mut actual_state = match planned_current {
             Some(Current::Present(present)) => read_managed_state_with_retry(
-                provider,
+                operation_provider,
                 historical_id,
                 present.identifier(),
                 state_file,
@@ -1205,6 +1263,9 @@ pub(crate) async fn detect_drift<S>(
                 )));
             }
             Some(Current::CreateInFlight(_pending)) => State::not_found(historical_id.clone()),
+            Some(Current::CreateOutcomeUnknown(_unknown)) => {
+                State::not_found(historical_id.clone())
+            }
             Some(Current::Absent(_state)) => State::not_found(historical_id.clone()),
             None => State::not_found(historical_id.clone()),
         };
@@ -1237,7 +1298,13 @@ pub(crate) async fn detect_drift<S>(
                             saved_plan_secret_rehydration_error(error, apply_target)
                         })?;
                 let secret_drift = verification.drifted_attributes();
-                let verified_planned = verification.state();
+                let mut verified_planned = verification.state().clone();
+                resolved_resource
+                    .ignore_changes()
+                    .mask_observed_readable_leaves(
+                        &mut verified_planned.attributes,
+                        &actual_state.attributes,
+                    );
                 verified_planned_states.insert(resource.id.clone(), verified_planned.clone());
                 // Compare attributes for existing resources
                 let mut attr_diffs: Vec<String> = Vec::new();
@@ -1262,7 +1329,15 @@ pub(crate) async fn detect_drift<S>(
                                 format_value(&masked)
                             ));
                         }
-                        Some(actual_val) if actual_val != planned_val => {
+                        Some(actual_val)
+                            if !carina_core::diff_helpers::resource_attribute_values_equal(
+                                actual_val,
+                                planned_val,
+                                Some(typed_comparison.owner_schema().schema()),
+                                key,
+                                typed_comparison.context(),
+                            ) =>
+                        {
                             let masked = carina_core::value::mask_plaintext_using_secret_shape(
                                 actual_val,
                                 historical_shape,
@@ -1327,6 +1402,33 @@ pub(crate) async fn detect_drift<S>(
     })
 }
 
+#[cfg(test)]
+pub(crate) async fn detect_drift_for_test<S: Clone>(
+    sorted_resources: &[carina_core::resource::Resource<S>],
+    planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
+    historical_addresses: &HistoricalResourceAddresses,
+    operation_provider: &dyn Provider,
+    state_file: Option<&StateFile>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    apply_target: ApplyTarget<'_>,
+) -> Result<DriftCheckResult, AppError> {
+    let (schemas, comparison_provider) = carina_core::provider::comparison_fixture_for_test(
+        schemas,
+        sorted_resources.iter().map(|resource| &resource.id),
+    );
+    detect_drift(
+        sorted_resources,
+        planned_state_entries,
+        historical_addresses,
+        operation_provider,
+        &comparison_provider,
+        state_file,
+        &schemas,
+        apply_target,
+    )
+    .await
+}
+
 fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
     format!(
         "Please re-run `{}` to create a new plan that reflects the current state.",
@@ -1377,7 +1479,6 @@ async fn run_apply_with_observer_factory(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
     let bootstrap_unresolved = loaded.unresolved_parsed.clone();
     let parsed = loaded.parsed;
@@ -1390,7 +1491,6 @@ async fn run_apply_with_observer_factory(
         loaded.unresolved_parsed,
         base_dir,
         false,
-        &inference_errors,
         &duplicate_declarations,
     )?;
     // Wiring needs declaration metadata and schemas before a bootstrap
@@ -1466,7 +1566,8 @@ async fn run_apply_with_observer_factory(
                 // the same expanded compositions and resolved config values
                 // that are available before any provider effect runs.
                 create_checked_bootstrap_resource(
-                    bucket_provider.as_ref(),
+                    &bucket_provider,
+                    &bucket_provider,
                     bucket_resource.clone(),
                     BootstrapCreateContext {
                         backend: backend.as_ref(),
@@ -1634,20 +1735,18 @@ fn reload_apply_configuration_after_bootstrap(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
-    let inference_errors = reloaded.inference_errors;
     let duplicate_declarations = reloaded.duplicate_declarations;
     validated_config.revalidate_config_pair(
         reloaded.parsed,
         unresolved,
         base_dir,
         true,
-        &inference_errors,
         &duplicate_declarations,
     )
 }
 
 async fn load_apply_provider_inputs<E>(
-    parsed: &carina_core::parser::File<E, carina_core::resource::AbsoluteBindingAddress>,
+    parsed: &carina_core::parser::ModuleResolvedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -1667,7 +1766,7 @@ async fn create_state_bucket_bootstrap_provider<R>(
     provider_name: &str,
 ) -> Result<
     (
-        Box<dyn Provider>,
+        ProviderRouter,
         Box<dyn carina_core::provider::ProviderNormalizer>,
     ),
     AppError,
@@ -1676,9 +1775,11 @@ async fn create_state_bucket_bootstrap_provider<R>(
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
-    let provider = factory.create_provider(None, &config).await?;
+    let provider = factory.create_initialized_provider(None, &config).await?;
     let normalizer = factory.create_normalizer(None, &config).await?;
-    Ok((provider, normalizer))
+    let mut router = ProviderRouter::new();
+    router.add_provider(provider_name.to_string(), provider);
+    Ok((router, normalizer))
 }
 
 type CheckedApplyExports = carina_core::validation::ExportsCheckedPreApply<
@@ -1715,6 +1816,7 @@ struct SourceApplyExecuted {
     checked_exports: CheckedApplyExports,
     wait_aliases: Vec<WaitAliasSpec>,
     pre_resolve_compositions: Vec<carina_core::resource::LiveComposition>,
+    provider_context: LoadedProviderContext,
     cancel: ShutdownToken,
 }
 
@@ -1824,6 +1926,7 @@ async fn run_apply_locked_owned(
             )?
             .detect_moves(
                 ctx,
+                &provider,
                 &parsed.data_sources,
                 raw_provider_configs,
                 &state_block_claims,
@@ -1895,6 +1998,7 @@ async fn run_apply_locked_owned(
                         Current::Absent(_state) => false,
                         Current::Present(_present) => true,
                         Current::CreateInFlight(_pending) => true,
+                        Current::CreateOutcomeUnknown(_unknown) => true,
                         Current::MissingIdentifier(_state) => true,
                     };
                     if exists {
@@ -1961,6 +2065,7 @@ async fn run_apply_locked_owned(
                     validated_config,
                     crate::wiring::ValidatedCanonicalExpandRefreshAndLiftInputs {
                         provider: &provider,
+                        comparison_provider: &provider,
                         expansion: prepared_expansion,
                         warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
                         remote_bindings,
@@ -1992,7 +2097,7 @@ async fn run_apply_locked_owned(
             } = match post_expansion {
                 crate::wiring::PostExpansionOutcome::Planned(planned) => planned,
                 crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
-                    return Err(diagnostics.render_and_abort());
+                    return Err(diagnostics.render_and_abort(project_dir));
                 }
             };
             let crate::wiring::PostExpansionArtifacts {
@@ -2007,7 +2112,7 @@ async fn run_apply_locked_owned(
                 prev_explicit,
                 wait_aliases,
             } = artifacts;
-            render_plan_errors_and_abort(&plan)?;
+            render_plan_errors_and_abort(&plan, project_dir)?;
             #[cfg(any(test, feature = "test-utils"))]
             capture_live_apply_plan_for_test(&plan)?;
             let crate::wiring::PostExpansionApplyResources {
@@ -2046,7 +2151,7 @@ async fn run_apply_locked_owned(
                         plan: &plan,
                         schemas: ctx.schemas(),
                         wait_aliases: &wait_aliases,
-                        provider_context,
+                        provider_context: ctx.provider_context(),
                     })
                     .map_err(AppError::Validation)?;
                 let empty_exports = HashMap::new();
@@ -2077,7 +2182,8 @@ async fn run_apply_locked_owned(
                     &HashMap::new(),
                     None,
                     None,
-                );
+                    &provider,
+                )?;
                 // This fast path has no managed-resource mutations, so it
                 // cannot contain the Delete + Create pair required for a
                 // moved-block hint.
@@ -2133,7 +2239,7 @@ async fn run_apply_locked_owned(
                     plan: &plan,
                     schemas: ctx.schemas(),
                     wait_aliases: &wait_aliases,
-                    provider_context,
+                    provider_context: ctx.provider_context(),
                 })
                 .map_err(AppError::Validation)?;
             let current_exports = state_file
@@ -2154,9 +2260,14 @@ async fn run_apply_locked_owned(
                 &moved_origins,
                 Some(&prev_explicit),
                 None,
-            );
-            let moved_hints =
-                crate::moved_hint::detect_moved_block_hints(&plan, &managed_current, ctx.schemas());
+                &provider,
+            )?;
+            let moved_hints = crate::moved_hint::detect_moved_block_hints(
+                &plan,
+                &managed_current,
+                ctx.schemas(),
+                &provider,
+            )?;
             moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -2178,26 +2289,29 @@ async fn run_apply_locked_owned(
             // `ProviderNormalizer`; the same object is passed in both positions
             // so apply re-normalizes with exactly the plan-time normalizer
             // (carina#3060). They must stay the same object.
-            let observer = observer_factory(&plan);
+            let observer = observer_factory(&plan, project_dir);
+            let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_resources.clone(),
                 plan.clone(),
                 ctx.schemas().clone(),
                 None,
-            ));
+                provider.as_ref(),
+            )?);
             let saver =
                 start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
             let publisher = saver.publisher();
             let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
                 publisher.send_replace(Some(snapshot));
             });
-            // Remove and Move need no provider call. Report them now; every
-            // checkpoint's state writeback materializes them from the plan.
+            // Remove, Move, and keyed-list release need no provider call.
+            // Report them now; every checkpoint's state writeback materializes
+            // them from the plan.
             let state_only_success_count = execute_state_only_effects(&plan);
             let outcome = execute_effects_with_observer(
                 &plan,
-                &provider,
-                &provider,
+                provider.as_ref(),
+                provider.as_ref(),
                 raw_provider_configs,
                 ctx.factories(),
                 ctx.schemas(),
@@ -2220,7 +2334,14 @@ async fn run_apply_locked_owned(
                 .map_err(|error| AppError::Config(error.to_string()))?;
 
             // Execute import effects: read imported resources from the provider
-            execute_import_effects(&plan, &provider, &mut result, &cancel, &checkpoint_sink).await;
+            execute_import_effects(
+                &plan,
+                provider.as_ref(),
+                &mut result,
+                &cancel,
+                &checkpoint_sink,
+            )
+            .await;
             let state_base = saver.stop(&cancel).await;
             let resources_finished = Instant::now();
 
@@ -2236,6 +2357,7 @@ async fn run_apply_locked_owned(
                     checked_exports: checked_exports_pre_apply,
                     wait_aliases,
                     pre_resolve_compositions,
+                    provider_context: ctx.provider_context().clone(),
                     cancel,
                 },
             )))
@@ -2279,7 +2401,7 @@ async fn run_apply_locked_owned(
                     validated_config.context().schemas(),
                     &wait_aliases,
                     &managed_current,
-                    provider_context,
+                    validated_config.context().provider_context(),
                 )
                 .await?;
                 Ok(None)
@@ -2296,6 +2418,7 @@ async fn run_apply_locked_owned(
                     checked_exports,
                     wait_aliases,
                     pre_resolve_compositions,
+                    provider_context,
                     cancel,
                 } = *context;
                 let export_resources: Vec<Resource> = state_save_inputs
@@ -2319,10 +2442,10 @@ async fn run_apply_locked_owned(
                                     export_params: &checked_exports,
                                     data_source_values: &data_source_values,
                                     resources: &export_resources,
+                                    provider_context: &provider_context,
                                 }),
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                provider_context,
                                 wait_aliases: &wait_aliases,
                                 pre_resolve_compositions: &pre_resolve_compositions,
                             },
@@ -2557,13 +2680,19 @@ fn import_identifiers_from_current_config<S>(
 /// Reproduce the state-aware desired-side preparation that plan runs before
 /// persisting secret placeholders. The supplied wiring has already passed the
 /// saved-plan schema check; only then may this function build normalizers.
+struct PreparedSavedPlanSecretCandidates {
+    candidates: SavedPlanSecretCandidates,
+    provider: ProviderRouter,
+}
+
 async fn prepare_saved_plan_secret_candidates(
     mut validated_config: ValidatedConfig,
     pending_plan: &SchemaCheckedPendingPlanFile,
     state_file: &Option<StateFile>,
     base_dir: &Path,
     provider_context: &ProviderContext,
-) -> Result<SavedPlanSecretCandidates, AppError> {
+    apply_target: ApplyTarget<'_>,
+) -> Result<PreparedSavedPlanSecretCandidates, AppError> {
     let mut candidate_state = state_file.clone();
     let PreparedPlanIdentityData {
         provider_inputs,
@@ -2584,6 +2713,8 @@ async fn prepare_saved_plan_secret_candidates(
     let wiring = validated_config.context();
     let canonical_resources = validated_config.resources();
     let parsed = canonical_resources.parsed();
+    let provider =
+        create_providers_from_configs_with_ctx(wiring, provider_inputs.configs()).await?;
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
         canonical_resources,
         &candidate_state,
@@ -2591,6 +2722,7 @@ async fn prepare_saved_plan_secret_candidates(
     )?
     .detect_moves(
         wiring,
+        &provider,
         &parsed.data_sources,
         provider_inputs.configs().as_provider_configs(),
         &state_blocks.claims,
@@ -2602,6 +2734,7 @@ async fn prepare_saved_plan_secret_candidates(
         &candidate_state,
     )?;
     let data_source_values = pending_plan.data_source_values(&parsed.data_sources)?;
+    pending_plan.verify_provider_scopes(&provider, apply_target)?;
     let prepared_expansion = expansion_prelude
         .bind_projected_phase1_state(
             prior_states.managed,
@@ -2614,6 +2747,7 @@ async fn prepare_saved_plan_secret_candidates(
         &prepared_expansion,
         provider_inputs.remote_bindings(),
         crate::wiring::DeferredForWarningPolicy::Suppress,
+        &provider,
     )?;
 
     let normalizers = create_normalizers_from_configs_with_ctx(
@@ -2632,7 +2766,10 @@ async fn prepare_saved_plan_secret_candidates(
     let candidates =
         SavedPlanSecretCandidates::from_expansion(validated_expansion, provider_inputs);
 
-    Ok(candidates)
+    Ok(PreparedSavedPlanSecretCandidates {
+        candidates,
+        provider,
+    })
 }
 
 fn rehydrate_desired_plan_file(
@@ -2673,7 +2810,7 @@ fn rehydrate_desired_plan_file_from_parts(
         &resource_candidates,
         &data_source_candidates,
         &import_identifiers,
-        &parsed.deferred_for_expressions,
+        parsed.deferred_for_expressions(),
     )
     .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
     *plan_file.plan_mut() = rehydrated_plan;
@@ -2837,8 +2974,13 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 27
-    // requires normalized composition call origins. Plan-file version 26
+    // Validate version compatibility before decoding the payload. Format 33
+    // adds the typed keyed-list release effect. Format 32 records provider
+    // instance reference scopes and create-outcome-unknown markers for
+    // protocol v13. Format 31 persists authored ignore paths; format 30 was
+    // never emitted. Format 29 persists anonymous-loop provenance, typed
+    // deferred-loop targets, and Move origins. Format 27 requires normalized
+    // composition call origins. Plan-file version 26
     // persists the exact provider artifacts used to compute the plan. Plan-file
     // version 25 persists every data-source outcome so apply never re-derives
     // it from a partial graph.
@@ -2991,7 +3133,6 @@ async fn run_apply_from_plan_with_observer_factory(
             })?;
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;
-            let inference_errors = current_config.inference_errors;
             let duplicate_declarations = current_config.duplicate_declarations;
             let providers = providers
                 .check_saved_plan_config_pair(
@@ -2999,7 +3140,6 @@ async fn run_apply_from_plan_with_observer_factory(
                     unresolved,
                     base_dir,
                     false,
-                    &inference_errors,
                     &duplicate_declarations,
                 )
                 .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
@@ -3157,8 +3297,9 @@ async fn run_apply_from_plan_locked_owned(
         }
     }
 
-    let inspected_plan =
-        try_with_lock!(inspected_plan.reload_in_flight_from_locked_state(state_file.as_ref()));
+    let inspected_plan = try_with_lock!(
+        inspected_plan.reload_in_flight_from_locked_state(state_file.as_ref(), project_dir)
+    );
 
     // A typed `read` address plus an identifier-less row shape distinguishes
     // historical pre-#3181 data-source rows without erasing an identifier-
@@ -3192,23 +3333,31 @@ async fn run_apply_from_plan_locked_owned(
             // both that exact load and its retained current-config pair, so
             // validation is not repeated under the lock and execution cannot
             // substitute either half.
-            let validated_plan = match inspected_plan {
+            let (validated_plan, initialized_provider) = match inspected_plan {
                 ReloadedProviderBoundPlanFile::Verified { plan, providers } => {
-                    plan.verify_provider_load(providers, apply_target)?
+                    (plan.verify_provider_load(providers, apply_target)?, None)
                 }
                 ReloadedProviderBoundPlanFile::NeedsSecretVerification { plan, providers } => {
                     let (pending, validated_config) =
                         plan.verify_provider_load(providers, apply_target)?;
-                    let candidates = prepare_saved_plan_secret_candidates(
+                    let prepared = prepare_saved_plan_secret_candidates(
                         validated_config,
                         &pending,
                         &state_file,
                         project_dir,
                         provider_context,
+                        apply_target,
                     )
                     .await
-                    .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
-                    pending.verify_desired(candidates, apply_target)?
+                    .map_err(|source| saved_plan_secret_preparation_error(source, apply_target))?;
+                    let PreparedSavedPlanSecretCandidates {
+                        candidates,
+                        provider,
+                    } = prepared;
+                    (
+                        pending.verify_desired(candidates, apply_target)?,
+                        Some(provider),
+                    )
                 }
             };
             let wiring = validated_plan.context();
@@ -3218,11 +3367,19 @@ async fn run_apply_from_plan_locked_owned(
                     .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
             let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
-            // Desired/config secret verification is complete before a CRUD-capable
-            // provider is constructed. Historical placeholders are verified by the
-            // drift reads below before the executor gate is minted.
-            let provider =
-                create_providers_from_configs_with_ctx(wiring, &resolved_provider_configs).await?;
+            // Secret-bearing plans initialize once while reproducing the
+            // provider-aware expansion used to verify desired values. Plans
+            // without desired placeholders initialize here. Either way, the
+            // same initialized instances continue through drift and execution.
+            let provider = match initialized_provider {
+                Some(provider) => provider,
+                None => {
+                    create_providers_from_configs_with_ctx(wiring, &resolved_provider_configs)
+                        .await?
+                }
+            };
+            let validated_plan = validated_plan.verify_provider_scopes(provider, apply_target)?;
+            let wiring = validated_plan.context();
 
             // Drift detection: re-read actual infrastructure state and compare against planned states
             println!("{}", "Checking for infrastructure drift...".cyan());
@@ -3231,7 +3388,8 @@ async fn run_apply_from_plan_locked_owned(
                 validated_plan.sorted_resources(),
                 validated_plan.current_states(),
                 &historical_addresses,
-                &provider,
+                validated_plan.provider(),
+                validated_plan.provider(),
                 state_file.as_ref(),
                 wiring.schemas(),
                 apply_target,
@@ -3261,21 +3419,23 @@ async fn run_apply_from_plan_locked_owned(
             let (mut actual_states, mut verified_planned_states) =
                 drift_check.into_verified_states();
 
-            let rehydrated_plan_file = validated_plan
+            let scope_checked_plan = validated_plan
                 .verify_historical(
-                    &provider,
                     &mut actual_states,
                     &mut verified_planned_states,
                     &historical_addresses,
                     apply_target,
                 )
                 .await?;
+            let (rehydrated_plan_file, provider) = scope_checked_plan.into_parts();
             let wiring = rehydrated_plan_file.context();
 
             let plan = rehydrated_plan_file.plan();
             let sorted_resources = rehydrated_plan_file.sorted_resources();
-            let resolved_sorted_resources =
-                ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+            let resolved_sorted_resources = ResolvedResource::collect_resolved_with_schemas(
+                sorted_resources.iter().cloned(),
+                wiring.schemas(),
+            )?;
             let plan_compositions = rehydrated_plan_file.compositions();
             let plan_data_sources = rehydrated_plan_file.data_sources();
             let plan_data_source_origins: &[SavedDataSource] =
@@ -3291,7 +3451,7 @@ async fn run_apply_from_plan_locked_owned(
                 plan_data_sources,
                 rehydrated_plan_file.data_source_values(),
             )?;
-            render_plan_errors_and_abort(plan)?;
+            render_plan_errors_and_abort(plan, project_dir)?;
             let executable_data_source_values = data_source_values
                 .clone()
                 .into_executable()
@@ -3335,7 +3495,8 @@ async fn run_apply_from_plan_locked_owned(
             let historical_display =
                 collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
 
-            let summary = PlanChangeSummary::new(plan, &[], &[]);
+            let summary =
+                PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());
             print_plan(
                 plan,
                 &summary,
@@ -3345,12 +3506,14 @@ async fn run_apply_from_plan_locked_owned(
                 &HashMap::new(),
                 None,
                 None,
-            );
+                &provider,
+            )?;
             let moved_hints = crate::moved_hint::detect_moved_block_hints(
                 plan,
                 &managed_current,
                 wiring.schemas(),
-            );
+                &provider,
+            )?;
             moved_hints.eprint();
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -3431,26 +3594,29 @@ async fn run_apply_from_plan_locked_owned(
             // Same object in both positions: `ProviderRouter` is both the
             // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
             // with the plan-time normalizer (carina#3060).
-            let observer = observer_factory(plan);
+            let observer = observer_factory(plan, project_dir);
+            let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),
                 (*plan).clone(),
                 wiring.schemas().clone(),
                 Some(rehydrated_plan_file.planned_secret_hashes().clone()),
-            ));
+                provider.as_ref(),
+            )?);
             let saver =
                 start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
             let publisher = saver.publisher();
             let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
                 publisher.send_replace(Some(snapshot));
             });
-            // Remove and Move need no provider call. Report them now; every
-            // checkpoint's state writeback materializes them from the plan.
+            // Remove, Move, and keyed-list release need no provider call.
+            // Report them now; every checkpoint's state writeback materializes
+            // them from the plan.
             let state_only_success_count = execute_state_only_effects(plan);
             let outcome = execute_rehydrated_saved_plan(
                 &rehydrated_plan_file,
-                &provider,
-                &provider,
+                provider.as_ref(),
+                provider.as_ref(),
                 raw_provider_configs,
                 wiring.factories(),
                 wiring.schemas(),
@@ -3473,7 +3639,14 @@ async fn run_apply_from_plan_locked_owned(
                 .map_err(|error| AppError::Config(error.to_string()))?;
 
             // Execute import effects: read imported resources from the provider
-            execute_import_effects(plan, &provider, &mut result, &cancel, &checkpoint_sink).await;
+            execute_import_effects(
+                plan,
+                provider.as_ref(),
+                &mut result,
+                &cancel,
+                &checkpoint_sink,
+            )
+            .await;
             let state_base = saver.stop(&cancel).await;
 
             Ok(SavedPlanApplyAfterHeartbeat::Executed(Box::new(
@@ -3517,10 +3690,6 @@ async fn run_apply_from_plan_locked_owned(
                     wait_aliases,
                     cancel,
                 } = *context;
-                // Reuse the exact factory/schema context that prepared and executed the
-                // saved plan for write-only attribute persistence.
-                let provider_context = ProviderContext::default();
-
                 let skipped_exports = finalize_after_execute(
                     |persistence| {
                         finalize_apply(
@@ -3535,7 +3704,6 @@ async fn run_apply_from_plan_locked_owned(
                                 export_resolution_inputs: None,
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
-                                provider_context: &provider_context,
                                 // No export resolution runs here, but pass the reconstructed
                                 // aliases so the value is correct if a future plan file persists
                                 // export parameters.

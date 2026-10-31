@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range};
 
 use crate::document::Document;
 use crate::position;
@@ -16,7 +16,7 @@ use carina_core::schema::{
     EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
 };
 
-use super::{DiagnosticEngine, carina_diagnostic};
+use super::{DiagnosticEngine, build_enum_diagnostic_from_error, carina_diagnostic};
 
 impl DiagnosticEngine {
     /// Run [`carina_core::schema::EffectiveType::validate_collect`] against
@@ -34,11 +34,25 @@ impl DiagnosticEngine {
         attr_name: &str,
         value: &Value,
         effective_type: &EffectiveType<'_>,
+        value_range: Option<Range>,
     ) -> Vec<Diagnostic> {
         let errors = effective_type.validate_collect_in_phase(value);
         let mut diagnostics = Vec::new();
         for (path, err) in errors {
             if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
+                if path.is_empty() {
+                    let tagged = err.clone().with_attribute(attr_name);
+                    if let Some(diagnostic) = build_enum_diagnostic_from_error(&tagged, value_range)
+                    {
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                }
+                let err = if matches!(&err, TypeError::FieldGroupViolation { .. }) {
+                    err.with_attribute(attr_name)
+                } else {
+                    err
+                };
                 diagnostics.push(carina_diagnostic(
                     line,
                     col,
@@ -63,7 +77,14 @@ impl DiagnosticEngine {
     ) -> Option<(u32, u32, u32)> {
         let steps = path.steps();
         if steps.is_empty() {
-            return None;
+            return self
+                .find_attribute_position(doc, attr_name, None)
+                .or_else(|| {
+                    self.find_all_block_positions(doc, attr_name)
+                        .first()
+                        .copied()
+                })
+                .map(|(line, col)| (line, col, col + attr_name.len() as u32));
         }
 
         // For a List<Struct> at the top level (block syntax `attr {
@@ -303,7 +324,9 @@ impl DiagnosticEngine {
 
 fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
     match error {
-        TypeError::ReadOnlyAttribute { .. } => DiagnosticSeverity::ERROR,
+        TypeError::ReadOnlyAttribute { .. } | TypeError::FieldGroupViolation { .. } => {
+            DiagnosticSeverity::ERROR
+        }
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
         | TypeError::MapValueError { inner, .. }

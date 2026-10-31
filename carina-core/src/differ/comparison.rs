@@ -6,12 +6,15 @@ use std::collections::{BTreeMap, HashMap};
 use indexmap::IndexMap;
 
 use crate::explicit::{ExplicitFields, ExplicitProjection};
-use crate::provider::NestedWriteOnlyRecord;
+use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, SavedValueViews, UnknownReason, Value,
-    merge_with_saved,
+    ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges, SavedValueViews,
+    UnknownReason, Value, merge_with_saved, value_at_leaf,
 };
-use crate::schema::{AttributeType, LeafPath, ResourceSchema, empty_defs_for_schema_walks};
+use crate::schema::{
+    AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
+    ResourceSchema, TypeIdentity, empty_defs_for_schema_walks,
+};
 use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
 
 /// Type-aware semantic comparison of two Values.
@@ -59,13 +62,77 @@ use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secr
 // rows agree with `find_changed_attributes`' own verdict. Reusing it
 // — never reimplementing — is the carina#3073 fix; a second equality
 // notion is precisely the drift this avoids.
+#[derive(Debug, Clone, Copy)]
+pub struct ComparisonContext<'a> {
+    scope: &'a ReferenceScope,
+    reference_forms: &'a ReferenceForms,
+}
+
+impl<'a> ComparisonContext<'a> {
+    pub(crate) fn from_initialized_provider(
+        provider: &'a InitializedProvider,
+        schema: OwnerBoundResourceSchema<'a>,
+    ) -> Self {
+        Self::from_scope_and_forms(provider.reference_scope(), schema.reference_forms())
+    }
+
+    pub(crate) fn from_scope_and_forms(
+        scope: &'a ReferenceScope,
+        reference_forms: &'a ReferenceForms,
+    ) -> Self {
+        Self {
+            scope,
+            reference_forms,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
+        Self::from_scope_and_forms(scope, reference_forms)
+    }
+
+    fn reference_form(&self, identity: &TypeIdentity) -> Option<&ReferenceForm> {
+        self.reference_forms.get(identity)
+    }
+
+    /// Canonicalize the protocol's unqualified reference form.
+    ///
+    /// `{name}` denotes exactly one bare segment: it contains neither `:` nor
+    /// `/`. Values containing either delimiter are already qualified or path
+    /// forms and compare exactly; they are never expanded and can never equal
+    /// a bare name through reference-form canonicalization.
+    pub(crate) fn canonical_string<'b>(
+        &self,
+        value: &'b str,
+        identity: Option<&TypeIdentity>,
+        to_dsl: Option<&DslTransform>,
+    ) -> Cow<'b, str> {
+        let transformed = to_dsl
+            .map(|transform| transform.apply(value))
+            .unwrap_or(Cow::Borrowed(value));
+        let Some(form) = identity.and_then(|identity| self.reference_form(identity)) else {
+            return transformed;
+        };
+        if transformed.is_empty() || transformed.contains(':') || transformed.contains('/') {
+            return transformed;
+        }
+        match form {
+            ReferenceForm::Template { long } => long
+                .render(self.scope, transformed.as_ref())
+                .map(Cow::Owned)
+                .unwrap_or(transformed),
+        }
+    }
+}
+
 pub(crate) fn type_aware_equal(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> bool {
-    type_aware_equal_on_path(a, b, attr_type, defs, &[])
+    type_aware_equal_on_path(a, b, attr_type, defs, &[], context)
 }
 
 fn type_aware_equal_on_path<'a>(
@@ -74,6 +141,7 @@ fn type_aware_equal_on_path<'a>(
     attr_type: Option<&'a AttributeType>,
     defs: &'a BTreeMap<String, AttributeType>,
     visited_refs: &[&'a str],
+    context: &ComparisonContext<'_>,
 ) -> bool {
     // Secret comparison: compare the desired secret with the typed hash
     // decoded from state. Desired carries `DeferredValue::Secret(inner)`.
@@ -111,11 +179,11 @@ fn type_aware_equal_on_path<'a>(
                 (
                     Value::Concrete(ConcreteValue::Map(ma)),
                     Value::Concrete(ConcreteValue::Map(mb)),
-                ) => type_aware_maps_equal(ma, mb, |_key| None, defs),
+                ) => type_aware_maps_equal(ma, mb, |_key| None, defs, context),
                 (
                     Value::Concrete(ConcreteValue::List(la)),
                     Value::Concrete(ConcreteValue::List(lb)),
-                ) => type_aware_lists_equal(la, lb, None, defs, false),
+                ) => type_aware_lists_equal(la, lb, None, defs, false, context),
                 _ => a.semantically_equal(b),
             }
         }
@@ -132,21 +200,21 @@ fn type_aware_equal_on_path<'a>(
                 crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
             ) => *f == (*i as f64) && (*i as f64) as i64 == *i,
 
-            // String refinements may carry provider/API-to-DSL normalization
-            // such as Route53 trailing-dot stripping.
+            // Preserve provider/API-to-DSL transform equality first, then
+            // consult the identity's reference form under this initialized
+            // provider instance's scope.
             (
                 Value::Concrete(ConcreteValue::String(sa)),
                 Value::Concrete(ConcreteValue::String(sb)),
                 crate::schema::Shape::String {
-                    to_dsl: Some(transform),
-                    ..
+                    identity, to_dsl, ..
                 },
-            ) => transform.apply(sa.expose_plaintext()) == transform.apply(sb.expose_plaintext()),
-            (
-                Value::Concrete(ConcreteValue::String(sa)),
-                Value::Concrete(ConcreteValue::String(sb)),
-                crate::schema::Shape::String { to_dsl: None, .. },
-            ) => sa == sb,
+            ) => {
+                let a = sa.expose_plaintext();
+                let b = sb.expose_plaintext();
+                context.canonical_string(a, identity, to_dsl)
+                    == context.canonical_string(b, identity, to_dsl)
+            }
 
             // Lists: ordered or multiset comparison with inner type awareness
             (
@@ -157,7 +225,7 @@ fn type_aware_equal_on_path<'a>(
                     ordered,
                     ..
                 },
-            ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered),
+            ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered, context),
 
             (
                 Value::Concrete(ConcreteValue::StringList(la)),
@@ -181,7 +249,7 @@ fn type_aware_equal_on_path<'a>(
                 };
                 let la = as_values(la);
                 let lb = as_values(lb);
-                type_aware_lists_equal(&la, &lb, Some(inner), defs, ordered)
+                type_aware_lists_equal(&la, &lb, Some(inner), defs, ordered, context)
             }
 
             // Maps: recursive comparison with inner value type
@@ -189,7 +257,7 @@ fn type_aware_equal_on_path<'a>(
                 Value::Concrete(ConcreteValue::Map(ma)),
                 Value::Concrete(ConcreteValue::Map(mb)),
                 crate::schema::Shape::Map { value: inner, .. },
-            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner), defs),
+            ) => type_aware_maps_equal(ma, mb, |_key| Some(inner), defs, context),
 
             // Struct: per-field type-aware comparison with default-value tolerance
             (
@@ -201,7 +269,7 @@ fn type_aware_equal_on_path<'a>(
                     resolved_attr_type.expect("Some(shape) implies Some(resolved attr_type)");
                 let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
                     .expect("Shape::Struct must expose struct fields internally");
-                type_aware_struct_equal(ma, mb, fields, defs)
+                type_aware_struct_equal(ma, mb, fields, defs, context)
             }
 
             // Union: try each member type; if any says equal, they're equal
@@ -230,7 +298,14 @@ fn type_aware_equal_on_path<'a>(
                         (*i as f64) == *f && (*i as f64) as i64 == *i
                     }
                     _ => types.any_on_path(&mut current_path, |member, member_path| {
-                        type_aware_equal_on_path(a, b, Some(member.as_attr()), defs, member_path)
+                        type_aware_equal_on_path(
+                            a,
+                            b,
+                            Some(member.as_attr()),
+                            defs,
+                            member_path,
+                            context,
+                        )
                     }),
                 }
             }
@@ -331,6 +406,7 @@ fn type_aware_lists_equal(
     inner: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     ordered: bool,
+    context: &ComparisonContext<'_>,
 ) -> bool {
     if a.len() != b.len() {
         return false;
@@ -339,14 +415,14 @@ fn type_aware_lists_equal(
         // Sequential comparison: element order matters
         a.iter()
             .zip(b.iter())
-            .all(|(va, vb)| type_aware_equal(va, vb, inner, defs))
+            .all(|(va, vb)| type_aware_equal(va, vb, inner, defs, context))
     } else {
         // Multiset comparison: order-insensitive
         let mut matched = vec![false; b.len()];
         for item_a in a {
             let mut found = false;
             for (j, item_b) in b.iter().enumerate() {
-                if !matched[j] && type_aware_equal(item_a, item_b, inner, defs) {
+                if !matched[j] && type_aware_equal(item_a, item_b, inner, defs, context) {
                     matched[j] = true;
                     found = true;
                     break;
@@ -366,6 +442,7 @@ fn type_aware_maps_equal<'a, F>(
     b: &IndexMap<String, Value>,
     get_type: F,
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> bool
 where
     F: Fn(&str) -> Option<&'a AttributeType>,
@@ -375,7 +452,7 @@ where
     }
     a.iter().all(|(k, va)| {
         b.get(k)
-            .map(|vb| type_aware_equal(va, vb, get_type(k), defs))
+            .map(|vb| type_aware_equal(va, vb, get_type(k), defs, context))
             .unwrap_or(false)
     })
 }
@@ -391,6 +468,7 @@ fn type_aware_struct_equal(
     b: &IndexMap<String, Value>,
     fields: &[crate::schema::StructField],
     defs: &BTreeMap<String, AttributeType>,
+    context: &ComparisonContext<'_>,
 ) -> bool {
     let field_types: HashMap<&str, &AttributeType> = fields
         .iter()
@@ -401,7 +479,7 @@ fn type_aware_struct_equal(
     for (k, va) in a {
         match b.get(k) {
             Some(vb) => {
-                if !type_aware_equal(va, vb, field_types.get(k.as_str()).copied(), defs) {
+                if !type_aware_equal(va, vb, field_types.get(k.as_str()).copied(), defs, context) {
                     return false;
                 }
             }
@@ -595,7 +673,7 @@ fn contains_pending_reread(value: &Value) -> bool {
 }
 
 /// Return whether a single attribute's values differ semantically.
-pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
+pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>, context: &ComparisonContext<'_>) -> bool {
     // A post-apply read failure can leave a generated desired value unknown.
     // There is no concrete target value to send, so it cannot form a patch
     // (and, in particular, cannot force replacement for a create-only name).
@@ -615,11 +693,17 @@ pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
 
     match cmp.saved {
         Some(saved) => {
-            let effective_to =
-                merge_with_saved(cmp.to, saved.views, saved.authoring, attr_type, defs);
-            !type_aware_equal(from_value, &effective_to, attr_type, defs)
+            let effective_to = merge_with_saved(
+                cmp.to,
+                saved.views,
+                saved.authoring,
+                attr_type,
+                defs,
+                context,
+            );
+            !type_aware_equal(from_value, &effective_to, attr_type, defs, context)
         }
-        None => !type_aware_equal(from_value, cmp.to, attr_type, defs),
+        None => !type_aware_equal(from_value, cmp.to, attr_type, defs, context),
     }
 }
 
@@ -629,7 +713,29 @@ pub(crate) fn key_should_enter_patch(
     schema: Option<&ResourceSchema>,
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
+    context: &ComparisonContext<'_>,
 ) -> bool {
+    key_should_enter_patch_with_ignores(
+        key,
+        schema,
+        leaf_provenance,
+        cmp,
+        &ResolvedIgnoreChanges::default(),
+        context,
+    )
+}
+
+pub(crate) fn key_should_enter_patch_with_ignores(
+    key: &str,
+    schema: Option<&ResourceSchema>,
+    leaf_provenance: LeafProvenance<'_>,
+    cmp: AttrComparison<'_>,
+    ignore_changes: &ResolvedIgnoreChanges,
+    context: &ComparisonContext<'_>,
+) -> bool {
+    if ignore_changes.ignores_whole_attribute(key) {
+        return false;
+    }
     // CloudControl reads omit write-only values. Ignore that absence only when
     // the key cannot be updated: otherwise the value must enter an Update and
     // exact accepted-request provenance can make subsequent plans converge.
@@ -642,9 +748,16 @@ pub(crate) fn key_should_enter_patch(
     if let Some(schema) = schema
         && schema.write_only_bearing(key)
     {
-        return nested_write_only_should_enter_patch(key, schema, leaf_provenance, cmp);
+        return nested_write_only_should_enter_patch(
+            key,
+            schema,
+            leaf_provenance,
+            cmp,
+            ignore_changes,
+            context,
+        );
     }
-    should_patch_attr(cmp)
+    should_patch_attr(cmp, context)
 }
 
 fn nested_write_only_should_enter_patch(
@@ -652,6 +765,8 @@ fn nested_write_only_should_enter_patch(
     schema: &ResourceSchema,
     leaf_provenance: LeafProvenance<'_>,
     cmp: AttrComparison<'_>,
+    ignore_changes: &ResolvedIgnoreChanges,
+    context: &ComparisonContext<'_>,
 ) -> bool {
     if contains_pending_reread(cmp.to) {
         return false;
@@ -667,13 +782,24 @@ fn nested_write_only_should_enter_patch(
                 saved.authoring,
                 Some(attr_type),
                 &schema.defs,
+                context,
             ))
         },
     );
-    let observable_equal =
-        write_only_observable_equal(schema, key, cmp.from, effective_to.as_ref(), attr_type);
+    let observable_equal = write_only_observable_equal(
+        schema,
+        key,
+        cmp.from,
+        effective_to.as_ref(),
+        attr_type,
+        context,
+    );
 
-    let desired_leaves = schema.write_only_leaf_projection(key, cmp.to);
+    let desired_leaves = schema
+        .write_only_leaf_projection(key, cmp.to)
+        .into_iter()
+        .filter(|(path, _, _)| !ignore_changes.ignores_leaf(key, path))
+        .collect::<Vec<_>>();
     let leaf_equal = match leaf_provenance {
         LeafProvenance::Recorded(saved_leaves) => {
             if schema
@@ -685,6 +811,10 @@ fn nested_write_only_should_enter_patch(
                 return !observable_equal;
             }
             saved_leaves.map_or(desired_leaves.is_empty(), |saved_leaves| {
+                let saved_leaves = saved_leaves
+                    .iter()
+                    .filter(|(path, _)| !ignore_changes.ignores_leaf(key, path))
+                    .collect::<Vec<_>>();
                 saved_leaves.len() == desired_leaves.len()
                     && desired_leaves.iter().zip(saved_leaves).all(
                         |((path, desired, field_type), (saved_path, saved))| {
@@ -695,6 +825,7 @@ fn nested_write_only_should_enter_patch(
                                         &saved,
                                         Some(field_type),
                                         &schema.defs,
+                                        context,
                                     )
                                 })
                         },
@@ -746,6 +877,7 @@ fn write_only_observable_equal(
     from: Option<&Value>,
     to: &Value,
     attr_type: &AttributeType,
+    context: &ComparisonContext<'_>,
 ) -> bool {
     let observable_to = schema.strip_write_only_leaves(key, to);
     let Some(from) = from else {
@@ -757,6 +889,7 @@ fn write_only_observable_equal(
         &observable_to,
         Some(attr_type),
         &schema.defs,
+        context,
     )
 }
 
@@ -839,14 +972,47 @@ pub(crate) fn secret_grafted_comparison_view<'a>(
 /// end of this function: the same set of top-level keys is used to
 /// flag attributes the user *previously* wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used for each attribute.
-pub(super) fn find_changed_attributes(
-    desired: &HashMap<String, Value>,
-    current: &HashMap<String, Value>,
-    saved: Option<&HashMap<String, Value>>,
-    nested_write_only: &NestedWriteOnlyRecord,
+pub(super) struct AttributeChanges {
+    pub changed: Vec<String>,
+    pub ignored_readable_differences: usize,
+}
+
+pub(super) struct AttributeValueViews<'a> {
+    desired: &'a HashMap<String, Value>,
+    current: &'a HashMap<String, Value>,
+    saved: Option<&'a HashMap<String, Value>>,
+    nested_write_only: &'a NestedWriteOnlyRecord,
+}
+
+impl<'a> AttributeValueViews<'a> {
+    pub(super) fn new(
+        desired: &'a HashMap<String, Value>,
+        current: &'a HashMap<String, Value>,
+        saved: Option<&'a HashMap<String, Value>>,
+        nested_write_only: &'a NestedWriteOnlyRecord,
+    ) -> Self {
+        Self {
+            desired,
+            current,
+            saved,
+            nested_write_only,
+        }
+    }
+}
+
+pub(super) fn find_changed_attributes_with_ignores(
+    values: AttributeValueViews<'_>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
-) -> Vec<String> {
+    ignore_changes: &ResolvedIgnoreChanges,
+    context: &ComparisonContext<'_>,
+) -> AttributeChanges {
+    let AttributeValueViews {
+        desired,
+        current,
+        saved,
+        nested_write_only,
+    } = values;
     let mut changed = Vec::new();
 
     // Pull the cyclic-struct definition map (`Ref` targets) from the
@@ -874,6 +1040,7 @@ pub(super) fn find_changed_attributes(
             desired,
             explicit,
             schema,
+            context,
         )
     });
     let projected_current = projection.as_ref().map_or_else(
@@ -894,7 +1061,42 @@ pub(super) fn find_changed_attributes(
     };
     let projected_saved = projected_saved.as_ref().or(raw_saved);
 
+    let mut differing_ignored_paths = std::collections::HashSet::new();
+    for path in ignore_changes.iter().filter(|path| !path.is_write_only()) {
+        let Some(desired_value) = desired.get(path.attribute()) else {
+            continue;
+        };
+        let desired_leaf = value_at_leaf(desired_value, path.leaf());
+        let current_leaf = current
+            .get(path.attribute())
+            .and_then(|value| value_at_leaf(value, path.leaf()));
+        let equal = match (desired_leaf, current_leaf) {
+            (Some(desired), Some(current)) => {
+                let attr_type = path
+                    .leaf()
+                    .segments()
+                    .is_empty()
+                    .then(|| {
+                        schema?
+                            .attributes
+                            .get(path.attribute())
+                            .map(|attr| &attr.attr_type)
+                    })
+                    .flatten();
+                type_aware_equal(current, desired, attr_type, defs, context)
+            }
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if !equal {
+            differing_ignored_paths.insert(path.authored());
+        }
+    }
+
     for (key, desired_value) in desired {
+        if ignore_changes.ignores_whole_attribute(key) {
+            continue;
+        }
         let type_info = schema.and_then(|s| {
             s.attributes.get(key).map(|attr| TypedAttr {
                 attr_type: &attr.attr_type,
@@ -916,9 +1118,11 @@ pub(super) fn find_changed_attributes(
                 .filter(|value| crate::value::contains_redacted_secret(value))
         });
 
+        let effective_desired =
+            ignore_changes.with_observed_readable_leaves(key, desired_value, current_value);
         let comparison = AttrComparison {
             from: current_value,
-            to: desired_value,
+            to: &effective_desired,
             saved: projected_saved.and_then(|projected_saved| {
                 projected_saved.get(key).map(|projected_value| SavedAttr {
                     views: raw_saved
@@ -942,11 +1146,13 @@ pub(super) fn find_changed_attributes(
             }),
             type_info,
         };
-        let should_patch = key_should_enter_patch(
+        let should_patch = key_should_enter_patch_with_ignores(
             key,
             schema,
             LeafProvenance::Recorded(nested_write_only.get(key)),
             comparison,
+            ignore_changes,
+            context,
         );
         if should_patch {
             changed.push(key.clone());
@@ -983,13 +1189,51 @@ pub(super) fn find_changed_attributes(
         | None => {}
     }
 
-    changed
+    AttributeChanges {
+        changed,
+        ignored_readable_differences: differing_ignored_paths.len(),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn find_changed_attributes(
+    desired: &HashMap<String, Value>,
+    current: &HashMap<String, Value>,
+    saved: Option<&HashMap<String, Value>>,
+    nested_write_only: &NestedWriteOnlyRecord,
+    prev_explicit: Option<&ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
+) -> Vec<String> {
+    find_changed_attributes_with_ignores(
+        AttributeValueViews::new(desired, current, saved, nested_write_only),
+        prev_explicit,
+        schema,
+        &ResolvedIgnoreChanges::default(),
+        context,
+    )
+    .changed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::{DslTransform, TypeIdentity};
+
+    fn type_aware_equal(
+        a: &Value,
+        b: &Value,
+        attr_type: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> bool {
+        super::type_aware_equal(
+            a,
+            b,
+            attr_type,
+            defs,
+            &crate::differ::exact_comparison_context_for_tests(),
+        )
+    }
 
     #[test]
     fn refined_string_to_dsl_transform_is_applied_before_comparison() {

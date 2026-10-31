@@ -14,8 +14,10 @@ use indexmap::IndexMap;
 use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, ModuleArgument,
-    ModuleCall, ParsedFile, ProviderContext, TypeExpr,
+    ArgumentOrigin, ArgumentParameter, AttributePathSegment, BindingUseOwner, DeferredForBody,
+    DeferredForExpression, LoadedProviderContext, ModuleArgument, ModuleCall,
+    ModuleResolvedParsedFile, ParsedDeferredForExpression, ParsedDeferredForPhase, ParsedFile,
+    ProviderContext, ResourceTypePath, SourceSpan, TypeExpr,
 };
 use crate::resource::{
     AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
@@ -26,25 +28,31 @@ use crate::resource::{
 };
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
+fn known(type_expr: TypeExpr) -> TypeExpr {
+    type_expr
+}
+
+fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
+    crate::validation::resolve_consumer_static_type_for_signature(
+        &type_expr,
+        &ProviderContext::default(),
+    )
+}
+
 fn resolve_modules(
-    mut parsed: ParsedFile,
+    parsed: ParsedFile,
     base_dir: &std::path::Path,
-) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
-    super::resolver::resolve_modules_authored_for_test(&mut parsed, base_dir)
+) -> Result<ModuleResolvedParsedFile, ModuleError> {
+    super::resolve_modules_providerless(parsed, base_dir)
 }
 
 fn resolve_modules_with_config(
-    mut parsed: ParsedFile,
+    parsed: ParsedFile,
     base_dir: &std::path::Path,
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
-) -> Result<crate::parser::ExpandedParsedFile, ModuleError> {
-    super::resolver::resolve_modules_authored_with_config_for_test(
-        &mut parsed,
-        base_dir,
-        config,
-        schemas,
-    )
+) -> Result<ModuleResolvedParsedFile, ModuleError> {
+    super::resolve_modules_with_providerless_config(parsed, base_dir, config, schemas)
 }
 
 fn reconcile_anonymous_module_instances(
@@ -82,10 +90,35 @@ fn expanded_resource_ref(
     .resolve_root(&crate::resource::RootScope::new())
 }
 
+fn parsed_deferred_resource(expression: DeferredForExpression) -> ParsedDeferredForExpression {
+    let DeferredForExpression {
+        file,
+        line,
+        header,
+        resource_type: _,
+        attributes: _,
+        target,
+        iterable,
+        binding,
+        template_resource,
+    } = expression;
+    ParsedDeferredForExpression {
+        file,
+        line,
+        span: SourceSpan::dummy(),
+        header,
+        target,
+        iterable,
+        iterable_state: crate::parser::ParsedDeferredForIterableState::Deferred,
+        binding,
+        body: DeferredForBody::Resource(Box::new(template_resource)),
+    }
+}
+
 fn resolve_anonymous_loop_module_fixture(
     module_body: &str,
     root_body: &str,
-) -> crate::parser::ExpandedParsedFile {
+) -> ModuleResolvedParsedFile {
     let root = tempfile::tempdir().expect("temporary module fixture");
     let module_dir = root.path().join("modules/network");
     fs::create_dir_all(&module_dir).expect("create module directory");
@@ -350,22 +383,45 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     );
 
     let claims = crate::identifier::StateBlockClaims::empty();
-    let state_entry = crate::identifier::AnonymousIdStateInfo {
-        name: "_for0[0]._for0[0]".to_string(),
-        provider_instance: None,
-        create_only_values: HashMap::from([("name".to_string(), "inner".to_string())]),
-    };
+    let state_entry = crate::identifier::AnonymousIdStateInfo::try_from_state_attributes(
+        crate::resource::ResolvedResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            ResourceIdentity::new("_for0[0]._for0[0]"),
+            None,
+        ),
+        None,
+        registry
+            .get("mock", "test.resource", crate::schema::SchemaKind::Resource)
+            .expect("state fixture schema")
+            .schema(),
+        &HashMap::from([(
+            "name".to_string(),
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("inner".into())),
+        )]),
+    )
+    .expect("state fixture has a valid resolved address");
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &registry,
+        parsed.iter_all_resources().map(|resource| resource.id()),
+    );
     let moves = crate::identifier::detect_legacy_loop_address_moves(
         &parsed.resources,
         &registry,
+        &comparison_provider,
         &|provider, resource_type| {
-            claims.screen_entries(provider, resource_type, [state_entry.clone()], |entry| {
-                entry.name.as_str()
-            })
+            claims.screen_entries(
+                provider,
+                resource_type,
+                [state_entry.clone()],
+                crate::identifier::AnonymousIdStateInfo::name,
+            )
         },
+        &|_binding| Vec::new(),
         &claims,
         &[],
-    );
+    )
+    .expect("legacy-loop comparison fixture must resolve");
     assert_eq!(
         moves.len(),
         1,
@@ -438,6 +494,7 @@ fn create_test_module() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -452,14 +509,14 @@ fn create_test_module() -> ParsedFile {
         arguments: vec![
             ArgumentParameter {
                 name: "vpc_id".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "enable_flag".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
@@ -477,7 +534,7 @@ fn create_test_module() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -582,6 +639,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
                 attrs
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: BTreeSet::new(),
@@ -606,7 +664,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -775,6 +833,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
                 provider_instance: Some("us".to_string()),
                 ..Directives::default()
             },
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".into()),
             dependency_bindings: BTreeSet::new(),
@@ -799,7 +858,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -880,6 +939,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             provider_instance: Some("us".to_string()),
             ..Directives::default()
         },
+        resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix).into()),
         dependency_bindings: BTreeSet::new(),
@@ -943,6 +1003,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".into()),
                 dependency_bindings: BTreeSet::new(),
@@ -962,6 +1023,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                     attrs.into_iter().collect()
                 },
                 directives: Directives::default(),
+                resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".into()),
                 dependency_bindings: BTreeSet::new(),
@@ -976,7 +1038,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "cidr".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: known(TypeExpr::String),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -993,7 +1055,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -1117,6 +1179,7 @@ fn create_module_with_attributes() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".into()),
             dependency_bindings: BTreeSet::new(),
@@ -1149,7 +1212,7 @@ fn create_module_with_attributes() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -1444,14 +1507,14 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         arguments: vec![
             ArgumentParameter {
                 name: "region".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: vec![],
             },
             ArgumentParameter {
                 name: "instance_count".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: vec![],
@@ -1475,7 +1538,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -1532,7 +1595,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .signature
             .arguments
             .get("region")
-            .map(|argument| argument.declared_type()),
+            .and_then(|argument| argument.declared_type().known()),
         Some(&TypeExpr::String),
         "the declared sink type must travel with the argument value",
     );
@@ -1577,7 +1640,7 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
 /// (one `awscc.iam.Role` whose `role_name` comes from a `name` argument)
 /// and a `root/main.crn` with the caller-supplied body; returns the parsed
 /// root with modules already resolved.
-fn resolve_thing_fixture(root_body: &str) -> crate::parser::ExpandedParsedFile {
+fn resolve_thing_fixture(root_body: &str) -> ModuleResolvedParsedFile {
     let tmp = tempfile::tempdir().expect("tempdir");
     let module_dir = tmp.path().join("modules/thing");
     fs::create_dir_all(&module_dir).unwrap();
@@ -1605,7 +1668,7 @@ let role = awscc.iam.Role {
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_names(parsed: &crate::parser::ExpandedParsedFile) -> HashSet<String> {
+fn role_names(parsed: &ModuleResolvedParsedFile) -> HashSet<String> {
     parsed
         .resources
         .iter()
@@ -1940,7 +2003,7 @@ thing { name = 'after-edit' }
                 "role_name".to_string(),
                 vec![],
             ),
-            TypeExpr::String,
+            consumer_type(TypeExpr::String),
             ArgumentOrigin::Defaulted,
         ),
     );
@@ -2518,6 +2581,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("distribution".into()),
             dependency_bindings: BTreeSet::new(),
@@ -2820,6 +2884,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                 attrs.into_iter().collect()
             },
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".into()),
             dependency_bindings: BTreeSet::new(),
@@ -2834,14 +2899,14 @@ fn create_module_with_interpolation() -> ParsedFile {
         arguments: vec![
             ArgumentParameter {
                 name: "cidr_block".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "env_name".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -2859,7 +2924,7 @@ fn create_module_with_interpolation() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -3466,7 +3531,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "port".to_string(),
-            type_expr: TypeExpr::Int,
+            static_type: known(TypeExpr::Int),
             default: Some(Value::Concrete(ConcreteValue::Int(8080))),
             description: Some("Web server port".to_string()),
             validations: vec![ValidationBlock::dummy(
@@ -3497,7 +3562,7 @@ fn create_module_with_port_validation() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -3534,7 +3599,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
 
     let mut module = create_module_with_port_validation();
-    module.arguments[0].type_expr = TypeExpr::String;
+    module.arguments[0].static_type = known(TypeExpr::String);
     module.arguments[0].validations = vec![ValidationBlock::dummy(
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::FunctionCall {
@@ -3623,7 +3688,7 @@ let root = outer { outer_port = producer.port }
                     Value::Deferred(DeferredValue::BindingRef {
                         binding: "outer_port".into(),
                     }),
-                    TypeExpr::String,
+                    consumer_type(TypeExpr::String),
                     ArgumentOrigin::Defaulted,
                 ),
             )]),
@@ -3658,7 +3723,7 @@ let root = outer { outer_port = producer.port }
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "outer_port".to_string(),
-            type_expr: TypeExpr::String,
+            static_type: known(TypeExpr::String),
             default: None,
             description: None,
             validations: vec![],
@@ -3675,7 +3740,7 @@ let root = outer { outer_port = producer.port }
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
     let resolver = {
@@ -3838,7 +3903,7 @@ fn test_argument_validation_no_message_uses_default() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "count".to_string(),
-            type_expr: TypeExpr::Int,
+            static_type: known(TypeExpr::Int),
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(
@@ -3862,7 +3927,7 @@ fn test_argument_validation_no_message_uses_default() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -3902,7 +3967,7 @@ fn test_argument_validation_len_with_list() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "tags".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
             default: None,
             description: None,
             validations: vec![ValidationBlock::dummy(
@@ -3929,7 +3994,7 @@ fn test_argument_validation_len_with_list() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -3986,14 +4051,14 @@ fn test_require_block_passes() {
         arguments: vec![
             ArgumentParameter {
                 name: "enable_https".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "cert_arn".to_string(),
-                type_expr: TypeExpr::String,
+                static_type: known(TypeExpr::String),
                 default: Some(Value::Concrete(ConcreteValue::String(
                     "arn:aws:acm:us-east-1:123:cert/abc".into(),
                 ))),
@@ -4026,7 +4091,7 @@ fn test_require_block_passes() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4068,14 +4133,14 @@ fn test_require_block_fails_with_not_expr() {
         arguments: vec![
             ArgumentParameter {
                 name: "enable_https".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(true))),
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "has_cert".to_string(),
-                type_expr: TypeExpr::Bool,
+                static_type: known(TypeExpr::Bool),
                 default: Some(Value::Concrete(ConcreteValue::Bool(false))),
                 description: None,
                 validations: Vec::new(),
@@ -4102,7 +4167,7 @@ fn test_require_block_fails_with_not_expr() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4149,7 +4214,7 @@ fn test_require_block_len_function() {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "subnet_ids".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
             default: None,
             description: None,
             validations: Vec::new(),
@@ -4177,7 +4242,7 @@ fn test_require_block_len_function() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4237,14 +4302,14 @@ fn test_require_block_multiple_constraints() {
         arguments: vec![
             ArgumentParameter {
                 name: "min_size".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
             },
             ArgumentParameter {
                 name: "max_size".to_string(),
-                type_expr: TypeExpr::Int,
+                static_type: known(TypeExpr::Int),
                 default: None,
                 description: None,
                 validations: Vec::new(),
@@ -4270,7 +4335,7 @@ fn test_require_block_multiple_constraints() {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
 
@@ -4404,11 +4469,11 @@ fn test_argument_type_mismatch_string_for_bool() {
 
 #[test]
 fn test_argument_type_custom_validator() {
-    // Create a ProviderContext with a custom "arn" validator
+    // Create a loaded ProviderContext with a custom "arn" validator
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4436,20 +4501,21 @@ fn test_argument_type_custom_validator() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arn".to_string(),
-        type_expr: TypeExpr::SchemaType { owned },
+        static_type: known(TypeExpr::SchemaType { owned }),
         default: None,
         description: None,
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -4494,7 +4560,7 @@ fn test_argument_type_list_of_custom_type() {
     let identity = TypeIdentity::bare("Arn");
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
     let validator_identity = identity.clone();
-    let config = ProviderContext {
+    let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([owned.clone()]),
             Box::new(move |target, value| {
@@ -4522,20 +4588,21 @@ fn test_argument_type_list_of_custom_type() {
             }),
         ),
         ..ProviderContext::default()
-    };
+    });
 
     let mut module = create_test_module();
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "policy_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType { owned })),
+        static_type: known(TypeExpr::List(Box::new(TypeExpr::SchemaType { owned }))),
         default: None,
         description: None,
         validations: Vec::new(),
     }];
 
+    let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config(".", &config);
+        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -4622,10 +4689,7 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
 /// root body to a tempdir, parse and resolve, return the parsed root with
 /// modules expanded. Mirrors the directory-scoped fixture shape required by
 /// CLAUDE.md so single-file thinking can't sneak back in.
-fn resolve_default_arg_fixture(
-    module_body: &str,
-    root_body: &str,
-) -> crate::parser::ExpandedParsedFile {
+fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ModuleResolvedParsedFile {
     let tmp = tempfile::tempdir().expect("tempdir");
     let module_dir = tmp.path().join("modules/m");
     fs::create_dir_all(&module_dir).unwrap();
@@ -4640,7 +4704,7 @@ fn resolve_default_arg_fixture(
     resolve_modules(parsed, &root_dir).expect("resolve_modules should succeed")
 }
 
-fn role_attr<'a>(parsed: &'a crate::parser::ExpandedParsedFile, attr: &str) -> &'a ExpandedValue {
+fn role_attr<'a>(parsed: &'a ModuleResolvedParsedFile, attr: &str) -> &'a ExpandedValue {
     parsed
         .resources
         .iter()
@@ -5894,8 +5958,8 @@ outer {
         tmp.path(),
         &config,
         &crate::schema::SchemaRegistry::new(),
-    )
-    .map(|_| ())
+    )?;
+    Ok(())
 }
 
 /// A declared resource reference is a typed handle for boundary checking even
@@ -6127,10 +6191,10 @@ fn create_module_with_environment_union() -> ParsedFile {
         module_calls: vec![],
         arguments: vec![ArgumentParameter {
             name: "environment".to_string(),
-            type_expr: TypeExpr::Union(vec![
+            static_type: known(TypeExpr::Union(vec![
                 TypeExpr::StringLiteral("dev".to_string()),
                 TypeExpr::StringLiteral("prod".to_string()),
-            ]),
+            ])),
             default: Some(Value::Concrete(ConcreteValue::String("dev".into()))),
             description: None,
             validations: Vec::new(),
@@ -6147,7 +6211,7 @@ fn create_module_with_environment_union() -> ParsedFile {
         parser_binding_metadata: Default::default(),
         parsed_binding_uses: Default::default(),
         warnings: vec![],
-        deferred_for_expressions: vec![],
+        deferred_for_phase: ParsedDeferredForPhase::default(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
     }
 }
@@ -6395,7 +6459,7 @@ m { foo = 'x' }
 /// the PR-A → PR-B boundary.
 #[test]
 fn test_expand_module_call_propagates_deferred_for_expressions() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
@@ -6407,6 +6471,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             id: ResourceId::with_identity("acm.Certificate", "cert"),
             attributes: HashMap::new().into_iter().collect(),
             directives: Directives::default(),
+            resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".into()),
             dependency_bindings: BTreeSet::new(),
@@ -6415,45 +6480,47 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             loop_provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         });
-        m.deferred_for_expressions.push(DeferredForExpression {
-            file: None,
-            line: 7,
-            header: "for _, opt in cert.domain_validation_options".to_string(),
-            resource_type: "aws.route53.RecordSet".to_string(),
-            attributes: vec![],
-            target: DeferredForTarget::Bound {
-                binding: "_domain_validation_options".into(),
-            },
-            iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-            binding: ForBinding::Map("_".to_string(), "opt".to_string()),
-            template_resource: Resource {
-                id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
-                attributes: {
-                    // The loop body references the module-internal
-                    // `cert` binding — the part of the template
-                    // treatment that actually SURVIVES materialization
-                    // (`substitute_attrs` does not re-run ref-rewrite).
-                    // PR-B must prefix this to `r.cert` so the
-                    // generated RecordSet wires to the prefixed module
-                    // certificate; without it the loop body silently
-                    // dangles. Round-3 review test gap.
-                    let mut a = IndexMap::new();
-                    a.insert(
-                        "validated_cert".to_string(),
-                        Value::resource_ref("cert".to_string(), "arn".to_string(), vec![]),
-                    );
-                    a
+        m.parsed_deferred_for_expressions_mut()
+            .push(parsed_deferred_resource(DeferredForExpression {
+                file: None,
+                line: 7,
+                header: "for _, opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.RecordSet".to_string(),
+                attributes: vec![],
+                target: DeferredForTarget::Bound {
+                    binding: "_domain_validation_options".into(),
                 },
-                directives: Directives::default(),
-                prefixes: HashMap::new(),
-                binding: None,
-                dependency_bindings: BTreeSet::new(),
-                module_source: None,
-                default_tag_keys: Default::default(),
-                loop_provenance: Default::default(),
-                quoted_string_attrs: std::collections::HashSet::new(),
-            },
-        });
+                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                binding: ForBinding::Map("_".to_string(), "opt".to_string()),
+                template_resource: Resource {
+                    id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
+                    attributes: {
+                        // The loop body references the module-internal
+                        // `cert` binding — the part of the template
+                        // treatment that actually SURVIVES materialization
+                        // (`substitute_attrs` does not re-run ref-rewrite).
+                        // PR-B must prefix this to `r.cert` so the
+                        // generated RecordSet wires to the prefixed module
+                        // certificate; without it the loop body silently
+                        // dangles. Round-3 review test gap.
+                        let mut a = IndexMap::new();
+                        a.insert(
+                            "validated_cert".to_string(),
+                            Value::resource_ref("cert".to_string(), "arn".to_string(), vec![]),
+                        );
+                        a
+                    },
+                    directives: Directives::default(),
+                    resolved_ignore_changes: Default::default(),
+                    prefixes: HashMap::new(),
+                    binding: None,
+                    dependency_bindings: BTreeSet::new(),
+                    module_source: None,
+                    default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
+                    quoted_string_attrs: std::collections::HashSet::new(),
+                },
+            }));
         m
     };
 
@@ -6478,15 +6545,15 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // reached the caller instead of vanishing at the expansion
     // boundary.
     assert_eq!(
-        expanded.deferred_for_expressions.len(),
+        expanded.parsed_deferred_for_expressions().len(),
         1,
         "module-internal deferred-for must survive expand_module_call (carina#3126)"
     );
-    let d = &expanded.deferred_for_expressions[0];
-    assert_eq!(d.resource_type, "aws.route53.RecordSet");
+    let d = &expanded.parsed_deferred_for_expressions()[0];
     assert!(
-        d.reference_candidates()
-            .contains("r.cert.domain_validation_options")
+        d.root_bindings()
+            .iter()
+            .any(|binding| binding.as_str() == "r.cert")
     );
     // carina#3126 PR-B: binding-name fields are instance-prefixed so
     // the loop-generated resources are isolated per module instance
@@ -6517,8 +6584,10 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // intra-module ref must be prefixed, and module_source stamped, so
     // the generated RecordSet wires to the prefixed module certificate.
     // Round-3 review found this load-bearing path had zero coverage.
-    let validated_cert = d
-        .template_resource
+    let DeferredForBody::Resource(template_resource) = &d.body else {
+        panic!("deferred test body must remain a resource")
+    };
+    let validated_cert = template_resource
         .attributes
         .get("validated_cert")
         .expect("template attr preserved");
@@ -6535,35 +6604,44 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     }
     assert!(
         matches!(
-            d.template_resource.module_source,
+            template_resource.module_source,
             Some(crate::resource::ModuleSource::Module(ref source)) if source.instance() == "r"
         ),
         "template_resource must carry the module instance source; got: {:?}",
-        d.template_resource.module_source
+        template_resource.module_source
     );
 }
 
 #[test]
 fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForTarget, ForBinding};
 
     let mut module = create_test_module_with_anonymous_resource();
     module.resources.clear();
-    module.deferred_for_expressions.push(DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for _, account in accounts.items".to_string(),
-        resource_type: "awscc.sso.Assignment".to_string(),
-        attributes: Vec::new(),
-        target: DeferredForTarget::Bound {
-            binding: "assignments".into(),
-        },
-        iterable: Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("account".into()),
-        )])),
-        binding: ForBinding::Map("_".to_string(), "account".to_string()),
-        template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
+    module.arguments.push(ArgumentParameter {
+        name: "accounts".to_string(),
+        static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
+        default: None,
+        description: None,
+        validations: Vec::new(),
     });
+    module
+        .parsed_deferred_for_expressions_mut()
+        .push(parsed_deferred_resource(DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for _, account in accounts.items".to_string(),
+            resource_type: "awscc.sso.Assignment".to_string(),
+            attributes: Vec::new(),
+            target: DeferredForTarget::Bound {
+                binding: "assignments".into(),
+            },
+            iterable: Value::Deferred(DeferredValue::BindingRef {
+                binding: "accounts".into(),
+            }),
+            binding: ForBinding::Map("_".to_string(), "account".to_string()),
+            template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
+        }));
 
     let resolver = {
         let mut resolver = ModuleResolver::new(".");
@@ -6572,24 +6650,33 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
             .insert("assignments".to_string(), module);
         resolver
     };
-    let call = ModuleCall::test("assignments".to_string(), None, HashMap::new());
+    let call = ModuleCall::test("assignments".to_string(), None, {
+        let mut arguments = HashMap::new();
+        arguments.insert(
+            "accounts".to_string(),
+            Value::resource_ref("accounts", "items", Vec::new()),
+        );
+        module_arguments(arguments)
+    });
 
-    let first = resolver
-        .expand_module_call(&call, "first")
-        .unwrap()
-        .deferred_for_expressions
+    let first_expanded = resolver.expand_module_call(&call, "first").unwrap();
+    let first = first_expanded
+        .into_parsed_deferred_for_expressions()
         .into_iter()
         .next()
-        .unwrap()
-        .template_resource;
-    let second = resolver
-        .expand_module_call(&call, "second")
-        .unwrap()
-        .deferred_for_expressions
+        .unwrap();
+    let DeferredForBody::Resource(first) = first.body else {
+        panic!("deferred test body must remain a resource")
+    };
+    let second_expanded = resolver.expand_module_call(&call, "second").unwrap();
+    let second = second_expanded
+        .into_parsed_deferred_for_expressions()
         .into_iter()
         .next()
-        .unwrap()
-        .template_resource;
+        .unwrap();
+    let DeferredForBody::Resource(second) = second.body else {
+        panic!("deferred test body must remain a resource")
+    };
 
     assert_eq!(first.id.identity_str(), None);
     assert_eq!(second.id.identity_str(), None);
@@ -6601,43 +6688,47 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
 /// never be prefixed with the callee's instance address.
 #[test]
 fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
-    use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
+    use crate::parser::{DeferredForTarget, ForBinding};
 
     let module = {
         let mut m = create_module_with_intra_refs();
         m.arguments.push(ArgumentParameter {
             name: "accounts".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            static_type: known(TypeExpr::List(Box::new(TypeExpr::String))),
             default: None,
             description: None,
             validations: Vec::new(),
         });
-        m.deferred_for_expressions.push(DeferredForExpression {
-            file: None,
-            line: 3,
-            header: "for _, a in accounts.list".to_string(),
-            resource_type: "awscc.sso.Assignment".to_string(),
-            attributes: vec![],
-            target: DeferredForTarget::Bound {
-                binding: "_list".into(),
-            },
-            iterable: Value::Deferred(DeferredValue::BindingRef {
-                binding: "accounts".into(),
-            }),
-            binding: ForBinding::Map("_".to_string(), "a".to_string()),
-            template_resource: Resource {
-                id: ResourceId::with_identity("sso.Assignment", "placeholder"),
-                attributes: HashMap::new().into_iter().collect(),
-                directives: Directives::default(),
-                prefixes: HashMap::new(),
-                binding: None,
-                dependency_bindings: BTreeSet::new(),
-                module_source: None,
-                default_tag_keys: Default::default(),
-                loop_provenance: Default::default(),
-                quoted_string_attrs: std::collections::HashSet::new(),
-            },
-        });
+        // `accounts` is a module argument, so its caller-expanded address is
+        // substituted rather than acquiring the callee's instance prefix.
+        m.parsed_deferred_for_expressions_mut()
+            .push(parsed_deferred_resource(DeferredForExpression {
+                file: None,
+                line: 3,
+                header: "for _, a in accounts.list".to_string(),
+                resource_type: "awscc.sso.Assignment".to_string(),
+                attributes: vec![],
+                target: DeferredForTarget::Bound {
+                    binding: "_list".into(),
+                },
+                iterable: Value::Deferred(DeferredValue::BindingRef {
+                    binding: "accounts".into(),
+                }),
+                binding: ForBinding::Map("_".to_string(), "a".to_string()),
+                template_resource: Resource {
+                    id: ResourceId::with_identity("sso.Assignment", "placeholder"),
+                    attributes: HashMap::new().into_iter().collect(),
+                    directives: Directives::default(),
+                    resolved_ignore_changes: Default::default(),
+                    prefixes: HashMap::new(),
+                    binding: None,
+                    dependency_bindings: BTreeSet::new(),
+                    module_source: None,
+                    default_tag_keys: Default::default(),
+                    loop_provenance: Default::default(),
+                    quoted_string_attrs: std::collections::HashSet::new(),
+                },
+            }));
         m
     };
 
@@ -6661,7 +6752,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     });
 
     let expanded = resolver.expand_module_call(&call, "prod").unwrap();
-    let d = &expanded.deferred_for_expressions[0];
+    let d = &expanded.parsed_deferred_for_expressions()[0];
     // `binding_name` is a synthesized address prefix → always prefixed.
     assert_eq!(d.target.bound_binding(), Some("prod._list"));
     // The caller's already-absolute `accounts` address must stay
@@ -6748,13 +6839,13 @@ let r = registry {
     // resolve_modules pipeline (through relabel_export_phase +
     // merge_parsed_file), not just expand_module_call.
     assert_eq!(
-        parsed.deferred_for_expressions.len(),
+        parsed.deferred_for_expressions().len(),
         1,
         "module-internal deferred-for must reach the caller through the \
          single merge surface (carina#3126); got: {:?}",
-        parsed.deferred_for_expressions
+        parsed.deferred_for_expressions()
     );
-    let d = &parsed.deferred_for_expressions[0];
+    let d = &parsed.deferred_for_expressions()[0];
     assert_eq!(d.resource_type, "aws.route53.RecordSet");
     assert!(
         d.reference_candidates()
@@ -6792,6 +6883,120 @@ let r = registry {
     );
     assert_eq!(parsed.wait_bindings[0].binding.as_str(), "r.cert_issued");
     assert_eq!(parsed.wait_bindings[0].target.as_str(), "r.cert");
+}
+
+#[test]
+fn resolve_modules_rebuilds_deferred_for_from_typed_parser_order() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let parsed = crate::parser::parse(
+        r#"
+let source = mock.test.resource { name = "source" }
+
+let first = for item in source.first {
+  mock.test.resource { name = item comment = "first" }
+}
+
+let second = for item in source.second {
+  mock.test.resource { name = item comment = "second" }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("deferred resource loops parse");
+
+    let parsed = resolve_modules(parsed, tmp.path()).expect("deferred loops finalize");
+
+    let comments = parsed
+        .deferred_for_expressions()
+        .iter()
+        .map(|deferred| deferred.template_resource.get_attr("comment"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        comments,
+        [
+            Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "first".into()
+            ))),
+            Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "second".into()
+            ))),
+        ],
+        "finalization must derive order and templates from the typed list alone"
+    );
+}
+
+#[test]
+fn finalize_rejects_undefined_iterable_for_managed_resource_body() {
+    let fixture = tempfile::tempdir().expect("undefined managed iterable fixture");
+    let source_file = fixture.path().join("main.crn");
+    let source = r#"let items = ["one"]
+let resources = for item in itmes {
+  mock.test.resource { name = item }
+}
+"#;
+    fs::write(&source_file, source).expect("write undefined iterable fixture");
+    let loaded = crate::config_loader::load_configuration_with_config(
+        fixture.path(),
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("undefined iterable remains deferred until finalization");
+    let identifier_scope_errors = crate::parser::check_identifier_scope(&loaded.parsed);
+    assert!(matches!(
+        identifier_scope_errors.as_slice(),
+        [crate::parser::ParseError::Located { error, .. }]
+            if matches!(error.as_ref(), crate::parser::ParseError::UndefinedDeferredIterable { name, .. } if name == "itmes")
+    ));
+
+    let error = super::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        fixture.path(),
+        &ProviderContext::default(),
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("finalization must reject an undefined managed-resource iterable");
+    let ModuleError::ParseInFile { path, error } = error.root_cause() else {
+        panic!("expected a file-owned parse error, got {error:?}");
+    };
+    assert_eq!(path, &source_file);
+    assert!(matches!(
+        error.as_ref(),
+        crate::parser::ParseError::UndefinedDeferredIterable {
+            name,
+            line: 2,
+            span,
+            ..
+        } if name == "itmes" && span.start_line() == 2 && span.end_line() == 4
+    ));
+    assert!(error.to_string().contains("Did you mean `items`"));
+}
+
+#[test]
+fn finalize_reports_every_undefined_iterable_for_managed_resource_bodies() {
+    let parsed = crate::parser::parse(
+        r#"let first = for item in frist_items {
+  mock.test.resource { name = item }
+}
+let second = for item in secnd_items {
+  mock.test.resource { name = item }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("both undefined iterables remain deferred until finalization");
+
+    let error = super::resolve_modules_providerless(parsed, std::path::Path::new("."))
+        .expect_err("finalization must reject both undefined iterables");
+    let message = error.display_relative_to(std::path::Path::new("."));
+
+    assert!(
+        message.contains("Undefined identifier `frist_items`"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Undefined identifier `secnd_items`"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -7081,7 +7286,9 @@ fn argument_type_list_accepts_resource_ref() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "role_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        static_type: known(TypeExpr::List(Box::new(TypeExpr::Simple(
+            "arn".to_string(),
+        )))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7120,7 +7327,7 @@ fn argument_type_map_accepts_resource_ref() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "tags".to_string(),
-        type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
+        static_type: known(TypeExpr::Map(Box::new(TypeExpr::String))),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7158,9 +7365,9 @@ fn argument_type_struct_accepts_resource_ref() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "options".to_string(),
-        type_expr: TypeExpr::Struct {
+        static_type: known(TypeExpr::Struct {
             fields: vec![("name".to_string(), TypeExpr::String)],
-        },
+        }),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7195,7 +7402,7 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "count".to_string(),
-        type_expr: TypeExpr::Int,
+        static_type: known(TypeExpr::Int),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7331,7 +7538,7 @@ fn module_argument_type_error_with_config(
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: arg_name.to_string(),
-        type_expr,
+        static_type: known(type_expr),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7495,10 +7702,10 @@ fn binding_ref_argument_defers_to_binding_index() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "environment".to_string(),
-        type_expr: TypeExpr::Union(vec![
+        static_type: known(TypeExpr::Union(vec![
             TypeExpr::StringLiteral("dev".to_string()),
             TypeExpr::StringLiteral("prod".to_string()),
-        ]),
+        ])),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -7706,10 +7913,46 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
     .expect("module signature fixture must parse");
 
     let signature = super::signature::resolved_signature(&parsed, &context);
-    let resolved = &signature.arguments[0].type_expr;
+    let resolved = &signature.arguments[0].static_type;
 
     assert!(
-        matches!(resolved, TypeExpr::List(inner) if matches!(inner.as_ref(), TypeExpr::SchemaType { .. })),
+        matches!(
+            resolved,
+            crate::static_type::StaticType::Known(resolved)
+                if matches!(resolved.type_expr(), TypeExpr::List(inner)
+                    if matches!(inner.as_ref(), TypeExpr::SchemaType { .. }))
+        ),
         "module signatures must not retain DottedUnresolved for a known shared identity: {resolved:?}"
+    );
+}
+
+#[test]
+fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effort_snapshot() {
+    let parsed = crate::parser::parse(
+        "attributes {\n  out: missing.types.Identifier = 'value'\n}\n",
+        &ProviderContext::default(),
+    )
+    .expect("module signature fixture must parse");
+
+    let signature = super::signature::resolved_signature(&parsed, &ProviderContext::default());
+    let static_type = signature.attributes["out"]
+        .as_ref()
+        .expect("declared attribute type");
+
+    assert!(
+        matches!(
+            static_type,
+            crate::static_type::StaticType::Unchecked(reason)
+                if reason.original()
+                    == &TypeExpr::DottedUnresolved(ResourceTypePath::new(
+                        "missing",
+                        "types.Identifier",
+                    ))
+                    && matches!(
+                        reason.resolution_error(),
+                        crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
+                    )
+        ),
+        "best-effort module signature must retain the typed unchecked reason: {static_type:?}",
     );
 }

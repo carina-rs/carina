@@ -170,13 +170,16 @@ fn live_apply_moves_legacy_loop_row_without_provider_mutation() {
 }
 
 #[test]
-fn format_29_saved_plan_apply_moves_legacy_loop_row_without_provider_mutation() {
+fn current_saved_plan_apply_moves_legacy_loop_row_without_provider_mutation() {
     let scenario = Scenario::new();
     let plan = scenario.carina(&["plan", "--out", "migration.plan.json", "."]);
     assert_success("carina plan --out", &plan);
 
     let saved_plan = read_json(&scenario.project.join("migration.plan.json"));
-    assert_eq!(saved_plan["version"], Value::from(29));
+    assert_eq!(
+        saved_plan["version"],
+        Value::from(carina_cli::commands::plan::PlanFile::CURRENT_VERSION)
+    );
     let move_payload = saved_plan["plan"]["effects"]
         .as_array()
         .expect("saved plan effects")
@@ -185,7 +188,7 @@ fn format_29_saved_plan_apply_moves_legacy_loop_row_without_provider_mutation() 
         .expect("saved plan must contain the detected legacy Move");
     assert!(
         move_payload["origin"].is_object(),
-        "format 29 must preserve the loop origin: {move_payload:#?}"
+        "the current saved-plan format must preserve the loop origin: {move_payload:#?}"
     );
 
     scenario.clear_operation_log();

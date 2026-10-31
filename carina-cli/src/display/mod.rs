@@ -20,6 +20,7 @@ use carina_core::plan_tree::{
     deferred_for_detail_rows, deferred_for_display_name, deferred_for_source, deferred_for_verb,
     extract_compact_hint,
 };
+use carina_core::provider::{ProviderResult, ProviderRouter};
 #[cfg(test)]
 use carina_core::resource::Value;
 use carina_core::resource::{ModuleSource, ResourceId};
@@ -116,6 +117,7 @@ impl Sigil {
             // and the trailing `(remove from state)` annotation
             // disambiguates from Update's `~` line.
             Effect::Remove { .. } | Effect::Move { .. } => raw.yellow().bold(),
+            Effect::ReleaseListKeys { .. } => raw.yellow().bold(),
             Effect::Wait { .. } => raw.magenta().bold(),
         };
         Self { raw, rendered }
@@ -295,7 +297,8 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
     moved_origins: &HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
-) {
+    provider: &ProviderRouter,
+) -> ProviderResult<()> {
     print!(
         "{}",
         format_plan_with_delete_instances(
@@ -307,8 +310,10 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
             moved_origins,
             prev_explicit,
             expansion_trace,
-        )
+            provider,
+        )?
     );
+    Ok(())
 }
 
 /// Format a plan as a string for display.
@@ -330,7 +335,8 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
     moved_origins: &HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
-) -> String {
+    provider: &ProviderRouter,
+) -> ProviderResult<String> {
     let mut out = String::new();
 
     if !summary.has_changes() {
@@ -340,7 +346,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
             "No changes. Infrastructure is up-to-date.".green()
         )
         .unwrap();
-        return out;
+        return Ok(out);
     }
 
     writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
@@ -355,7 +361,8 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
         moved_origins,
         prev_explicit,
         expansion_trace,
-    ));
+        provider,
+    )?);
 
     // Show deferred for-expressions
     for deferred in summary.residual_deferred_for() {
@@ -401,6 +408,9 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
                 format!("{} to remove from state", count.to_string().yellow())
             }
             PlanSummaryPart::Move { count } => format!("{} to move", count.to_string().yellow()),
+            PlanSummaryPart::Release { count } => {
+                format!("{} to release", count.to_string().yellow())
+            }
             PlanSummaryPart::Wait { count } => format!("{} to wait", count.to_string().magenta()),
         })
         .collect();
@@ -438,7 +448,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
     }
     writeln!(out).unwrap();
 
-    out
+    Ok(out)
 }
 
 /// Format a single deferred for-expression for plan display.
@@ -484,11 +494,12 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
     plan: &Plan,
     detail: DetailLevel,
     historical_display: &D,
-) -> String {
+    provider: &ProviderRouter,
+) -> ProviderResult<String> {
     let mut out = String::new();
 
     if plan.effects().is_empty() {
-        return out;
+        return Ok(out);
     }
 
     writeln!(out, "{}", "Destroy Plan:".red().bold()).unwrap();
@@ -503,9 +514,10 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
         &HashMap::new(),
         None,
         None, // ExpansionTrace doesn't apply to destroy plans (no compositions in state)
-    ));
+        provider,
+    )?);
 
-    out
+    Ok(out)
 }
 
 /// Holds shared state and configuration for recursive tree rendering.
@@ -530,6 +542,7 @@ struct TreeRenderContext<'a, S> {
     /// ResourceIds that are targets of Update or Replace effects.
     /// Used to skip Move line display when the move is already shown via annotation.
     update_or_replace_targets: HashSet<ResourceId>,
+    provider: &'a ProviderRouter,
 }
 
 impl<'a, S> TreeRenderContext<'a, S> {
@@ -540,13 +553,13 @@ impl<'a, S> TreeRenderContext<'a, S> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
-    ) -> bool {
+    ) -> ProviderResult<bool> {
         if self.printed.contains(&idx) {
-            return false;
+            return Ok(false);
         }
         if self.replacement_delete_indices.contains(&idx) {
             self.printed.insert(idx);
-            return false;
+            return Ok(false);
         }
         self.printed.insert(idx);
 
@@ -810,7 +823,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 // for this target — those effects show "(moved from: ...)" annotation.
                 // Pure moves (no Update/Replace) must be displayed.
                 if self.update_or_replace_targets.contains(to) {
-                    return false;
+                    return Ok(false);
                 }
                 writeln!(
                     self.out,
@@ -820,6 +833,17 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     to.identity_str().yellow().bold(),
                     format!("(moved from: {})", from.identity_str()).dimmed(),
                     origin_note.dimmed(),
+                )
+                .unwrap();
+            }
+            Effect::ReleaseListKeys { id, .. } => {
+                writeln!(
+                    self.out,
+                    "{}{} {} {}",
+                    line_prefix,
+                    id.display_type().cyan().bold(),
+                    id.identity_str().yellow().bold(),
+                    "(release keyed list entries from state)".dimmed(),
                 )
                 .unwrap();
             }
@@ -896,6 +920,32 @@ impl<'a, S> TreeRenderContext<'a, S> {
             }
         }
 
+        if let Some(summary) = self
+            .plan
+            .ignored_change_summaries()
+            .iter()
+            .find(|summary| summary.resource_id() == effect.resource_id())
+        {
+            let attr_prefix = if indent == 0 {
+                format!("{}{}", base_indent, attr_base)
+            } else {
+                let continuation = if is_last {
+                    format!("{}{}", prefix, SPACE_CONTINUATION)
+                } else {
+                    format!("{}{}", prefix, VERTICAL_CONTINUATION)
+                };
+                format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
+            };
+            writeln!(
+                self.out,
+                "{}{}",
+                attr_prefix,
+                format!("# {} ignored attribute(s) differ", summary.count()).dimmed()
+            )
+            .unwrap();
+            has_displayed_attrs = true;
+        }
+
         // --- Detail rows (attributes) ---
         if self.detail != DetailLevel::None {
             let attr_prefix = if indent == 0 {
@@ -920,7 +970,8 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.schemas,
                         self.detail.to_core(),
                         explicit,
-                    )
+                        self.provider,
+                    )?
                 } else {
                     build_detail_rows_by_instance(
                         effect,
@@ -928,7 +979,8 @@ impl<'a, S> TreeRenderContext<'a, S> {
                         self.detail.to_core(),
                         self.historical_display,
                         self.prev_explicit,
-                    )
+                        self.provider,
+                    )?
                 };
 
             if !detail_rows.is_empty() {
@@ -969,9 +1021,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 parent_displayed_attrs: has_displayed_attrs,
                 child_prefix_override: None,
             },
-        );
+        )?;
 
-        has_displayed_attrs
+        Ok(has_displayed_attrs)
     }
 
     fn format_render_item(
@@ -981,7 +1033,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
-    ) -> bool {
+    ) -> ProviderResult<bool> {
         match item {
             ChildRenderItem::Normal(idx) => {
                 self.format_effect_tree(*idx, indent, is_last, prefix, parent_binding)
@@ -1020,6 +1072,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             | Effect::Read { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
+            | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace(_) => true,
@@ -1051,14 +1104,14 @@ impl<'a, S> TreeRenderContext<'a, S> {
         &mut self,
         items: &[ChildRenderItem],
         options: ChildRenderOptions<'_>,
-    ) -> bool {
+    ) -> ProviderResult<bool> {
         for item in items {
             self.consume_suppressed_item(item);
         }
 
         let rendering_items: Vec<_> = items.iter().filter(|item| self.will_render(item)).collect();
         if rendering_items.is_empty() {
-            return false;
+            return Ok(false);
         }
 
         let child_prefix = options.child_prefix_override.unwrap_or_else(|| {
@@ -1082,7 +1135,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 child_is_last,
                 &child_prefix,
                 options.parent_binding,
-            );
+            )?;
             if child_had_attrs {
                 any_child_displayed_attrs = true;
             }
@@ -1091,7 +1144,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             }
         }
 
-        any_child_displayed_attrs
+        Ok(any_child_displayed_attrs)
     }
 }
 
@@ -1134,7 +1187,8 @@ fn format_plan_tree<'a, S>(
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
-) -> String {
+    provider: &'a ProviderRouter,
+) -> ProviderResult<String> {
     // Build dependency graph from effects
     let graph = build_dependency_graph(plan);
 
@@ -1157,8 +1211,17 @@ fn format_plan_tree<'a, S>(
         .filter_map(|(idx, e)| match e {
             Effect::Update { to, .. } => Some(to.id.clone()),
             Effect::Create(r) if replacement_create_info.contains_key(&idx) => Some(r.id.clone()),
-            Effect::DeferredReplace(_) => None,
-            _ => None,
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate { .. }
+            | Effect::DeferredReplace(_) => None,
         })
         .collect();
 
@@ -1175,6 +1238,7 @@ fn format_plan_tree<'a, S>(
         moved_origins,
         prev_explicit,
         update_or_replace_targets,
+        provider,
     };
 
     // #3307: when an ExpansionTrace is supplied AND it actually
@@ -1193,7 +1257,7 @@ fn format_plan_tree<'a, S>(
         let ungrouped_items = ctx.child_render_items(&composition_groups.ungrouped);
         for (i, item) in ungrouped_items.iter().enumerate() {
             let last = i == ungrouped_items.len() - 1 && composition_groups.grouped.is_empty();
-            ctx.format_render_item(item, 0, last, "", None);
+            ctx.format_render_item(item, 0, last, "", None)?;
         }
         // Then: each composition group with its header. The header is a
         // virtual parent, and the leaves render through the same child path
@@ -1216,14 +1280,14 @@ fn format_plan_tree<'a, S>(
                     parent_displayed_attrs: false,
                     child_prefix_override: Some(module_child_prefix()),
                 },
-            );
+            )?;
         }
     } else {
         // No trace, or trace empty for this plan's leaves — use the
         // pre-#3307 flat layout so existing snapshots remain valid.
         let root_items = ctx.child_render_items(&roots);
         for (i, item) in root_items.iter().enumerate() {
-            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None);
+            ctx.format_render_item(item, 0, i == root_items.len() - 1, "", None)?;
         }
     }
 
@@ -1235,10 +1299,35 @@ fn format_plan_tree<'a, S>(
         .collect();
     let remaining_items = ctx.child_render_items(&remaining);
     for (i, item) in remaining_items.iter().enumerate() {
-        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None);
+        ctx.format_render_item(item, 0, i == remaining_items.len() - 1, "", None)?;
     }
 
-    ctx.out
+    let effected_ids: HashSet<_> = plan.effects().iter().map(Effect::resource_id).collect();
+    for summary in plan
+        .ignored_change_summaries()
+        .iter()
+        .filter(|summary| !effected_ids.contains(summary.resource_id()))
+    {
+        let id = summary.resource_id();
+        writeln!(
+            ctx.out,
+            "{}# {} {}",
+            LEFT_MARGIN,
+            id.display_type().cyan().bold(),
+            id.identity_display().to_string().white().bold(),
+        )
+        .unwrap();
+        writeln!(
+            ctx.out,
+            "{}{}{}",
+            LEFT_MARGIN,
+            ATTR_BASE,
+            format!("# {} ignored attribute(s) differ", summary.count()).dimmed(),
+        )
+        .unwrap();
+    }
+
+    Ok(ctx.out)
 }
 
 /// Header row for a composition group in the folded plan layout.
@@ -1470,6 +1559,22 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
         DetailRow::Text { text } => {
             writeln!(out, "{}{}", attr_prefix, text).unwrap();
         }
+        DetailRow::ReleasedListKey {
+            attribute,
+            key,
+            retained_value,
+        } => {
+            writeln!(
+                out,
+                "{}{} {}[{:?}]: left as {} (AWS does not revert omitted keys; write the default value to revert)",
+                attr_prefix,
+                "!".yellow().bold(),
+                attribute,
+                key,
+                colored_value(retained_value),
+            )
+            .unwrap();
+        }
         DetailRow::Attribute {
             key,
             value,
@@ -1480,7 +1585,17 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 Effect::Delete { .. } => {
                     render_value_ansi(value, AnsiValueStyle::RedStrikethrough, None)
                 }
-                _ => colored_value(value),
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => colored_value(value),
             };
             let annotation_suffix = annotation_suffix(annotation.as_deref());
             writeln!(out, "{}{}: {}{}", attr_prefix, key, cv, annotation_suffix).unwrap();
@@ -1496,7 +1611,19 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 Effect::Delete { .. } => {
                     render_value_ansi(&pretty, AnsiValueStyle::RedStrikethrough, Some(attr_prefix))
                 }
-                _ => render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix)),
+                Effect::Read { .. }
+                | Effect::Create(_)
+                | Effect::ResumeCreate { .. }
+                | Effect::Update { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => {
+                    render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
+                }
             };
             writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
         }
@@ -1524,7 +1651,19 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                         AnsiValueStyle::RedStrikethrough,
                         Some(attr_prefix),
                     ),
-                    _ => render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix)),
+                    Effect::Read { .. }
+                    | Effect::Create(_)
+                    | Effect::ResumeCreate { .. }
+                    | Effect::Update { .. }
+                    | Effect::Import { .. }
+                    | Effect::Remove { .. }
+                    | Effect::Move { .. }
+                    | Effect::ReleaseListKeys { .. }
+                    | Effect::Wait { .. }
+                    | Effect::DeferredCreate { .. }
+                    | Effect::DeferredReplace(_) => {
+                        render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
+                    }
                 };
                 let annotation_suffix = annotation_suffix(entry.annotation.as_deref());
                 writeln!(
@@ -2103,6 +2242,14 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
         }
         Effect::Move { from, to, .. } => {
             format!("Move {} -> {}", from.human(), to.human())
+        }
+        Effect::ReleaseListKeys { id, keys, .. } => {
+            format!(
+                "Release {} keyed list entr{} for {}",
+                keys.len(),
+                if keys.len() == 1 { "y" } else { "ies" },
+                id.human()
+            )
         }
         Effect::Wait {
             identity,

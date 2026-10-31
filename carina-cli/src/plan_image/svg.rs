@@ -313,6 +313,15 @@ fn kind_style(kind: EffectKind, palette: &Palette) -> KindStyle {
             stroke_class: "stroke-teal",
             tint_class: "fill-teal-tint",
         },
+        EffectKind::Release => KindStyle {
+            symbol: "!",
+            label: "release",
+            color: palette.update.color,
+            tint: palette.update.tint,
+            fill_class: "fill-update",
+            stroke_class: "stroke-update",
+            tint_class: "fill-update-tint",
+        },
         EffectKind::Wait => KindStyle {
             symbol: "w",
             label: "wait",
@@ -391,6 +400,7 @@ fn summary_label(kind: EffectKind) -> &'static str {
         EffectKind::Import => "to import",
         EffectKind::Remove => "to remove",
         EffectKind::Move => "to move",
+        EffectKind::Release => "to release",
         EffectKind::Wait => "to wait",
         EffectKind::DeferredCreate => "deferred creates",
         EffectKind::DeferredReplace => "deferred replaces",
@@ -513,6 +523,7 @@ fn effect_kind_for_summary(kind: PlanEffectSummaryKind) -> EffectKind {
         PlanEffectSummaryKind::Import => EffectKind::Import,
         PlanEffectSummaryKind::Remove => EffectKind::Remove,
         PlanEffectSummaryKind::Move => EffectKind::Move,
+        PlanEffectSummaryKind::Release => EffectKind::Release,
         PlanEffectSummaryKind::Wait => EffectKind::Wait,
         PlanEffectSummaryKind::DeferredCreate => EffectKind::DeferredCreate,
         PlanEffectSummaryKind::DeferredReplace => EffectKind::DeferredReplace,
@@ -988,6 +999,7 @@ fn render_legend(out: &mut String, model: &GraphModel, layout: &Layout, render_s
         EffectKind::Import,
         EffectKind::Remove,
         EffectKind::Move,
+        EffectKind::Release,
         EffectKind::Wait,
         EffectKind::DeferredCreate,
         EffectKind::DeferredReplace,
@@ -1217,7 +1229,11 @@ mod tests {
             changed_attributes: vec!["secret_token".to_string(), "write_only_token".to_string()],
         });
         let desired = vec![ResolvedResource::new(resource)];
-        let summary = crate::plan_summary::PlanChangeSummary::new(&plan, &[], &[]);
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        );
         let model = build_model(PlanImageInput {
             plan: &plan,
             desired_resources: &desired,
@@ -1267,7 +1283,11 @@ mod tests {
             changed_attributes,
         });
         let desired = vec![ResolvedResource::new(resource)];
-        let summary = crate::plan_summary::PlanChangeSummary::new(&plan, &[], &[]);
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        );
         let model = build_model(PlanImageInput {
             plan: &plan,
             desired_resources: &desired,
@@ -1371,7 +1391,11 @@ mod tests {
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
             .collect();
-        let summary = crate::plan_summary::PlanChangeSummary::new(&plan, &[], &[]);
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+        );
         let model = build_model(PlanImageInput {
             plan: &plan,
             desired_resources: &desired,

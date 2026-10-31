@@ -10,12 +10,13 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, InputMode, ResourceSchema,
+    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, FieldGroup, FieldGroupKind,
+    InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceSchema,
     ResourceValidation, SchemaKind, StructField, TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v4";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v5";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -85,15 +86,43 @@ impl ResourceSchema {
     /// not affect planning or provider calls. Executable validator callbacks
     /// have no portable cross-process identity, so a fixed marker is encoded;
     /// all declarative validator inputs and refinements are encoded normally.
-    pub fn semantic_fingerprint(&self) -> String {
-        hex::encode(Sha256::digest(self.semantic_encoding()))
+    #[cfg(test)]
+    pub(crate) fn semantic_fingerprint(&self) -> String {
+        hex::encode(Sha256::digest(semantic_encoding(
+            self,
+            &ReferenceForms::new(),
+        )))
     }
+}
 
-    fn semantic_encoding(&self) -> Vec<u8> {
-        let mut encoder = CanonicalEncoder::default();
-        encoder.string(ENCODING_VERSION);
-        encode_resource_schema(&mut encoder, self);
-        encoder.finish()
+impl OwnerBoundResourceSchema<'_> {
+    /// SHA-256 of the resource semantics and its owner's complete forms table.
+    pub fn semantic_fingerprint(self) -> String {
+        hex::encode(Sha256::digest(semantic_encoding(
+            self.schema().as_schema(),
+            self.reference_forms(),
+        )))
+    }
+}
+
+fn semantic_encoding(schema: &ResourceSchema, reference_forms: &ReferenceForms) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(ENCODING_VERSION);
+    encode_resource_schema(&mut encoder, schema);
+    encode_reference_forms(&mut encoder, reference_forms);
+    encoder.finish()
+}
+
+fn encode_reference_forms(encoder: &mut CanonicalEncoder, forms: &ReferenceForms) {
+    encoder.usize(forms.len());
+    for (identity, form) in forms {
+        encode_type_identity(encoder, identity);
+        match form {
+            ReferenceForm::Template { long } => {
+                encoder.tag(0);
+                encoder.string(long.as_str());
+            }
+        }
     }
 }
 
@@ -106,7 +135,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
         kind,
         unique_name,
         operation_config,
-        exclusive_required,
+        field_groups,
         default_wait_timeout,
         default_wait_interval,
         defs,
@@ -126,19 +155,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     encode_unique_name(encoder, unique_name);
     encoder.option(operation_config.as_ref(), encode_operation_config);
 
-    let mut exclusive_required = exclusive_required
-        .iter()
-        .map(|group| {
-            let mut group = group.clone();
-            group.sort();
-            group
-        })
-        .collect::<Vec<_>>();
-    exclusive_required.sort();
-    encoder.usize(exclusive_required.len());
-    for group in exclusive_required {
-        encoder.strings(&group);
-    }
+    encode_field_groups(encoder, field_groups);
 
     encoder.option(default_wait_timeout.as_ref(), |encoder, duration| {
         encode_duration(encoder, *duration);
@@ -151,6 +168,29 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     for (name, attribute_type) in defs {
         encoder.string(name);
         encode_attribute_type(encoder, attribute_type);
+    }
+}
+
+fn encode_field_groups(encoder: &mut CanonicalEncoder, groups: &[FieldGroup]) {
+    let mut encoded = groups
+        .iter()
+        .map(|group| {
+            let mut group_encoder = CanonicalEncoder::default();
+            group_encoder.tag(match group.kind() {
+                FieldGroupKind::ExactlyOne => 0,
+                FieldGroupKind::AtLeastOne => 1,
+                FieldGroupKind::AtMostOne => 2,
+            });
+            let mut fields = group.fields().to_vec();
+            fields.sort();
+            group_encoder.strings(&fields);
+            group_encoder.finish()
+        })
+        .collect::<Vec<_>>();
+    encoded.sort();
+    encoder.usize(encoded.len());
+    for group in encoded {
+        encoder.bytes(&group);
     }
 }
 
@@ -196,6 +236,7 @@ fn encode_attribute_schema(encoder: &mut CanonicalEncoder, schema: &AttributeSch
         removable,
         block_name,
         write_only,
+        keyed_partial_update,
         identity,
         deferred_populate,
     } = schema;
@@ -209,6 +250,9 @@ fn encode_attribute_schema(encoder: &mut CanonicalEncoder, schema: &AttributeSch
     encoder.option(*removable, CanonicalEncoder::bool);
     encoder.option(block_name.as_deref(), CanonicalEncoder::string);
     encoder.bool(*write_only);
+    encoder.option(keyed_partial_update.as_ref(), |encoder, keyed| {
+        encoder.string(keyed.key_field().as_str());
+    });
     encoder.bool(*identity);
     encoder.bool(*deferred_populate);
 }
@@ -306,7 +350,11 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encode_attribute_type(encoder, key);
             encode_attribute_type(encoder, value);
         }
-        AttrTypeKind::Struct { name, fields } => {
+        AttrTypeKind::Struct {
+            name,
+            fields,
+            field_groups,
+        } => {
             encoder.tag(10);
             encoder.string(name);
             let mut fields = fields.iter().collect::<Vec<_>>();
@@ -315,6 +363,7 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             for field in fields {
                 encode_struct_field(encoder, field);
             }
+            encode_field_groups(encoder, field_groups);
         }
         AttrTypeKind::Union(members) => {
             encoder.tag(11);
@@ -514,6 +563,7 @@ fn encode_json(encoder: &mut CanonicalEncoder, value: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::ReferenceTemplate;
 
     fn attribute_type_encoding(attribute_type: AttributeType) -> Vec<u8> {
         let mut encoder = CanonicalEncoder::default();
@@ -565,5 +615,51 @@ mod tests {
         ]);
 
         assert_eq!(once.semantic_fingerprint(), repeated.semantic_fingerprint());
+    }
+
+    #[test]
+    fn owner_reference_forms_change_the_resource_fingerprint() {
+        let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
+        let schema = ResourceSchema::new("aws.lambda.Function")
+            .attribute(
+                AttributeSchema::optional(
+                    "name",
+                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let empty = ReferenceForms::new();
+        let first = ReferenceForms::from([(
+            identity.clone(),
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function:{name}",
+                )
+                .unwrap(),
+            },
+        )]);
+        let changed = ReferenceForms::from([(
+            identity,
+            ReferenceForm::Template {
+                long: ReferenceTemplate::new(
+                    "arn:{partition}:lambda:{region}:{account}:function-alias:{name}",
+                )
+                .unwrap(),
+            },
+        )]);
+
+        let without = OwnerBoundResourceSchema::new("aws", &schema, &empty).semantic_fingerprint();
+        let with = OwnerBoundResourceSchema::new("aws", &schema, &first).semantic_fingerprint();
+        let changed =
+            OwnerBoundResourceSchema::new("aws", &schema, &changed).semantic_fingerprint();
+
+        assert_ne!(without, with, "adding a form must change the fingerprint");
+        assert_ne!(with, changed, "changing a form must change the fingerprint");
+        assert_ne!(
+            without, changed,
+            "removing a form must change the fingerprint"
+        );
     }
 }

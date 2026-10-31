@@ -1,0 +1,12 @@
+let seed = mock.test.resource {
+  name = "${label}-seed"
+}
+
+let consumer = mock.test.resource {
+  name    = "${label}-consumer"
+  comment = secret(local.attr)
+
+  directives {
+    depends_on = [seed, upstream]
+  }
+}
