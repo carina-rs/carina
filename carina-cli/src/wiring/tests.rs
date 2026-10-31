@@ -19,44 +19,56 @@ use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 #[test]
-fn unresolved_resource_views_follow_dependency_sorted_order() {
-    let resource = |binding: &str| {
-        let identity = ResourceIdentity::try_from(binding.to_string()).expect("valid identity");
-        let mut resource = Resource::new("test.resource", identity);
-        resource.binding = Some(binding.to_string());
-        resource
-    };
-    let producer = resource("producer");
-    let consumer = resource("consumer");
-    let sorted = vec![
-        ResolvedResource::new(producer.clone()),
-        ResolvedResource::new(consumer.clone()),
-    ];
-    let declaration_order = vec![consumer, producer];
-    let resolved_declaration_order = declaration_order
+fn dependency_metadata_is_paired_to_unresolved_views_by_resource_id() {
+    let mut producer = Resource::new("test.resource", "producer").with_binding("producer");
+    producer.set_attr(
+        "name",
+        Value::Concrete(carina_core::resource::ConcreteValue::String(
+            "producer".into(),
+        )),
+    );
+    let mut consumer = Resource::new("test.resource", "consumer").with_binding("consumer");
+    consumer.directives.depends_on.push("producer".to_string());
+    let declaration_order = vec![producer, consumer];
+    let scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        &declaration_order,
+        &[] as &[DataSource],
+        std::iter::empty(),
+    );
+    let resources_with_dependencies = declaration_order
         .iter()
         .cloned()
-        .map(ResolvedResource::new)
+        .map(|resource| {
+            let dependencies = scope.resolve_resource(&resource).unwrap();
+            (resource, dependencies)
+        })
+        .collect::<Vec<_>>();
+    let dependencies_by_id = resources_with_dependencies
+        .iter()
+        .map(|(resource, dependencies)| (resource.id.clone(), dependencies.clone()))
         .collect();
+    let resolved = ResolvedResource::collect_resolved_with_schemas_and_dependencies(
+        resources_with_dependencies,
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let paired_unresolved = declaration_order.into_iter().rev().collect::<Vec<_>>();
+    let resolved = resolve_and_sort_paired_resource_views(
+        resolved,
+        paired_unresolved,
+        &dependencies_by_id,
+        &SchemaRegistry::new(),
+    )
+    .expect("dependency evidence must follow the resource ID, not a vector position")
+    .into_iter()
+    .map(|views| views.resolved_unresolved)
+    .collect::<Vec<_>>();
 
-    let (unresolved, resolved_unresolved) =
-        align_unresolved_resource_views(&sorted, declaration_order, resolved_declaration_order)
-            .expect("resource views should align by resolved ID");
-
-    assert_eq!(
-        unresolved
-            .iter()
-            .map(|resource| resource.id.identity_str().expect("resolved identity"))
-            .collect::<Vec<_>>(),
-        ["producer", "consumer"],
-    );
-    assert_eq!(
-        resolved_unresolved
-            .iter()
-            .map(|resource| resource.id.identity_str().expect("resolved identity"))
-            .collect::<Vec<_>>(),
-        ["producer", "consumer"],
-    );
+    let consumer = resolved
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("consumer"))
+        .expect("consumer remains present");
+    assert!(consumer.explicit_dependencies().contains("producer"));
 }
 
 fn comparison_provider_for_resources(
@@ -9724,6 +9736,97 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
 }
 
 #[test]
+fn final_dependency_resolution_seam_has_no_pending_late_target_identity() {
+    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let mut gate: Resource = Resource::pending("ec2.SubnetRouteTableAssociation");
+    gate.id.provider = "awscc".to_string();
+    gate.binding = Some("gate".to_string());
+    gate.set_attr(
+        "route_table_id",
+        Value::Concrete(carina_core::resource::ConcreteValue::String(
+            "rtb-private".into(),
+        )),
+    );
+    gate.set_attr(
+        "subnet_id",
+        Value::Concrete(carina_core::resource::ConcreteValue::String(
+            "subnet-a".into(),
+        )),
+    );
+    let mut consumer =
+        Resource::with_provider("awscc", "ec2.Route", "consumer", None).with_binding("consumer");
+    consumer.directives.depends_on.push("gate".to_string());
+    consumer.set_attr(
+        "route_table_id",
+        Value::Concrete(carina_core::resource::ConcreteValue::String(
+            "rtb-private".into(),
+        )),
+    );
+    let (mut resources, _) = build_override_aware_pair_for_test(
+        canonical_unresolved(vec![gate, consumer], ctx.schemas()),
+        None::<&StateFile>,
+        LivePreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            managed_current: &HashMap::new(),
+            data_source_values: &DataSourceValues::empty(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("late-identity fixture has no unresolved value references");
+    let claims = StateBlockClaims::empty();
+    let mut addressed = AddressedState {
+        managed_current: HashMap::new(),
+        orphans: Orphans::new(),
+        saved_attrs: crate::empty_lifted_saved_attrs(),
+        prev_explicit: HashMap::new(),
+        moved_pairs: Vec::new(),
+    };
+    let comparison_provider =
+        comparison_provider_for_resources(ctx.schemas(), resources.resources());
+
+    reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            addressed: &mut addressed,
+            data_sources: &[],
+            state_file: None,
+            state_block_claims: &claims,
+            providers: &[],
+            comparison_provider: &comparison_provider,
+        },
+    )
+    .expect("late identity reconciliation succeeds before final planning");
+
+    let scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        resources.resources(),
+        &[] as &[DataSource],
+        std::iter::empty(),
+    );
+    let consumer = resources
+        .resources()
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("consumer"))
+        .expect("consumer remains in the final configuration scope");
+    let dependency = scope
+        .resolve_resource(consumer)
+        .expect("late target identity is final before dependency resolution");
+    let gate = resources
+        .resources()
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("gate"))
+        .expect("gate remains in the final configuration scope");
+
+    assert!(gate.id.identity().is_some());
+    assert_eq!(
+        dependency.iter().next().unwrap().identity(),
+        gate.id.identity().unwrap()
+    );
+}
+
+#[test]
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
     let ctx = WiringContext::new_for_test(vec![], &[]);
     let (mut resources, _) = build_override_aware_pair_for_test(
@@ -10500,6 +10603,7 @@ fn deferred_replace_test_target() -> DeferredCreateTarget {
             None,
         ),
         template: deferred_replace_test_template(),
+        explicit_dependencies: Default::default(),
     }
 }
 

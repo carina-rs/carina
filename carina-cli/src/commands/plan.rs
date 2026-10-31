@@ -647,6 +647,10 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 37 persists resolver-produced explicit-dependency targets
+    /// (binding plus identity), so saved-plan load consumes the reviewed proof
+    /// instead of re-resolving against the effect-only subset.
+    ///
     /// Plan format 36 adds typed deferred-for templates, stage-specific
     /// placeholder types, and template attributes stored only on
     /// `template_resource`.
@@ -949,10 +953,87 @@ struct ProviderEvidence {
 pub struct PlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
+    resource_dependency_evidence: Vec<PlanResourceDependencyEvidence>,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
-/// Private format-35 wire representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PlanResourceDependencyEvidence {
+    id: ResourceId,
+    explicit_dependencies: carina_core::dependency::ResolvedDependencies,
+}
+
+impl PlanResourceDependencyEvidence {
+    fn from_resolved<S>(resource: &carina_core::resource::ResolvedResource<S>) -> Self {
+        Self {
+            id: resource.id.clone(),
+            explicit_dependencies: resource.explicit_dependencies().clone(),
+        }
+    }
+}
+
+fn validate_resource_dependency_evidence<S>(
+    resources: &[Resource<S>],
+    evidence: &[PlanResourceDependencyEvidence],
+) -> Result<(), ProviderEvidenceError> {
+    let expected = resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::with_capacity(evidence.len());
+    for entry in evidence {
+        if !seen.insert(entry.id.clone()) {
+            return Err(ProviderEvidenceError::DuplicateResourceDependencyEvidence {
+                id: entry.id.clone(),
+            });
+        }
+        if !expected.contains(&entry.id) {
+            return Err(
+                ProviderEvidenceError::UnexpectedResourceDependencyEvidence {
+                    id: entry.id.clone(),
+                },
+            );
+        }
+    }
+    if let Some(id) = expected.into_iter().find(|id| !seen.contains(id)) {
+        return Err(ProviderEvidenceError::MissingResourceDependencyEvidence { id });
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn resolve_resource_dependency_evidence_for_test<S>(
+    resources: &[Resource<S>],
+    data_sources: &[carina_core::resource::DataSource<S>],
+    compositions: &[SavedComposition],
+    upstream_sources: &[UpstreamSource],
+) -> Result<Vec<PlanResourceDependencyEvidence>, ProviderEvidenceError> {
+    let scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        resources,
+        data_sources,
+        upstream_sources
+            .iter()
+            .map(|upstream| upstream.binding.clone()),
+    )
+    .with_declared_targets(compositions);
+    resources
+        .iter()
+        .map(|resource| {
+            let explicit_dependencies = scope.resolve_resource(resource).map_err(|error| {
+                ProviderEvidenceError::InvalidResourceDependencyEvidence {
+                    id: resource.id.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            Ok(PlanResourceDependencyEvidence {
+                id: resource.id.clone(),
+                explicit_dependencies,
+            })
+        })
+        .collect()
+}
+
+/// Private format-37 wire representation.
 ///
 /// Existing field order remains identical to the historical `PlanFile`
 /// serialization order. Format-35 directive changes and provider evidence are
@@ -981,6 +1062,7 @@ struct PlanFileWire {
     upstream_sources: Vec<UpstreamSource>,
     #[serde(default)]
     wait_bindings: Vec<PlanWaitBinding>,
+    resource_dependency_evidence: Vec<PlanResourceDependencyEvidence>,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
     schema_fingerprints: PlanSchemaFingerprints,
     provider_artifacts: PlanProviderArtifacts,
@@ -1031,6 +1113,19 @@ pub enum ProviderEvidenceError {
         instance: ProviderInstanceKey,
         recorded: Option<()>,
         initialized: Option<()>,
+    },
+    DuplicateResourceDependencyEvidence {
+        id: ResourceId,
+    },
+    MissingResourceDependencyEvidence {
+        id: ResourceId,
+    },
+    UnexpectedResourceDependencyEvidence {
+        id: ResourceId,
+    },
+    InvalidResourceDependencyEvidence {
+        id: ResourceId,
+        message: String,
     },
 }
 
@@ -1108,6 +1203,22 @@ impl std::fmt::Display for ProviderEvidenceError {
                 display_provider_instance(instance),
                 display_scope_presence(*recorded),
                 display_scope_presence(*initialized)
+            ),
+            Self::DuplicateResourceDependencyEvidence { id } => write!(
+                formatter,
+                "resource_dependency_evidence contains duplicate resource `{id}`"
+            ),
+            Self::MissingResourceDependencyEvidence { id } => write!(
+                formatter,
+                "resource_dependency_evidence is missing resource `{id}`"
+            ),
+            Self::UnexpectedResourceDependencyEvidence { id } => write!(
+                formatter,
+                "resource_dependency_evidence contains unknown resource `{id}`"
+            ),
+            Self::InvalidResourceDependencyEvidence { id, message } => write!(
+                formatter,
+                "resource_dependency_evidence for `{id}` is invalid: {message}"
             ),
         }
     }
@@ -1336,6 +1447,7 @@ impl From<PlanFile> for PlanFileWire {
         let PlanFile {
             contents,
             evidence,
+            resource_dependency_evidence,
             persisted_directive_changes,
         } = plan_file;
         let PlanFileContents {
@@ -1384,6 +1496,7 @@ impl From<PlanFile> for PlanFileWire {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            resource_dependency_evidence,
             persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
@@ -1416,6 +1529,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             upstream_snapshot,
             upstream_sources,
             wait_bindings,
+            resource_dependency_evidence,
             persisted_directive_changes,
             schema_fingerprints,
             provider_artifacts,
@@ -1442,6 +1556,10 @@ impl TryFrom<PlanFileWire> for PlanFile {
             upstream_sources,
             wait_bindings,
         };
+        validate_resource_dependency_evidence(
+            &contents.sorted_resources,
+            &resource_dependency_evidence,
+        )?;
         let references = contents.referenced_schema_types();
         let available_providers = provider_artifacts.keys().cloned().collect();
         let expected_instances = contents.expected_provider_instances(&available_providers);
@@ -1456,6 +1574,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
         Ok(Self {
             contents,
             evidence,
+            resource_dependency_evidence,
             persisted_directive_changes,
         })
     }
@@ -1477,9 +1596,16 @@ impl PlanFileContents {
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
+        let resource_dependency_evidence = validated
+            .resources()
+            .sorted_resources
+            .iter()
+            .map(PlanResourceDependencyEvidence::from_resolved)
+            .collect();
         self.record_with_context(
             validated.context(),
             &validated.resources().provider,
+            resource_dependency_evidence,
             persisted_directive_changes,
         )
     }
@@ -1491,6 +1617,12 @@ impl PlanFileContents {
         validated: &ValidatedConfig<R>,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
+        let resource_dependency_evidence = resolve_resource_dependency_evidence_for_test(
+            &self.sorted_resources,
+            &self.data_sources,
+            &self.compositions,
+            &self.upstream_sources,
+        )?;
         let available_providers = validated
             .context()
             .provider_artifacts()
@@ -1499,7 +1631,12 @@ impl PlanFileContents {
             .collect();
         let provider =
             test_provider_router(&self.expected_provider_instances(&available_providers));
-        self.record_with_context(validated.context(), &provider, persisted_directive_changes)
+        self.record_with_context(
+            validated.context(),
+            &provider,
+            resource_dependency_evidence,
+            persisted_directive_changes,
+        )
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1509,13 +1646,25 @@ impl PlanFileContents {
         provider: &ProviderRouter,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(validated.context(), provider, persisted_directive_changes)
+        let resource_dependency_evidence = resolve_resource_dependency_evidence_for_test(
+            &self.sorted_resources,
+            &self.data_sources,
+            &self.compositions,
+            &self.upstream_sources,
+        )?;
+        self.record_with_context(
+            validated.context(),
+            provider,
+            resource_dependency_evidence,
+            persisted_directive_changes,
+        )
     }
 
     fn record_with_context(
         self,
         ctx: &WiringContext,
         provider: &ProviderRouter,
+        resource_dependency_evidence: Vec<PlanResourceDependencyEvidence>,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
@@ -1532,6 +1681,7 @@ impl PlanFileContents {
         Ok(PlanFile {
             contents: saved.into(),
             evidence,
+            resource_dependency_evidence,
             persisted_directive_changes,
         })
     }
@@ -1544,6 +1694,12 @@ impl UnresolvedPlanFileContents {
         validated: &ValidatedConfig<R>,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
+        let resource_dependency_evidence = resolve_resource_dependency_evidence_for_test(
+            &self.sorted_resources,
+            &self.data_sources,
+            &self.compositions,
+            &self.upstream_sources,
+        )?;
         let references = self.referenced_schema_types();
         let available_providers = validated
             .context()
@@ -1563,6 +1719,7 @@ impl UnresolvedPlanFileContents {
         Ok(PlanFile {
             contents: self,
             evidence,
+            resource_dependency_evidence,
             persisted_directive_changes,
         })
     }
@@ -1627,7 +1784,9 @@ impl<S> PlanFileContents<S> {
                 Effect::Remove { id } => {
                     insert(&mut references, id, SchemaKind::Resource);
                 }
-                Effect::DeferredCreate { id: _id, template } => {
+                Effect::DeferredCreate {
+                    id: _id, template, ..
+                } => {
                     insert(
                         &mut references,
                         &template.template_resource.id,
@@ -1720,7 +1879,7 @@ impl<S> PlanFileContents<S> {
                 | Effect::Import { id, .. }
                 | Effect::Remove { id }
                 | Effect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
-                Effect::DeferredCreate { id, template } => {
+                Effect::DeferredCreate { id, template, .. } => {
                     insert(&mut instances, id);
                     insert(&mut instances, &template.template_resource.id);
                 }
@@ -1801,10 +1960,10 @@ impl UnresolvedPlanFileContents {
         let mut references = BTreeSet::new();
         for effect in self.plan.effects() {
             match effect {
-                UnresolvedSavedEffect::Read { resource } => {
+                UnresolvedSavedEffect::Read { resource, .. } => {
                     insert(&mut references, &resource.id, SchemaKind::DataSource);
                 }
-                UnresolvedSavedEffect::Create(resource)
+                UnresolvedSavedEffect::Create { resource, .. }
                 | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
                     insert(&mut references, &resource.id, SchemaKind::Resource);
                 }
@@ -1884,8 +2043,10 @@ impl UnresolvedPlanFileContents {
             .collect::<BTreeSet<_>>();
         for effect in self.plan.effects() {
             match effect {
-                UnresolvedSavedEffect::Read { resource } => insert(&mut instances, &resource.id),
-                UnresolvedSavedEffect::Create(resource)
+                UnresolvedSavedEffect::Read { resource, .. } => {
+                    insert(&mut instances, &resource.id)
+                }
+                UnresolvedSavedEffect::Create { resource, .. }
                 | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
                     insert(&mut instances, &resource.id)
                 }
@@ -1897,7 +2058,7 @@ impl UnresolvedPlanFileContents {
                 | UnresolvedSavedEffect::Import { id, .. }
                 | UnresolvedSavedEffect::Remove { id }
                 | UnresolvedSavedEffect::ReleaseListKeys { id, .. } => insert(&mut instances, id),
-                UnresolvedSavedEffect::DeferredCreate { id, template } => {
+                UnresolvedSavedEffect::DeferredCreate { id, template, .. } => {
                     insert(&mut instances, id);
                     insert(&mut instances, &template.template_resource.id);
                 }
@@ -1945,7 +2106,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 36;
+    pub const CURRENT_VERSION: u32 = 37;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -1974,6 +2135,7 @@ impl PlanFile {
         let PlanFile {
             mut contents,
             evidence,
+            resource_dependency_evidence,
             persisted_directive_changes,
         } = self;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
@@ -2121,6 +2283,7 @@ impl PlanFile {
             contents,
             evidence,
             current_states,
+            resource_dependency_evidence,
             persisted_directive_changes,
         })
     }
@@ -2347,10 +2510,10 @@ impl PlanFile {
         for (index, effect) in self.plan.effects().iter().enumerate() {
             let location = format!("plan.effects[{index}]");
             match effect {
-                UnresolvedSavedEffect::Read { resource } => {
+                UnresolvedSavedEffect::Read { resource, .. } => {
                     require_identity(&resource.id, &location)?
                 }
-                UnresolvedSavedEffect::Create(resource)
+                UnresolvedSavedEffect::Create { resource, .. }
                 | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
                     require_identity(&resource.id, &location)?
                 }
@@ -2429,7 +2592,7 @@ impl PlanFile {
                     effects.len()
                 )
             })?;
-            if !matches!(create, UnresolvedSavedEffect::Create(_)) {
+            if !matches!(create, UnresolvedSavedEffect::Create { .. }) {
                 return Err(format!(
                     "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].create_idx {} points at {}, expected Create",
                     replacement.create_idx,
@@ -2462,7 +2625,7 @@ impl PlanFile {
                     ));
                 }
                 UnresolvedSavedEffect::Read { .. }
-                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::Create { .. }
                 | UnresolvedSavedEffect::ResumeCreate { .. }
                 | UnresolvedSavedEffect::Update { .. }
                 | UnresolvedSavedEffect::Import { .. }
@@ -2916,7 +3079,7 @@ impl MovedOrigins {
                     Some((to.as_inner().clone(), from.as_inner().clone()))
                 }
                 UnresolvedSavedEffect::Read { .. }
-                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::Create { .. }
                 | UnresolvedSavedEffect::ResumeCreate { .. }
                 | UnresolvedSavedEffect::Update { .. }
                 | UnresolvedSavedEffect::Delete { .. }
@@ -3137,6 +3300,7 @@ pub(crate) struct UnresolvedReloadedPlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
+    resource_dependency_evidence: Vec<PlanResourceDependencyEvidence>,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
 }
 
@@ -3184,6 +3348,7 @@ impl UnresolvedReloadedPlanFile {
             contents,
             evidence,
             current_states,
+            resource_dependency_evidence,
             persisted_directive_changes,
         } = self;
         let PlanFileContents {
@@ -3207,36 +3372,36 @@ impl UnresolvedReloadedPlanFile {
             upstream_sources,
             wait_bindings,
         } = contents;
-        let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
-            &sorted_resources,
-            &data_sources,
-            upstream_sources
-                .iter()
-                .map(|upstream| upstream.binding.clone()),
-        )?;
+        let dependency_evidence = resource_dependency_evidence
+            .into_iter()
+            .map(|entry| (entry.id, entry.explicit_dependencies))
+            .collect::<HashMap<_, _>>();
         let resolve_resources = |resources: Vec<SavedResource>| {
-            let mut resolved_resources = Vec::with_capacity(resources.len());
-            let mut resolved_dependencies = Vec::with_capacity(resources.len());
-            for resource in resources {
-                let dependencies = dependency_scope.resolve_resource(&resource)?;
-                let resource =
+            resources
+                .into_iter()
+                .map(|resource| {
+                    let dependencies = dependency_evidence.get(&resource.id).cloned().ok_or_else(
+                        || carina_core::dependency::DependencyResolutionError::MetadataMismatch {
+                            owner: format!("saved-plan dependency evidence for '{}'", resource.id),
+                        },
+                    )?;
+                    let resource =
                     carina_core::resource::ResolvedResource::resolve_with_schemas_and_dependencies(
                         resource,
                         schemas,
                         dependencies.clone(),
                     )?
                     .into_inner();
-                resolved_resources.push(resource);
-                resolved_dependencies.push(dependencies);
-            }
-            Ok::<_, carina_core::resource::ResolvedResourceError>((
-                resolved_resources,
-                resolved_dependencies,
-            ))
+                    Ok::<_, carina_core::resource::ResolvedResourceError>((resource, dependencies))
+                })
+                .collect::<Result<Vec<_>, _>>()
         };
-        let (sorted_resources, sorted_resource_dependencies) = resolve_resources(sorted_resources)?;
-        let (unresolved_resources, _unresolved_resource_dependencies) =
-            resolve_resources(unresolved_resources)?;
+        let (sorted_resources, sorted_resource_dependencies) =
+            resolve_resources(sorted_resources)?.into_iter().unzip();
+        let unresolved_resources = resolve_resources(unresolved_resources)?
+            .into_iter()
+            .map(|(resource, _dependencies)| resource)
+            .collect();
         let contents = PlanFileContents {
             version,
             carina_version,
@@ -3246,7 +3411,7 @@ impl UnresolvedReloadedPlanFile {
             state_serial,
             provider_configs,
             backend_config,
-            plan: plan.resolve_with_schemas_and_dependencies(schemas, &dependency_scope)?,
+            plan: plan.resolve_with_schemas(schemas)?,
             sorted_resources,
             unresolved_resources,
             compositions,
@@ -3316,8 +3481,11 @@ impl ReloadedPlanFile {
         carina_core::resource::ResolvedResourceError,
     > {
         carina_core::resource::ResolvedResource::collect_resolved_with_schemas_and_dependencies(
-            self.contents.sorted_resources.iter().cloned(),
-            self.sorted_resource_dependencies.iter().cloned(),
+            self.contents
+                .sorted_resources
+                .iter()
+                .cloned()
+                .zip(self.sorted_resource_dependencies.iter().cloned()),
             schemas,
         )
     }
@@ -4079,7 +4247,7 @@ impl CurrentStateEntry {
 enum PlanSaveError {
     Serialization(carina_core::value::SerializationError),
     CompositionSourceIdentity(carina_core::resource::CompositionSourceIdentityError),
-    ProviderEvidence(ProviderEvidenceError),
+    ProviderEvidence(Box<ProviderEvidenceError>),
 }
 
 impl From<carina_core::value::SerializationError> for PlanSaveError {
@@ -4090,7 +4258,7 @@ impl From<carina_core::value::SerializationError> for PlanSaveError {
 
 impl From<ProviderEvidenceError> for PlanSaveError {
     fn from(error: ProviderEvidenceError) -> Self {
-        Self::ProviderEvidence(error)
+        Self::ProviderEvidence(Box::new(error))
     }
 }
 
@@ -6843,7 +7011,11 @@ mod run_plan_out_tests {
             &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
         )
         .expect("saved plan should serialize");
-        let UnresolvedSavedEffect::Create(created_effect) = &saved.plan.effects()[0] else {
+        let UnresolvedSavedEffect::Create {
+            resource: created_effect,
+            ..
+        } = &saved.plan.effects()[0]
+        else {
             panic!("expected create effect")
         };
         let UnresolvedSavedEffect::Update {
@@ -7416,9 +7588,12 @@ mod run_plan_out_tests {
         .expect_err("a configured provider without an artifact must fail plan saving");
         assert!(matches!(
             &error,
-            PlanSaveError::ProviderEvidence(
-                ProviderEvidenceError::MissingProviderArtifact { provider }
-            ) if provider == "aws"
+            PlanSaveError::ProviderEvidence(error)
+                if matches!(
+                    error.as_ref(),
+                    ProviderEvidenceError::MissingProviderArtifact { provider }
+                        if provider == "aws"
+                )
         ));
         assert_eq!(
             map_plan_save_error(error, "--out").to_string(),

@@ -846,6 +846,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
             "validation_records",
         )),
         template: Box::new(deferred),
+        explicit_dependencies: Default::default(),
     });
 
     let output = strip_ansi(&format_plan_for_test(
@@ -901,6 +902,7 @@ fn deferred_validation_records_effect() -> Effect {
             "validation_records",
         )),
         template: Box::new(deferred),
+        explicit_dependencies: Default::default(),
     }
 }
 
@@ -921,7 +923,12 @@ fn delete_record_effect(binding: &'static str) -> Effect {
 }
 
 fn deferred_replace_validation_records_effect() -> Effect {
-    let Effect::DeferredCreate { id, template } = deferred_validation_records_effect() else {
+    let Effect::DeferredCreate {
+        id,
+        template,
+        explicit_dependencies: deferred_explicit_dependencies,
+    } = deferred_validation_records_effect()
+    else {
         unreachable!("helper constructs DeferredCreate")
     };
     let Effect::Delete {
@@ -951,6 +958,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
         .expect("fixture has one delete"),
         id,
         template,
+        explicit_dependencies: deferred_explicit_dependencies,
     }))
 }
 

@@ -23,13 +23,13 @@ use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
     CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, UpdateRequest,
 };
-#[cfg(test)]
-use crate::resource::NoPlaceholder;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, LiveComposition, ParserPlaceholder, PlaceholderKind,
-    ProviderDataSource, ProviderModuleSource, ProviderResource, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
+    ProviderDataSource, ProviderModuleSource, ProviderResource, ResolvedResource, Resource,
+    ResourceId, SavedComposition, Value,
 };
+#[cfg(test)]
+use crate::resource::{NoPlaceholder, ResolvedDataSource};
 use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
 
@@ -76,7 +76,16 @@ impl<T> Deref for ProviderReady<T> {
 pub type ProviderReadyResource = ProviderReady<ResolvedResource<ProviderModuleSource>>;
 
 /// A fully resolved data source whose known input constraints have run.
-pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource<ProviderModuleSource>>;
+///
+/// Dependency evidence is retained separately from the provider-facing
+/// payload because refresh-time reads legitimately occur before the final
+/// planning resolver seam, while apply-time reads already carry that proof.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderReadyDataSource {
+    value: ProviderDataSource,
+    directives: ProviderDirectives,
+    explicit_dependencies: crate::dependency::ResolvedDependencies,
+}
 
 /// Provider configuration attributes whose schema-known enum leaves are in
 /// host-resolved API spelling.
@@ -392,7 +401,23 @@ impl ProviderReadyResource {
 impl ProviderReadyDataSource {
     /// Borrow the provider-facing data-source payload.
     pub fn as_data_source(&self) -> &ProviderDataSource {
-        self.value.as_inner()
+        &self.value
+    }
+
+    pub fn directives(&self) -> &ProviderDirectives {
+        &self.directives
+    }
+
+    pub fn explicit_dependencies(&self) -> &crate::dependency::ResolvedDependencies {
+        &self.explicit_dependencies
+    }
+}
+
+impl std::ops::Deref for ProviderReadyDataSource {
+    type Target = ProviderDataSource;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_data_source()
     }
 }
 
@@ -815,6 +840,7 @@ pub fn prepare_provider_ready_data_source(
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     prepare_provider_ready_data_source_after_resolution(
         ResolvedCheckInput::authored(resource),
+        crate::dependency::ResolvedDependencies::empty(),
         context,
     )
 }
@@ -825,6 +851,7 @@ pub fn prepare_provider_ready_data_source(
 /// scope because they already passed the plan-time authored-value gate.
 pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
     input: ResolvedCheckInput<DataSource<S>>,
+    explicit_dependencies: crate::dependency::ResolvedDependencies,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     let ResolvedCheckInput {
@@ -864,13 +891,16 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
-    let value = ResolvedDataSource::new(value.into_provider_data_source());
-    let directives = context.schemas.resolve_directives(
-        &value.as_inner().id,
-        SchemaKind::DataSource,
-        &value.as_inner().directives,
-    );
-    Ok(ProviderReady { value, directives })
+    let value = value.into_provider_data_source();
+    let directives =
+        context
+            .schemas
+            .resolve_directives(&value.id, SchemaKind::DataSource, &value.directives);
+    Ok(ProviderReadyDataSource {
+        value,
+        directives,
+        explicit_dependencies,
+    })
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -996,6 +1026,45 @@ mod provider_config_tests {
         AttributeSchema, AttributeType, ResourceSchema, RootlessType, TypeIdentity,
         legacy_validator,
     };
+
+    #[test]
+    fn provider_ready_data_source_preserves_resolved_explicit_dependencies() {
+        let gate: Resource = Resource::new("test.Gate", "gate").with_binding("gate");
+        let mut lookup: DataSource = DataSource::new("test.Lookup", "lookup");
+        lookup.binding = Some("lookup".to_string());
+        lookup.directives.depends_on.push("gate".to_string());
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            std::slice::from_ref(&gate),
+            std::slice::from_ref(&lookup),
+            std::iter::empty(),
+        );
+        let dependencies = scope
+            .resolve_data_source(&lookup)
+            .expect("fixture dependency resolves");
+        let lookup = ResolvedDataSource::new_with_dependencies(lookup, dependencies)
+            .expect("resolved data source retains dependency evidence");
+
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = SchemaRegistry::new();
+        let context = ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            &[],
+            &crate::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+
+        let ready = prepare_provider_ready_data_source_after_resolution(
+            ResolvedCheckInput::authored(lookup.as_inner().clone()),
+            lookup.explicit_dependencies().clone(),
+            &context,
+        )
+        .expect("resolved data source should cross provider preparation");
+
+        assert!(ready.explicit_dependencies().contains("gate"));
+    }
 
     #[tokio::test]
     async fn prepare_create_request_resolves_authored_ignore_changes() {

@@ -298,6 +298,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             "validation_records",
         )),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     })));
     plan.add(Effect::Update {
         identifier: AppliedIdentifier::new("consumer-id").expect("fixture identifier is non-empty"),

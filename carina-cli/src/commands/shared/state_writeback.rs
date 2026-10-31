@@ -2083,8 +2083,7 @@ mod apply_state_save_tests {
             &scope_resources,
             &[] as &[carina_core::resource::DataSource],
             std::iter::empty(),
-        )
-        .expect("fixture dependency scope must resolve");
+        );
         let dependencies = scope
             .resolve_resource(&resource)
             .expect("fixture dependencies must resolve");
@@ -2354,6 +2353,7 @@ mod apply_state_save_tests {
                 // must key this pending id by provider instance and type.
                 template_resource: Resource::pending_with_provider("aws", "route53.Record", None),
             }),
+            explicit_dependencies: Default::default(),
         });
         let runtime_id = ResourceId::with_provider_identity(
             "aws",
@@ -4990,6 +4990,7 @@ mod apply_state_save_tests {
                 )
                 .with_binding("validation_records"),
             }),
+            explicit_dependencies: Default::default(),
         });
         let successfully_deleted = HashSet::from([DeletedInstanceKey::new(
             id.clone(),
@@ -5065,6 +5066,7 @@ mod apply_state_save_tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
+            explicit_dependencies: Default::default(),
         }))
     }
 

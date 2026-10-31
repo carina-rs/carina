@@ -17,7 +17,6 @@ pub(super) struct DeferredIdentityInputs<'a> {
     pub(super) provider_configs: &'a [crate::parser::ProviderConfig],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
     pub(super) schemas: &'a crate::schema::SchemaRegistry,
-    pub(super) dependency_scope: &'a crate::dependency::ResolvedDependencyScope,
 }
 
 /// Failure while expanding a deferred-for create half against apply-time
@@ -218,6 +217,7 @@ pub(super) fn materialize_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
     template: &DeferredForExpression<S>,
+    explicit_dependencies: &crate::dependency::ResolvedDependencies,
     bindings: &ResolvedBindings,
     identity_inputs: &DeferredIdentityInputs<'_>,
 ) -> Result<Vec<Effect<S>>, DeferredCreateFailure> {
@@ -302,15 +302,10 @@ pub(super) fn materialize_deferred_create<
                     .is_subset(&resource.dependency_bindings),
                 "apply-time deferred-for child must retain iterable dependencies"
             );
-            let dependencies = identity_inputs
-                .dependency_scope
-                .resolve_resource(&resource)
-                .map_err(ResolvedResourceError::from)
-                .map_err(|error| DeferredCreateFailure::ResolveResource { error })?;
             ResolvedResource::resolve_with_schemas_and_dependencies(
                 resource,
                 identity_inputs.schemas,
-                dependencies,
+                explicit_dependencies.clone(),
             )
             .map(Effect::Create)
             .map_err(|error| DeferredCreateFailure::ResolveResource { error })
@@ -362,10 +357,16 @@ pub(super) fn dispatch_deferred_create<
 >(
     effect: &Effect<S>,
     template: &DeferredForExpression<S>,
+    explicit_dependencies: &crate::dependency::ResolvedDependencies,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_, S>,
 ) -> DeferredDispatchResult<S> {
-    match materialize_deferred_create(template, bindings, &ctx.identity_inputs) {
+    match materialize_deferred_create(
+        template,
+        explicit_dependencies,
+        bindings,
+        &ctx.identity_inputs,
+    ) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => {
             report_deferred_create_failure(effect, &err, ctx);
@@ -418,12 +419,12 @@ mod tests {
         let schemas = crate::schema::SchemaRegistry::new();
         materialize_deferred_create(
             template,
+            &crate::dependency::ResolvedDependencies::empty(),
             bindings,
             &DeferredIdentityInputs {
                 provider_configs: &[],
                 factories: &[],
                 schemas: &schemas,
-                dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
             },
         )
     }
@@ -482,10 +483,14 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
-            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
-        let children = materialize_deferred_create(&template, &bindings, &identity_inputs)
-            .expect("deferred children must resolve authored ignore paths");
+        let children = materialize_deferred_create(
+            &template,
+            &crate::dependency::ResolvedDependencies::empty(),
+            &bindings,
+            &identity_inputs,
+        )
+        .expect("deferred children must resolve authored ignore paths");
 
         let Effect::Create(child) = &children[0] else {
             panic!("expected a create child");
@@ -535,11 +540,15 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
-            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
 
-        let children = materialize_deferred_create(template, &bindings, &identity_inputs)
-            .expect("apply-time anonymous child materializes");
+        let children = materialize_deferred_create(
+            template,
+            &crate::dependency::ResolvedDependencies::empty(),
+            &bindings,
+            &identity_inputs,
+        )
+        .expect("apply-time anonymous child materializes");
 
         let [Effect::Create(child)] = children.as_slice() else {
             panic!("one concrete create child expected");
@@ -599,11 +608,15 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
-            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
 
-        let runtime_children = materialize_deferred_create(template, &bindings, &identity_inputs)
-            .expect("apply-time enum child materializes");
+        let runtime_children = materialize_deferred_create(
+            template,
+            &crate::dependency::ResolvedDependencies::empty(),
+            &bindings,
+            &identity_inputs,
+        )
+        .expect("apply-time enum child materializes");
         let [Effect::Create(runtime_child)] = runtime_children.as_slice() else {
             panic!("one runtime child expected");
         };
@@ -680,11 +693,15 @@ mod tests {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
-            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         };
 
-        let error = materialize_deferred_create(template, &bindings, &identity_inputs)
-            .expect_err("identical apply-time children must fail identity assignment");
+        let error = materialize_deferred_create(
+            template,
+            &crate::dependency::ResolvedDependencies::empty(),
+            &bindings,
+            &identity_inputs,
+        )
+        .expect_err("identical apply-time children must fail identity assignment");
         let source = std::error::Error::source(&error)
             .expect("deferred failure must retain its typed identity source");
 

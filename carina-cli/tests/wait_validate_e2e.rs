@@ -357,6 +357,55 @@ let instance = reusable { label = "caller" }
 }
 
 #[test]
+fn validate_accepts_resource_and_wait_dependencies_on_module_call_binding() {
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+        ),
+        (
+            "main.crn",
+            r#"let reusable = use { source = "./module" }
+let instance = reusable { label = "caller" }
+"#,
+        ),
+        (
+            "consumer.crn",
+            r#"let local = mock.test.resource {
+    name = "local"
+    directives { depends_on = [instance] }
+}
+let w = wait local {
+    until = local.comment == "ready"
+    depends_on = [instance]
+}
+"#,
+        ),
+        ("module/arguments.crn", "arguments { label: String }\n"),
+        (
+            "module/resource.crn",
+            r#"let inner = mock.test.resource {
+    name = label
+}
+attributes {
+    name = inner.name
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = cli_validate(&fixture);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|message| !message.contains("binding 'instance' is not declared")),
+        "declared module-call/composition bindings remain valid dependency targets: {diagnostics:?}"
+    );
+}
+
+#[test]
 fn validate_accepts_well_formed_wait_multi_file_fixture() {
     let fixture = write_fixture(&[
         (

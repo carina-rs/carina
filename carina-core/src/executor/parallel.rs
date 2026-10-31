@@ -352,51 +352,6 @@ pub(super) async fn execute_effects_sequential<
         .provider_check_inputs
         .resource_origins()
         .unwrap_or(&empty_resource_origins);
-    let mut dependency_resources = resource_origins
-        .values()
-        .map(|resource| resource.as_resource().clone())
-        .map(|resource| (resource.id.clone(), resource))
-        .collect::<HashMap<_, _>>();
-    let mut dependency_data_sources = input
-        .provider_check_inputs
-        .data_source_origins()
-        .unwrap_or_default()
-        .iter()
-        .cloned()
-        .map(|resource| (resource.id.clone(), resource))
-        .collect::<HashMap<_, _>>();
-    for effect in &effects {
-        match effect {
-            Effect::Read { resource } => {
-                dependency_data_sources
-                    .entry(resource.id.clone())
-                    .or_insert_with(|| resource.as_inner().clone());
-            }
-            Effect::Create(resource)
-            | Effect::ResumeCreate { resource, .. }
-            | Effect::Update { to: resource, .. } => {
-                dependency_resources
-                    .entry(resource.id.clone())
-                    .or_insert_with(|| resource.as_inner().clone());
-            }
-            Effect::Delete { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace(_) => {}
-        }
-    }
-    let dependency_resources = dependency_resources.into_values().collect::<Vec<_>>();
-    let dependency_data_sources = dependency_data_sources.into_values().collect::<Vec<_>>();
-    let dependency_scope = crate::dependency::ResolvedDependencyScope::from_resources(
-        &dependency_resources,
-        &dependency_data_sources,
-        std::iter::empty(),
-    )
-    .expect("planned dependency targets must retain resolved identities");
     let mut desired_ids = resource_origins.keys().cloned().collect::<HashSet<_>>();
     for effect in &effects {
         if matches!(
@@ -604,7 +559,6 @@ pub(super) async fn execute_effects_sequential<
                     provider_configs: input.provider_configs,
                     factories: input.factories,
                     schemas: input.schemas,
-                    dependency_scope: &dependency_scope,
                 },
             };
             match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
@@ -792,6 +746,7 @@ pub(super) async fn execute_effects_sequential<
                                         if unresolved.is_empty() {
                                             match super::provider_ready::prepare_provider_ready_data_source_after_resolution(
                                                 resolved_input,
+                                                resource.explicit_dependencies().clone(),
                                                 &preparation,
                                             ) {
                                                 Ok(ready) => {
@@ -1266,6 +1221,7 @@ mod tests {
                     None,
                 ),
                 template: Box::new(unbound_deferred_template_in("a.crn")),
+                explicit_dependencies: Default::default(),
             },
             Effect::DeferredCreate {
                 id: crate::resource::ResolvedResourceId::with_provider_identity(
@@ -1275,6 +1231,7 @@ mod tests {
                     None,
                 ),
                 template: Box::new(unbound_deferred_template_in("b.crn")),
+                explicit_dependencies: Default::default(),
             },
         ];
         let mut deps_of = HashMap::from([
@@ -1809,8 +1766,7 @@ mod tests {
             &[parent_resource, child.clone()],
             &[] as &[crate::resource::DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
         let dependencies = scope.resolve_resource(&child).unwrap();
         let child = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("id"),

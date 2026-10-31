@@ -96,6 +96,11 @@ placeholder values. Deferred template attributes are serialized only through
 their `template_resource`. Older plans are rejected with the same replan
 guidance; the state format remains unchanged.
 
+Saved-plan format 37 persists the plan-time resolver's explicit-dependency
+proof as binding-and-identity pairs. Saved-plan apply consumes that reviewed
+proof directly instead of resolving again against a partial set of
+effect-owning resources. The state format remains unchanged.
+
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host
 validates and preserves that continuation through the same typestate path as

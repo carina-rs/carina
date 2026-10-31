@@ -745,7 +745,7 @@ fn node_from_effect(
             Vec::new(),
             None,
         ),
-        Effect::DeferredCreate { id, template } => (
+        Effect::DeferredCreate { id, template, .. } => (
             deferred_label(template, id),
             id.display_type(),
             EffectKind::DeferredCreate,
@@ -1203,8 +1203,7 @@ mod tests {
             &[dependency, resource.clone()],
             &[] as &[carina_core::resource::DataSource],
             std::iter::empty(),
-        )
-        .expect("dependency scope resolves");
+        );
         let dependencies = scope
             .resolve_resource(&resource)
             .expect("explicit dependency resolves");
@@ -1376,6 +1375,7 @@ mod tests {
         let effect = Effect::DeferredCreate {
             id: ResolvedResourceId::new(ResourceId::with_identity("__deferred_for", "widgets")),
             template: Box::new(template),
+            explicit_dependencies: Default::default(),
         };
 
         let node = node_from_effect(0, &effect, None, None);
@@ -1457,6 +1457,7 @@ mod tests {
                 None,
             ),
             template: Box::new(round_tripped),
+            explicit_dependencies: Default::default(),
         });
         let node = node_from_effect(0, &plan.effects()[0], None, None);
 

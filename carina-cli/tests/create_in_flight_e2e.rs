@@ -178,7 +178,7 @@ fn assert_resume_count(plan: &PlanFile, expected: usize) {
         .plan
         .effects()
         .iter()
-        .filter(|effect| matches!(effect, Effect::Create(_resource)))
+        .filter(|effect| matches!(effect, Effect::Create { .. }))
         .count();
     assert_eq!(
         resume_count, expected,
@@ -913,7 +913,7 @@ fn discarded_resume_clears_only_current_and_keeps_deposed_generation() {
         plan.plan
             .effects()
             .iter()
-            .filter(|effect| matches!(effect, Effect::Create(_resource)))
+            .filter(|effect| matches!(effect, Effect::Create { .. }))
             .count(),
         1,
         "the absent current instance must be recreated"
@@ -1012,7 +1012,7 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
     assert!(
         !cached_plan.plan.effects().iter().any(|effect| matches!(
             effect,
-            Effect::Create(_)
+            Effect::Create { .. }
                 | Effect::Delete {
                     generation: carina_core::effect::EffectGeneration::Current,
                     ..
@@ -1064,7 +1064,7 @@ fn created_read_failed_resume_marks_unknowns_without_replacing_or_regenerating_p
     assert!(
         !live_plan.plan.effects().iter().any(|effect| matches!(
             effect,
-            Effect::Create(_)
+            Effect::Create { .. }
                 | Effect::Delete {
                     generation: carina_core::effect::EffectGeneration::Current,
                     ..
@@ -1132,7 +1132,7 @@ fn absent_refresh_recreates_with_the_stored_prefixed_name() {
         plan.plan
             .effects()
             .iter()
-            .any(|effect| matches!(effect, Effect::Create(_))),
+            .any(|effect| matches!(effect, Effect::Create { .. })),
         "the absent resource must be recreated: {:#?}",
         plan.plan.effects()
     );

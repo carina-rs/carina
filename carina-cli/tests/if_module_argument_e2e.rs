@@ -308,9 +308,15 @@ fn resource_dependency_bindings<'a>(
         .expect("resource collection")
         .iter()
         .find(|resource| {
+            let resource = resource.get("resource").unwrap_or(resource);
             resource.get("binding").and_then(serde_json::Value::as_str) == Some(binding)
         })
-        .and_then(|resource| resource.get("dependency_bindings"))
+        .and_then(|resource| {
+            resource
+                .get("resource")
+                .unwrap_or(resource)
+                .get("dependency_bindings")
+        })
         .unwrap_or_else(|| panic!("missing dependency metadata for {binding}: {resources:#}"))
 }
 
@@ -320,6 +326,7 @@ fn dependency_bindings_by_binding(resources: &serde_json::Value) -> BTreeMap<Str
         .expect("resource collection")
         .iter()
         .map(|resource| {
+            let resource = resource.get("resource").unwrap_or(resource);
             let binding = resource["binding"]
                 .as_str()
                 .expect("resource binding")
@@ -623,7 +630,10 @@ fn plan_json_preserves_if_free_two_level_module_dependency_edges() {
     assert_eq!(wait["identity"], "stack.ready");
     assert_eq!(
         wait["explicit_dependencies"],
-        serde_json::json!(["stack.data_consumer"]),
+        serde_json::json!([{
+            "binding": "stack.data_consumer",
+            "identity": "stack.data_consumer",
+        }]),
     );
 }
 

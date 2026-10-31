@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::resource::{ResolvedDataSource, ResolvedResource, Resource, Value};
+use crate::resource::{ResolvedResource, Resource, Value};
 
 /// Extract binding names that a resource depends on.
 ///
@@ -37,15 +37,15 @@ pub fn get_resource_dependencies<S, P: crate::resource::PlaceholderKind>(
     deps
 }
 
-/// Dependency identities for a resource whose explicit names have crossed
-/// the dependency-resolution seam.
-pub fn get_resolved_resource_dependencies<S>(resource: &ResolvedResource<S>) -> HashSet<String> {
-    let mut dependencies = get_resource_value_ref_dependencies(
-        crate::parser::ResourceRef::Resource(resource.as_inner()),
-    );
+/// Dependency bindings for a resource-like value whose explicit names have
+/// crossed the dependency-resolution seam.
+pub fn get_resolved_dependencies<S, P: crate::resource::PlaceholderKind>(
+    resource: crate::parser::ResourceRef<'_, S, P>,
+    explicit_dependencies: &crate::dependency::ResolvedDependencies,
+) -> HashSet<String> {
+    let mut dependencies = get_resource_value_ref_dependencies(resource);
     dependencies.extend(
-        resource
-            .explicit_dependencies()
+        explicit_dependencies
             .iter()
             .map(|target| target.as_str().to_string()),
     );
@@ -99,22 +99,6 @@ pub fn get_data_source_dependencies<S, P: crate::resource::PlaceholderKind>(
         deps.insert(name.clone());
     }
     deps
-}
-
-/// Data-source counterpart of [`get_resolved_resource_dependencies`].
-pub fn get_resolved_data_source_dependencies<S>(
-    data_source: &ResolvedDataSource<S>,
-) -> HashSet<String> {
-    let mut dependencies = get_resource_value_ref_dependencies(
-        crate::parser::ResourceRef::DataSource(data_source.as_inner()),
-    );
-    dependencies.extend(
-        data_source
-            .explicit_dependencies()
-            .iter()
-            .map(|target| target.as_str().to_string()),
-    );
-    dependencies
 }
 
 /// Recursively collect resource reference dependencies from a value.
@@ -172,17 +156,6 @@ pub fn get_resource_value_ref_dependencies<S, P: crate::resource::PlaceholderKin
 pub fn sort_resources_by_dependencies<S: Clone, P: crate::resource::PlaceholderKind>(
     resources: &[Resource<S, P>],
 ) -> Result<Vec<Resource<S, P>>, String> {
-    topological_sort(resources)
-}
-
-/// Sort planning-ready resources using only resolver-produced explicit edges.
-///
-/// Unlike [`sort_resources_by_dependencies`], this path never interprets an
-/// authored `directives.depends_on` string. Explicit targets are opaque
-/// resolved identities, so an unknown name cannot be silently skipped here.
-pub fn sort_resolved_resources_by_dependencies<S: Clone>(
-    resources: &[ResolvedResource<S>],
-) -> Result<Vec<ResolvedResource<S>>, String> {
     let binding_to_index = resources
         .iter()
         .enumerate()
@@ -193,23 +166,114 @@ pub fn sort_resolved_resources_by_dependencies<S: Clone>(
                 .map(|binding| (binding.clone(), index))
         })
         .collect::<HashMap<_, _>>();
-    let identity_to_index = resources
+    let edges = resources
+        .iter()
+        .map(|resource| {
+            get_resource_dependencies(resource)
+                .into_iter()
+                .filter_map(|dependency| binding_to_index.get(&dependency).copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let labels = resources
+        .iter()
+        .map(|resource| {
+            resource
+                .binding
+                .clone()
+                .unwrap_or_else(|| resource.id.to_string())
+        })
+        .collect::<Vec<_>>();
+    let order = topological_order(&edges, &labels)?;
+    Ok(order
+        .into_iter()
+        .map(|index| resources[index].clone())
+        .collect())
+}
+
+/// Sort planning-ready resources using only resolver-produced explicit edges.
+///
+/// Unlike [`sort_resources_by_dependencies`], this path never interprets an
+/// authored `directives.depends_on` string. Explicit targets are opaque
+/// resolved identities, so an unknown name cannot be silently skipped here.
+pub fn sort_resolved_resources_by_dependencies<S: Clone>(
+    resources: &[ResolvedResource<S>],
+) -> Result<Vec<ResolvedResource<S>>, String> {
+    sort_by_resolved_resource_dependencies(resources, |resource| resource)
+}
+
+/// Sort values carrying a resolved resource view, preserving all paired views
+/// in the same topological order.
+pub fn sort_by_resolved_resource_dependencies<T: Clone, S>(
+    values: &[T],
+    resource_of: impl Fn(&T) -> &ResolvedResource<S>,
+) -> Result<Vec<T>, String> {
+    let binding_to_index = values
         .iter()
         .enumerate()
-        .map(|(index, resource)| (resource.identity().clone(), index))
+        .filter_map(|(index, value)| {
+            let resource = resource_of(value);
+            resource
+                .binding
+                .as_ref()
+                .map(|binding| (binding.clone(), index))
+        })
         .collect::<HashMap<_, _>>();
-    let mut sorted = Vec::with_capacity(resources.len());
+    let identity_to_index = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (resource_of(value).identity().clone(), index))
+        .collect::<HashMap<_, _>>();
+    let edges = values
+        .iter()
+        .map(|value| {
+            let resource = resource_of(value);
+            let mut edges = get_resource_value_ref_dependencies(
+                crate::parser::ResourceRef::Resource(resource.as_inner()),
+            )
+            .into_iter()
+            .filter_map(|dependency| binding_to_index.get(&dependency).copied())
+            .collect::<Vec<_>>();
+            for dependency in resource.explicit_dependencies().iter() {
+                if let Some(dependency_index) = identity_to_index
+                    .get(dependency.identity())
+                    .or_else(|| binding_to_index.get(dependency.as_str()))
+                {
+                    edges.push(*dependency_index);
+                }
+            }
+            edges
+        })
+        .collect::<Vec<_>>();
+    let labels = values
+        .iter()
+        .map(|value| {
+            let resource = resource_of(value);
+            resource
+                .binding
+                .clone()
+                .unwrap_or_else(|| resource.id.to_string())
+        })
+        .collect::<Vec<_>>();
+    let order = topological_order(&edges, &labels)?;
+    Ok(order
+        .into_iter()
+        .map(|index| values[index].clone())
+        .collect())
+}
+
+fn topological_order(edges: &[Vec<usize>], labels: &[String]) -> Result<Vec<usize>, String> {
+    let mut sorted = Vec::with_capacity(edges.len());
     let mut visited = HashSet::new();
     let mut visiting = Vec::new();
 
-    fn visit<S: Clone>(
+    fn visit(
         index: usize,
-        resources: &[ResolvedResource<S>],
-        binding_to_index: &HashMap<String, usize>,
-        identity_to_index: &HashMap<crate::resource::ResourceIdentity, usize>,
+        edges: &[Vec<usize>],
+        labels: &[String],
         visited: &mut HashSet<usize>,
         visiting: &mut Vec<usize>,
-        sorted: &mut Vec<ResolvedResource<S>>,
+        sorted: &mut Vec<usize>,
     ) -> Result<(), String> {
         if visited.contains(&index) {
             return Ok(());
@@ -219,12 +283,7 @@ pub fn sort_resolved_resources_by_dependencies<S: Clone>(
                 .iter()
                 .copied()
                 .chain(std::iter::once(index))
-                .map(|cycle_index| {
-                    resources[cycle_index]
-                        .binding
-                        .clone()
-                        .unwrap_or_else(|| resources[cycle_index].id.to_string())
-                })
+                .map(|cycle_index| labels[cycle_index].clone())
                 .collect::<Vec<_>>();
             return Err(format!(
                 "Circular dependency detected: {}",
@@ -233,149 +292,25 @@ pub fn sort_resolved_resources_by_dependencies<S: Clone>(
         }
 
         visiting.push(index);
-        let resource = &resources[index];
-        let value_dependencies = get_resource_value_ref_dependencies(
-            crate::parser::ResourceRef::Resource(resource.as_inner()),
-        );
-        for dependency in value_dependencies {
-            if let Some(dependency_index) = binding_to_index.get(&dependency) {
-                visit(
-                    *dependency_index,
-                    resources,
-                    binding_to_index,
-                    identity_to_index,
-                    visited,
-                    visiting,
-                    sorted,
-                )?;
-            }
-        }
-        for dependency in resource.explicit_dependencies().iter() {
-            let dependency_index = identity_to_index.get(dependency.identity()).ok_or_else(
-                || {
-                    format!(
-                        "resolved dependency target '{}' is missing from the managed resource set",
-                        dependency.as_str()
-                    )
-                },
-            )?;
-            visit(
-                *dependency_index,
-                resources,
-                binding_to_index,
-                identity_to_index,
-                visited,
-                visiting,
-                sorted,
-            )?;
+        for dependency_index in &edges[index] {
+            visit(*dependency_index, edges, labels, visited, visiting, sorted)?;
         }
         visiting.pop();
         visited.insert(index);
-        sorted.push(resource.clone());
+        sorted.push(index);
         Ok(())
     }
 
-    for index in 0..resources.len() {
+    for index in 0..edges.len() {
         visit(
             index,
-            resources,
-            &binding_to_index,
-            &identity_to_index,
+            edges,
+            labels,
             &mut visited,
             &mut visiting,
             &mut sorted,
         )?;
     }
-    Ok(sorted)
-}
-
-/// Internal topological sort for creation ordering.
-fn topological_sort<S: Clone, P: crate::resource::PlaceholderKind>(
-    resources: &[Resource<S, P>],
-) -> Result<Vec<Resource<S, P>>, String> {
-    // Build binding name to input index mapping. Graph membership is indexed
-    // by declaration position so two anonymous resources cannot collapse.
-    let mut binding_to_index: HashMap<String, usize> = HashMap::new();
-    for (index, resource) in resources.iter().enumerate() {
-        if let Some(ref binding_name) = resource.binding {
-            binding_to_index.insert(binding_name.clone(), index);
-        }
-    }
-
-    // Build dependency graph
-    let mut sorted = Vec::new();
-    let mut visited: HashSet<usize> = HashSet::new();
-    let mut visiting: Vec<usize> = Vec::new();
-
-    fn label<S, P: crate::resource::PlaceholderKind>(resource: &Resource<S, P>) -> String {
-        resource
-            .binding
-            .clone()
-            .unwrap_or_else(|| resource.id.to_string())
-    }
-
-    fn visit<S: Clone, P: crate::resource::PlaceholderKind>(
-        index: usize,
-        resources: &[Resource<S, P>],
-        binding_to_index: &HashMap<String, usize>,
-        visited: &mut HashSet<usize>,
-        visiting: &mut Vec<usize>,
-        sorted: &mut Vec<Resource<S, P>>,
-    ) -> Result<(), String> {
-        if visited.contains(&index) {
-            return Ok(());
-        }
-        if let Some(pos) = visiting
-            .iter()
-            .position(|visiting_index| *visiting_index == index)
-        {
-            let cycle = visiting[pos..]
-                .iter()
-                .copied()
-                .chain(std::iter::once(index))
-                .map(|cycle_index| label(&resources[cycle_index]))
-                .collect::<Vec<_>>();
-            return Err(format!(
-                "Circular dependency detected: {}",
-                cycle.join(" -> ")
-            ));
-        }
-
-        visiting.push(index);
-
-        // Visit dependencies first
-        let resource = &resources[index];
-        let deps = get_resource_dependencies(resource);
-        for dep in &deps {
-            if let Some(dep_index) = binding_to_index.get(dep) {
-                visit(
-                    *dep_index,
-                    resources,
-                    binding_to_index,
-                    visited,
-                    visiting,
-                    sorted,
-                )?;
-            }
-        }
-
-        visiting.pop();
-        visited.insert(index);
-        sorted.push(resource.clone());
-        Ok(())
-    }
-
-    for index in 0..resources.len() {
-        visit(
-            index,
-            resources,
-            &binding_to_index,
-            &mut visited,
-            &mut visiting,
-            &mut sorted,
-        )?;
-    }
-
     Ok(sorted)
 }
 
@@ -602,8 +537,7 @@ mod tests {
             &raw,
             &[] as &[crate::resource::DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
         let resolved = vec![
             ResolvedResource::new_with_dependencies(
                 dependent.clone(),

@@ -265,6 +265,7 @@ fn build_deferred_for_plan() -> Plan {
             "validation_records",
         )),
         template: Box::new(deferred),
+        explicit_dependencies: Default::default(),
     });
     plan
 }
@@ -316,6 +317,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
             "_anon_validation_records",
         )),
         template: Box::new(deferred),
+        explicit_dependencies: Default::default(),
     });
     plan
 }
@@ -360,6 +362,7 @@ fn build_deferred_replace_plan() -> Plan {
             "validation_records",
         )),
         template: Box::new(deferred),
+        explicit_dependencies: Default::default(),
     })));
     plan
 }

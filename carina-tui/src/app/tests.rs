@@ -127,6 +127,7 @@ fn deferred_create_uses_create_symbol_and_kind() {
             "validation_records",
         )),
         template: Box::new(deferred),
+        explicit_dependencies: Default::default(),
     });
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());

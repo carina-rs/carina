@@ -18,9 +18,12 @@ pub fn satisfier_augmentation(
     for hint in provider.satisfier_hint(target_id, attr_path)? {
         match hint {
             BindingPattern::Exact(name) => {
-                if known_bindings.contains(&name) {
-                    additional.insert(name);
+                if !known_bindings.contains(&name) {
+                    return Err(crate::provider::ProviderError::internal(format!(
+                        "provider satisfier hint named unknown binding '{name}'"
+                    )));
                 }
+                additional.insert(name);
             }
             BindingPattern::ForLoopChildren { base } => {
                 let prefix = format!("{base}[");
@@ -171,8 +174,20 @@ mod tests {
     }
 
     #[test]
-    fn exact_hint_skipped_when_missing() {
-        assert!(augment(vec![BindingPattern::Exact("missing".to_string())], &["alb"]).is_empty());
+    fn exact_hint_for_missing_binding_is_a_provider_error() {
+        let provider = HintProvider {
+            hints: vec![BindingPattern::Exact("missing".to_string())],
+            failure: None,
+        };
+        let error = satisfier_augmentation(
+            &provider,
+            &ResourceId::with_identity("acm.Certificate", "cert"),
+            &AttrPath::single("status"),
+            &HashSet::from(["alb".to_string()]),
+        )
+        .expect_err("a provider cannot name a binding outside the plan scope");
+
+        assert!(error.to_string().contains("missing"), "{error}");
     }
 
     #[test]

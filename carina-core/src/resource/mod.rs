@@ -830,12 +830,6 @@ pub enum ResolvedResourceError {
         id: ResourceId,
         errors: Vec<IgnoreChangeError>,
     },
-    UnresolvedDependencies {
-        id: ResourceId,
-    },
-    DependencyMetadataMismatch {
-        id: ResourceId,
-    },
 }
 
 impl Display for ResolvedResourceError {
@@ -857,14 +851,6 @@ impl Display for ResolvedResourceError {
                 }
                 Ok(())
             }
-            Self::UnresolvedDependencies { id } => write!(
-                formatter,
-                "resource '{id}' has explicit dependency names that have not been resolved"
-            ),
-            Self::DependencyMetadataMismatch { id } => write!(
-                formatter,
-                "resource '{id}' has resolved dependencies that do not match its authored depends_on"
-            ),
         }
     }
 }
@@ -874,10 +860,7 @@ impl std::error::Error for ResolvedResourceError {
         match self {
             Self::PendingIdentity(error) => Some(error),
             Self::Dependency(error) => Some(error),
-            Self::MissingSchema { .. }
-            | Self::InvalidIgnoreChanges { .. }
-            | Self::UnresolvedDependencies { .. }
-            | Self::DependencyMetadataMismatch { .. } => None,
+            Self::MissingSchema { .. } | Self::InvalidIgnoreChanges { .. } => None,
         }
     }
 }
@@ -977,17 +960,15 @@ impl<S> ResolvedResource<S> {
             resolved_ignore_changes_match(&resource),
             "ResolvedResource with ignore_changes requires schema resolution"
         );
-        let authored = resource
-            .directives
-            .depends_on
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            authored,
-            explicit_dependencies.names(),
-            "ResolvedResource dependency metadata must match depends_on"
-        );
+        crate::dependency::validate_dependency_metadata(
+            format!(
+                "directives.depends_on on '{}'",
+                resource.binding.as_deref().unwrap_or("(anonymous)")
+            ),
+            &resource.directives.depends_on,
+            &explicit_dependencies,
+        )
+        .expect("ResolvedResource dependency metadata must match depends_on");
         Self::from_resolved_parts(resource, explicit_dependencies)
     }
 
@@ -1040,22 +1021,11 @@ impl<S> ResolvedResource<S> {
     /// Convert resources after explicit dependency names have been resolved
     /// against the exact planning scope.
     pub fn collect_resolved_with_schemas_and_dependencies(
-        resources: impl IntoIterator<Item = Resource<S>>,
-        dependencies: impl IntoIterator<Item = crate::dependency::ResolvedDependencies>,
+        resources: impl IntoIterator<Item = (Resource<S>, crate::dependency::ResolvedDependencies)>,
         registry: &crate::schema::SchemaRegistry,
     ) -> Result<Vec<Self>, ResolvedResourceError> {
-        let resources = resources.into_iter().collect::<Vec<_>>();
-        let dependencies = dependencies.into_iter().collect::<Vec<_>>();
-        if resources.len() != dependencies.len() {
-            let id = resources
-                .first()
-                .map(|resource| resource.id.clone())
-                .unwrap_or_else(|| ResourceId::pending("dependency-metadata"));
-            return Err(ResolvedResourceError::DependencyMetadataMismatch { id });
-        }
         resources
             .into_iter()
-            .zip(dependencies)
             .map(|(resource, dependencies)| {
                 Self::resolve_with_schemas_and_dependencies(resource, registry, dependencies)
             })
@@ -1075,11 +1045,14 @@ impl<S> ResolvedResource<S> {
             }
             .into());
         }
-        if !resource.directives.depends_on.is_empty() {
-            return Err(ResolvedResourceError::UnresolvedDependencies {
-                id: resource.id.clone(),
-            });
-        }
+        crate::dependency::validate_dependency_metadata(
+            format!(
+                "directives.depends_on on '{}'",
+                resource.binding.as_deref().unwrap_or("(anonymous)")
+            ),
+            &resource.directives.depends_on,
+            &crate::dependency::ResolvedDependencies::empty(),
+        )?;
         resolve_resource_ignore_changes(&mut resource, registry)?;
         Ok(Self::from_resolved_parts(
             resource,
@@ -1101,17 +1074,14 @@ impl<S> ResolvedResource<S> {
             }
             .into());
         }
-        let authored = resource
-            .directives
-            .depends_on
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        if authored != explicit_dependencies.names() {
-            return Err(ResolvedResourceError::DependencyMetadataMismatch {
-                id: resource.id.clone(),
-            });
-        }
+        crate::dependency::validate_dependency_metadata(
+            format!(
+                "directives.depends_on on '{}'",
+                resource.binding.as_deref().unwrap_or("(anonymous)")
+            ),
+            &resource.directives.depends_on,
+            &explicit_dependencies,
+        )?;
         resolve_resource_ignore_changes(&mut resource, registry)?;
         Ok(Self::from_resolved_parts(resource, explicit_dependencies))
     }
@@ -1142,7 +1112,23 @@ impl<S> ResolvedResource<S> {
     /// Rewrap an attribute-transformed resource without discarding the
     /// resolver evidence carried by this value.
     pub(crate) fn with_transformed_inner(&self, resource: Resource<S>) -> Self {
-        Self::new_with_dependencies(resource, self.explicit_dependencies.clone())
+        debug_assert!(matches!(
+            resource.id.identity_state(),
+            ResourceIdentityState::Resolved(_)
+        ));
+        debug_assert!(resolved_ignore_changes_match(&resource));
+        debug_assert!(
+            crate::dependency::validate_dependency_metadata(
+                format!(
+                    "directives.depends_on on '{}'",
+                    resource.binding.as_deref().unwrap_or("(anonymous)")
+                ),
+                &resource.directives.depends_on,
+                &self.explicit_dependencies,
+            )
+            .is_ok()
+        );
+        Self::from_resolved_parts(resource, self.explicit_dependencies.clone())
     }
 
     pub fn identity(&self) -> &ResourceIdentity {

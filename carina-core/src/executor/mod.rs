@@ -654,16 +654,6 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
         }
     }
 
-    fn data_source_origins(&self) -> Option<&[DataSource<S>]> {
-        match self {
-            Self::Authored => None,
-            Self::PlanNormalized {
-                data_source_origins,
-                ..
-            } => Some(data_source_origins),
-        }
-    }
-
     pub(in crate::executor) fn resource_input(
         &self,
         resolved: &Resource<S>,

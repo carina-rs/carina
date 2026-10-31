@@ -257,6 +257,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             "validation_records",
         )),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     })));
     plan.add(Effect::Create(resolved(alias.clone())));
 

@@ -179,7 +179,7 @@ fn created_names(plan: &PlanFile) -> Vec<String> {
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Create(resource) => match resource.get_attr("name") {
+            Effect::Create { resource, .. } => match resource.get_attr("name") {
                 Some(Value::Concrete(ConcreteValue::String(name))) => {
                     Some(name.expose_plaintext().to_string())
                 }

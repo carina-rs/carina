@@ -1434,10 +1434,9 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
 ) -> Result<DriftCheckResult, AppError> {
     let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
         sorted_resources,
-        &[],
+        &[] as &[carina_core::resource::DataSource<S>],
         std::iter::empty(),
-    )
-    .map_err(|error| AppError::Validation(error.to_string()))?;
+    );
     let sorted_resources = sorted_resources
         .iter()
         .cloned()

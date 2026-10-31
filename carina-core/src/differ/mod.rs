@@ -793,20 +793,24 @@ fn create_plan_for_tests(
     orphans: &Orphans,
     wait_bindings: &[crate::parser::WaitBinding],
 ) -> crate::plan::Plan {
-    let (_, managed_dependencies, _, _) = crate::dependency::ResolvedPlanningDependencies::resolve(
+    let dependency_scope = crate::dependency::ResolvedDependencyScope::from_resources(
         managed,
         data_sources,
-        wait_bindings,
         std::iter::empty(),
-    )
-    .expect("differ test dependencies must resolve")
-    .into_parts();
-    let managed = ResolvedResource::collect_resolved_with_schemas_and_dependencies(
-        managed.iter().cloned(),
-        managed_dependencies,
-        registry,
-    )
-    .expect("differ test resources must have resolved identities and valid ignore paths");
+    );
+    let managed = managed
+        .iter()
+        .cloned()
+        .map(|resource| {
+            let dependencies = dependency_scope
+                .resolve_resource(&resource)
+                .expect("differ test dependencies must resolve");
+            (resource, dependencies)
+        })
+        .collect::<Vec<_>>();
+    let managed =
+        ResolvedResource::collect_resolved_with_schemas_and_dependencies(managed, registry)
+            .expect("differ test resources must have resolved identities and valid ignore paths");
     plan::create_plan_for_test(
         &managed,
         data_sources,

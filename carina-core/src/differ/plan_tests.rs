@@ -4237,6 +4237,60 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
 }
 
 #[test]
+fn wait_provider_satisfier_hint_accepts_data_source_binding() {
+    use crate::effect::Effect;
+    use crate::wait::BindingPattern;
+
+    let parsed = crate::parser::parse_and_resolve(
+        r#"
+        let cert = aws.acm.Certificate {
+            domain_name = "example.com"
+        }
+        let validation = read aws.route53.RecordSet {
+            name = "_acme.example.com"
+        }
+        let cert_issued = wait cert {
+            until = cert.status == "ISSUED"
+        }
+        let dist = aws.cloudfront.Distribution {
+            cert_status = cert_issued.status
+        }
+        "#,
+    )
+    .expect("parsed file should be valid")
+    .into_expanded()
+    .expect("plan fixture contains no parser placeholders");
+    let provider = HintProvider {
+        hints: vec![BindingPattern::Exact("validation".to_string())],
+    };
+    let plan = create_plan(
+        &parsed.resources,
+        &parsed.data_sources,
+        &provider,
+        &HashMap::new(),
+        &HashMap::new(),
+        &string_wait_schemas("aws"),
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &parsed.wait_bindings,
+    );
+
+    let Effect::Wait {
+        explicit_dependencies,
+        ..
+    } = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.is_wait())
+        .expect("wait should be emitted")
+    else {
+        unreachable!()
+    };
+    assert!(explicit_dependencies.contains("validation"));
+}
+
+#[test]
 fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
     use crate::effect::Effect;
     use crate::parser::{UntilPredicateAst, WaitBinding};

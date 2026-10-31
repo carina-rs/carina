@@ -979,6 +979,7 @@ for account_id in orgs.accounts {
             None,
         )),
         template: Box::new(bound),
+        explicit_dependencies: Default::default(),
     });
     plan.add(Effect::DeferredCreate {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
@@ -988,6 +989,7 @@ for account_id in orgs.accounts {
             None,
         )),
         template: Box::new(unbound),
+        explicit_dependencies: Default::default(),
     });
 
     let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
@@ -9568,10 +9570,11 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 36 adds typed
-    //! deferred-for templates and stage-specific placeholder types. Version 35
-    //! stores tri-state prevent-destroy directives and the approved state-only
-    //! directive change set. Version 34 adds Int-only integer arithmetic.
+    //! `carina plan` is the supported migration. Version 37 persists resolved
+    //! dependency targets. Version 36 adds typed deferred-for templates and
+    //! stage-specific placeholder types. Version 35 stores tri-state
+    //! prevent-destroy directives and the approved state-only directive change
+    //! set. Version 34 adds Int-only integer arithmetic.
     //! Version 33 adds typed keyed-list release effects. Version 32 adds mandatory
     //! provider-instance reference scopes and the create-outcome-unknown marker
     //! for provider protocol v13. Version 31 persists authored ignore paths;
@@ -9678,12 +9681,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            36,
-            "carina#4094 uses saved-plan format 36 after carina#4150 format 35",
+            37,
+            "carina#4153 uses saved-plan format 37 after carina#4094 format 36",
         );
-        let previous = 35;
+        let previous = 36;
 
-        for older_version in [previous, 34, 33, 32] {
+        for older_version in [previous, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

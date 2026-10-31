@@ -4188,6 +4188,7 @@ impl RefreshableChildIds {
 pub struct DeferredCreateTarget {
     pub id: ResolvedResourceId,
     pub template: carina_core::parser::DeferredForExpression,
+    pub explicit_dependencies: carina_core::dependency::ResolvedDependencies,
 }
 
 impl DeferredCreateTarget {
@@ -4207,13 +4208,23 @@ impl DeferredCreateTarget {
         Some(Self {
             id,
             template: deferred.clone(),
+            explicit_dependencies: carina_core::dependency::ResolvedDependencies::empty(),
         })
+    }
+
+    fn resolve_dependencies(
+        &mut self,
+        scope: &carina_core::dependency::ResolvedDependencyScope,
+    ) -> Result<(), carina_core::dependency::DependencyResolutionError> {
+        self.explicit_dependencies = scope.resolve_resource(&self.template.template_resource)?;
+        Ok(())
     }
 
     fn to_effect(&self) -> Effect {
         Effect::DeferredCreate {
             id: self.id.clone(),
             template: Box::new(self.template.clone()),
+            explicit_dependencies: self.explicit_dependencies.clone(),
         }
     }
 
@@ -4222,6 +4233,7 @@ impl DeferredCreateTarget {
             deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
             id: self.id.clone(),
             template: Box::new(self.template.clone()),
+            explicit_dependencies: self.explicit_dependencies.clone(),
         }))
     }
 }
@@ -5335,7 +5347,7 @@ pub fn derive_managed_binding_stability<E>(
             .into_iter()
             .map(str::to_string),
     )
-    .map_err(|error| AppError::Validation(error.to_string()))?;
+    .with_declared_targets(&parsed.compositions);
     // Identity derivation runs later in the plan pipeline. Pending resources
     // cannot have a refreshed row addressed to them yet, so they are
     // conservatively unavailable; resolved resources can be diffed normally.
@@ -5563,67 +5575,54 @@ pub(crate) struct PostExpansionResourceInputs<'a> {
     resolved_unresolved: Vec<ResolvedResource>,
 }
 
-/// Keep the pre-resolution views paired with the dependency-sorted desired
-/// view. Module expansion can leave those views in declaration order while
-/// resolved value references move a consumer behind a module-owned resource.
-/// Saved plans and live apply both rely on positional pairing at their next
-/// boundary, so compute that order once from the stable resolved resource ID.
-fn align_unresolved_resource_views(
-    resolved: &[ResolvedResource],
+#[derive(Clone)]
+struct PairedResolvedResourceViews {
+    resolved: ResolvedResource,
+    paired_unresolved: Resource,
+    resolved_unresolved: ResolvedResource,
+}
+
+fn resolve_and_sort_paired_resource_views(
+    resolved_resources: Vec<ResolvedResource>,
     paired_unresolved: Vec<Resource>,
-    resolved_unresolved: Vec<ResolvedResource>,
-) -> Result<(Vec<Resource>, Vec<ResolvedResource>), AppError> {
-    if paired_unresolved.len() != resolved_unresolved.len()
-        || paired_unresolved.len() != resolved.len()
-    {
-        return Err(AppError::Validation(format!(
-            "resource view count mismatch after dependency ordering: {} resolved, {} unresolved, {} resolved-unresolved",
-            resolved.len(),
-            paired_unresolved.len(),
-            resolved_unresolved.len(),
-        )));
-    }
-
-    let mut unresolved_by_id = HashMap::with_capacity(paired_unresolved.len());
-    for (unresolved, resolved_unresolved) in paired_unresolved.into_iter().zip(resolved_unresolved)
-    {
-        if unresolved.id != resolved_unresolved.id {
-            return Err(AppError::Validation(format!(
-                "resource views lost their pairing for {} and {}",
-                unresolved.id, resolved_unresolved.id,
-            )));
-        }
+    dependencies_by_id: &HashMap<ResourceId, carina_core::dependency::ResolvedDependencies>,
+    schemas: &SchemaRegistry,
+) -> Result<Vec<PairedResolvedResourceViews>, AppError> {
+    let mut resolved_by_id = resolved_resources
+        .into_iter()
+        .map(|resource| (resource.id.clone(), resource))
+        .collect::<HashMap<_, _>>();
+    let mut views = Vec::with_capacity(paired_unresolved.len());
+    for unresolved in paired_unresolved {
         let id = unresolved.id.clone();
-        if unresolved_by_id
-            .insert(id.clone(), (unresolved, resolved_unresolved))
-            .is_some()
-        {
-            return Err(AppError::Validation(format!(
-                "duplicate resolved resource ID while ordering resource views: {id}",
-            )));
-        }
+        let resolved = resolved_by_id.remove(&id).ok_or_else(|| {
+            AppError::Validation(format!(
+                "unresolved resource view {id} has no resolved resource view"
+            ))
+        })?;
+        let dependencies = dependencies_by_id.get(&id).cloned().ok_or_else(|| {
+            AppError::Validation(format!(
+                "unresolved resource view {id} has no resolved dependency evidence"
+            ))
+        })?;
+        let resolved_unresolved = ResolvedResource::resolve_with_schemas_and_dependencies(
+            unresolved.clone(),
+            schemas,
+            dependencies,
+        )?;
+        views.push(PairedResolvedResourceViews {
+            resolved,
+            paired_unresolved: unresolved,
+            resolved_unresolved,
+        });
     }
-
-    let mut ordered_unresolved = Vec::with_capacity(resolved.len());
-    let mut ordered_resolved_unresolved = Vec::with_capacity(resolved.len());
-    for resource in resolved {
-        let Some((unresolved, resolved_unresolved)) = unresolved_by_id.remove(&resource.id) else {
-            return Err(AppError::Validation(format!(
-                "dependency-sorted resource {} has no paired unresolved view",
-                resource.id,
-            )));
-        };
-        ordered_unresolved.push(unresolved);
-        ordered_resolved_unresolved.push(resolved_unresolved);
-    }
-
-    if let Some(unexpected) = unresolved_by_id.keys().next() {
+    if let Some(unexpected) = resolved_by_id.keys().next() {
         return Err(AppError::Validation(format!(
-            "unresolved resource view {unexpected} has no dependency-sorted resource",
+            "resolved resource view {unexpected} has no paired unresolved view"
         )));
     }
-
-    Ok((ordered_unresolved, ordered_resolved_unresolved))
+    carina_core::deps::sort_by_resolved_resource_dependencies(&views, |view| &view.resolved)
+        .map_err(AppError::Validation)
 }
 
 /// Consumer-specific semantics for the shared post-expansion seam.
@@ -5920,7 +5919,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         mut data_source_values,
         wait_aliases,
         residual_deferred_for,
-        deferred_create_targets,
+        mut deferred_create_targets,
     } = data;
     let parsed = expanded_resources.parsed();
 
@@ -6062,31 +6061,41 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         context.schemas(),
         override_aware_resources.resources(),
     );
-    let dependency_resolution = carina_core::dependency::ResolvedPlanningDependencies::resolve(
+    let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
         override_aware_resources.resources(),
         &data_sources_for_plan,
-        &wait_bindings,
         parsed
             .upstream_states
             .iter()
             .map(|upstream| upstream.binding.clone()),
     )
-    .map_err(|error| AppError::Validation(error.to_string()))?;
-    let (_dependency_scope, managed_dependencies, data_source_dependencies, wait_bindings) =
-        dependency_resolution.into_parts();
+    .with_declared_targets(&parsed.compositions);
+    let managed_resources_with_dependencies = override_aware_resources
+        .resources()
+        .iter()
+        .cloned()
+        .map(|resource| {
+            let dependencies = dependency_scope
+                .resolve_resource(&resource)
+                .map_err(|error| AppError::Validation(error.to_string()))?;
+            Ok((resource, dependencies))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let managed_dependencies_by_id = managed_resources_with_dependencies
+        .iter()
+        .map(|(resource, dependencies)| (resource.id.clone(), dependencies.clone()))
+        .collect::<HashMap<_, _>>();
     let resolved_resources = ResolvedResource::collect_resolved_with_schemas_and_dependencies(
-        override_aware_resources.resources().iter().cloned(),
-        managed_dependencies.clone(),
+        managed_resources_with_dependencies,
         context.schemas(),
     )?;
-    let resolved_resources =
-        carina_core::deps::sort_resolved_resources_by_dependencies(&resolved_resources)
-            .map_err(AppError::Validation)?;
     let resolved_data_sources = data_sources_for_plan
         .iter()
         .cloned()
-        .zip(data_source_dependencies)
-        .map(|(data_source, dependencies)| {
+        .map(|data_source| {
+            let dependencies = dependency_scope
+                .resolve_data_source(&data_source)
+                .map_err(|error| AppError::Validation(error.to_string()))?;
             carina_core::resource::ResolvedDataSource::new_with_dependencies(
                 data_source,
                 dependencies,
@@ -6094,6 +6103,19 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             .map_err(|error| AppError::Validation(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let wait_bindings = wait_bindings
+        .into_iter()
+        .map(|wait| {
+            dependency_scope
+                .resolve_wait(wait)
+                .map_err(|error| AppError::Validation(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for target in &mut deferred_create_targets {
+        target
+            .resolve_dependencies(&dependency_scope)
+            .map_err(|error| AppError::Validation(error.to_string()))?;
+    }
     let managed_stability = carina_core::differ::managed_binding_stability(
         &resolved_resources,
         &reconciled_input_current,
@@ -6120,18 +6142,24 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         .build_directives();
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let resolved_unresolved_resources =
-        ResolvedResource::collect_resolved_with_schemas_and_dependencies(
-            paired_unresolved_resources.iter().cloned(),
-            managed_dependencies,
-            context.schemas(),
-        )?;
-    let (paired_unresolved_resources, resolved_unresolved_resources) =
-        align_unresolved_resource_views(
-            &resolved_resources,
-            paired_unresolved_resources,
-            resolved_unresolved_resources,
-        )?;
+    let resource_views = resolve_and_sort_paired_resource_views(
+        resolved_resources,
+        paired_unresolved_resources,
+        &managed_dependencies_by_id,
+        context.schemas(),
+    )?;
+    let resolved_resources = resource_views
+        .iter()
+        .map(|view| view.resolved.clone())
+        .collect::<Vec<_>>();
+    let paired_unresolved_resources = resource_views
+        .iter()
+        .map(|view| view.paired_unresolved.clone())
+        .collect::<Vec<_>>();
+    let resolved_unresolved_resources = resource_views
+        .into_iter()
+        .map(|view| view.resolved_unresolved)
+        .collect::<Vec<_>>();
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         addressed.managed_current.clone(),
         context.schemas(),

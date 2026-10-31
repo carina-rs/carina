@@ -748,8 +748,7 @@ mod tests {
             &[role.clone(), bucket.clone()],
             &[] as &[crate::resource::DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
         let bucket_dependencies = scope.resolve_resource(&bucket).unwrap();
 
         let mut plan = Plan::new();
@@ -940,6 +939,7 @@ mod tests {
                 "validation_records",
             )),
             template: Box::new(deferred),
+            explicit_dependencies: Default::default(),
         })));
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1015,6 +1015,7 @@ mod tests {
                 "validation_records",
             )),
             template: Box::new(deferred),
+            explicit_dependencies: Default::default(),
         })));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("wait_validation_record_0"),

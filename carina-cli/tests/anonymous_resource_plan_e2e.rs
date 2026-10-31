@@ -597,7 +597,7 @@ fn stable_anonymous_resources_both_reach_the_plan() {
         .plan
         .effects()
         .iter()
-        .filter(|effect| matches!(effect, Effect::Create(_)))
+        .filter(|effect| matches!(effect, Effect::Create { .. }))
         .count();
     assert_eq!(creates, 2, "both anonymous creates must be serialized");
 }
@@ -784,7 +784,7 @@ let x = outer { n = "a" }
         .effects()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Create(resource) => resource.id.identity_str().map(str::to_string),
+            Effect::Create { resource, .. } => resource.id.identity_str().map(str::to_string),
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();

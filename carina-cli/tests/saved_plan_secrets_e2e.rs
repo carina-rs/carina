@@ -108,6 +108,52 @@ impl Scenario {
 
 const ISSUE_3974_ENV: &str = "SAVED_PLAN_BUILTIN_SECRET_3974";
 
+#[test]
+fn saved_plan_secret_dependency_on_unchanged_resource_rehydrates_and_applies() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    scenario.write_root_file(
+        "resources.crn",
+        r#"let gate = mock.test.resource {
+  name = "saved-secret-gate"
+}
+"#,
+    );
+    assert_success(
+        "initial unchanged dependency apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+
+    scenario.write_root_file(
+        "resources.crn",
+        r#"let gate = mock.test.resource {
+  name = "saved-secret-gate"
+}
+
+let dependent = mock.test.resource {
+  name    = "saved-secret-dependent"
+  comment = secret("SAVED_SECRET_DEPENDENCY_PLAIN_4153")
+  directives { depends_on = [gate] }
+}
+"#,
+    );
+    assert_success("saved dependency plan", &scenario.plan());
+    assert_success("saved dependency apply", &scenario.apply_plan());
+
+    let provider = scenario.provider_json();
+    assert_eq!(
+        provider_resource_by_name(&provider, "saved-secret-dependent")["comment"],
+        "SAVED_SECRET_DEPENDENCY_PLAIN_4153",
+    );
+    let state = scenario.state_json();
+    assert_secret_hash(
+        &state_resource_by_name(&state, "saved-secret-dependent")["attributes"]["comment"],
+    );
+}
+
 fn issue_3974_scenario(label: &str, expression: &str, env_value: &str) -> Scenario {
     let scenario = Scenario::new_with_env(
         r#"backend local { path = "carina.state.json" }
@@ -2063,7 +2109,7 @@ let item = mock.test.resource {
         .find_map(|effect| effect.get("Create"))
         .expect("CBD replacement create effect");
     let create_name = create
-        .pointer("/attributes/name/String")
+        .pointer("/resource/attributes/name/String")
         .and_then(Value::as_str)
         .expect("CBD create name");
     assert!(

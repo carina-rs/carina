@@ -66,8 +66,74 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
-fn saved_plan_version_is_36_for_deferred_value_stages() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 36);
+fn saved_plan_version_is_37_for_resolved_dependency_evidence() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 37);
+}
+
+#[test]
+fn saved_plan_load_preserves_dependency_on_unchanged_resource() {
+    let role = Resource::with_provider("mock", "test.Role", "role", None).with_binding("role");
+    let mut bucket =
+        Resource::with_provider("mock", "test.Bucket", "bucket", None).with_binding("bucket");
+    bucket.directives.depends_on.push("role".to_string());
+    let resources = vec![role.clone(), bucket.clone()];
+    let scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        &resources,
+        &[] as &[DataSource],
+        std::iter::empty(),
+    );
+    let dependencies = scope
+        .resolve_resource(&bucket)
+        .expect("plan-time full scope contains the unchanged role");
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(ResolvedResource::new_with_dependencies(
+        bucket.clone(),
+        dependencies,
+    )));
+
+    let plan_file = record_test_plan(
+        PlanFileContents {
+            version: PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-10-31T00:00:00Z".to_string(),
+            source_path: "main.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
+                "mock",
+            )]),
+            backend_config: None,
+            plan,
+            sorted_resources: resources.clone(),
+            unresolved_resources: resources,
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
+            data_source_values: Vec::new(),
+            current_states: Vec::new(),
+            upstream_snapshot: HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        },
+        &["mock"],
+    );
+    let encoded = serde_json::to_vec(&plan_file).expect("format 37 plan serializes");
+    let decoded: PlanFile = serde_json::from_slice(&encoded).expect("format 37 plan decodes");
+    let reloaded = decoded
+        .reload_in_flight_from_locked_state(None)
+        .expect("locked state has no changed create status")
+        .resolve_with_schemas(&SchemaRegistry::new())
+        .expect("saved resolver proof crosses schema resolution");
+
+    let Effect::Create(bucket) = &reloaded.plan().effects()[0] else {
+        panic!("saved plan must retain the bucket create")
+    };
+    let dependency = bucket
+        .explicit_dependencies()
+        .iter()
+        .find(|target| target.as_str() == "role")
+        .expect("bucket retains its role dependency");
+    assert_eq!(dependency.identity(), role.id.identity().unwrap());
 }
 
 #[test]
@@ -902,7 +968,7 @@ fn plan_file_serde_round_trip() {
     let saved_module_source = serde_json::json!({
         "Module": { "name": "web_tier", "instance": "web" }
     });
-    wire["plan"]["effects"][0]["Create"]["module_source"] = saved_module_source.clone();
+    wire["plan"]["effects"][0]["Create"]["resource"]["module_source"] = saved_module_source.clone();
     wire["sorted_resources"][0]["module_source"] = saved_module_source.clone();
     wire["unresolved_resources"][0]["module_source"] = saved_module_source.clone();
     wire["data_sources"][0]["module_source"] = saved_module_source.clone();
@@ -958,7 +1024,7 @@ fn plan_file_serde_round_trip() {
         }),
         "a decoded plan must keep module metadata attached to its saved resource",
     );
-    let carina_core::effect::UnresolvedSavedEffect::Create(resource) =
+    let carina_core::effect::UnresolvedSavedEffect::Create { resource, .. } =
         &deserialized.plan.effects()[0]
     else {
         panic!("fixture effect must remain a create");
@@ -987,7 +1053,7 @@ fn plan_file_serde_round_trip() {
     assert_eq!(keys[0].key(), "stickiness.enabled");
     let reserialized = serde_json::to_value(&deserialized).unwrap();
     assert_eq!(
-        reserialized["plan"]["effects"][0]["Create"]["module_source"],
+        reserialized["plan"]["effects"][0]["Create"]["resource"]["module_source"],
         saved_module_source
     );
     assert_eq!(
@@ -3786,7 +3852,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
 }
 
 #[test]
-fn plan_file_validation_rejects_missing_resource_identity() {
+fn plan_file_decode_rejects_missing_resource_identity() {
     let plan_file = record_test_plan(
         PlanFileContents {
             version: PlanFile::CURRENT_VERSION,
@@ -3823,12 +3889,19 @@ fn plan_file_validation_rejects_missing_resource_identity() {
         .as_object_mut()
         .unwrap()
         .remove("identity");
+    json["resource_dependency_evidence"][0]["id"]
+        .as_object_mut()
+        .unwrap()
+        .remove("identity");
 
-    let decoded: PlanFile = serde_json::from_value(json).unwrap();
-    let error = decoded
-        .validate_resource_identities()
+    let error = serde_json::from_value::<PlanFile>(json)
         .expect_err("a saved plan must reject a missing resource identity");
-    assert!(error.contains("sorted_resources[0]"), "got: {error}");
+    assert!(
+        error
+            .to_string()
+            .contains("resource_dependency_evidence contains unknown resource"),
+        "got: {error}"
+    );
 }
 
 #[test]
@@ -3859,6 +3932,7 @@ fn plan_file_validation_rejects_pending_bound_deferred_template_identity() {
             None,
         ),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     });
     let plan_file = record_test_plan(
         PlanFileContents {
@@ -3938,6 +4012,7 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
             None,
         ),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     });
     let plan_file = record_test_plan(
         PlanFileContents {
@@ -4367,7 +4442,7 @@ fn builtin_mock_recording_context() -> ValidatedConfig<()> {
 }
 
 #[test]
-fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
+fn recorded_builtin_only_plan_round_trips_with_format_37_top_level_keys() {
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents
@@ -4398,6 +4473,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
         "provider_artifacts",
         "provider_configs",
         "provider_scopes",
+        "resource_dependency_evidence",
         "schema_fingerprints",
         "sorted_resources",
         "source_path",
@@ -4460,6 +4536,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
             "upstream_snapshot",
             "upstream_sources",
             "wait_bindings",
+            "resource_dependency_evidence",
             "persisted_directive_changes",
             "schema_fingerprints",
             "provider_artifacts",

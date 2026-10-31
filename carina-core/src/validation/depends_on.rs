@@ -217,20 +217,6 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                     continue;
                 }
 
-                if !matches!(
-                    target,
-                    ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
-                ) {
-                    diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "directives.depends_on on '{}': binding '{}' is not declared in this scope",
-                        self_name, dep_name
-                    ))
-                    .at_element(self_name, dep_name),
-                );
-                    continue;
-                }
-
                 if value_ref_deps.contains(dep_name.as_str()) {
                     diags.push(
                         DependsOnDiagnostic::warning(format!(
@@ -318,19 +304,6 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                     DependsOnDiagnostic::error(format!(
                         "wait '{wait_name}' depends_on: data sources cannot be depends_on targets \
                          (binding '{dep_name}')"
-                    ))
-                    .at_element(wait_name, dep_name),
-                );
-                continue;
-            }
-
-            if !matches!(
-                target,
-                ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
-            ) {
-                diags.push(
-                    DependsOnDiagnostic::error(format!(
-                        "wait '{wait_name}' depends_on: binding '{dep_name}' is not declared in this scope"
                     ))
                     .at_element(wait_name, dep_name),
                 );

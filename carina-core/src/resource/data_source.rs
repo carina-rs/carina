@@ -343,15 +343,11 @@ impl<S> ResolvedDataSource<S> {
             "directives.depends_on on '{}'",
             resource.binding.as_deref().unwrap_or("(anonymous)")
         );
-        let authored = resource
-            .directives
-            .depends_on
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        if authored != explicit_dependencies.names() {
-            return Err(crate::dependency::DependencyResolutionError::MetadataMismatch { owner });
-        }
+        crate::dependency::validate_dependency_metadata(
+            owner,
+            &resource.directives.depends_on,
+            &explicit_dependencies,
+        )?;
         if matches!(
             resource.id.identity_state(),
             ResourceIdentityState::Pending(_)
@@ -397,8 +393,22 @@ impl<S> ResolvedDataSource<S> {
     /// Rewrap an attribute-transformed data source without discarding the
     /// resolver evidence carried by this value.
     pub(crate) fn with_transformed_inner(&self, resource: DataSource<S>) -> Self {
-        Self::new_with_dependencies(resource, self.explicit_dependencies.clone())
-            .expect("a transformed resolved data source must preserve identity and depends_on")
+        debug_assert!(matches!(
+            resource.id.identity_state(),
+            ResourceIdentityState::Resolved(_)
+        ));
+        debug_assert!(
+            crate::dependency::validate_dependency_metadata(
+                format!(
+                    "directives.depends_on on '{}'",
+                    resource.binding.as_deref().unwrap_or("(anonymous)")
+                ),
+                &resource.directives.depends_on,
+                &self.explicit_dependencies,
+            )
+            .is_ok()
+        );
+        Self::from_resolved_parts(resource, self.explicit_dependencies.clone())
     }
 
     pub fn identity(&self) -> &ResourceIdentity {

@@ -22,15 +22,25 @@ pub(super) struct SchedulerDeps {
 pub(super) struct PureMetaStep<'a, S> {
     effect: &'a Effect<S>,
     template: &'a DeferredForExpression<S>,
+    explicit_dependencies: &'a crate::dependency::ResolvedDependencies,
 }
 
 impl<'a, S> PureMetaStep<'a, S> {
     fn from_effect(effect: &'a Effect<S>) -> Option<Self> {
         match effect {
-            Effect::DeferredCreate { template, .. } => Some(Self { effect, template }),
+            Effect::DeferredCreate {
+                template,
+                explicit_dependencies,
+                ..
+            } => Some(Self {
+                effect,
+                template,
+                explicit_dependencies,
+            }),
             Effect::DeferredReplace(payload) => Some(Self {
                 effect,
                 template: payload.template.as_ref(),
+                explicit_dependencies: &payload.explicit_dependencies,
             }),
             Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -61,7 +71,13 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
         return PureMetaOutcome::NotPureMeta;
     };
 
-    match dispatch_deferred_create(step.effect, step.template, bindings, ctx) {
+    match dispatch_deferred_create(
+        step.effect,
+        step.template,
+        step.explicit_dependencies,
+        bindings,
+        ctx,
+    ) {
         DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
         DeferredDispatchResult::MaterializeFailed => PureMetaOutcome::Failed,
     }
@@ -315,6 +331,7 @@ mod tests {
                     "failed_unbound_loop",
                 )),
                 template: Box::new(template),
+                explicit_dependencies: Default::default(),
             },
             Effect::Delete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(

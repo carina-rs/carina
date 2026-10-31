@@ -972,6 +972,7 @@ mod tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
+            explicit_dependencies: Default::default(),
         });
 
         let entries = collect_required_actions(
@@ -1017,6 +1018,7 @@ mod tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
+            explicit_dependencies: Default::default(),
         });
 
         let mut schemas = SchemaRegistry::new();

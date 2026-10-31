@@ -477,6 +477,11 @@ impl<'a> DependencyAnalyzer<'a> {
         for dependency in dependencies.iter() {
             if let Some(parent) = self.lookup_by_identity(dependency.identity()) {
                 analysis.add_edge(child, parent, ReadsSet::unknown());
+            } else if self
+                .compositions_by_binding
+                .contains_key(dependency.as_str())
+            {
+                self.record_binding_edge(dependency.as_str(), ReadsSet::unknown(), analysis, child);
             }
         }
     }
@@ -828,8 +833,7 @@ mod tests {
             &raw,
             &[] as &[crate::resource::DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
         let effects = vec![
             Effect::Create(ResolvedResource::new(parent)),
             Effect::Create(ResolvedResource::new_with_dependencies(

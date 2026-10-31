@@ -1,10 +1,11 @@
 //! Typed explicit dependency targets used after configuration resolution.
 //!
-//! Parser and saved-plan wire types intentionally retain authored strings.
-//! Live planning crosses this module once: every name is matched against the
-//! managed bindings in scope and lowered to [`ResolvedDependencyTarget`].
-//! The target's field and constructor are private so scheduling code cannot
-//! manufacture an edge from an unchecked string.
+//! Parser types retain authored strings. Live planning crosses this module
+//! once: every name is matched against the managed bindings in scope and
+//! lowered to [`ResolvedDependencyTarget`]. Format-37 saved plans persist that
+//! resolver-produced proof and decode it here without re-resolving names.
+//! The target's fields are private so scheduling code cannot manufacture an
+//! edge from an unchecked runtime string.
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,10 +48,11 @@ impl ResolvedDependencyTarget {
 
 /// Deduplicated explicit dependency targets.
 ///
-/// Non-empty values can only be created by this module's resolver. Empty is
-/// public because effects with no authored ordering edges need no authority.
+/// Non-empty values can only be created by this module's resolver or decoded
+/// from its persisted format-37 proof. Empty is public because effects with no
+/// authored ordering edges need no authority.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ResolvedDependencies(HashSet<ResolvedDependencyTarget>);
+pub struct ResolvedDependencies(HashMap<String, ResolvedDependencyTarget>);
 
 impl ResolvedDependencies {
     pub fn empty() -> Self {
@@ -66,18 +68,22 @@ impl ResolvedDependencies {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ResolvedDependencyTarget> {
-        self.0.iter()
+        self.0.values()
     }
 
     pub fn contains(&self, binding: &str) -> bool {
-        self.0.iter().any(|target| target.as_str() == binding)
+        self.0.contains_key(binding)
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
         self.0.extend(other.0);
     }
 
-    pub(crate) fn names(&self) -> HashSet<String> {
+    pub fn binding_names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    pub(crate) fn names_snapshot(&self) -> HashSet<String> {
         self.iter()
             .map(|target| target.as_str().to_string())
             .collect()
@@ -89,7 +95,21 @@ impl Serialize for ResolvedDependencies {
     where
         S: serde::Serializer,
     {
-        self.names().serialize(serializer)
+        #[derive(Serialize)]
+        struct PersistedDependencyTarget<'a> {
+            binding: &'a str,
+            identity: &'a ResourceIdentity,
+        }
+
+        let mut targets = self
+            .iter()
+            .map(|target| PersistedDependencyTarget {
+                binding: target.as_str(),
+                identity: target.identity(),
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.binding.cmp(right.binding));
+        targets.serialize(serializer)
     }
 }
 
@@ -98,14 +118,28 @@ impl<'de> Deserialize<'de> for ResolvedDependencies {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = HashSet::<String>::deserialize(deserializer)?;
-        if raw.is_empty() {
-            Ok(Self::empty())
-        } else {
-            Err(serde::de::Error::custom(
-                "explicit dependency names must be resolved against the plan scope",
-            ))
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PersistedDependencyTarget {
+            binding: String,
+            identity: ResourceIdentity,
         }
+
+        let raw = Vec::<PersistedDependencyTarget>::deserialize(deserializer)?;
+        let mut targets = HashMap::with_capacity(raw.len());
+        for target in raw {
+            let binding = target.binding;
+            let resolved = ResolvedDependencyTarget {
+                binding: binding.clone(),
+                identity: target.identity,
+            };
+            if targets.insert(binding.clone(), resolved).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate persisted dependency target '{binding}'"
+                )));
+            }
+        }
+        Ok(Self(targets))
     }
 }
 
@@ -116,8 +150,9 @@ impl FromIterator<String> for ResolvedDependencies {
             iter.into_iter()
                 .map(|binding| ResolvedDependencyTarget {
                     identity: ResourceIdentity::new(binding.clone()),
-                    binding,
+                    binding: binding.clone(),
                 })
+                .map(|target| (target.binding.clone(), target))
                 .collect(),
         )
     }
@@ -164,6 +199,106 @@ pub enum DependencyResolutionError {
     PendingTargetIdentity { binding: String },
     #[error("resolved dependency metadata does not match authored depends_on on {owner}")]
     MetadataMismatch { owner: String },
+    #[error(
+        "provider satisfier hint named binding '{dependency}', which is not declared in this scope"
+    )]
+    UnknownProviderHint { dependency: String },
+}
+
+pub(crate) fn validate_dependency_metadata(
+    owner: String,
+    authored: &[String],
+    resolved: &ResolvedDependencies,
+) -> Result<(), DependencyResolutionError> {
+    let authored = authored.iter().map(String::as_str).collect::<HashSet<_>>();
+    if authored.len() == resolved.len() && authored.iter().all(|binding| resolved.contains(binding))
+    {
+        Ok(())
+    } else {
+        Err(DependencyResolutionError::MetadataMismatch { owner })
+    }
+}
+
+mod scope_entry {
+    pub trait Sealed {}
+}
+
+/// A resource-shaped configuration node that can contribute a binding and
+/// identity to the dependency resolver's scope.
+pub trait DependencyScopeEntry: scope_entry::Sealed {
+    fn dependency_id(&self) -> &crate::resource::ResourceId;
+    fn dependency_binding(&self) -> Option<&str>;
+}
+
+impl<S, P: crate::resource::PlaceholderKind> scope_entry::Sealed for Resource<S, P> {}
+impl<S, P: crate::resource::PlaceholderKind> DependencyScopeEntry for Resource<S, P> {
+    fn dependency_id(&self) -> &crate::resource::ResourceId {
+        &self.id
+    }
+
+    fn dependency_binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+}
+
+impl<S, P: crate::resource::PlaceholderKind> scope_entry::Sealed for DataSource<S, P> {}
+impl<S, P: crate::resource::PlaceholderKind> DependencyScopeEntry for DataSource<S, P> {
+    fn dependency_id(&self) -> &crate::resource::ResourceId {
+        &self.id
+    }
+
+    fn dependency_binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+}
+
+impl<S> scope_entry::Sealed for ResolvedResource<S> {}
+impl<S> DependencyScopeEntry for ResolvedResource<S> {
+    fn dependency_id(&self) -> &crate::resource::ResourceId {
+        &self.id
+    }
+
+    fn dependency_binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+}
+
+impl<S> scope_entry::Sealed for ResolvedDataSource<S> {}
+impl<S> DependencyScopeEntry for ResolvedDataSource<S> {
+    fn dependency_id(&self) -> &crate::resource::ResourceId {
+        &self.id
+    }
+
+    fn dependency_binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+}
+
+impl<P: crate::resource::PlaceholderKind> scope_entry::Sealed
+    for crate::resource::LiveComposition<P>
+{
+}
+impl<P: crate::resource::PlaceholderKind> DependencyScopeEntry
+    for crate::resource::LiveComposition<P>
+{
+    fn dependency_id(&self) -> &crate::resource::ResourceId {
+        self.id.as_inner()
+    }
+
+    fn dependency_binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+}
+
+impl scope_entry::Sealed for crate::resource::SavedComposition {}
+impl DependencyScopeEntry for crate::resource::SavedComposition {
+    fn dependency_id(&self) -> &crate::resource::ResourceId {
+        self.id.as_inner()
+    }
+
+    fn dependency_binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
 }
 
 /// Resolver-owned lookup of the managed targets admitted by depends_on.
@@ -171,7 +306,8 @@ pub enum DependencyResolutionError {
 pub struct ResolvedDependencyScope {
     managed: HashMap<String, ResolvedDependencyTarget>,
     pending_managed: HashSet<String>,
-    data_sources: HashSet<String>,
+    data_sources: HashMap<String, ResolvedDependencyTarget>,
+    pending_data_sources: HashSet<String>,
     upstream_states: HashSet<String>,
 }
 
@@ -180,99 +316,86 @@ impl ResolvedDependencyScope {
         Self {
             managed: HashMap::new(),
             pending_managed: HashSet::new(),
-            data_sources: HashSet::new(),
+            data_sources: HashMap::new(),
+            pending_data_sources: HashSet::new(),
             upstream_states: HashSet::new(),
         }
     }
 
-    pub fn from_resources<S>(
-        managed: &[Resource<S>],
-        data_sources: &[DataSource<S>],
+    pub fn from_resources<M: DependencyScopeEntry, D: DependencyScopeEntry>(
+        managed: &[M],
+        data_sources: &[D],
         upstream_states: impl IntoIterator<Item = String>,
-    ) -> Result<Self, DependencyResolutionError> {
+    ) -> Self {
         let mut targets = HashMap::new();
         let mut pending_managed = HashSet::new();
         for resource in managed {
-            let Some(binding) = resource.binding.as_ref() else {
+            let Some(binding) = resource.dependency_binding() else {
                 continue;
             };
-            let ResourceIdentityState::Resolved(identity) = resource.id.identity_state() else {
-                pending_managed.insert(binding.clone());
+            let ResourceIdentityState::Resolved(identity) =
+                resource.dependency_id().identity_state()
+            else {
+                pending_managed.insert(binding.to_string());
                 continue;
             };
             targets.insert(
-                binding.clone(),
+                binding.to_string(),
                 ResolvedDependencyTarget {
-                    binding: binding.clone(),
+                    binding: binding.to_string(),
                     identity: identity.clone(),
                 },
             );
         }
-        Ok(Self {
-            managed: targets,
-            pending_managed,
-            data_sources: data_sources
-                .iter()
-                .filter_map(|source| source.binding.clone())
-                .collect(),
-            upstream_states: upstream_states.into_iter().collect(),
-        })
-    }
-
-    pub fn from_resolved_resources<S>(
-        managed: &[ResolvedResource<S>],
-        data_sources: &[DataSource<S>],
-    ) -> Result<Self, DependencyResolutionError> {
-        let mut targets = HashMap::new();
-        for resource in managed {
-            let Some(binding) = resource.binding.as_ref() else {
+        let mut resolved_data_sources = HashMap::new();
+        let mut pending_data_sources = HashSet::new();
+        for source in data_sources {
+            let Some(binding) = source.dependency_binding() else {
                 continue;
             };
-            targets.insert(
-                binding.clone(),
+            let ResourceIdentityState::Resolved(identity) = source.dependency_id().identity_state()
+            else {
+                pending_data_sources.insert(binding.to_string());
+                continue;
+            };
+            resolved_data_sources.insert(
+                binding.to_string(),
                 ResolvedDependencyTarget {
-                    binding: binding.clone(),
-                    identity: resource.identity().clone(),
+                    binding: binding.to_string(),
+                    identity: identity.clone(),
                 },
             );
         }
-        Ok(Self {
+        Self {
             managed: targets,
-            pending_managed: HashSet::new(),
-            data_sources: data_sources
-                .iter()
-                .filter_map(|source| source.binding.clone())
-                .collect(),
-            upstream_states: HashSet::new(),
-        })
+            pending_managed,
+            data_sources: resolved_data_sources,
+            pending_data_sources,
+            upstream_states: upstream_states.into_iter().collect(),
+        }
     }
 
-    pub fn from_typed_resources<S>(
-        managed: &[ResolvedResource<S>],
-        data_sources: &[ResolvedDataSource<S>],
-    ) -> Self {
-        Self {
-            managed: managed
-                .iter()
-                .filter_map(|resource| {
-                    resource.binding.as_ref().map(|binding| {
-                        (
-                            binding.clone(),
-                            ResolvedDependencyTarget {
-                                binding: binding.clone(),
-                                identity: resource.identity().clone(),
-                            },
-                        )
-                    })
-                })
-                .collect(),
-            pending_managed: HashSet::new(),
-            data_sources: data_sources
-                .iter()
-                .filter_map(|source| source.binding.clone())
-                .collect(),
-            upstream_states: HashSet::new(),
+    pub fn with_declared_targets<T: DependencyScopeEntry>(mut self, targets: &[T]) -> Self {
+        for target in targets {
+            let Some(binding) = target.dependency_binding() else {
+                continue;
+            };
+            match target.dependency_id().identity_state() {
+                ResourceIdentityState::Resolved(identity) => {
+                    self.managed.insert(
+                        binding.to_string(),
+                        ResolvedDependencyTarget {
+                            binding: binding.to_string(),
+                            identity: identity.clone(),
+                        },
+                    );
+                }
+                ResourceIdentityState::Pending(_) => {
+                    self.pending_managed.insert(binding.to_string());
+                }
+            }
         }
+        self
     }
 
     fn resolve(
@@ -282,7 +405,7 @@ impl ResolvedDependencyScope {
         implicit_target: Option<&str>,
         dependencies: impl IntoIterator<Item = String>,
     ) -> Result<ResolvedDependencies, DependencyResolutionError> {
-        let mut resolved = HashSet::new();
+        let mut resolved = HashMap::new();
         for dependency in dependencies {
             if self_binding == Some(dependency.as_str()) {
                 return Err(DependencyResolutionError::SelfReference { owner, dependency });
@@ -295,7 +418,9 @@ impl ResolvedDependencyScope {
             if self.upstream_states.contains(&dependency) {
                 return Err(DependencyResolutionError::UpstreamState { owner, dependency });
             }
-            if self.data_sources.contains(&dependency) {
+            if self.data_sources.contains_key(&dependency)
+                || self.pending_data_sources.contains(&dependency)
+            {
                 return Err(DependencyResolutionError::DataSource { owner, dependency });
             }
             if self.pending_managed.contains(&dependency) {
@@ -306,14 +431,14 @@ impl ResolvedDependencyScope {
             let Some(target) = self.managed.get(&dependency) else {
                 return Err(DependencyResolutionError::Unknown { owner, dependency });
             };
-            resolved.insert(target.clone());
+            resolved.insert(dependency, target.clone());
         }
         Ok(ResolvedDependencies(resolved))
     }
 
-    pub fn resolve_resource<S>(
+    pub fn resolve_resource<S, P: crate::resource::PlaceholderKind>(
         &self,
-        resource: &Resource<S>,
+        resource: &Resource<S, P>,
     ) -> Result<ResolvedDependencies, DependencyResolutionError> {
         let name = resource.binding.as_deref().unwrap_or("(anonymous)");
         self.resolve(
@@ -324,9 +449,9 @@ impl ResolvedDependencyScope {
         )
     }
 
-    pub fn resolve_data_source<S>(
+    pub fn resolve_data_source<S, P: crate::resource::PlaceholderKind>(
         &self,
-        resource: &DataSource<S>,
+        resource: &DataSource<S, P>,
     ) -> Result<ResolvedDependencies, DependencyResolutionError> {
         let name = resource.binding.as_deref().unwrap_or("(anonymous)");
         self.resolve(
@@ -353,82 +478,22 @@ impl ResolvedDependencyScope {
         })
     }
 
-    pub fn resolve_persisted_wait(
-        &self,
-        identity: &ResourceIdentity,
-        target: &ResourceIdentity,
-        dependencies: impl IntoIterator<Item = String>,
-    ) -> Result<ResolvedDependencies, DependencyResolutionError> {
-        self.resolve(
-            format!("wait '{}' depends_on", identity.as_str()),
-            Some(identity.as_str()),
-            Some(target.as_str()),
-            dependencies,
-        )
-    }
-
-    /// Resolve provider-derived names after the provider has already filtered
-    /// them against the known managed binding set.
     pub(crate) fn resolve_provider_dependencies(
         &self,
         dependencies: impl IntoIterator<Item = String>,
-    ) -> ResolvedDependencies {
-        ResolvedDependencies(
-            dependencies
-                .into_iter()
-                .filter_map(|dependency| self.managed.get(&dependency).cloned())
-                .collect(),
-        )
-    }
-}
-
-/// Resolve every explicit dependency carried into one live planning run.
-pub struct ResolvedPlanningDependencies {
-    scope: ResolvedDependencyScope,
-    managed: Vec<ResolvedDependencies>,
-    data_sources: Vec<ResolvedDependencies>,
-    waits: Vec<ResolvedWaitBinding>,
-}
-
-impl ResolvedPlanningDependencies {
-    pub fn resolve<S: Clone>(
-        managed: &[Resource<S>],
-        data_sources: &[DataSource<S>],
-        waits: &[WaitBinding],
-        upstream_states: impl IntoIterator<Item = String>,
-    ) -> Result<Self, DependencyResolutionError> {
-        let scope =
-            ResolvedDependencyScope::from_resources(managed, data_sources, upstream_states)?;
-        let managed_dependencies = managed
-            .iter()
-            .map(|resource| scope.resolve_resource(resource))
-            .collect::<Result<_, _>>()?;
-        let data_source_dependencies = data_sources
-            .iter()
-            .map(|resource| scope.resolve_data_source(resource))
-            .collect::<Result<_, _>>()?;
-        let waits = waits
-            .iter()
-            .cloned()
-            .map(|wait| scope.resolve_wait(wait))
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            scope,
-            managed: managed_dependencies,
-            data_sources: data_source_dependencies,
-            waits,
-        })
-    }
-
-    pub fn into_parts(
-        self,
-    ) -> (
-        ResolvedDependencyScope,
-        Vec<ResolvedDependencies>,
-        Vec<ResolvedDependencies>,
-        Vec<ResolvedWaitBinding>,
-    ) {
-        (self.scope, self.managed, self.data_sources, self.waits)
+    ) -> Result<ResolvedDependencies, DependencyResolutionError> {
+        let mut resolved = HashMap::new();
+        for dependency in dependencies {
+            let target = self
+                .managed
+                .get(&dependency)
+                .or_else(|| self.data_sources.get(&dependency))
+                .ok_or_else(|| DependencyResolutionError::UnknownProviderHint {
+                    dependency: dependency.clone(),
+                })?;
+            resolved.insert(dependency, target.clone());
+        }
+        Ok(ResolvedDependencies(resolved))
     }
 }
 
@@ -460,21 +525,16 @@ mod tests {
     }
 
     #[test]
-    fn persisted_wait_rejects_an_unknown_dependency() {
+    fn wait_rejects_an_unknown_dependency() {
         let resources = vec![managed("target")];
         let scope = ResolvedDependencyScope::from_resources(
             &resources,
             &[] as &[DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
 
         let error = scope
-            .resolve_persisted_wait(
-                &ResourceIdentity::new("w"),
-                &ResourceIdentity::new("target"),
-                ["nope".to_string()],
-            )
+            .resolve_wait(wait("w", "target", &["nope"]))
             .unwrap_err();
 
         assert_eq!(
@@ -490,8 +550,7 @@ mod tests {
             &resources,
             &[] as &[DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
 
         let resolved = scope
             .resolve_wait(wait("w", "target", &["target", "other"]))
@@ -505,15 +564,14 @@ mod tests {
     #[test]
     fn wait_dependency_target_rules_match_managed_resource_rules() {
         let resources = vec![managed("target")];
-        let mut data_source = DataSource::new("mock.test.Lookup", "lookup");
+        let mut data_source: DataSource = DataSource::new("mock.test.Lookup", "lookup");
         data_source.binding = Some("lookup".to_string());
         let data_sources = vec![data_source];
         let scope = ResolvedDependencyScope::from_resources(
             &resources,
             &data_sources,
             ["remote".to_string()],
-        )
-        .unwrap();
+        );
 
         assert!(matches!(
             scope.resolve_wait(wait("w", "target", &["lookup"])),
@@ -540,8 +598,7 @@ mod tests {
             &resources,
             &[] as &[DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
 
         let dependencies = scope.resolve_resource(&consumer).unwrap();
         let resolved = dependencies.iter().next().unwrap();

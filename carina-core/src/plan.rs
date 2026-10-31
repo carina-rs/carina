@@ -745,55 +745,6 @@ impl UnresolvedSavedPlan {
         self,
         schemas: &crate::schema::SchemaRegistry,
     ) -> Result<SavedPlan, crate::resource::ResolvedResourceError> {
-        let managed = self
-            .effects
-            .iter()
-            .filter_map(|effect| match effect {
-                UnresolvedSavedEffect::Create(resource)
-                | UnresolvedSavedEffect::ResumeCreate { resource, .. } => Some(resource.clone()),
-                UnresolvedSavedEffect::Update { to, .. } => Some(to.clone()),
-                UnresolvedSavedEffect::Read { .. }
-                | UnresolvedSavedEffect::Delete { .. }
-                | UnresolvedSavedEffect::Import { .. }
-                | UnresolvedSavedEffect::Remove { .. }
-                | UnresolvedSavedEffect::Move { .. }
-                | UnresolvedSavedEffect::ReleaseListKeys { .. }
-                | UnresolvedSavedEffect::Wait { .. }
-                | UnresolvedSavedEffect::DeferredCreate { .. }
-                | UnresolvedSavedEffect::DeferredReplace(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let data_sources = self
-            .effects
-            .iter()
-            .filter_map(|effect| match effect {
-                UnresolvedSavedEffect::Read { resource } => Some(resource.clone()),
-                UnresolvedSavedEffect::Create(_)
-                | UnresolvedSavedEffect::ResumeCreate { .. }
-                | UnresolvedSavedEffect::Update { .. }
-                | UnresolvedSavedEffect::Delete { .. }
-                | UnresolvedSavedEffect::Import { .. }
-                | UnresolvedSavedEffect::Remove { .. }
-                | UnresolvedSavedEffect::Move { .. }
-                | UnresolvedSavedEffect::ReleaseListKeys { .. }
-                | UnresolvedSavedEffect::Wait { .. }
-                | UnresolvedSavedEffect::DeferredCreate { .. }
-                | UnresolvedSavedEffect::DeferredReplace(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
-            &managed,
-            &data_sources,
-            std::iter::empty(),
-        )?;
-        self.resolve_with_schemas_and_dependencies(schemas, &scope)
-    }
-
-    pub fn resolve_with_schemas_and_dependencies(
-        self,
-        schemas: &crate::schema::SchemaRegistry,
-        dependency_scope: &crate::dependency::ResolvedDependencyScope,
-    ) -> Result<SavedPlan, crate::resource::ResolvedResourceError> {
         let Self {
             effects,
             ignored_change_summaries,
@@ -805,9 +756,7 @@ impl UnresolvedSavedPlan {
         Ok(Plan {
             effects: effects
                 .into_iter()
-                .map(|effect| {
-                    effect.resolve_with_schemas_and_dependencies(schemas, dependency_scope)
-                })
+                .map(|effect| effect.resolve_with_schemas(schemas))
                 .collect::<Result<Vec<_>, _>>()?,
             ignored_change_summaries,
             replace_display,
@@ -1365,6 +1314,43 @@ mod tests {
         serde_json::from_value::<SavedPlan>(value).unwrap()
     }
 
+    #[test]
+    fn saved_plan_round_trip_preserves_dependency_on_unchanged_resource() {
+        let role = Resource::new("iam.Role", "role").with_binding("role");
+        let mut bucket = Resource::new("s3.Bucket", "bucket").with_binding("bucket");
+        bucket.directives.depends_on.push("role".to_string());
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            &[role.clone(), bucket.clone()],
+            &[] as &[DataSource],
+            std::iter::empty(),
+        );
+        let dependencies = scope.resolve_resource(&bucket).unwrap();
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(ResolvedResource::new_with_dependencies(
+            bucket,
+            dependencies,
+        )));
+
+        let unresolved = UnresolvedSavedPlan::from(SavedPlan::from(plan));
+        let wire = serde_json::to_vec(&unresolved).expect("saved plan serializes");
+        let decoded: UnresolvedSavedPlan =
+            serde_json::from_slice(&wire).expect("saved plan deserializes");
+        let resolved = decoded
+            .resolve_with_schemas(&crate::schema::SchemaRegistry::new())
+            .expect("unchanged dependency target must not be needed as an effect owner");
+
+        let Effect::Create(bucket) = &resolved.effects()[0] else {
+            panic!("expected create effect")
+        };
+        let target = bucket
+            .explicit_dependencies()
+            .iter()
+            .next()
+            .expect("dependency evidence survives the wire round trip");
+        assert_eq!(target.as_str(), "role");
+        assert_eq!(target.identity(), role.id.identity().unwrap());
+    }
+
     fn changed_create_only() -> ChangedCreateOnly {
         ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap()
     }
@@ -1563,6 +1549,7 @@ mod tests {
                 "validation_records",
             )),
             template: Box::new(deferred),
+            explicit_dependencies: Default::default(),
         });
 
         let summary = plan.summary();
@@ -1623,6 +1610,7 @@ mod tests {
                 "validation_records",
             )),
             template: Box::new(template),
+            explicit_dependencies: Default::default(),
         })));
 
         let summary = plan.summary();

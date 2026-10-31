@@ -2750,10 +2750,10 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
     use crate::effect::UnresolvedSavedEffect;
 
     match effect {
-        UnresolvedSavedEffect::Read { resource } => {
+        UnresolvedSavedEffect::Read { resource, .. } => {
             attributes_contain_redacted_secret(resource.attributes.values())
         }
-        UnresolvedSavedEffect::Create(resource)
+        UnresolvedSavedEffect::Create { resource, .. }
         | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
             attributes_contain_redacted_secret(resource.attributes.values())
         }
@@ -2837,14 +2837,15 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
         } => contains_redacted_secret(until.value()),
-        Effect::DeferredCreate { id: _id, template } => {
-            deferred_template_contains_redacted_secret(template)
-        }
+        Effect::DeferredCreate {
+            id: _id, template, ..
+        } => deferred_template_contains_redacted_secret(template),
         Effect::DeferredReplace(payload) => {
             let crate::effect::DeferredReplacePayload {
                 deletes: _deletes,
                 id: _id,
                 template,
+                ..
             } = payload.as_ref();
             deferred_template_contains_redacted_secret(template)
         }
@@ -4274,15 +4275,21 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
-        Effect::DeferredCreate { id, template } => Effect::DeferredCreate {
+        Effect::DeferredCreate {
+            id,
+            template,
+            explicit_dependencies,
+        } => Effect::DeferredCreate {
             id: id.clone(),
             template: Box::new(redact_deferred_template(template)?),
+            explicit_dependencies: explicit_dependencies.clone(),
         },
         Effect::DeferredReplace(payload) => {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                 deletes: payload.deletes.clone(),
                 id: payload.id.clone(),
                 template: Box::new(redact_deferred_template(&payload.template)?),
+                explicit_dependencies: payload.explicit_dependencies.clone(),
             }))
         }
     })
@@ -4449,9 +4456,8 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     )
                 })?;
                 Ok(Effect::Read {
-                    resource: crate::resource::ResolvedDataSource::new(
-                        rehydrate_data_source_secrets(resource, fresh)?,
-                    ),
+                    resource: resource
+                        .with_transformed_inner(rehydrate_data_source_secrets(resource, fresh)?),
                 })
             }
             Effect::Create(resource) => {
@@ -4464,7 +4470,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                         SecretRehydrationError::ShapeMismatch,
                     )
                 })?;
-                Ok(Effect::Create(crate::resource::ResolvedResource::new(
+                Ok(Effect::Create(resource.with_transformed_inner(
                     rehydrate_resource_secrets(resource, fresh)?,
                 )))
             }
@@ -4486,9 +4492,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                 Ok(Effect::Update {
                     from: from.clone(),
                     identifier: identifier.clone(),
-                    to: crate::resource::ResolvedResource::new(rehydrate_resource_secrets(
-                        to, fresh,
-                    )?),
+                    to: to.with_transformed_inner(rehydrate_resource_secrets(to, fresh)?),
                     changed_attributes: changed_attributes.clone(),
                 })
             }
@@ -4504,11 +4508,16 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     .expect("guarded by contains_redacted_secret"),
                 })
             }
-            Effect::DeferredCreate { id, template } => {
+            Effect::DeferredCreate {
+                id,
+                template,
+                explicit_dependencies,
+            } => {
                 let template = rehydrate_deferred_template(template, deferred_templates)?;
                 Ok(Effect::DeferredCreate {
                     id: id.clone(),
                     template: Box::new(template),
+                    explicit_dependencies: explicit_dependencies.clone(),
                 })
             }
             Effect::DeferredReplace(payload) => {
@@ -4517,6 +4526,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     deletes: payload.deletes.clone(),
                     id: payload.id.clone(),
                     template: Box::new(template),
+                    explicit_dependencies: payload.explicit_dependencies.clone(),
                 })))
             }
             Effect::ResumeCreate { .. }
@@ -6685,6 +6695,79 @@ mod tests {
     type InterpolationPart = crate::resource::InterpolationPart<crate::resource::NoPlaceholder>;
     type LoopValue = crate::resource::Value<LoopSlot>;
     type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+
+    #[test]
+    fn plan_secret_rehydration_preserves_read_create_and_update_dependencies() {
+        use crate::effect::Effect;
+        use crate::plan::Plan;
+        use crate::resource::{DataSource, ResolvedDataSource, ResolvedResource, Resource, State};
+
+        let secret = |value: &str| {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(value.to_string().into()),
+            ))))
+        };
+        let gate = Resource::new("test.Gate", "gate").with_binding("gate");
+        let mut created = Resource::new("test.Widget", "created").with_binding("created");
+        created.directives.depends_on.push("gate".to_string());
+        created.set_attr("token", secret("create-secret"));
+        let mut updated = Resource::new("test.Widget", "updated").with_binding("updated");
+        updated.directives.depends_on.push("gate".to_string());
+        updated.set_attr("token", secret("update-secret"));
+        let mut lookup = DataSource::new("test.Lookup", "lookup");
+        lookup.binding = Some("lookup".to_string());
+        lookup.directives.depends_on.push("gate".to_string());
+        lookup.set_attr("token", secret("read-secret"));
+
+        let managed = vec![gate, created.clone(), updated.clone()];
+        let data_sources = vec![lookup.clone()];
+        let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+            &managed,
+            &data_sources,
+            std::iter::empty(),
+        );
+        let created_dependencies = scope.resolve_resource(&created).unwrap();
+        let updated_dependencies = scope.resolve_resource(&updated).unwrap();
+        let lookup_dependencies = scope.resolve_data_source(&lookup).unwrap();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Read {
+            resource: ResolvedDataSource::new_with_dependencies(
+                lookup.clone(),
+                lookup_dependencies,
+            )
+            .unwrap(),
+        });
+        plan.add(Effect::Create(ResolvedResource::new_with_dependencies(
+            created.clone(),
+            created_dependencies,
+        )));
+        plan.add(Effect::Update {
+            from: Box::new(
+                State::existing(updated.id.clone(), HashMap::new()).with_identifier("updated-id"),
+            ),
+            identifier: crate::effect::fixture_applied_identifier("updated-id"),
+            to: ResolvedResource::new_with_dependencies(updated.clone(), updated_dependencies),
+            changed_attributes: vec!["token".to_string()],
+        });
+        let redacted = redact_secrets_in_plan(&plan).expect("fixture plan redacts");
+
+        let rehydrated = rehydrate_plan_desired_secrets(
+            &redacted,
+            &HashMap::from([(created.id.clone(), created), (updated.id.clone(), updated)]),
+            &HashMap::from([(lookup.id.clone(), lookup)]),
+            &HashMap::new(),
+            &resolved_deferred_templates([]),
+        )
+        .expect("saved-plan secrets rehydrate");
+
+        for effect in rehydrated.effects() {
+            let dependencies = effect
+                .resolved_explicit_dependencies()
+                .expect("read/create/update effects retain resolved dependencies");
+            assert!(dependencies.contains("gate"), "effect: {effect:?}");
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, serde::Serialize)]
     struct DisplayMutablePlaceholder {
@@ -10236,8 +10319,7 @@ mod tests {
             &[parent, child.clone()],
             &[] as &[crate::resource::DataSource],
             std::iter::empty(),
-        )
-        .unwrap();
+        );
         let dependencies = scope.resolve_resource(&child).unwrap();
         let effect = crate::effect::Effect::Create(
             crate::resource::ResolvedResource::new_with_dependencies(child, dependencies),
@@ -13502,6 +13584,7 @@ mod tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
+            explicit_dependencies: Default::default(),
         };
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact deferred secret");
@@ -13586,6 +13669,7 @@ mod tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
+            explicit_dependencies: Default::default(),
         };
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact deferred template");
@@ -13641,6 +13725,7 @@ mod tests {
                 "children",
             )),
             template: Box::new(template.clone()),
+            explicit_dependencies: Default::default(),
         };
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact placeholder-free template");
@@ -13660,6 +13745,7 @@ mod tests {
                 "children",
             )),
             template: redacted_template,
+            explicit_dependencies: Default::default(),
         });
         let deferred_templates = resolved_deferred_templates([]);
         let rehydrated = rehydrate_plan_desired_secrets(

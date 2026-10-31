@@ -2311,7 +2311,7 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
             let binding = identity.to_string();
             format!("Wait {} (until {})", binding, until_surface)
         }
-        Effect::DeferredCreate { id, template } => {
+        Effect::DeferredCreate { id, template, .. } => {
             format!(
                 "Expand deferred for {} (waits on {})",
                 id.human(),

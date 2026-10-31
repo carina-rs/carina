@@ -1070,37 +1070,55 @@ async fn run_state_lookup(
 ///
 /// Each resource in the state becomes a `Read` effect so the TUI can
 /// render it with all attributes in the detail panel.
-fn build_plan_from_state(state: &StateFile) -> Plan {
+fn build_plan_from_state(
+    state: &StateFile,
+) -> Result<Plan, carina_core::dependency::DependencyResolutionError> {
+    let resources = state
+        .resources()
+        .iter()
+        .map(|rs| {
+            let identity = rs.identity.clone();
+            // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
+            let mut resource = carina_core::resource::DataSource::with_provider(
+                &rs.provider,
+                &rs.resource_type,
+                identity,
+                rs.directives.provider_instance.clone(),
+            );
+            resource.directives = rs.directives.clone().into();
+
+            // Set typed metadata fields from state
+            resource.binding = rs.binding.clone();
+            resource.dependency_bindings = rs.dependency_bindings.clone();
+
+            // Convert persisted JSON attributes through the state-only decoder.
+            for (key, value) in rs
+                .persisted_attributes()
+                .map(PersistedAttributes::to_values)
+                .unwrap_or_default()
+            {
+                resource.set_attr(key, value);
+            }
+
+            resource
+        })
+        .collect::<Vec<_>>();
+    // State rows describe managed resources even though this display-only
+    // projection renders them as Read effects. Resolve their persisted
+    // depends_on names against that complete managed scope before wrapping.
+    let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        &resources,
+        &[] as &[carina_core::resource::DataSource],
+        std::iter::empty(),
+    );
     let mut plan = Plan::new();
-    for rs in state.resources() {
-        let identity = rs.identity.clone();
-        // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
-        let mut resource = carina_core::resource::DataSource::with_provider(
-            &rs.provider,
-            &rs.resource_type,
-            identity,
-            rs.directives.provider_instance.clone(),
-        );
-        resource.directives = rs.directives.clone().into();
-
-        // Set typed metadata fields from state
-        resource.binding = rs.binding.clone();
-        resource.dependency_bindings = rs.dependency_bindings.clone();
-
-        // Convert persisted JSON attributes through the state-only decoder.
-        for (key, value) in rs
-            .persisted_attributes()
-            .map(PersistedAttributes::to_values)
-            .unwrap_or_default()
-        {
-            resource.set_attr(key, value);
-        }
-
+    for resource in resources {
+        let dependencies = dependency_scope.resolve_data_source(&resource)?;
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::new(resource),
+            resource: ResolvedDataSource::new_with_dependencies(resource, dependencies)?,
         });
     }
-    plan
+    Ok(plan)
 }
 
 /// Format state show output (non-TUI mode).
@@ -1201,7 +1219,8 @@ async fn run_state_show(
     }
 
     if tui {
-        let plan = build_plan_from_state(&state);
+        let plan = build_plan_from_state(&state)
+            .map_err(|error| AppError::Validation(error.to_string()))?;
         let historical_display =
             carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
         let prev_explicit = state.build_explicit();
@@ -1777,21 +1796,23 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let (_, managed_dependencies, _, _) =
-        carina_core::dependency::ResolvedPlanningDependencies::resolve(
-            &sorted_resources,
-            &parsed.data_sources,
-            &parsed.wait_bindings,
-            parsed
-                .upstream_binding_names()
-                .into_iter()
-                .map(str::to_string),
-        )
-        .map_err(|error| AppError::Validation(error.to_string()))?
-        .into_parts();
+    let dependency_scope = carina_core::dependency::ResolvedDependencyScope::from_resources(
+        &sorted_resources,
+        &parsed.data_sources,
+        parsed
+            .upstream_binding_names()
+            .into_iter()
+            .map(str::to_string),
+    )
+    .with_declared_targets(&parsed.compositions);
+    let resources_with_dependencies = sorted_resources.iter().cloned().map(|resource| {
+        let dependencies = dependency_scope
+            .resolve_resource(&resource)
+            .map_err(|error| AppError::Validation(error.to_string()))?;
+        Ok((resource, dependencies))
+    });
     let resolved_resources = ResolvedResource::collect_resolved_with_schemas_and_dependencies(
-        sorted_resources.iter().cloned(),
-        managed_dependencies,
+        resources_with_dependencies.collect::<Result<Vec<_>, AppError>>()?,
         ctx.schemas(),
     )?;
 
@@ -6966,7 +6987,7 @@ mod tests {
     #[test]
     fn build_plan_from_state_creates_read_effects() {
         let state = load_fixture_state();
-        let plan = build_plan_from_state(&state);
+        let plan = build_plan_from_state(&state).expect("state dependencies resolve");
 
         assert_eq!(plan.effects().len(), 3);
         for effect in plan.effects() {
@@ -6977,7 +6998,7 @@ mod tests {
     #[test]
     fn build_plan_from_state_preserves_bindings() {
         let state = load_fixture_state();
-        let plan = build_plan_from_state(&state);
+        let plan = build_plan_from_state(&state).expect("state dependencies resolve");
 
         let vpc_effect = &plan.effects()[0];
         assert_eq!(vpc_effect.binding_name(), Some("vpc".to_string()),);
@@ -6986,7 +7007,7 @@ mod tests {
     #[test]
     fn build_plan_from_state_preserves_attributes() {
         let state = load_fixture_state();
-        let plan = build_plan_from_state(&state);
+        let plan = build_plan_from_state(&state).expect("state dependencies resolve");
 
         let vpc_resource = plan.effects()[0].as_resource_ref().unwrap();
         assert!(vpc_resource.attributes().contains_key("cidr_block"));
@@ -6996,14 +7017,14 @@ mod tests {
     #[test]
     fn build_plan_from_state_empty() {
         let state = StateFile::new();
-        let plan = build_plan_from_state(&state);
+        let plan = build_plan_from_state(&state).expect("state dependencies resolve");
         assert!(plan.effects().is_empty());
     }
 
     #[test]
     fn build_plan_from_state_preserves_dependency_bindings() {
         let state = load_fixture_state();
-        let plan = build_plan_from_state(&state);
+        let plan = build_plan_from_state(&state).expect("state dependencies resolve");
 
         // subnet depends on vpc
         let subnet_resource = plan.effects()[1].as_resource_ref().unwrap();
@@ -7011,6 +7032,36 @@ mod tests {
             subnet_resource.dependency_bindings(),
             &std::collections::BTreeSet::from(["vpc".to_string()])
         );
+    }
+
+    #[test]
+    fn build_plan_from_state_preserves_resolved_explicit_dependencies() {
+        let mut role = ResourceState::try_applied("iam.Role", "role", "aws", "role-id")
+            .expect("fixture identifier is non-empty");
+        role.binding = Some("role".to_string());
+        let mut bucket = ResourceState::try_applied("s3.Bucket", "bucket", "aws", "bucket-id")
+            .expect("fixture identifier is non-empty");
+        bucket.binding = Some("bucket".to_string());
+        bucket.directives.depends_on.push("role".to_string());
+        let mut state = StateFile::new();
+        state.upsert_resource(role).expect("role state is valid");
+        state
+            .upsert_resource(bucket)
+            .expect("bucket state is valid");
+
+        let plan = build_plan_from_state(&state).expect("state dependencies resolve");
+
+        let bucket = plan
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Read { resource } if resource.binding.as_deref() == Some("bucket") => {
+                    Some(resource)
+                }
+                _ => None,
+            })
+            .expect("bucket read effect");
+        assert!(bucket.explicit_dependencies().contains("role"));
     }
 
     #[test]

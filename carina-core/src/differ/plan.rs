@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::deps::{get_resolved_data_source_dependencies, get_resolved_resource_dependencies};
+use crate::deps::get_resolved_dependencies;
 
 use crate::dependency::{ResolvedDependencyScope, ResolvedWaitBinding};
 use crate::effect::{ChangedCreateOnly, Effect, OutcomeUnknownImportReplacement, TemporaryName};
@@ -312,8 +312,7 @@ fn resolve_raw_planning_dependencies(
     data_sources: &[DataSource],
     wait_bindings: &[WaitBinding],
 ) -> ProviderResult<(Vec<ResolvedDataSource>, Vec<ResolvedWaitBinding>)> {
-    let scope = ResolvedDependencyScope::from_resolved_resources(managed, data_sources)
-        .map_err(|error| ProviderError::internal(error.to_string()))?;
+    let scope = ResolvedDependencyScope::from_resources(managed, data_sources, std::iter::empty());
     let data_sources = data_sources
         .iter()
         .cloned()
@@ -495,8 +494,9 @@ fn create_plan_parts(
 ) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
-    let known_bindings = known_binding_names(managed);
-    let dependency_scope = ResolvedDependencyScope::from_typed_resources(managed, data_sources);
+    let known_bindings = known_binding_names(managed, data_sources);
+    let dependency_scope =
+        ResolvedDependencyScope::from_resources(managed, data_sources, std::iter::empty());
 
     // Data sources only generate Read effects; the typestate split
     // routes them through their own slice so the legacy
@@ -810,13 +810,21 @@ fn create_plan_parts(
         // produces the wait + its dependency edge (carina#3085 /
         // carina#3061 behavior preserved).
         let gates_a_pending_change = managed.iter().any(|m| {
-            get_resolved_resource_dependencies(m).contains(wb.binding.as_str())
+            get_resolved_dependencies(
+                crate::parser::ResourceRef::Resource(m.as_inner()),
+                m.explicit_dependencies(),
+            )
+            .contains(wb.binding.as_str())
                 && plan
                     .effects()
                     .iter()
                     .any(|e| e.resource_id() == &m.id && e.is_mutating())
         }) || data_sources.iter().any(|d| {
-            get_resolved_data_source_dependencies(d).contains(wb.binding.as_str())
+            get_resolved_dependencies(
+                crate::parser::ResourceRef::DataSource(d.as_inner()),
+                d.explicit_dependencies(),
+            )
+            .contains(wb.binding.as_str())
                 && plan
                     .effects()
                     .iter()
@@ -876,9 +884,16 @@ fn create_plan_parts(
         // Provider hints supplement user-authored ordering. They are additive
         // because `depends_on` is the user's source of truth and must never be
         // weakened by provider-derived knowledge.
-        explicit_dependencies.extend(dependency_scope.resolve_provider_dependencies(
-            satisfier_augmentation(provider, target_id.as_inner(), &attr, &known_bindings)?,
-        ));
+        explicit_dependencies.extend(
+            dependency_scope
+                .resolve_provider_dependencies(satisfier_augmentation(
+                    provider,
+                    target_id.as_inner(),
+                    &attr,
+                    &known_bindings,
+                )?)
+                .map_err(|error| ProviderError::internal(error.to_string()))?,
+        );
 
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new(wb.binding.as_str()),
@@ -931,7 +946,10 @@ pub fn block_deletes_on_prior_consumer_updates(
                     from,
                     prior_directives.get(&from.id).cloned().unwrap_or_default(),
                 ),
-                get_resolved_resource_dependencies(to),
+                get_resolved_dependencies(
+                    crate::parser::ResourceRef::Resource(to.as_inner()),
+                    to.explicit_dependencies(),
+                ),
             )),
             Effect::Read { .. }
             | Effect::Create(_)
@@ -1093,10 +1111,18 @@ fn decompose_replace_into_effects(
     }
 }
 
-fn known_binding_names(managed: &[ResolvedResource]) -> HashSet<String> {
+fn known_binding_names(
+    managed: &[ResolvedResource],
+    data_sources: &[ResolvedDataSource],
+) -> HashSet<String> {
     managed
         .iter()
         .filter_map(|resource| resource.binding.clone())
+        .chain(
+            data_sources
+                .iter()
+                .filter_map(|resource| resource.binding.clone()),
+        )
         .collect()
 }
 
@@ -1140,7 +1166,10 @@ fn promote_referenced_replaces_to_cbd(
     let mut promote = Vec::new();
 
     for resource in unresolved_managed {
-        let deps = get_resolved_resource_dependencies(resource);
+        let deps = get_resolved_dependencies(
+            crate::parser::ResourceRef::Resource(resource.as_inner()),
+            resource.explicit_dependencies(),
+        );
         for dep in &deps {
             let Some(replaced_identity) = ref_targets.get(dep) else {
                 continue;
@@ -1207,7 +1236,10 @@ fn promote_pending_replaces_for_dependents(
 
     for resource in unresolved_managed {
         let consumer_identity = resource_identity(resource);
-        let deps = get_resolved_resource_dependencies(resource);
+        let deps = get_resolved_dependencies(
+            crate::parser::ResourceRef::Resource(resource.as_inner()),
+            resource.explicit_dependencies(),
+        );
 
         for dep in &deps {
             let Some(replaced_identity) = ref_targets.get(dep).cloned() else {

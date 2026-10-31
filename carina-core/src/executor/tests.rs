@@ -187,12 +187,12 @@ fn anonymous_deferred_collision_fixture() -> (
     );
     let children = deferred_dispatch::materialize_deferred_create(
         &template,
+        &crate::dependency::ResolvedDependencies::empty(),
         &bindings,
         &deferred_dispatch::DeferredIdentityInputs {
             provider_configs: &[],
             factories: &[],
             schemas: &schemas,
-            dependency_scope: &crate::dependency::ResolvedDependencyScope::empty(),
         },
     )
     .expect("fixture child materializes");
@@ -319,6 +319,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                     "validation_records",
                 )),
                 template: Box::new(validation_deferred_for_expression()),
+                explicit_dependencies: Default::default(),
             })),
         ],
         origins(std::slice::from_ref(&cert)),
@@ -3697,6 +3698,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
             "validation_records",
         )),
         template: Box::new(validation_deferred_for_expression()),
+        explicit_dependencies: Default::default(),
     });
     let schemas = deferred_child_constraint_schemas();
     let input = ExecutionInput {
@@ -7806,8 +7808,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         &resources,
         &[] as &[DataSource],
         std::iter::empty(),
-    )
-    .unwrap();
+    );
 
     let mut current_states = HashMap::new();
     let mut plan = Plan::new();
@@ -9793,6 +9794,7 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
             "validation_records",
         )),
         template: Box::new(validation_deferred_for_expression()),
+        explicit_dependencies: Default::default(),
     });
 
     let input = ExecutionInput {
@@ -9826,6 +9828,81 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
 }
 
 #[tokio::test]
+async fn authored_deferred_child_keeps_dependency_on_unchanged_resource() {
+    let cert_id = ResourceId::with_identity("test", "cert");
+    let cert_state = cert_state_for_deferred_replace_deadlock(&cert_id);
+    let child_id = ResourceId::with_identity("test", "validation_records[0]");
+    let child_state =
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("validation-id");
+    let provider = MockProvider::new();
+    provider.push_create(Ok(cert_state));
+    provider.push_create(Ok(child_state));
+
+    let gate: Resource = Resource::new("test", "gate").with_binding("gate");
+    let mut template = validation_deferred_for_expression();
+    template
+        .template_resource
+        .directives
+        .depends_on
+        .push("gate".to_string());
+    let mut cert = Resource::new("test", "cert");
+    cert.binding = Some("cert".to_string());
+    let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+        &[gate.clone(), cert.clone()],
+        &[] as &[DataSource],
+        std::iter::empty(),
+    );
+    let explicit_dependencies = scope
+        .resolve_resource(&template.template_resource)
+        .expect("template dependency resolves at plan time");
+    let mut plan = Plan::new();
+    plan.add(create_effect(cert));
+    plan.add(Effect::DeferredCreate {
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "validation_records",
+        )),
+        template: Box::new(template),
+        explicit_dependencies,
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(
+            gate.id.clone(),
+            Current::from_state(
+                State::existing(gate.id.clone(), HashMap::new()).with_identifier("gate-id"),
+            ),
+        )]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+    assert!(
+        provider
+            .calls()
+            .iter()
+            .any(|(operation, id)| operation == "create" && id == &child_id.to_string()),
+        "the deferred child should be materialized; calls: {:?}",
+        provider.calls()
+    );
+}
+
+#[tokio::test]
 async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_error() {
     let (template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
     let collision_id = child.id.clone();
@@ -9844,6 +9921,7 @@ async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_err
             "anonymous_collision",
         )),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     });
     let input = ExecutionInput {
         plan: &plan,
@@ -9892,6 +9970,7 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
             "anonymous_state_collision",
         )),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     });
     let current = Current::from_state(
         State::existing(collision_id.clone(), HashMap::new()).with_identifier("existing"),
@@ -9948,6 +10027,7 @@ fn legacy_unbound_deferred_replace(
             "anonymous_legacy_replace",
         )),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     }))
 }
 
@@ -10069,6 +10149,7 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
             "anonymous_remint",
         )),
         template: Box::new(template),
+        explicit_dependencies: Default::default(),
     });
     let current = Current::from_state(
         State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
@@ -10122,6 +10203,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
             "validation_records",
         )),
         template: Box::new(validation_deferred_for_expression()),
+        explicit_dependencies: Default::default(),
     });
 
     let input = ExecutionInput {
@@ -10175,6 +10257,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
             "validation_records",
         )),
         template: Box::new(validation_deferred_for_expression()),
+        explicit_dependencies: Default::default(),
     });
 
     let input = ExecutionInput {
@@ -10275,6 +10358,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
             "validation_records",
         )),
         template: Box::new(validation_deferred_for_expression()),
+        explicit_dependencies: Default::default(),
     })));
 
     let input = ExecutionInput {
@@ -10371,6 +10455,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
             "validation_records",
         )),
         template: Box::new(validation_deferred_for_expression()),
+        explicit_dependencies: Default::default(),
     })));
 
     let input = ExecutionInput {
@@ -10630,6 +10715,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             "validation_records",
         )),
         template: Box::new(validation_deferred_for_expression()),
+        explicit_dependencies: Default::default(),
     })));
 
     let unresolved = HashMap::from([
