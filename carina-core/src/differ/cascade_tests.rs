@@ -6,7 +6,8 @@ use crate::plan::{
     PlanErrorKind, PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
 };
 use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
-use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use indexmap::IndexMap;
 
 fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string().into()))
@@ -194,6 +195,55 @@ fn standard_states() -> HashMap<ResourceId, State> {
     ])
 }
 
+fn nested_subnet_resources() -> (Resource, Resource, State, ResourceSchema) {
+    let id = ResourceId::with_identity("ec2.NestedSubnet", "my-subnet");
+    let network = |vpc_id: Value| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("vpc_id".to_string(), vpc_id),
+            ("cidr_block".to_string(), string("10.1.1.0/24")),
+        ])))
+    };
+    let managed = Resource::new("ec2.NestedSubnet", "my-subnet")
+        .with_binding("subnet")
+        .with_attribute("name", string("subnet-main"))
+        .with_attribute("network", network(string("vpc-old")));
+    let unresolved = Resource::new("ec2.NestedSubnet", "my-subnet")
+        .with_binding("subnet")
+        .with_attribute("name", string("subnet-main"))
+        .with_attribute("network", network(ref_value("vpc", "vpc_id")));
+    let current = state(
+        &id,
+        &[
+            ("name", string("subnet-main")),
+            ("network", network(string("vpc-old"))),
+        ],
+        "subnet-123",
+    );
+    let schema = ResourceSchema::new("ec2.NestedSubnet")
+        .attribute(
+            AttributeSchema::optional("name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required(
+                "network",
+                AttributeType::struct_(
+                    "Network",
+                    vec![
+                        StructField::required("vpc_id", AttributeType::string())
+                            .create_only()
+                            .build(),
+                        StructField::required("cidr_block", AttributeType::string()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .with_unique_name_attribute("name");
+    (managed, unresolved, current, schema)
+}
+
 fn replacement_indices(plan: &Plan, id: &ResourceId) -> (usize, usize) {
     for metadata in &plan.replace_display {
         if plan.effects()[metadata.create_idx].resource_id() == id {
@@ -325,6 +375,42 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
             .cascade_ref_hints
             .contains(&("vpc_id".to_string(), "vpc.vpc_id".to_string()))
     );
+}
+
+#[test]
+fn cascade_generates_replace_when_nested_create_only_field_references_replaced_resource() {
+    let mut schemas = base_schemas(false);
+    let (managed_subnet, unresolved_subnet, subnet_state, subnet_schema) =
+        nested_subnet_resources();
+    schemas.insert(
+        "",
+        subnet_schema
+            .validate()
+            .expect("nested subnet schema fixture must be valid"),
+    );
+    let (managed_vpc, unresolved_vpc) = vpc_resources(true);
+    let vpc_id = managed_vpc.id.clone();
+    let subnet_id = managed_subnet.id.clone();
+    let mut states = standard_states();
+    states.remove(&ResourceId::with_identity("ec2.Subnet", "my-subnet"));
+    states.insert(subnet_id.clone(), subnet_state);
+
+    let plan = plan_for(
+        vec![managed_vpc, managed_subnet],
+        vec![unresolved_vpc, unresolved_subnet],
+        states,
+        &schemas,
+    );
+
+    assert!(update_for(&plan, &subnet_id).is_none());
+    let metadata = replacement_metadata(&plan, &subnet_id);
+    assert!(metadata.changed_create_only.contains("network"));
+    assert!(
+        metadata
+            .cascade_ref_hints
+            .contains(&("network".to_string(), "vpc.vpc_id".to_string()))
+    );
+    assert!(delete_blocked_by(&plan, &vpc_id).contains(&ResourceIdentity::new("my-subnet")));
 }
 
 #[test]

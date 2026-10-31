@@ -705,6 +705,35 @@ fn anonymous_deferred_declared_identity_is_a_typed_error() {
 }
 
 #[test]
+fn anonymous_reference_valued_declared_identity_remains_incomplete() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("identity schema fixture must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr("name", Value::resource_ref("source", "name", Vec::new()));
+    let mut resources = vec![resource];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("reference-valued declared identity policy must remain unchanged");
+
+    assert!(matches!(
+        error,
+        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
+    ));
+}
+
+#[test]
 fn named_resource_is_unaffected_by_missing_declared_identity() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -909,7 +938,7 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
 }
 
 #[test]
-fn anonymous_identity_basis_is_incomplete_when_identity_attribute_prefix_is_set() {
+fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
             .create_only()
@@ -928,7 +957,7 @@ fn anonymous_identity_basis_is_incomplete_when_identity_attribute_prefix_is_set(
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &registry),
-        Some(AnonymousIdentityBasis::IncompleteDeclaredIdentity),
+        Some(AnonymousIdentityBasis::Stable),
     );
 }
 
@@ -957,7 +986,7 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
 }
 
 #[test]
-fn identity_attribute_prefix_values_are_rejected_for_anonymous_resources() {
+fn identity_attribute_prefix_values_produce_distinct_anonymous_addresses() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
             .create_only()
@@ -978,22 +1007,19 @@ fn identity_attribute_prefix_values_are_rejected_for_anonymous_resources() {
         .insert("immutable_name".to_string(), "beta-".to_string());
     let mut resources = vec![alpha, beta];
 
-    let result =
-        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("resolved identity prefixes must produce complete addresses");
 
-    assert!(matches!(
-        result,
-        Err(AnonymousIdentityError::IncompleteDeclaredIdentity(_))
-    ));
     assert!(
         resources
             .iter()
-            .all(|resource| resource.id.identity().is_none())
+            .all(|resource| resource.id.identity().is_some())
     );
+    assert_ne!(resources[0].id, resources[1].id);
 }
 
 #[test]
-fn unresolved_identity_prefix_values_are_rejected_for_anonymous_resources() {
+fn unresolved_identity_prefix_values_produce_distinct_anonymous_addresses() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
             .create_only()
@@ -1017,18 +1043,15 @@ fn unresolved_identity_prefix_values_are_rejected_for_anonymous_resources() {
     );
     let mut resources = vec![alpha, beta];
 
-    let result =
-        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("unresolved identity prefixes must produce complete addresses");
 
-    assert!(matches!(
-        result,
-        Err(AnonymousIdentityError::IncompleteDeclaredIdentity(_))
-    ));
     assert!(
         resources
             .iter()
-            .all(|resource| resource.id.identity().is_none())
+            .all(|resource| resource.id.identity().is_some())
     );
+    assert_ne!(resources[0].id, resources[1].id);
 }
 
 #[test]
@@ -1175,7 +1198,7 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
 }
 
 #[test]
-fn unresolved_and_resolved_identity_prefix_forms_are_both_incomplete() {
+fn unresolved_and_resolved_identity_prefix_forms_have_the_same_complete_identity() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
             .create_only()
@@ -1199,26 +1222,177 @@ fn unresolved_and_resolved_identity_prefix_forms_are_both_incomplete() {
 
     let mut unresolved_resources = vec![unresolved];
     let mut resolved_resources = vec![resolved];
-    let unresolved_error =
-        compute_anonymous_identifiers_for_test(&mut unresolved_resources, &[], &registry, &|_| {
-            Vec::new()
-        })
-        .expect_err("unresolved identity prefix must be rejected");
-    let resolved_error =
-        compute_anonymous_identifiers_for_test(&mut resolved_resources, &[], &registry, &|_| {
-            Vec::new()
-        })
-        .expect_err("resolved identity prefix must be rejected");
+    compute_anonymous_identifiers_for_test(&mut unresolved_resources, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("unresolved identity prefix must be complete");
+    compute_anonymous_identifiers_for_test(&mut resolved_resources, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("resolved identity prefix must be complete");
 
-    assert!(matches!(
-        unresolved_error,
-        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
-    ));
-    assert!(matches!(
-        resolved_error,
-        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
-    ));
-    assert_eq!(unresolved_error.to_string(), resolved_error.to_string());
+    assert_eq!(unresolved_resources[0].id, resolved_resources[0].id);
+}
+
+#[test]
+fn declared_identity_prefix_is_complete_and_hashes_the_same_before_and_after_resolution() {
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    let mut unresolved = Resource::pending_with_provider("mock", "test.resource", None);
+    unresolved.set_attr("immutable_name_prefix", concrete_string("service-"));
+    let mut resolved = Resource::pending_with_provider("mock", "test.resource", None);
+    resolved
+        .prefixes
+        .insert("immutable_name".to_string(), "service-".to_string());
+    resolved.set_attr("immutable_name", concrete_string("service-random"));
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&unresolved, &registry),
+        Some(AnonymousIdentityBasis::Stable),
+    );
+    assert_eq!(
+        classify_anonymous_identity_basis(&resolved, &registry),
+        Some(AnonymousIdentityBasis::Stable),
+    );
+
+    let mut unresolved = vec![unresolved];
+    let mut resolved = vec![resolved];
+    compute_anonymous_identifiers_for_test(&mut unresolved, &[], &registry, &|_| Vec::new())
+        .expect("unresolved prefix must produce a complete declared identity");
+    compute_anonymous_identifiers_for_test(&mut resolved, &[], &registry, &|_| Vec::new())
+        .expect("resolved prefix must produce a complete declared identity");
+
+    assert_eq!(unresolved[0].id, resolved[0].id);
+}
+
+#[test]
+fn declared_identity_reconciliation_classifies_both_prefix_forms_as_complete() {
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.resource",
+        "mock_test_resource_11111111",
+        None,
+        None,
+        [("immutable_name", concrete_string("service-existing"))],
+    )];
+    let unresolved = Resource::with_provider(
+        "mock",
+        "test.resource",
+        ResourceIdentity::new("mock_test_resource_22222222"),
+        None,
+    )
+    .with_attribute("immutable_name_prefix", concrete_string("service-"));
+    let mut resolved = Resource::with_provider(
+        "mock",
+        "test.resource",
+        ResourceIdentity::new("mock_test_resource_33333333"),
+        None,
+    );
+    resolved
+        .prefixes
+        .insert("immutable_name".to_string(), "service-".to_string());
+    resolved.set_attr("immutable_name", concrete_string("service-random"));
+
+    for resource in [unresolved, resolved] {
+        let destination = resource.id.identity_str().unwrap().to_string();
+        let moves = reconcile_anonymous_identifiers(
+            std::slice::from_ref(&resource),
+            &registry,
+            &|_provider, _resource_type| state_entries.clone(),
+            &|_binding| Vec::new(),
+        );
+        assert_eq!(
+            resolved_move_identity_pairs(&moves),
+            vec![("mock_test_resource_11111111".to_string(), destination)],
+        );
+    }
+}
+
+fn canonical_record_type_identity_schema() -> ResourceSchema {
+    ResourceSchema::new("route53.RecordSet").attribute(
+        AttributeSchema::required(
+            "type",
+            AttributeType::enum_(
+                enum_identity("RecordType", Some("mock.route53.RecordSet")),
+                Some(vec!["A".to_string(), "AAAA".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        )
+        .create_only()
+        .identity()
+        .build(),
+    )
+}
+
+fn canonical_record_type_resource(value: Value) -> Resource {
+    Resource::pending_with_provider("mock", "route53.RecordSet", None).with_attribute("type", value)
+}
+
+#[test]
+fn declared_identity_hash_canonicalizes_enum_identifier_and_string_values() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        canonical_record_type_identity_schema()
+            .validate()
+            .expect("record type identity schema must be valid"),
+    );
+    let mut identifier = vec![canonical_record_type_resource(Value::Concrete(
+        ConcreteValue::enum_identifier("a"),
+    ))];
+    let mut string = vec![canonical_record_type_resource(concrete_string("A"))];
+
+    compute_anonymous_identifiers_for_test(&mut identifier, &[], &registry, &|_| Vec::new())
+        .expect("enum identifier identity must compute");
+    compute_anonymous_identifiers_for_test(&mut string, &[], &registry, &|_| Vec::new())
+        .expect("string identity must compute");
+
+    assert_eq!(identifier[0].id, string[0].id);
+}
+
+#[test]
+fn equal_canonical_declared_identity_values_report_a_duplicate() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        canonical_record_type_identity_schema()
+            .validate()
+            .expect("record type identity schema must be valid"),
+    );
+    let mut resources = vec![
+        canonical_record_type_resource(Value::Concrete(ConcreteValue::enum_identifier("a"))),
+        canonical_record_type_resource(concrete_string("A")),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("canonical-equal declared identity values must be rejected");
+
+    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    assert!(error.to_string().contains("equal declared identity values"));
 }
 
 #[test]
@@ -2922,6 +3096,95 @@ fn reconcile_identity_declared_address_migration_matches_nested_state_identity()
         resolved_move_identity_pairs(&moves),
         vec![(old_address.to_string(), destination)],
     );
+}
+
+#[test]
+fn reconcile_complete_declared_identity_rejects_multiple_legacy_state_matches() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut desired = vec![budget_resource(Some("monthly"), "forecasted")];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("desired budget identity");
+    let destination = desired[0].id.clone();
+    let state_entry = |name: &str| {
+        let budget = IndexMap::from([
+            ("budget_name".to_string(), concrete_string("monthly")),
+            ("budget_type".to_string(), concrete_string("COST")),
+        ]);
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "budgets.Budget",
+            name,
+            None,
+            None,
+            [("budget", Value::Concrete(ConcreteValue::Map(budget)))],
+        )
+    };
+    let state_entries = vec![
+        state_entry("mock_budgets_budget_11111111"),
+        state_entry("mock_budgets_budget_22222222"),
+    ];
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &registry,
+        desired.iter().map(|resource| &resource.id),
+    );
+    let claims = StateBlockClaims::empty();
+    let find_state_by_type = |provider: &str, resource_type: &str| {
+        claims.screen_entries(
+            provider,
+            resource_type,
+            state_entries.clone(),
+            AnonymousIdStateInfo::name,
+        )
+    };
+
+    let error = super::reconcile_anonymous_identifiers(
+        &desired,
+        &[],
+        &registry,
+        &comparison_provider,
+        &find_state_by_type,
+        &|_binding| Vec::new(),
+        &claims,
+    )
+    .expect_err("multiple complete declared-identity matches must be rejected");
+
+    let AnonymousIdentifierReconciliationError::AmbiguousDeclaredIdentity(ambiguous) = &error
+    else {
+        panic!("expected typed ambiguous declared-identity error, got {error}");
+    };
+    assert_eq!(
+        ambiguous.resource().identity_str(),
+        destination.identity_str().unwrap()
+    );
+    assert_eq!(
+        ambiguous
+            .candidate_rows()
+            .iter()
+            .map(|candidate| candidate.identity_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "mock_budgets_budget_11111111",
+            "mock_budgets_budget_22222222"
+        ]
+    );
+    let message = error.to_string();
+    assert!(message.contains(&destination.to_string()), "{message}");
+    assert!(
+        message.contains("mock_budgets_budget_11111111"),
+        "{message}"
+    );
+    assert!(
+        message.contains("mock_budgets_budget_22222222"),
+        "{message}"
+    );
+    assert!(message.contains("moved"), "{message}");
 }
 
 #[test]

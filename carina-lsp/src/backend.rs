@@ -1147,7 +1147,7 @@ mock.test.Thing {
             matching[0].message,
             "Anonymous resources of type 'mock.budgets.Budget' on the same provider route have \
              equal declared identity values and produce address \
-             'mock_budgets_budget_2874da1a'. Give one of them a name with `let`."
+             'mock_budgets_budget_1f99b02d'. Give one of them a name with `let`."
         );
     }
 

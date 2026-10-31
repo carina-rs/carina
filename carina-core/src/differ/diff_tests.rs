@@ -748,6 +748,52 @@ fn nested_create_only_plan(immutable: &str, mutable: &str) -> (Plan, ResourceId)
     (plan, id)
 }
 
+fn omitted_optional_nested_create_only_fixture() -> (Resource, State, SchemaRegistry) {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let id = ResourceId::with_identity("budgets.Budget", "monthly");
+    let desired_budget = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "budget_type".to_string(),
+        Value::Concrete(ConcreteValue::String("FORECASTED".into())),
+    )])));
+    let current_budget = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "budget_name".to_string(),
+            Value::Concrete(ConcreteValue::String("provider-default".into())),
+        ),
+        (
+            "budget_type".to_string(),
+            Value::Concrete(ConcreteValue::String("ACTUAL".into())),
+        ),
+    ])));
+    let desired =
+        Resource::new("budgets.Budget", "monthly").with_attribute("budget", desired_budget);
+    let current = existing_state(id, HashMap::from([("budget".to_string(), current_budget)]));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("budgets.Budget")
+            .attribute(
+                AttributeSchema::required(
+                    "budget",
+                    AttributeType::struct_(
+                        "BudgetData",
+                        vec![
+                            StructField::optional("budget_name", AttributeType::string())
+                                .create_only()
+                                .build(),
+                            StructField::required("budget_type", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    (desired, current, schemas)
+}
+
 #[test]
 fn replace_when_nested_create_only_field_changes() {
     let (plan, id) = nested_create_only_plan("new-key", "old-value");
@@ -772,6 +818,75 @@ fn update_when_only_mutable_sibling_of_nested_create_only_field_changes() {
         plan.replace_display.is_empty(),
         "unexpected replacement for {id}"
     );
+}
+
+#[test]
+fn update_when_optional_nested_create_only_field_is_omitted_but_present_in_state() {
+    let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(id.clone(), current)]);
+
+    let plan = create_plan(
+        std::slice::from_ref(&desired),
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_current_map_from_states(
+            current_states,
+            &schemas,
+            std::slice::from_ref(&desired),
+        ),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(plan.replace_display.is_empty(), "unexpected replacement");
+    assert!(matches!(
+        plan.effects(),
+        [Effect::Update {
+            changed_attributes,
+            ..
+        }] if changed_attributes == &["budget".to_string()]
+    ));
+}
+
+#[test]
+fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_state() {
+    let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();
+    let id = desired.id.clone();
+    let managed =
+        ResolvedResource::collect_resolved_with_schemas(std::iter::once(desired.clone()), &schemas)
+            .expect("budget fixture must resolve");
+    let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+        &schemas,
+        managed.iter().map(|resource| &resource.id),
+    );
+    let current_states = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(id.clone(), current)]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let stability = managed_binding_stability(
+        &managed,
+        &current_states,
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &provider,
+    )
+    .expect("comparison fixture must resolve");
+
+    assert!(matches!(
+        stability.get(&id),
+        Some(ManagedBindingStability::Updating {
+            changed_attributes,
+            ..
+        }) if changed_attributes == &HashSet::from(["budget".to_string()])
+    ));
 }
 
 fn create_only_nested_write_only_fixture(

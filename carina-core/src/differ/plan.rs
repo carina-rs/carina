@@ -57,19 +57,6 @@ struct RefAttr {
     hint: String,
 }
 
-/// Check which changed attributes are create-only according to the schema
-fn find_top_level_changed_create_only(
-    changed_attributes: &[String],
-    schema: &ResourceSchema,
-) -> Vec<String> {
-    let create_only_attrs = schema.create_only_attributes();
-    changed_attributes
-        .iter()
-        .filter(|attr| create_only_attrs.contains(&attr.as_str()))
-        .cloned()
-        .collect()
-}
-
 pub(super) fn find_changed_create_only(
     changed_attributes: &[String],
     from: &State,
@@ -95,19 +82,20 @@ pub(super) fn find_changed_create_only(
                 .get(attribute.as_str())
                 .map(|value| schema.create_only_leaf_projection(attribute, value))
                 .unwrap_or_default();
-            from_leaves.len() != to_leaves.len()
-                || from_leaves.iter().zip(&to_leaves).any(
-                    |((from_path, from_value, field_type), (to_path, to_value, _))| {
-                        from_path != to_path
-                            || !type_aware_equal(
-                                from_value,
-                                to_value,
-                                Some(field_type),
-                                &schema.defs,
-                                context,
-                            )
-                    },
-                )
+            to_leaves.iter().any(|(to_path, to_value, field_type)| {
+                from_leaves
+                    .iter()
+                    .find(|(from_path, _, _)| from_path == to_path)
+                    .is_none_or(|(_, from_value, _)| {
+                        !type_aware_equal(
+                            from_value,
+                            to_value,
+                            Some(field_type),
+                            &schema.defs,
+                            context,
+                        )
+                    })
+            })
         })
         .cloned()
         .collect()
@@ -481,8 +469,9 @@ pub fn create_plan_with_cascades(
         unresolved_managed,
         &managed_current,
         registry,
+        provider,
         outcome_unknown_import_replacements,
-    );
+    )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
     Ok(build.plan)
@@ -1133,13 +1122,14 @@ fn cascade_dependent_updates(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) {
+) -> ProviderResult<()> {
     loop {
         promote_referenced_replaces_to_cbd(plan, pending_replaces, unresolved_managed, registry);
 
         if pending_replaces.is_empty() {
-            return;
+            return Ok(());
         }
 
         let promoted = promote_pending_replaces_for_dependents(
@@ -1148,13 +1138,15 @@ fn cascade_dependent_updates(
             unresolved_managed,
             current_states,
             registry,
+            comparison_provider,
             outcome_unknown_import_replacements,
-        );
+        )?;
 
         if !promoted {
             break;
         }
     }
+    Ok(())
 }
 
 fn promote_referenced_replaces_to_cbd(
@@ -1227,8 +1219,9 @@ fn promote_pending_replaces_for_dependents(
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
+    comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> bool {
+) -> ProviderResult<bool> {
     let ref_targets = pending_reference_targets(pending_replaces, true);
     let mut promoted = false;
 
@@ -1253,16 +1246,20 @@ fn promote_pending_replaces_for_dependents(
                 .iter()
                 .map(|ref_attr| ref_attr.attribute.clone())
                 .collect();
-            let Some(owner_schema) = registry.get(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                SchemaKind::Resource,
-            ) else {
+            let Some(Current::Present(present)) = current_states
+                .get(&resource.id)
+                .map(PlanInputCurrent::current)
+            else {
                 continue;
             };
-            let create_only_refs = find_top_level_changed_create_only(
+            let resolved_comparison = comparison_provider.comparison_for(registry, &resource.id)?;
+            let owner_schema = resolved_comparison.owner_schema();
+            let create_only_refs = find_changed_create_only(
                 &ref_attr_names,
+                present.state(),
+                resource,
                 owner_schema.schema().as_schema(),
+                resolved_comparison.context(),
             );
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
@@ -1324,7 +1321,7 @@ fn promote_pending_replaces_for_dependents(
         }
     }
 
-    promoted
+    Ok(promoted)
 }
 
 fn pending_reference_targets(

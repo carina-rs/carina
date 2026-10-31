@@ -839,6 +839,12 @@ pub enum AppError {
     #[error(transparent)]
     ComparisonResolution(#[from] carina_core::provider::ComparisonResolutionError),
 
+    /// Anonymous state reconciliation found no safe unique legacy row.
+    #[error(transparent)]
+    AnonymousIdentifierReconciliation(
+        #[from] carina_core::identifier::AmbiguousDeclaredIdentityMatch,
+    ),
+
     /// A module argument constraint became decidable during an operation.
     #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
@@ -1147,6 +1153,19 @@ impl AppError {
             source => Self::StateBucketPreparation(StateBucketPreparationError {
                 source: Box::new(source),
             }),
+        }
+    }
+}
+
+impl From<carina_core::identifier::AnonymousIdentifierReconciliationError> for AppError {
+    fn from(error: carina_core::identifier::AnonymousIdentifierReconciliationError) -> Self {
+        match error {
+            carina_core::identifier::AnonymousIdentifierReconciliationError::Comparison(error) => {
+                Self::ComparisonResolution(error)
+            }
+            carina_core::identifier::AnonymousIdentifierReconciliationError::AmbiguousDeclaredIdentity(
+                error,
+            ) => Self::AnonymousIdentifierReconciliation(error),
         }
     }
 }
