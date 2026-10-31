@@ -19,8 +19,8 @@ use carina_core::provider::{
     UnknownCreateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, State, Value,
+    ConcreteValue, Current, ModuleSource, PersistedDirectives, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -63,6 +63,41 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
             }
         }
     }
+}
+
+/// Count managed resources whose authored, persisted directives differ from
+/// the row currently in state.
+///
+/// Routing is metadata on the row, so lookup deliberately ignores the current
+/// provider-instance value. That value is itself one of the fields this check
+/// must be able to update.
+pub(crate) fn persisted_directive_change_count<S>(
+    state_file: Option<&StateFile>,
+    resources: &[ResolvedResource<S>],
+) -> usize {
+    let Some(state_file) = state_file else {
+        return 0;
+    };
+    resources
+        .iter()
+        .filter(|resource| {
+            let Some(identity) = resource.id.identity_str() else {
+                return false;
+            };
+            let Some(row) = state_file.find_resource(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                identity,
+            ) else {
+                return false;
+            };
+            let mut desired = PersistedDirectives::from(&resource.directives);
+            if desired.provider_instance.is_none() {
+                desired.provider_instance = resource.id.provider_instance.clone();
+            }
+            row.directives != desired
+        })
+        .count()
 }
 
 /// Queue a state refresh for a resource after a failed operation.
@@ -253,6 +288,35 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
                 plan: &self.plan,
                 successfully_deleted: &result.successfully_deleted,
                 failed_refreshes: &result.failed_refreshes,
+                schemas: &self.schemas,
+            },
+            self.planned_secret_hashes.as_ref(),
+            &self.comparisons,
+        )
+    }
+
+    /// Rebuild unchanged current rows through the same carried-state path used
+    /// after provider execution. This persists desired metadata without
+    /// inventing an applied provider result.
+    pub(crate) fn build_state_only(
+        &self,
+        state: StateFile,
+        managed_current: &HashMap<ResourceId, Current>,
+    ) -> Result<StateFile, AppError> {
+        let runtime_synthesized_resources: Vec<ResolvedResource<S>> = Vec::new();
+        let applied_states = HashMap::new();
+        let successfully_deleted = HashSet::new();
+        let failed_refreshes = HashSet::new();
+        build_state_after_apply_with_comparisons(
+            ApplyStateSave {
+                state_file: state,
+                sorted_resources: &self.sorted_resources,
+                runtime_synthesized_resources: &runtime_synthesized_resources,
+                managed_current,
+                applied_states: &applied_states,
+                plan: &self.plan,
+                successfully_deleted: &successfully_deleted,
+                failed_refreshes: &failed_refreshes,
                 schemas: &self.schemas,
             },
             self.planned_secret_hashes.as_ref(),
@@ -1994,6 +2058,52 @@ mod apply_state_save_tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn state_with_default_directives() -> StateFile {
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::try_applied("test.Resource", "main", "mock", "provider-main")
+                    .expect("fixture identifier is valid"),
+            )
+            .expect("fixture row is unique");
+        state
+    }
+
+    #[test]
+    fn persisted_directive_change_count_covers_every_persisted_field() {
+        let changed = |resource: Resource| {
+            persisted_directive_change_count(
+                Some(&state_with_default_directives()),
+                &[resolved(resource)],
+            )
+        };
+
+        let mut force_delete = Resource::with_provider("mock", "test.Resource", "main", None);
+        force_delete.directives.force_delete = true;
+        assert_eq!(changed(force_delete), 1);
+
+        let mut create_before_destroy =
+            Resource::with_provider("mock", "test.Resource", "main", None);
+        create_before_destroy.directives.create_before_destroy = true;
+        assert_eq!(changed(create_before_destroy), 1);
+
+        let mut prevent_destroy = Resource::with_provider("mock", "test.Resource", "main", None);
+        prevent_destroy.directives.set_prevent_destroy(false);
+        assert_eq!(changed(prevent_destroy), 1);
+
+        let mut depends_on = Resource::with_provider("mock", "test.Resource", "main", None);
+        depends_on.directives.depends_on = vec!["dependency".to_string()];
+        assert_eq!(changed(depends_on), 1);
+
+        let provider_instance = Resource::with_provider(
+            "mock",
+            "test.Resource",
+            "main",
+            Some("secondary".to_string()),
+        );
+        assert_eq!(changed(provider_instance), 1);
     }
 
     #[test]

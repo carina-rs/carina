@@ -12,7 +12,10 @@ use crate::plan::{
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
+use crate::provider::{
+    LiftedSavedAttrs, Provider, ProviderDirectiveSchema, ProviderDirectives, ProviderResult,
+    ProviderRouter,
+};
 use crate::resource::{
     ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
     ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
@@ -584,11 +587,10 @@ fn create_plan_parts(
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
                         {
-                            let prevent_destroy_source = resource
-                                .directives
-                                .prevent_destroy_setting()
-                                .resolve(Some(schema))
-                                .source();
+                            let prevent_destroy_source = registry
+                                .resolve_resource_directives(&resource.id, &resource.directives)
+                                .expect("a diffed managed resource has a registered schema")
+                                .prevent_destroy_source();
                             if let Some(source) = prevent_destroy_source {
                                 plan.add_error(PlanError::prevent_destroy(
                                     id.clone(),
@@ -672,12 +674,12 @@ fn create_plan_parts(
             }
         };
         let directives = orphan.directives().clone();
-        let schema = registry.get(&id.provider, &id.resource_type, SchemaKind::Resource);
-        let schema = schema.as_ref().map(|schema| schema.as_schema());
-        let prevent_destroy_source = directives
-            .prevent_destroy_setting()
-            .resolve(schema)
-            .source();
+        let resolved_directives = registry
+            .resolve_resource_directives(id, &directives)
+            .unwrap_or_else(|| {
+                ProviderDirectives::resolve(&directives, ProviderDirectiveSchema::Unavailable)
+            });
+        let prevent_destroy_source = resolved_directives.prevent_destroy_source();
         if let Some(source) = prevent_destroy_source {
             plan.add_error(PlanError::prevent_destroy(
                 id.clone(),
@@ -1239,17 +1241,10 @@ fn promote_pending_replaces_for_dependents(
                         ref_hints,
                     );
                 } else {
-                    let schema = registry.get(
-                        &resource.id.provider,
-                        &resource.id.resource_type,
-                        SchemaKind::Resource,
-                    );
-                    let schema = schema.as_ref().map(|schema| schema.as_schema());
-                    let prevent_destroy_source = resource
-                        .directives
-                        .prevent_destroy_setting()
-                        .resolve(schema)
-                        .source();
+                    let prevent_destroy_source = registry
+                        .resolve_resource_directives(&resource.id, &resource.directives)
+                        .expect("a cascading managed resource has a registered schema")
+                        .prevent_destroy_source();
                     if let Some(source) = prevent_destroy_source {
                         plan.add_error(PlanError::prevent_destroy(
                             resource.id.clone(),

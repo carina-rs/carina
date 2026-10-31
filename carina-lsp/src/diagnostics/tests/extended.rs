@@ -9158,6 +9158,38 @@ fn non_literal_prevent_destroy_warning_is_directory_scoped() {
 }
 
 #[test]
+fn sibling_true_prevent_destroy_expression_does_not_warn() {
+    let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
+    let resource = r#"let account = mock.test.resource {
+  name = "example"
+  directives { prevent_destroy = protect }
+}
+"#;
+    std::fs::write(fixture.path().join("flags.crn"), "let protect = true\n")
+        .expect("write sibling expression input");
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write sibling provider fixture");
+    std::fs::write(fixture.path().join("resources.crn"), resource).expect("write resource fixture");
+
+    let path = fixture.path().join("resources.crn");
+    let diagnostics =
+        test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("only a literal `false` opts out of schema-default protection")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        warnings.is_empty(),
+        "the directory-resolved true value enables protection without an opt-out warning: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn single_quoted_interpolation_warning_uses_original_line_after_heredoc() {
     let engine = test_engine();
     let buffer = r#"let doc = <<EOF

@@ -22,13 +22,12 @@ use carina_core::effect::deps::{
 use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::parser::WaitBinding;
 use carina_core::plan::{Plan, PlanError};
-use carina_core::provider::Provider;
+use carina_core::provider::{Provider, ProviderDirectiveSchema, ProviderDirectives};
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
     ConcreteValue, Current, PreventDestroySource, ResolvedResourceId, Resource, ResourceId, Value,
 };
-use carina_core::schema::SchemaKind;
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
@@ -596,16 +595,16 @@ async fn run_destroy_locked_owned(
 
             // Resolve authored and schema-default protection unless --force.
             if !force {
-                let schema = ctx.schemas().get(
-                    &r.id.provider,
-                    &r.id.resource_type,
-                    SchemaKind::Resource,
-                );
-                let prevent_destroy_source = r
-                    .directives
-                    .prevent_destroy_setting()
-                    .resolve(schema.as_ref().map(|schema| schema.as_schema()))
-                    .source();
+                let resolved_directives = ctx
+                    .schemas()
+                    .resolve_resource_directives(&r.id, &r.directives)
+                    .unwrap_or_else(|| {
+                        ProviderDirectives::resolve(
+                            &r.directives,
+                            ProviderDirectiveSchema::Unavailable,
+                        )
+                    });
+                let prevent_destroy_source = resolved_directives.prevent_destroy_source();
                 if let Some(source) = prevent_destroy_source {
                     prevent_destroy_resources.push((r, source));
                     return false;
@@ -975,15 +974,18 @@ async fn run_destroy_locked_owned(
                 let identifier = identifier.clone();
                 let generation = generation.clone();
                 let directives = directives.clone();
-                let schema = ctx.schemas().get(
-                    resource_id.provider(),
-                    resource_id.resource_type(),
-                    SchemaKind::Resource,
+                let resolved_directives = ctx
+                    .schemas()
+                    .resolve_resource_directives(resource_id.as_inner(), &directives)
+                    .unwrap_or_else(|| {
+                        ProviderDirectives::resolve(
+                            &directives,
+                            ProviderDirectiveSchema::Unavailable,
+                        )
+                    });
+                let delete_request = carina_core::provider::DeleteRequest::from_resolved(
+                    resolved_directives,
                 );
-                let schema = schema.map(|schema| schema.schema().as_schema());
-                let schema = carina_core::provider::ProviderDirectiveSchema::from(schema);
-                let delete_request =
-                    carina_core::provider::DeleteRequest::resolve(&directives, schema);
 
                 let provider_ref = &provider;
                 let result_shutdown = &cancel;

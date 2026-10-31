@@ -739,12 +739,18 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
     crate::resource::assert_resource_fully_resolved(&resource)?;
     let resource =
         ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
-    let schema = context
+    let directives = context
         .schemas
-        .get_for(resource.as_resource())
-        .map(|schema| schema.schema().as_schema());
-    let schema = ProviderDirectiveSchema::from(schema);
-    let directives = ProviderDirectives::resolve(&resource.as_resource().directives, schema);
+        .resolve_resource_directives(
+            &resource.as_resource().id,
+            &resource.as_resource().directives,
+        )
+        .unwrap_or_else(|| {
+            ProviderDirectives::resolve(
+                &resource.as_resource().directives,
+                ProviderDirectiveSchema::Unavailable,
+            )
+        });
     Ok(ProviderReady {
         value: resource,
         directives,
@@ -815,12 +821,16 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
         crate::resource::assert_value_fully_resolved(value)?;
     }
     let value = ResolvedDataSource::new(value.into_provider_data_source());
-    let schema = context
-        .schemas
-        .get_for_data_source(value.as_inner())
-        .map(|schema| schema.schema().as_schema());
-    let schema = ProviderDirectiveSchema::from(schema);
-    let directives = ProviderDirectives::resolve(&value.as_inner().directives, schema);
+    let directives = match context.schemas.get_for_data_source(value.as_inner()) {
+        Some(schema) => ProviderDirectives::resolve(
+            &value.as_inner().directives,
+            ProviderDirectiveSchema::Available(schema.schema().as_schema()),
+        ),
+        None => ProviderDirectives::resolve(
+            &value.as_inner().directives,
+            ProviderDirectiveSchema::Unavailable,
+        ),
+    };
     Ok(ProviderReady { value, directives })
 }
 

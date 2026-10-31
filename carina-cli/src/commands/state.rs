@@ -1309,11 +1309,8 @@ async fn run_state_bucket_delete(
     })?;
     let bucket_id =
         ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
-    let delete_request = state_bucket_delete_request(
-        validated_config.context().schemas(),
-        provider_name,
-        resource_type,
-    )?;
+    let delete_request =
+        state_bucket_delete_request(validated_config.context().schemas(), &bucket_id)?;
     match bucket_provider
         .provider()
         .delete(&bucket_id, &bucket_identifier, delete_request)
@@ -1334,24 +1331,20 @@ async fn run_state_bucket_delete(
 
 fn state_bucket_delete_request(
     schemas: &carina_core::schema::SchemaRegistry,
-    provider_name: &str,
-    resource_type: &str,
+    resource_id: &ResourceId,
 ) -> Result<carina_core::provider::DeleteRequest, AppError> {
-    let schema = schemas
-        .get(
-            provider_name,
-            resource_type,
-            carina_core::schema::SchemaKind::Resource,
-        )
+    let directives = carina_core::resource::Directives::default();
+    let resolved = schemas
+        .resolve_resource_directives(resource_id, &directives)
         .ok_or_else(|| {
             AppError::Config(format!(
                 "No managed resource schema registered for state bucket type \
-                 '{provider_name}.{resource_type}'"
+                 '{}.{}'",
+                resource_id.provider, resource_id.resource_type
             ))
         })?;
-    Ok(carina_core::provider::DeleteRequest::resolve(
-        &carina_core::resource::Directives::default(),
-        carina_core::provider::ProviderDirectiveSchema::Available(schema.schema().as_schema()),
+    Ok(carina_core::provider::DeleteRequest::from_resolved(
+        resolved,
     ))
 }
 
@@ -3133,7 +3126,8 @@ mod tests {
                 .expect("bucket schema must validate"),
         );
 
-        let request = state_bucket_delete_request(&schemas, "aws", "s3.Bucket")
+        let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "state", None);
+        let request = state_bucket_delete_request(&schemas, &id)
             .expect("the registered bucket schema must resolve");
 
         assert!(request.directives().prevent_destroy());

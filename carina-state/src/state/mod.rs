@@ -23,8 +23,7 @@ pub use carina_core::resource::DeposedKey;
 use carina_core::resource::Resource;
 use carina_core::resource::{
     ConcreteValue, Current, DataSource, Directives, PartialReadMarker, PendingReRead,
-    PersistedDirectives, PreventDestroy, ResolvedResource, ResourceId, ResourceIdentity, State,
-    Value,
+    PersistedDirectives, ResolvedResource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::{
     FieldName, ResourceSchema, SchemaKind, SchemaRegistry, schema_write_only_keys,
@@ -2792,7 +2791,7 @@ impl ResourceState {
             && !self.protected
             && !self.directives.force_delete
             && !self.directives.create_before_destroy
-            && self.directives.prevent_destroy_setting() != PreventDestroy::Explicit(true)
+            && !self.directives.explicitly_prevents_destroy()
             && self.directives.depends_on.is_empty()
             && self.prefixes.is_empty()
             && self.name_overrides.is_empty()

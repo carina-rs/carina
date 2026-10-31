@@ -6042,6 +6042,16 @@ pub enum PreventDestroyResolution {
     Protected(PreventDestroySource),
 }
 
+/// Whether the resource schema needed for directive resolution is available.
+///
+/// The named `Unavailable` branch keeps compatibility paths explicit. A
+/// missing registry lookup must not silently become schema-free resolution.
+#[derive(Debug, Clone, Copy)]
+pub enum ProviderDirectiveSchema<'a> {
+    Available(&'a ResourceSchema),
+    Unavailable,
+}
+
 impl PreventDestroyResolution {
     /// Return the protection provenance, or `None` when destruction is allowed.
     pub fn source(self) -> Option<PreventDestroySource> {
@@ -6057,17 +6067,21 @@ impl PreventDestroy {
     ///
     /// When a schema is unavailable, an unspecified directive preserves the
     /// historical orphan-delete behavior and is not considered protected.
-    pub fn resolve(self, schema: Option<&ResourceSchema>) -> PreventDestroyResolution {
+    pub fn resolve(self, schema: ProviderDirectiveSchema<'_>) -> PreventDestroyResolution {
         match self {
             Self::Explicit(true) => {
                 PreventDestroyResolution::Protected(PreventDestroySource::ExplicitDirective)
             }
             Self::Explicit(false) => PreventDestroyResolution::NotProtected,
             Self::Unspecified => match schema {
-                Some(schema) if schema.prevents_destroy_by_default() => {
+                ProviderDirectiveSchema::Available(schema)
+                    if schema.prevents_destroy_by_default() =>
+                {
                     PreventDestroyResolution::Protected(PreventDestroySource::SchemaDefault)
                 }
-                Some(_) | None => PreventDestroyResolution::NotProtected,
+                ProviderDirectiveSchema::Available(_) | ProviderDirectiveSchema::Unavailable => {
+                    PreventDestroyResolution::NotProtected
+                }
             },
         }
     }
@@ -6148,8 +6162,14 @@ impl Directives {
         self
     }
 
-    pub fn prevent_destroy_setting(&self) -> PreventDestroy {
+    pub(crate) fn prevent_destroy_setting(&self) -> PreventDestroy {
         self.prevent_destroy
+    }
+
+    /// Whether this authored setting explicitly protects destruction without
+    /// consulting a schema.
+    pub fn explicitly_prevents_destroy(&self) -> bool {
+        matches!(self.prevent_destroy, PreventDestroy::Explicit(true))
     }
 
     pub fn set_prevent_destroy(&mut self, value: bool) {
@@ -6163,8 +6183,11 @@ impl Directives {
 }
 
 impl PersistedDirectives {
-    pub fn prevent_destroy_setting(&self) -> PreventDestroy {
-        self.prevent_destroy
+    /// Whether this persisted setting protects destruction without consulting
+    /// a schema. Used by state-shell retention, which intentionally has no
+    /// schema registry.
+    pub fn explicitly_prevents_destroy(&self) -> bool {
+        matches!(self.prevent_destroy, PreventDestroy::Explicit(true))
     }
 
     pub fn set_prevent_destroy(&mut self, value: bool) {

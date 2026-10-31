@@ -12696,6 +12696,30 @@ impl SchemaRegistry {
         )
     }
 
+    /// Resolve every provider-visible directive for one managed resource.
+    ///
+    /// The lookup key and managed-resource schema kind live here so policy
+    /// enforcement and provider dispatch cannot accidentally disagree. `None`
+    /// leaves the caller responsible for explicitly choosing whether a missing
+    /// schema is an error or a schema-unavailable compatibility path.
+    pub fn resolve_resource_directives(
+        &self,
+        resource_id: &crate::resource::ResourceId,
+        directives: &crate::resource::Directives,
+    ) -> Option<crate::provider::ProviderDirectives> {
+        self.get(
+            &resource_id.provider,
+            &resource_id.resource_type,
+            SchemaKind::Resource,
+        )
+        .map(|schema| {
+            crate::provider::ProviderDirectives::resolve(
+                directives,
+                crate::resource::ProviderDirectiveSchema::Available(schema.schema().as_schema()),
+            )
+        })
+    }
+
     /// Look up the `DataSource` schema for a given [`DataSource`].
     pub fn get_for_data_source<S>(
         &self,

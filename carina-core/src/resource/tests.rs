@@ -785,23 +785,23 @@ fn prevent_destroy_resolution_reports_source_and_fails_safe_for_expressions() {
     let protected = ResourceSchema::new("test.Protected").default_prevent_destroy();
 
     assert_eq!(
-        PreventDestroy::Unspecified.resolve(Some(&ordinary)),
+        PreventDestroy::Unspecified.resolve(ProviderDirectiveSchema::Available(&ordinary)),
         PreventDestroyResolution::NotProtected
     );
     assert_eq!(
-        PreventDestroy::Unspecified.resolve(Some(&protected)),
+        PreventDestroy::Unspecified.resolve(ProviderDirectiveSchema::Available(&protected)),
         PreventDestroyResolution::Protected(PreventDestroySource::SchemaDefault)
     );
     assert_eq!(
-        PreventDestroy::Explicit(true).resolve(Some(&ordinary)),
+        PreventDestroy::Explicit(true).resolve(ProviderDirectiveSchema::Available(&ordinary)),
         PreventDestroyResolution::Protected(PreventDestroySource::ExplicitDirective)
     );
     assert_eq!(
-        PreventDestroy::Explicit(false).resolve(Some(&protected)),
+        PreventDestroy::Explicit(false).resolve(ProviderDirectiveSchema::Available(&protected)),
         PreventDestroyResolution::NotProtected
     );
     assert_eq!(
-        PreventDestroy::Unspecified.resolve(None),
+        PreventDestroy::Unspecified.resolve(ProviderDirectiveSchema::Unavailable),
         PreventDestroyResolution::NotProtected,
         "an unavailable schema preserves the existing orphan-delete behavior"
     );

@@ -41,6 +41,7 @@ use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_fo
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
+use crate::commands::shared::state_writeback::persisted_directive_change_count;
 use crate::display::print_plan;
 use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
@@ -4797,6 +4798,8 @@ pub async fn run_plan(
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&checked_exports, &current_exports);
+    let directive_change_count =
+        persisted_directive_change_count(state_file.as_ref(), &ctx.sorted_resources);
     let summary = PlanChangeSummary::new(&ctx.plan, &export_changes, &ctx.residual_deferred_for);
     // Preserve the CLI contract from before plan-image summaries existed:
     // detailed exit code 2 means a managed-resource mutation, not merely
@@ -4827,6 +4830,12 @@ pub async fn run_plan(
         let json_str = serde_json::to_string_pretty(&plan_file)
             .map_err(|e| format!("Failed to serialize plan: {}", e))?;
         println!("{}", json_str);
+        if directive_change_count > 0 {
+            eprintln!(
+                "State-only update: {} resource directive change(s) will be persisted on apply.",
+                directive_change_count
+            );
+        }
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -4839,6 +4848,12 @@ pub async fn run_plan(
             Some(&ctx.prev_explicit),
             &ctx.provider,
         )?;
+        if directive_change_count > 0 {
+            eprintln!(
+                "State-only update: {} resource directive change(s) will be persisted on apply.",
+                directive_change_count
+            );
+        }
         moved_hints.eprint();
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(result);
@@ -4855,6 +4870,12 @@ pub async fn run_plan(
             Some(&ctx.expansion_trace),
             &ctx.provider,
         )?;
+        if directive_change_count > 0 {
+            println!(
+                "State-only update: {} resource directive change(s) will be persisted on apply.",
+                directive_change_count
+            );
+        }
         if let Some(note) = drift_note.as_ref() {
             println!();
             println!("{}", note.yellow());

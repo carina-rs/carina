@@ -32,11 +32,13 @@ impl Scenario {
     }
 
     fn write_resource(&self, name: &str, explicit_opt_out: bool) {
-        let directives = if explicit_opt_out {
-            "  directives { prevent_destroy = false }\n"
-        } else {
-            ""
-        };
+        self.write_resource_with_prevent_destroy(name, explicit_opt_out.then_some(false));
+    }
+
+    fn write_resource_with_prevent_destroy(&self, name: &str, setting: Option<bool>) {
+        let directives = setting.map_or_else(String::new, |value| {
+            format!("  directives {{ prevent_destroy = {value} }}\n")
+        });
         fs::write(
             self.project.join("resources.crn"),
             format!(
@@ -174,5 +176,101 @@ fn non_literal_false_is_valid_but_does_not_opt_out() {
     assert!(
         plan_output.contains("only a literal `false` opts out of schema-default protection"),
         "plan must warn about the ignored non-literal opt-out:\n{plan_output}"
+    );
+}
+
+#[test]
+fn directive_only_false_is_persisted_before_removed_resource_delete() {
+    let scenario = Scenario::new();
+    scenario.write_resource("account-v1", false);
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    scenario.write_resource_with_prevent_destroy("account-v1", Some(false));
+    let directive_apply = scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]);
+    assert_success("directive-only opt-out apply", &directive_apply);
+    assert!(
+        output_text(&directive_apply).contains("directive"),
+        "directive-only apply must tell the user that state metadata changed:\n{}",
+        output_text(&directive_apply)
+    );
+
+    scenario.remove_resource();
+    assert_success("opted-out removal plan", &scenario.run(&["plan", "."]));
+    assert_success(
+        "opted-out removal apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+}
+
+#[test]
+fn saved_plan_apply_persists_directive_only_false() {
+    let scenario = Scenario::new();
+    scenario.write_resource("account-v1", false);
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    scenario.write_resource_with_prevent_destroy("account-v1", Some(false));
+    let saved_plan = scenario.run(&["plan", "--out", "directive-only.plan.json", "."]);
+    assert_success("directive-only saved plan", &saved_plan);
+    assert!(
+        output_text(&saved_plan).contains("directive"),
+        "plan must disclose the state-only directive update:\n{}",
+        output_text(&saved_plan)
+    );
+    assert_success(
+        "directive-only saved-plan apply",
+        &scenario.run(&[
+            "apply",
+            "--auto-approve",
+            "--lock=false",
+            "directive-only.plan.json",
+        ]),
+    );
+
+    scenario.remove_resource();
+    assert_success(
+        "saved-plan opted-out removal plan",
+        &scenario.run(&["plan", "."]),
+    );
+    assert_success(
+        "saved-plan opted-out removal apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+}
+
+#[test]
+fn directive_only_true_is_persisted_as_explicit_protection() {
+    let scenario = Scenario::new();
+    scenario.write_resource("account-v1", false);
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    scenario.write_resource_with_prevent_destroy("account-v1", Some(true));
+    assert_success(
+        "directive-only protection apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    scenario.remove_resource();
+    let plan = scenario.run(&["plan", "."]);
+    let rendered = output_text(&plan);
+    assert!(
+        !plan.status.success(),
+        "explicitly protected removal unexpectedly succeeded:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("resource has prevent_destroy set")
+            && !rendered.contains("resource type is protected from destruction by default"),
+        "the orphan must retain explicit-true provenance:\n{rendered}"
     );
 }

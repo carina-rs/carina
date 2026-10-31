@@ -76,8 +76,12 @@ pub fn resolve_wit_resource_directives(
         let schema = schema.as_schema();
         schema.resource_type() == resource_type && schema.kind() == kind
     });
-    let schema = schema.map(|schema| schema.as_schema());
-    let schema = carina_core::provider::ProviderDirectiveSchema::from(schema);
+    let schema = match schema {
+        Some(schema) => {
+            carina_core::provider::ProviderDirectiveSchema::Available(schema.as_schema())
+        }
+        None => carina_core::provider::ProviderDirectiveSchema::Unavailable,
+    };
     let directives = carina_core::provider::ProviderDirectives::resolve(
         &carina_core::resource::Directives::default(),
         schema,

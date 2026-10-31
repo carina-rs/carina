@@ -1294,7 +1294,7 @@ impl UpdateRequest {
 
 /// Per-operation request record for `delete`. Mirrors
 /// `delete-request` in `wit/types.wit`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteRequest {
     #[serde(default)]
     pub directives: Directives,
@@ -3358,5 +3358,14 @@ mod tests {
             "do-not-log-this",
             "the raw value is available only at the explicit provider-call seam"
         );
+    }
+
+    #[test]
+    fn delete_request_retains_default_for_provider_compatibility() {
+        let request = DeleteRequest::default();
+
+        assert!(!request.directives.force_delete);
+        assert!(!request.directives.create_before_destroy);
+        assert!(!request.directives.prevent_destroy);
     }
 }

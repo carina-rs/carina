@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::resource::{DeferredValue, PendingReRead, PreventDestroy, ReReadReason};
+use carina_core::resource::{DeferredValue, PendingReRead, ReReadReason};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -7,6 +7,12 @@ fn published_exports_from_state(state: &StateFile) -> PublishedExports {
     let bytes = carina_core::utils::pretty_with_newline_bytes(state)
         .expect("test state must serialize with the state writer encoding");
     PublishedExports::from_state_bytes(&bytes).expect("serialized test exports must decode")
+}
+
+fn persisted_prevent_destroy_json(directives: &PersistedDirectives) -> serde_json::Value {
+    serde_json::to_value(directives)
+        .expect("persisted directives must serialize")["prevent_destroy"]
+        .clone()
 }
 
 fn exact_comparison_context() -> carina_core::differ::ComparisonContext<'static> {
@@ -104,8 +110,8 @@ fn v19_migrates_to_v20_without_rewriting_resource_data() {
     assert_eq!(state.resources()[0].identity.as_str(), "carried");
     assert!(state.resources()[0].protected);
     assert_eq!(
-        state.resources()[0].directives.prevent_destroy_setting(),
-        PreventDestroy::Unspecified
+        persisted_prevent_destroy_json(&state.resources()[0].directives),
+        serde_json::json!({"kind": "unspecified"})
     );
     assert_eq!(
         state.resources()[0].binding.as_deref(),
@@ -158,14 +164,23 @@ fn v19_migration_preserves_true_and_makes_false_or_missing_unspecified() {
         .map(|row| {
             (
                 row.identity.as_str(),
-                row.directives.prevent_destroy_setting(),
+                persisted_prevent_destroy_json(&row.directives),
             )
         })
         .collect::<HashMap<_, _>>();
 
-    assert_eq!(settings["explicit-true"], PreventDestroy::Explicit(true));
-    assert_eq!(settings["legacy-false"], PreventDestroy::Unspecified);
-    assert_eq!(settings["legacy-missing"], PreventDestroy::Unspecified);
+    assert_eq!(
+        settings["explicit-true"],
+        serde_json::json!({"kind": "explicit", "value": true})
+    );
+    assert_eq!(
+        settings["legacy-false"],
+        serde_json::json!({"kind": "unspecified"})
+    );
+    assert_eq!(
+        settings["legacy-missing"],
+        serde_json::json!({"kind": "unspecified"})
+    );
 }
 
 #[test]
@@ -185,8 +200,8 @@ fn v20_state_round_trip_preserves_explicit_prevent_destroy_false() {
         .into_state();
 
     assert_eq!(
-        decoded.resources()[0].directives.prevent_destroy_setting(),
-        PreventDestroy::Explicit(false)
+        persisted_prevent_destroy_json(&decoded.resources()[0].directives),
+        serde_json::json!({"kind": "explicit", "value": false})
     );
     let json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
     assert_eq!(
@@ -4669,10 +4684,7 @@ fn state_json_cannot_persist_ignore_changes_paths() {
     row.directives = (&runtime).into();
     let encoded = serde_json::to_string(&row).expect("state row serializes");
 
-    assert_eq!(
-        row.directives.prevent_destroy_setting(),
-        PreventDestroy::Explicit(true)
-    );
+    assert!(row.directives.explicitly_prevents_destroy());
     assert!(!encoded.contains("ignore_changes"), "{encoded}");
     assert!(!encoded.contains("comment"), "{encoded}");
 }
@@ -4723,10 +4735,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
         "provider-facing orphan state must not contain host metadata"
     );
     assert_eq!(orphan.binding(), Some("my_subnet"));
-    assert_eq!(
-        orphan.directives().prevent_destroy_setting(),
-        PreventDestroy::Explicit(true)
-    );
+    assert!(orphan.directives().explicitly_prevents_destroy());
     assert_eq!(orphan.directives().depends_on, ["security_group"]);
     assert_eq!(
         orphan_state.dependency_bindings,
@@ -4755,10 +4764,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     };
     assert_eq!(refreshed.binding(), Some("my_subnet"));
     assert_eq!(refreshed_state.id, id);
-    assert_eq!(
-        refreshed.directives().prevent_destroy_setting(),
-        PreventDestroy::Explicit(true)
-    );
+    assert!(refreshed.directives().explicitly_prevents_destroy());
     assert_eq!(refreshed.directives().depends_on, ["security_group"]);
     assert_eq!(
         refreshed_state.dependency_bindings,

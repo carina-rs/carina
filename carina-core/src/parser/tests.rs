@@ -10248,6 +10248,33 @@ let resources = for x in src.list {
 }
 
 #[test]
+fn static_for_deduplicates_non_literal_prevent_destroy_warning() {
+    let parsed = parse(
+        r#"let allow_destroy = false
+for name in ["one", "two", "three"] {
+  mock.test.resource {
+    name = name
+    directives { prevent_destroy = allow_destroy }
+  }
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("a static resource loop with directives must parse");
+
+    assert_eq!(
+        parsed.warnings.len(),
+        1,
+        "one authored expression must produce one warning even when its loop body expands three times: {:?}",
+        parsed.warnings
+    );
+    assert_eq!(
+        parsed.warnings[0].kind,
+        WarningKind::NonLiteralPreventDestroy
+    );
+}
+
+#[test]
 fn iter_all_resources_yields_parser_side_deferred_resource_bodies_only() {
     let parsed = parse(
         r#"let child = use { source = "./child" }

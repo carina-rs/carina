@@ -177,7 +177,20 @@ impl<'cfg> ParseContext<'cfg> {
     }
 
     pub(super) fn take_warnings(&self) -> Vec<ParseWarning> {
-        std::mem::take(&mut *self.warnings.borrow_mut())
+        let warnings = std::mem::take(&mut *self.warnings.borrow_mut());
+        let mut deduplicated = Vec::with_capacity(warnings.len());
+        for warning in warnings {
+            let duplicate = deduplicated.iter().any(|existing: &ParseWarning| {
+                existing.file == warning.file
+                    && existing.span == warning.span
+                    && existing.kind == warning.kind
+                    && existing.message == warning.message
+            });
+            if !duplicate {
+                deduplicated.push(warning);
+            }
+        }
+        deduplicated
     }
 
     pub(super) fn restore_warnings(&self, mut warnings: Vec<ParseWarning>) {

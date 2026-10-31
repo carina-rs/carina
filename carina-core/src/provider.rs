@@ -27,9 +27,11 @@ use carina_provider_protocol::types::{
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
+pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
-    PreventDestroyResolution, ProviderResource, Resource, ResourceId, State, Value, ValueString,
+    PreventDestroyResolution, PreventDestroySource, ProviderResource, Resource, ResourceId, State,
+    Value, ValueString,
 };
 #[cfg(test)]
 use crate::resource::{DataSource, RedactedSecretHash};
@@ -883,38 +885,15 @@ impl DeleteRequest {
         }
     }
 
+    /// Construct a delete request from directives already resolved through a
+    /// schema registry or an explicitly named schema-unavailable path.
+    pub fn from_resolved(directives: ProviderDirectives) -> Self {
+        Self { directives }
+    }
+
     /// Effective directives carried by this request.
     pub fn directives(&self) -> &ProviderDirectives {
         &self.directives
-    }
-}
-
-/// Whether the resource schema needed for directive resolution is available.
-///
-/// The named `Unavailable` branch makes schema-free compatibility paths
-/// explicit at each call site. Normal provider dispatch must use `Available`
-/// with the schema obtained from its registry.
-#[derive(Debug, Clone, Copy)]
-pub enum ProviderDirectiveSchema<'a> {
-    Available(&'a ResourceSchema),
-    Unavailable,
-}
-
-impl<'a> ProviderDirectiveSchema<'a> {
-    fn as_option(self) -> Option<&'a ResourceSchema> {
-        match self {
-            Self::Available(schema) => Some(schema),
-            Self::Unavailable => None,
-        }
-    }
-}
-
-impl<'a> From<Option<&'a ResourceSchema>> for ProviderDirectiveSchema<'a> {
-    fn from(schema: Option<&'a ResourceSchema>) -> Self {
-        match schema {
-            Some(schema) => Self::Available(schema),
-            None => Self::Unavailable,
-        }
     }
 }
 
@@ -943,22 +922,24 @@ pub struct ProviderDirectives {
     force_delete: bool,
     create_before_destroy: bool,
     prevent_destroy: bool,
+    prevent_destroy_source: Option<PreventDestroySource>,
 }
 
 impl ProviderDirectives {
     /// Resolve the provider-visible directive subset against an explicitly
     /// available or unavailable resource schema.
     pub fn resolve(directives: &Directives, schema: ProviderDirectiveSchema<'_>) -> Self {
+        let prevent_destroy_resolution = directives.prevent_destroy_setting().resolve(schema);
+        let prevent_destroy_source = prevent_destroy_resolution.source();
         let prevent_destroy = matches!(
-            directives
-                .prevent_destroy_setting()
-                .resolve(schema.as_option()),
+            prevent_destroy_resolution,
             PreventDestroyResolution::Protected(_)
         );
         Self {
             force_delete: directives.force_delete,
             create_before_destroy: directives.create_before_destroy,
             prevent_destroy,
+            prevent_destroy_source,
         }
     }
 
@@ -974,6 +955,8 @@ impl ProviderDirectives {
             force_delete,
             create_before_destroy,
             prevent_destroy,
+            prevent_destroy_source: prevent_destroy
+                .then_some(PreventDestroySource::ExplicitDirective),
         }
     }
 
@@ -987,6 +970,11 @@ impl ProviderDirectives {
 
     pub fn prevent_destroy(&self) -> bool {
         self.prevent_destroy
+    }
+
+    /// Provenance for effective destruction protection, when enabled.
+    pub fn prevent_destroy_source(&self) -> Option<PreventDestroySource> {
+        self.prevent_destroy_source
     }
 }
 

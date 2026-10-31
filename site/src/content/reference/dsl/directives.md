@@ -38,11 +38,11 @@ directives {
 }
 ```
 
-An expression is not treated as an explicit opt-out. Until directive
-expressions can be evaluated as lifecycle policy, a value such as
-`prevent_destroy = allow_destroy` remains unspecified and therefore keeps any
-schema-default protection enabled. An explicit `true` always enables
-protection, even for resource types whose schema default is false.
+A non-literal expression that resolves to `true` enables protection. Any other
+non-literal value is treated as unspecified and produces a warning, so it keeps
+any schema-default protection enabled. Only the literal `false` opts out of a
+schema default. An explicit `true` always enables protection, even for resource
+types whose schema default is false.
 
 ## `ignore_changes`
 
