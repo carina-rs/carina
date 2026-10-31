@@ -18,9 +18,9 @@
 //! binding LHS) is enforced upstream by `parse_wait_expr`; the parse
 //! error surfaces via the regular parser diagnostic path.
 
-use crate::parser::{File, ResourceRef};
+use crate::parser::{File, TopLevelResourceRef};
 use crate::schema::{SchemaKind, SchemaRegistry};
-use crate::wait::predicate::resolve_wait_predicate;
+use crate::wait::predicate::validate_wait_predicate;
 
 enum WaitTarget {
     Pollable {
@@ -47,7 +47,7 @@ pub struct WaitDiagnostic {
 /// Run all wait diagnostics against a parsed file + schema registry.
 /// Returns the full list of errors; callers decide how to surface them.
 pub fn validate_wait_bindings<E, D>(
-    parsed: &File<E, D>,
+    parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D>,
     schemas: &SchemaRegistry,
 ) -> Vec<WaitDiagnostic> {
     if parsed.wait_bindings.is_empty() {
@@ -65,19 +65,12 @@ pub fn validate_wait_bindings<E, D>(
         if let Some(b) = rref.binding() {
             let id = rref.id();
             let target = match rref {
-                ResourceRef::Resource(_) => WaitTarget::Pollable {
+                TopLevelResourceRef::Resource(_) => WaitTarget::Pollable {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
                 },
-                ResourceRef::Deferred {
-                    resource: _resource,
-                    deferred: _deferred,
-                } => WaitTarget::Pollable {
-                    provider: id.provider.clone(),
-                    resource_type: id.resource_type.clone(),
-                },
-                ResourceRef::DataSource(_) => WaitTarget::DataSource,
-                ResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
+                TopLevelResourceRef::DataSource(_) => WaitTarget::DataSource,
+                TopLevelResourceRef::LiveComposition(_) => WaitTarget::LiveComposition,
             };
             by_binding.insert(b.to_string(), target);
         }
@@ -130,9 +123,9 @@ pub fn validate_wait_bindings<E, D>(
             // diagnostic from the upstream identifier-scope pass.
             continue;
         };
-        if let Err(error) = resolve_wait_predicate(
+        if let Err(error) = validate_wait_predicate(
             &wb.until_predicate.lhs_segments,
-            wb.until_predicate.rhs.clone(),
+            &wb.until_predicate.rhs,
             Some(schema.schema()),
         ) {
             let attribute = wb

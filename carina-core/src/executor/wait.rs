@@ -830,7 +830,9 @@ mod tests {
         AppliedState, BoxFuture, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
         UpdateRequest,
     };
-    use crate::resource::{ConcreteValue, DeferredValue, ResolvedResource, UnknownReason, Value};
+    use crate::resource::{
+        ApplyTimeUnknown, ConcreteValue, DeferredValue, ResolvedResource, Value,
+    };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1503,7 +1505,11 @@ mod tests {
             last_attrs: HashMap::from([
                 (
                     "status".to_string(),
-                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                    Value::Deferred(DeferredValue::Unknown(
+                        ApplyTimeUnknown::UpstreamAllExports {
+                            binding: "upstream".to_string(),
+                        },
+                    )),
                 ),
                 (
                     "target".to_string(),
@@ -1517,7 +1523,7 @@ mod tests {
 
         assert!(
             message.contains(
-                "last observed attributes: status=(known after upstream apply), target=vpc.id"
+                "last observed attributes: status=(known after upstream apply: upstream), target=vpc.id"
             ),
             "{message}"
         );

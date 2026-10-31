@@ -1,9 +1,9 @@
 use super::*;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    AccessPath, CompositionCall, CompositionCallPath, LoopModulePrefixOrigin, LoopProvenance,
-    ModuleInstanceScope, ModuleSource, PendingReRead, ReReadReason, Resource, ResourceIdentity,
-    Subscript, UnknownReason, ValueString,
+    AccessPath, ApplyTimeUnknown, CompositionCall, CompositionCallPath, LoopModulePrefixOrigin,
+    LoopProvenance, ModuleInstanceScope, ModuleSource, PendingReRead, ReReadReason,
+    Resource as StagedResource, ResourceIdentity, Subscript, ValueString,
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
@@ -12,6 +12,11 @@ use crate::schema::{
 };
 use indexmap::IndexMap;
 use std::path::Path;
+
+type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
+type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
+type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
+type Resource = StagedResource<ModuleSource, crate::resource::NoPlaceholder>;
 
 fn concrete_string(value: impl Into<ValueString>) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
@@ -118,6 +123,8 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         &crate::parser::ProviderContext::default(),
     )
     .expect("valid loop fixture")
+    .into_expanded()
+    .expect("loop fixture contains no parser placeholders")
     .resources
 }
 
@@ -240,7 +247,7 @@ fn pending_reread_identifier_material_has_stable_typed_bytes() {
     ];
 
     for (pending, expected) in cases {
-        let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(
+        let value = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
             pending,
         )));
         assert_eq!(
@@ -3621,7 +3628,7 @@ fn canonical_enum_create_only_comparison_preserves_identity_hash_material() {
 
 #[test]
 fn upstream_unknown_identity_hash_strings_remain_stable() {
-    let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let export = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: AccessPath::new("network", "vpc_id"),
     }));
     assert_eq!(
@@ -3629,9 +3636,11 @@ fn upstream_unknown_identity_hash_strings_remain_stable() {
         "Unknown(UpstreamRef(network.vpc_id))"
     );
 
-    let all_exports = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
-        binding: "network".into(),
-    }));
+    let all_exports = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: "network".into(),
+        },
+    ));
     assert_eq!(
         deterministic_value_string(&all_exports),
         "Unknown(UpstreamBareRef(network))"
@@ -7135,7 +7144,8 @@ fn nested_loop_rewrite_uses_current_module_prefix_and_is_a_valid_move_target() {
     )
     .expect("rendered move target must parse");
     assert!(
-        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]).is_empty(),
+        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource],)
+            .is_empty(),
         "the suggested current-prefix target must not be classified as legacy",
     );
 }
@@ -7157,7 +7167,9 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         fixture.path(),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("directory parses");
+    .expect("directory parses")
+    .into_expanded()
+    .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =
@@ -7515,7 +7527,8 @@ fn moved_to_rejects_an_orphaned_legacy_segment_below_a_regular_prefix() {
     )
     .expect("moved block parses");
 
-    let errors = check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[]);
+    let errors =
+        check_legacy_loop_move_targets::<ModuleSource>(&parsed.state_blocks, &[] as &[Resource]);
 
     assert_eq!(errors.len(), 1);
     assert!(errors[0].to_string().contains("net._for0[0]"));

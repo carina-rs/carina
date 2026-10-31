@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, PlaceholderKind, Value};
 use crate::schema::{AttributePathTypeError, ValidatedResourceSchema};
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -216,6 +216,78 @@ pub fn resolve_wait_predicate(
     })
 }
 
+/// Validate a parser-stage wait RHS without converting the surrounding value
+/// tree to the post-expansion stage.
+pub(crate) fn validate_wait_predicate<P: PlaceholderKind>(
+    lhs_segments: &[String],
+    value: &Value<P>,
+    schema: Option<&ValidatedResourceSchema>,
+) -> Result<(), WaitResolutionError> {
+    let (target, attribute_segments) = lhs_segments
+        .split_first()
+        .ok_or(WaitResolutionError::InvalidPath(AttrPathError::Empty))?;
+    let attr =
+        AttrPath::try_new(attribute_segments.to_vec()).map_err(WaitResolutionError::InvalidPath)?;
+    let attribute = attr.segments().join(".");
+
+    if let Some(schema) = schema {
+        let effective_type = schema
+            .effective_type_at_attribute_path(attr.segments())
+            .map_err(|error| match error {
+                AttributePathTypeError::Empty => {
+                    WaitResolutionError::InvalidPath(AttrPathError::Empty)
+                }
+                AttributePathTypeError::UnknownAttribute { attribute } => {
+                    WaitResolutionError::UnknownAttribute {
+                        target: target.clone(),
+                        attribute,
+                        resource_type: schema.as_schema().resource_type().to_string(),
+                    }
+                }
+                AttributePathTypeError::UnknownStructField {
+                    parent_path,
+                    field,
+                    struct_name,
+                } => WaitResolutionError::UnknownStructField {
+                    target: target.clone(),
+                    full_path: format!("{parent_path}.{field}"),
+                    struct_name,
+                },
+                AttributePathTypeError::CannotTraverse { path, type_name } => {
+                    WaitResolutionError::CannotTraverse {
+                        target: target.clone(),
+                        full_path: attribute.clone(),
+                        traversed: path,
+                        type_name,
+                    }
+                }
+            })?;
+        if let Value::Concrete(ConcreteValue::EnumIdentifier(identifier)) = value {
+            let resolved = crate::value::canonicalize_wait_rhs_with_type(
+                Value::Concrete(ConcreteValue::EnumIdentifier(identifier.clone())),
+                &effective_type,
+            );
+            if let Some(identifier) = unresolved_enum_identifier(&resolved) {
+                return Err(WaitResolutionError::UnresolvedEnumIdentifier {
+                    target: target.clone(),
+                    attribute,
+                    identifier: identifier.to_string(),
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    if let Some(identifier) = unresolved_enum_identifier(value) {
+        return Err(WaitResolutionError::UnresolvedEnumIdentifier {
+            target: target.clone(),
+            attribute,
+            identifier: identifier.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// A wait RHS that is safe to persist and evaluate.
 ///
 /// The inner value is private so an unresolved [`ConcreteValue::EnumIdentifier`]
@@ -251,7 +323,7 @@ impl<'de> Deserialize<'de> for WaitPredicateValue {
     }
 }
 
-fn unresolved_enum_identifier(value: &Value) -> Option<&str> {
+fn unresolved_enum_identifier<P: PlaceholderKind>(value: &Value<P>) -> Option<&str> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
             .values()
@@ -300,7 +372,8 @@ fn unresolved_enum_identifier(value: &Value) -> Option<&str> {
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => None,
     }
 }
@@ -514,7 +587,7 @@ mod tests {
         let json = serde_json::json!({
             "kind": "equals",
             "attr": AttrPath::single("state"),
-            "value": Value::Concrete(ConcreteValue::enum_identifier("ready")),
+            "value": Value::<crate::resource::NoPlaceholder>::Concrete(ConcreteValue::enum_identifier("ready")),
         })
         .to_string();
 

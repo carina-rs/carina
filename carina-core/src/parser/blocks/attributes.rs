@@ -3,11 +3,11 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use crate::parser::ParsedValue as Value;
+use crate::parser::ParserValidationBlock as ValidationBlock;
 use crate::parser::ProviderContext;
 use crate::parser::Rule;
-use crate::parser::ast::{
-    ArgumentParameter, AttributeParameter, ExportParameter, SourceSpan, ValidationBlock,
-};
+use crate::parser::ast::{ArgumentParameter, AttributeParameter, ExportParameter, SourceSpan};
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::{ParseError, ParseWarning};
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -15,7 +15,7 @@ use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression;
 use crate::parser::types::parse_type_expr;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue};
 
 pub(in crate::parser) struct ParsedArgumentsBlock {
     pub parameters: Vec<ArgumentParameter>,
@@ -170,11 +170,10 @@ fn register_argument_binding(
 ) {
     ctx.set_argument_variable(
         name.to_string(),
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument {
+        Value::Deferred(DeferredValue::Placeholder(
+            crate::resource::ParserPlaceholder::ModuleArgument {
                 name: name.to_string(),
-                source_line: (0).into(),
-                diagnostic_name: None,
+                diagnostic: Default::default(),
             },
         )),
         Some(type_expr.clone()),

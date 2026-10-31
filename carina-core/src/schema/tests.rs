@@ -1,5 +1,19 @@
 use super::*;
 
+type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
+type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
+type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
+type Resource =
+    crate::resource::Resource<crate::resource::ModuleSource, crate::resource::NoPlaceholder>;
+type LoopValue = crate::resource::Value<crate::resource::LoopSlot>;
+type LoopDeferredValue = crate::resource::DeferredValue<crate::resource::LoopSlot>;
+type ParserValue = crate::resource::Value<crate::resource::ParserPlaceholder>;
+type ParserConcreteValue = crate::resource::ConcreteValue<crate::resource::ParserPlaceholder>;
+type ParserResource =
+    crate::resource::Resource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
+type ParserDataSource =
+    crate::resource::DataSource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
+
 #[test]
 fn field_group_members_require_two_distinct_field_names() {
     assert_eq!(
@@ -279,7 +293,9 @@ fn struct_field_groups_enforce_all_cardinality_kinds() {
 fn group_presence_counts_unknown_and_reference_values() {
     for deferred in [
         Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ForValue,
+            crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                binding: "computed_after_apply".to_string(),
+            },
         )),
         Value::Deferred(DeferredValue::BindingRef {
             binding: "computed_after_apply".to_string(),
@@ -1086,7 +1102,9 @@ fn schema_admission_rejects_deferred_defaults_recursively() {
         ResourceSchema::new("test.Widget").attribute(
             AttributeSchema::optional("name", AttributeType::string())
                 .with_default(Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue,
+                    crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                        binding: "upstream".to_string(),
+                    },
                 )))
                 .build(),
         ),
@@ -3803,8 +3821,6 @@ fn with_declared_validators_stores_portable_validation() {
 
 #[test]
 fn validate_known_values_defers_constraints_until_values_are_concrete() {
-    use crate::resource::UnknownReason;
-
     let schema = ResourceSchema::new("test.KnownValues")
         .attribute(
             AttributeSchema::optional(
@@ -3841,7 +3857,13 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
         )
         .validate()
         .expect("secret enum schema must be valid");
-    let unknown = || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+    let unknown = || {
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                binding: "upstream".to_string(),
+            },
+        ))
+    };
     let mut attributes = HashMap::from([
         ("pattern".to_string(), unknown()),
         ("length".to_string(), unknown()),
@@ -3920,8 +3942,6 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
 
 #[test]
 fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
-    use crate::resource::UnknownReason;
-
     let schema = ResourceSchema::new("test.NestedKnownValues").attribute(
         AttributeSchema::optional(
             "names",
@@ -3937,7 +3957,11 @@ fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
     let attributes = HashMap::from([(
         "names".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "upstream".to_string(),
+                },
+            )),
             Value::Concrete(ConcreteValue::String("INVALID".into())),
         ])),
     )]);
@@ -5100,18 +5124,18 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
         schema.validate().expect("schema fixture must be valid"),
     );
 
-    let evaluated_resource = Resource::with_provider("test", "thing", "consumer", None)
+    let evaluated_resource = ParserResource::with_provider("test", "thing", "consumer", None)
         .with_attribute(
             "rule",
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Map(IndexMap::from([(
+            ParserValue::Concrete(ParserConcreteValue::List(vec![ParserValue::Concrete(
+                ParserConcreteValue::Map(IndexMap::from([(
                     "action".to_string(),
-                    Value::Concrete(ConcreteValue::String("allow".into())),
+                    ParserValue::Concrete(ParserConcreteValue::String("allow".into())),
                 )])),
             )])),
         );
-    let unresolved_ref = Value::resource_ref("source", "rules", Vec::new());
-    let unresolved_resource = Resource::with_provider("test", "thing", "consumer", None)
+    let unresolved_ref = ParserValue::resource_ref("source", "rules", Vec::new());
+    let unresolved_resource = ParserResource::with_provider("test", "thing", "consumer", None)
         .with_attribute("rule", unresolved_ref.clone());
     let evaluated = crate::parser::ParsedFile {
         resources: vec![evaluated_resource],
@@ -5167,19 +5191,19 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
     // Reference resolution may make the evaluated value a concrete list, but
     // the authored ResourceRef still identifies assignment syntax. The paired
     // resolver must therefore keep the real singular field on both sides.
-    let evaluated_resource = Resource::with_provider("test", "thing", "consumer", None)
+    let evaluated_resource = ParserResource::with_provider("test", "thing", "consumer", None)
         .with_attribute(
             "lifecycle_configuration",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            ParserValue::Concrete(ParserConcreteValue::Map(IndexMap::from([(
                 "transition".to_string(),
-                Value::Concrete(ConcreteValue::List(Vec::new())),
+                ParserValue::Concrete(ParserConcreteValue::List(Vec::new())),
             )]))),
         );
-    let unresolved_ref = Value::resource_ref("source", "transitions", Vec::new());
-    let unresolved_resource = Resource::with_provider("test", "thing", "consumer", None)
+    let unresolved_ref = ParserValue::resource_ref("source", "transitions", Vec::new());
+    let unresolved_resource = ParserResource::with_provider("test", "thing", "consumer", None)
         .with_attribute(
             "lifecycle_configuration",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            ParserValue::Concrete(ParserConcreteValue::Map(IndexMap::from([(
                 "transition".to_string(),
                 unresolved_ref.clone(),
             )]))),
@@ -5202,14 +5226,14 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
 
     for resource in [&evaluated.resources[0], &unresolved[0]] {
         let lifecycle = match resource.get_attr("lifecycle_configuration") {
-            Some(Value::Concrete(ConcreteValue::Map(map))) => map,
+            Some(ParserValue::Concrete(ParserConcreteValue::Map(map))) => map,
             _ => panic!("expected lifecycle map"),
         };
         assert!(lifecycle.contains_key("transition"));
         assert!(!lifecycle.contains_key("transitions"));
     }
     let unresolved_lifecycle = match unresolved[0].get_attr("lifecycle_configuration") {
-        Some(Value::Concrete(ConcreteValue::Map(map))) => map,
+        Some(ParserValue::Concrete(ParserConcreteValue::Map(map))) => map,
         _ => panic!("expected unresolved lifecycle map"),
     };
     assert_eq!(
@@ -5220,14 +5244,13 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
 
 #[test]
 fn resolve_file_block_names_canonicalizes_data_source_blocks() {
-    let mut data_source =
-        crate::resource::DataSource::with_provider("test", "thing", "lookup", None);
+    let mut data_source = ParserDataSource::with_provider("test", "thing", "lookup", None);
     data_source.set_attr(
         "rule",
-        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
+        ParserValue::Concrete(ParserConcreteValue::List(vec![ParserValue::Concrete(
+            ParserConcreteValue::Map(IndexMap::from([(
                 "action".to_string(),
-                Value::Concrete(ConcreteValue::String("allow".into())),
+                ParserValue::Concrete(ParserConcreteValue::String("allow".into())),
             )])),
         )])),
     );
@@ -11537,8 +11560,8 @@ fn schema_registry_routes_lookup_by_typestate() {
             .expect("schema fixture must be valid"),
     );
 
-    let managed_res = Resource::with_provider("aws", "s3.Bucket", "new", None);
-    let data_res = DataSource::with_provider("aws", "s3.Bucket", "existing", None);
+    let managed_res: Resource = Resource::with_provider("aws", "s3.Bucket", "new", None);
+    let data_res: DataSource = DataSource::with_provider("aws", "s3.Bucket", "existing", None);
 
     let m = registry
         .get_for(&managed_res)
@@ -11566,7 +11589,8 @@ fn schema_registry_missing_returns_none() {
 #[test]
 fn schema_registry_resolves_missing_schema_with_unavailable_fallback() {
     let registry = SchemaRegistry::new();
-    let resource = crate::resource::Resource::with_provider("aws", "s3.Bucket", "bucket", None);
+    let resource: crate::resource::Resource =
+        crate::resource::Resource::with_provider("aws", "s3.Bucket", "bucket", None);
     let directives = crate::resource::Directives::default().with_prevent_destroy(true);
 
     let resolved = registry.resolve_directives(&resource.id, SchemaKind::Resource, &directives);
@@ -11589,7 +11613,7 @@ fn schema_registry_resolves_data_source_directives_through_the_same_api() {
             .validate()
             .expect("schema fixture must be valid"),
     );
-    let data_source =
+    let data_source: crate::resource::DataSource =
         crate::resource::DataSource::with_provider("aws", "s3.Bucket", "bucket", None);
 
     assert!(
@@ -11632,13 +11656,15 @@ fn validate_skips_value_unknown_for_primitive_types() {
     // takes the same skip path as `FunctionCall` and `Secret`. Without
     // this, a `for x in upstream.list { ... attr = x ... }` body fails
     // parse-time validation with `expected <type>, got unknown`.
-    use crate::resource::{AccessPath, UnknownReason};
-    let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+    use crate::resource::{AccessPath, ApplyTimeUnknown};
+    let unknown = LoopValue::Deferred(LoopDeferredValue::Placeholder(
+        crate::resource::LoopSlot::Value,
+    ));
     assert!(AttributeType::string().validate(&unknown).is_ok());
     assert!(AttributeType::int().validate(&unknown).is_ok());
     assert!(AttributeType::bool().validate(&unknown).is_ok());
 
-    let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let upstream = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
     assert!(AttributeType::string().validate(&upstream).is_ok());
@@ -11652,8 +11678,6 @@ fn walk_custom_lookup_skips_value_unknown() {
     // `Value::Deferred(DeferredValue::Unknown)` here too, otherwise a custom-typed attribute
     // bound from a for-expression element fails plan with
     // `expected vpc_id, got unknown`.
-    use crate::resource::UnknownReason;
-
     let always_fail = validator(|_v: &Value| {
         Err(TypeError::ValidationFailed {
             message: "validator must not run for Value::Deferred(DeferredValue::Unknown)"
@@ -11671,7 +11695,9 @@ fn walk_custom_lookup_skips_value_unknown() {
     let mut errors = Vec::new();
     walk_custom_lookup(
         &custom_type,
-        &Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        &LoopValue::Deferred(LoopDeferredValue::Placeholder(
+            crate::resource::LoopSlot::Value,
+        )),
         Some("vpc_id"),
         &|_, _| {
             Err(TypeError::ValidationFailed {

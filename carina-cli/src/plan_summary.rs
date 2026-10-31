@@ -200,7 +200,6 @@ mod tests {
             line: 1,
             header: "for item in upstream.items".to_string(),
             resource_type: "test.Widget".to_string(),
-            attributes: Vec::new(),
             target: carina_core::parser::DeferredForTarget::Bound {
                 binding: "widgets".to_string(),
             },

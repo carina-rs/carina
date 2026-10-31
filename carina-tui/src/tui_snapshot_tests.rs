@@ -12,8 +12,8 @@ use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect,
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Directives, ResolvedResource, Resource, ResourceId, State,
-    UnknownReason, Value,
+    ConcreteValue, DeferredValue, Directives, LoopSlot, ModuleSource, ResolvedResource, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::SchemaRegistry;
 
@@ -239,14 +239,16 @@ fn build_map_key_diff_plan() -> Plan {
 }
 
 fn build_deferred_for_plan() -> Plan {
-    let template_resource =
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::new("route53.Record", "validation_records").with_binding("validation_records");
+    template_resource
+        .attributes
+        .extend(deferred_record_attributes());
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: deferred_record_attributes(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
@@ -268,7 +270,11 @@ fn build_deferred_for_plan() -> Plan {
 }
 
 fn build_anonymous_deferred_for_plan() -> Plan {
-    let template_resource = Resource::new("route53.Record", "validation_records");
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
+        Resource::new("route53.Record", "validation_records");
+    template_resource
+        .attributes
+        .extend(deferred_record_attributes());
     let parsed = carina_core::parser::parse_file(
         "for opt in cert.domain_validation_options {\n  aws.route53.Record { name = opt }\n}\n",
         std::path::Path::new("main.crn"),
@@ -296,7 +302,6 @@ fn build_anonymous_deferred_for_plan() -> Plan {
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: deferred_record_attributes(),
         target,
         iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
         binding: ForBinding::Simple("opt".to_string()),
@@ -316,14 +321,16 @@ fn build_anonymous_deferred_for_plan() -> Plan {
 }
 
 fn build_deferred_replace_plan() -> Plan {
-    let template_resource =
+    let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::new("route53.Record", "validation_records").with_binding("validation_records");
+    template_resource
+        .attributes
+        .extend(deferred_record_attributes());
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.Record".to_string(),
-        attributes: deferred_record_attributes(),
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
@@ -370,7 +377,7 @@ fn certificate_resource() -> Resource {
         )
 }
 
-fn deferred_record_attributes() -> Vec<(String, Value)> {
+fn deferred_record_attributes() -> Vec<(String, Value<LoopSlot>)> {
     vec![
         (
             "hosted_zone_id".to_string(),
@@ -383,11 +390,11 @@ fn deferred_record_attributes() -> Vec<(String, Value)> {
         ),
         (
             "name".to_string(),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         ),
         (
             "resource_records".to_string(),
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         ),
     ]
 }
@@ -411,6 +418,13 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("parse anonymous-loop fixture");
+    let parsed = carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        std::path::Path::new("."),
+    )
+    .expect("resolve anonymous-loop fixture")
+    .into_expanded()
+    .expect("anonymous-loop fixture must not retain parser placeholders");
     let mut resource = parsed
         .resources
         .into_iter()

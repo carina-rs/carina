@@ -3,7 +3,9 @@ use std::path::Path;
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
-use carina_core::parser::{BackendConfig, InferredExportParam, SavedProviderConfigs};
+use carina_core::parser::{
+    BackendConfig, ExpandedInferredExportParam as InferredExportParam, SavedProviderConfigs,
+};
 use carina_core::plan::SavedPlan;
 use carina_core::provider::{
     AppliedIdentifier, PersistedAttributes, Provider, ProviderRouter, ReadRequest,
@@ -492,19 +494,21 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
 /// [`ExpandedCanonicalResources`] witness, so a pending saved plan cannot be
 /// verified accidentally against the parser's pre-expansion resource view.
 pub(super) struct SavedPlanSecretCandidates {
-    validated: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
+    validated: ValidatedConfig<
+        ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
+    >,
     provider_inputs: ResolvedProviderInputs,
 }
 
 #[cfg(test)]
 pub(super) struct TestSavedPlanSecretCandidates {
-    parsed: carina_core::parser::ModuleResolvedInferredFile,
+    parsed: carina_core::parser::ExpandedInferredFile,
     provider_inputs: ResolvedProviderInputs,
 }
 
 #[cfg(test)]
 impl TestSavedPlanSecretCandidates {
-    pub(super) fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
+    pub(super) fn parsed(&self) -> &carina_core::parser::ExpandedInferredFile {
         &self.parsed
     }
 
@@ -515,7 +519,9 @@ impl TestSavedPlanSecretCandidates {
 
 impl SavedPlanSecretCandidates {
     pub(super) fn from_expansion(
-        validated: ValidatedConfig<ExpandedCanonicalResources<InferredExportParam>>,
+        validated: ValidatedConfig<
+            ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
+        >,
         provider_inputs: ResolvedProviderInputs,
     ) -> Self {
         Self {
@@ -526,7 +532,7 @@ impl SavedPlanSecretCandidates {
 
     #[cfg(test)]
     pub(super) fn from_test_parts(
-        parsed: carina_core::parser::ModuleResolvedInferredFile,
+        parsed: carina_core::parser::ExpandedInferredFile,
         provider_inputs: ResolvedProviderInputs,
     ) -> TestSavedPlanSecretCandidates {
         TestSavedPlanSecretCandidates {
@@ -535,7 +541,7 @@ impl SavedPlanSecretCandidates {
         }
     }
 
-    pub(super) fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
+    pub(super) fn parsed(&self) -> &carina_core::parser::ExpandedInferredFile {
         self.validated.resources().parsed()
     }
 
@@ -1286,13 +1292,13 @@ mod tests {
     }
 
     fn builtin_load() -> ProviderLoad {
-        ProviderLoad::for_test(Vec::new(), &[])
+        ProviderLoad::for_test::<carina_core::resource::NoPlaceholder>(Vec::new(), &[])
     }
 
     fn saved_provider_configs(
         configs: Vec<ProviderConfig>,
     ) -> carina_core::parser::SavedProviderConfigs {
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
         let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,

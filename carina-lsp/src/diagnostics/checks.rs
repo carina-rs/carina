@@ -2,19 +2,21 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
 use carina_core::binding_index::{
-    BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings,
+    BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings as GenericResolvedBindings,
 };
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
-    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan,
-    TopLevelBlockSourceSpan, TypeExpr,
+    AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, ParserPlaceholderBoundary,
+    SourceSpan, TopLevelBlockSourceSpan, TypeExpr,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ParserPlaceholder, Value as GenericValue,
+};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::typecheck::{self, TypecheckInference};
@@ -23,6 +25,9 @@ use super::{
     DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic, carina_diagnostic_range,
     parse_error_to_diagnostic, parser_span_range,
 };
+
+type Value = GenericValue<ParserPlaceholder>;
+type ResolvedBindings = GenericResolvedBindings<ParserPlaceholder>;
 
 /// Directory parse plus the typed module-resolution outcome.
 pub(super) struct MergedParseResult {
@@ -43,6 +48,23 @@ pub(super) enum MergedModuleResolution {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ExpansionBoundaryScope {
+    All,
+    Authored,
+    Unlocated,
+}
+
+impl ExpansionBoundaryScope {
+    fn includes(self, placeholder: &ParserPlaceholder) -> bool {
+        match self {
+            Self::All => true,
+            Self::Authored => placeholder.authored_location().is_some(),
+            Self::Unlocated => placeholder.authored_location().is_none(),
+        }
+    }
+}
+
 fn source_span_position(span: SourceSpan) -> (u32, u32) {
     (
         span.start_line().saturating_sub(1) as u32,
@@ -53,7 +75,10 @@ fn source_span_position(span: SourceSpan) -> (u32, u32) {
 fn top_level_anonymous_resources_with_spans<'a>(
     doc: &Document,
     current_file: &'a ParsedFile,
-) -> Vec<(&'a carina_core::resource::Resource, TopLevelBlockSourceSpan)> {
+) -> Vec<(
+    &'a carina_core::resource::Resource<carina_core::resource::ModuleSource, ParserPlaceholder>,
+    TopLevelBlockSourceSpan,
+)> {
     let Ok(authored_spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
     else {
         return Vec::new();
@@ -206,9 +231,11 @@ fn value_depends_on_module_output(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::RedactedSecret { .. }) => {
-            false
-        }
+        | Value::Deferred(
+            DeferredValue::Unknown(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Placeholder(_),
+        ) => false,
     }
 }
 
@@ -311,6 +338,7 @@ impl<'a> ContextFreeValue<'a> {
                 | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
                 | Value::Deferred(DeferredValue::Access(_))
                 | Value::Deferred(DeferredValue::Unknown(_))
+                | Value::Deferred(DeferredValue::Placeholder(_))
                 | Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
                 Value::Concrete(ConcreteValue::List(items)) => {
                     items.iter().all(is_context_free)
@@ -343,8 +371,15 @@ impl<'a> ContextFreeValue<'a> {
 trait SemanticLookup: Sized {
     fn lookup_in<'a, D>(
         &self,
-        merged: &'a carina_core::parser::File<ParsedExportParam, D>,
-    ) -> Option<&'a Self>;
+        merged: &'a carina_core::parser::File<
+            ParsedExportParam,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+        >,
+    ) -> Option<&'a Self>
+    where
+        D: carina_core::parser::DeferredForPhaseTraversal;
 
     fn value(&self) -> Option<&Value>;
 }
@@ -352,8 +387,16 @@ trait SemanticLookup: Sized {
 impl SemanticLookup for AttributeParameter {
     fn lookup_in<'a, D>(
         &self,
-        merged: &'a carina_core::parser::File<ParsedExportParam, D>,
-    ) -> Option<&'a Self> {
+        merged: &'a carina_core::parser::File<
+            ParsedExportParam,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+        >,
+    ) -> Option<&'a Self>
+    where
+        D: carina_core::parser::DeferredForPhaseTraversal,
+    {
         let authored_span = self.source_span();
         let authored_file = self.source_file();
         merged.attribute_params.iter().find(|candidate| {
@@ -369,8 +412,16 @@ impl SemanticLookup for AttributeParameter {
 impl SemanticLookup for ParsedExportParam {
     fn lookup_in<'a, D>(
         &self,
-        merged: &'a carina_core::parser::File<ParsedExportParam, D>,
-    ) -> Option<&'a Self> {
+        merged: &'a carina_core::parser::File<
+            ParsedExportParam,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+        >,
+    ) -> Option<&'a Self>
+    where
+        D: carina_core::parser::DeferredForPhaseTraversal,
+    {
         let authored_span = self.source_span();
         let authored_file = self.source_file();
         merged.export_params.iter().find(|candidate| {
@@ -559,9 +610,9 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
     }
 }
 
-/// Whether a deferred expression was parsed from the editor's current
-/// document. Both deferred typestates stamp the full source path, so compare
-/// by basename to the LSP-supplied `current_file_name`.
+/// Whether `deferred` was parsed from the editor's current document.
+/// `DeferredForExpression.file` is stamped with the full source path, so we
+/// compare by basename to the LSP-supplied `current_file_name`.
 fn deferred_in_current_file(file: Option<&str>, current_file_name: Option<&str>) -> bool {
     source_file_is_current(file, current_file_name)
 }
@@ -666,8 +717,11 @@ impl DiagnosticEngine {
 
     fn generated_identity_for_plain_resource(
         &self,
-        resource: &carina_core::resource::Resource,
-        providers: &[carina_core::parser::ProviderConfig],
+        resource: &carina_core::resource::Resource<
+            carina_core::resource::ModuleSource,
+            ParserPlaceholder,
+        >,
+        providers: &[carina_core::parser::ProviderConfig<ParserPlaceholder>],
     ) -> Option<String> {
         let mut candidate = vec![resource.clone()];
         let canonical =
@@ -1195,12 +1249,11 @@ impl DiagnosticEngine {
                 continue;
             };
 
-            let validation =
-                carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
-                    factory.as_ref(),
-                    &provider.name,
-                    &provider.attributes,
-                );
+            let validation = carina_core::executor::provider_ready::validate_parser_provider_config(
+                factory.as_ref(),
+                &provider.name,
+                &provider.attributes,
+            );
             if let Err(error) = validation {
                 if error.provider_error().is_some_and(|provider_error| {
                     !deduplicator.should_emit(&provider.name, provider_error)
@@ -2284,7 +2337,9 @@ impl DiagnosticEngine {
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
-        inference_bindings: &carina_core::validation::inference::InferenceBindings,
+        inference_bindings: &carina_core::validation::inference::InferenceBindings<
+            ParserPlaceholder,
+        >,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let semantic_params = parsed
@@ -2587,8 +2642,16 @@ impl DiagnosticEngine {
     fn check_inferred_export_types<D>(
         &self,
         doc: &Document,
-        inference_input: &carina_core::parser::File<ParsedExportParam, D>,
-    ) -> Vec<Diagnostic> {
+        inference_input: &carina_core::parser::File<
+            ParsedExportParam,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+        >,
+    ) -> Vec<Diagnostic>
+    where
+        D: carina_core::parser::DeferredForPhaseTraversal,
+    {
         let mut diagnostics = Vec::new();
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
             let provider_inferred = carina_core::validation::inference::
@@ -2650,8 +2713,16 @@ impl DiagnosticEngine {
 
     fn infer_export_params_without_loaded_provider_schemas<D>(
         &self,
-        parsed: &carina_core::parser::File<ParsedExportParam, D>,
-    ) -> carina_core::validation::inference::SchemaCheckedExportParams {
+        parsed: &carina_core::parser::File<
+            ParsedExportParam,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+        >,
+    ) -> carina_core::validation::inference::SchemaCheckedExportParams
+    where
+        D: carina_core::parser::DeferredForPhaseTraversal,
+    {
         carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
     }
 
@@ -2981,37 +3052,69 @@ impl DiagnosticEngine {
         None
     }
 
-    /// Walk the buffer line-by-line and emit a `WARNING` diagnostic for every
-    /// empty `${}` interpolation inside a double-quoted string. The parser
-    /// accepts the empty form (so the rest of the AST stays intact and other
-    /// diagnostics keep running), but a buffer that ships with literal `${}`
-    /// will produce a meaningless value at apply time — so the user wants a
-    /// hint that the placeholder is unfilled. An empty body only admits spaces
-    /// and tabs, so it cannot cross a line; non-empty expressions use normal
-    /// trivia, including newlines at either edge. See #2480 and #3959.
-    ///
-    /// The shared source lexer is used rather than an AST walk: the parser
-    /// stamps the empty case as
-    /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))` but discards the
-    /// source span, so the diagnostic range has to come from a source-level
-    /// pass anyway. Sharing this lexer also keeps heredoc boundaries aligned
-    /// with semantic tokens and completion.
-    pub(super) fn check_empty_interpolations(&self, doc: &Document) -> Vec<Diagnostic> {
-        crate::lex::lex(&doc.text())
-            .interpolations()
-            .iter()
-            .copied()
-            .filter(|span| span.is_inline_empty())
-            .filter_map(|span| {
-                let end = span.end?;
-                debug_assert_eq!(span.start.line, end.line);
-                Some(carina_diagnostic(
-                    span.start.line,
-                    span.start.character,
-                    end.character,
-                    DiagnosticSeverity::WARNING,
-                    "empty interpolation `${}` — fill in the expression or remove it".to_string(),
-                ))
+    /// Run the same typed parser-placeholder boundary as CLI validation.
+    pub(super) fn check_expansion_boundary(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        boundary: ParserPlaceholderBoundary,
+        scope: ExpansionBoundaryScope,
+    ) -> Vec<Diagnostic> {
+        let Err(leftovers) = parsed.validate_expansion_boundary(boundary) else {
+            return Vec::new();
+        };
+        leftovers
+            .into_errors()
+            .into_iter()
+            .filter_map(|error| {
+                if !scope.includes(error.placeholder()) {
+                    return None;
+                }
+                let message = error.to_string();
+                match error.placeholder() {
+                    placeholder @ (ParserPlaceholder::EmptyInterpolation { .. }
+                    | ParserPlaceholder::ModuleArgument { .. }) => {
+                        let Some((source_file, range)) = placeholder.authored_location() else {
+                            // Parser-created placeholders always carry an
+                            // authored span. Serde deliberately drops that
+                            // diagnostic-only metadata, so keep a deserialized
+                            // value visible if one ever reaches the LSP.
+                            return Some(carina_diagnostic(
+                                0,
+                                0,
+                                0,
+                                DiagnosticSeverity::ERROR,
+                                message,
+                            ));
+                        };
+                        if source_file != doc.source_file() {
+                            return None;
+                        }
+                        Some(carina_diagnostic_range(
+                            Range {
+                                start: Position {
+                                    line: range.start_line().saturating_sub(1) as u32,
+                                    character: range.start_column().saturating_sub(1) as u32,
+                                },
+                                end: Position {
+                                    line: range.end_line().saturating_sub(1) as u32,
+                                    character: range.end_column().saturating_sub(1) as u32,
+                                },
+                            },
+                            DiagnosticSeverity::ERROR,
+                            message,
+                        ))
+                    }
+                    ParserPlaceholder::FnParam { .. }
+                    | ParserPlaceholder::FnLocal { .. }
+                    | ParserPlaceholder::Loop(_) => Some(carina_diagnostic(
+                        0,
+                        0,
+                        0,
+                        DiagnosticSeverity::ERROR,
+                        message,
+                    )),
+                }
             })
             .collect()
     }

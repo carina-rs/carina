@@ -45,10 +45,15 @@ pub async fn run_export(
         )?
         .parsed;
         let base_dir = get_base_dir(path);
+        let backend_config = parsed
+            .backend
+            .clone()
+            .map(carina_core::parser::BackendConfig::into_expanded)
+            .transpose()?;
         let backend = resolve_backend_for_read(
             base_dir,
             path,
-            parsed.backend.as_ref(),
+            backend_config.as_ref(),
             BackendLockRequirement::AllowMissing,
             ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
         )

@@ -13,14 +13,17 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::Document;
 use crate::position;
 use carina_core::parser::{
-    ParseError, ParsedFile, ResourceContext, ResourceRef, SourceSpan, WarningKind,
-    contains_function_call,
+    ParseError, ParsedFile, ResourceRef, SourceSpan, WarningKind, contains_function_call,
 };
 use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ParserPlaceholder, Value as GenericValue,
+};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+type Value = GenericValue<ParserPlaceholder>;
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
@@ -199,9 +202,9 @@ enum DiagnosticProviderContext {
 
 struct DiagnosticValidationInputs<'a> {
     binding_index: carina_core::binding_index::BindingIndex<'a>,
-    inference_bindings: carina_core::validation::inference::InferenceBindings,
+    inference_bindings: carina_core::validation::inference::InferenceBindings<ParserPlaceholder>,
     binding_use_report: carina_core::validation::BindingUseReport,
-    export_value_bindings: carina_core::binding_index::ResolvedBindings,
+    export_value_bindings: carina_core::binding_index::ResolvedBindings<ParserPlaceholder>,
 }
 
 impl DiagnosticProviderContext {
@@ -306,7 +309,12 @@ impl DiagnosticEngine {
 
     fn validation_inputs<'a, D>(
         &'a self,
-        binding_input: &'a carina_core::parser::File<carina_core::parser::ParsedExportParam, D>,
+        binding_input: &'a carina_core::parser::File<
+            carina_core::parser::ParsedExportParam,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+        >,
         upstream_exports: &'a carina_core::upstream_exports::UpstreamExports,
         module_signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> DiagnosticValidationInputs<'a>
@@ -379,12 +387,6 @@ impl DiagnosticEngine {
         });
         let current_file_name = current_file_name.as_deref();
 
-        // Empty `${}` interpolation hint. Runs even when other parses
-        // succeeded — and especially before the buffer-only checks
-        // below — so users get an actionable warning right at the
-        // placeholder rather than only learning at apply time.
-        diagnostics.extend(self.check_empty_interpolations(doc));
-
         // Build the directory-scoped merged parse once up-front — it is
         // the authoritative source of truth for every check that needs
         // cross-file context: undefined-identifier (#2132), upstream-
@@ -436,14 +438,12 @@ impl DiagnosticEngine {
         // When the authoritative directory parse succeeds, use its per-file
         // semantic AST for source-oriented checks instead of dropping every
         // check merely because the provisional document parse failed.
-        let merged_current_file = || {
-            current_file_path.and_then(|path| {
-                merged_result
-                    .as_ref()
-                    .and_then(|result| result.directory.semantic_file(path))
-            })
-        };
-        let current_parsed = doc.parsed().or_else(merged_current_file);
+        let merged_current_file = current_file_path.and_then(|path| {
+            merged_result
+                .as_ref()
+                .and_then(|result| result.directory.semantic_file(path))
+        });
+        let current_parsed = doc.parsed().or(merged_current_file);
         // A source parsed in isolation cannot know sibling function
         // declarations. Prefer the successful directory parse over that
         // provisional failure (notably a sibling user function used as a
@@ -510,6 +510,35 @@ impl DiagnosticEngine {
         let merged = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
+        if let Some(boundary_file) = merged_current_file.or(current_parsed) {
+            let boundary =
+                if carina_core::validation::is_module_definition(merged.unwrap_or(boundary_file)) {
+                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+                } else {
+                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+                };
+            if let Some(merged) = merged {
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    merged,
+                    boundary,
+                    checks::ExpansionBoundaryScope::Authored,
+                ));
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    boundary_file,
+                    boundary,
+                    checks::ExpansionBoundaryScope::Unlocated,
+                ));
+            } else {
+                diagnostics.extend(self.check_expansion_boundary(
+                    doc,
+                    boundary_file,
+                    boundary,
+                    checks::ExpansionBoundaryScope::All,
+                ));
+            }
+        }
         if let Some(current_file) = current_parsed {
             diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
                 doc,
@@ -1509,11 +1538,8 @@ impl DiagnosticEngine {
                                 }
                                 (
                                     _,
-                                    Value::Deferred(DeferredValue::Unknown(
-                                        carina_core::resource::UnknownReason::ModuleArgument {
-                                            name,
-                                            ..
-                                        },
+                                    Value::Deferred(DeferredValue::Placeholder(
+                                        ParserPlaceholder::ModuleArgument { name, .. },
                                     )),
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_index,
@@ -1848,7 +1874,7 @@ impl DiagnosticEngine {
             // context meant for CLI output only and are not elevated here.
             diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
             diagnostics.extend(self.check_single_quoted_interpolation_warnings(parsed));
-            let prevent_destroy_warnings = merged_current_file().unwrap_or(parsed);
+            let prevent_destroy_warnings = merged_current_file.unwrap_or(parsed);
             diagnostics
                 .extend(self.check_non_literal_prevent_destroy_warnings(prevent_destroy_warnings));
 
@@ -2244,13 +2270,19 @@ impl DiagnosticEngine {
 /// parses). Callers that fall back to `None` get document-wide search —
 /// the historic behavior — which is still correct when there's no
 /// ambiguity.
-fn resource_source_range<D: carina_core::parser::DeferredForPhaseTraversal>(
+fn resource_source_range<P, T, D>(
     doc: &Document,
-    ctx: ResourceContext<'_, carina_core::resource::ModuleSource, D>,
+    ctx: carina_core::parser::ResourceContext<'_, carina_core::resource::ModuleSource, P, T, D>,
     provider: &str,
     resource_type: &str,
     authored_direct_start: Option<u32>,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32)>
+where
+    P: carina_core::resource::PlaceholderKind,
+    T: carina_core::resource::PlaceholderKind,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T>,
+{
+    use carina_core::parser::ResourceContext;
     let text = doc.text();
     let lines: Vec<&str> = text.lines().collect();
 

@@ -25,8 +25,8 @@ use crate::provider::{
     UpdateRequest, fixture_read_outcome, fixture_read_outcome_for_identifier,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, PathSegment,
-    ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity, UnknownReason, Value,
+    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, LoopSlot, PathSegment,
+    ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity, Value,
 };
 use crate::value::SerializationError;
 use parallel::build_dependency_levels;
@@ -101,9 +101,9 @@ fn create_effect(resource: Resource) -> Effect {
     Effect::Create(resolved(resource))
 }
 
-fn for_value_access(fields: &[&str]) -> Value {
+fn for_value_access(fields: &[&str]) -> Value<LoopSlot> {
     fields.iter().fold(
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+        Value::<LoopSlot>::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         |base, field| {
             crate::resource::apply_postfix_access(
                 base,
@@ -119,7 +119,8 @@ fn for_value_access(fields: &[&str]) -> Value {
 }
 
 fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
-    let mut template_resource = Resource::new("test", "validation_records");
+    let mut template_resource: Resource<crate::resource::ModuleSource, LoopSlot> =
+        Resource::new("test", "validation_records");
     template_resource.binding = Some("validation_records".to_string());
     template_resource
         .dependency_bindings
@@ -132,11 +133,6 @@ fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression 
         line: 1,
         header: "for opt in cert.domain_validation_options".to_string(),
         resource_type: "test.ValidationRecord".to_string(),
-        attributes: template_resource
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
         target: crate::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },
@@ -160,10 +156,9 @@ fn anonymous_deferred_collision_fixture() -> (
         std::path::Path::new("main.crn"),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("unbound deferred loop parses");
-    let parsed =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect("deferred fixture crosses the module-resolution seam");
+    .expect("unbound deferred loop parses")
+    .into_expanded()
+    .expect("deferred-loop fixture contains no parser placeholders");
     let template = parsed.deferred_for_expressions()[0].clone();
     let mut bindings = ResolvedBindings::default();
     bindings.set_with_completeness(
@@ -886,21 +881,6 @@ fn resource_with_attr(value: Value) -> Resource {
     resource
 }
 
-fn for_value_path_unknown() -> Value {
-    for_value_access(&["resource_record", "name"])
-}
-
-#[test]
-fn resolved_resource_constructor_rejects_value_unknown() {
-    let err = basic::resolved_resource(resource_with_attr(for_value_path_unknown()))
-        .expect_err("deferred unknown must not construct a ResolvedResource");
-
-    assert!(
-        matches!(err, SerializationError::UnresolvedAccess { .. }),
-        "expected UnresolvedAccess, got {err:?}"
-    );
-}
-
 #[test]
 fn resolved_resource_constructor_rejects_resource_ref() {
     let value = Value::Deferred(DeferredValue::ResourceRef {
@@ -921,7 +901,11 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
     let mut map = indexmap::IndexMap::new();
     map.insert(
         "secret".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(for_value_path_unknown()))),
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
+            DeferredValue::ResourceRef {
+                path: AccessPath::new("cert", "domain_validation_options"),
+            },
+        )))),
     );
     let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(map),
@@ -931,8 +915,8 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
         .expect_err("nested deferred values must not construct a ResolvedResource");
 
     assert!(
-        matches!(err, SerializationError::UnresolvedAccess { .. }),
-        "expected UnresolvedAccess, got {err:?}"
+        matches!(err, SerializationError::UnresolvedResourceRef { .. }),
+        "expected UnresolvedResourceRef, got {err:?}"
     );
 }
 
@@ -6711,6 +6695,9 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
     .expect("reference alias source parses");
     crate::parser::resolve_resource_refs(&mut parsed)
         .expect("pre-apply reference resolution succeeds");
+    let parsed = parsed
+        .into_expanded()
+        .expect("reference alias fixture contains no parser placeholders");
 
     let role = parsed
         .resources

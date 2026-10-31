@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
 use crate::provider::ProviderLoadedSchemaRegistry;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind, Value};
 use crate::schema::{AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry};
 pub use crate::static_type::InferenceError;
 use crate::static_type::{
@@ -54,14 +54,14 @@ use crate::static_type::{
 /// expression on the module's `attributes { ... }` block, instead of
 /// failing with `unknown binding` (#2493).
 #[derive(Debug, Clone)]
-pub enum InferenceBinding {
+pub enum InferenceBinding<P: PlaceholderKind = NoPlaceholder> {
     Resource {
         provider: String,
         resource_type: String,
     },
     UpstreamState,
     Virtual {
-        attributes: indexmap::IndexMap<String, Value>,
+        attributes: indexmap::IndexMap<String, Value<P>>,
     },
     /// Module-call binding registered before module expansion.
     /// Inference treats it like `UpstreamState` (known-but-non-
@@ -72,7 +72,7 @@ pub enum InferenceBinding {
     /// that can actually project to a `TypeExpr`. #2493.
     ModuleCall,
     /// A value parameter declared by an `arguments {}` block. Parser-side
-    /// expressions carry an `Unknown(ModuleArgument)` placeholder until the
+    /// expressions carry a `Placeholder(ModuleArgument)` until the
     /// caller value is substituted; retaining the declaration here lets
     /// postfix access be checked before expansion.
     Argument {
@@ -87,12 +87,18 @@ pub enum InferenceBinding {
     },
 }
 
-pub type InferenceBindings = HashMap<String, InferenceBinding>;
+pub type InferenceBindings<P = NoPlaceholder> = HashMap<String, InferenceBinding<P>>;
 
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
-pub fn bindings_from_parsed<E, D>(parsed: &crate::parser::File<E, D>) -> InferenceBindings {
+pub fn bindings_from_parsed<E, P, T, D>(
+    parsed: &crate::parser::File<E, P, T, D>,
+) -> InferenceBindings<P>
+where
+    P: PlaceholderKind + PartialEq,
+    T: PlaceholderKind,
+{
     // carina#3181: pass the typed top-level slices directly so
     // `bindings_from_parts` classifies managed resources, data sources,
     // and (post-expansion) composition rows from their own kinds.
@@ -151,12 +157,12 @@ pub fn bindings_from_parsed<E, D>(parsed: &crate::parser::File<E, D>) -> Inferen
 /// instead of degrading to `NonInferableBinding`. Two resource bindings
 /// with the same name likewise remain deterministic here while the loader
 /// diagnostic reports the collision to the user.
-pub fn bindings_from_parts(
-    resources: &[crate::resource::Resource],
-    data_sources: &[crate::resource::DataSource],
-    compositions: &[crate::resource::LiveComposition],
+pub fn bindings_from_parts<P: PlaceholderKind + PartialEq>(
+    resources: &[crate::resource::Resource<crate::resource::ModuleSource, P>],
+    data_sources: &[crate::resource::DataSource<crate::resource::ModuleSource, P>],
+    compositions: &[crate::resource::LiveComposition<P>],
     upstream_states: &[crate::parser::UpstreamState],
-) -> InferenceBindings {
+) -> InferenceBindings<P> {
     let mut out = InferenceBindings::new();
     for us in upstream_states {
         out.insert(us.binding.clone(), InferenceBinding::UpstreamState);
@@ -218,9 +224,9 @@ pub fn bindings_from_parts(
 /// expected to either fall back to a user-supplied annotation or
 /// surface the error as "type annotation required" at the offending
 /// field.
-pub fn infer_type_from_value(
-    value: &Value,
-    bindings: &InferenceBindings,
+pub fn infer_type_from_value<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &InferenceBindings<P>,
     schemas: &SchemaRegistry,
 ) -> Result<TypeExpr, InferenceIssue> {
     let mut visiting = indexmap::IndexSet::new();
@@ -242,11 +248,11 @@ fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> Inferenc
 /// remain unknown, while literals and computed values whose return shape is
 /// intrinsic (for example `split(...)[0]`) can still be checked. Callers use
 /// this instead of manufacturing empty binding/schema registries.
-pub(crate) fn infer_type_from_value_without_bindings(
-    value: &Value,
+pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind>(
+    value: &Value<P>,
 ) -> Result<TypeExpr, InferenceIssue> {
-    fn infer_collection_without_bindings<'a>(
-        values: impl IntoIterator<Item = &'a Value>,
+    fn infer_collection_without_bindings<'a, P: PlaceholderKind + 'a>(
+        values: impl IntoIterator<Item = &'a Value<P>>,
         wrap: impl FnOnce(Box<TypeExpr>) -> TypeExpr,
     ) -> Result<TypeExpr, InferenceIssue> {
         let mut values = values.into_iter();
@@ -387,7 +393,8 @@ pub(crate) fn infer_type_from_value_without_bindings(
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
+        | Value::Deferred(DeferredValue::Unknown(_))
+        | Value::Deferred(DeferredValue::Placeholder(_)) => Err(InferenceError::UnknownType {
             reason: "value requires binding/schema authority".to_string(),
         }
         .into()),
@@ -402,9 +409,9 @@ pub(crate) fn infer_type_from_value_without_bindings(
 /// `Virtual` recursion returns, so unrelated sibling traversals (two
 /// list elements that each resolve through different `Virtual`
 /// bindings) do not see each other.
-fn infer_type_from_value_with_visiting(
-    value: &Value,
-    bindings: &InferenceBindings,
+fn infer_type_from_value_with_visiting<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &InferenceBindings<P>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
@@ -549,35 +556,26 @@ fn infer_type_from_value_with_visiting(
                 })
             })
         }
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { name, .. },
-        )) => match bindings.get(name) {
-            Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
-            Some(InferenceBinding::Resource { .. })
-            | Some(InferenceBinding::UpstreamState)
-            | Some(InferenceBinding::Virtual { .. })
-            | Some(InferenceBinding::ModuleCall)
-            | Some(InferenceBinding::UserFunction { .. })
-            | None => Err(InferenceError::UnknownType {
-                reason: format!("module argument `{name}` has no type authority"),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            let Some(name) = placeholder.inference_binding_name() else {
+                return Err(InferenceError::UnknownType {
+                    reason: "parser placeholder has no inferable type authority".to_string(),
+                }
+                .into());
+            };
+            match bindings.get(name) {
+                Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
+                Some(InferenceBinding::Resource { .. })
+                | Some(InferenceBinding::UpstreamState)
+                | Some(InferenceBinding::Virtual { .. })
+                | Some(InferenceBinding::ModuleCall)
+                | Some(InferenceBinding::UserFunction { .. })
+                | None => Err(InferenceError::UnknownType {
+                    reason: format!("parser binding `{name}` has no type authority"),
+                }
+                .into()),
             }
-            .into()),
-        },
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::FnParam { name }
-            | crate::resource::UnknownReason::FnLocal { name },
-        )) => match bindings.get(name) {
-            Some(InferenceBinding::Argument { type_expr }) => Ok(type_expr.clone()),
-            Some(InferenceBinding::Resource { .. })
-            | Some(InferenceBinding::UpstreamState)
-            | Some(InferenceBinding::Virtual { .. })
-            | Some(InferenceBinding::ModuleCall)
-            | Some(InferenceBinding::UserFunction { .. })
-            | None => Err(InferenceError::UnknownType {
-                reason: format!("function value `{name}` has no type authority"),
-            }
-            .into()),
-        },
+        }
         Value::Deferred(DeferredValue::Unknown(_)) => Err(InferenceError::UnknownType {
             reason: "value not yet known at plan time (unresolved upstream)".to_string(),
         }
@@ -593,8 +591,6 @@ fn require_proven_integer_operand(
 ) -> Result<TypeExpr, InferenceIssue> {
     match inferred {
         Ok(inferred) => Ok(inferred),
-        // Preserve the innermost arithmetic operator and operand when nested
-        // arithmetic is the actual source of the failure.
         Err(
             error @ InferenceIssue::Failed(InferenceError::InvalidIntegerArithmeticOperand {
                 ..
@@ -663,16 +659,17 @@ fn inferred_scalar_kind(
     }
 }
 
-fn infer_collection<'a, I, F>(
+fn infer_collection<'a, I, F, P>(
     items: I,
-    bindings: &InferenceBindings,
+    bindings: &InferenceBindings<P>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
     wrap: F,
 ) -> Result<TypeExpr, InferenceIssue>
 where
-    I: IntoIterator<Item = &'a Value>,
+    I: IntoIterator<Item = &'a Value<P>>,
     F: FnOnce(Box<TypeExpr>) -> TypeExpr,
+    P: PlaceholderKind + 'a,
 {
     // All-or-nothing: every element must infer cleanly and to the
     // same type. Tolerating dynamic siblings ("the concrete one
@@ -701,11 +698,11 @@ where
     Ok(wrap(Box::new(first)))
 }
 
-fn infer_resource_ref_with_visiting(
+fn infer_resource_ref_with_visiting<P: PlaceholderKind>(
     binding: &str,
     attribute: &str,
     segments: &[crate::resource::PathSegment],
-    bindings: &InferenceBindings,
+    bindings: &InferenceBindings<P>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
@@ -1014,10 +1011,10 @@ pub(super) fn attribute_type_to_type_expr(
     }
 }
 
-fn infer_function_call(
+fn infer_function_call<P: PlaceholderKind>(
     name: &str,
-    args: &[crate::resource::FunctionArgument],
-    bindings: &InferenceBindings,
+    args: &[crate::resource::FunctionArgument<P>],
+    bindings: &InferenceBindings<P>,
     schemas: &SchemaRegistry,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
@@ -1086,9 +1083,19 @@ fn infer_function_call(
 /// Phase transition (#2360 stage 2): attach declared/inferred origin and any
 /// typed unchecked reason to every export.
 pub fn apply_inference<D>(
-    parsed: crate::parser::File<crate::parser::ParsedExportParam, D>,
+    parsed: crate::parser::File<
+        crate::parser::ParsedExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &SchemaRegistry,
-) -> crate::parser::File<crate::parser::InferredExportParam, D> {
+) -> crate::parser::File<
+    crate::parser::InferredExportParam,
+    crate::resource::ParserPlaceholder,
+    crate::resource::ParserPlaceholder,
+    D,
+> {
     let inferred_exports = infer_export_params(&parsed, schemas).into_parameters();
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
@@ -1120,7 +1127,12 @@ impl SchemaCheckedExportParams {
 /// (LSP diagnostics, in particular) should use this instead to avoid
 /// the per-keystroke deep-clone.
 pub fn infer_export_params<D>(
-    parsed: &crate::parser::File<crate::parser::ParsedExportParam, D>,
+    parsed: &crate::parser::File<
+        crate::parser::ParsedExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &SchemaRegistry,
 ) -> SchemaCheckedExportParams {
     let bindings = bindings_from_parsed(parsed);
@@ -1176,7 +1188,12 @@ impl ExportParamsInferredWithLoadedProviderSchemas {
 
 /// Infer export parameters using schemas proven to come from provider loading.
 pub fn infer_export_params_with_loaded_provider_schemas<D>(
-    parsed: &crate::parser::File<crate::parser::ParsedExportParam, D>,
+    parsed: &crate::parser::File<
+        crate::parser::ParsedExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &ProviderLoadedSchemaRegistry,
 ) -> ExportParamsInferredWithLoadedProviderSchemas {
     ExportParamsInferredWithLoadedProviderSchemas {
@@ -1221,7 +1238,12 @@ pub fn attached_inference_failures<'a>(
 /// authority. A newly reportable failure replaces that reason; successful or
 /// still-deferred probes retain the original provenance.
 pub fn retry_unchecked_export_inference<'a, D>(
-    parsed: &'a mut crate::parser::File<crate::parser::InferredExportParam, D>,
+    parsed: &'a mut crate::parser::File<
+        crate::parser::InferredExportParam,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+    >,
     schemas: &ProviderLoadedSchemaRegistry,
 ) -> ExportsInferredWithLoadedProviderSchemas<'a> {
     let bindings = bindings_from_parsed(parsed);
@@ -1285,7 +1307,13 @@ mod tests {
         legacy_validator,
     };
 
-    fn noop(_v: &Value) -> Result<(), String> {
+    type Value = crate::resource::Value<crate::resource::ParserPlaceholder>;
+    type ConcreteValue = crate::resource::ConcreteValue<crate::resource::ParserPlaceholder>;
+    type DeferredValue = crate::resource::DeferredValue<crate::resource::ParserPlaceholder>;
+    type ParserValue = crate::resource::Value<crate::resource::ParserPlaceholder>;
+    type ParserDeferredValue = crate::resource::DeferredValue<crate::resource::ParserPlaceholder>;
+
+    fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
     }
 
@@ -1403,11 +1431,10 @@ mod tests {
                 },
             )]);
             let expression = evaluate_integer_values(
-                Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
+                Value::Deferred(DeferredValue::Placeholder(
+                    crate::resource::ParserPlaceholder::ModuleArgument {
                         name: name.to_string(),
-                        source_line: Default::default(),
-                        diagnostic_name: None,
+                        diagnostic: Default::default(),
                     },
                 )),
                 IntegerOp::Add,
@@ -1451,7 +1478,7 @@ mod tests {
         }
     }
 
-    fn binding_to_vpc(name: &str) -> InferenceBindings {
+    fn binding_to_vpc(name: &str) -> InferenceBindings<crate::resource::ParserPlaceholder> {
         let mut b = InferenceBindings::new();
         b.insert(
             name.to_string(),
@@ -1906,12 +1933,20 @@ mod tests {
 
     #[test]
     fn postfix_access_on_unknown_base_keeps_type_unknown() {
-        use crate::resource::{
-            AccessMissPolicy, PathSegment, Subscript, UnknownReason, apply_postfix_access,
-        };
+        use crate::resource::{AccessMissPolicy, PathSegment, Subscript, apply_postfix_access};
 
         let value = apply_postfix_access(
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
+            ParserValue::Deferred(ParserDeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::EmptyInterpolation {
+                    source: crate::resource::DiagnosticSourceSpan::authored(
+                        "test.crn".into(),
+                        1,
+                        1,
+                        1,
+                        4,
+                    ),
+                },
+            )),
             PathSegment::Subscript {
                 index: Subscript::Int { index: 0 },
             },
@@ -2052,7 +2087,8 @@ mod tests {
         // degrading to `NonInferableBinding`.
         use crate::parser::UpstreamState;
         use crate::resource::Resource;
-        let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
+        let resource: Resource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder> =
+            Resource::with_provider("awscc", "ec2.Vpc", "main", None).with_binding("x");
         let upstream = UpstreamState {
             binding: "x".to_string(),
             source: std::path::PathBuf::from("../other"),
@@ -2071,7 +2107,8 @@ mod tests {
             binding: "network".to_string(),
             source: std::path::PathBuf::from("../network"),
         };
-        let bindings = bindings_from_parts(&[], &[], &[], &[upstream]);
+        let bindings =
+            bindings_from_parts::<crate::resource::ParserPlaceholder>(&[], &[], &[], &[upstream]);
         assert!(matches!(
             bindings.get("network"),
             Some(InferenceBinding::UpstreamState)
@@ -2445,8 +2482,10 @@ mod tests {
         // `vpc_id` here stands in for the module-exposed attribute that
         // points at the inner role's schema attribute. carina#3181:
         // compositions are a distinct typestate in `compositions`.
-        let mut virt_attrs: indexmap::IndexMap<String, crate::resource::LiveCompositionAttribute> =
-            indexmap::IndexMap::new();
+        let mut virt_attrs: indexmap::IndexMap<
+            String,
+            crate::resource::LiveCompositionAttribute<crate::resource::ParserPlaceholder>,
+        > = indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_id".to_string(),
             crate::resource::LiveCompositionAttribute::from_value(
@@ -2560,7 +2599,9 @@ mod tests {
     }
 
     /// Convenience for the `Virtual`-binding cycle tests below.
-    fn composition_binding(attrs: &[(&str, Value)]) -> InferenceBinding {
+    fn composition_binding(
+        attrs: &[(&str, Value)],
+    ) -> InferenceBinding<crate::resource::ParserPlaceholder> {
         let mut map = indexmap::IndexMap::new();
         for (k, v) in attrs {
             map.insert((*k).to_string(), v.clone());

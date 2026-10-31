@@ -5012,6 +5012,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Deferred(DeferredValue::Unknown(_)) => {
             crate::resource::assert_value_fully_resolved(value)
         }
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -8223,7 +8224,7 @@ mod tests {
 
     #[test]
     fn enum_canonicalization_error_renders_its_reason_once() {
-        let mut resources = vec![
+        let mut resources: Vec<Resource> = vec![
             Resource::with_provider("test", "widget", "example", None).with_attribute(
                 "mode",
                 Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.invalid")),
@@ -9221,7 +9222,7 @@ mod tests {
 
     #[test]
     fn partial_create_and_update_share_the_canonical_pending_reread_value() {
-        use crate::resource::{PendingReRead, ReReadReason, UnknownReason};
+        use crate::resource::{ApplyTimeUnknown, PendingReRead, ReReadReason};
 
         fn assert_materialized(mut state: State, expected: &PendingReRead) {
             let marker = state
@@ -9239,7 +9240,7 @@ mod tests {
                 .attributes
                 .get("computed")
                 .expect("missing attribute is materialized");
-            let Value::Deferred(DeferredValue::Unknown(UnknownReason::PendingReRead(pending))) =
+            let Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(pending))) =
                 unknown
             else {
                 panic!(
@@ -9248,7 +9249,7 @@ mod tests {
             };
             assert_eq!(pending, expected);
             let rendered =
-                crate::value::render_unknown(&UnknownReason::PendingReRead(pending.clone()));
+                crate::value::render_unknown(&ApplyTimeUnknown::PendingReRead(pending.clone()));
             assert_eq!(
                 rendered,
                 "(unknown until next refresh: read after apply was incomplete — provider returned a partial read)"
@@ -11611,7 +11612,9 @@ mod tests {
 
         let peer_ref = Value::resource_ref("peer", "identifier", Vec::new());
         let pending = Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ForValue,
+            crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                binding: "upstream".to_string(),
+            },
         ));
         let mut resources = vec![
             Resource::with_provider("normalizing", "test", "example", None)
@@ -11629,7 +11632,7 @@ mod tests {
         assert!(matches!(
             resources[0].get_attr("pending"),
             Some(Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports { .. }
             )))
         ));
     }

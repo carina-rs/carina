@@ -43,9 +43,17 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
 
 fn mixed_tag_key_style_warnings_for_population<E, D>(
     root_inputs: &[(PathBuf, String)],
-    parsed: &carina_core::parser::File<E, D>,
+    parsed: &carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        D,
+    >,
     base_dir: &Path,
-) -> Vec<LintWarning> {
+) -> Vec<LintWarning>
+where
+    D: carina_core::parser::DeferredForPhaseTraversal,
+{
     let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
     mixed_tag_key_style_warnings(&tag_keys)
 }
@@ -58,7 +66,15 @@ enum LintFile {
 impl LintFile {
     fn iter_top_level_resources(
         &self,
-    ) -> Box<dyn Iterator<Item = carina_core::parser::ResourceRef<'_>> + '_> {
+    ) -> Box<
+        dyn Iterator<
+                Item = carina_core::parser::TopLevelResourceRef<
+                    '_,
+                    carina_core::resource::ModuleSource,
+                    carina_core::resource::ParserPlaceholder,
+                >,
+            > + '_,
+    > {
         match self {
             Self::Blocked(parsed) => Box::new(parsed.iter_top_level_resources()),
             Self::Resolved(parsed) => Box::new(parsed.iter_top_level_resources()),
@@ -169,13 +185,11 @@ pub fn run_lint(
     // have no schema, so `get_for` returns `None` for them.
     for rref in parsed.iter_top_level_resources() {
         let schema = match rref {
-            carina_core::parser::ResourceRef::Resource(m) => schemas.get_for(m),
-            carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
-            carina_core::parser::ResourceRef::LiveComposition(_) => None,
-            carina_core::parser::ResourceRef::Deferred {
-                resource,
-                deferred: _deferred,
-            } => schemas.get_for(resource),
+            carina_core::parser::TopLevelResourceRef::Resource(m) => schemas.get_for(m),
+            carina_core::parser::TopLevelResourceRef::DataSource(d) => {
+                schemas.get_for_data_source(d)
+            }
+            carina_core::parser::TopLevelResourceRef::LiveComposition(_) => None,
         };
         if let Some(schema) = schema {
             let schema = schema.as_schema();

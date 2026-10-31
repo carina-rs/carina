@@ -203,9 +203,11 @@ fn snapshot_postfix_access() {
 #[test]
 fn snapshot_deferred_integer_arithmetic_is_structural() {
     let expression = carina_core::integer_arithmetic::evaluate_integer_values(
-        carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Unknown(
-            carina_core::resource::UnknownReason::ForValue,
-        )),
+        carina_core::resource::Value::<carina_core::resource::LoopSlot>::Deferred(
+            carina_core::resource::DeferredValue::Placeholder(
+                carina_core::resource::LoopSlot::Value,
+            ),
+        ),
         carina_core::integer_arithmetic::IntegerOp::Divide,
         carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::Int(60)),
         carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
@@ -3101,16 +3103,13 @@ fn snapshot_top_level_sigil_alignment() {
     });
     plan.add(Effect::Create(resolved(cluster)));
 
-    let deferred_template = Resource::new("aws.route53.RecordSet", "validation_records");
+    let mut deferred_template = Resource::new("aws.route53.RecordSet", "validation_records");
+    deferred_template.set_attr("name", Value::resource_ref("option", "name", vec![]));
     let deferred = DeferredForExpression {
         file: None,
         line: 1,
         header: "for option in cert.domain_validation_options".to_string(),
         resource_type: "aws.route53.RecordSet".to_string(),
-        attributes: vec![(
-            "name".to_string(),
-            Value::resource_ref("option", "name", vec![]),
-        )],
         target: carina_core::parser::DeferredForTarget::Bound {
             binding: "validation_records".to_string(),
         },

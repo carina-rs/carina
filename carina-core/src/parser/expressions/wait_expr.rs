@@ -4,8 +4,9 @@
 //! design. The grammar piece lives in `carina.pest::wait_expr`.
 
 use super::primary::parse_duration_secs;
-use crate::parser::ast::{BindingName, UntilPredicateAst, WaitBinding};
+use crate::parser::ast::BindingName;
 use crate::parser::error::ParseError;
+use crate::parser::{ParserUntilPredicate as UntilPredicateAst, ParserWaitBinding as WaitBinding};
 use crate::parser::{Rule, first_inner};
 use crate::resource::{ConcreteValue, Value};
 use pest::iterators::Pair;

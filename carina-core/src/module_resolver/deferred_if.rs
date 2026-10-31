@@ -12,9 +12,16 @@ use crate::parser::{
     DeferredForBody, DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, ParsedFile,
 };
 use crate::resource::{
-    AccessMissPolicy, CompositionCall, ConcreteValue, DataSource, DeferredValue, LiveComposition,
-    ModuleInstanceScope, Resource, Value,
+    AccessMissPolicy, CompositionCall, ConcreteValue, DataSource as GenericDataSource,
+    DeferredValue, LiveComposition as GenericLiveComposition, ModuleInstanceScope, ModuleSource,
+    ParserPlaceholder, PlaceholderKind, Resource as GenericResource, Value as GenericValue,
 };
+
+type Value = GenericValue<ParserPlaceholder>;
+type Resource = GenericResource<ModuleSource, ParserPlaceholder>;
+type DataSource = GenericDataSource<ModuleSource, ParserPlaceholder>;
+type LiveComposition = GenericLiveComposition<ParserPlaceholder>;
+type ResolvedBindings = crate::binding_index::ResolvedBindings<ParserPlaceholder>;
 
 use super::error::ModuleError;
 use super::expander::{
@@ -411,7 +418,13 @@ fn first_dropped_reference(
         {
             return Some(binding);
         }
-        if let Some(binding) = find(&wait.until_predicate.rhs) {
+        if let Some(binding) = wait
+            .until_predicate
+            .rhs
+            .root_bindings()
+            .into_iter()
+            .find_map(|binding| find_binding(&binding))
+        {
             return Some(binding);
         }
     }
@@ -461,31 +474,31 @@ fn first_dropped_reference(
 
 /// Allocation-free predicate used on hot parser-metadata paths. Error-context
 /// strings are intentionally built only by the publication audit.
-pub(super) fn value_contains_module_if(value: &Value) -> bool {
+pub(super) fn value_contains_module_if<P: PlaceholderKind>(value: &GenericValue<P>) -> bool {
     value_contains_module_if_inner(value, &mut HashSet::new(), &mut HashSet::new())
 }
 
-fn value_contains_module_if_inner(
-    value: &Value,
+fn value_contains_module_if_inner<P: PlaceholderKind>(
+    value: &GenericValue<P>,
     functions: &mut HashSet<usize>,
     function_scopes: &mut HashSet<usize>,
 ) -> bool {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(_)) => true,
-        Value::Concrete(crate::resource::ConcreteValue::List(values)) => {
+        GenericValue::Deferred(DeferredValue::ModuleIf(_)) => true,
+        GenericValue::Concrete(crate::resource::ConcreteValue::List(values)) => {
             values
                 .iter()
                 .any(|value| value_contains_module_if_inner(value, functions, function_scopes))
         }
-        Value::Concrete(crate::resource::ConcreteValue::Map(values)) => {
+        GenericValue::Concrete(crate::resource::ConcreteValue::Map(values)) => {
             values
                 .values()
                 .any(|value| value_contains_module_if_inner(value, functions, function_scopes))
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+        GenericValue::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if value_contains_module_if_inner(value, functions, function_scopes))
         }),
-        Value::Deferred(
+        GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. },
         ) => args.iter().any(|argument| {
@@ -499,7 +512,7 @@ fn value_contains_module_if_inner(
                 })
                 .is_err()
         }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        GenericValue::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions: scope,
             args,
@@ -530,26 +543,27 @@ fn value_contains_module_if_inner(
                     user_function_contains_module_if(function, functions, function_scopes)
                 })
         }
-        Value::Deferred(DeferredValue::Access(access)) => {
+        GenericValue::Deferred(DeferredValue::Access(access)) => {
             value_contains_module_if_inner(access.base(), functions, function_scopes)
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => {
             value_contains_module_if_inner(inner, functions, function_scopes)
         }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+        GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_module_if_inner(value, functions, function_scopes)
                 || value_contains_module_if_inner(default, functions, function_scopes)
         }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+        GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             value_contains_module_if_inner(expression.lhs(), functions, function_scopes)
                 || value_contains_module_if_inner(expression.rhs(), functions, function_scopes)
         }
-        Value::Concrete(_)
-        | Value::Deferred(
+        GenericValue::Concrete(_)
+        | GenericValue::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => false,
     }
 }
@@ -710,7 +724,7 @@ pub(super) fn prefix_forwarded_module_ifs<P: TypeResolutionPolicy>(
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-    resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    resolved_bindings: Option<&ResolvedBindings>,
     source_metadata: &crate::parser::ParserBindingMetadata,
     selected_metadata: &crate::parser::ParserBindingMetadata,
     expanded_metadata: &mut crate::parser::ParserBindingMetadata,
@@ -777,7 +791,7 @@ fn prefix_deferred_if_body<P: TypeResolutionPolicy>(
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-    resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    resolved_bindings: Option<&ResolvedBindings>,
     source_metadata: &crate::parser::ParserBindingMetadata,
     selected_metadata: &crate::parser::ParserBindingMetadata,
     expanded_metadata: &mut crate::parser::ParserBindingMetadata,
@@ -851,7 +865,7 @@ fn prefix_expanded_contribution<P: TypeResolutionPolicy>(
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-    resolved_bindings: Option<&crate::binding_index::ResolvedBindings>,
+    resolved_bindings: Option<&ResolvedBindings>,
     contextualize: &impl Fn(ArgumentSubstitutionError) -> ModuleError,
 ) -> Result<ParsedFile, ModuleError> {
     // A prepared conditional module call can itself contain conditionals

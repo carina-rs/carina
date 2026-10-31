@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{ConcreteValue, Resource, Value};
+use super::{ConcreteValue, PlaceholderKind, Resource, Value};
 use crate::schema::{
     EffectiveType, LeafPath, LeafPathSegment, Shape, ShapeWalkBudget, ValidatedResourceSchema,
 };
@@ -321,15 +321,15 @@ impl Display for IgnoreChangeError {
 
 impl std::error::Error for IgnoreChangeError {}
 
-struct ValueCursor<'a> {
+struct ValueCursor<'a, P: PlaceholderKind> {
     leaf: Vec<LeafPathSegment>,
-    value: &'a Value,
+    value: &'a Value<P>,
 }
 
 /// Resolve authored ignore paths against the effective schema and the values
 /// written in the same resource block.
-pub fn resolve_ignore_changes<S>(
-    resource: &Resource<S>,
+pub fn resolve_ignore_changes<S, P: PlaceholderKind>(
+    resource: &Resource<S, P>,
     schema: &ValidatedResourceSchema,
 ) -> Result<ResolvedIgnoreChanges, Vec<IgnoreChangeError>> {
     let mut errors = Vec::new();
@@ -357,8 +357,8 @@ pub fn resolve_ignore_changes<S>(
     }
 }
 
-fn resolve_one_ignore_change<S>(
-    resource: &Resource<S>,
+fn resolve_one_ignore_change<S, P: PlaceholderKind>(
+    resource: &Resource<S, P>,
     schema: &ValidatedResourceSchema,
     path: &ParsedIgnorePath,
 ) -> Result<Vec<ResolvedIgnorePath>, IgnoreChangeError> {
@@ -476,9 +476,9 @@ fn resolve_one_ignore_change<S>(
         .collect())
 }
 
-fn normalize_authored_struct_block<'a>(
+fn normalize_authored_struct_block<'a, P: PlaceholderKind>(
     value_type: &EffectiveType<'_>,
-    cursors: &mut Vec<ValueCursor<'a>>,
+    cursors: &mut Vec<ValueCursor<'a, P>>,
 ) {
     if !matches!(value_type.shape(), Shape::Struct { .. }) {
         return;

@@ -5,6 +5,39 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::{self, ProviderConfig, ProviderContext};
+use carina_core::resource::ParserPlaceholder;
+
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredProviderConfig {
+    comparison_key: ProviderConfig<ParserPlaceholder>,
+    factory_config: ProviderConfig,
+}
+
+impl DiscoveredProviderConfig {
+    pub(crate) fn from_parser(provider: ProviderConfig<ParserPlaceholder>) -> Self {
+        let factory_config = provider.loading_projection();
+        Self {
+            comparison_key: provider,
+            factory_config,
+        }
+    }
+
+    pub(crate) fn comparison_key(&self) -> &ProviderConfig<ParserPlaceholder> {
+        &self.comparison_key
+    }
+
+    pub(crate) fn factory_config(&self) -> &ProviderConfig {
+        &self.factory_config
+    }
+}
+
+impl std::ops::Deref for DiscoveredProviderConfig {
+    type Target = ProviderConfig<ParserPlaceholder>;
+
+    fn deref(&self) -> &Self::Target {
+        self.comparison_key()
+    }
+}
 
 #[derive(PartialEq, Eq, Hash)]
 struct ProviderInstanceKey {
@@ -21,19 +54,33 @@ impl From<&ProviderConfig> for ProviderInstanceKey {
     }
 }
 
+impl From<&DiscoveredProviderConfig> for ProviderInstanceKey {
+    fn from(config: &DiscoveredProviderConfig) -> Self {
+        Self {
+            kind: config.name.clone(),
+            binding: config.binding.clone(),
+        }
+    }
+}
+
 /// Discover provider configurations grouped by directory.
 ///
 /// Each directory is an independent Carina configuration with its own set of
 /// providers. Within a directory, duplicate provider instances are identified
 /// by provider kind and optional binding; the first declaration in sorted path
 /// order wins.
-pub fn discover_providers_by_dir(workspace_root: &Path) -> HashMap<PathBuf, Vec<ProviderConfig>> {
-    let mut result: HashMap<PathBuf, Vec<ProviderConfig>> = HashMap::new();
+pub(crate) fn discover_providers_by_dir(
+    workspace_root: &Path,
+) -> HashMap<PathBuf, Vec<DiscoveredProviderConfig>> {
+    let mut result: HashMap<PathBuf, Vec<DiscoveredProviderConfig>> = HashMap::new();
     discover_by_dir_recursive(workspace_root, &mut result);
     result
 }
 
-fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<ProviderConfig>>) {
+fn discover_by_dir_recursive(
+    dir: &Path,
+    result: &mut HashMap<PathBuf, Vec<DiscoveredProviderConfig>>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -58,6 +105,7 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
                     .map(ProviderInstanceKey::from)
                     .collect();
                 for provider in parsed.providers {
+                    let provider = DiscoveredProviderConfig::from_parser(provider);
                     if seen.insert(ProviderInstanceKey::from(&provider)) {
                         dir_providers.push(provider);
                     }

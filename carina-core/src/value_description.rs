@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::parser::display_string_literal;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, PlaceholderKind, Value};
 
 /// Value-derived description used in type-mismatch diagnostics.
 ///
@@ -17,7 +17,7 @@ pub struct ValueDescription(String);
 
 impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
-    pub fn of(value: &Value) -> Self {
+    pub fn of<P: PlaceholderKind>(value: &Value<P>) -> Self {
         Self(match value {
             Value::Deferred(DeferredValue::ModuleIf(_)) => "module conditional".to_string(),
             Value::Concrete(ConcreteValue::String(value)) => value
@@ -55,6 +55,9 @@ impl ValueDescription {
                 "secret".to_string()
             }
             Value::Deferred(DeferredValue::Unknown(_)) => "unknown".to_string(),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+                format!("placeholder ({placeholder})")
+            }
         })
     }
 }
@@ -71,7 +74,7 @@ mod tests {
 
     #[test]
     fn string_value_uses_canonical_carina_literal() {
-        let value = Value::Concrete(ConcreteValue::String("production".into()));
+        let value: Value = Value::Concrete(ConcreteValue::String("production".into()));
 
         assert_eq!(
             ValueDescription::of(&value).to_string(),
@@ -81,7 +84,7 @@ mod tests {
 
     #[test]
     fn typed_persisted_secret_is_masked() {
-        let value = Value::Deferred(crate::resource::DeferredValue::RedactedSecret {
+        let value: Value = Value::Deferred(crate::resource::DeferredValue::RedactedSecret {
             hash: crate::resource::RedactedSecretHash::generate(b"description-test"),
         });
 

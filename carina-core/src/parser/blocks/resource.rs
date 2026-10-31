@@ -15,10 +15,13 @@ use crate::parser::error::{
     WarningKind,
 };
 use crate::parser::util::expression_is_plain_string_literal;
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
+};
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, LoopElementOrigin, LoopProvenance,
-    ParsedIgnorePath, ParsedIgnorePathSegment, Resource, ResourceId, ResourceIdentity, Value,
+    ConcreteValue, DeferredValue, Directives, LoopElementOrigin, LoopProvenance, ParsedIgnorePath,
+    ParsedIgnorePathSegment, ResourceId, ResourceIdentity,
 };
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -680,11 +683,11 @@ fn eval_as_binding_name(
                 Err(ParseError::InvalidExpression { line, message })
             }
         }
-        EvalValue::User(Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { name, .. },
+        EvalValue::User(Value::Deferred(DeferredValue::Placeholder(
+            crate::resource::ParserPlaceholder::ModuleArgument { name, .. },
         ))) if matches!(usage, BindingNameUse::Dependency) => Ok(name),
-        EvalValue::User(Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { name, .. },
+        EvalValue::User(Value::Deferred(DeferredValue::Placeholder(
+            crate::resource::ParserPlaceholder::ModuleArgument { name, .. },
         ))) => Err(ParseError::InvalidExpression {
             line,
             message: format!(

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{AccessPath, DataSource, ModuleSource, ResourceId, State, UnknownReason};
+use crate::resource::{AccessPath, ApplyTimeUnknown, DataSource, ModuleSource, ResourceId, State};
 
 /// A data-source input attribute whose unresolved value shapes make the read
 /// apply-time dependent or unsafe to hand to a provider.
@@ -13,7 +13,7 @@ pub struct UnresolvedDataSourceInput {
     pub attribute: String,
     pub paths: Vec<AccessPath>,
     pub bindings: Vec<String>,
-    pub unknowns: Vec<UnknownReason>,
+    pub unknowns: Vec<ApplyTimeUnknown>,
 }
 
 /// The value status of one configured data source after the pre-apply read

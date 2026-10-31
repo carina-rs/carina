@@ -459,7 +459,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         "shared",
         Some("imported".to_string()),
     );
-    let other =
+    let other: Resource =
         Resource::with_provider("mock", "test.Resource", "shared", Some("other".to_string()));
     let imported_id = imported.id.clone();
     let other_id = other.id.clone();
@@ -4198,7 +4198,9 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         }
         "#,
     )
-    .expect("parsed file should be valid");
+    .expect("parsed file should be valid")
+    .into_expanded()
+    .expect("plan fixture contains no parser placeholders");
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("validation_records".to_string())],
     };
