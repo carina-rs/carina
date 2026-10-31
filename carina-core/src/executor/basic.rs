@@ -280,7 +280,8 @@ pub(super) async fn resolve_resource<S: Clone>(
 fn needs_apply_resolution(value: &Value) -> bool {
     match value {
         Value::Deferred(
-            DeferredValue::ResourceRef { .. }
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
             | DeferredValue::Interpolation(_)
@@ -402,6 +403,10 @@ fn assert_fully_resolved(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             assert_fully_resolved(inner, attribute_key, bindings)
         }
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(format!(
+            "Attribute '{}' contains an unresolved module-template conditional",
+            attribute_key
+        )),
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(format!(
             "Attribute '{}' contains a saved-plan secret that was not rehydrated; create a new saved plan before applying",
             attribute_key
@@ -536,6 +541,12 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
         Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
         Value::Deferred(DeferredValue::Secret(inner)) => collect_unresolved_bindings(inner, out),
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred
+                .values()
+                .into_iter()
+                .for_each(|value| collect_unresolved_bindings(value, out));
+        }
         Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for p in parts {

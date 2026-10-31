@@ -71,6 +71,21 @@ pub enum ModuleError {
         message: String,
     },
 
+    #[error(
+        "binding '{binding}' is defined only in a dropped branch of condition `{condition}` in {source_path} at line {line}"
+    )]
+    DroppedConditionalBinding {
+        binding: String,
+        condition: String,
+        source_path: PathBuf,
+        line: usize,
+    },
+
+    #[error(
+        "cannot publish a reusable module template with an unresolved argument-dependent `if` at {context}; instantiate the module with concrete arguments before plan or apply"
+    )]
+    UnexpandedModuleTemplate { context: String },
+
     #[error("Reference type validation failed: {0}")]
     ReferenceType(crate::validation::ExpansionBoundaryReferenceErrors),
 
@@ -170,6 +185,8 @@ impl ModuleError {
             | Self::InvalidArgumentType { .. }
             | Self::BareStructuralHandleArgument { .. }
             | Self::ArgumentValueAccess { .. }
+            | Self::DroppedConditionalBinding { .. }
+            | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -214,6 +231,13 @@ impl ModuleError {
                 line: _,
                 message: _,
             }
+            | Self::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | Self::UnexpandedModuleTemplate { context: _ }
             | Self::ReferenceType(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -243,6 +267,8 @@ impl ModuleError {
             | Self::InvalidArgumentType { .. }
             | Self::BareStructuralHandleArgument { .. }
             | Self::ArgumentValueAccess { .. }
+            | Self::DroppedConditionalBinding { .. }
+            | Self::UnexpandedModuleTemplate { .. }
             | Self::ReferenceType(_)
             | Self::Io(_)
             | Self::Parse(_)
@@ -283,6 +309,18 @@ impl ModuleError {
             } => format!(
                 "module '{module}' ({}) at line {line}: {message}",
                 display_source_path_relative_to(Path::new(source_path), root),
+            ),
+            Self::DroppedConditionalBinding {
+                binding,
+                condition,
+                source_path,
+                line,
+            } => format!(
+                "binding '{binding}' is defined only in a dropped branch of condition `{condition}` in {} at line {line}",
+                display_source_path_relative_to(source_path, root),
+            ),
+            Self::UnexpandedModuleTemplate { context } => format!(
+                "cannot publish a reusable module template with an unresolved argument-dependent `if` at {context}; instantiate the module with concrete arguments before plan or apply"
             ),
             Self::Parse(ParseError::Located { path, error }) => format!(
                 "Parse error in {}: {}",

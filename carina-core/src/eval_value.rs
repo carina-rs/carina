@@ -145,6 +145,30 @@ impl StructuralHandleMetadata {
             (Self::Handle { .. }, _) | (Self::List(_), _) | (Self::Map(_), _) => None,
         }
     }
+
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Handle { access_base } => {
+                if let Some(value) = access_base {
+                    visit(value)?;
+                }
+            }
+            Self::List(items) => {
+                for item in items.iter().flatten() {
+                    item.try_visit_values(visit)?;
+                }
+            }
+            Self::Map(entries) => {
+                for item in entries.values() {
+                    item.try_visit_values(visit)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

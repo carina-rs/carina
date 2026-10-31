@@ -4,6 +4,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use super::DeferredStructuralIf;
 use super::ast::{
     AttributePath, AttributePathSegment, BareBindingKind, BareBindingSource, BareBindingUse,
     BindingScopeId, BindingUseOwner, DeferredForExpression, ModuleCallId, ParsedBindingUses,
@@ -94,6 +95,8 @@ pub(crate) struct ParseContext<'cfg> {
     pub(super) warnings: Vec<ParseWarning>,
     /// Deferred for-expressions collected during parsing
     pub(super) deferred_for_expressions: Vec<DeferredForExpression>,
+    /// Module-argument-dependent structural `if` templates.
+    pub(super) deferred_module_ifs: Vec<DeferredStructuralIf>,
     /// Names pre-registered via the directory-aware seed pass
     /// (`parse_with_seeded_bindings`). Excluded from local duplicate-
     /// binding checks, so a `let role = ...` in this file does not
@@ -135,6 +138,7 @@ impl<'cfg> ParseContext<'cfg> {
             named_provider_instances: Vec::new(),
             warnings: Vec::new(),
             deferred_for_expressions: Vec::new(),
+            deferred_module_ifs: Vec::new(),
             seeded_bindings: HashSet::new(),
             pending_function_type_checks: Rc::new(RefCell::new(Vec::new())),
             defer_provisional_static_conditions: false,
@@ -148,6 +152,10 @@ impl<'cfg> ParseContext<'cfg> {
     pub(super) fn set_source_scope(&mut self, source_file: &std::path::Path) {
         self.binding_scope = BindingScopeId::root(source_file);
         self.binding_scope_source_file = source_file.to_path_buf();
+    }
+
+    pub(super) fn source_file(&self) -> &std::path::Path {
+        &self.binding_scope_source_file
     }
 
     pub(super) fn child_scope(&self) -> Self {

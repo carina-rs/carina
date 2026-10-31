@@ -4870,6 +4870,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_))
+        | Value::Deferred(DeferredValue::ModuleIf(_))
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
@@ -4945,7 +4946,8 @@ pub fn merge_default_tags<S>(
             Err(
                 source @ (SerializationError::NonFiniteFloat { .. }
                 | SerializationError::UnresolvedEnumIdentifier { .. }
-                | SerializationError::RedactedSecretNotAllowed { .. }),
+                | SerializationError::RedactedSecretNotAllowed { .. }
+                | SerializationError::UnexpandedModuleIf { .. }),
             ) => {
                 return Err(ProviderError::invalid_input_caused_by(
                     "failed to encode default tag",

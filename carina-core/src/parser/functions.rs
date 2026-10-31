@@ -307,6 +307,10 @@ fn function_argument_must_remain_deferred(argument: &FunctionArgument) -> bool {
 
 fn contains_deferred_user_function_call(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
+            .values()
+            .into_iter()
+            .any(contains_deferred_user_function_call),
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             crate::builtins::builtin_arity(name).is_none()
                 || args.iter().any(|argument| {
@@ -369,6 +373,9 @@ fn function_argument_awaits_module_substitution(argument: &FunctionArgument) -> 
 
 fn contains_module_argument(value: &Value) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(contains_module_argument)
+        }
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { .. })) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_module_argument),
         Value::Concrete(ConcreteValue::Map(entries)) => {
@@ -951,6 +958,11 @@ fn substitute_fn_params_with_position(
     position: FunctionSubstitutionPosition,
 ) -> Result<Value, ParseError> {
     Ok(match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred
+                .try_map(|value| substitute_fn_params(value, substitutions, source_line))?;
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
         Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam { name }))
         | Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal { name })) => {
             match substitutions.get(name) {
@@ -1229,6 +1241,17 @@ pub(super) fn try_evaluate_fn_value(
     containing_line: usize,
 ) -> Result<Value, ParseError> {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let mut deferred = *deferred;
+            deferred.condition.value = try_evaluate_fn_value(
+                deferred.condition.value,
+                ctx,
+                deferred.condition.source_line,
+            )?;
+            deferred.then_value = try_evaluate_fn_value(deferred.then_value, ctx, containing_line)?;
+            deferred.else_value = try_evaluate_fn_value(deferred.else_value, ctx, containing_line)?;
+            Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred))))
+        }
         Value::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,

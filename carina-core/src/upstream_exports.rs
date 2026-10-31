@@ -689,6 +689,12 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
 ) -> Vec<UpstreamForIterableShapeError> {
     fn visit_possible_iterables(value: &Value, f: &mut impl FnMut(&crate::resource::AccessPath)) {
         match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                deferred
+                    .values()
+                    .into_iter()
+                    .for_each(|value| visit_possible_iterables(value, f));
+            }
             Value::Deferred(DeferredValue::ResourceRef { path }) => f(path),
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 visit_possible_iterables(value, f);

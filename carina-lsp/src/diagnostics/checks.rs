@@ -92,6 +92,16 @@ fn value_depends_on_module_output(
     visiting_variables: &mut HashSet<String>,
 ) -> bool {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred.values().into_iter().any(|value| {
+                value_depends_on_module_output(
+                    value,
+                    module_bindings,
+                    variables,
+                    visiting_variables,
+                )
+            })
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             if module_bindings.contains(path.binding()) {
                 return true;
@@ -275,6 +285,7 @@ impl<'a> ContextFreeValue<'a> {
                 // bare/dotted name, so even a dotted spelling needs directory
                 // authority before it is safe to type-check.
                 Value::Concrete(ConcreteValue::EnumIdentifier(_))
+                | Value::Deferred(DeferredValue::ModuleIf(_))
                 | Value::Deferred(DeferredValue::ResourceRef { .. })
                 | Value::Deferred(DeferredValue::BindingRef { .. })
                 | Value::Deferred(DeferredValue::FunctionCall { .. })

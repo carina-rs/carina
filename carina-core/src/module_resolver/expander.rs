@@ -9,8 +9,8 @@ use crate::binding_index::{BindingIndex, RefType, RefTypeError};
 use crate::eval_value::{BareStructuralHandle, StructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
-    ArgumentOrigin, BindingName, DeferredForExpression, ModuleArgument, ModuleCall, ParseError,
-    ParsedFile, WaitBinding,
+    ArgumentOrigin, BindingName, DeferredForExpression, DeferredValueIf, ModuleArgument,
+    ModuleCall, ParseError, ParsedFile, WaitBinding,
 };
 use crate::resource::{
     AccessMissPolicy, CompositionCall, CompositionCallPath, ConcreteValue, DataSource,
@@ -19,6 +19,10 @@ use crate::resource::{
     StructuralOperandRef, Value, ValuePathSegmentResult, apply_value_path_segment,
 };
 
+use super::deferred_if::{
+    ConditionSelection, reject_dropped_references, select_deferred_module_ifs,
+    substitute_and_decide_if, substitute_module_ifs_in_secret, value_contains_module_if,
+};
 use super::error::ModuleError;
 use super::resolver::{
     ModuleCallConstraintReport, ModuleResolver, ResolvedModuleConstraintOrigin,
@@ -414,6 +418,16 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             }
         }
 
+        // Select structural templates after the fixed-point argument pass but
+        // before collecting local bindings. The imported module stays
+        // borrowed; only the chosen branch contribution is owned here.
+        let selected_module_ifs = select_deferred_module_ifs(
+            module,
+            argument_substitutions,
+            &contextualize_access_error,
+        )?;
+        let selected = &selected_module_ifs.contribution;
+
         // Collect intra-module binding names so we can rewrite
         // ResourceRefs. Wait-binding names are included alongside
         // resource bindings so a downstream resource referencing
@@ -428,9 +442,22 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .resources
             .iter()
             .filter_map(|r| r.binding.clone())
+            .chain(selected.resources.iter().filter_map(|r| r.binding.clone()))
             .chain(module.data_sources.iter().filter_map(|d| d.binding.clone()))
             .chain(
+                selected
+                    .data_sources
+                    .iter()
+                    .filter_map(|d| d.binding.clone()),
+            )
+            .chain(
                 module
+                    .wait_bindings
+                    .iter()
+                    .map(|w| w.binding.as_str().to_string()),
+            )
+            .chain(
+                selected
                     .wait_bindings
                     .iter()
                     .map(|w| w.binding.as_str().to_string()),
@@ -445,6 +472,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             // (`middle.inner`). When this module is itself expanded, refs to
             // that exact binding must gain the new outer prefix as well.
             .chain(module.compositions.iter().filter_map(|c| c.binding.clone()))
+            .chain(
+                selected
+                    .compositions
+                    .iter()
+                    .filter_map(|c| c.binding.clone()),
+            )
+            .chain(selected_module_ifs.conditional_bindings.iter().cloned())
             .collect();
         let module_source = self.module_paths.get(&call.module_name).cloned();
         let module_directory = module_source.as_deref().map(|source| {
@@ -475,12 +509,44 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut resources: Vec<Resource> = Vec::new();
         let mut expanded_parser_metadata = crate::parser::ParserBindingMetadata::default();
         let mut expanded_binding_uses = module.bare_binding_uses().clone();
-        for resource in &module.resources {
+        expanded_binding_uses.extend(selected.bare_binding_uses().clone());
+        expanded_binding_uses
+            .try_rewrite_values(|value| {
+                if value_contains_module_if(value) {
+                    prefix_attr_value(
+                        value,
+                        instance_prefix,
+                        &intra_module_bindings,
+                        argument_substitutions,
+                    )
+                } else {
+                    // Bare-binding provenance normally retains the authored
+                    // source value. Rewriting every record would lower a
+                    // forwarded structural parameter as an ordinary value
+                    // before the schema-aware binding authority sees it.
+                    Ok(value.clone())
+                }
+            })
+            .map_err(contextualize_access_error)?;
+        for resource in module.resources.iter().chain(&selected.resources) {
             let source_file = module
                 .parser_binding_metadata
-                .resource_source_file(&resource.id);
+                .resource_source_file(&resource.id)
+                .or_else(|| {
+                    selected
+                        .parser_binding_metadata
+                        .resource_source_file(&resource.id)
+                });
+            let template_dependency_values = module
+                .parser_binding_metadata
+                .template_dependency_values(&resource.id)
+                .or_else(|| {
+                    selected
+                        .parser_binding_metadata
+                        .template_dependency_values(&resource.id)
+                });
             let expanded = prefix_module_resource(
-                resource,
+                TemplateValueCarrier::new(resource, template_dependency_values),
                 instance_prefix,
                 &call.module_name,
                 &module_instance_scope,
@@ -491,22 +557,36 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .map_err(|error| {
                 contextualize_access_error(error.with_optional_source_file(source_file))
             })?;
+            let expanded_id = expanded.value().id.clone();
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
-                    .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
+                    .insert_resource_source_file(expanded_id.clone(), source_file.to_path_buf());
             }
-            expanded_binding_uses.remap_resource_owner(&resource.id, &expanded.id);
-            resources.push(expanded);
+            expanded_binding_uses.remap_resource_owner(&resource.id, &expanded_id);
+            resources.push(expanded.into_value(&mut expanded_parser_metadata));
         }
 
         // Expand data sources with substituted values.
         let mut data_sources: Vec<DataSource> = Vec::new();
-        for data_source in &module.data_sources {
+        for data_source in module.data_sources.iter().chain(&selected.data_sources) {
             let source_file = module
                 .parser_binding_metadata
-                .resource_source_file(&data_source.id);
+                .resource_source_file(&data_source.id)
+                .or_else(|| {
+                    selected
+                        .parser_binding_metadata
+                        .resource_source_file(&data_source.id)
+                });
+            let template_dependency_values = module
+                .parser_binding_metadata
+                .template_dependency_values(&data_source.id)
+                .or_else(|| {
+                    selected
+                        .parser_binding_metadata
+                        .template_dependency_values(&data_source.id)
+                });
             let expanded = prefix_module_data_source(
-                data_source,
+                TemplateValueCarrier::new(data_source, template_dependency_values),
                 instance_prefix,
                 &call.module_name,
                 &module_instance_scope,
@@ -517,18 +597,19 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .map_err(|error| {
                 contextualize_access_error(error.with_optional_source_file(source_file))
             })?;
+            let expanded_id = expanded.value().id.clone();
             if let Some(source_file) = source_file {
                 expanded_parser_metadata
-                    .insert_resource_source_file(expanded.id.clone(), source_file.to_path_buf());
+                    .insert_resource_source_file(expanded_id.clone(), source_file.to_path_buf());
             }
-            expanded_binding_uses.remap_resource_owner(&data_source.id, &expanded.id);
-            data_sources.push(expanded);
+            expanded_binding_uses.remap_resource_owner(&data_source.id, &expanded_id);
+            data_sources.push(expanded.into_value(&mut expanded_parser_metadata));
         }
 
         // Propagate the module's own composition resources (synthesized by
         // nested module-call expansion), instance-prefixed.
         let mut compositions: Vec<LiveComposition> = Vec::new();
-        for composition in &module.compositions {
+        for composition in module.compositions.iter().chain(&selected.compositions) {
             let mut expanded = prefix_module_composition(
                 composition,
                 instance_prefix,
@@ -671,6 +752,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let expanded_wait_bindings: Vec<WaitBinding> = module
             .wait_bindings
             .iter()
+            .chain(&selected.wait_bindings)
             .map(|wb| prefix_wait_binding(wb, instance_prefix))
             .collect();
 
@@ -680,15 +762,29 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // the loop resolves against the prefixed module bindings and
         // its generated resources are isolated per module instance
         // (carina#3126 PR-B).
-        let expanded_deferred_for_expressions: Vec<DeferredForExpression> = module
+        let expanded_deferred_for_expressions = module
             .deferred_for_expressions
             .iter()
+            .chain(&selected.deferred_for_expressions)
             .map(|d| {
                 let source_file = module
                     .parser_binding_metadata
-                    .resource_source_file(&d.template_resource.id);
+                    .resource_source_file(&d.template_resource.id)
+                    .or_else(|| {
+                        selected
+                            .parser_binding_metadata
+                            .resource_source_file(&d.template_resource.id)
+                    });
+                let template_dependency_values = module
+                    .parser_binding_metadata
+                    .template_dependency_values(&d.template_resource.id)
+                    .or_else(|| {
+                        selected
+                            .parser_binding_metadata
+                            .template_dependency_values(&d.template_resource.id)
+                    });
                 prefix_deferred_for_expression(
-                    d,
+                    TemplateValueCarrier::new(d, template_dependency_values),
                     instance_prefix,
                     &call.module_name,
                     &module_instance_scope,
@@ -698,8 +794,27 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 )
                 .map_err(|error| error.with_optional_source_file(source_file))
             })
-            .collect::<Result<_, _>>()
-            .map_err(contextualize_access_error)?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(contextualize_access_error)?
+            .into_iter()
+            .map(|expanded| expanded.into_value(&mut expanded_parser_metadata))
+            .collect::<Vec<_>>();
+
+        let expanded_deferred_module_ifs = super::deferred_if::prefix_forwarded_module_ifs(
+            self,
+            &selected_module_ifs.forwarded,
+            instance_prefix,
+            &call.module_name,
+            &module_instance_scope,
+            &expanded_call,
+            &intra_module_bindings,
+            argument_substitutions,
+            resolved_bindings,
+            &module.parser_binding_metadata,
+            &selected.parser_binding_metadata,
+            &mut expanded_parser_metadata,
+            &contextualize_access_error,
+        )?;
 
         // carina#3181: managed resources, data sources, and composition
         // resources are collected into separate typed `Vec`s above —
@@ -718,10 +833,14 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // that bypass `process_imports`; real expansions always have
         // a recorded path.
         let source_path = module_source.as_deref();
+        let mut inner_trace = module.expansion_trace.clone();
+        for (leaf, call_sites) in selected.expansion_trace.iter() {
+            inner_trace.record(leaf.clone(), call_sites.clone());
+        }
         let expansion_trace = build_expansion_trace(
             instance_prefix,
             source_path,
-            &module.expansion_trace,
+            &inner_trace,
             &resources,
             &data_sources,
         );
@@ -736,9 +855,16 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         contribution.compositions = compositions;
         contribution.wait_bindings = expanded_wait_bindings;
         contribution.deferred_for_expressions = expanded_deferred_for_expressions;
+        contribution.deferred_module_ifs = expanded_deferred_module_ifs;
         contribution.parser_binding_metadata = expanded_parser_metadata;
-        contribution.warnings = module.warnings.clone();
+        contribution.warnings = module
+            .warnings
+            .iter()
+            .chain(&selected.warnings)
+            .cloned()
+            .collect();
         contribution.expansion_trace = expansion_trace;
+        reject_dropped_references(&selected_module_ifs, &contribution, instance_prefix)?;
         Ok(contribution)
     }
 
@@ -840,7 +966,7 @@ pub(crate) fn build_expansion_trace(
 /// drift between binding kinds (the carina#3061 class of bug was a binding
 /// kind that was *not* prefixed at all; keeping one spelling makes "is this
 /// kind prefixed?" a single, greppable call site per kind).
-fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
+pub(super) fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
     format!("{instance_prefix}.{name}")
 }
 
@@ -964,7 +1090,7 @@ fn prefix_binding_name(instance_prefix: &str, name: &BindingName) -> BindingName
 /// `until_raw` (verbatim user surface text), `until_predicate.rhs` (a
 /// comparison value), `timeout_secs`, and `line` are not binding names
 /// and pass through unchanged.
-fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
+pub(super) fn prefix_wait_binding(wb: &WaitBinding, instance_prefix: &str) -> WaitBinding {
     let WaitBinding {
         binding,
         target,
@@ -1044,16 +1170,16 @@ impl ResolvedArgument {
 }
 
 #[derive(Clone, Copy)]
-struct ArgumentSubstitutions<'a> {
+pub(super) struct ArgumentSubstitutions<'a> {
     arguments: &'a HashMap<String, ResolvedArgument>,
     default_line: usize,
     caller_source_file: &'a std::path::Path,
     binding_index: Option<&'a BindingIndex<'a>>,
-    config: &'a crate::parser::ProviderContext,
+    pub(super) config: &'a crate::parser::ProviderContext,
 }
 
 #[derive(Clone, Copy)]
-enum ArgumentSubstitutionPosition {
+pub(super) enum ArgumentSubstitutionPosition {
     Value,
     AccessBase,
 }
@@ -1371,7 +1497,7 @@ fn prefix_constraint_expression(
 /// by [`prefix_module_resource`] (a module resource's attrs) and
 /// [`prefix_deferred_for_expression`] (a loop body's attrs) so the two
 /// carriers can never drift — the exact carina#3126 bug class.
-fn prefix_attr_value(
+pub(super) fn prefix_attr_value(
     value: &Value,
     instance_prefix: &str,
     intra_module_bindings: &HashSet<String>,
@@ -1387,6 +1513,137 @@ fn prefix_attr_value(
     Ok(substituted)
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TemplateValueCarrier<'a, T> {
+    value: &'a T,
+    dependency_values: Option<&'a IndexMap<String, Value>>,
+}
+
+impl<'a, T> TemplateValueCarrier<'a, T> {
+    pub(super) fn new(
+        value: &'a T,
+        dependency_values: Option<&'a IndexMap<String, Value>>,
+    ) -> Self {
+        Self {
+            value,
+            dependency_values,
+        }
+    }
+}
+
+/// One expanded value-bearing node plus any authored dependency template that
+/// still contains a forwarded module conditional. The wrapped node cannot be
+/// extracted without installing that template in parser metadata, so a later
+/// module boundary can never fall back to its union-of-branches dependency
+/// snapshot.
+pub(super) struct ExpandedValueCarrier<T> {
+    value: T,
+    forwarded_dependency_values: Option<(ResourceId, IndexMap<String, Value>)>,
+}
+
+impl<T> ExpandedValueCarrier<T> {
+    fn new(
+        value: T,
+        id: ResourceId,
+        forwarded_dependency_values: Option<IndexMap<String, Value>>,
+    ) -> Self {
+        Self {
+            value,
+            forwarded_dependency_values: forwarded_dependency_values.map(|values| (id, values)),
+        }
+    }
+
+    pub(super) fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub(super) fn map<U>(self, map: impl FnOnce(T) -> U) -> ExpandedValueCarrier<U> {
+        ExpandedValueCarrier {
+            value: map(self.value),
+            forwarded_dependency_values: self.forwarded_dependency_values,
+        }
+    }
+
+    pub(super) fn into_value(self, metadata: &mut crate::parser::ParserBindingMetadata) -> T {
+        if let Some((id, values)) = self.forwarded_dependency_values {
+            metadata.insert_template_dependency_values(id, values);
+        }
+        self.value
+    }
+}
+
+struct ExpandedResourceValues {
+    attributes: IndexMap<String, Value>,
+    dependency_bindings: BTreeSet<String>,
+    forwarded_dependency_values: Option<IndexMap<String, Value>>,
+}
+
+fn prefix_attribute_map(
+    values: &IndexMap<String, Value>,
+    instance_prefix: &str,
+    intra_module_bindings: &HashSet<String>,
+    arguments: ArgumentSubstitutions<'_>,
+) -> Result<IndexMap<String, Value>, ArgumentSubstitutionError> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            Ok((
+                key.clone(),
+                prefix_attr_value(value, instance_prefix, intra_module_bindings, arguments)?,
+            ))
+        })
+        .collect()
+}
+
+fn expand_resource_values(
+    attributes: &IndexMap<String, Value>,
+    template_dependency_values: Option<&IndexMap<String, Value>>,
+    dependency_bindings: &BTreeSet<String>,
+    instance_prefix: &str,
+    intra_module_bindings: &HashSet<String>,
+    arguments: ArgumentSubstitutions<'_>,
+) -> Result<ExpandedResourceValues, ArgumentSubstitutionError> {
+    let attributes = prefix_attribute_map(
+        attributes,
+        instance_prefix,
+        intra_module_bindings,
+        arguments,
+    )?;
+    let Some(template_dependency_values) = template_dependency_values else {
+        return Ok(ExpandedResourceValues {
+            attributes,
+            dependency_bindings: prefix_dependency_bindings(
+                dependency_bindings,
+                instance_prefix,
+                intra_module_bindings,
+                arguments,
+            )?,
+            forwarded_dependency_values: None,
+        });
+    };
+
+    let selected_dependency_values = prefix_attribute_map(
+        template_dependency_values,
+        instance_prefix,
+        intra_module_bindings,
+        arguments,
+    )?;
+    let mut dependencies = HashSet::new();
+    for value in selected_dependency_values.values() {
+        crate::deps::collect_dependencies(value, &mut dependencies);
+    }
+    let forwarded_dependency_values = selected_dependency_values
+        .values()
+        .any(value_contains_module_if)
+        .then_some(selected_dependency_values);
+
+    Ok(ExpandedResourceValues {
+        attributes,
+        dependency_bindings: dependencies.into_iter().collect(),
+        forwarded_dependency_values,
+    })
+}
+
 /// Instance-prefix one module resource: `Bound` id name, binding, and
 /// intra-module dependency metadata take the instance prefix, typed
 /// module-source is stamped, and every attribute is
@@ -1397,19 +1654,19 @@ fn prefix_attr_value(
 /// `module.resources` loop and `prefix_deferred_for_expression`'s
 /// `template_resource` so a loop body inside a module is prefixed
 /// identically to a top-level module resource (carina#3126 PR-B).
-fn prefix_module_resource(
-    resource: &Resource,
+pub(super) fn prefix_module_resource(
+    template: TemplateValueCarrier<'_, Resource>,
     instance_prefix: &str,
     module_name: &str,
     module_instance_scope: &ModuleInstanceScope,
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-) -> Result<Resource, ArgumentSubstitutionError> {
+) -> Result<ExpandedValueCarrier<Resource>, ArgumentSubstitutionError> {
     let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
         .expect("module instance prefix is non-empty");
     prefix_module_resource_with_identity(
-        resource,
+        template,
         instance_prefix,
         &instance_identity,
         module_name,
@@ -1422,7 +1679,7 @@ fn prefix_module_resource(
 
 #[allow(clippy::too_many_arguments)]
 fn prefix_module_resource_with_identity(
-    resource: &Resource,
+    template: TemplateValueCarrier<'_, Resource>,
     instance_prefix: &str,
     instance_identity: &ResourceIdentity,
     module_name: &str,
@@ -1430,7 +1687,11 @@ fn prefix_module_resource_with_identity(
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-) -> Result<Resource, ArgumentSubstitutionError> {
+) -> Result<ExpandedValueCarrier<Resource>, ArgumentSubstitutionError> {
+    let TemplateValueCarrier {
+        value: resource,
+        dependency_values: template_dependency_values,
+    } = template;
     // Only assigned identities take the prefix here. Anonymous resources
     // stay pending so `compute_anonymous_identifiers` can later attach both
     // the hash and the instance prefix in one shot (#2516). Each module
@@ -1464,12 +1725,6 @@ fn prefix_module_resource_with_identity(
         intra_module_bindings,
         arguments,
     )?;
-    new_resource.dependency_bindings = prefix_dependency_bindings(
-        &new_resource.dependency_bindings,
-        instance_prefix,
-        intra_module_bindings,
-        arguments,
-    )?;
 
     let (scope, call_path) = match new_resource.module_source.as_ref() {
         Some(ModuleSource::Module(child)) => (
@@ -1491,18 +1746,23 @@ fn prefix_module_resource_with_identity(
         call_path,
     ));
 
-    // `IndexMap` preserves authored attribute order across expansion
-    // (#2222); each value goes through the shared `prefix_attr_value`.
-    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
-    for (key, expr) in &new_resource.attributes {
-        substituted_attrs.insert(
-            key.clone(),
-            prefix_attr_value(expr, instance_prefix, intra_module_bindings, arguments)?,
-        );
-    }
-    new_resource.attributes = substituted_attrs;
+    let expanded_values = expand_resource_values(
+        &new_resource.attributes,
+        template_dependency_values,
+        &new_resource.dependency_bindings,
+        instance_prefix,
+        intra_module_bindings,
+        arguments,
+    )?;
+    new_resource.attributes = expanded_values.attributes;
+    new_resource.dependency_bindings = expanded_values.dependency_bindings;
+    let id = new_resource.id.clone();
 
-    Ok(new_resource)
+    Ok(ExpandedValueCarrier::new(
+        new_resource,
+        id,
+        expanded_values.forwarded_dependency_values,
+    ))
 }
 
 /// Instance-prefix one module data source — the [`DataSource`] analogue
@@ -1510,15 +1770,19 @@ fn prefix_module_resource_with_identity(
 /// field, so its assigned identity, `binding`, intra-module dependency
 /// metadata, `module_source`, and attributes take the module-boundary
 /// treatment.
-fn prefix_module_data_source(
-    data_source: &DataSource,
+pub(super) fn prefix_module_data_source(
+    template: TemplateValueCarrier<'_, DataSource>,
     instance_prefix: &str,
     module_name: &str,
     module_instance_scope: &ModuleInstanceScope,
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-) -> Result<DataSource, ArgumentSubstitutionError> {
+) -> Result<ExpandedValueCarrier<DataSource>, ArgumentSubstitutionError> {
+    let TemplateValueCarrier {
+        value: data_source,
+        dependency_values: template_dependency_values,
+    } = template;
     let mut new_data_source = match data_source.id.identity_state() {
         ResourceIdentityState::Pending(_) => data_source.instantiate(),
         ResourceIdentityState::Resolved(identity) => data_source.instantiate_with_identity(
@@ -1531,12 +1795,6 @@ fn prefix_module_data_source(
     }
     new_data_source.directives.depends_on = prefix_directive_dependencies(
         &new_data_source.directives.depends_on,
-        instance_prefix,
-        intra_module_bindings,
-        arguments,
-    )?;
-    new_data_source.dependency_bindings = prefix_dependency_bindings(
-        &new_data_source.dependency_bindings,
         instance_prefix,
         intra_module_bindings,
         arguments,
@@ -1562,23 +1820,30 @@ fn prefix_module_data_source(
         call_path,
     ));
 
-    let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
-    for (key, expr) in &new_data_source.attributes {
-        substituted_attrs.insert(
-            key.clone(),
-            prefix_attr_value(expr, instance_prefix, intra_module_bindings, arguments)?,
-        );
-    }
-    new_data_source.attributes = substituted_attrs;
+    let expanded_values = expand_resource_values(
+        &new_data_source.attributes,
+        template_dependency_values,
+        &new_data_source.dependency_bindings,
+        instance_prefix,
+        intra_module_bindings,
+        arguments,
+    )?;
+    new_data_source.attributes = expanded_values.attributes;
+    new_data_source.dependency_bindings = expanded_values.dependency_bindings;
+    let id = new_data_source.id.clone();
 
-    Ok(new_data_source)
+    Ok(ExpandedValueCarrier::new(
+        new_data_source,
+        id,
+        expanded_values.forwarded_dependency_values,
+    ))
 }
 
 /// Instance-prefix one composition resource crossing a module boundary — the
 /// [`LiveComposition`] analogue of [`prefix_module_resource`]. The flattened
 /// identity/binding, diagnostic call provenance, arguments, and attributes all
 /// take the prefix treatment; compositions have no `prefixes` or `directives`.
-fn prefix_module_composition(
+pub(super) fn prefix_module_composition(
     composition: &LiveComposition,
     instance_prefix: &str,
     intra_module_bindings: &HashSet<String>,
@@ -1693,7 +1958,7 @@ fn prefix_module_composition(
 /// expansion. Satisfied constraints disappear, unresolved constraints remain
 /// for plan/apply gates, and concrete failures use the same typed diagnostic
 /// path as direct module calls.
-fn settle_prefixed_composition_constraints(
+pub(super) fn settle_prefixed_composition_constraints(
     composition: &mut LiveComposition,
     record_outcomes: bool,
 ) -> Result<Option<ModuleCallConstraintReport>, ModuleError> {
@@ -1843,15 +2108,19 @@ fn check_composition_argument_type(
 ///   ref-rewrite + arg-substitute + canonicalize as `module.resources`.
 /// - `file`/`line`/`header`/`resource_type`/`binding`
 ///   → provenance / display / non-binding / loop-local: pass through.
-fn prefix_deferred_for_expression(
-    d: &DeferredForExpression,
+pub(super) fn prefix_deferred_for_expression(
+    template: TemplateValueCarrier<'_, DeferredForExpression>,
     instance_prefix: &str,
     module_name: &str,
     module_instance_scope: &ModuleInstanceScope,
     module_call: &CompositionCall,
     intra_module_bindings: &HashSet<String>,
     arguments: ArgumentSubstitutions<'_>,
-) -> Result<DeferredForExpression, ArgumentSubstitutionError> {
+) -> Result<ExpandedValueCarrier<DeferredForExpression>, ArgumentSubstitutionError> {
+    let TemplateValueCarrier {
+        value: d,
+        dependency_values: template_dependency_values,
+    } = template;
     let DeferredForExpression {
         file,
         line,
@@ -1870,83 +2139,90 @@ fn prefix_deferred_for_expression(
         .map(|origin| origin.legacy_address().clone())
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
 
-    Ok(DeferredForExpression {
-        // provenance — pass through (like WaitBinding.line)
-        file: file.clone(),
-        line: *line,
-        // verbatim user-surface display text — pass through
-        // (like WaitBinding.until_raw)
-        header: header.clone(),
-        // provider-qualified type — not a binding
-        resource_type: resource_type.clone(),
-        // The loop body's attrs may reference module-internal bindings
-        // / module arguments — same shared `prefix_attr_value` the
-        // module resource attrs get.
-        attributes: attributes
-            .iter()
-            .map(|(k, v)| {
-                Ok((
-                    k.clone(),
-                    prefix_attr_value(v, instance_prefix, intra_module_bindings, arguments)?,
-                ))
-            })
-            .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        // Generated-resource address prefix — `binding_name` is a name
-        // the loop *synthesizes* for its own resources (e.g.
-        // `_domain_validation_options`), NOT a reference to a
-        // pre-existing binding, so the caller-collision concern does
-        // not apply: prefix it unconditionally (same as
-        // `Resource.binding`) to isolate each module instance's loop
-        // resources.
-        target: match target {
-            crate::parser::DeferredForTarget::Bound { binding } => {
-                crate::parser::DeferredForTarget::Bound {
-                    binding: apply_instance_prefix(instance_prefix, binding),
-                }
+    let attributes = attributes
+        .iter()
+        .map(|(k, v)| {
+            Ok((
+                k.clone(),
+                prefix_attr_value(v, instance_prefix, intra_module_bindings, arguments)?,
+            ))
+        })
+        .collect::<Result<_, ArgumentSubstitutionError>>()?;
+    let target = match target {
+        crate::parser::DeferredForTarget::Bound { binding } => {
+            crate::parser::DeferredForTarget::Bound {
+                binding: apply_instance_prefix(instance_prefix, binding),
             }
-            crate::parser::DeferredForTarget::Unbound { template } => {
-                let mut template = template.clone();
-                template.prefix_for_module(&instance_identity, &legacy_parent);
-                crate::parser::DeferredForTarget::Unbound { template }
-            }
-        },
-        // The full iterable is a value expression: rewrite every reference
-        // and substitute module arguments in both coalesce operands.
-        iterable: prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?,
-        // loop-var pattern kind — loop-local, not a module binding
-        binding: binding.clone(),
-        // Full module-resource treatment — identical to a
-        // `module.resources` entry.
-        template_resource: prefix_module_resource_with_identity(
+        }
+        crate::parser::DeferredForTarget::Unbound { template } => {
+            let mut template = template.clone();
+            template.prefix_for_module(&instance_identity, &legacy_parent);
+            crate::parser::DeferredForTarget::Unbound { template }
+        }
+    };
+    let iterable = prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?;
+    let template_resource = prefix_module_resource_with_identity(
+        TemplateValueCarrier::new(template_resource, template_dependency_values),
+        instance_prefix,
+        &instance_identity,
+        module_name,
+        module_instance_scope,
+        module_call,
+        intra_module_bindings,
+        arguments,
+    )?;
+
+    Ok(
+        template_resource.map(|template_resource| DeferredForExpression {
+            // provenance — pass through (like WaitBinding.line)
+            file: file.clone(),
+            line: *line,
+            // verbatim user-surface display text — pass through
+            // (like WaitBinding.until_raw)
+            header: header.clone(),
+            // provider-qualified type — not a binding
+            resource_type: resource_type.clone(),
+            // The loop body's attrs may reference module-internal bindings
+            // / module arguments — same shared `prefix_attr_value` the
+            // module resource attrs get.
+            attributes,
+            // Generated-resource address prefix — `binding_name` is a name
+            // the loop *synthesizes* for its own resources (e.g.
+            // `_domain_validation_options`), NOT a reference to a
+            // pre-existing binding, so the caller-collision concern does
+            // not apply: prefix it unconditionally (same as
+            // `Resource.binding`) to isolate each module instance's loop
+            // resources.
+            target,
+            // The full iterable is a value expression: rewrite every reference
+            // and substitute module arguments in both coalesce operands.
+            iterable,
+            // loop-var pattern kind — loop-local, not a module binding
+            binding: binding.clone(),
+            // Full module-resource treatment — identical to a
+            // `module.resources` entry.
             template_resource,
-            instance_prefix,
-            &instance_identity,
-            module_name,
-            module_instance_scope,
-            module_call,
-            intra_module_bindings,
-            arguments,
-        )?,
-    })
+        }),
+    )
 }
 
 #[derive(Debug)]
 pub(super) struct ArgumentSubstitutionError {
-    source_file: Option<std::path::PathBuf>,
-    line: usize,
-    message: String,
-    parse_error: Option<Box<ParseError>>,
+    pub(super) source_file: Option<std::path::PathBuf>,
+    pub(super) line: usize,
+    pub(super) message: String,
+    pub(super) parse_error: Option<Box<ParseError>>,
 }
 
 impl ArgumentSubstitutionError {
-    fn with_optional_source_file(self, source_file: Option<&std::path::Path>) -> Self {
+    pub(super) fn with_optional_source_file(self, source_file: Option<&std::path::Path>) -> Self {
         match source_file {
             Some(source_file) => self.with_source_file(source_file),
             None => self,
         }
     }
 
-    fn with_source_file(mut self, source_file: &std::path::Path) -> Self {
+    pub(super) fn with_source_file(mut self, source_file: &std::path::Path) -> Self {
         if self.source_file.is_none() {
             self.source_file = Some(source_file.to_path_buf());
         }
@@ -2040,12 +2316,39 @@ fn substitute_function_argument(
     })
 }
 
-fn substitute_arguments_with_position(
+pub(super) fn substitute_arguments_with_position(
     value: &Value,
     arguments: ArgumentSubstitutions<'_>,
     position: ArgumentSubstitutionPosition,
 ) -> Result<Value, ArgumentSubstitutionError> {
     let substituted = match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            match substitute_and_decide_if(deferred.condition(), arguments)? {
+                ConditionSelection::Then => {
+                    substitute_arguments_with_position(deferred.then_value(), arguments, position)?
+                }
+                ConditionSelection::Else => {
+                    substitute_arguments_with_position(deferred.else_value(), arguments, position)?
+                }
+                ConditionSelection::Forwarded(condition) => {
+                    let then_value = substitute_arguments_with_position(
+                        deferred.then_value(),
+                        arguments,
+                        position,
+                    )?;
+                    let else_value = substitute_arguments_with_position(
+                        deferred.else_value(),
+                        arguments,
+                        position,
+                    )?;
+                    Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+                        condition.into_deferred(),
+                        then_value,
+                        else_value,
+                    ))))
+                }
+            }
+        }
         Value::Deferred(DeferredValue::Unknown(
             crate::resource::UnknownReason::ModuleArgument {
                 name,
@@ -2266,6 +2569,15 @@ fn substitute_arguments_with_position(
                     parse_error: None,
                 })?
         }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            if value_contains_module_if(inner) {
+                Value::Deferred(DeferredValue::Secret(Box::new(
+                    substitute_module_ifs_in_secret(inner, arguments, position)?,
+                )))
+            } else {
+                value.clone()
+            }
+        }
         Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -2276,11 +2588,9 @@ fn substitute_arguments_with_position(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(
-            DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
-        ) => value.clone(),
+        | Value::Deferred(DeferredValue::RedactedSecret { .. } | DeferredValue::Unknown(_)) => {
+            value.clone()
+        }
     };
 
     if let (Some(binding_index), Value::Deferred(DeferredValue::ResourceRef { path })) =
@@ -2316,6 +2626,12 @@ pub(super) fn rewrite_intra_module_refs(
     intra_module_bindings: &HashSet<String>,
 ) -> Value {
     match value {
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            let deferred = deferred.map(|value| {
+                rewrite_intra_module_refs(value, instance_prefix, intra_module_bindings)
+            });
+            Value::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
+        }
         Value::Deferred(DeferredValue::BindingRef { binding })
             if intra_module_bindings.contains(binding) =>
         {
@@ -2879,6 +3195,10 @@ fn rewrite_ref_prefixes(
 mod tests {
     use super::*;
 
+    fn publish<T>(expanded: ExpandedValueCarrier<T>) -> T {
+        expanded.into_value(&mut crate::parser::ParserBindingMetadata::default())
+    }
+
     fn test_expanded_call() -> CompositionCall {
         let parsed = crate::parser::parse_file(
             "let registry = use { source = './registry' }\nlet registry_publish = registry {}\n",
@@ -2916,20 +3236,22 @@ mod tests {
             binding_index: None,
             config: &config,
         };
-        let prefixed = prefix_module_data_source(
-            &data_source,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
+        let prefixed = publish(
+            prefix_module_data_source(
+                TemplateValueCarrier::new(&data_source, None),
                 "registry_publish",
-            ),
-            &test_expanded_call(),
-            &HashSet::from(["caller".to_string(), "target".to_string()]),
-            substitutions,
-        )
-        .expect("prefix data source");
+                "registry",
+                &ModuleInstanceScope::for_call(
+                    "registry",
+                    Some("registry_publish"),
+                    "registry_publish",
+                ),
+                &test_expanded_call(),
+                &HashSet::from(["caller".to_string(), "target".to_string()]),
+                substitutions,
+            )
+            .expect("prefix data source"),
+        );
 
         assert_eq!(
             prefixed.id.identity_str().expect("resolved identity"),
@@ -2964,20 +3286,22 @@ mod tests {
             binding_index: None,
             config: &config,
         };
-        let prefixed = prefix_module_resource(
-            &resource,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
+        let prefixed = publish(
+            prefix_module_resource(
+                TemplateValueCarrier::new(&resource, None),
                 "registry_publish",
-            ),
-            &test_expanded_call(),
-            &HashSet::from(["consumer".to_string(), "target".to_string()]),
-            substitutions,
-        )
-        .expect("prefix resource");
+                "registry",
+                &ModuleInstanceScope::for_call(
+                    "registry",
+                    Some("registry_publish"),
+                    "registry_publish",
+                ),
+                &test_expanded_call(),
+                &HashSet::from(["consumer".to_string(), "target".to_string()]),
+                substitutions,
+            )
+            .expect("prefix resource"),
+        );
 
         assert_eq!(
             prefixed.dependency_bindings,
@@ -3015,20 +3339,22 @@ mod tests {
             binding_index: None,
             config: &config,
         };
-        let prefixed = prefix_module_resource(
-            resource,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
+        let prefixed = publish(
+            prefix_module_resource(
+                TemplateValueCarrier::new(resource, None),
                 "registry_publish",
-            ),
-            &module_call,
-            &HashSet::new(),
-            substitutions,
-        )
-        .expect("prefix loop resource");
+                "registry",
+                &ModuleInstanceScope::for_call(
+                    "registry",
+                    Some("registry_publish"),
+                    "registry_publish",
+                ),
+                &module_call,
+                &HashSet::new(),
+                substitutions,
+            )
+            .expect("prefix loop resource"),
+        );
 
         assert_eq!(
             prefixed
@@ -3177,20 +3503,22 @@ mod tests {
             binding_index: None,
             config: &config,
         };
-        let roles = prefix_module_data_source(
-            &roles,
-            "registry_publish",
-            "registry",
-            &ModuleInstanceScope::for_call(
-                "registry",
-                Some("registry_publish"),
+        let roles = publish(
+            prefix_module_data_source(
+                TemplateValueCarrier::new(&roles, None),
                 "registry_publish",
-            ),
-            &expanded_call,
-            &intra_module_bindings,
-            substitutions,
-        )
-        .expect("prefix data source");
+                "registry",
+                &ModuleInstanceScope::for_call(
+                    "registry",
+                    Some("registry_publish"),
+                    "registry_publish",
+                ),
+                &expanded_call,
+                &intra_module_bindings,
+                substitutions,
+            )
+            .expect("prefix data source"),
+        );
 
         assert_eq!(
             roles.dependency_bindings,

@@ -7,19 +7,18 @@
 //!   be a resource, a module call, or a value.
 //! * value position (interpolations, attribute values) — handled by
 //!   [`parse_if_value_expr_with_mode`], which only allows a [`Value`] body and
-//!   requires an `else` clause.
+//!   requires an `else` branch so the false case also has a value.
 
-use crate::ValueDescription;
 use crate::eval_value::EvalValue;
 use crate::parser::context::ExpressionMode;
 use crate::parser::expressions::for_expr::LoopParseTarget;
 use crate::parser::{
-    LetBindingKind, LetBindingRhs, ModuleCall, ParseContext, ParseError, PreprocessedFile, Rule,
-    evaluate_static_value, first_inner, if_structural_handle, is_static_value, next_pair,
-    parse_expression, parse_expression_eval, parse_module_call, parse_read_resource_expr,
-    parse_resource_for_target,
+    DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, DeferredValueIf, LetBindingKind,
+    LetBindingRhs, ModuleCall, ParseContext, ParseError, PreprocessedFile, Rule,
+    decide_if_condition, first_inner, if_structural_handle, next_pair, parse_expression,
+    parse_expression_eval, parse_module_call, parse_read_resource_expr, parse_resource_for_target,
 };
-use crate::resource::{ConcreteValue, DataSource, LoopKind, Resource, Value};
+use crate::resource::{DataSource, DeferredValue, LoopKind, Resource, Value};
 
 /// Result of parsing an if expression body: a managed resource, a data
 /// source, a module call, or a value.
@@ -30,12 +29,90 @@ pub(crate) enum IfBodyResult {
     Value(Value),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IfBodyKind {
+    Structural,
+    Value,
+}
+
+fn if_body_kind(pair: &pest::iterators::Pair<Rule>) -> Result<IfBodyKind, ParseError> {
+    let tail = pair
+        .clone()
+        .into_inner()
+        .next_back()
+        .ok_or_else(|| ParseError::InternalError {
+            expected: "resource expression, module call, or value expression".to_string(),
+            context: "if body classification".to_string(),
+        })?;
+    match tail.as_rule() {
+        Rule::resource_expr | Rule::read_resource_expr | Rule::module_call => {
+            Ok(IfBodyKind::Structural)
+        }
+        Rule::expression if expression_contains_structural_declaration(&tail) => {
+            Ok(IfBodyKind::Structural)
+        }
+        Rule::expression => Ok(IfBodyKind::Value),
+        _ => Err(ParseError::InternalError {
+            expected: "resource expression, module call, or value expression".to_string(),
+            context: "if body classification".to_string(),
+        }),
+    }
+}
+
+fn expression_contains_structural_declaration(pair: &pest::iterators::Pair<Rule>) -> bool {
+    pair.clone().into_inner().any(|inner| {
+        matches!(
+            inner.as_rule(),
+            Rule::resource_expr | Rule::read_resource_expr | Rule::module_call
+        ) || expression_contains_structural_declaration(&inner)
+    })
+}
+
+fn validate_if_body_shapes(
+    then_body: &pest::iterators::Pair<Rule>,
+    else_body: Option<&pest::iterators::Pair<Rule>>,
+    condition_line: usize,
+) -> Result<(), ParseError> {
+    let then_kind = if_body_kind(then_body)?;
+    let else_kind = else_body.map(if_body_kind).transpose()?;
+    match (then_kind, else_kind) {
+        (IfBodyKind::Value, None) => Err(ParseError::InvalidExpression {
+            line: condition_line,
+            message: "an `if` that produces a value must have an `else` branch, because there is no value to use when the condition is false; add `else { <value> }`"
+                .to_string(),
+        }),
+        (IfBodyKind::Value, Some(IfBodyKind::Structural)) => Err(ParseError::InvalidExpression {
+            line: condition_line,
+            message: "both branches of this `if` must be the same kind: the `then` branch produces a value but the `else` branch declares resources/module calls; make both branches values, or both branches resource/module declarations"
+                .to_string(),
+        }),
+        (IfBodyKind::Structural, Some(IfBodyKind::Value)) => Err(ParseError::InvalidExpression {
+            line: condition_line,
+            message: "both branches of this `if` must be the same kind: the `then` branch declares resources/module calls but the `else` branch produces a value; make both branches values, or both branches resource/module declarations"
+                .to_string(),
+        }),
+        (IfBodyKind::Structural, None)
+        | (IfBodyKind::Value, Some(IfBodyKind::Value))
+        | (IfBodyKind::Structural, Some(IfBodyKind::Structural)) => Ok(()),
+    }
+}
+
+fn structural_if_value_error(line: usize) -> ParseError {
+    ParseError::InvalidExpression {
+        line,
+        message: "resource expressions and module calls cannot be used in if value expressions; use a let binding instead"
+            .to_string(),
+    }
+}
+
 /// Parse an if expression and conditionally include resources/module calls/values.
 ///
 /// `if condition { body }` includes the body when condition is true.
 /// `if condition { body } else { body }` selects one branch.
 ///
-/// The condition must evaluate to a static Bool value at parse time.
+/// In root files the condition must evaluate to a static Bool at parse time.
+/// A module-argument-only condition is retained as a parser template and
+/// selected after call-site argument substitution.
 pub(crate) fn parse_if_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &mut ParseContext,
@@ -48,6 +125,7 @@ pub(crate) fn parse_if_expr(
     // Parse the condition expression
     let condition_pair = next_pair(&mut inner, "condition", "if expression")?;
     let condition_line = condition_pair.line_col().0;
+    let condition_source = condition_pair.as_str().trim().to_string();
     let condition_value = parse_expression_eval(condition_pair, ctx)?;
 
     // Pass 1 of a directory fixed point knows that a sibling name exists but
@@ -65,44 +143,35 @@ pub(crate) fn parse_if_expr(
         .into_value()
         .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
 
-    // Ensure the condition is statically evaluable
-    if !is_static_value(&condition_value) {
-        return Err(ParseError::InvalidExpression {
-            line: condition_line,
-            message: "if condition depends on a runtime value; \
-                      condition must be statically known at parse time"
-                .to_string(),
-        });
+    let decision = decide_if_condition(&condition_value, ctx.config)
+        .map_err(|error| error.into_parse_error(condition_line))?;
+    let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
+    let else_body_pair = inner
+        .next()
+        .map(|else_pair| first_inner(else_pair, "else body", "else clause"))
+        .transpose()?;
+    validate_if_body_shapes(&if_body_pair, else_body_pair.as_ref(), condition_line)?;
+
+    if decision.is_none() {
+        let then_branch =
+            parse_if_body(if_body_pair, ctx, &target, preprocessed_file, source_file)?;
+        let else_branch = else_body_pair
+            .map(|else_body| parse_if_body(else_body, ctx, &target, preprocessed_file, source_file))
+            .transpose()?;
+        let condition = DeferredIfCondition::new_with_source_expression(
+            condition_value,
+            source_file.to_path_buf(),
+            condition_line,
+            condition_source,
+        );
+        return defer_if_body(condition, then_branch, else_branch, ctx, &target);
     }
 
-    let condition_value = evaluate_static_value(condition_value, ctx.config)?;
-
-    // Condition must be a Bool
-    let condition = match &condition_value {
-        Value::Concrete(ConcreteValue::Bool(b)) => *b,
-        other => {
-            return Err(ParseError::InvalidExpression {
-                line: condition_line,
-                message: format!(
-                    "if condition must be a Bool value, got: {}",
-                    ValueDescription::of(other)
-                ),
-            });
-        }
-    };
-
-    // Parse the if body
-    let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
-
-    // Check for else clause
-    let else_body_pair = inner.next();
-
-    if condition {
+    if decision.expect("module-dependent decision returned above") {
         // Use the if branch
         parse_if_body_to_rhs(if_body_pair, ctx, &target, preprocessed_file, source_file)
-    } else if let Some(else_pair) = else_body_pair {
+    } else if let Some(else_body) = else_body_pair {
         // Use the else branch
-        let else_body = first_inner(else_pair, "else body", "else clause")?;
         parse_if_body_to_rhs(else_body, ctx, &target, preprocessed_file, source_file)
     } else {
         // No else clause and condition is false: produce nothing
@@ -114,6 +183,62 @@ pub(crate) fn parse_if_expr(
             None,
             LetBindingKind::Structural,
         ))
+    }
+}
+
+fn defer_if_body(
+    condition: DeferredIfCondition,
+    then_branch: IfBodyResult,
+    else_branch: Option<IfBodyResult>,
+    ctx: &mut ParseContext,
+    target: &LoopParseTarget,
+) -> Result<LetBindingRhs, ParseError> {
+    match (then_branch, else_branch) {
+        (IfBodyResult::Value(then_value), Some(IfBodyResult::Value(else_value))) => Ok((
+            EvalValue::from_value(Value::Deferred(DeferredValue::ModuleIf(Box::new(
+                DeferredValueIf::new(condition, then_value, else_value),
+            )))),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            LetBindingKind::Value,
+        )),
+        (IfBodyResult::Value(_), None)
+        | (IfBodyResult::Value(_), Some(_))
+        | (_, Some(IfBodyResult::Value(_))) => Err(ParseError::InternalError {
+            expected: "validated if branch shapes".to_string(),
+            context: "deferred module if".to_string(),
+        }),
+        (then_branch, else_branch) => {
+            let then_branch = structural_if_body(then_branch)?;
+            let else_branch = else_branch.map(structural_if_body).transpose()?;
+            ctx.deferred_module_ifs.push(DeferredStructuralIf::new(
+                condition,
+                then_branch,
+                else_branch,
+            ));
+            Ok((
+                if_structural_handle(target.scheduler_key()),
+                vec![],
+                vec![],
+                vec![],
+                None,
+                LetBindingKind::Structural,
+            ))
+        }
+    }
+}
+
+fn structural_if_body(body: IfBodyResult) -> Result<DeferredIfBody, ParseError> {
+    match body {
+        IfBodyResult::Resource(resource) => Ok(DeferredIfBody::Resource(resource)),
+        IfBodyResult::DataSource(data_source) => Ok(DeferredIfBody::DataSource(data_source)),
+        IfBodyResult::ModuleCall(call) => Ok(DeferredIfBody::ModuleCall(call)),
+        IfBodyResult::Value(_) => Err(ParseError::InternalError {
+            expected: "structural if body".to_string(),
+            context: "deferred module if".to_string(),
+        }),
     }
 }
 
@@ -236,8 +361,10 @@ pub(crate) fn parse_if_body(
 /// Parse an if/else expression in value position (attribute values, not let bindings).
 ///
 /// Unlike `parse_if_expr()` which returns `LetBindingRhs` (resources, module calls, or values),
-/// this function only returns `Value`. The condition must be a static Bool.
-/// An else clause is required when the condition is false (a value must always be determined).
+/// this function only returns `Value`. Root conditions must be static;
+/// module-argument-only conditions remain parser templates until expansion.
+/// An else branch is always required because a value must be determined for
+/// either result of the condition.
 pub(crate) fn parse_if_value_expr_with_mode(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -248,6 +375,7 @@ pub(crate) fn parse_if_value_expr_with_mode(
     // Parse the condition expression
     let condition_pair = next_pair(&mut inner, "condition", "if value expression")?;
     let condition_line = condition_pair.line_col().0;
+    let condition_source = condition_pair.as_str().trim().to_string();
     let condition_value = parse_expression_eval(condition_pair, ctx)?;
     if matches!(condition_value, EvalValue::ProvisionalReference { .. })
         && ctx.defer_provisional_static_conditions
@@ -259,50 +387,49 @@ pub(crate) fn parse_if_value_expr_with_mode(
         .into_value()
         .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
 
-    // Ensure the condition is statically evaluable
-    if !is_static_value(&condition_value) {
-        return Err(ParseError::InvalidExpression {
-            line: condition_line,
-            message: "if condition depends on a runtime value; \
-                      condition must be statically known at parse time"
-                .to_string(),
-        });
+    // Preserve eager ordering: decide and type-check the condition before
+    // inspecting either branch.
+    let decision = decide_if_condition(&condition_value, ctx.config)
+        .map_err(|error| error.into_parse_error(condition_line))?;
+
+    let if_body_pair = next_pair(&mut inner, "if body", "if value expression")?;
+    let else_body = inner
+        .next()
+        .map(|else_pair| first_inner(else_pair, "else body", "else clause"))
+        .transpose()?;
+    if if_body_kind(&if_body_pair)? == IfBodyKind::Structural && else_body.is_none() {
+        return Err(structural_if_value_error(condition_line));
+    }
+    validate_if_body_shapes(&if_body_pair, else_body.as_ref(), condition_line)?;
+    let else_body = else_body.expect("value if branch shape requires an else branch");
+
+    if decision.is_none() {
+        let then_value = parse_if_body_value_with_mode(if_body_pair, ctx, mode)?
+            .into_value()
+            .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
+        let else_value = parse_if_body_value_with_mode(else_body, ctx, mode)?
+            .into_value()
+            .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
+        return Ok(EvalValue::from_value(Value::Deferred(
+            DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+                DeferredIfCondition::new_with_source_expression(
+                    condition_value,
+                    ctx.source_file().to_path_buf(),
+                    condition_line,
+                    condition_source,
+                ),
+                then_value,
+                else_value,
+            ))),
+        )));
     }
 
-    let condition_value = evaluate_static_value(condition_value, ctx.config)?;
-
-    // Condition must be a Bool
-    let condition = match &condition_value {
-        Value::Concrete(ConcreteValue::Bool(b)) => *b,
-        other => {
-            return Err(ParseError::InvalidExpression {
-                line: condition_line,
-                message: format!(
-                    "if condition must be a Bool value, got: {}",
-                    ValueDescription::of(other)
-                ),
-            });
-        }
-    };
-
-    // Parse the if body
-    let if_body_pair = next_pair(&mut inner, "if body", "if value expression")?;
-
-    // Check for else clause
-    let else_body_pair = inner.next();
+    let condition = decision.expect("module-dependent decision returned above");
 
     if condition {
         parse_if_body_value_with_mode(if_body_pair, ctx, mode)
-    } else if let Some(else_pair) = else_body_pair {
-        let else_body = first_inner(else_pair, "else body", "else clause")?;
-        parse_if_body_value_with_mode(else_body, ctx, mode)
     } else {
-        Err(ParseError::InvalidExpression {
-            line: condition_line,
-            message: "if expression in value position requires an else clause \
-                      when condition is false"
-                .to_string(),
-        })
+        parse_if_body_value_with_mode(else_body, ctx, mode)
     }
 }
 
@@ -339,12 +466,7 @@ fn parse_if_body_value_with_mode(
                     .map_err(|error| ParseError::from_eval_value(error, line));
             }
             Rule::resource_expr | Rule::read_resource_expr | Rule::module_call => {
-                return Err(ParseError::InvalidExpression {
-                    line: 0,
-                    message: "resource expressions and module calls cannot be used \
-                              in if value expressions; use a let binding instead"
-                        .to_string(),
-                });
+                return Err(structural_if_value_error(0));
             }
             _ => {}
         }

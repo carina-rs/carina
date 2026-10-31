@@ -7,10 +7,10 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{
-    LoadedProviderContext, ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext,
-    UseStatement,
+    DeferredIfBody, File, LoadedProviderContext, ModuleCallDiagnosticSource, ParseError,
+    ParsedFile, ProviderContext, StateBlock, UseStatement, ValidateExpr,
 };
-use crate::resource::ModuleConstraintId;
+use crate::resource::{ModuleConstraintId, Value};
 use crate::schema::SchemaRegistry;
 
 use super::error::{ModuleError, ModuleErrorCallSource};
@@ -137,6 +137,16 @@ impl ResidualModuleResolutionError {
                 source_path,
                 line: *line,
             }),
+            ModuleError::DroppedConditionalBinding {
+                binding: _binding,
+                condition: _condition,
+                source_path,
+                line,
+            } => Some(ResidualModuleResolutionDiagnostic::ArgumentValueAccess {
+                source_path: source_path.to_str().unwrap_or("<module>"),
+                line: *line,
+            }),
+            ModuleError::UnexpandedModuleTemplate { context: _context } => None,
             ModuleError::Parse(_error) => Some(ResidualModuleResolutionDiagnostic::Parse),
             ModuleError::ParseInFile {
                 path: _path,
@@ -244,6 +254,8 @@ impl ResidualModuleResolutionError {
                 line: _,
                 message: _,
             } => false,
+            ModuleError::DroppedConditionalBinding { .. } => false,
+            ModuleError::UnexpandedModuleTemplate { .. } => false,
             ModuleError::Io(_) => false,
             ModuleError::Parse(error) => match error {
                 ParseError::Located { path, error } => {
@@ -397,6 +409,13 @@ fn without_covered_reference_type_members(
             line: _,
             message: _,
         }
+        | ModuleError::DroppedConditionalBinding {
+            binding: _,
+            condition: _,
+            source_path: _,
+            line: _,
+        }
+        | ModuleError::UnexpandedModuleTemplate { context: _ }
         | ModuleError::Io(_)
         | ModuleError::Parse(_)
         | ModuleError::ParseInFile { path: _, error: _ }
@@ -575,10 +594,11 @@ mod diagnostic_status_tests {
 /// Opaque proof that every reachable module definition has passed the shared
 /// BindingIndex reference-type validation before expansion.
 ///
-/// Expansion is exposed only as [`Self::expand`]; the resolver and the witness
-/// consumed by its internal expansion primitive are private. Consequently a
-/// command may skip provider/resource validation, but cannot construct an
-/// expansion path that skips reference-type validation.
+/// Expansion is exposed only through [`Self::expand`] and
+/// [`Self::expand_template`]; the resolver and the witness consumed by their
+/// internal expansion primitives are private. Consequently a command may skip
+/// provider/resource validation, but cannot construct an expansion path that
+/// skips reference-type validation.
 ///
 /// ```compile_fail
 /// use carina_core::module_resolver::ModuleResolver;
@@ -1006,6 +1026,13 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
         }
 
+        // Keep the authored value tree beside the semantic tree while this
+        // file is a reusable template. Reference resolution below may fold a
+        // direct reference to a concrete value, but dependency edges for an
+        // argument-dependent `if` must be derived only after expansion has
+        // selected a branch.
+        merged.capture_template_dependency_values();
+
         // Resolve references while the module's own binding namespace is still
         // intact. Besides folding module-local values, this records the direct
         // dependency bindings that expansion subsequently instance-prefixes.
@@ -1090,9 +1117,25 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let original_imported = std::mem::take(&mut self.imported_modules);
         let original_paths = std::mem::take(&mut self.module_paths);
 
-        // Process the module's own imports
+        let conditional_calls = parsed
+            .deferred_module_ifs
+            .iter()
+            .flat_map(|deferred| deferred.branches())
+            .filter_map(|branch| match branch {
+                DeferredIfBody::ModuleCall(call) => Some(call.clone()),
+                DeferredIfBody::Resource(_)
+                | DeferredIfBody::DataSource(_)
+                | DeferredIfBody::ExpandedModuleCall(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        // Process the module's own imports. Conditional calls participate in
+        // source ownership even though their branch cannot be selected until
+        // an outer caller supplies the module argument.
         let imports = parsed.uses.clone();
-        let result = self.process_imports(&imports, &parsed.module_calls);
+        let mut owned_calls = parsed.module_calls.clone();
+        owned_calls.extend(conditional_calls.iter().cloned());
+        let result = self.process_imports(&imports, &owned_calls);
 
         if let Err(e) = result {
             // Restore state on error
@@ -1113,12 +1156,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         };
 
         // Expand the module's own module_calls. `module_calls` is cloned
-        // because the loop body now folds the contribution in via
-        // `merge_parsed_file(parsed, …)` — a
-        // whole-`&mut parsed` borrow that conflicts with any live
-        // immutable borrow of a `parsed` field (the old per-field
-        // `.extend()` only needed a disjoint field borrow; the single
-        // merge surface needs the whole struct).
+        // because the loop body folds each contribution into the whole file;
+        // that mutable borrow conflicts with any live immutable borrow of a
+        // `parsed` field.
         let module_calls = parsed.module_calls.clone();
         let signatures = self.resolved_module_signatures();
         let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
@@ -1128,6 +1168,27 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         );
         let resolved_bindings = crate::binding_index::ResolvedBindings::for_validation(parsed);
         let mut expanded_calls = Vec::with_capacity(module_calls.len());
+        let mut expanded_conditional_calls = HashMap::with_capacity(conditional_calls.len());
+        for call in &conditional_calls {
+            let instance_prefix = instance_prefix_for_call(call);
+            match self.expand_module_call_checked(
+                call,
+                &instance_prefix,
+                &ref_check,
+                Some(&binding_index),
+                Some(&resolved_bindings),
+            ) {
+                Ok(expanded) => {
+                    expanded_conditional_calls.insert(call.id().clone(), expanded);
+                }
+                Err(e) => {
+                    self.base_dir = original_base_dir;
+                    self.imported_modules = original_imported;
+                    self.module_paths = original_paths;
+                    return Err(e);
+                }
+            }
+        }
         for call in &module_calls {
             let instance_prefix = instance_prefix_for_call(call);
             match self.expand_module_call_checked(
@@ -1147,10 +1208,23 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             }
         }
         drop(binding_index);
+        for deferred in &mut parsed.deferred_module_ifs {
+            for branch in deferred.branches_mut() {
+                let DeferredIfBody::ModuleCall(call) = branch else {
+                    continue;
+                };
+                let expanded = expanded_conditional_calls
+                    .remove(call.id())
+                    .expect("every conditional call was expanded in its module scope");
+                *branch = DeferredIfBody::ExpandedModuleCall(std::sync::Arc::new(expanded));
+            }
+        }
+        debug_assert!(expanded_conditional_calls.is_empty());
         for expanded in expanded_calls {
             // The module contribution is a `ParsedFile`; fold it in via the
-            // one shared merge surface so no field can be silently dropped.
-            crate::config_loader::merge_parsed_file(parsed, expanded);
+            // same-phase exhaustive merge. This is deliberately the raw
+            // template path: forwarded outer arguments may still be deferred.
+            parsed.merge_from(expanded);
         }
 
         // Restore original state
@@ -1204,6 +1278,22 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'pa
     /// Consume the checked graph and expand its root configuration.
     pub fn expand(mut self) -> Result<(), ModuleError> {
         resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
+    }
+
+    /// Expand as much as possible while retaining argument-dependent nodes
+    /// owned by a reusable module template. Validation, lint, and editors use
+    /// this path; it deliberately does not mint a publishable root graph.
+    pub fn expand_template(mut self) -> Result<(), ModuleError> {
+        let mut errors = resolve_modules_with_resolver_collecting(
+            self.parsed,
+            &mut self.resolver,
+            &self.root_witness,
+        );
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.remove(0))
+        }
     }
 }
 
@@ -1290,6 +1380,29 @@ pub fn resolve_modules_with_providerless_config<E: crate::parser::ExportParamLik
     schemas: &SchemaRegistry,
 ) -> Result<(), ModuleError> {
     RefCheckedModuleGraph::check_providerless(parsed, base_dir, config, schemas)?.expand()
+}
+
+/// Template-tolerant counterpart of [`resolve_modules_with_config`].
+///
+/// Imported calls are expanded and checked, but a module argument owned by the
+/// root directory may remain deferred for a future caller.
+pub fn resolve_module_template_with_config<E: crate::parser::ExportParamLike>(
+    parsed: &mut crate::parser::File<E>,
+    base_dir: &Path,
+    config: &LoadedProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<(), ModuleError> {
+    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand_template()
+}
+
+/// Providerless/editor form of [`resolve_module_template_with_config`].
+pub fn resolve_module_template_with_providerless_config<E: crate::parser::ExportParamLike>(
+    parsed: &mut crate::parser::File<E>,
+    base_dir: &Path,
+    config: &ProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<(), ModuleError> {
+    RefCheckedModuleGraph::check_providerless(parsed, base_dir, config, schemas)?.expand_template()
 }
 
 /// Expand an upstream project's modules using the consumer's necessarily
@@ -1393,7 +1506,383 @@ fn resolve_modules_with_diagnostics_and_resolver<E: crate::parser::ExportParamLi
     }
 }
 
-fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
+/// A parser-phase module contribution that has proved no parser-template
+/// conditional can escape into the published root graph.
+///
+/// The inner file is private and this conversion is the only constructor used
+/// by root expansion. Recursive module-template expansion intentionally keeps
+/// using `ParsedFile` so an outer argument may still select a forwarded node.
+#[derive(Debug)]
+struct ExpandedModuleContribution(ParsedFile);
+
+impl ExpandedModuleContribution {
+    fn try_new(file: ParsedFile) -> Result<Self, ModuleError> {
+        audit_expanded_module_contribution(&file).map_err(|context| {
+            ModuleError::Parse(ParseError::InternalError {
+                expected: "a module contribution with no deferred module conditionals".to_string(),
+                context,
+            })
+        })?;
+        Ok(Self(file))
+    }
+
+    fn merge_into<E: crate::parser::ExportParamLike>(self, target: &mut File<E>) {
+        let contribution = crate::config_loader::relabel_export_phase(self.0);
+        crate::config_loader::merge_parsed_file(target, contribution);
+    }
+}
+
+/// Publication gate for a fully resolved root graph. Validation and editor
+/// diagnostics deliberately operate on reusable module templates before this
+/// gate; planning/apply and the ordinary resolver must pass it.
+pub fn ensure_expanded_root_graph<E: crate::parser::ExportParamLike>(
+    file: &File<E>,
+) -> Result<(), ModuleError> {
+    audit_expanded_module_contribution(file)
+        .map_err(|context| ModuleError::UnexpandedModuleTemplate { context })
+}
+
+fn audit_value_has_no_module_if(
+    value: &Value,
+    context: std::fmt::Arguments<'_>,
+) -> Result<(), String> {
+    if super::deferred_if::value_contains_module_if(value) {
+        Err(context.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn audit_validate_expr_has_no_module_if(
+    expression: &ValidateExpr,
+    context: std::fmt::Arguments<'_>,
+) -> Result<(), String> {
+    match expression {
+        ValidateExpr::BoundArgument { value, .. } => audit_value_has_no_module_if(value, context),
+        ValidateExpr::Compare { lhs, rhs, .. }
+        | ValidateExpr::And(lhs, rhs)
+        | ValidateExpr::Or(lhs, rhs) => {
+            audit_validate_expr_has_no_module_if(lhs, context)?;
+            audit_validate_expr_has_no_module_if(rhs, context)
+        }
+        ValidateExpr::Not(inner) => audit_validate_expr_has_no_module_if(inner, context),
+        ValidateExpr::FunctionCall { args, .. } => {
+            for argument in args {
+                audit_validate_expr_has_no_module_if(argument, context)?;
+            }
+            Ok(())
+        }
+        ValidateExpr::Bool(_)
+        | ValidateExpr::Int(_)
+        | ValidateExpr::Float(_)
+        | ValidateExpr::Duration(_)
+        | ValidateExpr::String(_)
+        | ValidateExpr::Var(_)
+        | ValidateExpr::Access { .. }
+        | ValidateExpr::Null => Ok(()),
+    }
+}
+
+fn audit_attributes<'a>(
+    values: impl IntoIterator<Item = &'a Value>,
+    context: std::fmt::Arguments<'_>,
+) -> Result<(), String> {
+    for (index, value) in values.into_iter().enumerate() {
+        audit_value_has_no_module_if(value, format_args!("{context}[{index}]"))?;
+    }
+    Ok(())
+}
+
+/// Exhaustively classify every `File` field, then recursively classify every
+/// `Value`/`DeferredValue` shape reachable from fields that carry values. A new
+/// file field or deferred-value variant therefore breaks compilation until the
+/// publication audit makes an explicit decision about it.
+fn audit_expanded_module_contribution<E: crate::parser::ExportParamLike>(
+    file: &File<E>,
+) -> Result<(), String> {
+    file.assert_module_if_audit_classifies_every_field();
+    let File {
+        providers,
+        resources,
+        data_sources,
+        compositions,
+        variables,
+        uses: _uses,
+        module_calls,
+        arguments,
+        attribute_params,
+        export_params,
+        backend,
+        state_blocks,
+        user_functions,
+        upstream_states: _upstream_states,
+        wait_bindings,
+        requires,
+        structural_bindings: _structural_bindings,
+        parser_binding_metadata,
+        warnings: _warnings,
+        deferred_for_expressions,
+        deferred_module_ifs,
+        expansion_trace: _expansion_trace,
+        ..
+    } = file;
+
+    if !deferred_module_ifs.is_empty() {
+        return Err("expanded contribution structural conditionals".to_string());
+    }
+    for (index, provider) in providers.iter().enumerate() {
+        let crate::parser::ProviderConfig {
+            name: _name,
+            attributes,
+            default_tags,
+            source: _source,
+            version: _version,
+            revision: _revision,
+            unresolved_attributes,
+            binding: _binding,
+        } = provider;
+        audit_attributes(
+            attributes.values(),
+            format_args!("provider[{index}].attributes"),
+        )?;
+        audit_attributes(
+            default_tags.values(),
+            format_args!("provider[{index}].default_tags"),
+        )?;
+        audit_attributes(
+            unresolved_attributes.values(),
+            format_args!("provider[{index}].unresolved_attributes"),
+        )?;
+    }
+    for (index, resource) in resources.iter().enumerate() {
+        let crate::resource::Resource {
+            id: _id,
+            attributes,
+            directives: _directives,
+            resolved_ignore_changes: _resolved_ignore_changes,
+            prefixes: _prefixes,
+            binding: _binding,
+            dependency_bindings: _dependency_bindings,
+            module_source: _module_source,
+            default_tag_keys: _default_tag_keys,
+            loop_provenance: _loop_provenance,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = resource;
+        audit_attributes(
+            attributes.values(),
+            format_args!("resource[{index}].attributes"),
+        )?;
+    }
+    for (index, data_source) in data_sources.iter().enumerate() {
+        let crate::resource::DataSource {
+            id: _id,
+            attributes,
+            directives: _directives,
+            binding: _binding,
+            dependency_bindings: _dependency_bindings,
+            module_source: _module_source,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = data_source;
+        audit_attributes(
+            attributes.values(),
+            format_args!("data_source[{index}].attributes"),
+        )?;
+    }
+    for (index, composition) in compositions.iter().enumerate() {
+        let crate::resource::LiveComposition {
+            id: _id,
+            signature,
+            binding: _binding,
+            dependency_bindings: _dependency_bindings,
+            module_name: _module_name,
+            instance: _instance,
+            call_path: _call_path,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = composition;
+        let crate::resource::LiveCompositionSignature {
+            arguments,
+            attributes,
+            pending_constraints,
+        } = signature;
+        for (name, argument) in arguments {
+            argument.try_visit_values(&mut |value| {
+                audit_value_has_no_module_if(
+                    value,
+                    format_args!("composition[{index}].argument.{name}"),
+                )
+            })?;
+        }
+        for (name, attribute) in attributes {
+            audit_value_has_no_module_if(
+                &attribute.to_value(),
+                format_args!("composition[{index}].attribute.{name}"),
+            )?;
+        }
+        for constraint in pending_constraints {
+            audit_validate_expr_has_no_module_if(
+                constraint.expression(),
+                format_args!("composition[{index}].constraint"),
+            )?;
+        }
+    }
+    audit_attributes(variables.values(), format_args!("variables"))?;
+    for (index, call) in module_calls.iter().enumerate() {
+        call.try_visit_values_for_module_if_audit(&mut |value| {
+            audit_value_has_no_module_if(value, format_args!("module_call[{index}].argument"))
+        })?;
+    }
+    for (index, argument) in arguments.iter().enumerate() {
+        let crate::parser::ArgumentParameter {
+            name: _name,
+            static_type: _static_type,
+            default,
+            description: _description,
+            validations,
+        } = argument;
+        if let Some(default) = default {
+            audit_value_has_no_module_if(default, format_args!("argument[{index}].default"))?;
+        }
+        for validation in validations {
+            audit_validate_expr_has_no_module_if(
+                validation.condition_for_module_if_audit(),
+                format_args!("argument[{index}].validation"),
+            )?;
+        }
+    }
+    for (index, attribute) in attribute_params.iter().enumerate() {
+        if let Some(value) = attribute.value_for_module_if_audit() {
+            audit_value_has_no_module_if(value, format_args!("attribute[{index}].value"))?;
+        }
+    }
+    for (index, export) in export_params.iter().enumerate() {
+        if let Some(value) = export.value() {
+            audit_value_has_no_module_if(value, format_args!("export[{index}].value"))?;
+        }
+    }
+    if let Some(backend) = backend {
+        let crate::parser::BackendConfig {
+            backend_type: _backend_type,
+            attributes,
+            attribute_spans: _attribute_spans,
+        } = backend;
+        audit_attributes(attributes.values(), format_args!("backend.attributes"))?;
+    }
+    for (index, block) in state_blocks.iter().enumerate() {
+        match block {
+            StateBlock::Import {
+                to: _to,
+                to_span: _to_span,
+                id,
+            } => {
+                audit_value_has_no_module_if(id, format_args!("state_block[{index}].id"))?;
+            }
+            StateBlock::Removed { from: _from } => {}
+            StateBlock::Moved {
+                addresses: _addresses,
+            } => {}
+        }
+    }
+    for (name, function) in user_functions {
+        let crate::parser::UserFunction {
+            name: _function_name,
+            params,
+            return_type: _return_type,
+            local_lets,
+            body,
+        } = function;
+        for (index, parameter) in params.iter().enumerate() {
+            let crate::parser::FnParam {
+                name: _parameter_name,
+                param_type: _param_type,
+                default,
+            } = parameter;
+            if let Some(default) = default {
+                audit_value_has_no_module_if(
+                    default,
+                    format_args!("function.{name}.parameter[{index}]"),
+                )?;
+            }
+        }
+        for (local, value, _line) in local_lets {
+            audit_value_has_no_module_if(value, format_args!("function.{name}.local.{local}"))?;
+        }
+        let crate::parser::UserFunctionBody {
+            value,
+            source_line: _source_line,
+            source_file: _source_file,
+        } = body;
+        audit_value_has_no_module_if(value, format_args!("function.{name}.body"))?;
+    }
+    for (index, wait) in wait_bindings.iter().enumerate() {
+        let crate::parser::WaitBinding {
+            binding: _binding,
+            target: _target,
+            until_raw: _until_raw,
+            until_predicate,
+            timeout_secs: _timeout_secs,
+            depends_on: _depends_on,
+            line: _line,
+        } = wait;
+        let crate::parser::UntilPredicateAst {
+            lhs_segments: _lhs_segments,
+            rhs,
+        } = until_predicate;
+        audit_value_has_no_module_if(rhs, format_args!("wait[{index}].predicate"))?;
+    }
+    for (index, requirement) in requires.iter().enumerate() {
+        audit_validate_expr_has_no_module_if(
+            requirement.condition_for_module_if_audit(),
+            format_args!("require[{index}]"),
+        )?;
+    }
+    for (index, deferred) in deferred_for_expressions.iter().enumerate() {
+        let crate::parser::DeferredForExpression {
+            file: _file,
+            line: _line,
+            header: _header,
+            resource_type: _resource_type,
+            attributes,
+            target: _target,
+            iterable,
+            binding: _binding,
+            template_resource,
+        } = deferred;
+        audit_attributes(
+            attributes.iter().map(|(_, value)| value),
+            format_args!("deferred_for[{index}].attributes"),
+        )?;
+        audit_value_has_no_module_if(iterable, format_args!("deferred_for[{index}].iterable"))?;
+        let crate::resource::Resource {
+            id: _id,
+            attributes: template_attributes,
+            directives: _directives,
+            resolved_ignore_changes: _resolved_ignore_changes,
+            prefixes: _prefixes,
+            binding: _template_binding,
+            dependency_bindings: _dependency_bindings,
+            module_source: _module_source,
+            default_tag_keys: _default_tag_keys,
+            loop_provenance: _loop_provenance,
+            quoted_string_attrs: _quoted_string_attrs,
+        } = template_resource;
+        audit_attributes(
+            template_attributes.values(),
+            format_args!("deferred_for[{index}].template"),
+        )?;
+    }
+    parser_binding_metadata.try_visit_values(&mut |value| {
+        audit_value_has_no_module_if(value, format_args!("parser_binding_metadata"))
+    })?;
+    file.try_visit_bare_binding_values(&mut |value| {
+        audit_value_has_no_module_if(value, format_args!("parsed_binding_uses"))
+    })?;
+    Ok(())
+}
+
+fn resolve_modules_with_resolver_collecting<
+    E: crate::parser::ExportParamLike,
+    P: TypeResolutionPolicy,
+>(
     parsed: &mut crate::parser::File<E>,
     resolver: &mut ModuleResolver<'_, P>,
     ref_check: &RefCheckWitness,
@@ -1425,28 +1914,29 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
             Some(&binding_index),
             Some(&resolved_bindings),
         ) {
-            Ok(expanded) => {
-                expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
-            }
+            // Editor/validation expansion deliberately retains a forwarded
+            // parser template. Only the ordinary publication path below may
+            // construct `ExpandedModuleContribution` and reject leakage.
+            Ok(expanded) => expanded_calls.push(expanded),
             Err(error) => errors.push(error),
         }
     }
     drop(binding_index);
     for expanded in expanded_calls {
-        crate::config_loader::merge_parsed_file(parsed, expanded);
+        let contribution = crate::config_loader::relabel_export_phase(expanded);
+        crate::config_loader::merge_parsed_file(parsed, contribution);
     }
     errors
 }
 
-fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
+fn resolve_modules_with_resolver<E: crate::parser::ExportParamLike, P: TypeResolutionPolicy>(
     parsed: &mut crate::parser::File<E>,
     resolver: &mut ModuleResolver<'_, P>,
     ref_check: &RefCheckWitness,
 ) -> Result<(), ModuleError> {
-    // Expand module calls. `module_calls` is cloned because the loop
-    // body folds each contribution in via `merge_parsed_file(parsed,
-    // …)`, a whole-`&mut parsed` borrow that conflicts with iterating
-    // `&parsed.module_calls` in place.
+    // Expand module calls. `module_calls` is cloned because merging each
+    // contribution takes a whole-`&mut parsed` borrow, which conflicts with
+    // iterating `&parsed.module_calls` in place.
     let module_calls = parsed.module_calls.clone();
     let signatures = resolver.resolved_module_signatures();
     let binding_index = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
@@ -1465,20 +1955,21 @@ fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
             Some(&binding_index),
             Some(&resolved_bindings),
         )?;
+        let expanded = ExpandedModuleContribution::try_new(expanded)?;
         // `expand_module_call` returns a parser-phase `ParsedFile`;
         // this caller's `parsed` is a generic `File<E>` (the CLI
         // validate path passes an `InferredFile`). Relabel the
         // export-param-free contribution to the target phase, then
         // fold it in via the one shared merge surface so no field can
         // be silently dropped here (carina#3126 / carina#3061).
-        expanded_calls.push(crate::config_loader::relabel_export_phase(expanded));
+        expanded_calls.push(expanded);
     }
     drop(binding_index);
     for expanded in expanded_calls {
-        crate::config_loader::merge_parsed_file(parsed, expanded);
+        expanded.merge_into(parsed);
     }
 
-    Ok(())
+    ensure_expanded_root_graph(parsed)
 }
 
 #[cfg(test)]
