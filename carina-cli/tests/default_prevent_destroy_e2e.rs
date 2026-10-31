@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 struct Scenario {
@@ -67,6 +68,21 @@ impl Scenario {
         .expect("write resource configuration with directive expression");
     }
 
+    fn write_exports(&self, ready: bool) {
+        fs::write(
+            self.project.join("exports.crn"),
+            format!("exports {{ ready = {ready} }}\n"),
+        )
+        .expect("write exports configuration");
+    }
+
+    fn state_json(&self) -> Value {
+        serde_json::from_slice(
+            &fs::read(self.project.join("carina.state.json")).expect("read local state"),
+        )
+        .expect("parse local state")
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         command(&self.project)
             .args(args)
@@ -112,6 +128,26 @@ fn assert_schema_default_refusal(label: &str, output: &Output) {
         rendered.contains("resource type is protected from destruction by default")
             && rendered.contains("directives { prevent_destroy = false }"),
         "{label} must name the schema default and exact opt-out\noutput:\n{rendered}"
+    );
+}
+
+fn state_serial(state: &Value) -> u64 {
+    state["serial"].as_u64().expect("state serial")
+}
+
+fn account_row(state: &Value) -> &Value {
+    state["resources"]
+        .as_array()
+        .expect("state resources")
+        .iter()
+        .find(|row| row["identity"] == "account")
+        .expect("account state row")
+}
+
+fn assert_persisted_prevent_destroy(state: &Value, value: bool) {
+    assert_eq!(
+        account_row(state)["directives"]["prevent_destroy"],
+        json!({ "kind": "explicit", "value": value })
     );
 }
 
@@ -186,16 +222,53 @@ fn directive_only_false_is_persisted_before_removed_resource_delete() {
     assert_success("carina init", &scenario.run(&["init", "."]));
     assert_success(
         "initial apply",
-        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+        &scenario.run(&["apply", ".", "--auto-approve"]),
     );
+    let serial_before_directive_apply = state_serial(&scenario.state_json());
 
     scenario.write_resource_with_prevent_destroy("account-v1", Some(false));
-    let directive_apply = scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]);
-    assert_success("directive-only opt-out apply", &directive_apply);
+    let directive_plan = scenario.run(&["plan", "."]);
+    assert_success("directive-only opt-out plan", &directive_plan);
+    let directive_plan_text = output_text(&directive_plan);
     assert!(
-        output_text(&directive_apply).contains("directive"),
-        "directive-only apply must tell the user that state metadata changed:\n{}",
-        output_text(&directive_apply)
+        !directive_plan_text.contains("No changes. Infrastructure is up-to-date.")
+            && directive_plan_text.contains("mock.test.default_prevent_destroy.account")
+            && directive_plan_text.contains("prevent_destroy: unspecified -> false"),
+        "directive-only plan must render the affected address and field transition:\n{directive_plan_text}"
+    );
+
+    let json_plan = scenario.run(&["plan", "--json", "."]);
+    assert_success("directive-only JSON plan", &json_plan);
+    serde_json::from_slice::<Value>(&json_plan.stdout).expect("JSON plan stdout must remain valid");
+    let json_stderr = String::from_utf8_lossy(&json_plan.stderr);
+    assert!(
+        json_stderr.contains("mock.test.default_prevent_destroy.account")
+            && json_stderr.contains("prevent_destroy: unspecified -> false"),
+        "versioned JSON plan keeps the detailed state-only section on stderr:\n{json_stderr}"
+    );
+
+    // Deliberately keep the default state lock enabled for the write-back.
+    let directive_apply = scenario.run(&["apply", ".", "--auto-approve"]);
+    assert_success("directive-only opt-out apply", &directive_apply);
+    let after_directive_apply = scenario.state_json();
+    assert_persisted_prevent_destroy(&after_directive_apply, false);
+    let directive_serial = state_serial(&after_directive_apply);
+    assert!(
+        directive_serial > serial_before_directive_apply,
+        "directive-only apply must advance the state serial"
+    );
+
+    let converged = scenario.run(&["apply", ".", "--auto-approve"]);
+    assert_success("converged locked apply", &converged);
+    assert!(
+        output_text(&converged).contains("No changes needed."),
+        "second apply must converge without another write:\n{}",
+        output_text(&converged)
+    );
+    assert_eq!(
+        state_serial(&scenario.state_json()),
+        directive_serial,
+        "converged apply must not advance the state serial"
     );
 
     scenario.remove_resource();
@@ -215,14 +288,16 @@ fn saved_plan_apply_persists_directive_only_false() {
         "initial apply",
         &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
     );
+    let serial_before_directive_apply = state_serial(&scenario.state_json());
 
     scenario.write_resource_with_prevent_destroy("account-v1", Some(false));
     let saved_plan = scenario.run(&["plan", "--out", "directive-only.plan.json", "."]);
     assert_success("directive-only saved plan", &saved_plan);
+    let saved_plan_text = output_text(&saved_plan);
     assert!(
-        output_text(&saved_plan).contains("directive"),
-        "plan must disclose the state-only directive update:\n{}",
-        output_text(&saved_plan)
+        saved_plan_text.contains("mock.test.default_prevent_destroy.account")
+            && saved_plan_text.contains("prevent_destroy: unspecified -> false"),
+        "plan must disclose the exact state-only directive update:\n{saved_plan_text}"
     );
     assert_success(
         "directive-only saved-plan apply",
@@ -232,6 +307,12 @@ fn saved_plan_apply_persists_directive_only_false() {
             "--lock=false",
             "directive-only.plan.json",
         ]),
+    );
+    let after_directive_apply = scenario.state_json();
+    assert_persisted_prevent_destroy(&after_directive_apply, false);
+    assert!(
+        state_serial(&after_directive_apply) > serial_before_directive_apply,
+        "saved-plan directive-only apply must advance the state serial"
     );
 
     scenario.remove_resource();
@@ -260,6 +341,7 @@ fn directive_only_true_is_persisted_as_explicit_protection() {
         "directive-only protection apply",
         &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
     );
+    assert_persisted_prevent_destroy(&scenario.state_json(), true);
 
     scenario.remove_resource();
     let plan = scenario.run(&["plan", "."]);
@@ -272,5 +354,63 @@ fn directive_only_true_is_persisted_as_explicit_protection() {
         rendered.contains("resource has prevent_destroy set")
             && !rendered.contains("resource type is protected from destruction by default"),
         "the orphan must retain explicit-true provenance:\n{rendered}"
+    );
+}
+
+#[test]
+fn export_only_apply_preserves_resource_rows_byte_for_byte() {
+    let scenario = Scenario::new();
+    scenario.write_resource("account-v1", false);
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    // Keep valid historical row metadata that is deliberately not reproduced
+    // from current configuration. An export-only write must treat the entire
+    // row as opaque instead of rebuilding it through the apply write-back
+    // path.
+    let mut seeded = scenario.state_json();
+    let row = seeded["resources"]
+        .as_array_mut()
+        .expect("state resources")
+        .iter_mut()
+        .find(|row| row["identity"] == "account")
+        .expect("account state row");
+    row["dependency_bindings"] = json!(["historical-only"]);
+    fs::write(
+        scenario.project.join("carina.state.json"),
+        serde_json::to_vec_pretty(&seeded).expect("serialize seeded state"),
+    )
+    .expect("seed historical row metadata");
+
+    let before = scenario.state_json();
+    let resource_rows_before =
+        serde_json::to_vec(&before["resources"]).expect("serialize resource rows before apply");
+    let exports_before = before["exports"].clone();
+
+    scenario.write_exports(false);
+    let export_apply = scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]);
+    assert_success("export-only apply", &export_apply);
+
+    let after = scenario.state_json();
+    let resource_rows_after =
+        serde_json::to_vec(&after["resources"]).expect("serialize resource rows after apply");
+    assert_eq!(
+        resource_rows_after, resource_rows_before,
+        "export-only apply must leave every persisted resource row byte-identical"
+    );
+    assert_ne!(
+        after["exports"], exports_before,
+        "the fixture must exercise an actual export change"
+    );
+
+    let mut normalized_before = before;
+    normalized_before["serial"] = after["serial"].clone();
+    normalized_before["exports"] = after["exports"].clone();
+    assert_eq!(
+        after, normalized_before,
+        "only exports and the state serial may change on an export-only apply"
     );
 }

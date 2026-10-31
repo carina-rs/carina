@@ -6183,6 +6183,11 @@ impl Directives {
 }
 
 impl PersistedDirectives {
+    /// Return the authored tri-state destruction-protection setting stored in state.
+    pub fn prevent_destroy_setting(&self) -> PreventDestroy {
+        self.prevent_destroy
+    }
+
     /// Whether this persisted setting protects destruction without consulting
     /// a schema. Used by state-shell retention, which intentionally has no
     /// schema registry.

@@ -38,6 +38,20 @@ directives {
 }
 ```
 
+To remove an existing resource that is protected by the schema default, opt
+out in two separate applies:
+
+1. Add `prevent_destroy = false` to the existing resource and apply that
+   state-only directive change.
+2. After the first apply succeeds, remove the resource block and apply the
+   resulting destroy plan.
+
+Do not add the opt-out and remove the resource block in the same change: once
+the block is gone, Carina cannot read its new directive. Schema-default
+protection for a removed resource also requires that resource's provider
+schema to be available. If the schema is unavailable, an unspecified removed
+resource is not protected by the schema default.
+
 A non-literal expression that resolves to `true` enables protection. Any other
 non-literal value is treated as unspecified and produces a warning, so it keeps
 any schema-default protection enabled. Only the literal `false` opts out of a

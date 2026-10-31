@@ -66,7 +66,7 @@ use crate::commands::shared::progress::{
 use crate::commands::shared::state_writeback::{
     ApplyStateSaveInputs, ExportResolutionInputs, FinalizeApplyInput, PostApplyStates,
     ResolveExportValuesPostApplyInput, SkippedExports, materialize_exports,
-    persisted_directive_change_count, resolve_export_values_post_apply,
+    persisted_directive_changes, resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -2191,41 +2191,31 @@ async fn run_apply_locked_owned(
                     &checked_exports_pre_apply,
                     current_exports,
                 );
-                let directive_change_count =
-                    persisted_directive_change_count(state_file.as_ref(), &resolved_resources);
+                let directive_changes =
+                    persisted_directive_changes(state_file.as_ref(), &resolved_resources);
+                let directive_change_count = directive_changes.len();
 
                 if export_changes.is_empty() && directive_change_count == 0 {
                     println!("{}", "No changes needed.".green());
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
-                if !export_changes.is_empty() {
-                    let historical_display =
-                        carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
-                    let summary =
-                        PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for);
-                    print_plan(
-                        &plan,
-                        &summary,
-                        DetailLevel::Full,
-                        &historical_display,
-                        Some(ctx.schemas()),
-                        &HashMap::new(),
-                        None,
-                        None,
-                        &provider,
-                    )?;
-                }
-                if directive_change_count > 0 {
-                    println!(
-                        "{}",
-                        format!(
-                            "State-only update: {} resource directive change(s) will be persisted.",
-                            directive_change_count
-                        )
-                        .cyan()
-                    );
-                }
+                let historical_display =
+                    carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+                let summary =
+                    PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for)
+                        .with_persisted_directive_changes(directive_changes);
+                print_plan(
+                    &plan,
+                    &summary,
+                    DetailLevel::Full,
+                    &historical_display,
+                    Some(ctx.schemas()),
+                    &HashMap::new(),
+                    None,
+                    None,
+                    &provider,
+                )?;
                 // This fast path has no managed-resource mutations, so it
                 // cannot contain the Delete + Create pair required for a
                 // moved-block hint.
@@ -2257,17 +2247,21 @@ async fn run_apply_locked_owned(
                         .cyan()
                     );
                 }
-                let state_save_inputs = ApplyStateSaveInputs::new(
-                    resolved_resources.clone(),
-                    plan.clone(),
-                    ctx.schemas().clone(),
-                    None,
-                    &provider,
-                )?;
-                let state_file = Some(
-                    state_save_inputs
-                        .build_state_only(state_file.unwrap_or_default(), &managed_current)?,
-                );
+                let state_file = if directive_change_count > 0 {
+                    let state_save_inputs = ApplyStateSaveInputs::new(
+                        resolved_resources.clone(),
+                        plan.clone(),
+                        ctx.schemas().clone(),
+                        None,
+                        &provider,
+                    )?;
+                    Some(
+                        state_save_inputs
+                            .build_state_only(state_file.unwrap_or_default(), &managed_current)?,
+                    )
+                } else {
+                    state_file
+                };
                 // No-op apply path: compositions were never resolved (no head-of-
                 // pipeline pass ran). carina#3181: compositions live in
                 // `parsed.compositions` and still carry the authored
@@ -2317,7 +2311,10 @@ async fn run_apply_locked_owned(
                 &checked_exports_pre_apply,
                 &current_exports,
             );
-            let summary = PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for);
+            let directive_changes =
+                persisted_directive_changes(state_file.as_ref(), &resolved_resources);
+            let summary = PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for)
+                .with_persisted_directive_changes(directive_changes);
             print_plan(
                 &plan,
                 &summary,
@@ -3542,6 +3539,8 @@ async fn run_apply_from_plan_locked_owned(
                 .clone()
                 .into_executable()
                 .map_err(|error| AppError::Config(error.to_string()))?;
+            let directive_changes =
+                persisted_directive_changes(state_file.as_ref(), &resolved_sorted_resources);
 
             if can_use_export_only_fast_path(plan, &executable_data_source_values) {
                 // Saved plans serialize every `Effect::Read` produced by the
@@ -3573,23 +3572,32 @@ async fn run_apply_from_plan_locked_owned(
                     wait_aliases: &terminal_wait_aliases,
                 });
                 finalize_saved_module_constraints(plan_compositions, &terminal_bindings)?;
-                let directive_change_count = persisted_directive_change_count(
-                    state_file.as_ref(),
-                    &resolved_sorted_resources,
-                );
+                let directive_change_count = directive_changes.len();
                 if directive_change_count == 0 {
                     println!("{}", "No changes needed.".green());
                     return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
                 }
 
-                println!(
-                    "{}",
-                    format!(
-                        "State-only update: {} resource directive change(s) will be persisted.",
-                        directive_change_count
-                    )
-                    .cyan()
+                let historical_display = collect_historical_display_attributes(
+                    plan,
+                    &managed_current,
+                    state_file.as_ref(),
                 );
+                let summary = PlanChangeSummary::from_reloaded_plan(
+                    rehydrated_plan_file.reloaded_plan_file(),
+                )
+                .with_persisted_directive_changes(directive_changes.clone());
+                print_plan(
+                    plan,
+                    &summary,
+                    DetailLevel::Full,
+                    &historical_display,
+                    Some(wiring.schemas()),
+                    &HashMap::new(),
+                    None,
+                    None,
+                    &provider,
+                )?;
                 let stdin = tokio::io::BufReader::new(tokio::io::stdin());
                 if confirm_apply(stdin, cancel.clone(), auto_approve).await?
                     == ApplyConfirmation::Cancelled
@@ -3626,7 +3634,8 @@ async fn run_apply_from_plan_locked_owned(
                 collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
 
             let summary =
-                PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());
+                PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file())
+                    .with_persisted_directive_changes(directive_changes);
             print_plan(
                 plan,
                 &summary,

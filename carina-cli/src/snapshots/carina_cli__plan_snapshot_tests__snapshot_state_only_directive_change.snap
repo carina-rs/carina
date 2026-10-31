@@ -1,0 +1,10 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+State-only updates:
+
+  ~ awscc.ec2.Vpc.vpc
+    prevent_destroy: unspecified -> false
+
+Plan: 1 resource directive change.

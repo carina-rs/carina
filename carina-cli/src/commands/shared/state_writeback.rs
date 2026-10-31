@@ -19,7 +19,7 @@ use carina_core::provider::{
     UnknownCreateOutcome,
 };
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, PersistedDirectives, ResolvedResource,
+    ConcreteValue, Current, ModuleSource, PersistedDirectives, PreventDestroy, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
@@ -65,39 +65,106 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
     }
 }
 
-/// Count managed resources whose authored, persisted directives differ from
-/// the row currently in state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedDirectiveFieldChange {
+    pub(crate) name: &'static str,
+    pub(crate) before: String,
+    pub(crate) after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedDirectiveChange {
+    pub(crate) address: String,
+    pub(crate) fields: Vec<PersistedDirectiveFieldChange>,
+}
+
+fn prevent_destroy_label(value: PreventDestroy) -> &'static str {
+    match value {
+        PreventDestroy::Unspecified => "unspecified",
+        PreventDestroy::Explicit(false) => "false",
+        PreventDestroy::Explicit(true) => "true",
+    }
+}
+
+fn bindings_label(bindings: &[String]) -> String {
+    format!("[{}]", bindings.join(", "))
+}
+
+fn provider_instance_label(provider_instance: Option<&str>) -> String {
+    provider_instance.unwrap_or("unspecified").to_string()
+}
+
+/// Describe managed resources whose authored, persisted directives differ
+/// from the row currently in state.
 ///
 /// Routing is metadata on the row, so lookup deliberately ignores the current
 /// provider-instance value. That value is itself one of the fields this check
 /// must be able to update.
-pub(crate) fn persisted_directive_change_count<S>(
+pub(crate) fn persisted_directive_changes<S>(
     state_file: Option<&StateFile>,
     resources: &[ResolvedResource<S>],
-) -> usize {
+) -> Vec<PersistedDirectiveChange> {
     let Some(state_file) = state_file else {
-        return 0;
+        return Vec::new();
     };
     resources
         .iter()
-        .filter(|resource| {
-            let Some(identity) = resource.id.identity_str() else {
-                return false;
-            };
-            let Some(row) = state_file.find_resource(
+        .filter_map(|resource| {
+            let identity = resource.id.identity_str()?;
+            let row = state_file.find_resource(
                 &resource.id.provider,
                 &resource.id.resource_type,
                 identity,
-            ) else {
-                return false;
-            };
+            )?;
             let mut desired = PersistedDirectives::from(&resource.directives);
             if desired.provider_instance.is_none() {
                 desired.provider_instance = resource.id.provider_instance.clone();
             }
-            row.directives != desired
+
+            let current = &row.directives;
+            let mut fields = Vec::new();
+            if current.force_delete != desired.force_delete {
+                fields.push(PersistedDirectiveFieldChange {
+                    name: "force_delete",
+                    before: current.force_delete.to_string(),
+                    after: desired.force_delete.to_string(),
+                });
+            }
+            if current.create_before_destroy != desired.create_before_destroy {
+                fields.push(PersistedDirectiveFieldChange {
+                    name: "create_before_destroy",
+                    before: current.create_before_destroy.to_string(),
+                    after: desired.create_before_destroy.to_string(),
+                });
+            }
+            if current.prevent_destroy_setting() != desired.prevent_destroy_setting() {
+                fields.push(PersistedDirectiveFieldChange {
+                    name: "prevent_destroy",
+                    before: prevent_destroy_label(current.prevent_destroy_setting()).to_string(),
+                    after: prevent_destroy_label(desired.prevent_destroy_setting()).to_string(),
+                });
+            }
+            if current.depends_on != desired.depends_on {
+                fields.push(PersistedDirectiveFieldChange {
+                    name: "depends_on",
+                    before: bindings_label(&current.depends_on),
+                    after: bindings_label(&desired.depends_on),
+                });
+            }
+            if current.provider_instance != desired.provider_instance {
+                fields.push(PersistedDirectiveFieldChange {
+                    name: "provider",
+                    before: provider_instance_label(current.provider_instance.as_deref()),
+                    after: provider_instance_label(desired.provider_instance.as_deref()),
+                });
+            }
+
+            (!fields.is_empty()).then(|| PersistedDirectiveChange {
+                address: resource.id.to_string(),
+                fields,
+            })
         })
-        .count()
+        .collect()
 }
 
 /// Queue a state refresh for a resource after a failed operation.
@@ -2072,30 +2139,34 @@ mod apply_state_save_tests {
     }
 
     #[test]
-    fn persisted_directive_change_count_covers_every_persisted_field() {
-        let changed = |resource: Resource| {
-            persisted_directive_change_count(
+    fn persisted_directive_changes_describe_every_persisted_field() {
+        let changed = |resource: Resource, expected_field: &str| {
+            let changes = persisted_directive_changes(
                 Some(&state_with_default_directives()),
                 &[resolved(resource)],
-            )
+            );
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].address, "mock.test.Resource.main");
+            assert_eq!(changes[0].fields.len(), 1);
+            assert_eq!(changes[0].fields[0].name, expected_field);
         };
 
         let mut force_delete = Resource::with_provider("mock", "test.Resource", "main", None);
         force_delete.directives.force_delete = true;
-        assert_eq!(changed(force_delete), 1);
+        changed(force_delete, "force_delete");
 
         let mut create_before_destroy =
             Resource::with_provider("mock", "test.Resource", "main", None);
         create_before_destroy.directives.create_before_destroy = true;
-        assert_eq!(changed(create_before_destroy), 1);
+        changed(create_before_destroy, "create_before_destroy");
 
         let mut prevent_destroy = Resource::with_provider("mock", "test.Resource", "main", None);
         prevent_destroy.directives.set_prevent_destroy(false);
-        assert_eq!(changed(prevent_destroy), 1);
+        changed(prevent_destroy, "prevent_destroy");
 
         let mut depends_on = Resource::with_provider("mock", "test.Resource", "main", None);
         depends_on.directives.depends_on = vec!["dependency".to_string()];
-        assert_eq!(changed(depends_on), 1);
+        changed(depends_on, "depends_on");
 
         let provider_instance = Resource::with_provider(
             "mock",
@@ -2103,7 +2174,7 @@ mod apply_state_save_tests {
             "main",
             Some("secondary".to_string()),
         );
-        assert_eq!(changed(provider_instance), 1);
+        changed(provider_instance, "provider");
     }
 
     #[test]

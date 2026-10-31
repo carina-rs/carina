@@ -3,6 +3,7 @@ use carina_core::parser::{DeferredForExpression, ResolvedDeferredForExpressions}
 use carina_core::plan::{DeferredSummaryAction, DeferredSummaryEntry, Plan, PlanSummaryPart};
 
 use crate::commands::plan::{ExportChange, ReloadedPlanFile};
+use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 
 #[cfg(test)]
 pub(crate) fn resolved_deferred_for_for_test(
@@ -46,6 +47,7 @@ pub struct PlanChangeSummary {
     text_parts: Vec<PlanSummaryPart>,
     deferred_effects: Vec<DeferredSummaryEntry>,
     export_changes: Vec<ExportChange>,
+    persisted_directive_changes: Vec<PersistedDirectiveChange>,
     residual_deferred_for: Vec<DeferredForExpression>,
     has_plan_effects: bool,
 }
@@ -120,6 +122,7 @@ impl PlanChangeSummary {
             text_parts,
             deferred_effects: plan_summary.deferred,
             export_changes: export_changes.to_vec(),
+            persisted_directive_changes: Vec::new(),
             residual_deferred_for,
             has_plan_effects: !plan.effects().is_empty()
                 || !plan.ignored_change_summaries().is_empty(),
@@ -127,9 +130,21 @@ impl PlanChangeSummary {
     }
 
     pub(crate) fn has_changes(&self) -> bool {
+        self.has_non_directive_changes() || !self.persisted_directive_changes.is_empty()
+    }
+
+    pub(crate) fn has_non_directive_changes(&self) -> bool {
         self.has_plan_effects
             || !self.export_changes.is_empty()
             || !self.residual_deferred_for.is_empty()
+    }
+
+    pub(crate) fn with_persisted_directive_changes(
+        mut self,
+        changes: Vec<PersistedDirectiveChange>,
+    ) -> Self {
+        self.persisted_directive_changes = changes;
+        self
     }
 
     pub(crate) fn effect_parts(&self) -> &[PlanEffectSummaryPart] {
@@ -154,6 +169,10 @@ impl PlanChangeSummary {
 
     pub(crate) fn export_changes(&self) -> &[ExportChange] {
         &self.export_changes
+    }
+
+    pub(crate) fn persisted_directive_changes(&self) -> &[PersistedDirectiveChange] {
+        &self.persisted_directive_changes
     }
 
     pub(crate) fn residual_deferred_for(&self) -> &[DeferredForExpression] {
