@@ -10983,6 +10983,12 @@ fn empty_interpolation_emits_diagnostic_at_span() {
             )
         });
 
+    assert_eq!(
+        empty.message,
+        "aws.s3.Bucket.bucket: attribute `name`: empty interpolation `${}` — fill in the expression or remove it",
+        "the diagnostic range already identifies the source location",
+    );
+
     // The `${}` span sits inside `name = "arn:${}:root"` on line 1.
     // The diagnostic must point at that interpolation, not the whole
     // string and not the resource block.

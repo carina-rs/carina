@@ -880,12 +880,12 @@ pub enum AppError {
     BindingUseReport(Box<carina_core::validation::BindingUseReport>),
 
     /// A parser-only placeholder survived module and function expansion.
-    #[error(transparent)]
-    LeftoverPlaceholder(#[from] carina_core::resource::LeftoverPlaceholder),
+    #[error("{}", .0.located())]
+    LeftoverPlaceholder(carina_core::resource::LeftoverPlaceholder),
 
     /// All parser-only placeholders rejected by one file expansion boundary.
-    #[error(transparent)]
-    LeftoverPlaceholders(#[from] carina_core::resource::LeftoverPlaceholders),
+    #[error("{}", .0.located())]
+    LeftoverPlaceholders(carina_core::resource::LeftoverPlaceholders),
 
     /// One core-owned module-call finding at its parser-authored location.
     #[error(transparent)]
@@ -1106,6 +1106,18 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 impl From<carina_core::resource::ResolvedResourceError> for AppError {
     fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
         Self::ResolvedResource(Box::new(error))
+    }
+}
+
+impl From<carina_core::resource::LeftoverPlaceholder> for AppError {
+    fn from(error: carina_core::resource::LeftoverPlaceholder) -> Self {
+        Self::LeftoverPlaceholder(error)
+    }
+}
+
+impl From<carina_core::resource::LeftoverPlaceholders> for AppError {
+    fn from(error: carina_core::resource::LeftoverPlaceholders) -> Self {
+        Self::LeftoverPlaceholders(error)
     }
 }
 

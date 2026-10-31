@@ -72,7 +72,9 @@ moduleの展開と関数の呼び出しで仮置きを置き換えたあと、�
 
 検査は、`carina validate`、`plan`、`destroy`、`state`の各コマンドと、エディタ（LSP）の診断がすべて同じこの境目を通ります。mainでは`destroy`と`state`が書きかけの`${}`を見逃していましたが、見逃すには展開できない値を黙って捨てる経路が要るので、ここでは場所つきのエラーで止めます。エディタでも、空の`${}`は警告ではなくエラーとして出します。
 
-集める処理は`File`とその中の構造体のフィールドをすべて書き出して分解するので、新しいフィールドを足すとコンパイルで止まります。moduleの定義そのもの（呼び出し側がまだ引数を渡していないもの）は`ParserPlaceholderBoundary::ModuleDefinition`で検査し、moduleの展開が実際に置き換えるフィールド（資源、データソース、composition、入れ子のmodule呼び出しの引数、引数の既定値と検証、`let`の値、requires、for-loop）でだけmoduleの引数の仮置きを許します。providerやbackend、stateのimport、export、waitの比べる値は、展開で置き換わらないので、moduleの定義の中でもエラーにします。moduleの引数は`arguments`にだけ置き、`let`の変数としては複製しません。
+集める処理は`File`とその中の構造体のフィールドをすべて書き出して分解するので、新しいフィールドを足すとコンパイルで止まります。moduleの定義そのもの（呼び出し側がまだ引数を渡していないもの）は`ParserPlaceholderBoundary::ModuleDefinition`で検査し、moduleの展開が実際に置き換えるフィールド（資源、データソース、composition、入れ子のmodule呼び出しの引数、引数の既定値と検証、`let`の値、requires、for-loop）でだけmoduleの引数の仮置きを許します。providerやbackend、stateのimport、exportは、展開で置き換わらないので、moduleの定義の中でもエラーにします。waitの比べる値は文法上リテラルしか書けないので、仮置きを持てない型（`Value<NoPlaceholder>`）にしてあり、ここでは検査しません。moduleの引数は`arguments`にだけ置き、`let`の変数としては複製しません。
+
+moduleの引数の仮置きが持つ位置は、引数を最初に参照した箇所です。たとえば`let reg = r`をproviderの属性で使うと、エラーの位置は`let`の行になり、文言のほうで「どのproviderのどの属性か」を示します。使った側の位置も持たせるには、属性ごとに位置を持たせる必要があり、この変更では入れていません。
 
 for-loopの子を作る`expand_deferred_children`は、`Value<LoopSlot>`のテンプレートを受け取り、仮置きを置き換えた`Value`を返す変換になります。テンプレートの属性は、子を作るときに実際に使う`template_resource`の1か所にだけ置きます（以前は同じ属性を2か所に持っていました）。テンプレートの外の値は、最初から`Value`です。
 

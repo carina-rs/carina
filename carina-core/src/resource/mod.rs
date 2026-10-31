@@ -2787,10 +2787,10 @@ struct AuthoredDiagnosticSourceSpan {
 /// compares equal and hashes to the same value because authored location is
 /// not semantic value data.
 ///
-/// Parser code must attach an authored source rather than manufacturing an
-/// unlocated span:
+/// Parser code must attach an authored source; there is no public constructor
+/// for an unlocated span:
 ///
-/// ```compile_fail,E0624
+/// ```compile_fail,E0599
 /// use carina_core::resource::DiagnosticSourceSpan;
 ///
 /// let _ = DiagnosticSourceSpan::synthetic();
@@ -4803,7 +4803,17 @@ pub struct LeftoverPlaceholder {
 
 impl fmt::Display for LeftoverPlaceholder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some((source_file, range)) = self.placeholder.authored_location() {
+        write!(formatter, "{}{}", self.context, self.placeholder)
+    }
+}
+
+impl std::error::Error for LeftoverPlaceholder {}
+
+struct LocatedLeftoverPlaceholder<'a>(&'a LeftoverPlaceholder);
+
+impl fmt::Display for LocatedLeftoverPlaceholder<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some((source_file, range)) = self.0.placeholder.authored_location() {
             write!(
                 formatter,
                 "{}:{}:{}: ",
@@ -4812,11 +4822,9 @@ impl fmt::Display for LeftoverPlaceholder {
                 range.start_column(),
             )?;
         }
-        write!(formatter, "{}{}", self.context, self.placeholder)
+        self.0.fmt(formatter)
     }
 }
-
-impl std::error::Error for LeftoverPlaceholder {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LeftoverPlaceholderContext {
@@ -4960,6 +4968,11 @@ impl fmt::Display for LeftoverPlaceholderContext {
 }
 
 impl LeftoverPlaceholder {
+    /// Render this error with its authored source location when one is known.
+    pub fn located(&self) -> impl fmt::Display + '_ {
+        LocatedLeftoverPlaceholder(self)
+    }
+
     pub fn placeholder(&self) -> &ParserPlaceholder {
         &self.placeholder
     }
@@ -5025,6 +5038,27 @@ impl fmt::Display for LeftoverPlaceholders {
 }
 
 impl std::error::Error for LeftoverPlaceholders {}
+
+struct LocatedLeftoverPlaceholders<'a>(&'a LeftoverPlaceholders);
+
+impl fmt::Display for LocatedLeftoverPlaceholders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, error) in self.0.errors().iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("\n")?;
+            }
+            write!(formatter, "{}", error.located())?;
+        }
+        Ok(())
+    }
+}
+
+impl LeftoverPlaceholders {
+    /// Render every error with its authored source location when one is known.
+    pub fn located(&self) -> impl fmt::Display + '_ {
+        LocatedLeftoverPlaceholders(self)
+    }
+}
 
 /// A serialized for-loop slot appeared in an ordinary expanded value instead
 /// of a deferred for-loop template.

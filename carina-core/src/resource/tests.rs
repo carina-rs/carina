@@ -79,8 +79,9 @@ fn into_expanded_rejects_leftover_module_argument() {
         .into_expanded()
         .expect_err("a module argument must be substituted before expansion completes");
 
+    assert_eq!(error.to_string(), "unresolved module argument: region");
     assert_eq!(
-        error.to_string(),
+        error.located().to_string(),
         "module.crn:17:3: unresolved module argument: region"
     );
     assert!(matches!(
@@ -103,6 +104,10 @@ fn into_expanded_rejects_empty_interpolation_with_existing_wording() {
 
     assert_eq!(
         error.to_string(),
+        "empty interpolation `${}` — fill in the expression or remove it"
+    );
+    assert_eq!(
+        error.located().to_string(),
         "test.crn:1:1: empty interpolation `${}` — fill in the expression or remove it"
     );
 }
