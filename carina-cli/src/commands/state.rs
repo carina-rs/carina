@@ -1335,7 +1335,11 @@ fn state_bucket_delete_request(
 ) -> Result<carina_core::provider::DeleteRequest, AppError> {
     let directives = carina_core::resource::Directives::default();
     let resolved = schemas
-        .resolve_resource_directives(resource_id, &directives)
+        .try_resolve_directives(
+            resource_id,
+            carina_core::schema::SchemaKind::Resource,
+            &directives,
+        )
         .ok_or_else(|| {
             AppError::Config(format!(
                 "No managed resource schema registered for state bucket type \

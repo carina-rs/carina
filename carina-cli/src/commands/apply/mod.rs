@@ -2204,9 +2204,12 @@ async fn run_apply_locked_owned(
 
                 let historical_display =
                     carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
-                let summary =
-                    PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for)
-                        .with_persisted_directive_changes(directive_changes.clone());
+                let summary = PlanChangeSummary::new(
+                    &plan,
+                    &export_changes,
+                    &residual_deferred_for,
+                    &directive_changes,
+                );
                 print_plan(
                     &plan,
                     &summary,
@@ -2311,8 +2314,12 @@ async fn run_apply_locked_owned(
             );
             let directive_changes =
                 persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
-            let summary = PlanChangeSummary::new(&plan, &export_changes, &residual_deferred_for)
-                .with_persisted_directive_changes(directive_changes);
+            let summary = PlanChangeSummary::new(
+                &plan,
+                &export_changes,
+                &residual_deferred_for,
+                &directive_changes,
+            );
             print_plan(
                 &plan,
                 &summary,
@@ -3596,8 +3603,7 @@ async fn run_apply_from_plan_locked_owned(
                 );
                 let summary = PlanChangeSummary::from_reloaded_plan(
                     rehydrated_plan_file.reloaded_plan_file(),
-                )
-                .with_persisted_directive_changes(directive_changes.clone());
+                );
                 print_plan(
                     plan,
                     &summary,
@@ -3642,8 +3648,7 @@ async fn run_apply_from_plan_locked_owned(
                 collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
 
             let summary =
-                PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file())
-                    .with_persisted_directive_changes(directive_changes);
+                PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());
             print_plan(
                 plan,
                 &summary,

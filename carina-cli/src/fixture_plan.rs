@@ -305,8 +305,8 @@ pub fn build_fixture_plan_change_summary(fixture: &FixturePlan) -> PlanChangeSum
         &fixture.plan,
         &export_changes,
         &fixture.deferred_for_expressions,
+        &directive_changes,
     )
-    .with_persisted_directive_changes(directive_changes)
 }
 
 /// Build a plan from an absolute fixture path. Loads the configuration,

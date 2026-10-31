@@ -22,12 +22,13 @@ use carina_core::effect::deps::{
 use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::parser::WaitBinding;
 use carina_core::plan::{Plan, PlanError};
-use carina_core::provider::{Provider, ProviderDirectiveSchema, ProviderDirectives};
+use carina_core::provider::Provider;
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
     ConcreteValue, Current, PreventDestroySource, ResolvedResourceId, Resource, ResourceId, Value,
 };
+use carina_core::schema::SchemaKind;
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
@@ -597,13 +598,7 @@ async fn run_destroy_locked_owned(
             if !force {
                 let resolved_directives = ctx
                     .schemas()
-                    .resolve_resource_directives(&r.id, &r.directives)
-                    .unwrap_or_else(|| {
-                        ProviderDirectives::resolve(
-                            &r.directives,
-                            ProviderDirectiveSchema::Unavailable,
-                        )
-                    });
+                    .resolve_directives(&r.id, SchemaKind::Resource, &r.directives);
                 let prevent_destroy_source = resolved_directives.prevent_destroy_source();
                 if let Some(source) = prevent_destroy_source {
                     prevent_destroy_resources.push((r, source));
@@ -976,13 +971,11 @@ async fn run_destroy_locked_owned(
                 let directives = directives.clone();
                 let resolved_directives = ctx
                     .schemas()
-                    .resolve_resource_directives(resource_id.as_inner(), &directives)
-                    .unwrap_or_else(|| {
-                        ProviderDirectives::resolve(
-                            &directives,
-                            ProviderDirectiveSchema::Unavailable,
-                        )
-                    });
+                    .resolve_directives(
+                        resource_id.as_inner(),
+                        SchemaKind::Resource,
+                        &directives,
+                    );
                 let delete_request = carina_core::provider::DeleteRequest::from_resolved(
                     resolved_directives,
                 );

@@ -4,8 +4,9 @@ description: Carina-side lifecycle, ordering, routing, and change-ownership cont
 ---
 
 A `directives` block controls how Carina manages a resource. Directives are not
-resource attributes. Carina enforces them and sends only the effective
-provider-visible delete flags at the provider boundary.
+resource attributes. In provider protocol 13, only delete requests carry the
+resolved provider-visible directives; other request resource records do not
+transport authored directives.
 
 ```crn
 cloud.storage.Bucket {

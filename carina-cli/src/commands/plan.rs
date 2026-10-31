@@ -4894,8 +4894,12 @@ pub async fn run_plan(
     let export_changes = compute_export_diffs(&checked_exports, &current_exports);
     let directive_changes =
         persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
-    let summary = PlanChangeSummary::new(&ctx.plan, &export_changes, &ctx.residual_deferred_for)
-        .with_persisted_directive_changes(directive_changes.clone());
+    let summary = PlanChangeSummary::new(
+        &ctx.plan,
+        &export_changes,
+        &ctx.residual_deferred_for,
+        &directive_changes,
+    );
     // Preserve the CLI contract from before plan-image summaries existed:
     // detailed exit code 2 means a managed-resource mutation, not merely
     // displayable work such as reads, waits, exports, or deferred loops.
@@ -6966,7 +6970,7 @@ mod run_plan_out_tests {
             ))));
         }
         let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
-        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred, &[]);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();
@@ -7021,7 +7025,7 @@ mod run_plan_out_tests {
             ))));
         }
         let deferred = crate::plan_summary::resolved_deferred_for_for_test([]);
-        let summary = PlanChangeSummary::new(&plan, &[], &deferred);
+        let summary = PlanChangeSummary::new(&plan, &[], &deferred, &[]);
         let desired_resources = Vec::new();
         let unresolved_resources = Vec::new();
         let compositions = Vec::new();

@@ -11564,6 +11564,55 @@ fn schema_registry_missing_returns_none() {
 }
 
 #[test]
+fn schema_registry_resolves_missing_schema_with_unavailable_fallback() {
+    let registry = SchemaRegistry::new();
+    let resource = crate::resource::Resource::with_provider("aws", "s3.Bucket", "bucket", None);
+    let directives = crate::resource::Directives::default().with_prevent_destroy(true);
+
+    let resolved = registry.resolve_directives(&resource.id, SchemaKind::Resource, &directives);
+
+    assert!(resolved.prevent_destroy());
+    assert!(
+        registry
+            .try_resolve_directives(&resource.id, SchemaKind::Resource, &directives)
+            .is_none()
+    );
+}
+
+#[test]
+fn schema_registry_resolves_data_source_directives_through_the_same_api() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .as_data_source()
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let data_source =
+        crate::resource::DataSource::with_provider("aws", "s3.Bucket", "bucket", None);
+
+    assert!(
+        registry
+            .try_resolve_directives(
+                &data_source.id,
+                SchemaKind::DataSource,
+                &data_source.directives,
+            )
+            .is_some()
+    );
+    assert!(
+        registry
+            .try_resolve_directives(
+                &data_source.id,
+                SchemaKind::Resource,
+                &data_source.directives,
+            )
+            .is_none()
+    );
+}
+
+#[test]
 fn schema_registry_has_managed_only_does_not_imply_data_source() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -13187,6 +13236,24 @@ fn resource_schema_default_prevent_destroy_is_opt_in_and_survives_validation() {
         .validate()
         .expect("the lifecycle default must not invalidate a schema");
     assert!(protected.parts().default_prevent_destroy);
+}
+
+#[test]
+fn data_source_schema_rejects_default_prevent_destroy() {
+    let error = ResourceSchema::new("test.Lookup")
+        .as_data_source()
+        .default_prevent_destroy()
+        .validate()
+        .expect_err("data sources cannot have a destruction default");
+
+    let issues = error.located_issues().collect::<Vec<_>>();
+    assert_eq!(
+        issues,
+        vec![(
+            &SchemaValidationIssueLocation::DefaultPreventDestroy,
+            "data-source schemas cannot set `default_prevent_destroy`",
+        )],
+    );
 }
 
 fn fingerprint_group_fixture(

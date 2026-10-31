@@ -57,22 +57,30 @@ impl PlanChangeSummary {
         plan: &Plan<S>,
         export_changes: &[ExportChange],
         residual_deferred_for: &ResolvedDeferredForExpressions,
+        persisted_directive_changes: &[PersistedDirectiveChange],
     ) -> Self {
         Self::from_parts(
             plan,
             export_changes,
             residual_deferred_for.as_slice().to_vec(),
+            persisted_directive_changes.to_vec(),
         )
     }
 
     pub(crate) fn from_reloaded_plan(plan_file: &ReloadedPlanFile) -> Self {
-        Self::from_parts(plan_file.plan(), &[], Vec::new())
+        Self::from_parts(
+            plan_file.plan(),
+            &[],
+            Vec::new(),
+            plan_file.persisted_directive_changes().to_vec(),
+        )
     }
 
     fn from_parts<S>(
         plan: &Plan<S>,
         export_changes: &[ExportChange],
         residual_deferred_for: Vec<DeferredForExpression>,
+        persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Self {
         let plan_summary = plan.summary();
         let resume_create = plan
@@ -122,7 +130,7 @@ impl PlanChangeSummary {
             text_parts,
             deferred_effects: plan_summary.deferred,
             export_changes: export_changes.to_vec(),
-            persisted_directive_changes: Vec::new(),
+            persisted_directive_changes,
             residual_deferred_for,
             has_plan_effects: !plan.effects().is_empty()
                 || !plan.ignored_change_summaries().is_empty(),
@@ -137,14 +145,6 @@ impl PlanChangeSummary {
         self.has_plan_effects
             || !self.export_changes.is_empty()
             || !self.residual_deferred_for.is_empty()
-    }
-
-    pub(crate) fn with_persisted_directive_changes(
-        mut self,
-        changes: Vec<PersistedDirectiveChange>,
-    ) -> Self {
-        self.persisted_directive_changes = changes;
-        self
     }
 
     pub(crate) fn effect_parts(&self) -> &[PlanEffectSummaryPart] {
@@ -221,12 +221,17 @@ mod tests {
         let no_deferred = resolved_deferred_for_for_test([]);
         let deferred = resolved_deferred_for_for_test([residual_deferred_for()]);
 
-        assert!(!PlanChangeSummary::new(&plan, &[], &no_deferred).has_changes());
+        assert!(!PlanChangeSummary::new(&plan, &[], &no_deferred, &[]).has_changes());
         assert!(
-            PlanChangeSummary::new(&plan, std::slice::from_ref(&export_change), &no_deferred,)
-                .has_changes()
+            PlanChangeSummary::new(
+                &plan,
+                std::slice::from_ref(&export_change),
+                &no_deferred,
+                &[],
+            )
+            .has_changes()
         );
-        assert!(PlanChangeSummary::new(&plan, &[], &deferred).has_changes());
+        assert!(PlanChangeSummary::new(&plan, &[], &deferred, &[]).has_changes());
     }
 
     #[test]
@@ -237,6 +242,6 @@ mod tests {
         });
 
         let no_deferred = resolved_deferred_for_for_test([]);
-        assert!(PlanChangeSummary::new(&plan, &[], &no_deferred).has_changes());
+        assert!(PlanChangeSummary::new(&plan, &[], &no_deferred, &[]).has_changes());
     }
 }

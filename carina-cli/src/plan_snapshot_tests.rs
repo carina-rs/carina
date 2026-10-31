@@ -44,7 +44,7 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     let deferred_for_expressions = crate::plan_summary::resolved_deferred_for_for_test(
         deferred_for_expressions.iter().cloned(),
     );
-    let summary = PlanChangeSummary::new(plan, export_changes, &deferred_for_expressions);
+    let summary = PlanChangeSummary::new(plan, export_changes, &deferred_for_expressions, &[]);
     let provider = provider_router_for_plan(plan);
     format_plan_with_delete_instances(
         plan,

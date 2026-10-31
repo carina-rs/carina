@@ -13,7 +13,7 @@ expression: "fixture_svg_with_theme(\"plan_image_module_cascade\",\nSvgTheme::Fi
   </defs>
   <g font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-rendering="geometricPrecision">
     <text x="28" y="36" font-size="22" font-weight="700" fill="#e6edf3">carina plan</text>
-    <text x="28" y="65" font-size="12.5" fill="#8b949e"><tspan fill="#4493f8" font-weight="600">2 to update</tspan><tspan fill="#6e7681"> · </tspan><tspan fill="#ab7df8" font-weight="700">2 to replace</tspan><tspan fill="#6e7681"> · </tspan><tspan fill="#f85149" font-weight="700">2 to destroy</tspan><tspan fill="#6e7681"> · </tspan><tspan fill="#8b949e" font-weight="600">2 exports to change</tspan><tspan fill="#6e7681"> · </tspan><tspan fill="#8b949e" font-weight="600">1 resource directive change</tspan></text>
+    <text x="28" y="65" font-size="12.5" fill="#8b949e"><tspan fill="#4493f8" font-weight="600">2 to update</tspan><tspan fill="#6e7681"> · </tspan><tspan fill="#ab7df8" font-weight="700">2 to replace</tspan><tspan fill="#6e7681"> · </tspan><tspan fill="#f85149" font-weight="700">2 to destroy</tspan><tspan fill="#6e7681"> · </tspan><tspan fill="#8b949e" font-weight="600">2 exports to change</tspan></text>
     <text x="28" y="90" font-size="10.5" fill="#8b949e">state test-plan-image-module-cascade · serial 9</text>
     <rect x="12.0" y="739.0" width="264.0" height="175.0" rx="12" fill="#161b22" stroke="#30363d"/>
     <path d="M248.0,177.0 C263.4,177.0 263.4,177.0 278.7,177.0 C312.0,177.0 312.0,279.6 345.3,279.6 C354.6,279.6 354.6,279.6 364.0,279.6" fill="none" stroke="#f85149" stroke-width="2.2" stroke-opacity="0.76" marker-end="url(#arrow-delete)"/>

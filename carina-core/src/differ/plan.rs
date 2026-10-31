@@ -12,10 +12,7 @@ use crate::plan::{
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{
-    LiftedSavedAttrs, Provider, ProviderDirectiveSchema, ProviderDirectives, ProviderResult,
-    ProviderRouter,
-};
+use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
 use crate::resource::{
     ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, ResolvedDataSource,
     ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
@@ -58,17 +55,7 @@ struct RefAttr {
 }
 
 /// Check which changed attributes are create-only according to the schema
-fn find_changed_create_only(
-    provider: &str,
-    resource_type: &str,
-    changed_attributes: &[String],
-    registry: &SchemaRegistry,
-) -> Vec<String> {
-    let Some(schema) = registry.get(provider, resource_type, SchemaKind::Resource) else {
-        return Vec::new();
-    };
-    let schema = schema.as_schema();
-
+fn find_changed_create_only(changed_attributes: &[String], schema: &ResourceSchema) -> Vec<String> {
     let create_only_attrs = schema.create_only_attributes();
     changed_attributes
         .iter()
@@ -577,19 +564,14 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
-                        let changed_create_only = find_changed_create_only(
-                            &resource.id.provider,
-                            &resource.id.resource_type,
-                            &changed_attributes,
-                            registry,
-                        );
+                        let changed_create_only =
+                            find_changed_create_only(&changed_attributes, schema);
 
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
                         {
-                            let prevent_destroy_source = registry
-                                .resolve_resource_directives(&resource.id, &resource.directives)
-                                .expect("a diffed managed resource has a registered schema")
+                            let prevent_destroy_source = owner_schema
+                                .resolve_directives(&resource.directives)
                                 .prevent_destroy_source();
                             if let Some(source) = prevent_destroy_source {
                                 plan.add_error(PlanError::prevent_destroy(
@@ -674,11 +656,8 @@ fn create_plan_parts(
             }
         };
         let directives = orphan.directives().clone();
-        let resolved_directives = registry
-            .resolve_resource_directives(id, &directives)
-            .unwrap_or_else(|| {
-                ProviderDirectives::resolve(&directives, ProviderDirectiveSchema::Unavailable)
-            });
+        let resolved_directives =
+            registry.resolve_directives(id, SchemaKind::Resource, &directives);
         let prevent_destroy_source = resolved_directives.prevent_destroy_source();
         if let Some(source) = prevent_destroy_source {
             plan.add_error(PlanError::prevent_destroy(
@@ -1220,12 +1199,15 @@ fn promote_pending_replaces_for_dependents(
                 .iter()
                 .map(|ref_attr| ref_attr.attribute.clone())
                 .collect();
-            let create_only_refs = find_changed_create_only(
+            let Some(owner_schema) = registry.get(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                &ref_attr_names,
-                registry,
-            );
+                SchemaKind::Resource,
+            ) else {
+                continue;
+            };
+            let create_only_refs =
+                find_changed_create_only(&ref_attr_names, owner_schema.schema().as_schema());
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
                 let ref_hints: Vec<(String, String)> = ref_attrs
@@ -1241,9 +1223,8 @@ fn promote_pending_replaces_for_dependents(
                         ref_hints,
                     );
                 } else {
-                    let prevent_destroy_source = registry
-                        .resolve_resource_directives(&resource.id, &resource.directives)
-                        .expect("a cascading managed resource has a registered schema")
+                    let prevent_destroy_source = owner_schema
+                        .resolve_directives(&resource.directives)
                         .prevent_destroy_source();
                     if let Some(source) = prevent_destroy_source {
                         plan.add_error(PlanError::prevent_destroy(

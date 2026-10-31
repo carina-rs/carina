@@ -1260,6 +1260,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
 
@@ -1289,6 +1290,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
@@ -1320,6 +1322,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
@@ -1458,6 +1461,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
@@ -1482,6 +1486,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let leaf = model.node(&GraphNodeId::Effect(2)).unwrap();
@@ -1516,6 +1521,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let connector_id = GraphNodeId::Unchanged(ResolvedResourceId::new(connector.id));
@@ -1535,7 +1541,12 @@ mod tests {
             compositions: &[],
             expansion_trace: None,
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
+            summary: &PlanChangeSummary::new(
+                &fixture.plan,
+                &[],
+                &fixture.deferred_for_expressions,
+                &[],
+            ),
         });
 
         let replacements: Vec<_> = model
@@ -1567,6 +1578,7 @@ mod tests {
                 &plan,
                 &[],
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
             ),
         ));
         let source = model
@@ -1618,6 +1630,7 @@ mod tests {
                     &plan,
                     &[],
                     &crate::plan_summary::resolved_deferred_for_for_test([]),
+                    &[],
                 ),
             )
         });
@@ -1674,6 +1687,7 @@ mod tests {
                     &plan,
                     &[],
                     &crate::plan_summary::resolved_deferred_for_for_test([]),
+                    &[],
                 ),
             )
         });
@@ -1700,7 +1714,12 @@ mod tests {
             compositions: &fixture.compositions,
             expansion_trace: Some(&fixture.expansion_trace),
             state: None,
-            summary: &PlanChangeSummary::new(&fixture.plan, &[], &fixture.deferred_for_expressions),
+            summary: &PlanChangeSummary::new(
+                &fixture.plan,
+                &[],
+                &fixture.deferred_for_expressions,
+                &[],
+            ),
         });
 
         let replacements: Vec<_> = model

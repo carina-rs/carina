@@ -21,15 +21,14 @@ use crate::module_resolver::{
 };
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
-    CreateRequest, ProviderDirectiveSchema, ProviderDirectives, ProviderFactory,
-    ProviderNormalizer, UpdateRequest,
+    CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, UpdateRequest,
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, LiveComposition, ProviderDataSource,
     ProviderModuleSource, ProviderResource, ResolvedDataSource, ResolvedResource, Resource,
     ResourceId, SavedComposition, Value,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry, TypeError};
+use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
 
 /// An immutable value that passed the provider-boundary constraint gate.
@@ -739,18 +738,11 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone>(
     crate::resource::assert_resource_fully_resolved(&resource)?;
     let resource =
         ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
-    let directives = context
-        .schemas
-        .resolve_resource_directives(
-            &resource.as_resource().id,
-            &resource.as_resource().directives,
-        )
-        .unwrap_or_else(|| {
-            ProviderDirectives::resolve(
-                &resource.as_resource().directives,
-                ProviderDirectiveSchema::Unavailable,
-            )
-        });
+    let directives = context.schemas.resolve_directives(
+        &resource.as_resource().id,
+        SchemaKind::Resource,
+        &resource.as_resource().directives,
+    );
     Ok(ProviderReady {
         value: resource,
         directives,
@@ -821,16 +813,11 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S>(
         crate::resource::assert_value_fully_resolved(value)?;
     }
     let value = ResolvedDataSource::new(value.into_provider_data_source());
-    let directives = match context.schemas.get_for_data_source(value.as_inner()) {
-        Some(schema) => ProviderDirectives::resolve(
-            &value.as_inner().directives,
-            ProviderDirectiveSchema::Available(schema.schema().as_schema()),
-        ),
-        None => ProviderDirectives::resolve(
-            &value.as_inner().directives,
-            ProviderDirectiveSchema::Unavailable,
-        ),
-    };
+    let directives = context.schemas.resolve_directives(
+        &value.as_inner().id,
+        SchemaKind::DataSource,
+        &value.as_inner().directives,
+    );
     Ok(ProviderReady { value, directives })
 }
 

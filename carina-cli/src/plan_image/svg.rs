@@ -1249,6 +1249,7 @@ mod tests {
             &plan,
             &[],
             &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
         );
         let model = build_model(PlanImageInput {
             plan: &plan,
@@ -1303,6 +1304,7 @@ mod tests {
             &plan,
             &[],
             &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
         );
         let model = build_model(PlanImageInput {
             plan: &plan,
@@ -1413,6 +1415,7 @@ mod tests {
             &plan,
             &[],
             &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
         );
         let model = build_model(PlanImageInput {
             plan: &plan,

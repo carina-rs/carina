@@ -7763,6 +7763,7 @@ pub enum SchemaValidationIssueLocation {
     Definition(String),
     FieldGroup(usize),
     UniqueName,
+    DefaultPreventDestroy,
 }
 
 impl SchemaValidationIssueLocation {
@@ -7770,7 +7771,7 @@ impl SchemaValidationIssueLocation {
         match self {
             Self::Attribute(path) => Self::Attribute(format!("{path}{suffix}")),
             Self::Definition(path) => Self::Definition(format!("{path}{suffix}")),
-            Self::FieldGroup(_) | Self::UniqueName => {
+            Self::FieldGroup(_) | Self::UniqueName | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
         }
@@ -7779,7 +7780,10 @@ impl SchemaValidationIssueLocation {
     pub fn attribute_path(&self) -> Option<&str> {
         match self {
             Self::Attribute(path) => Some(path),
-            Self::Definition(_) | Self::FieldGroup(_) | Self::UniqueName => None,
+            Self::Definition(_)
+            | Self::FieldGroup(_)
+            | Self::UniqueName
+            | Self::DefaultPreventDestroy => None,
         }
     }
 }
@@ -7791,6 +7795,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
             Self::Definition(path) => write!(f, "defs.{path}"),
             Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
+            Self::DefaultPreventDestroy => f.write_str("default_prevent_destroy"),
         }
     }
 }
@@ -10217,6 +10222,14 @@ impl ResourceSchema {
         let mut visited_definitions = HashSet::new();
         let mut identified_kinds = HashMap::new();
 
+        if self.kind == SchemaKind::DataSource && self.default_prevent_destroy {
+            push_schema_issue(
+                &mut issues,
+                &SchemaValidationIssueLocation::DefaultPreventDestroy,
+                "data-source schemas cannot set `default_prevent_destroy`".to_string(),
+            );
+        }
+
         for name in &self.duplicate_attributes {
             let location = SchemaValidationIssueLocation::Attribute(name.clone());
             push_schema_issue(
@@ -12505,6 +12518,17 @@ impl<'a> OwnerBoundResourceSchema<'a> {
         self.schema
     }
 
+    /// Resolve provider-visible directives against this registered schema.
+    pub fn resolve_directives(
+        self,
+        directives: &crate::resource::Directives,
+    ) -> crate::provider::ProviderDirectives {
+        crate::provider::ProviderDirectives::resolve(
+            directives,
+            crate::resource::ProviderDirectiveSchema::Available(self.schema.as_schema()),
+        )
+    }
+
     /// Return the complete reference-form table declared by this schema's
     /// owner. Forms are provider-wide rather than per resource occurrence.
     pub fn reference_forms(self) -> &'a ReferenceForms {
@@ -12765,28 +12789,35 @@ impl SchemaRegistry {
         )
     }
 
-    /// Resolve every provider-visible directive for one managed resource.
+    /// Resolve every provider-visible directive with one missing-schema policy.
     ///
-    /// The lookup key and managed-resource schema kind live here so policy
-    /// enforcement and provider dispatch cannot accidentally disagree. `None`
-    /// leaves the caller responsible for explicitly choosing whether a missing
-    /// schema is an error or a schema-unavailable compatibility path.
-    pub fn resolve_resource_directives(
+    /// Registry misses use the named schema-unavailable compatibility path.
+    /// Callers that require a schema must use [`Self::try_resolve_directives`]
+    /// and surface the miss as an error.
+    pub fn resolve_directives(
         &self,
         resource_id: &crate::resource::ResourceId,
+        kind: SchemaKind,
+        directives: &crate::resource::Directives,
+    ) -> crate::provider::ProviderDirectives {
+        self.try_resolve_directives(resource_id, kind, directives)
+            .unwrap_or_else(|| {
+                crate::provider::ProviderDirectives::resolve(
+                    directives,
+                    crate::resource::ProviderDirectiveSchema::Unavailable,
+                )
+            })
+    }
+
+    /// Resolve directives only when the explicitly selected schema exists.
+    pub fn try_resolve_directives(
+        &self,
+        resource_id: &crate::resource::ResourceId,
+        kind: SchemaKind,
         directives: &crate::resource::Directives,
     ) -> Option<crate::provider::ProviderDirectives> {
-        self.get(
-            &resource_id.provider,
-            &resource_id.resource_type,
-            SchemaKind::Resource,
-        )
-        .map(|schema| {
-            crate::provider::ProviderDirectives::resolve(
-                directives,
-                crate::resource::ProviderDirectiveSchema::Available(schema.schema().as_schema()),
-            )
-        })
+        self.get(&resource_id.provider, &resource_id.resource_type, kind)
+            .map(|schema| schema.resolve_directives(directives))
     }
 
     /// Look up the `DataSource` schema for a given [`DataSource`].
