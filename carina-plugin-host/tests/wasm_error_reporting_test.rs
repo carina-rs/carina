@@ -29,9 +29,17 @@ const NON_WASI_BOGUS_COMPONENT_WAT: &str = r#"
 
 async fn render_instantiation_error(wat: &str) -> String {
     let cache_dir = tempfile::tempdir().expect("cache dir");
+    let mut component = wat::parse_str(wat).expect("fixture WAT must compile");
+    if wat.contains("wasi:http/") {
+        append_custom_section(
+            &mut component,
+            "carina:egress",
+            br#"{"version":1,"hosts":[]}"#,
+        );
+    }
     let err = match WasmProviderFactory::from_bytes_with_cache_dir(
         VerifiedLoad::for_test(
-            wat.as_bytes(),
+            &component,
             ProviderLoadIdentity::for_test("fixture", ProviderTrustClass::Untrusted),
         ),
         cache_dir.path(),
@@ -45,6 +53,37 @@ async fn render_instantiation_error(wat: &str) -> String {
         WasmProviderLoadError::Instantiation(error) => error.to_string(),
         other => panic!("expected typed instantiation error, got: {other}"),
     }
+}
+
+fn push_leb128_u32(bytes: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn append_custom_section(component: &mut Vec<u8>, name: &str, payload: &[u8]) {
+    let mut contents = Vec::new();
+    push_leb128_u32(
+        &mut contents,
+        u32::try_from(name.len()).expect("custom section name length fits u32"),
+    );
+    contents.extend_from_slice(name.as_bytes());
+    contents.extend_from_slice(payload);
+
+    component.push(0);
+    push_leb128_u32(
+        component,
+        u32::try_from(contents.len()).expect("custom section length fits u32"),
+    );
+    component.extend_from_slice(&contents);
 }
 
 #[tokio::test(flavor = "multi_thread")]

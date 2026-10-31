@@ -1970,7 +1970,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
     let rendered = error.to_string();
 
     assert!(
-        rendered.contains("Failed to load WASM component"),
+        rendered.contains("failed to read provider component"),
         "provider load diagnostic is missing: {rendered}"
     );
     assert!(
