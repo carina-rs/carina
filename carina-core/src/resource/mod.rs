@@ -2467,6 +2467,20 @@ impl<P: PlaceholderKind> StructuralOperand<P> {
         }
     }
 
+    pub(crate) fn visit_values(&self, visitor: &mut impl FnMut(&Value<P>)) {
+        match self {
+            Self::Value { value, access_base } => {
+                visitor(value);
+                if let Some(access_base) = access_base {
+                    visitor(access_base);
+                }
+            }
+            Self::Handle { access_base, .. } | Self::Parameter { access_base, .. } => {
+                visitor(access_base);
+            }
+        }
+    }
+
     pub(crate) fn try_map<E>(
         &self,
         mut map: impl FnMut(&Value<P>) -> Result<Value<P>, E>,
@@ -4602,17 +4616,88 @@ pub struct LeftoverPlaceholder {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LeftoverPlaceholderContext {
+pub(crate) enum LeftoverPlaceholderContext {
     Value,
-    ResourceAttribute { resource: String, attribute: String },
-    Export { name: String },
-    AttributeDefault { name: String },
+    Variable {
+        name: String,
+    },
+    ProviderAttribute {
+        provider: String,
+        attribute: String,
+    },
+    BackendAttribute {
+        backend: String,
+        attribute: String,
+    },
+    ModuleCallArgument {
+        module_call: String,
+        argument: String,
+    },
+    ArgumentDefault {
+        name: String,
+    },
+    ArgumentValidation {
+        name: String,
+    },
+    ResourceAttribute {
+        resource: String,
+        attribute: String,
+    },
+    Export {
+        name: String,
+    },
+    AttributeDefault {
+        name: String,
+    },
+    StateImport {
+        target: String,
+    },
+    WaitBinding {
+        binding: String,
+    },
+    Require {
+        label: String,
+    },
+    DeferredForIterable {
+        header: String,
+    },
+    DeferredForAttribute {
+        header: String,
+        attribute: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopPlaceholderPolicy {
+    Reject,
+    AllowInDeferredTemplate,
 }
 
 impl fmt::Display for LeftoverPlaceholderContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Value => Ok(()),
+            Self::Variable { name } => write!(formatter, "let `{name}`: "),
+            Self::ProviderAttribute {
+                provider,
+                attribute,
+            } => write!(formatter, "provider `{provider}` attribute `{attribute}`: "),
+            Self::BackendAttribute { backend, attribute } => {
+                write!(formatter, "backend `{backend}` attribute `{attribute}`: ")
+            }
+            Self::ModuleCallArgument {
+                module_call,
+                argument,
+            } => write!(
+                formatter,
+                "module call `{module_call}` argument `{argument}`: "
+            ),
+            Self::ArgumentDefault { name } => {
+                write!(formatter, "arguments `{name}` default: ")
+            }
+            Self::ArgumentValidation { name } => {
+                write!(formatter, "arguments `{name}` validation: ")
+            }
             Self::ResourceAttribute {
                 resource,
                 attribute,
@@ -4620,6 +4705,15 @@ impl fmt::Display for LeftoverPlaceholderContext {
             Self::Export { name } => write!(formatter, "exports `{name}`: "),
             Self::AttributeDefault { name } => {
                 write!(formatter, "attributes `{name}` default: ")
+            }
+            Self::StateImport { target } => write!(formatter, "import `{target}` id: "),
+            Self::WaitBinding { binding } => write!(formatter, "wait binding `{binding}`: "),
+            Self::Require { label } => write!(formatter, "require `{label}`: "),
+            Self::DeferredForIterable { header } => {
+                write!(formatter, "deferred `{header}` iterable: ")
+            }
+            Self::DeferredForAttribute { header, attribute } => {
+                write!(formatter, "deferred `{header}` attribute `{attribute}`: ")
             }
         }
     }
@@ -4652,6 +4746,45 @@ impl LeftoverPlaceholder {
         self
     }
 }
+
+/// Every parser-stage placeholder rejected by one file expansion boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftoverPlaceholders(Vec<LeftoverPlaceholder>);
+
+impl LeftoverPlaceholders {
+    pub(crate) fn new(errors: Vec<LeftoverPlaceholder>) -> Self {
+        debug_assert!(!errors.is_empty());
+        Self(errors)
+    }
+
+    pub fn errors(&self) -> &[LeftoverPlaceholder] {
+        &self.0
+    }
+
+    pub fn into_errors(self) -> Vec<LeftoverPlaceholder> {
+        self.0
+    }
+}
+
+impl From<LeftoverPlaceholder> for LeftoverPlaceholders {
+    fn from(error: LeftoverPlaceholder) -> Self {
+        Self(vec![error])
+    }
+}
+
+impl fmt::Display for LeftoverPlaceholders {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, error) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("\n")?;
+            }
+            error.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LeftoverPlaceholders {}
 
 /// A serialized for-loop slot appeared in an ordinary expanded value instead
 /// of a deferred for-loop template.
@@ -4713,19 +4846,16 @@ pub trait PlaceholderKind:
     fn render(&self) -> String {
         self.to_string()
     }
+
+    /// Parser-stage placeholders are stable syntax tokens during directory
+    /// fixed-point parsing. Runtime/template placeholders deliberately retain
+    /// unknown-value equality semantics.
+    fn parser_token_eq(&self, _other: &Self) -> bool {
+        false
+    }
 }
 
 impl PlaceholderKind for NoPlaceholder {}
-
-impl PlaceholderKind for LoopSlot {
-    fn loop_slot(&self) -> Option<LoopSlot> {
-        Some(*self)
-    }
-
-    fn from_loop_slot(slot: LoopSlot) -> Result<Self, PlaceholderOutsideTemplate> {
-        Ok(slot)
-    }
-}
 
 impl fmt::Display for NoPlaceholder {
     fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -4736,10 +4866,28 @@ impl fmt::Display for NoPlaceholder {
 impl fmt::Display for LoopSlot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Key => "(known after upstream apply: key)",
-            Self::Index => "(known after upstream apply: index)",
-            Self::Value => "(known after upstream apply)",
+            Self::Key => "deferred for-binding key",
+            Self::Index => "deferred for-binding index",
+            Self::Value => "deferred for-binding value",
         })
+    }
+}
+
+impl PlaceholderKind for LoopSlot {
+    fn loop_slot(&self) -> Option<LoopSlot> {
+        Some(*self)
+    }
+
+    fn from_loop_slot(slot: LoopSlot) -> Result<Self, PlaceholderOutsideTemplate> {
+        Ok(slot)
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Key => "(known after upstream apply: key)".to_string(),
+            Self::Index => "(known after upstream apply: index)".to_string(),
+            Self::Value => "(known after upstream apply)".to_string(),
+        }
     }
 }
 
@@ -4775,9 +4923,13 @@ impl PlaceholderKind for ParserPlaceholder {
             Self::ModuleArgument { name, .. } => {
                 format!("(unresolved module argument: {name})")
             }
-            Self::Loop(slot) => slot.to_string(),
+            Self::Loop(slot) => slot.render(),
             Self::EmptyInterpolation => "(empty interpolation)".to_string(),
         }
+    }
+
+    fn parser_token_eq(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -4790,47 +4942,46 @@ impl<P: PlaceholderKind> Value<P> {
             .ok()
     }
 
-    /// Return whether any parser/runtime placeholder in this value tree
-    /// matches `predicate`.
-    pub fn contains_placeholder_matching(&self, predicate: &impl Fn(&P) -> bool) -> bool {
-        let argument_matches = |argument: &FunctionArgument<P>| match &argument.operand {
-            StructuralOperand::Value { value, access_base } => {
-                value.contains_placeholder_matching(predicate)
-                    || access_base
-                        .as_ref()
-                        .is_some_and(|value| value.contains_placeholder_matching(predicate))
-            }
-            StructuralOperand::Handle { access_base, .. }
-            | StructuralOperand::Parameter { access_base, .. } => {
-                access_base.contains_placeholder_matching(predicate)
-            }
-        };
-
+    pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
         match self {
-            Value::Deferred(DeferredValue::Placeholder(placeholder)) => predicate(placeholder),
-            Value::Concrete(ConcreteValue::List(values)) => values
-                .iter()
-                .any(|value| value.contains_placeholder_matching(predicate)),
-            Value::Concrete(ConcreteValue::Map(values)) => values
-                .values()
-                .any(|value| value.contains_placeholder_matching(predicate)),
-            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                value.contains_placeholder_matching(predicate)
-                    || default.contains_placeholder_matching(predicate)
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => visitor(placeholder),
+            Value::Concrete(ConcreteValue::List(values)) => {
+                for value in values {
+                    value.visit_placeholders(visitor);
+                }
             }
-            Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-                matches!(part, InterpolationPart::Expr(value) if value.contains_placeholder_matching(predicate))
-            }),
+            Value::Concrete(ConcreteValue::Map(values)) => {
+                for value in values.values() {
+                    value.visit_placeholders(visitor);
+                }
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                value.visit_placeholders(visitor);
+                default.visit_placeholders(visitor);
+            }
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                for part in parts {
+                    if let InterpolationPart::Expr(value) = part {
+                        value.visit_placeholders(visitor);
+                    }
+                }
+            }
             Value::Deferred(
                 DeferredValue::FunctionCall { args, .. }
                 | DeferredValue::Unavailable { args, .. }
                 | DeferredValue::ResolvedFunctionCall { args, .. },
-            ) => args.iter().any(argument_matches),
+            ) => {
+                for argument in args {
+                    argument.operand.visit_values(&mut |value| {
+                        value.visit_placeholders(visitor);
+                    });
+                }
+            }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().contains_placeholder_matching(predicate)
+                access.base().visit_placeholders(visitor);
             }
             Value::Deferred(DeferredValue::Secret(value)) => {
-                value.contains_placeholder_matching(predicate)
+                value.visit_placeholders(visitor);
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -4847,7 +4998,7 @@ impl<P: PlaceholderKind> Value<P> {
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::RedactedSecret { .. }
                 | DeferredValue::Unknown(_),
-            ) => false,
+            ) => {}
         }
     }
 
@@ -4998,6 +5149,24 @@ impl Value<NoPlaceholder> {
 }
 
 impl Value<ParserPlaceholder> {
+    pub(crate) fn collect_leftover_placeholders(
+        &self,
+        context: LeftoverPlaceholderContext,
+        loop_policy: LoopPlaceholderPolicy,
+        errors: &mut Vec<LeftoverPlaceholder>,
+    ) {
+        self.visit_placeholders(&mut |placeholder| {
+            if loop_policy == LoopPlaceholderPolicy::Reject
+                || !matches!(placeholder, ParserPlaceholder::Loop(_))
+            {
+                errors.push(LeftoverPlaceholder {
+                    placeholder: placeholder.clone(),
+                    context: context.clone(),
+                });
+            }
+        });
+    }
+
     pub fn into_expanded(self) -> Result<Value, LeftoverPlaceholder> {
         self.try_map_placeholder(&mut |placeholder| {
             Err(LeftoverPlaceholder {
@@ -5075,7 +5244,7 @@ impl<P: PlaceholderKind + PartialEq> PartialEq for Value<P> {
             (
                 Value::Deferred(DeferredValue::Placeholder(a)),
                 Value::Deferred(DeferredValue::Placeholder(b)),
-            ) if a.module_argument_name().is_some() && b.module_argument_name().is_some() => a == b,
+            ) if a.parser_token_eq(b) => true,
             // Constraint: Unknown is never equal to anything.
             (Value::Deferred(DeferredValue::Unknown(_)), _)
             | (_, Value::Deferred(DeferredValue::Unknown(_)))

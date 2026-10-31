@@ -15,9 +15,10 @@ use crate::eval_value::{StructuralHandle, StructuralHandleKind, StructuralHandle
 use crate::provider_source::ProviderSource;
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, Directives, ForLoopElement, FunctionArgument,
-    GraphNode, LeafNode, LiveComposition, LoopSlot, ModuleSource, NoPlaceholder, ParserPlaceholder,
-    PathSegment, PlaceholderKind, Resource, ResourceId, ResourceIdentity, SavedModuleSource,
-    StructuralOperand, StructuralOperandRef, UnboundLoopTemplate, Value,
+    GraphNode, LeafNode, LeftoverPlaceholderContext, LeftoverPlaceholders, LiveComposition,
+    LoopPlaceholderPolicy, LoopSlot, ModuleSource, NoPlaceholder, ParserPlaceholder, PathSegment,
+    PlaceholderKind, Resource, ResourceId, ResourceIdentity, SavedModuleSource, StructuralOperand,
+    StructuralOperandRef, UnboundLoopTemplate, Value,
 };
 use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
@@ -965,6 +966,40 @@ pub enum ValidateExpr<P: PlaceholderKind = NoPlaceholder> {
 }
 
 impl ValidateExpr<ParserPlaceholder> {
+    fn collect_leftover_placeholders(
+        &self,
+        context: &LeftoverPlaceholderContext,
+        errors: &mut Vec<crate::resource::LeftoverPlaceholder>,
+    ) {
+        match self {
+            Self::BoundArgument { value, .. } => {
+                value.collect_leftover_placeholders(
+                    context.clone(),
+                    LoopPlaceholderPolicy::Reject,
+                    errors,
+                );
+            }
+            Self::Compare { lhs, rhs, .. } | Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.collect_leftover_placeholders(context, errors);
+                rhs.collect_leftover_placeholders(context, errors);
+            }
+            Self::Not(value) => value.collect_leftover_placeholders(context, errors),
+            Self::FunctionCall { args, .. } => {
+                for argument in args {
+                    argument.collect_leftover_placeholders(context, errors);
+                }
+            }
+            Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::Duration(_)
+            | Self::String(_)
+            | Self::Var(_)
+            | Self::Access { .. }
+            | Self::Null => {}
+        }
+    }
+
     pub(crate) fn into_expanded(
         self,
     ) -> Result<ValidateExpr, crate::resource::LeftoverPlaceholder> {
@@ -1262,7 +1297,7 @@ impl<P: PlaceholderKind + PartialEq> ExportParamLike<P> for ParsedExportParam<P>
 }
 
 #[doc(hidden)]
-pub trait IntoExpandedExportParam {
+pub trait IntoExpandedExportParam: ExportParamLike<ParserPlaceholder> {
     type Expanded: ExportParamLike<NoPlaceholder>;
 
     fn into_expanded(self) -> Result<Self::Expanded, crate::resource::LeftoverPlaceholder>;
@@ -3038,6 +3073,17 @@ pub struct File<E, P: PlaceholderKind = ParserPlaceholder, T: PlaceholderKind = 
 pub type ParsedFile =
     File<ParsedExportParam<ParserPlaceholder>, ParserPlaceholder, ParserPlaceholder>;
 
+/// Parser-placeholder policy at the validation/expansion boundary.
+///
+/// A called root configuration must be fully expanded. A standalone module
+/// definition deliberately remains parser-stage until a caller supplies its
+/// arguments, so its typed module-argument slots are not leftovers yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserPlaceholderBoundary {
+    ExpandedFile,
+    ModuleDefinition,
+}
+
 /// Post-inference file: every export carries origin and unchecked provenance.
 pub type InferredFile =
     File<InferredExportParam<ParserPlaceholder>, ParserPlaceholder, ParserPlaceholder>;
@@ -3440,11 +3486,268 @@ impl<E, P: PlaceholderKind + PartialEq, T: PlaceholderKind> File<E, P, T> {
 }
 
 impl<E: IntoExpandedExportParam> File<E, ParserPlaceholder, ParserPlaceholder> {
+    fn leftover_placeholders(
+        &self,
+        boundary: ParserPlaceholderBoundary,
+    ) -> Vec<crate::resource::LeftoverPlaceholder> {
+        let mut errors = Vec::new();
+
+        for provider in &self.providers {
+            let provider_name = provider.name.clone();
+            for (attribute, value) in &provider.attributes {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ProviderAttribute {
+                        provider: provider_name.clone(),
+                        attribute: attribute.clone(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+            for (attribute, value) in &provider.default_tags {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ProviderAttribute {
+                        provider: provider_name.clone(),
+                        attribute: format!("default_tags.{attribute}"),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+            for (attribute, value) in &provider.unresolved_attributes {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ProviderAttribute {
+                        provider: provider_name.clone(),
+                        attribute: attribute.clone(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+        }
+
+        {
+            let mut collect_resource_attributes =
+                |resource: String, attributes: &IndexMap<String, Value<ParserPlaceholder>>| {
+                    for (attribute, value) in attributes {
+                        value.collect_leftover_placeholders(
+                            LeftoverPlaceholderContext::ResourceAttribute {
+                                resource: resource.clone(),
+                                attribute: attribute.clone(),
+                            },
+                            LoopPlaceholderPolicy::Reject,
+                            &mut errors,
+                        );
+                    }
+                };
+            for resource in &self.resources {
+                collect_resource_attributes(resource.id.to_string(), &resource.attributes);
+            }
+            for data_source in &self.data_sources {
+                collect_resource_attributes(data_source.id.to_string(), &data_source.attributes);
+            }
+        }
+
+        for composition in &self.compositions {
+            for (argument, value) in &composition.signature.arguments {
+                value.visit_values(&mut |value| {
+                    value.collect_leftover_placeholders(
+                        LeftoverPlaceholderContext::ModuleCallArgument {
+                            module_call: composition.instance.clone(),
+                            argument: argument.clone(),
+                        },
+                        LoopPlaceholderPolicy::Reject,
+                        &mut errors,
+                    );
+                });
+            }
+            for (attribute, value) in &composition.signature.attributes {
+                value.to_value().collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ResourceAttribute {
+                        resource: composition.id.to_string(),
+                        attribute: attribute.clone(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+            for constraint in &composition.signature.pending_constraints {
+                constraint.expression.collect_leftover_placeholders(
+                    &LeftoverPlaceholderContext::Require {
+                        label: format!("{} {}", composition.instance, constraint.id.as_str()),
+                    },
+                    &mut errors,
+                );
+            }
+        }
+
+        for (name, value) in &self.variables {
+            value.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::Variable { name: name.clone() },
+                LoopPlaceholderPolicy::Reject,
+                &mut errors,
+            );
+        }
+
+        for module_call in &self.module_calls {
+            let module_call_name = module_call
+                .binding_name
+                .as_ref()
+                .unwrap_or(&module_call.module_name)
+                .clone();
+            for (argument, value) in module_call.arguments() {
+                value.operand.visit_values(&mut |value| {
+                    value.collect_leftover_placeholders(
+                        LeftoverPlaceholderContext::ModuleCallArgument {
+                            module_call: module_call_name.clone(),
+                            argument: argument.to_string(),
+                        },
+                        LoopPlaceholderPolicy::Reject,
+                        &mut errors,
+                    );
+                });
+            }
+        }
+
+        for argument in &self.arguments {
+            if let Some(value) = &argument.default {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::ArgumentDefault {
+                        name: argument.name.clone(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+            for validation in &argument.validations {
+                validation.condition.collect_leftover_placeholders(
+                    &LeftoverPlaceholderContext::ArgumentValidation {
+                        name: argument.name.clone(),
+                    },
+                    &mut errors,
+                );
+            }
+        }
+
+        for attribute in &self.attribute_params {
+            if let Some(value) = &attribute.value {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::AttributeDefault {
+                        name: attribute.name.clone(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+        }
+
+        for export in &self.export_params {
+            if let Some(value) = export.value() {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::Export {
+                        name: export.name().to_string(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+        }
+
+        if let Some(backend) = &self.backend {
+            for (attribute, value) in &backend.attributes {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::BackendAttribute {
+                        backend: backend.backend_type.clone(),
+                        attribute: attribute.clone(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+        }
+
+        for state_block in &self.state_blocks {
+            if let StateBlock::Import { to, id, .. } = state_block {
+                id.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::StateImport {
+                        target: to.to_string(),
+                    },
+                    LoopPlaceholderPolicy::Reject,
+                    &mut errors,
+                );
+            }
+        }
+
+        for wait in &self.wait_bindings {
+            wait.until_predicate.rhs.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::WaitBinding {
+                    binding: wait.binding.as_str().to_string(),
+                },
+                LoopPlaceholderPolicy::Reject,
+                &mut errors,
+            );
+        }
+
+        for (index, require) in self.requires.iter().enumerate() {
+            require.condition.collect_leftover_placeholders(
+                &LeftoverPlaceholderContext::Require {
+                    label: (index + 1).to_string(),
+                },
+                &mut errors,
+            );
+        }
+
+        for deferred in &self.deferred_for_expressions {
+            deferred.iterable.collect_leftover_placeholders(
+                LeftoverPlaceholderContext::DeferredForIterable {
+                    header: deferred.header.clone(),
+                },
+                LoopPlaceholderPolicy::Reject,
+                &mut errors,
+            );
+            for (attribute, value) in &deferred.attributes {
+                value.collect_leftover_placeholders(
+                    LeftoverPlaceholderContext::DeferredForAttribute {
+                        header: deferred.header.clone(),
+                        attribute: attribute.clone(),
+                    },
+                    LoopPlaceholderPolicy::AllowInDeferredTemplate,
+                    &mut errors,
+                );
+            }
+        }
+
+        if boundary == ParserPlaceholderBoundary::ModuleDefinition {
+            errors.retain(|error| {
+                !matches!(
+                    error.placeholder(),
+                    ParserPlaceholder::ModuleArgument { .. }
+                )
+            });
+        }
+
+        errors
+    }
+
+    /// Check every value-bearing field at the parser-placeholder boundary.
+    pub fn validate_expansion_boundary(
+        &self,
+        boundary: ParserPlaceholderBoundary,
+    ) -> Result<(), LeftoverPlaceholders> {
+        let errors = self.leftover_placeholders(boundary);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(LeftoverPlaceholders::new(errors))
+        }
+    }
+
     #[doc(hidden)]
     pub fn into_expanded(
         self,
-    ) -> Result<File<E::Expanded, NoPlaceholder, LoopSlot>, crate::resource::LeftoverPlaceholder>
-    {
+    ) -> Result<File<E::Expanded, NoPlaceholder, LoopSlot>, LeftoverPlaceholders> {
+        self.validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)?;
+
         let File {
             providers,
             resources,

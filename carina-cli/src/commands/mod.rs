@@ -473,49 +473,6 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
     );
 }
 
-fn validate_no_empty_interpolations<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError>
-where
-    E: carina_core::parser::ExportParamLike,
-{
-    use carina_core::resource::ParserPlaceholder;
-
-    let contains_empty = |value: &carina_core::resource::Value<ParserPlaceholder>| {
-        value.contains_placeholder_matching(&|placeholder| {
-            matches!(placeholder, ParserPlaceholder::EmptyInterpolation)
-        })
-    };
-    let mut errors = Vec::new();
-
-    for resource in parsed.iter_all_resources() {
-        for (name, value) in resource.attributes().iter() {
-            if contains_empty(value) {
-                errors.push(AppError::Validation(format!(
-                    "{}: attribute `{name}`: empty interpolation `${{}}` — fill in the expression or remove it",
-                    resource.id(),
-                )));
-            }
-        }
-    }
-    for export in &parsed.export_params {
-        if export.value().is_some_and(contains_empty) {
-            errors.push(AppError::Validation(format!(
-                "exports `{}`: empty interpolation `${{}}` — fill in the expression or remove it",
-                export.name(),
-            )));
-        }
-    }
-    for attribute in &parsed.attribute_params {
-        if attribute.value.as_ref().is_some_and(contains_empty) {
-            errors.push(AppError::Validation(format!(
-                "attributes `{}` default: empty interpolation `${{}}` — fill in the expression or remove it",
-                attribute.name,
-            )));
-        }
-    }
-
-    errors
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_resolve_errors_inner<'a>(
     access: &crate::wiring::ValidationPipelineAccess,
@@ -859,6 +816,19 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     };
     let parsed = resolved_config.parsed();
 
+    // This is the sole parser-placeholder boundary. Standalone module
+    // definitions intentionally retain typed module-argument slots until a
+    // caller expands them; root configurations must be fully expanded.
+    let placeholder_boundary = if carina_core::validation::is_module_definition(parsed) {
+        carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+    } else {
+        carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+    };
+    if let Err(leftovers) = parsed.validate_expansion_boundary(placeholder_boundary) {
+        errors.extend(leftovers.into_errors().into_iter().map(AppError::from));
+        return Err(errors);
+    }
+
     let (upstream_exports, upstream_resolve_errors) = if skip_resource_validation {
         (Default::default(), Vec::new())
     } else {
@@ -871,12 +841,6 @@ pub(crate) fn validate_and_resolve_errors_inner<'a>(
     };
 
     if !skip_resource_validation {
-        // Mid-edit `${}` is parser-accepted (#2480) so the AST stays
-        // intact for LSP diagnostics, but it must not reach a provider —
-        // surface it as a hard error before the schema-level checks
-        // below try to type-check around the marker. See #2487.
-
-        errors.extend(validate_no_empty_interpolations(parsed));
         errors.extend(validate_resources_with_ctx(ctx, parsed, enriched_context));
         errors.extend(validate_depends_on_with_ctx(parsed));
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));

@@ -883,6 +883,10 @@ pub enum AppError {
     #[error(transparent)]
     LeftoverPlaceholder(#[from] carina_core::resource::LeftoverPlaceholder),
 
+    /// All parser-only placeholders rejected by one file expansion boundary.
+    #[error(transparent)]
+    LeftoverPlaceholders(#[from] carina_core::resource::LeftoverPlaceholders),
+
     /// One core-owned module-call finding at its parser-authored location.
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),

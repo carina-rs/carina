@@ -5,6 +5,60 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::{self, ProviderConfig, ProviderContext};
+use carina_core::resource::ParserPlaceholder;
+
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredProviderConfig {
+    comparison_key: ProviderConfig<ParserPlaceholder>,
+    factory_config: ProviderConfig,
+}
+
+impl DiscoveredProviderConfig {
+    pub(crate) fn from_parser(provider: ProviderConfig<ParserPlaceholder>) -> Self {
+        fn factory_values(
+            values: indexmap::IndexMap<String, carina_core::resource::Value<ParserPlaceholder>>,
+        ) -> indexmap::IndexMap<String, carina_core::resource::Value> {
+            values
+                .into_iter()
+                .filter_map(|(name, value)| match value.into_expanded() {
+                    Ok(value) => Some((name, value)),
+                    Err(_leftover) => None,
+                })
+                .collect()
+        }
+
+        let factory_config = ProviderConfig {
+            name: provider.name.clone(),
+            attributes: factory_values(provider.attributes.clone()),
+            default_tags: factory_values(provider.default_tags.clone()),
+            source: provider.source.clone(),
+            version: provider.version.clone(),
+            revision: provider.revision.clone(),
+            unresolved_attributes: factory_values(provider.unresolved_attributes.clone()),
+            binding: provider.binding.clone(),
+        };
+        Self {
+            comparison_key: provider,
+            factory_config,
+        }
+    }
+
+    pub(crate) fn comparison_key(&self) -> &ProviderConfig<ParserPlaceholder> {
+        &self.comparison_key
+    }
+
+    pub(crate) fn factory_config(&self) -> &ProviderConfig {
+        &self.factory_config
+    }
+}
+
+impl std::ops::Deref for DiscoveredProviderConfig {
+    type Target = ProviderConfig<ParserPlaceholder>;
+
+    fn deref(&self) -> &Self::Target {
+        self.comparison_key()
+    }
+}
 
 #[derive(PartialEq, Eq, Hash)]
 struct ProviderInstanceKey {
@@ -21,19 +75,33 @@ impl From<&ProviderConfig> for ProviderInstanceKey {
     }
 }
 
+impl From<&DiscoveredProviderConfig> for ProviderInstanceKey {
+    fn from(config: &DiscoveredProviderConfig) -> Self {
+        Self {
+            kind: config.name.clone(),
+            binding: config.binding.clone(),
+        }
+    }
+}
+
 /// Discover provider configurations grouped by directory.
 ///
 /// Each directory is an independent Carina configuration with its own set of
 /// providers. Within a directory, duplicate provider instances are identified
 /// by provider kind and optional binding; the first declaration in sorted path
 /// order wins.
-pub fn discover_providers_by_dir(workspace_root: &Path) -> HashMap<PathBuf, Vec<ProviderConfig>> {
-    let mut result: HashMap<PathBuf, Vec<ProviderConfig>> = HashMap::new();
+pub(crate) fn discover_providers_by_dir(
+    workspace_root: &Path,
+) -> HashMap<PathBuf, Vec<DiscoveredProviderConfig>> {
+    let mut result: HashMap<PathBuf, Vec<DiscoveredProviderConfig>> = HashMap::new();
     discover_by_dir_recursive(workspace_root, &mut result);
     result
 }
 
-fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<ProviderConfig>>) {
+fn discover_by_dir_recursive(
+    dir: &Path,
+    result: &mut HashMap<PathBuf, Vec<DiscoveredProviderConfig>>,
+) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -58,27 +126,7 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
                     .map(ProviderInstanceKey::from)
                     .collect();
                 for provider in parsed.providers {
-                    let expanded_values = |values: indexmap::IndexMap<
-                        String,
-                        carina_core::resource::Value<carina_core::resource::ParserPlaceholder>,
-                    >| {
-                        values
-                            .into_iter()
-                            .filter_map(|(name, value)| {
-                                value.into_expanded().ok().map(|value| (name, value))
-                            })
-                            .collect()
-                    };
-                    let provider = ProviderConfig {
-                        name: provider.name,
-                        attributes: expanded_values(provider.attributes),
-                        default_tags: expanded_values(provider.default_tags),
-                        source: provider.source,
-                        version: provider.version,
-                        revision: provider.revision,
-                        unresolved_attributes: expanded_values(provider.unresolved_attributes),
-                        binding: provider.binding,
-                    };
+                    let provider = DiscoveredProviderConfig::from_parser(provider);
                     if seen.insert(ProviderInstanceKey::from(&provider)) {
                         dir_providers.push(provider);
                     }

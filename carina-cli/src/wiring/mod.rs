@@ -813,7 +813,7 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)
         }
-        carina_core::validation::ResolveFileError::LeftoverPlaceholder(error) => error.into(),
+        carina_core::validation::ResolveFileError::LeftoverPlaceholders(error) => error.into(),
     }
 }
 

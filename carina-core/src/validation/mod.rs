@@ -528,7 +528,7 @@ pub enum ResolveFileError {
     #[error(transparent)]
     BindingUse(#[from] BindingUseReport),
     #[error(transparent)]
-    LeftoverPlaceholder(#[from] crate::resource::LeftoverPlaceholder),
+    LeftoverPlaceholders(#[from] crate::resource::LeftoverPlaceholders),
 }
 
 impl BindingUseReport {

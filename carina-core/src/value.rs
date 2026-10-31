@@ -1708,7 +1708,7 @@ fn format_value_into_context<P: PlaceholderKind>(
                         if let Some((upstream_binding, verb)) = context.upstream_deferred_label {
                             write_upstream_deferred_label(sink, upstream_binding, verb)
                         } else {
-                            sink.write_token(ValueSpanKind::Other, &slot.to_string())
+                            sink.write_token(ValueSpanKind::Other, &slot.render())
                         }
                     }
                     Some(AccessChainRoot::Unknown(reason)) => write_unknown(reason, sink, context),

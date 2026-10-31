@@ -3,7 +3,7 @@ use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, Resolv
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
     ConcreteValue, DeferredValue, ForLoopElement, InterpolationPart, LoopKind, LoopOriginKind,
-    NoPlaceholder, ParserPlaceholder, Resource, Value,
+    ModuleSource, NoPlaceholder, ParserPlaceholder, Resource, Value,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -26,6 +26,207 @@ fn expanded_value(value: &Value<ParserPlaceholder>) -> Value<NoPlaceholder> {
         .clone()
         .into_expanded()
         .expect("test value must contain no parser placeholder")
+}
+
+#[test]
+fn file_into_expanded_collects_every_leftover_with_locations() {
+    let source = r#"
+        let greeting = "${}"
+
+        let item = mock.test.resource {
+            name = "${}"
+        }
+
+        exports {
+            broken: String = "${}"
+        }
+    "#;
+    let parsed = parse(source, &ProviderContext::default()).expect("fixture must parse");
+
+    let error = parsed
+        .into_expanded()
+        .expect_err("every parser placeholder must be rejected at the expansion boundary");
+    let messages = error.to_string();
+
+    for expected in [
+        "let `greeting`: empty interpolation `${}` — fill in the expression or remove it",
+        "attribute `name`: empty interpolation `${}` — fill in the expression or remove it",
+        "exports `broken`: empty interpolation `${}` — fill in the expression or remove it",
+    ] {
+        assert!(
+            messages.contains(expected),
+            "missing {expected:?} from collected leftovers:\n{messages}",
+        );
+    }
+    assert_eq!(
+        messages.matches("empty interpolation `${}`").count(),
+        3,
+        "each leftover must be reported exactly once:\n{messages}",
+    );
+}
+
+#[test]
+fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
+    let empty = || {
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::EmptyInterpolation,
+        ))
+    };
+    let mut file = ParsedFile::default();
+    file.variables.insert(
+        "greeting".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![empty(), empty()])),
+    );
+
+    let rendered = file
+        .into_expanded()
+        .expect_err("both nested placeholders must be rejected")
+        .to_string();
+
+    assert_eq!(
+        rendered
+            .matches("let `greeting`: empty interpolation `${}`")
+            .count(),
+        2,
+        "every placeholder occurrence must survive collection:\n{rendered}",
+    );
+}
+
+#[test]
+fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
+    let empty = || {
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::EmptyInterpolation,
+        ))
+    };
+    let mut file = ParsedFile::default();
+
+    file.providers.push(ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::from([("region".to_string(), empty())]),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    });
+    file.backend = Some(BackendConfig {
+        backend_type: "local".to_string(),
+        attributes: HashMap::from([("path".to_string(), empty())]),
+        attribute_spans: HashMap::new(),
+    });
+    file.variables.insert("greeting".to_string(), empty());
+
+    let mut resource = Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
+        "mock",
+        "test.resource",
+        None,
+    );
+    resource.attributes.insert("name".to_string(), empty());
+    file.resources.push(resource);
+
+    file.module_calls.push(ModuleCall::test(
+        "example_module",
+        Some("component".to_string()),
+        HashMap::from([("input".to_string(), ModuleArgument::new(empty()))]),
+    ));
+    file.arguments.push(ArgumentParameter {
+        name: "input".to_string(),
+        static_type: TypeExpr::String,
+        default: Some(empty()),
+        description: None,
+        validations: vec![ValidationBlock::dummy(
+            ValidateExpr::BoundArgument {
+                argument: "input".to_string(),
+                operand: "input".to_string(),
+                value: empty(),
+            },
+            None,
+        )],
+    });
+    file.attribute_params.push(AttributeParameter::dummy(
+        "output".to_string(),
+        Some(TypeExpr::String),
+        Some(empty()),
+    ));
+    file.export_params.push(ParsedExportParam::dummy(
+        "published".to_string(),
+        Some(TypeExpr::String),
+        Some(empty()),
+    ));
+    file.state_blocks.push(StateBlock::Import {
+        to: StateBlockAddress::new("mock", "test.resource", "existing"),
+        to_span: None,
+        id: empty(),
+    });
+    file.wait_bindings.push(WaitBinding {
+        binding: BindingName::new("ready"),
+        target: BindingName::new("resource"),
+        until_raw: "resource.status == \"${}\"".to_string(),
+        until_predicate: UntilPredicateAst {
+            lhs_segments: vec!["resource".to_string(), "status".to_string()],
+            rhs: empty(),
+        },
+        timeout_secs: None,
+        depends_on: Vec::new(),
+        line: 1,
+    });
+    file.requires.push(RequireBlock::dummy(
+        ValidateExpr::BoundArgument {
+            argument: "input".to_string(),
+            operand: "input".to_string(),
+            value: empty(),
+        },
+        "input is required".to_string(),
+    ));
+
+    let mut template_resource =
+        Resource::<ModuleSource, ParserPlaceholder>::pending("mock.test.resource");
+    template_resource
+        .attributes
+        .insert("name".to_string(), empty());
+    file.deferred_for_expressions.push(DeferredForExpression {
+        file: Some("loops.crn".to_string()),
+        line: 1,
+        header: "for item in pending.items".to_string(),
+        resource_type: "mock.test.resource".to_string(),
+        attributes: vec![("name".to_string(), empty())],
+        target: DeferredForTarget::Bound {
+            binding: "items".to_string(),
+        },
+        iterable: empty(),
+        binding: ForBinding::Simple("item".to_string()),
+        template_resource,
+    });
+
+    let rendered = file
+        .into_expanded()
+        .expect_err("the fixture intentionally leaves placeholders in every field")
+        .to_string();
+
+    for expected in [
+        "provider `mock` attribute `region`:",
+        "backend `local` attribute `path`:",
+        "let `greeting`:",
+        "attribute `name`:",
+        "module call `component` argument `input`:",
+        "arguments `input` default:",
+        "arguments `input` validation:",
+        "attributes `output` default:",
+        "exports `published`:",
+        "import `mock.test.resource.existing` id:",
+        "wait binding `ready`:",
+        "require `1`:",
+        "deferred `for item in pending.items` iterable:",
+        "deferred `for item in pending.items` attribute `name`:",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing context {expected:?} from:\n{rendered}",
+        );
+    }
+    assert_eq!(rendered.matches("empty interpolation `${}`").count(), 14);
 }
 
 #[test]

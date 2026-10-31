@@ -50,7 +50,7 @@ struct ProviderState {
     semantic_tokens_provider: SemanticTokensProvider,
     /// Configs and their source directory, retained so a background poller can
     /// re-probe provider installation without re-scanning the workspace.
-    configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
+    configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)>,
     /// Injected install prober. Kept here so `is_stale()` can recompute the
     /// fingerprint with the same function that built the snapshot.
     prober: Option<ProviderInstallProber>,
@@ -66,12 +66,12 @@ impl ProviderState {
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_errors: HashMap<String, String>,
-        configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)>,
+        configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)>,
         prober: Option<ProviderInstallProber>,
         install_fingerprint: Vec<(String, ProviderInstallFingerprint)>,
     ) -> Self {
         let use_builtin_mock = carina_provider_mock::uses_builtin_provider(
-            configs.iter().map(|(_, config)| config),
+            configs.iter().map(|(_, config)| config.factory_config()),
             |provider_name| {
                 factories
                     .iter()
@@ -167,13 +167,32 @@ pub type ProviderInstallFingerprint =
 
 /// Compute `(provider_name, metadata)` pairs for a list of configs.
 /// Ordered to match the input so equality comparisons are stable.
-fn probe_install_fingerprint(
+trait FactoryConfigRef {
+    fn factory_config(&self) -> &carina_core::parser::ProviderConfig;
+}
+
+impl FactoryConfigRef for carina_core::parser::ProviderConfig {
+    fn factory_config(&self) -> &carina_core::parser::ProviderConfig {
+        self
+    }
+}
+
+impl FactoryConfigRef for workspace::DiscoveredProviderConfig {
+    fn factory_config(&self) -> &carina_core::parser::ProviderConfig {
+        workspace::DiscoveredProviderConfig::factory_config(self)
+    }
+}
+
+fn probe_install_fingerprint<C: FactoryConfigRef>(
     prober: &ProviderInstallProber,
-    configs: &[(PathBuf, carina_core::parser::ProviderConfig)],
+    configs: &[(PathBuf, C)],
 ) -> Vec<(String, ProviderInstallFingerprint)> {
     configs
         .iter()
-        .map(|(dir, cfg)| (cfg.name.clone(), prober(dir, cfg)))
+        .map(|(dir, cfg)| {
+            let cfg = cfg.factory_config();
+            (cfg.name.clone(), prober(dir, cfg))
+        })
         .collect()
 }
 
@@ -784,7 +803,7 @@ async fn load_schemas_impl(
     let mut any_work = false;
 
     for (dir, configs) in &dir_providers {
-        let dir_configs: Vec<(PathBuf, carina_core::parser::ProviderConfig)> =
+        let dir_configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)> =
             configs.iter().map(|c| (dir.clone(), c.clone())).collect();
 
         // Reuse the existing state when its cached configs are still the
@@ -800,7 +819,10 @@ async fn load_schemas_impl(
 
         any_work = true;
         let (dir_factories, dir_errors, dir_fingerprint) = tokio::task::spawn_blocking({
-            let configs = dir_configs.clone();
+            let configs = dir_configs
+                .iter()
+                .map(|(dir, config)| (dir.clone(), config.factory_config().clone()))
+                .collect::<Vec<_>>();
             let builder = Arc::clone(factory_builder);
             move || builder(&configs)
         })
@@ -865,18 +887,35 @@ async fn load_schemas_impl(
 }
 
 /// True when the two config lists describe the same set of providers
-/// per directory, including attribute values and default tags. Used by
-/// [`load_schemas_impl`] to reuse the existing factory instead of
-/// re-parsing WASM on every `.crn` save (#2136). Relies on
-/// `PartialEq` derived on `ProviderConfig`; `VersionConstraint`
-/// already implements `PartialEq` by comparing its raw DSL form, so
-/// two configs parsed from the same source text compare equal even
-/// though their internal `semver::VersionReq` may not.
-fn configs_match(
-    a: &[(PathBuf, carina_core::parser::ProviderConfig)],
-    b: &[(PathBuf, carina_core::parser::ProviderConfig)],
-) -> bool {
-    a == b
+/// per directory, including parser-stage attribute values and default tags.
+/// [`load_schemas_impl`] uses the retained discovery key, not the filtered
+/// factory config, so a mid-edit placeholder still invalidates the cache.
+/// `VersionConstraint` compares its raw DSL form, so two configs parsed from
+/// the same source text compare equal even when their internal
+/// `semver::VersionReq` representation differs.
+trait ProviderConfigMatch {
+    fn matches(&self, other: &Self) -> bool;
+}
+
+impl ProviderConfigMatch for carina_core::parser::ProviderConfig {
+    fn matches(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl ProviderConfigMatch for workspace::DiscoveredProviderConfig {
+    fn matches(&self, other: &Self) -> bool {
+        self.comparison_key() == other.comparison_key()
+    }
+}
+
+fn configs_match<C: ProviderConfigMatch>(a: &[(PathBuf, C)], b: &[(PathBuf, C)]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|((a_dir, a_config), (b_dir, b_config))| {
+                a_dir == b_dir && a_config.matches(b_config)
+            })
 }
 
 /// Decide whether a batch of watched-file events requires rebuilding provider
@@ -978,12 +1017,11 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()
-        .into_expanded()
-        .unwrap()
         .providers
         .into_iter()
         .next()
         .unwrap();
+        let config = workspace::DiscoveredProviderConfig::from_parser(config);
         ProviderState::new(
             vec![Box::new(BlockSchemaFactory { block_name })],
             HashMap::new(),
@@ -1574,6 +1612,58 @@ mod reload_skip_tests {
             .collect::<Vec<_>>();
 
         assert!(!configs_match(&first, &second));
+    }
+
+    #[test]
+    fn discovered_configs_match_keeps_empty_interpolation_in_comparison_key() {
+        let fixture = tempfile::tempdir().unwrap();
+        let provider_file = fixture.path().join("provider.crn");
+        let discover = || {
+            workspace::discover_providers_by_dir(fixture.path())
+                .remove(fixture.path())
+                .unwrap()
+                .into_iter()
+                .map(|config| (fixture.path().to_path_buf(), config))
+                .collect::<Vec<_>>()
+        };
+
+        std::fs::write(&provider_file, "provider awscc {}\n").unwrap();
+        let missing = discover();
+
+        std::fs::write(&provider_file, "provider awscc { region = \"${}\" }\n").unwrap();
+        let placeholder = discover();
+        assert!(
+            placeholder[0]
+                .1
+                .comparison_key()
+                .attributes
+                .contains_key("region"),
+            "the discovery key must retain the parser-stage placeholder",
+        );
+        assert!(
+            !placeholder[0]
+                .1
+                .factory_config()
+                .attributes
+                .contains_key("region"),
+            "the provider factory must receive only expanded attributes",
+        );
+
+        std::fs::write(
+            &provider_file,
+            "provider awscc { region = 'ap-northeast-1' }\n",
+        )
+        .unwrap();
+        let concrete = discover();
+
+        assert!(
+            !configs_match(&missing, &placeholder),
+            "a mid-edit placeholder must not collapse to a missing attribute",
+        );
+        assert!(
+            !configs_match(&placeholder, &concrete),
+            "a placeholder and concrete region must produce different discovery keys",
+        );
     }
 
     #[test]

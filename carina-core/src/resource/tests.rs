@@ -86,6 +86,29 @@ fn into_expanded_rejects_empty_interpolation_with_existing_wording() {
 }
 
 #[test]
+fn loop_slot_display_is_error_style_while_render_stays_plan_style() {
+    let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(ParserPlaceholder::Loop(
+        LoopSlot::Value,
+    )));
+
+    let error = value
+        .into_expanded()
+        .expect_err("a loop slot outside a deferred template must fail");
+
+    assert_eq!(error.to_string(), "deferred for-binding value");
+    assert_eq!(
+        LoopSlot::Value.render(),
+        "(known after upstream apply)",
+        "plan rendering must remain unchanged",
+    );
+    assert_eq!(
+        ParserPlaceholder::Loop(LoopSlot::Value).render(),
+        "(known after upstream apply)",
+        "parser-stage loop slots must delegate to the same plan renderer",
+    );
+}
+
+#[test]
 fn loop_placeholder_uses_the_existing_unknown_wire_shape() {
     let value = LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value));
 
@@ -105,11 +128,9 @@ fn expanded_value_deserialization_reports_typed_loop_placeholder_error() {
     let error = serde_json::from_value::<Value>(serde_json::json!({ "Unknown": "ForIndex" }))
         .expect_err("an expanded value cannot contain a loop slot");
 
-    assert!(
-        error
-            .to_string()
-            .contains("for-loop placeholder is not allowed outside a deferred for-loop template"),
-        "unexpected error: {error}"
+    assert_eq!(
+        error.to_string(),
+        "for-loop placeholder is not allowed outside a deferred for-loop template: deferred for-binding index",
     );
 }
 

@@ -317,6 +317,10 @@ impl<P: PlaceholderKind + PartialEq> LiveCompositionArgument<P> {
         self.operand.traversal_value()
     }
 
+    pub(crate) fn visit_values(&self, visitor: &mut impl FnMut(&Value<P>)) {
+        self.operand.visit_values(visitor);
+    }
+
     pub fn declared_type(&self) -> &ConsumerStaticType {
         &self.metadata.declared_type
     }
