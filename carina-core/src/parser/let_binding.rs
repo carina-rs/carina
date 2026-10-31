@@ -575,13 +575,15 @@ fn parse_primary_inner_with_resource_or_module(
             ))
         }
         Rule::for_expr => {
-            let (resources, data_sources, module_calls) = parse_for_expr(
-                inner,
-                ctx,
-                LoopParseTarget::bound(binding_name),
-                preprocessed_file,
-                source_file,
-            )?;
+            let line = ctx.original_position(&inner)?.line();
+            let target = LoopParseTarget::bound(binding_name).map_err(|error| {
+                ParseError::InvalidExpression {
+                    line,
+                    message: error.to_string(),
+                }
+            })?;
+            let (resources, data_sources, module_calls) =
+                parse_for_expr(inner, ctx, target, preprocessed_file, source_file)?;
             Ok((
                 for_structural_handle(binding_name),
                 resources,
@@ -592,14 +594,15 @@ fn parse_primary_inner_with_resource_or_module(
             ))
         }
         Rule::if_expr => {
+            let line = ctx.original_position(&inner)?.line();
+            let target = LoopParseTarget::bound(binding_name).map_err(|error| {
+                ParseError::InvalidExpression {
+                    line,
+                    message: error.to_string(),
+                }
+            })?;
             let (value, resources, data_sources, module_calls, import, binding_kind) =
-                parse_if_expr(
-                    inner,
-                    ctx,
-                    LoopParseTarget::bound(binding_name),
-                    preprocessed_file,
-                    source_file,
-                )?;
+                parse_if_expr(inner, ctx, target, preprocessed_file, source_file)?;
             Ok((
                 value,
                 resources,

@@ -2730,18 +2730,8 @@ where
     P: PlaceholderKind,
     T: PlaceholderKind,
 {
-    let crate::parser::DeferredForExpression {
-        file: _file,
-        line: _line,
-        header: _header,
-        resource_type: _resource_type,
-        target: _target,
-        iterable,
-        binding: _binding,
-        template_resource,
-    } = template;
-    contains_redacted_secret(iterable)
-        || attributes_contain_redacted_secret(template_resource.attributes.values())
+    contains_redacted_secret(&template.iterable)
+        || attributes_contain_redacted_secret(template.attributes().values())
 }
 
 pub(crate) fn unresolved_effect_contains_redacted_secret(
@@ -2766,8 +2756,8 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
             .iter()
             .any(|key| contains_redacted_secret(key.retained_value())),
         UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
-        UnresolvedSavedEffect::DeferredCreate { template, .. } => {
-            deferred_template_contains_redacted_secret(template)
+        UnresolvedSavedEffect::DeferredCreate(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
         }
         UnresolvedSavedEffect::DeferredReplace(payload) => {
             deferred_template_contains_redacted_secret(&payload.template)
@@ -2837,13 +2827,12 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
         } => contains_redacted_secret(until.value()),
-        Effect::DeferredCreate { id: _id, template } => {
-            deferred_template_contains_redacted_secret(template)
+        Effect::DeferredCreate(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
         }
         Effect::DeferredReplace(payload) => {
             let crate::effect::DeferredReplacePayload {
                 deletes: _deletes,
-                id: _id,
                 template,
             } = payload.as_ref();
             deferred_template_contains_redacted_secret(template)
@@ -4180,9 +4169,8 @@ fn redact_deferred_template(
 ) -> Result<crate::parser::DeferredForExpression, SerializationError> {
     let mut redacted = template.clone();
     redacted.iterable = redact_secrets_only(&template.iterable)?;
-    redacted.template_resource.attributes = template
-        .template_resource
-        .attributes
+    *redacted.template_resource.attributes_mut() = template
+        .attributes()
         .iter()
         .map(|(key, value)| redact_secrets_only(value).map(|value| (key.clone(), value)))
         .collect::<Result<_, _>>()?;
@@ -4193,7 +4181,7 @@ fn redact_deferred_template(
 pub fn redact_secrets_in_effect(
     effect: &crate::effect::Effect,
 ) -> Result<crate::effect::Effect, SerializationError> {
-    use crate::effect::{DeferredReplacePayload, Effect};
+    use crate::effect::{DeferredCreatePayload, DeferredReplacePayload, Effect};
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
             resource: crate::resource::ResolvedDataSource::new(redact_secrets_in_data_source(
@@ -4274,14 +4262,12 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
-        Effect::DeferredCreate { id, template } => Effect::DeferredCreate {
-            id: id.clone(),
-            template: Box::new(redact_deferred_template(template)?),
-        },
+        Effect::DeferredCreate(payload) => Effect::DeferredCreate(DeferredCreatePayload::new(
+            Box::new(redact_deferred_template(&payload.template)?),
+        )),
         Effect::DeferredReplace(payload) => {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                 deletes: payload.deletes.clone(),
-                id: payload.id.clone(),
                 template: Box::new(redact_deferred_template(&payload.template)?),
             }))
         }
@@ -4309,7 +4295,7 @@ fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resour
             | crate::effect::Effect::Move { .. }
             | crate::effect::Effect::ReleaseListKeys { .. }
             | crate::effect::Effect::Wait { .. }
-            | crate::effect::Effect::DeferredCreate { .. }
+            | crate::effect::Effect::DeferredCreate(_)
             | crate::effect::Effect::DeferredReplace(_) => None,
         })
         .collect()
@@ -4365,7 +4351,7 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                 | crate::effect::Effect::Move { .. }
                 | crate::effect::Effect::ReleaseListKeys { .. }
                 | crate::effect::Effect::Wait { .. }
-                | crate::effect::Effect::DeferredCreate { .. }
+                | crate::effect::Effect::DeferredCreate(_)
                 | crate::effect::Effect::DeferredReplace(_) => redact_secrets_in_effect(effect)?,
             };
             if let crate::effect::Effect::Update { from, .. } = &mut effect {
@@ -4433,7 +4419,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
     deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
 ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
-    use crate::effect::{DeferredReplacePayload, Effect};
+    use crate::effect::{DeferredCreatePayload, DeferredReplacePayload, Effect};
 
     let mut out = plan.clone();
     let effects = plan
@@ -4506,18 +4492,16 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     .expect("guarded by contains_redacted_secret"),
                 })
             }
-            Effect::DeferredCreate { id, template } => {
-                let template = rehydrate_deferred_template(template, deferred_templates)?;
-                Ok(Effect::DeferredCreate {
-                    id: id.clone(),
-                    template: Box::new(template),
-                })
+            Effect::DeferredCreate(payload) => {
+                let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
+                Ok(Effect::DeferredCreate(DeferredCreatePayload::new(
+                    Box::new(template),
+                )))
             }
             Effect::DeferredReplace(payload) => {
                 let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
                 Ok(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes: payload.deletes.clone(),
-                    id: payload.id.clone(),
                     template: Box::new(template),
                 })))
             }
@@ -4548,13 +4532,13 @@ fn rehydrate_deferred_template<S: Clone, T>(
     let candidate = candidates
         .iter()
         .find(|candidate| {
-            candidate.target.same_system_target(&saved.target)
-                && candidate.resource_type == saved.resource_type
+            candidate.target().same_system_target(saved.target())
+                && candidate.resource_type() == saved.resource_type()
                 && candidate.root_bindings() == saved.root_bindings()
         })
         .ok_or_else(|| {
             SecretRehydrationSiteError::new(
-                format!("deferred for {}", saved.target.display_name()),
+                format!("deferred for {}", saved.target().display_name()),
                 SecretRehydrationError::ShapeMismatch,
             )
         })?;
@@ -4562,17 +4546,17 @@ fn rehydrate_deferred_template<S: Clone, T>(
     if let Some(value) = rehydrate_secret_entry(
         &saved.iterable,
         Some(&candidate.iterable),
-        format!("deferred iterable {}", saved.target.display_name()),
+        format!("deferred iterable {}", saved.target().display_name()),
         SecretRehydrationCandidate::Evaluated,
     )? {
         out.iterable = value;
     }
 
-    for (key, saved_value) in &mut out.template_resource.attributes {
+    for (key, saved_value) in out.template_resource.attributes_mut() {
         if let Some(value) = rehydrate_secret_entry(
             saved_value,
-            candidate.template_resource.attributes.get(key),
-            format!("deferred resource {}.{key}", saved.target.display_name()),
+            candidate.attributes().get(key),
+            format!("deferred resource {}.{key}", saved.target().display_name()),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -4742,7 +4726,7 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<S: Clone>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
@@ -13429,10 +13413,10 @@ mod tests {
 
     #[test]
     fn redact_secrets_in_deferred_create_redacts_and_rehydrates_template() {
-        use crate::effect::Effect;
+        use crate::effect::{DeferredCreatePayload, Effect};
         use crate::parser::{DeferredForExpression, ForBinding};
         use crate::plan::Plan;
-        use crate::resource::{PathSegment, ResourceId};
+        use crate::resource::PathSegment;
 
         let placeholder_inner = crate::resource::apply_postfix_access(
             LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
@@ -13461,33 +13445,24 @@ mod tests {
         > = crate::resource::Resource::new("aws.route53.RecordSet", "validation_records");
         template_resource.set_attr("name", placeholder.clone());
         template_resource.set_attr("comment", secret.clone());
-        let effect = Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: None,
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.RecordSet".to_string(),
-                target: crate::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
+        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+            DeferredForExpression::new(
+                None,
+                1,
+                "for opt in cert.domain_validation_options".to_string(),
+                crate::parser::DeferredForTarget::bound("validation_records")
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                ForBinding::Simple("opt".to_string()),
                 template_resource,
-            }),
-        };
+            ),
+        )));
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact deferred secret");
-        let Effect::DeferredCreate {
-            template: redacted_template,
-            ..
-        } = &redacted
-        else {
+        let Effect::DeferredCreate(redacted_payload) = &redacted else {
             panic!("expected deferred create");
         };
+        let redacted_template = &redacted_payload.template;
         assert!(matches!(
             redacted_template
                 .template_resource
@@ -13501,10 +13476,10 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(effect.clone());
         let redacted_plan = redact_secrets_in_plan(&plan).expect("redact deferred plan");
-        let Effect::DeferredCreate { template, .. } = &effect else {
+        let Effect::DeferredCreate(payload) = &effect else {
             unreachable!();
         };
-        let deferred_templates = resolved_deferred_templates([template.as_ref().clone()]);
+        let deferred_templates = resolved_deferred_templates([payload.template.as_ref().clone()]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &redacted_plan,
             &HashMap::new(),
@@ -13513,9 +13488,10 @@ mod tests {
             &deferred_templates,
         )
         .expect("unchanged deferred template secret should rehydrate");
-        let Effect::DeferredCreate { template, .. } = &rehydrated.effects()[0] else {
+        let Effect::DeferredCreate(payload) = &rehydrated.effects()[0] else {
             panic!("expected rehydrated deferred create");
         };
+        let template = &payload.template;
         assert!(matches!(
             template.template_resource.attributes.get("comment"),
             Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
@@ -13531,9 +13507,8 @@ mod tests {
 
     #[test]
     fn deferred_template_redaction_uses_template_resource_as_single_projection() {
-        use crate::effect::Effect;
+        use crate::effect::{DeferredCreatePayload, Effect};
         use crate::parser::{DeferredForExpression, ForBinding};
-        use crate::resource::ResourceId;
 
         let secret = |plaintext: &str| {
             LoopValue::Deferred(LoopDeferredValue::Secret(Box::new(LoopValue::Concrete(
@@ -13545,29 +13520,24 @@ mod tests {
             LoopSlot,
         > = crate::resource::Resource::new("aws.route53.RecordSet", "records");
         template_resource.set_attr("comment", secret("authoritative"));
-        let effect = Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: None,
-                line: 1,
-                header: "for opt in cert.options".to_string(),
-                resource_type: "aws.route53.RecordSet".to_string(),
-                target: crate::parser::DeferredForTarget::Bound {
-                    binding: "records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
+        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+            DeferredForExpression::new(
+                None,
+                1,
+                "for opt in cert.options".to_string(),
+                crate::parser::DeferredForTarget::bound("records")
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("cert", "options", Vec::new()),
+                ForBinding::Simple("opt".to_string()),
                 template_resource,
-            }),
-        };
+            ),
+        )));
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact deferred template");
-        let Effect::DeferredCreate { template, .. } = redacted else {
+        let Effect::DeferredCreate(payload) = redacted else {
             panic!("expected deferred create");
         };
+        let template = payload.template;
         let canonical = template
             .template_resource
             .attributes
@@ -13584,9 +13554,8 @@ mod tests {
 
     #[test]
     fn deferred_template_redaction_noops_without_placeholders() {
-        use crate::effect::Effect;
+        use crate::effect::{DeferredCreatePayload, Effect};
         use crate::parser::{DeferredForExpression, ForBinding};
-        use crate::resource::ResourceId;
 
         let canonical =
             LoopValue::Concrete(crate::resource::ConcreteValue::String("canonical".into()));
@@ -13599,44 +13568,28 @@ mod tests {
         > = crate::resource::Resource::new("mock.test.resource", "children");
         template_resource.set_attr("comment", canonical.clone());
         template_resource.set_attr("identifier", display_only.clone());
-        let template = DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for child in parent.children".to_string(),
-            resource_type: "mock.test.resource".to_string(),
-            target: crate::parser::DeferredForTarget::Bound {
-                binding: "children".to_string(),
-            },
-            iterable: Value::resource_ref("parent", "children", Vec::new()),
-            binding: ForBinding::Simple("child".to_string()),
+        let template = DeferredForExpression::new(
+            None,
+            1,
+            "for child in parent.children".to_string(),
+            crate::parser::DeferredForTarget::bound("children").expect("fixture binding is valid"),
+            Value::resource_ref("parent", "children", Vec::new()),
+            ForBinding::Simple("child".to_string()),
             template_resource,
-        };
-        let effect = Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "children",
-            )),
-            template: Box::new(template.clone()),
-        };
+        );
+        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(template.clone())));
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact placeholder-free template");
-        let Effect::DeferredCreate {
-            template: redacted_template,
-            ..
-        } = redacted
-        else {
+        let Effect::DeferredCreate(redacted_payload) = redacted else {
             panic!("expected deferred create")
         };
+        let redacted_template = redacted_payload.template;
         assert_eq!(redacted_template.as_ref(), &template);
 
         let mut plan = crate::plan::Plan::new();
-        plan.add(Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "children",
-            )),
-            template: redacted_template,
-        });
+        plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+            redacted_template,
+        )));
         let deferred_templates = resolved_deferred_templates([]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &plan,
@@ -13646,12 +13599,10 @@ mod tests {
             &deferred_templates,
         )
         .expect("placeholder-free template must not need a candidate");
-        let Effect::DeferredCreate {
-            template: output, ..
-        } = &rehydrated.effects()[0]
-        else {
+        let Effect::DeferredCreate(payload) = &rehydrated.effects()[0] else {
             panic!("expected deferred create")
         };
+        let output = &payload.template;
         assert_eq!(output.as_ref(), &template);
         assert_eq!(
             output.template_resource.attributes.get("identifier"),

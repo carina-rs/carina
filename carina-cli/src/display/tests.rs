@@ -822,31 +822,25 @@ fn test_extract_compact_hint_considers_all_resource_attributes() {
 #[test]
 fn test_deferred_create_renders_deferred_until_apply_marker() {
     let mut template_resource: Resource<ModuleSource, LoopSlot> =
-        Resource::new("route53.Record", "validation_records");
+        Resource::with_provider("aws", "route53.Record", "validation_records", None);
     template_resource.binding = Some("validation_records".to_string());
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
-    let deferred = carina_core::parser::DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
-        },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+    let deferred = carina_core::parser::DeferredForExpression::new(
+        None,
+        1,
+        "for opt in cert.domain_validation_options".to_string(),
+        carina_core::parser::DeferredForTarget::bound("validation_records")
+            .expect("fixture binding is valid"),
+        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
-    };
+    );
 
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(deferred),
-    });
+    plan.add(Effect::DeferredCreate(
+        carina_core::effect::DeferredCreatePayload::new(Box::new(deferred)),
+    ));
 
     let output = strip_ansi(&format_plan_for_test(
         &plan,
@@ -878,30 +872,24 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
 
 fn deferred_validation_records_effect() -> Effect {
     let mut template_resource: Resource<ModuleSource, LoopSlot> =
-        Resource::new("route53.Record", "validation_records");
+        Resource::with_provider("aws", "route53.Record", "validation_records", None);
     template_resource.binding = Some("validation_records".to_string());
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
 
-    let deferred = carina_core::parser::DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
-        },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+    let deferred = carina_core::parser::DeferredForExpression::new(
+        None,
+        1,
+        "for opt in cert.domain_validation_options".to_string(),
+        carina_core::parser::DeferredForTarget::bound("validation_records")
+            .expect("fixture binding is valid"),
+        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
-    };
+    );
 
-    Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(deferred),
-    }
+    Effect::DeferredCreate(carina_core::effect::DeferredCreatePayload::new(Box::new(
+        deferred,
+    )))
 }
 
 fn delete_record_effect(binding: &'static str) -> Effect {
@@ -921,7 +909,7 @@ fn delete_record_effect(binding: &'static str) -> Effect {
 }
 
 fn deferred_replace_validation_records_effect() -> Effect {
-    let Effect::DeferredCreate { id, template } = deferred_validation_records_effect() else {
+    let Effect::DeferredCreate(payload) = deferred_validation_records_effect() else {
         unreachable!("helper constructs DeferredCreate")
     };
     let Effect::Delete {
@@ -949,8 +937,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
             blocked_by_updates,
         }])
         .expect("fixture has one delete"),
-        id,
-        template,
+        template: payload.template,
     }))
 }
 
@@ -993,11 +980,7 @@ fn test_deferred_replace_renders_dependent_children() {
         .with_binding("cert_validation");
     dependent.set_attr(
         "validation_record_id",
-        Value::resource_ref(
-            "__deferred_for.validation_records".to_string(),
-            "id".to_string(),
-            vec![],
-        ),
+        Value::resource_ref("validation_records".to_string(), "id".to_string(), vec![]),
     );
 
     let mut plan = Plan::new();
@@ -1028,7 +1011,7 @@ fn test_deferred_replace_renders_dependent_children() {
           name: (known after cert resolves)
             │
             └─ + acm.CertificateValidation cert-validation
-                  validation_record_id: __deferred_for.validation_records.id
+                  validation_record_id: validation_records.id
 
     Plan: 1 to add, 0 to change, 0 to destroy.
            N to replace after cert resolves.

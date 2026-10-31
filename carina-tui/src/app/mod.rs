@@ -186,7 +186,7 @@ impl App {
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => None,
             })
             .collect();
@@ -988,17 +988,18 @@ fn effect_to_node_with_rows(
                 parent: None,
             }
         }
-        Effect::DeferredCreate { template, .. } => {
+        Effect::DeferredCreate(payload) => {
+            let template = &payload.template;
             let verb = deferred_for_verb(plan, template);
             let upstream_binding = template.binding_description();
             let rows = deferred_for_detail_rows(template, &upstream_binding, verb);
             TreeNode {
                 effect_label: format!(
                     "{} {}",
-                    template.resource_type,
+                    template.resource_type(),
                     deferred_for_display_name(template, verb)
                 ),
-                resource_type: template.resource_type.clone(),
+                resource_type: template.resource_type(),
                 name_part: deferred_for_display_name(template, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Create,
@@ -1015,10 +1016,10 @@ fn effect_to_node_with_rows(
             TreeNode {
                 effect_label: format!(
                     "{} {}",
-                    payload.template.resource_type,
+                    payload.template.resource_type(),
                     deferred_for_display_name(&payload.template, verb)
                 ),
-                resource_type: payload.template.resource_type.clone(),
+                resource_type: payload.template.resource_type(),
                 name_part: deferred_for_display_name(&payload.template, verb),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Replace,

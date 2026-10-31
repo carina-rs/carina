@@ -195,18 +195,16 @@ mod tests {
     use crate::commands::plan::ExportChange;
 
     fn residual_deferred_for() -> DeferredForExpression {
-        DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for item in upstream.items".to_string(),
-            resource_type: "test.Widget".to_string(),
-            target: carina_core::parser::DeferredForTarget::Bound {
-                binding: "widgets".to_string(),
-            },
-            iterable: Value::resource_ref("upstream", "items", Vec::new()),
-            binding: ForBinding::Simple("item".to_string()),
-            template_resource: Resource::new("test.Widget", "widgets"),
-        }
+        DeferredForExpression::new(
+            None,
+            1,
+            "for item in upstream.items".to_string(),
+            carina_core::parser::DeferredForTarget::bound("widgets")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("upstream", "items", Vec::new()),
+            ForBinding::Simple("item".to_string()),
+            Resource::new("test.Widget", "widgets"),
+        )
     }
 
     #[test]

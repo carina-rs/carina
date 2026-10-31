@@ -11632,10 +11632,9 @@ fn resolve_file_block_names<
                 ));
             }
             crate::parser::ResourceMut::Deferred { resource } => {
-                conflicts.extend(resolve_block_names_detailed(
-                    std::slice::from_mut(resource),
-                    registry,
-                ));
+                conflicts.extend(resource.with_resource_mut(|resource| {
+                    resolve_block_names_detailed(std::slice::from_mut(resource), registry)
+                }));
             }
             crate::parser::ResourceMut::DataSource(data_source) => {
                 if let Some(schema) = registry.get_for_data_source(data_source) {
@@ -11663,11 +11662,11 @@ where
     parsed
         .iter_all_resources()
         .find_map(|resource| match resource {
-            crate::parser::ResourceRef::Resource(resource)
-            | crate::parser::ResourceRef::Deferred {
+            crate::parser::ResourceRef::Resource(resource) if resource.id == *id => Some(resource),
+            crate::parser::ResourceRef::Deferred {
                 resource,
                 deferred: _,
-            } if resource.id == *id => Some(resource),
+            } if resource.id() == id => Some(resource.as_resource()),
             crate::parser::ResourceRef::Resource(_)
             | crate::parser::ResourceRef::LiveComposition(_)
             | crate::parser::ResourceRef::DataSource(_)
@@ -11701,14 +11700,16 @@ where
                 ));
             }
             crate::parser::ResourceMut::Deferred { resource } => {
-                let authored_resources = managed_resource_by_id(authored, &resource.id)
+                let authored_resources = managed_resource_by_id(authored, resource.id())
                     .map(std::slice::from_ref)
                     .unwrap_or_default();
-                conflicts.extend(resolve_block_names_detailed_with_authored(
-                    std::slice::from_mut(resource),
-                    authored_resources,
-                    registry,
-                ));
+                conflicts.extend(resource.with_resource_mut(|resource| {
+                    resolve_block_names_detailed_with_authored(
+                        std::slice::from_mut(resource),
+                        authored_resources,
+                        registry,
+                    )
+                }));
             }
             crate::parser::ResourceMut::DataSource(data_source) => {
                 if let Some(schema) = registry.get_for_data_source(data_source) {

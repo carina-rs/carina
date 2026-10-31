@@ -773,7 +773,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
         match &mut deferred.body {
             super::DeferredForBody::Resource(resource) => {
-                for value in resource.attributes.values_mut() {
+                for value in resource.attributes_mut().values_mut() {
                     *value = resolve_function_calls_only(
                         value,
                         &binding_map,

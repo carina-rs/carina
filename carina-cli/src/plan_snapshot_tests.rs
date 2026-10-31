@@ -3105,18 +3105,16 @@ fn snapshot_top_level_sigil_alignment() {
 
     let mut deferred_template = Resource::new("aws.route53.RecordSet", "validation_records");
     deferred_template.set_attr("name", Value::resource_ref("option", "name", vec![]));
-    let deferred = DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for option in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.RecordSet".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: "validation_records".to_string(),
-        },
-        iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        binding: ForBinding::Simple("option".to_string()),
-        template_resource: deferred_template,
-    };
+    let deferred = DeferredForExpression::new(
+        None,
+        1,
+        "for option in cert.domain_validation_options".to_string(),
+        carina_core::parser::DeferredForTarget::bound("validation_records")
+            .expect("fixture binding is valid"),
+        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+        ForBinding::Simple("option".to_string()),
+        deferred_template,
+    );
     let deferred_for_expressions = vec![deferred];
 
     let mut trace = ExpansionTrace::new();

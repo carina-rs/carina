@@ -2217,7 +2217,7 @@ pub(super) fn parsed_deferred_for_body_id(
     deferred: &ParsedDeferredForExpression,
 ) -> Option<&ResourceId> {
     match &deferred.body {
-        DeferredForBody::Resource(resource) => Some(&resource.id),
+        DeferredForBody::Resource(resource) => Some(resource.id()),
         DeferredForBody::Read(data_source) => Some(&data_source.id),
         DeferredForBody::ModuleCall(_) => None,
     }
@@ -2241,28 +2241,25 @@ pub(super) fn prefix_parsed_deferred_for_expression(
         value: deferred,
         dependency_values: template_dependency_values,
     } = template;
-    let ParsedDeferredForExpression {
-        file,
-        line,
-        span,
-        header,
-        target,
-        iterable,
-        iterable_state,
-        binding,
-        body,
-    } = deferred;
     let instance_identity = ResourceIdentity::try_from(instance_prefix.to_string())
         .expect("module instance prefix is non-empty");
     let legacy_parent = module_call
         .loop_origin()
         .map(|origin| origin.legacy_address().clone())
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
-    let target = match target {
-        crate::parser::DeferredForTarget::Bound { binding } => {
-            crate::parser::DeferredForTarget::Bound {
-                binding: apply_instance_prefix(instance_prefix, binding),
-            }
+    let target = match deferred.target() {
+        crate::parser::DeferredForTarget::Bound(target) => {
+            let target = crate::parser::BoundDeferredTarget::new(apply_instance_prefix(
+                instance_prefix,
+                target.binding(),
+            ))
+            .map_err(|error| ArgumentSubstitutionError {
+                source_file: deferred.file.clone().map(std::path::PathBuf::from),
+                line: deferred.line,
+                message: error.to_string(),
+                parse_error: None,
+            })?;
+            crate::parser::DeferredForTarget::Bound(target)
         }
         crate::parser::DeferredForTarget::Unbound { template } => {
             let mut template = template.clone();
@@ -2270,33 +2267,46 @@ pub(super) fn prefix_parsed_deferred_for_expression(
             crate::parser::DeferredForTarget::Unbound { template }
         }
     };
-    let iterable = prefix_attr_value(iterable, instance_prefix, intra_module_bindings, arguments)?;
-    let rebuild = |body| ParsedDeferredForExpression {
-        file: file.clone(),
-        line: *line,
-        span: *span,
-        header: header.clone(),
-        target: target.clone(),
-        iterable: iterable.clone(),
-        iterable_state: iterable_state.clone(),
-        binding: binding.clone(),
-        body,
+    let iterable = prefix_attr_value(
+        &deferred.iterable,
+        instance_prefix,
+        intra_module_bindings,
+        arguments,
+    )?;
+    let rebuild = |body| {
+        ParsedDeferredForExpression::new(
+            deferred.file.clone(),
+            deferred.line,
+            deferred.span,
+            deferred.header.clone(),
+            target.clone(),
+            iterable.clone(),
+            deferred.iterable_state.clone(),
+            deferred.binding.clone(),
+            body,
+        )
     };
 
-    match body {
-        DeferredForBody::Resource(resource) => prefix_module_resource_with_identity(
-            TemplateValueCarrier::new(resource, template_dependency_values),
-            instance_prefix,
-            &instance_identity,
-            module_name,
-            module_instance_scope,
-            module_call,
-            intra_module_bindings,
-            arguments,
-        )
-        .map(|expanded| {
-            expanded.map(|resource| rebuild(DeferredForBody::Resource(Box::new(resource))))
-        }),
+    match &deferred.body {
+        DeferredForBody::Resource(resource) => {
+            let mut resource = resource.clone();
+            resource
+                .with_resource_mut(|resource| {
+                    prefix_module_resource_with_identity(
+                        TemplateValueCarrier::new(resource, template_dependency_values),
+                        instance_prefix,
+                        &instance_identity,
+                        module_name,
+                        module_instance_scope,
+                        module_call,
+                        intra_module_bindings,
+                        arguments,
+                    )
+                })
+                .map(|expanded| {
+                    expanded.map(|resource| rebuild(DeferredForBody::resource(&target, resource)))
+                })
+        }
         DeferredForBody::Read(data_source) => prefix_module_data_source(
             TemplateValueCarrier::new(data_source, template_dependency_values),
             instance_prefix,

@@ -317,7 +317,10 @@ impl<'de> Deserialize<'de> for ResourceIdentity {
 /// hashing while the resource remains in memory.
 #[derive(Debug)]
 struct PendingTokenMarker {
-    _value: u8,
+    // Historical deferred-template payloads encode an unbound template
+    // identity as JSON null. Ordinary pending identities remain
+    // non-serializable; only a short-lived wire clone sets this bit.
+    serializable_as_null: bool,
 }
 
 #[derive(Clone)]
@@ -325,7 +328,19 @@ pub struct PendingToken(Arc<PendingTokenMarker>);
 
 impl PendingToken {
     fn new() -> Self {
-        Self(Arc::new(PendingTokenMarker { _value: 0 }))
+        Self(Arc::new(PendingTokenMarker {
+            serializable_as_null: false,
+        }))
+    }
+
+    fn serializable_as_null() -> Self {
+        Self(Arc::new(PendingTokenMarker {
+            serializable_as_null: true,
+        }))
+    }
+
+    fn can_serialize_as_null(&self) -> bool {
+        self.0.serializable_as_null
     }
 }
 
@@ -361,6 +376,10 @@ impl ResourceIdentityState {
     fn pending() -> Self {
         Self::Pending(PendingToken::new())
     }
+
+    fn pending_deferred_template_wire() -> Self {
+        Self::Pending(PendingToken::serializable_as_null())
+    }
 }
 
 impl Default for ResourceIdentityState {
@@ -372,6 +391,7 @@ impl Default for ResourceIdentityState {
 impl Serialize for ResourceIdentityState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::Pending(token) if token.can_serialize_as_null() => serializer.serialize_none(),
             Self::Pending(_) => Err(serde::ser::Error::custom(
                 "pending resource identity cannot be serialized",
             )),
@@ -467,6 +487,19 @@ impl ResourceId {
             provider: provider.into(),
             resource_type: resource_type.into(),
             identity: ResourceIdentityState::pending(),
+            provider_instance,
+        }
+    }
+
+    pub(crate) fn pending_deferred_template_wire(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        provider_instance: Option<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            resource_type: resource_type.into(),
+            identity: ResourceIdentityState::pending_deferred_template_wire(),
             provider_instance,
         }
     }
@@ -867,10 +900,9 @@ impl From<PendingResourceIdentityError> for ResolvedResourceError {
 /// Re-resolve authored resource directives that depend on the provider schema.
 ///
 /// Deferred anonymous-loop templates intentionally still have pending identities
-/// when a saved plan is loaded. Their directives must nevertheless be checked
-/// against the fingerprint-validated schemas before apply; identity validation
-/// remains the responsibility of [`ResolvedResource::resolve_with_schemas`]
-/// after the template has been materialized.
+/// when a saved plan is loaded. Bound templates instead expose their derived
+/// materialized address while directives are checked, so diagnostics name the
+/// template (for example, `items[?]`) rather than a pending placeholder.
 pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind>(
     resource: &mut Resource<S, P>,
     registry: &crate::schema::SchemaRegistry,

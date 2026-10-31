@@ -239,8 +239,8 @@ fn writeback_comparison_ids<'a, S>(
         .collect::<Vec<_>>();
     for effect in plan.effects() {
         match effect {
-            Effect::DeferredCreate { template, .. } => {
-                ids.push(&template.template_resource.id);
+            Effect::DeferredCreate(payload) => {
+                ids.push(payload.template.template_resource_id());
             }
             Effect::DeferredReplace(payload) => {
                 ids.push(&payload.template.template_resource.id);
@@ -1261,7 +1261,7 @@ fn create_side_upsert_ids<S>(plan: &Plan<S>) -> HashSet<ResourceId> {
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Import { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::Wait { .. } => {}
         }
     }
@@ -2316,27 +2316,21 @@ mod apply_state_save_tests {
     #[test]
     fn apply_state_save_inputs_pre_resolve_deferred_runtime_comparisons() {
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredCreate {
-            id: ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: Some("main.crn".to_string()),
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.Record".to_string(),
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
-                // Saved deferred templates are reconstructed before their
-                // runtime element identity exists. Comparison pre-resolution
-                // must key this pending id by provider instance and type.
-                template_resource: Resource::pending_with_provider("aws", "route53.Record", None),
-            }),
-        });
+        let template = DeferredForExpression::new(
+            Some("main.crn".to_string()),
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            carina_core::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            // Comparison pre-resolution keys the materialized template by
+            // provider instance and type before any runtime child exists.
+            Resource::pending_with_provider("aws", "route53.Record", None),
+        );
+        plan.add(Effect::DeferredCreate(
+            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
+        ));
         let runtime_id = ResourceId::with_provider_identity(
             "aws",
             "route53.Record",
@@ -4949,30 +4943,20 @@ mod apply_state_save_tests {
             explicit_dependencies: HashSet::new(),
             blocked_by_updates: HashSet::new(),
         });
-        plan.add(Effect::DeferredCreate {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: Some("main.crn".to_string()),
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.Record".to_string(),
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
-                template_resource: Resource::with_provider(
-                    "aws",
-                    "route53.Record",
-                    "validation_records",
-                    None,
-                )
+        let template = DeferredForExpression::new(
+            Some("main.crn".to_string()),
+            1,
+            "for opt in cert.domain_validation_options".to_string(),
+            carina_core::parser::DeferredForTarget::bound("validation_records")
+                .expect("fixture binding is valid"),
+            Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+            ForBinding::Simple("opt".to_string()),
+            Resource::with_provider("aws", "route53.Record", "validation_records", None)
                 .with_binding("validation_records"),
-            }),
-        });
+        );
+        plan.add(Effect::DeferredCreate(
+            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
+        ));
         let successfully_deleted = HashSet::from([DeletedInstanceKey::new(
             id.clone(),
             EffectGeneration::Deposed(deposed_key),
@@ -5031,22 +5015,16 @@ mod apply_state_save_tests {
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: Some("main.crn".to_string()),
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.Record".to_string(),
-                target: carina_core::parser::DeferredForTarget::Bound {
-                    binding: "validation_records".to_string(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
+            template: Box::new(DeferredForExpression::new(
+                Some("main.crn".to_string()),
+                1,
+                "for opt in cert.domain_validation_options".to_string(),
+                carina_core::parser::DeferredForTarget::bound("validation_records")
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                ForBinding::Simple("opt".to_string()),
                 template_resource,
-            }),
+            )),
         }))
     }
 

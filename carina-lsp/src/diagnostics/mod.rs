@@ -1238,7 +1238,7 @@ impl DiagnosticEngine {
                         ResourceRef::Deferred {
                             resource,
                             deferred: _deferred,
-                        } => Some(resource),
+                        } => Some(&**resource),
                         ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
                     };
                     if let Some(resource) = ignore_changes_resource

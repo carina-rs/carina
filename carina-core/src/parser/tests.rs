@@ -785,20 +785,20 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     template_resource
         .attributes
         .insert("name".to_string(), empty());
+    let target = DeferredForTarget::bound("items").expect("fixture binding is valid");
+    let body = DeferredForBody::resource(&target, template_resource);
     file.parsed_deferred_for_expressions_mut()
-        .push(ParsedDeferredForExpression {
-            file: Some("loops.crn".to_string()),
-            line: 1,
-            span: SourceSpan::dummy(),
-            header: "for item in pending.items".to_string(),
-            target: DeferredForTarget::Bound {
-                binding: "items".to_string(),
-            },
-            iterable: empty(),
-            iterable_state: ParsedDeferredForIterableState::Deferred,
-            binding: ForBinding::Simple("item".to_string()),
-            body: DeferredForBody::Resource(Box::new(template_resource)),
-        });
+        .push(ParsedDeferredForExpression::new(
+            Some("loops.crn".to_string()),
+            1,
+            SourceSpan::dummy(),
+            "for item in pending.items".to_string(),
+            target,
+            empty(),
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".to_string()),
+            body,
+        ));
 
     let rendered = file
         .into_expanded()
@@ -861,22 +861,22 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
         .attributes
         .insert("name".to_string(), empty_interpolation_placeholder());
     let mut file = ParsedFile::default();
+    let target = DeferredForTarget::bound("items").expect("fixture binding is valid");
+    let body = DeferredForBody::resource(&target, template_resource);
     file.parsed_deferred_for_expressions_mut()
-        .push(ParsedDeferredForExpression {
-            file: Some("loops.crn".to_string()),
-            line: 1,
-            span: SourceSpan::dummy(),
-            header: "for item in pending.items".to_string(),
-            target: DeferredForTarget::Bound {
-                binding: "items".to_string(),
-            },
-            iterable: Value::Deferred(DeferredValue::BindingRef {
+        .push(ParsedDeferredForExpression::new(
+            Some("loops.crn".to_string()),
+            1,
+            SourceSpan::dummy(),
+            "for item in pending.items".to_string(),
+            target,
+            Value::Deferred(DeferredValue::BindingRef {
                 binding: "pending.items".to_string(),
             }),
-            iterable_state: ParsedDeferredForIterableState::Deferred,
-            binding: ForBinding::Simple("item".to_string()),
-            body: DeferredForBody::Resource(Box::new(template_resource)),
-        });
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".to_string()),
+            body,
+        ));
 
     let rendered = file
         .validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)
@@ -7526,7 +7526,7 @@ fn deferred_unbound_target_round_trips() {
         .unwrap(),
     );
 
-    let target = &parsed.deferred_for_expressions()[0].target;
+    let target = parsed.deferred_for_expressions()[0].target();
     assert!(matches!(target, DeferredForTarget::Unbound { .. }));
     let json = serde_json::to_string(target).unwrap();
     let decoded: DeferredForTarget = serde_json::from_str(&json).unwrap();
@@ -7677,7 +7677,7 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
-    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions()[0].target
+    let DeferredForTarget::Unbound { template } = result.deferred_for_expressions()[0].target()
     else {
         panic!("top-level deferred loop must remain unbound")
     };

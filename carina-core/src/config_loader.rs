@@ -1233,10 +1233,12 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
         }
     }
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
-        deferred.target.set_loop_display_file(&display_file);
+        deferred.set_loop_display_file(&display_file);
         match &mut deferred.body {
             crate::parser::DeferredForBody::Resource(resource) => {
-                resource.loop_provenance.set_display_file(&display_file);
+                resource
+                    .loop_provenance_mut()
+                    .set_display_file(&display_file);
             }
             crate::parser::DeferredForBody::Read(_)
             | crate::parser::DeferredForBody::ModuleCall(_) => {}
@@ -2602,7 +2604,7 @@ let orgs = upstream_state {
         };
         assert_eq!(deferred.header, "for x in src.list");
         assert_eq!(deferred.line, 3);
-        assert_eq!(deferred.resource_type, "mock.test.resource");
+        assert_eq!(deferred.resource_type(), "mock.test.resource");
         assert_eq!(
             deferred.template_resource.binding.as_deref(),
             Some("res_items[?]")
