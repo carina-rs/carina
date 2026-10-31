@@ -162,6 +162,62 @@ let disabled = choice { flag = false }
 }
 
 #[test]
+fn module_argument_if_selects_integer_arithmetic_branches() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "choice/main.crn",
+        r#"arguments {
+  flag: Bool
+  n: Int
+}
+attributes {
+  value: Int = if flag { n + 1 } else { n - 1 }
+  operand_value: Int = (if flag { n } else { n - 2 }) + 1
+}
+"#,
+    );
+    fixture.write(
+        "caller/main.crn",
+        r#"let choice = use { source = "../choice" }
+let incremented = choice { flag = true  n = 10 }
+let decremented = choice { flag = false  n = 10 }
+"#,
+    );
+
+    let parsed = fixture
+        .resolve_caller("caller/main.crn")
+        .expect("module conditionals with integer arithmetic expand");
+    let value = |binding: &str, attribute: &str| {
+        parsed
+            .compositions
+            .iter()
+            .find(|composition| composition.binding.as_deref() == Some(binding))
+            .and_then(|composition| composition.signature.attributes.get(attribute))
+            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .unwrap_or_else(|| panic!("missing `{binding}.{attribute}`"))
+    };
+
+    assert_eq!(
+        value("incremented", "value"),
+        Value::Concrete(ConcreteValue::Int(11))
+    );
+    assert_eq!(
+        value("decremented", "value"),
+        Value::Concrete(ConcreteValue::Int(9))
+    );
+    assert_eq!(
+        value("incremented", "operand_value"),
+        Value::Concrete(ConcreteValue::Int(11)),
+        "a ModuleIf nested in an arithmetic operand must be selected",
+    );
+    assert_eq!(
+        value("decremented", "operand_value"),
+        Value::Concrete(ConcreteValue::Int(9)),
+        "the false ModuleIf operand must be selected before arithmetic folds",
+    );
+}
+
+#[test]
 fn deferred_for_body_selects_module_if_before_deriving_dependencies() {
     let fixture = ModuleResolutionFixture::new();
     fixture.write(
@@ -238,8 +294,8 @@ fn module_argument_if_deferred_value_is_not_serializable_or_deserializable() {
             PathBuf::from("module/main.crn"),
             1,
         ),
-        Value::Concrete(ConcreteValue::String("yes".into())),
-        Value::Concrete(ConcreteValue::String("no".into())),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::Int(2)),
     )));
 
     let error = serde_json::to_string(&deferred)
@@ -249,6 +305,22 @@ fn module_argument_if_deferred_value_is_not_serializable_or_deserializable() {
             .to_string()
             .contains("module-template conditional cannot be serialized before expansion"),
         "unexpected serialization error: {error}",
+    );
+
+    let arithmetic = crate::integer_arithmetic::ValidatedIntegerExpr::new(
+        Value::Deferred(deferred.clone()),
+        crate::integer_arithmetic::IntegerOp::Add,
+        Value::Concrete(ConcreteValue::Int(1)),
+        crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("an Int-valued module conditional is a valid arithmetic operand");
+    let error = serde_json::to_string(&DeferredValue::IntegerArithmetic(arithmetic))
+        .expect_err("an arithmetic operand must not hide a module-template conditional");
+    assert!(
+        error
+            .to_string()
+            .contains("module-template conditional cannot be serialized before expansion"),
+        "unexpected nested serialization error: {error}",
     );
 
     let error = serde_json::from_str::<DeferredValue>(r#"{"ModuleIf":{}}"#)
@@ -1656,6 +1728,47 @@ fn substitute_arguments_enters_secret_only_along_module_if_paths() {
         Value::Concrete(ConcreteValue::String("yes".into())),
         "a ModuleIf nested inside Secret still has to be selected",
     );
+}
+
+#[test]
+fn module_argument_substitution_folds_and_checks_integer_arithmetic() {
+    let divisor = Value::Deferred(DeferredValue::Unknown(
+        crate::resource::UnknownReason::ModuleArgument {
+            name: "divisor".to_string(),
+            source_line: 1.into(),
+            diagnostic_name: None,
+        },
+    ));
+    let value = crate::integer_arithmetic::evaluate_integer_values(
+        Value::Concrete(ConcreteValue::Int(10)),
+        crate::integer_arithmetic::IntegerOp::Divide,
+        divisor,
+        crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+    )
+    .expect("typed module argument is a structurally valid parser-stage operand");
+
+    assert_eq!(
+        substitute_arguments(
+            &value,
+            &HashMap::from([(
+                "divisor".to_string(),
+                Value::Concrete(ConcreteValue::Int(2)),
+            )]),
+        )
+        .expect("known operands must fold during substitution"),
+        Value::Concrete(ConcreteValue::Int(5)),
+    );
+
+    let error = substitute_arguments(
+        &value,
+        &HashMap::from([(
+            "divisor".to_string(),
+            Value::Concrete(ConcreteValue::Int(0)),
+        )]),
+    )
+    .expect_err("a known zero module argument must fail during substitution");
+    let error = format!("{error:?}");
+    assert!(error.contains("division by zero"), "{error}");
 }
 
 #[test]
@@ -6810,6 +6923,66 @@ let prod = outer {
     assert!(
         error.to_string().contains("cannot assign Int to 'name'"),
         "{error}"
+    );
+}
+
+#[test]
+fn integer_arithmetic_crosses_a_module_argument_boundary_as_typed_int() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("modules/child");
+    fs::create_dir_all(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("main.crn"),
+        r#"
+arguments { count: Int }
+let target = mock.test.Target { count = count }
+"#,
+    )
+    .expect("module source");
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).expect("root directory");
+    let root_source = r#"
+let source = mock.test.Source {}
+let child = use { source = "../modules/child" }
+let instance = child { count = source.count + 1 }
+"#;
+    fs::write(root_dir.join("main.crn"), root_source).expect("root source");
+
+    let mut config = ProviderContext::default();
+    for resource_type in ["test.Source", "test.Target"] {
+        config
+            .resource_types
+            .insert(("mock".to_string(), resource_type.to_string()));
+    }
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Source")
+            .attribute(AttributeSchema::provider_populated("count", AttributeType::int()).build())
+            .validate()
+            .expect("source schema"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Target")
+            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+            .validate()
+            .expect("target schema"),
+    );
+
+    let parsed = crate::parser::parse(root_source, &config).expect("root parse");
+    let parsed = resolve_modules_with_config(parsed, &root_dir, &config, &schemas)
+        .expect("typed arithmetic module argument must expand");
+    let count = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("instance.target"))
+        .and_then(|resource| resource.get_attr("count"))
+        .expect("expanded target count");
+    assert!(
+        matches!(count, Value::Deferred(DeferredValue::IntegerArithmetic(_))),
+        "module substitution must preserve typed arithmetic, got {count:?}",
     );
 }
 

@@ -117,6 +117,10 @@ pub enum SerializationError {
     /// before its left operand became present or definitively absent.
     #[error("cannot serialize at {context}: unresolved coalesce expression")]
     UnresolvedCoalesce { context: SerializationContext },
+    /// A typed integer expression reached a concrete-only serialization
+    /// boundary before both operands resolved.
+    #[error("cannot serialize at {context}: unresolved integer arithmetic expression")]
+    UnresolvedIntegerArithmetic { context: SerializationContext },
     /// A parser-authored enum identifier reached a serialization boundary
     /// without schema resolution. Provider transports accept only
     /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
@@ -167,6 +171,9 @@ impl SerializationError {
                 context,
             },
             Self::UnresolvedCoalesce { context } => Self::UnresolvedCoalesce { context },
+            Self::UnresolvedIntegerArithmetic { context } => {
+                Self::UnresolvedIntegerArithmetic { context }
+            }
             other => other,
         }
     }
@@ -794,6 +801,9 @@ fn value_to_json_inner(
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce { context: ctx })
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic { context: ctx })
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation { context: ctx })
         }
@@ -892,6 +902,10 @@ fn saved_plan_secret_hashes_json(value: &Value) -> Option<serde_json::Value> {
                 .collect();
             found.then_some(serde_json::Value::Array(values))
         }
+        // The operand placeholder hashes the secret input, not the eventual
+        // arithmetic result. It is therefore not valid previous-state hash
+        // authority for that result; rehydration handles it structurally.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => None,
         _ => None,
     }
 }
@@ -920,6 +934,7 @@ pub(crate) fn canonical_secret_hash_material(value: &Value) -> Result<Vec<u8>, S
             | SerializationError::UnresolvedFunctionCall { .. }
             | SerializationError::UnresolvedAccess { .. }
             | SerializationError::UnresolvedCoalesce { .. }
+            | SerializationError::UnresolvedIntegerArithmetic { .. }
             | SerializationError::SecretNotAllowed { .. },
         ) => canonical_secret_template(value)?,
         Err(error) => return Err(error),
@@ -1675,6 +1690,9 @@ fn format_value_into_context(
             sink.write_token(ValueSpanKind::Structure, " ?? ")?;
             format_value_into_context(default, sink, context)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            format_integer_arithmetic(expression, sink, context)
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             sink.write_token(ValueSpanKind::StringLiteral, "\"")?;
             for part in parts {
@@ -1738,6 +1756,47 @@ fn format_value_into_context(
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => write_unknown(reason, sink, context),
     }
+}
+
+fn format_integer_arithmetic(
+    expression: &crate::integer_arithmetic::ValidatedIntegerExpr,
+    sink: &mut dyn FormatSink,
+    context: FormatContext<'_>,
+) -> Result<(), Overflow> {
+    format_integer_operand(expression.lhs(), expression.op(), false, sink, context)?;
+    sink.write_token(
+        ValueSpanKind::Structure,
+        &format!(" {} ", expression.op().symbol()),
+    )?;
+    format_integer_operand(expression.rhs(), expression.op(), true, sink, context)
+}
+
+fn format_integer_operand(
+    value: &Value,
+    parent_op: crate::integer_arithmetic::IntegerOp,
+    right_operand: bool,
+    sink: &mut dyn FormatSink,
+    context: FormatContext<'_>,
+) -> Result<(), Overflow> {
+    let child_precedence = match value {
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            Some(expression.op().precedence())
+        }
+        _ => None,
+    };
+    let parenthesize = matches!(value, Value::Deferred(DeferredValue::Coalesce { .. }))
+        || child_precedence.is_some_and(|precedence| {
+            precedence < parent_op.precedence()
+                || (right_operand && precedence == parent_op.precedence())
+        });
+    if parenthesize {
+        sink.write_token(ValueSpanKind::Structure, "(")?;
+    }
+    format_value_into_context(value, sink, context)?;
+    if parenthesize {
+        sink.write_token(ValueSpanKind::Structure, ")")?;
+    }
+    Ok(())
 }
 
 fn write_float(value: f64, sink: &mut dyn FormatSink) -> Result<(), Overflow> {
@@ -1844,6 +1903,7 @@ pub(crate) fn is_upstream_deferred_marker_value(value: &Value) -> bool {
             deferred_for_access_display_path(access).is_some()
                 || access_chain_unknown_root(access.base()).is_some_and(is_upstream_deferred_reason)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => false,
         _ => false,
     }
 }
@@ -1877,6 +1937,7 @@ pub(crate) fn access_chain_unknown_root(value: &Value) -> Option<&UnknownReason>
     match value {
         Value::Deferred(DeferredValue::Access(access)) => access_chain_unknown_root(access.base()),
         Value::Deferred(DeferredValue::Unknown(reason)) => Some(reason),
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => None,
         _ => None,
     }
 }
@@ -1902,6 +1963,9 @@ pub fn contains_secret(value: &Value) -> bool {
             .any(|argument| contains_secret(argument.walker_value())),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_secret(value) || contains_secret(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_secret(expression.lhs()) || contains_secret(expression.rhs())
         }
         Value::Deferred(DeferredValue::Access(access)) => contains_secret(access.base()),
         Value::Concrete(
@@ -1961,6 +2025,10 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_unredacted_secret(value) || contains_unredacted_secret(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_unredacted_secret(expression.lhs())
+                || contains_unredacted_secret(expression.rhs())
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -2210,6 +2278,7 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             DeferredValue::ModuleIf(_)
             | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
+            | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
@@ -2341,6 +2410,15 @@ fn redact_secrets_only(value: &Value) -> Result<Value, SerializationError> {
                 default: Box::new(redact_secrets_only(default)?),
             }))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = redact_secrets_only(expression.lhs())?;
+            let rhs = redact_secrets_only(expression.rhs())?;
+            expression.evaluate_with_operands(lhs, rhs).map_err(|_| {
+                SerializationError::UnresolvedIntegerArithmetic {
+                    context: SerializationContext::SecretRedaction,
+                }
+            })
+        }
         // `Unknown` and every other deferred / concrete shape pass through.
         other => Ok(other.clone()),
     }
@@ -2456,6 +2534,22 @@ fn canonical_secret_template(value: &Value) -> Result<serde_json::Value, Seriali
                 canonical_secret_template(default)?,
             ]),
         ),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let mut encoded = Map::new();
+            encoded.insert(
+                "lhs".to_string(),
+                canonical_secret_template(expression.lhs())?,
+            );
+            encoded.insert(
+                "op".to_string(),
+                JsonValue::String(expression.op().symbol().to_string()),
+            );
+            encoded.insert(
+                "rhs".to_string(),
+                canonical_secret_template(expression.rhs())?,
+            );
+            tagged("integer_arithmetic", JsonValue::Object(encoded))
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => tagged(
             "interpolation",
             JsonValue::Array(
@@ -2551,6 +2645,10 @@ pub fn contains_redacted_secret(value: &Value) -> bool {
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_redacted_secret(value) || contains_redacted_secret(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            contains_redacted_secret(expression.lhs())
+                || contains_redacted_secret(expression.rhs())
         }
         _ => false,
     }
@@ -3362,6 +3460,38 @@ fn rehydrate_redacted_secrets_impl(
                 default: Box::new(default),
             }))
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(saved_expression)) => {
+            let Value::Deferred(DeferredValue::IntegerArithmetic(candidate_expression)) = candidate
+            else {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            };
+            if saved_expression.op() != candidate_expression.op() {
+                return Err(SecretRehydrationError::ShapeMismatch);
+            }
+            let lhs = if contains_redacted_secret(saved_expression.lhs()) {
+                rehydrate_redacted_secrets_impl(
+                    saved_expression.lhs(),
+                    candidate_expression.lhs(),
+                    input,
+                )?
+            } else {
+                saved_expression.lhs().clone()
+            };
+            let rhs = if contains_redacted_secret(saved_expression.rhs()) {
+                rehydrate_redacted_secrets_impl(
+                    saved_expression.rhs(),
+                    candidate_expression.rhs(),
+                    input,
+                )?
+            } else {
+                saved_expression.rhs().clone()
+            };
+            saved_expression
+                .rebuild(lhs, rhs)
+                .map(DeferredValue::IntegerArithmetic)
+                .map(Value::Deferred)
+                .map_err(|_| SecretRehydrationError::ShapeMismatch)
+        }
         _ => Err(SecretRehydrationError::ShapeMismatch),
     }
 }
@@ -3534,6 +3664,15 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<Value, SerializationErro
                 value: Box::new(redact_secrets_only(value)?),
                 default: Box::new(redact_secrets_only(default)?),
             }))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = redact_secrets_only(expression.lhs())?;
+            let rhs = redact_secrets_only(expression.rhs())?;
+            expression.evaluate_with_operands(lhs, rhs).map_err(|_| {
+                SerializationError::UnresolvedIntegerArithmetic {
+                    context: SerializationContext::SecretRedaction,
+                }
+            })
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
@@ -5267,6 +5406,10 @@ fn reparse_canonical_enum_leaves(value: &mut Value) {
                 reparse_canonical_enum_leaves(item);
             }
         }
+        // Validated arithmetic operands are Int-shaped and cannot contain an
+        // enum leaf. Keep the arm explicit so this traversal cannot silently
+        // become stale if the deferred enum grows another variant.
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {}
         _ => {}
     }
 }
@@ -5555,6 +5698,7 @@ fn canonical_map_key_text(value: Value) -> Result<String, crate::schema::TypeErr
             | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::Unavailable { .. }
@@ -5997,6 +6141,10 @@ fn first_enum_identifier_inner(
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             first_enum_identifier_inner(value, inside_secret)
                 .or_else(|| first_enum_identifier_inner(default, inside_secret))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            first_enum_identifier_inner(expression.lhs(), inside_secret)
+                .or_else(|| first_enum_identifier_inner(expression.rhs(), inside_secret))
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -7078,6 +7226,23 @@ mod tests {
         });
 
         assert_eq!(format_value(&value), "(r.comment ?? r.parent) ?? 'd'");
+    }
+
+    #[test]
+    fn format_value_parenthesizes_a_coalesce_used_as_an_arithmetic_operand() {
+        let coalesce = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("r", "count", vec![])),
+            default: Box::new(Value::Concrete(ConcreteValue::Int(0))),
+        });
+        let value = crate::integer_arithmetic::evaluate_integer_values(
+            coalesce,
+            crate::integer_arithmetic::IntegerOp::Add,
+            Value::Concrete(ConcreteValue::Int(1)),
+            crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+        )
+        .expect("a deferred Int coalesce is a structurally valid parser-stage operand");
+
+        assert_eq!(format_value(&value), "(r.count ?? 0) + 1");
     }
 
     #[test]
@@ -9619,6 +9784,34 @@ mod tests {
                 redacted
             ),
         }
+    }
+
+    #[test]
+    fn integer_arithmetic_secret_operand_redacts_and_rehydrates_recursively() {
+        let candidate = Value::Deferred(DeferredValue::IntegerArithmetic(
+            crate::integer_arithmetic::ValidatedIntegerExpr::new(
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::Int(42),
+                )))),
+                crate::integer_arithmetic::IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(1)),
+                crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+            )
+            .expect("a secret Int is a valid arithmetic operand"),
+        ));
+
+        let redacted = redact_secrets_in_value(&candidate).expect("redact arithmetic operand");
+        assert!(contains_redacted_secret(&redacted));
+        assert!(
+            !serde_json::to_string(&redacted)
+                .unwrap()
+                .contains("\"Int\":42")
+        );
+        assert_eq!(
+            rehydrate_redacted_secrets(&redacted, &candidate)
+                .expect("matching arithmetic secret rehydrates"),
+            candidate,
+        );
     }
 
     #[test]

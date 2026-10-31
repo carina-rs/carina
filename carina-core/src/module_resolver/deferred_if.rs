@@ -540,6 +540,10 @@ fn value_contains_module_if_inner(
             value_contains_module_if_inner(value, functions, function_scopes)
                 || value_contains_module_if_inner(default, functions, function_scopes)
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_contains_module_if_inner(expression.lhs(), functions, function_scopes)
+                || value_contains_module_if_inner(expression.rhs(), functions, function_scopes)
+        }
         Value::Concrete(_)
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
@@ -668,6 +672,29 @@ pub(super) fn substitute_module_ifs_in_secret(
                     (**default).clone()
                 }),
             }))
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = if value_contains_module_if(expression.lhs()) {
+                substitute_module_ifs_in_secret(expression.lhs(), arguments, position)?
+            } else {
+                expression.lhs().clone()
+            };
+            let rhs = if value_contains_module_if(expression.rhs()) {
+                substitute_module_ifs_in_secret(expression.rhs(), arguments, position)?
+            } else {
+                expression.rhs().clone()
+            };
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ArgumentSubstitutionError {
+                    source_file: None,
+                    line: expression
+                        .operator_span()
+                        .line()
+                        .unwrap_or(arguments.default_line()),
+                    message: error.to_string(),
+                    parse_error: None,
+                })
         }
         _ => Ok(value.clone()),
     }

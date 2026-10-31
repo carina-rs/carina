@@ -2,6 +2,7 @@ use pest::Parser;
 use pest::error::{InputLocation, LineColLocation};
 use pest::iterators::Pairs;
 use pest_derive::Parser;
+use std::sync::Arc;
 
 use super::error::ParseError;
 
@@ -12,7 +13,7 @@ struct CarinaParser;
 /// An owned, heredoc-preprocessed file that can yield pest pairs borrowing its
 /// transformed source while retaining the original-position mapping.
 pub(crate) struct PreprocessedFile {
-    preprocess_result: crate::heredoc::PreprocessResult,
+    preprocess_result: Arc<crate::heredoc::PreprocessResult>,
 }
 
 impl PreprocessedFile {
@@ -30,6 +31,10 @@ impl PreprocessedFile {
 
     pub(crate) fn original_slice(&self, preprocessed_range: std::ops::Range<usize>) -> &str {
         self.preprocess_result.original_slice(preprocessed_range)
+    }
+
+    pub(super) fn shared_position_map(&self) -> Arc<crate::heredoc::PreprocessResult> {
+        Arc::clone(&self.preprocess_result)
     }
 
     pub(crate) fn loop_source(
@@ -63,7 +68,9 @@ pub(crate) fn preprocess_file(input: &str) -> Result<PreprocessedFile, ParseErro
             message: error.to_string(),
         }
     })?;
-    Ok(PreprocessedFile { preprocess_result })
+    Ok(PreprocessedFile {
+        preprocess_result: Arc::new(preprocess_result),
+    })
 }
 
 pub(super) fn parse_type_expr_fragment(
@@ -87,12 +94,12 @@ fn map_pest_error_lines(
     error.line_col = match error.location.clone() {
         InputLocation::Pos(byte) => {
             let position = preprocessed_file.original_position(byte);
-            LineColLocation::Pos((position.line, position.column))
+            LineColLocation::Pos((position.line(), position.column()))
         }
         InputLocation::Span((start, end)) => {
             let start = preprocessed_file.original_position(start);
             let end = preprocessed_file.original_position(end);
-            LineColLocation::Span((start.line, start.column), (end.line, end.column))
+            LineColLocation::Span((start.line(), start.column()), (end.line(), end.column()))
         }
     };
     error

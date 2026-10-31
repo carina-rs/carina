@@ -9,6 +9,591 @@ use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
+fn parsed_int_binding(source: &str, name: &str) -> i64 {
+    let parsed = parse_and_resolve(source).expect("integer expression should parse and resolve");
+    let value = parsed
+        .variables
+        .get(name)
+        .unwrap_or_else(|| panic!("missing `{name}` binding"));
+    let Value::Concrete(ConcreteValue::Int(value)) = value else {
+        panic!("`{name}` should be an Int, got {value:?}");
+    };
+    *value
+}
+
+#[test]
+fn integer_arithmetic_obeys_precedence_parentheses_and_left_associativity() {
+    assert_eq!(parsed_int_binding("let value = 1 + 2 * 3", "value"), 7);
+    assert_eq!(parsed_int_binding("let value = (1 + 2) * 3", "value"), 9);
+    assert_eq!(
+        parsed_int_binding("let value = [10, 20][1] + 1", "value"),
+        21,
+        "postfix access must bind more tightly than arithmetic",
+    );
+    assert_eq!(
+        parsed_int_binding("let value = 1 + 2 |> max(10)", "value"),
+        10,
+        "arithmetic must bind more tightly than the pipe operator",
+    );
+    assert_eq!(parsed_int_binding("let value = 20 - 6 - 3", "value"), 11);
+    assert_eq!(parsed_int_binding("let value = 20 / 3 / 2", "value"), 3);
+    assert_eq!(parsed_int_binding("let value = -5 / 2", "value"), -2);
+    assert_eq!(parsed_int_binding("let value = -5 % 2", "value"), -1);
+    assert_eq!(
+        parsed_int_binding("let value = -9223372036854775808", "value"),
+        i64::MIN,
+        "the signed i64 minimum remains a numeric literal",
+    );
+
+    let compose_error = parse_and_resolve("let value = 1 + 2 >> max(10)")
+        .expect_err("arithmetic binds before function composition");
+    assert!(
+        compose_error.to_string().contains("left side of >>"),
+        "unexpected composition error: {compose_error}",
+    );
+
+    let parsed =
+        parse_and_resolve("let source = test.clock {}\nlet value = source.seconds ?? 2 + 3")
+            .expect("coalesce default arithmetic should parse");
+    let Some(Value::Deferred(DeferredValue::Coalesce { default, .. })) =
+        parsed.variables.get("value")
+    else {
+        panic!("deferred coalesce should retain its folded arithmetic default");
+    };
+    assert_eq!(**default, Value::Concrete(ConcreteValue::Int(5)));
+}
+
+#[test]
+fn integer_arithmetic_lexing_preserves_signed_literals_and_comments() {
+    for (expression, expected) in [
+        ("5-1", 4),
+        ("5 -1", 4),
+        ("5 - 1", 4),
+        ("5--1", 6),
+        ("5 + -1", 4),
+        ("6 / /* outer /* nested */ block */ 2", 3),
+        ("6 /* block */ * 2", 12),
+        ("6 # line\n / 2", 3),
+        ("6 // line\n / 2", 3),
+    ] {
+        assert_eq!(
+            parsed_int_binding(&format!("let value = {expression}"), "value"),
+            expected,
+            "expression: {expression}"
+        );
+        let interpolated = parse_and_resolve(&format!("let value = \"${{{expression}}}\""))
+            .unwrap_or_else(|error| panic!("interpolation {expression:?} failed: {error}"));
+        assert_eq!(
+            interpolated.variables.get("value"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                expected.to_string().into(),
+            ))),
+            "interpolation expression: {expression}",
+        );
+    }
+
+    for expression in ["a-1", "a -1", "a - 1", "a--1", "a + -1"] {
+        let expected = if expression == "a--1" { 6 } else { 4 };
+        assert_eq!(
+            parsed_int_binding(&format!("let a = 5\nlet value = {expression}"), "value"),
+            expected,
+            "identifier-adjacent expression: {expression}",
+        );
+    }
+
+    assert!(
+        parse_and_resolve("let value = -(1)").is_err(),
+        "minus is part of a signed numeric literal, not a unary operator",
+    );
+}
+
+#[test]
+fn integer_arithmetic_reports_checked_zero_errors() {
+    for (expression, expected) in [
+        ("1 / 0", "division by zero"),
+        ("1 % 0", "remainder by zero"),
+    ] {
+        let error = parse_and_resolve(&format!("let value = {expression}"))
+            .expect_err("zero divisor must be rejected");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error}"
+        );
+    }
+}
+
+#[test]
+fn integer_arithmetic_operator_span_uses_original_line_after_heredoc() {
+    let error = parse(
+        "let p = <<EOT\na\nb\nc\nd\nEOT\n\nlet x = 1 / 0\n",
+        &ProviderContext::default(),
+    )
+    .expect_err("division by zero after a heredoc must be rejected");
+
+    let ParseError::IntegerArithmetic {
+        line,
+        column,
+        end_column,
+        message,
+    } = error
+    else {
+        panic!("expected an operator-local arithmetic error, got: {error}");
+    };
+    assert_eq!((line, column, end_column), (8, 11, 12));
+    assert!(message.contains("division by zero"), "{message}");
+}
+
+#[test]
+fn integer_arithmetic_rejects_every_non_int_operand_family() {
+    for (expression, expected) in [
+        ("1.0 + 2.0", "Float"),
+        ("-1.0 + 2", "Float"),
+        ("1 + 2.0", "Float"),
+        ("'x' + 1", "String"),
+        ("true + 1", "Bool"),
+        ("1s + 1", "Duration"),
+        ("[1] + [2]", "List"),
+        ("{ a = 1 } + { a = 2 }", "Map"),
+    ] {
+        let error = parse_and_resolve(&format!("let value = {expression}"))
+            .expect_err("non-Int operands must be rejected");
+        assert!(
+            error.to_string().contains(expected),
+            "expression {expression:?}: expected {expected:?}, got {error}"
+        );
+    }
+}
+
+#[test]
+fn integer_arithmetic_converts_to_string_only_at_interpolation_boundary() {
+    let parsed = parse_and_resolve(
+        r#"
+        let plain = 125 / 60
+        let text = "minutes=${125 / 60}"
+        "#,
+    )
+    .expect("arithmetic should be valid in and outside interpolation");
+
+    assert_eq!(
+        parsed.variables.get("plain"),
+        Some(&Value::Concrete(ConcreteValue::Int(2)))
+    );
+    assert_eq!(
+        parsed.variables.get("text"),
+        Some(&Value::Concrete(ConcreteValue::String("minutes=2".into())))
+    );
+}
+
+#[test]
+fn deferred_integer_arithmetic_stays_typed_inside_interpolation_and_tracks_dependencies() {
+    let parsed = parse_and_resolve(
+        r#"
+        let source = test.clock {}
+        let plain = (source.seconds + 30) / 60
+        let text = "minutes=${(source.seconds + 30) / 60}"
+        "#,
+    )
+    .expect("resource Int arithmetic should remain deferred");
+
+    let plain = parsed.variables.get("plain").expect("plain binding");
+    assert!(matches!(
+        plain,
+        Value::Deferred(DeferredValue::IntegerArithmetic(_))
+    ));
+    assert_eq!(plain.root_bindings(), ["source".to_string()].into());
+
+    let Some(Value::Deferred(DeferredValue::Interpolation(parts))) = parsed.variables.get("text")
+    else {
+        panic!("deferred interpolation should retain its expression part");
+    };
+    assert!(parts.iter().any(|part| matches!(
+        part,
+        InterpolationPart::Expr(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+    )));
+}
+
+#[test]
+fn secret_integer_arithmetic_taints_plain_and_interpolated_results() {
+    let parsed = parse_and_resolve(
+        r#"
+        let plain = secret(125) / 60
+        let text = "minutes=${secret(125) / 60}"
+        "#,
+    )
+    .expect("secret Int arithmetic should evaluate without losing sensitivity");
+
+    assert_eq!(
+        parsed.variables.get("plain"),
+        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::Int(2)),
+        ))))
+    );
+    assert_eq!(
+        parsed.variables.get("text"),
+        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::String("minutes=2".into())),
+        ))))
+    );
+}
+
+#[test]
+fn integer_arithmetic_accepts_typed_function_and_module_operands() {
+    let function = parse_and_resolve(
+        r#"
+        fn plus_one(value: Int): Int {
+            value + 1
+        }
+        let result = plus_one(41)
+        "#,
+    )
+    .expect("a typed Int function parameter is a valid arithmetic operand");
+    assert_eq!(
+        function.variables.get("result"),
+        Some(&Value::Concrete(ConcreteValue::Int(42)))
+    );
+
+    let module = parse(
+        r#"
+        arguments {
+            count: Int
+        }
+        attributes {
+            doubled: Int = count * 2
+        }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a typed Int module argument is a valid deferred arithmetic operand");
+    assert!(matches!(
+        module.attribute_params[0].value,
+        Some(Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+    ));
+}
+
+#[test]
+fn wait_predicates_reject_actual_integer_arithmetic_with_targeted_error() {
+    for predicate in [
+        "source.count + 1 == 2",
+        "(source.count + 1) == 2",
+        "source.count == (1 + 1)",
+    ] {
+        let source = r#"
+        let source = mock.test.Thing { name = 'source' }
+        let ready = wait source {
+            until = __PREDICATE__
+        }
+        "#
+        .replace("__PREDICATE__", predicate);
+        let error = parse(&source, &ProviderContext::default())
+            .expect_err("wait predicates deliberately remain narrow equality predicates");
+        assert!(
+            error
+                .to_string()
+                .contains("integer arithmetic is not supported in wait predicates"),
+            "predicate {predicate:?} produced an unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn structural_for_declarations_keep_pipe_and_postfix_behavior() {
+    let resource_pipe = parse(
+        r#"
+        fn f(value) { 7 }
+        let n = for x in [1] {
+            mock.test.Thing { value = x }
+        } |> f()
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("the resource binding should replace the pipe's computed value binding");
+    assert_eq!(resource_pipe.resources.len(), 1);
+    assert!(
+        !resource_pipe.variables.contains_key("n"),
+        "a resource pipe must not also leave `n` bound to the pipe result",
+    );
+    assert!(resource_pipe.structural_bindings.contains("n"));
+
+    let module_pipe = parse(
+        r#"
+        fn f(value) { 7 }
+        let n = for x in [1] {
+            child { value = x }
+        } |> f()
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("a structural module-call for-expression should remain a valid pipe input");
+    assert_eq!(module_pipe.module_calls.len(), 1);
+    assert!(
+        !module_pipe.variables.contains_key("n"),
+        "a module-call pipe must not also leave `n` bound to the pipe result",
+    );
+    assert!(module_pipe.structural_bindings.contains("n"));
+
+    for body in ["mock.test.Thing { value = x }", "child { value = x }"] {
+        let postfix = parse(
+            &format!("let n = for x in [1] {{ {body} }}.value"),
+            &ProviderContext::default(),
+        )
+        .expect_err("postfix access on a structural for-expression is invalid");
+        assert!(
+            postfix
+                .to_string()
+                .contains("postfix access cannot be applied to a resource or module declaration"),
+            "body {body:?} produced an unexpected postfix diagnostic: {postfix}",
+        );
+
+        let arithmetic = parse(
+            &format!("let n = for x in [1] {{ {body} }} + 1"),
+            &ProviderContext::default(),
+        )
+        .expect_err("integer arithmetic on a structural for-expression is invalid");
+        assert!(
+            arithmetic.to_string().contains(
+                "integer arithmetic cannot be applied to a resource, module, data-source, or import declaration"
+            ),
+            "body {body:?} produced an unexpected arithmetic diagnostic: {arithmetic}",
+        );
+    }
+}
+
+#[test]
+fn structural_for_resource_pipe_is_not_exported_as_a_value() {
+    let error = parse(
+        r#"
+        fn f(value) { 7 }
+        let n = for x in [1] {
+            mock.test.Thing { value = x }
+        } |> f()
+        exports { out: Int = n }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect_err("a resource and a computed pipe value cannot share one exported name");
+
+    assert!(
+        error
+            .to_string()
+            .contains("'n' is a resource, not a value; reference one of its attributes"),
+        "unexpected exported resource pipe diagnostic: {error}",
+    );
+}
+
+#[test]
+fn value_producing_for_body_is_a_syntax_error() {
+    let error = parse(
+        "mock.test.Thing { attr = for x in [1] { x } }",
+        &ProviderContext::default(),
+    )
+    .expect_err("for-expression bodies cannot produce ordinary values");
+    assert!(
+        matches!(error, ParseError::Syntax(_)),
+        "value-producing for body must fail in the grammar, got: {error}",
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("structural ForExpr expression reached ordinary value lowering"),
+        "value-producing for body leaked into ordinary value lowering: {error}",
+    );
+}
+
+#[test]
+fn structural_declarations_are_parsed_before_pipe_application() {
+    for (source, binding, expected_module_calls, expected_upstreams) in [
+        (
+            r#"
+            fn f(value) { 1 }
+            let v = mymod { a = 1 } |> f()
+        "#,
+            "v",
+            1,
+            0,
+        ),
+        (
+            r#"
+            fn f(value) { 1 }
+            let u = upstream_state { source = "../x" } |> f()
+        "#,
+            "u",
+            0,
+            1,
+        ),
+    ] {
+        let parsed = parse(source, &ProviderContext::default())
+            .unwrap_or_else(|error| panic!("structural pipe should parse: {error}"));
+        assert!(
+            !parsed.variables.contains_key(binding),
+            "a structural declaration must not also retain its pipe result as a value",
+        );
+        assert_eq!(parsed.module_calls.len(), expected_module_calls);
+        assert_eq!(parsed.upstream_states.len(), expected_upstreams);
+    }
+}
+
+#[test]
+fn postfix_and_arithmetic_on_declarations_have_targeted_errors() {
+    let postfix = parse(
+        "let b = aws.s3.Bucket { name = 'b' }.arn",
+        &ProviderContext::default(),
+    )
+    .expect_err("postfix access on an inline resource declaration is invalid");
+    assert!(
+        postfix
+            .to_string()
+            .contains("postfix access cannot be applied to a resource or module declaration"),
+        "unexpected postfix diagnostic: {postfix}",
+    );
+
+    let arithmetic = parse(
+        "let n = for x in [1] { mock.test.Thing { value = x } } + 1",
+        &ProviderContext::default(),
+    )
+    .expect_err("integer arithmetic on a structural declaration is invalid");
+    assert!(
+        arithmetic.to_string().contains(
+            "integer arithmetic cannot be applied to a resource, module, data-source, or import declaration"
+        ),
+        "unexpected arithmetic diagnostic: {arithmetic}",
+    );
+}
+
+#[test]
+fn value_if_expressions_are_integer_operands_in_every_position() {
+    for expression in [
+        "if c { 1 } else { 2 } + 1",
+        "1 + if c { 1 } else { 2 }",
+        "(if c { 1 } else { 2 }) + 1",
+        "1 + (if c { 1 } else { 2 })",
+    ] {
+        let parsed = parse_and_resolve(&format!("let c = true\nlet x = {expression}"))
+            .unwrap_or_else(|error| panic!("let operand {expression:?} failed: {error}"));
+        assert_eq!(
+            parsed.variables.get("x"),
+            Some(&Value::Concrete(ConcreteValue::Int(2))),
+            "let operand: {expression}",
+        );
+
+        let parsed = parse_and_resolve(&format!(
+            "let c = true\nmock.test.Thing {{ n = {expression} }}"
+        ))
+        .unwrap_or_else(|error| panic!("attribute operand {expression:?} failed: {error}"));
+        assert_eq!(
+            parsed.resources[0].get_attr("n"),
+            Some(&Value::Concrete(ConcreteValue::Int(2))),
+            "attribute operand: {expression}",
+        );
+    }
+}
+
+#[test]
+fn declaration_if_expressions_are_rejected_as_integer_operands_everywhere() {
+    let declaration = "if c { mock.test.Child { n = 1 } } else { mock.test.Child { n = 2 } }";
+    let expected = "integer arithmetic cannot be applied to a resource, module, data-source, or import declaration";
+
+    for expression in [
+        format!("{declaration} + 1"),
+        format!("1 + {declaration}"),
+        format!("({declaration}) + 1"),
+        format!("1 + ({declaration})"),
+    ] {
+        for source in [
+            format!("let c = true\nlet x = {expression}"),
+            format!("let c = true\nmock.test.Thing {{ n = {expression} }}"),
+        ] {
+            let error = parse(&source, &ProviderContext::default())
+                .expect_err("a declaration-valued if cannot be an integer operand");
+            assert!(
+                error.to_string().contains(expected),
+                "expression {expression:?} produced an unexpected error: {error}",
+            );
+        }
+    }
+}
+
+#[test]
+fn let_rhs_coalesce_errors_keep_the_authored_line() {
+    let closure_error = parse(
+        "let source = mock.test.Thing {}\nlet a = source.value\nlet x = a ?? join(\",\")",
+        &ProviderContext::default(),
+    )
+    .expect_err("a closure cannot be a coalesce default value");
+    let ParseError::InvalidExpression { line, .. } = closure_error else {
+        panic!("expected an invalid-expression error, got: {closure_error}");
+    };
+    assert_eq!(line, 3);
+
+    let resource_error = parse(
+        "let first = 1\nlet second = 2\nlet b = mock.test.Thing {} ?? 1",
+        &ProviderContext::default(),
+    )
+    .expect_err("a resource declaration cannot be coalesced as a value");
+    let ParseError::InvalidExpression { line, message } = resource_error else {
+        panic!("expected an invalid-expression error, got: {resource_error}");
+    };
+    assert_eq!(line, 3);
+    assert!(message.contains("not a value"), "{message}");
+
+    let upstream_error = parse(
+        "let first = 1\nlet u = upstream_state { source = \"../x\" } ?? {}",
+        &ProviderContext::default(),
+    )
+    .expect_err("an upstream-state declaration cannot be coalesced as a value");
+    let ParseError::InvalidExpression { line, message } = upstream_error else {
+        panic!("expected an invalid-expression error, got: {upstream_error}");
+    };
+    assert_eq!(line, 2);
+    assert!(message.contains("not a value"), "{message}");
+}
+
+#[test]
+fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
+    let mut parsed = cross_deferred_for_resolution_seam(
+        parse(
+            r#"
+            let source = mock.test.Source {}
+            let children = for item in source.items {
+                mock.test.Target { count = item + 1 }
+            }
+            "#,
+            &ProviderContext::default(),
+        )
+        .expect("deferred iterable fixture parses"),
+    );
+    let template_count = parsed.deferred_for_expressions()[0]
+        .template_resource
+        .get_attr("count")
+        .expect("template count");
+    assert!(matches!(
+        template_count,
+        Value::Deferred(DeferredValue::IntegerArithmetic(_))
+    ));
+
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "source",
+        HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Int(41),
+            )])),
+        )]),
+        crate::binding_index::BindingValueSource::Local,
+    );
+    parsed
+        .expand_deferred_for_expressions(&bindings.project_iterable_bindings())
+        .expect("deferred loop expands");
+    assert_eq!(
+        parsed
+            .resources
+            .iter()
+            .find(|resource| resource.binding.as_deref() == Some("children[0]"))
+            .and_then(|resource| resource.get_attr("count")),
+        Some(&Value::Concrete(ConcreteValue::Int(42))),
+    );
+}
+
 fn cross_deferred_for_resolution_seam(parsed: ParsedFile) -> ModuleResolvedParsedFile {
     crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
         .expect("deferred fixture crosses the module-resolution seam")
@@ -7128,6 +7713,86 @@ fn parse_arguments_block_form_validation_block() {
         }
         other => panic!("Expected And, got {:?}", other),
     }
+}
+
+#[test]
+fn parse_require_and_argument_validation_integer_arithmetic() {
+    let input = r#"
+        arguments {
+            count: Int {
+                default = 4
+                validation {
+                    condition = count % 2 == 0
+                    error_message = "count must be even"
+                }
+            }
+        }
+        require count / 2 >= 1, "count must be at least two"
+    "#;
+    let result = parse(input, &ProviderContext::default()).unwrap();
+
+    let ValidateExpr::Compare { lhs, op, rhs } = &result.arguments[0].validations[0].condition
+    else {
+        panic!("argument validation must retain its comparison");
+    };
+    assert_eq!(*op, CompareOp::Eq);
+    assert_eq!(**rhs, ValidateExpr::Int(0));
+    assert!(matches!(
+        lhs.as_ref(),
+        ValidateExpr::IntegerArithmetic {
+            op: crate::integer_arithmetic::IntegerOp::Remainder,
+            ..
+        }
+    ));
+
+    let ValidateExpr::Compare { lhs, op, rhs } = &result.requires[0].condition else {
+        panic!("require must retain its comparison");
+    };
+    assert_eq!(*op, CompareOp::Gte);
+    assert_eq!(**rhs, ValidateExpr::Int(1));
+    assert!(matches!(
+        lhs.as_ref(),
+        ValidateExpr::IntegerArithmetic {
+            op: crate::integer_arithmetic::IntegerOp::Divide,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn validation_integer_operator_spans_use_original_lines_after_heredoc() {
+    let input = "let p = <<EOT\na\nb\nEOT\n\
+                 arguments {\n\
+                 count: Int {\n\
+                 validation {\n\
+                 condition = count + 1 > 0\n\
+                 }\n\
+                 }\n\
+                 }\n\
+                 require count / 2 >= 1, \"x\"\n";
+    let result = parse(input, &ProviderContext::default()).expect("fixture must parse");
+
+    let ValidateExpr::Compare { lhs, .. } = &result.arguments[0].validations[0].condition else {
+        panic!("validation must retain its comparison");
+    };
+    let ValidateExpr::IntegerArithmetic { operator_span, .. } = lhs.as_ref() else {
+        panic!("validation lhs must retain integer arithmetic");
+    };
+    assert_eq!(
+        (operator_span.line(), operator_span.column()),
+        (Some(8), Some(19))
+    );
+
+    let ValidateExpr::Compare { lhs, .. } = &result.requires[0].condition else {
+        panic!("require must retain its comparison");
+    };
+    let ValidateExpr::IntegerArithmetic { operator_span, .. } = lhs.as_ref() else {
+        panic!("require lhs must retain integer arithmetic");
+    };
+    assert_eq!(
+        (operator_span.line(), operator_span.column()),
+        (Some(12), Some(15))
+    );
 }
 
 #[test]
@@ -15931,6 +16596,51 @@ fn sibling_structural_handle_is_pending_after_directory_kind_resolution() {
             && use_site.path.root_name() == "name"
             && matches!(use_site.binding, BareBindingKind::Structural { .. })
     }));
+}
+
+#[test]
+fn integer_arithmetic_rejects_a_structural_handle_from_a_sibling_file_in_both_positions() {
+    use crate::config_loader::parse_directory;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("sibling.crn"),
+        "let b = mock.test.Thing { name = \"source\" }\n",
+    )
+    .unwrap();
+
+    for expression in ["a + b", "b + a"] {
+        std::fs::write(
+            directory.path().join("main.crn"),
+            format!("let a = 1\nlet n = {expression}\n"),
+        )
+        .unwrap();
+
+        let error = parse_directory(directory.path(), &ProviderContext::default())
+            .expect_err("a resource handle cannot be an arithmetic operand");
+        assert!(
+            error.contains("'b' is a resource, not a value"),
+            "expression {expression:?} produced an unexpected diagnostic: {error}"
+        );
+    }
+}
+
+#[test]
+fn integer_arithmetic_retains_provisional_metadata_for_both_operands() {
+    let parsed = parse_with_seeded_bindings(
+        "let n = a + b\n",
+        &ProviderContext::default(),
+        &[BindingSeed::provisional("a"), BindingSeed::provisional("b")],
+    )
+    .expect("provisional operands remain pending until directory kind resolution");
+
+    assert!(matches!(
+        parsed
+            .parser_binding_metadata
+            .value_structural_handles("n"),
+        Some(crate::eval_value::StructuralHandleMetadata::ExpressionOperands(operands))
+            if operands.len() == 2
+    ));
 }
 
 #[test]

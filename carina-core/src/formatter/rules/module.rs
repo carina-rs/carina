@@ -57,7 +57,7 @@ impl Formatter {
                         if wrote_expr {
                             continue;
                         }
-                        self.format_default(n);
+                        self.format_validate_expr(n);
                         wrote_expr = true;
                     } else {
                         self.format_node(n);

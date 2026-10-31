@@ -137,7 +137,8 @@ fn lower_validate_expr_to_until(
     line: usize,
 ) -> Result<UntilPredicateAst, ParseError> {
     let cmp = descend_to_compare(pair, line)?;
-    // `validate_comparison` has shape: validate_primary (compare_op validate_primary)?
+    // `validate_comparison` has shape:
+    // validate_additive_expr (compare_op validate_additive_expr)?
     let mut iter = cmp.into_inner();
     let lhs_pair = iter.next().ok_or_else(|| ParseError::InvalidExpression {
         line,
@@ -162,10 +163,59 @@ fn lower_validate_expr_to_until(
         });
     }
 
+    let lhs_pair = unwrap_wait_arithmetic(lhs_pair, line)?;
+    let rhs_pair = unwrap_wait_arithmetic(rhs_pair, line)?;
     let lhs_segments = lower_until_lhs(lhs_pair, target_binding, line)?;
     let rhs = lower_until_rhs(rhs_pair, line)?;
 
     Ok(UntilPredicateAst { lhs_segments, rhs })
+}
+
+/// Remove the validation-only arithmetic precedence wrappers when they contain
+/// no operator. An authored arithmetic operation is deliberately rejected:
+/// wait polling remains a narrow equality predicate in this release.
+fn unwrap_wait_arithmetic<'i>(
+    pair: Pair<'i, Rule>,
+    line: usize,
+) -> Result<Pair<'i, Rule>, ParseError> {
+    fn contains_integer_arithmetic(pair: &Pair<'_, Rule>) -> bool {
+        if matches!(
+            pair.as_rule(),
+            Rule::validate_additive_expr | Rule::validate_multiplicative_expr
+        ) && pair.clone().into_inner().count() > 1
+        {
+            return true;
+        }
+        pair.clone()
+            .into_inner()
+            .any(|inner| contains_integer_arithmetic(&inner))
+    }
+
+    // Parentheses introduce another complete validation-expression wrapper.
+    // Scan the whole operand first so they cannot hide an arithmetic node from
+    // the targeted wait-predicate diagnostic.
+    if contains_integer_arithmetic(&pair) {
+        return Err(ParseError::InvalidExpression {
+            line,
+            message: "`until`: integer arithmetic is not supported in wait predicates".to_string(),
+        });
+    }
+
+    match pair.as_rule() {
+        Rule::validate_additive_expr | Rule::validate_multiplicative_expr => {
+            let mut inner = pair.into_inner();
+            let first = inner.next().ok_or_else(|| ParseError::InvalidExpression {
+                line,
+                message: "`until`: empty predicate operand".to_string(),
+            })?;
+            unwrap_wait_arithmetic(first, line)
+        }
+        Rule::validate_primary => Ok(pair),
+        other => Err(ParseError::InvalidExpression {
+            line,
+            message: format!("`until`: unexpected predicate operand ({other:?})"),
+        }),
+    }
 }
 
 /// Walk through `validate_expr` → `validate_or_expr` → `validate_and_expr`

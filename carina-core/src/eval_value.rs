@@ -106,9 +106,15 @@ impl StructuralHandleKind {
 /// is known to be a structural handle.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StructuralHandleMetadata {
-    Handle { access_base: Option<Value> },
+    Handle {
+        access_base: Option<Value>,
+    },
     List(Vec<Option<StructuralHandleMetadata>>),
     Map(IndexMap<String, StructuralHandleMetadata>),
+    /// Provisional handles consumed by a computed scalar expression. This
+    /// preserves every operand for the directory fixed point without making
+    /// the scalar result itself look like a handle alias.
+    ExpressionOperands(Vec<StructuralHandleMetadata>),
 }
 
 impl StructuralHandleMetadata {
@@ -119,8 +125,21 @@ impl StructuralHandleMetadata {
     pub(crate) fn access_base(&self) -> Option<&Value> {
         match self {
             Self::Handle { access_base } => access_base.as_ref(),
-            Self::List(_) | Self::Map(_) => None,
+            Self::List(_) | Self::Map(_) | Self::ExpressionOperands(_) => None,
         }
+    }
+
+    pub(crate) fn from_expression_operands(
+        operands: impl IntoIterator<Item = Option<Self>>,
+    ) -> Option<Self> {
+        let mut collected = Vec::new();
+        for operand in operands.into_iter().flatten() {
+            match operand {
+                Self::ExpressionOperands(nested) => collected.extend(nested),
+                other => collected.push(other),
+            }
+        }
+        (!collected.is_empty()).then_some(Self::ExpressionOperands(collected))
     }
 
     pub(crate) fn select(&self, step: &PathSegment) -> Option<Self> {
@@ -142,7 +161,10 @@ impl StructuralHandleMetadata {
                     index: Subscript::Str { key },
                 },
             ) => entries.get(key.expose_plaintext()).cloned(),
-            (Self::Handle { .. }, _) | (Self::List(_), _) | (Self::Map(_), _) => None,
+            (Self::Handle { .. }, _)
+            | (Self::List(_), _)
+            | (Self::Map(_), _)
+            | (Self::ExpressionOperands(_), _) => None,
         }
     }
 
@@ -164,6 +186,11 @@ impl StructuralHandleMetadata {
             Self::Map(entries) => {
                 for item in entries.values() {
                     item.try_visit_values(visit)?;
+                }
+            }
+            Self::ExpressionOperands(operands) => {
+                for operand in operands {
+                    operand.try_visit_values(visit)?;
                 }
             }
         }

@@ -1066,6 +1066,17 @@ pub enum ValidateExpr {
         operand: String,
         value: Value,
     },
+    /// Binary Int arithmetic used by `require` and argument validation.
+    IntegerArithmetic {
+        lhs: Box<ValidateExpr>,
+        op: crate::integer_arithmetic::IntegerOp,
+        rhs: Box<ValidateExpr>,
+        #[serde(
+            skip,
+            default = "crate::integer_arithmetic::IntegerOperatorSpan::synthetic"
+        )]
+        operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
+    },
     /// Comparison: lhs op rhs
     Compare {
         lhs: Box<ValidateExpr>,
@@ -2469,12 +2480,12 @@ impl SourceSpan {
         let start = file.original_position(start_byte);
         let end = file.original_position(end_byte);
         Self {
-            start_byte: start.byte,
-            end_byte: end.byte,
-            start_line: start.line,
-            start_column: start.column,
-            end_line: end.line,
-            end_column: end.column,
+            start_byte: start.byte(),
+            end_byte: end.byte(),
+            start_line: start.line(),
+            start_column: start.column(),
+            end_line: end.line(),
+            end_column: end.column(),
         }
     }
 
@@ -4293,6 +4304,9 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::ResourceRef { .. }) => "deferred resource reference",
         Value::Deferred(DeferredValue::BindingRef { .. }) => "deferred binding reference",
         Value::Deferred(DeferredValue::Coalesce { .. }) => "deferred coalesce expression",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            "deferred integer arithmetic expression"
+        }
         Value::Deferred(DeferredValue::Interpolation(_)) => "deferred interpolation",
         Value::Deferred(
             DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
@@ -4471,7 +4485,8 @@ fn substitute_placeholder_with_policy(
                 }
                 Ok(()) => {
                     let mut resolved_default = default.as_ref().clone();
-                    substitute_placeholder_lazily(&mut resolved_default, index, key, value);
+                    substitute_placeholder_lazily(&mut resolved_default, index, key, value)
+                        .map_err(nested_placeholder_error)?;
                     *v = Value::Deferred(DeferredValue::Coalesce {
                         value: Box::new(resolved_left),
                         default: Box::new(resolved_default),
@@ -4525,6 +4540,22 @@ fn substitute_placeholder_with_policy(
                 }
             }
         }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let expression = expression.clone();
+            let mut lhs = expression.lhs().clone();
+            let mut rhs = expression.rhs().clone();
+            substitute_placeholder_with_policy(&mut lhs, index, key, value, miss_policy)
+                .map_err(nested_placeholder_error)?;
+            substitute_placeholder_with_policy(&mut rhs, index, key, value, miss_policy)
+                .map_err(nested_placeholder_error)?;
+            *v = expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| PlaceholderAccessError {
+                    line: expression.operator_span().line().unwrap_or(0),
+                    message: error.to_string(),
+                    coalesce_absence: false,
+                })?;
+        }
         Value::Deferred(DeferredValue::Secret(inner)) => {
             substitute_placeholder_with_policy(inner, index, key, value, miss_policy)?;
         }
@@ -4542,13 +4573,14 @@ fn substitute_placeholder_with_policy(
 
 /// Substitute loop placeholders without evaluating any surrounding access or
 /// function. Used only for an unselected `??` fallback: the loop item must be
-/// captured now, but errors remain lazy until the fallback is selected.
+/// captured now. Operand substitution still validates and folds typed integer
+/// arithmetic so a bad materialized loop value cannot leave an invalid node.
 fn substitute_placeholder_lazily(
     value: &mut Value,
     index: Option<i64>,
     key: Option<&str>,
     item: &Value,
-) {
+) -> Result<(), PlaceholderAccessError> {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => match reason {
             UnknownReason::ForValue => *value = item.clone(),
@@ -4572,18 +4604,18 @@ fn substitute_placeholder_lazily(
         },
         Value::Concrete(ConcreteValue::List(values)) => {
             for value in values {
-                substitute_placeholder_lazily(value, index, key, item);
+                substitute_placeholder_lazily(value, index, key, item)?;
             }
         }
         Value::Concrete(ConcreteValue::Map(values)) => {
             for value in values.values_mut() {
-                substitute_placeholder_lazily(value, index, key, item);
+                substitute_placeholder_lazily(value, index, key, item)?;
             }
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    substitute_placeholder_lazily(value, index, key, item);
+                    substitute_placeholder_lazily(value, index, key, item)?;
                 }
             }
         }
@@ -4593,13 +4625,13 @@ fn substitute_placeholder_lazily(
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {
-                substitute_placeholder_lazily(argument.walker_value_mut(), index, key, item);
+                substitute_placeholder_lazily(argument.walker_value_mut(), index, key, item)?;
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access = access.clone();
             let mut base = access.base().clone();
-            substitute_placeholder_lazily(&mut base, index, key, item);
+            substitute_placeholder_lazily(&mut base, index, key, item)?;
             *value = match access.rebuild_result(
                 base.clone(),
                 access.step().clone(),
@@ -4616,18 +4648,32 @@ fn substitute_placeholder_lazily(
             value: left,
             default,
         }) => {
-            substitute_placeholder_lazily(left, index, key, item);
-            substitute_placeholder_lazily(default, index, key, item);
+            substitute_placeholder_lazily(left, index, key, item)?;
+            substitute_placeholder_lazily(default, index, key, item)?;
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let expression = expression.clone();
+            let mut lhs = expression.lhs().clone();
+            let mut rhs = expression.rhs().clone();
+            substitute_placeholder_lazily(&mut lhs, index, key, item)?;
+            substitute_placeholder_lazily(&mut rhs, index, key, item)?;
+            *value = expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| PlaceholderAccessError {
+                    line: expression.operator_span().line().unwrap_or(0),
+                    message: error.to_string(),
+                    coalesce_absence: false,
+                })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            substitute_placeholder_lazily(inner, index, key, item);
+            substitute_placeholder_lazily(inner, index, key, item)?;
         }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            **deferred = deferred.map(|nested| {
+            **deferred = deferred.try_map(|nested| {
                 let mut nested = nested.clone();
-                substitute_placeholder_lazily(&mut nested, index, key, item);
-                nested
-            });
+                substitute_placeholder_lazily(&mut nested, index, key, item)?;
+                Ok::<_, PlaceholderAccessError>(nested)
+            })?;
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -4645,6 +4691,7 @@ fn substitute_placeholder_lazily(
             | DeferredValue::RedactedSecret { .. },
         ) => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4655,6 +4702,34 @@ mod substitute_placeholder_tests {
         ResourceId, UnknownReason, Value,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn lazy_coalesce_for_substitution_rejects_non_integer_items_without_panicking() {
+        for item in [
+            Value::Concrete(ConcreteValue::String("not-an-int".into())),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ] {
+            let arithmetic = crate::integer_arithmetic::evaluate_integer_values(
+                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                crate::integer_arithmetic::IntegerOp::Add,
+                Value::Concrete(ConcreteValue::Int(1)),
+                crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
+            )
+            .expect("a for-value placeholder is admitted until substitution");
+            let mut value = Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::resource_ref("source", "optional", Vec::new())),
+                default: Box::new(arithmetic),
+            });
+
+            let error = substitute_placeholder(&mut value, None, None, &item)
+                .expect_err("a substituted non-Int arithmetic operand must be typed error");
+            assert!(
+                error.message.contains("operand must be Int"),
+                "unexpected substitution error: {}",
+                error.message
+            );
+        }
+    }
 
     #[test]
     fn module_argument_rewrite_cannot_leave_its_access_base_stale() {

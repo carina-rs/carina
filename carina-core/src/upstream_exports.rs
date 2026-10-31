@@ -716,6 +716,10 @@ pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredFor
                 visit_possible_iterables(value, f);
                 visit_possible_iterables(default, f);
             }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                visit_possible_iterables(expression.lhs(), f);
+                visit_possible_iterables(expression.rhs(), f);
+            }
             Value::Deferred(DeferredValue::Secret(inner)) => visit_possible_iterables(inner, f),
             // References inside a function argument constrain that argument,
             // not the function result used as the iterable.

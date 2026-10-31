@@ -2265,7 +2265,7 @@ pub fn validate_deferred_populate_refs_with_ctx<E>(
     .collect()
 }
 
-pub fn validate_resource_ref_types_with_ctx<E>(
+pub fn validate_resource_ref_types_with_ctx<E: carina_core::parser::ExportParamLike>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::ModuleResolvedFile<E>,
     argument_names: &HashSet<String>,
@@ -2378,6 +2378,10 @@ fn value_contains_empty_interpolation(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_empty_interpolation(inner),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_empty_interpolation(value) || value_contains_empty_interpolation(default)
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            value_contains_empty_interpolation(expression.lhs())
+                || value_contains_empty_interpolation(expression.rhs())
         }
         Value::Deferred(
             DeferredValue::FunctionCall { args, .. }

@@ -40,6 +40,9 @@ impl ValueDescription {
             Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference".to_string(),
             Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference".to_string(),
             Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce expression".to_string(),
+            Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+                "integer arithmetic expression".to_string()
+            }
             Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation".to_string(),
             Value::Deferred(
                 DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },

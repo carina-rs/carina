@@ -314,9 +314,9 @@ pub fn top_level_anonymous_resource_spans(
                 provider: provider.to_string(),
                 resource_type: resource_type.to_string(),
                 span: TopLevelBlockSourceSpan {
-                    start_line: start.line,
-                    start_column: start.column,
-                    end_column: start.column + full_type.chars().count(),
+                    start_line: start.line(),
+                    start_column: start.column(),
+                    end_column: start.column() + full_type.chars().count(),
                 },
             });
         }
@@ -353,9 +353,9 @@ fn top_level_block_spans(
             };
             let start = preprocessed_file.original_position(block.as_span().start());
             spans.push(TopLevelBlockSourceSpan {
-                start_line: start.line,
-                start_column: start.column,
-                end_column: start.column + keyword.len(),
+                start_line: start.line(),
+                start_column: start.column(),
+                end_column: start.column() + keyword.len(),
             });
         }
     }
@@ -517,6 +517,7 @@ fn resolve_top_level_user_functions(
                     }
 
                     let mut warnings = Vec::new();
+                    ctx.set_preprocessed_file(&preprocessed_file);
                     match parse_fn_def(statement, &ctx, &mut warnings, &preprocessed_file) {
                         Ok(mut function) => {
                             function.body.source_file = path.map(Path::to_path_buf);
@@ -631,6 +632,7 @@ fn parse_with_seeded_bindings_inner(
     };
 
     let mut ctx = ParseContext::new(config);
+    ctx.set_preprocessed_file(&preprocessed_file);
     ctx.set_source_scope(source_file);
     ctx.defer_provisional_static_conditions = !bindings_fully_classified;
     ctx.warnings.extend(single_quote_warnings);
@@ -1149,10 +1151,10 @@ fn collect_single_quoted_interpolation_warnings_from_pair(
             let start = preprocessed_file.original_position(content_start + start);
             let end = preprocessed_file.original_position(content_start + end);
             let span = ParseWarningSpan {
-                start_line: start.line,
-                start_column: start.column,
-                end_line: end.line,
-                end_column: end.column,
+                start_line: start.line(),
+                start_column: start.column(),
+                end_line: end.line(),
+                end_column: end.column(),
             };
             warnings.push(ParseWarning {
                 file: None,

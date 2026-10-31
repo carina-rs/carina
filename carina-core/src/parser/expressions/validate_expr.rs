@@ -5,6 +5,7 @@
 //! lives in `parser/mod.rs` (it moves in part 2 of #2262); only the
 //! parser logic and the [`CompareOp`] enum live here.
 
+use super::integer_arithmetic::parse_integer_operator;
 use crate::parser::{ParseContext, ParseError, Rule, ValidateExpr, first_inner, next_pair};
 
 /// Comparison operator used inside [`ValidateExpr::Compare`].
@@ -61,7 +62,7 @@ pub(crate) fn parse_validate_expr(
         }
         Rule::validate_comparison => {
             let mut inner = pair.into_inner();
-            let lhs_pair = next_pair(&mut inner, "validate_primary", "validate_comparison")?;
+            let lhs_pair = next_pair(&mut inner, "validate_additive_expr", "validate_comparison")?;
             let lhs = parse_validate_expr(lhs_pair, ctx)?;
             if let Some(op_pair) = inner.next() {
                 let op = match op_pair.as_str() {
@@ -78,8 +79,11 @@ pub(crate) fn parse_validate_expr(
                         });
                     }
                 };
-                let rhs_pair =
-                    next_pair(&mut inner, "validate_primary", "validate_comparison rhs")?;
+                let rhs_pair = next_pair(
+                    &mut inner,
+                    "validate_additive_expr",
+                    "validate_comparison rhs",
+                )?;
                 let rhs = parse_validate_expr(rhs_pair, ctx)?;
                 Ok(ValidateExpr::Compare {
                     lhs: Box::new(lhs),
@@ -89,6 +93,27 @@ pub(crate) fn parse_validate_expr(
             } else {
                 Ok(lhs)
             }
+        }
+        Rule::validate_additive_expr | Rule::validate_multiplicative_expr => {
+            let context = if pair.as_rule() == Rule::validate_additive_expr {
+                "validate_additive_expr"
+            } else {
+                "validate_multiplicative_expr"
+            };
+            let mut inner = pair.into_inner();
+            let first = next_pair(&mut inner, "integer operand", context)?;
+            let mut result = parse_validate_expr(first, ctx)?;
+            while let Some(operator) = inner.next() {
+                let rhs = next_pair(&mut inner, "integer operand", context)?;
+                let (op, operator_span) = parse_integer_operator(operator, ctx)?;
+                result = ValidateExpr::IntegerArithmetic {
+                    lhs: Box::new(result),
+                    op,
+                    rhs: Box::new(parse_validate_expr(rhs, ctx)?),
+                    operator_span,
+                };
+            }
+            Ok(result)
         }
         Rule::validate_primary => {
             let inner = first_inner(pair, "value", "validate_primary")?;

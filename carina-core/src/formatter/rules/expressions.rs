@@ -177,9 +177,9 @@ impl Formatter {
             match child {
                 CstChild::Token(token) => {
                     if token.text == "|>" {
-                        self.write(" |> ");
+                        self.write_binary_operator("|>");
                     } else if token.text == "??" {
-                        self.write(" ?? ");
+                        self.write_binary_operator("??");
                     } else {
                         self.write_token(&token.text);
                     }
@@ -192,7 +192,7 @@ impl Formatter {
                     }
                     first = false;
                 }
-                CstChild::Trivia(_) => {}
+                CstChild::Trivia(trivia) => self.format_expression_trivia(trivia),
             }
         }
     }
@@ -201,8 +201,8 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
-                    if token.text == ">>" {
-                        self.write(" >> ");
+                    if matches!(token.text.as_str(), ">>" | "+" | "-" | "*" | "/" | "%") {
+                        self.write_binary_operator(&token.text);
                     } else {
                         self.write_token(&token.text);
                     }
@@ -210,7 +210,24 @@ impl Formatter {
                 CstChild::Node(n) => {
                     self.format_node(n);
                 }
-                CstChild::Trivia(_) => {}
+                CstChild::Trivia(trivia) => self.format_expression_trivia(trivia),
+            }
+        }
+    }
+
+    pub(in crate::formatter) fn format_validate_expr(&mut self, node: &CstNode) {
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => match token.text.as_str() {
+                    "&&" | "||" | "==" | "!=" | ">=" | "<=" | ">" | "<" => {
+                        self.write_binary_operator(&token.text);
+                    }
+                    "," => self.write(", "),
+                    "!" | "(" | ")" => self.write(&token.text),
+                    _ => self.write_token(&token.text),
+                },
+                CstChild::Node(child) => self.format_node(child),
+                CstChild::Trivia(trivia) => self.format_expression_trivia(trivia),
             }
         }
     }

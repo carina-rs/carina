@@ -598,10 +598,10 @@ fn find_duplicate_attrs_in_pair<'source>(
             let first = preprocessed_file.original_position(first_span.start());
             results.push(DuplicateAttr {
                 name,
-                line: start.line,
-                column: start.column,
-                end_column: end.column,
-                first_line: first.line,
+                line: start.line(),
+                column: start.column(),
+                end_column: end.column(),
+                first_line: first.line(),
             });
         } else {
             first_spans.insert(name, key_span);

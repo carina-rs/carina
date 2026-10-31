@@ -1056,6 +1056,12 @@ fn deterministic_value_string(value: &Value) -> String {
             deterministic_value_string(value),
             deterministic_value_string(default)
         ),
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => format!(
+            "IntegerArithmetic({:?}, {}, {})",
+            expression.op(),
+            deterministic_value_string(expression.lhs()),
+            deterministic_value_string(expression.rhs())
+        ),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             use crate::resource::InterpolationPart;
             let strs: Vec<String> = parts

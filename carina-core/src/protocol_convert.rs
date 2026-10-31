@@ -1659,6 +1659,7 @@ fn deferred_value_variant(value: &DeferredValue) -> &'static str {
             value: _value,
             default: _default,
         } => "Coalesce",
+        DeferredValue::IntegerArithmetic(_expression) => "IntegerArithmetic",
         DeferredValue::Interpolation(_parts) => "Interpolation",
         DeferredValue::FunctionCall {
             name: _name,

@@ -4061,6 +4061,39 @@ fn interpolation_completion_after_whitespace_offers_matching_binding() {
 }
 
 #[test]
+fn integer_operator_completion_offers_bindings_in_every_value_surface() {
+    let provider = test_provider_single_attr();
+    let prefix = "let helper = test.foo.bar { attr = 'value' }\n\
+                  let role = test.foo.bar {\n";
+
+    for operator in ["+", "-", "*", "/", "%"] {
+        for (surface, tail) in [
+            ("ordinary value", format!("  attr = 1 {operator} hel")),
+            (
+                "double-quoted interpolation",
+                format!("  attr = \"${{1 {operator} hel"),
+            ),
+            (
+                "heredoc interpolation",
+                format!("  attr = <<EOT\n${{1 {operator} hel"),
+            ),
+        ] {
+            let text = format!("{prefix}{tail}");
+            let completions =
+                provider.complete(&create_document(&text), position_at_end(&text), None);
+            let labels = completions
+                .iter()
+                .map(|completion| completion.label.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                labels.contains(&"helper"),
+                "operator {operator} in {surface} must offer helper: {labels:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn interpolation_completion_after_heredoc_body_punctuation_offers_binding() {
     for body in ["it's", "rm -rf /tmp/*"] {
         let provider = test_provider();

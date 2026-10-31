@@ -296,6 +296,12 @@ impl ResidualModuleResolutionError {
                     line: _,
                     message: _,
                 }
+                | ParseError::IntegerArithmetic {
+                    line: _,
+                    column: _,
+                    end_column: _,
+                    message: _,
+                }
                 | ParseError::UnboundLoopRead {
                     kind: _,
                     line: _,
@@ -1619,6 +1625,7 @@ fn audit_validate_expr_has_no_module_if(
     match expression {
         ValidateExpr::BoundArgument { value, .. } => audit_value_has_no_module_if(value, context),
         ValidateExpr::Compare { lhs, rhs, .. }
+        | ValidateExpr::IntegerArithmetic { lhs, rhs, .. }
         | ValidateExpr::And(lhs, rhs)
         | ValidateExpr::Or(lhs, rhs) => {
             audit_validate_expr_has_no_module_if(lhs, context)?;

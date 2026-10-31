@@ -366,6 +366,11 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
         CoreValue::Deferred(DeferredValue::Interpolation(_)) => {
             Err(SerializationError::UnresolvedInterpolation {
                 context: SerializationContext::WasmBoundary,
@@ -725,6 +730,11 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         }
         CoreValue::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce {
+                context: SerializationContext::WasmBoundary,
+            })
+        }
+        CoreValue::Deferred(DeferredValue::IntegerArithmetic(_)) => {
+            Err(SerializationError::UnresolvedIntegerArithmetic {
                 context: SerializationContext::WasmBoundary,
             })
         }

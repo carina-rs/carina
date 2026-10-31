@@ -248,6 +248,9 @@ fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
             value: _value,
             default: _default,
         }) => Err("the value contains an unresolved coalesce expression"),
+        Value::Deferred(DeferredValue::IntegerArithmetic(_expression)) => {
+            Err("the value contains unresolved integer arithmetic")
+        }
         Value::Deferred(DeferredValue::Interpolation(_parts)) => {
             Err("the value contains an unresolved interpolation")
         }

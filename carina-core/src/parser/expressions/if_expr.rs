@@ -108,6 +108,8 @@ fn expression_root_rule(pair: &pest::iterators::Pair<Rule>) -> Option<Rule> {
             | Rule::coalesce_expr
             | Rule::pipe_expr
             | Rule::compose_expr
+            | Rule::additive_expr
+            | Rule::multiplicative_expr
             | Rule::postfix_expr => current = current.into_inner().next()?,
             Rule::primary => {
                 let inner = current.into_inner().next()?;
