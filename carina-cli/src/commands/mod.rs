@@ -493,6 +493,9 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.extend(
             carina_core::parser::check_identifier_scope(&parsed)
                 .into_iter()
+                .chain(carina_core::parser::check_provider_instance_routing(
+                    &parsed,
+                ))
                 .map(|error| AppError::Config(error.to_string())),
         );
     }

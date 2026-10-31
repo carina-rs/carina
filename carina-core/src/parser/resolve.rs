@@ -1180,7 +1180,7 @@ pub fn check_identifier_scope<E: ExportParamLike>(parsed: &File<E>) -> Vec<Parse
 /// from the generic "is this identifier in scope" walk, and folding
 /// them together would force callers that only want one kind of
 /// validation to pay for both.
-pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
+pub fn check_provider_instance_routing<E>(parsed: &File<E>) -> Vec<ParseError> {
     let mut errors = Vec::new();
     // carina#3181: walk the typed top-level slices. `directives()` is
     // `None` for the composition arm (no `directives` on a synthetic node),

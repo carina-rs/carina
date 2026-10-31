@@ -522,11 +522,10 @@ impl DiagnosticEngine {
         }
 
         // carina#2191 Phase 5: surface `check_provider_instance_routing`
-        // errors as editor diagnostics. The CLI's `load_configuration`
-        // accumulates them in `identifier_scope_errors`; LSP runs the
-        // same pass against the merged parse so users see the same
-        // "unknown provider instance" / "no default instance for kind"
-        // message before they run `carina validate`.
+        // errors as editor diagnostics. CLI commands run the same pass in
+        // their shared validation pipeline; LSP runs it against the merged
+        // parse so users see the same "unknown provider instance" / "no
+        // default instance for kind" message before `carina validate`.
         if let Some(merged) = merged {
             for err in carina_core::parser::check_provider_instance_routing(merged) {
                 diagnostics.push(parse_error_to_diagnostic(&err));
@@ -954,11 +953,9 @@ impl DiagnosticEngine {
                     }
                 }
             };
-            let resolved_buffer_resources = resolved_buffer.as_ref().map(|resolved| {
-                resolved
-                    .iter_all_resources()
-                    .collect::<Vec<ResourceRef<'_>>>()
-            });
+            let resolved_buffer_resources = resolved_buffer
+                .as_ref()
+                .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
             if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
             {
@@ -998,9 +995,11 @@ impl DiagnosticEngine {
                 });
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || match rref {
-                    ResourceRef::Resource(m)
-                    | ResourceRef::Deferred { resource: m, .. }
-                    | ResourceRef::ParsedDeferred { resource: m, .. } => self.schemas.get_for(m),
+                    ResourceRef::Resource(m) => self.schemas.get_for(m),
+                    ResourceRef::Deferred {
+                        resource: m,
+                        deferred: _deferred,
+                    } => self.schemas.get_for(m),
                     ResourceRef::DataSource(d) => self.schemas.get_for_data_source(d),
                     ResourceRef::LiveComposition(_) => None,
                 };
@@ -1014,9 +1013,11 @@ impl DiagnosticEngine {
                     }
                     ResourceRef::Resource(_)
                     | ResourceRef::LiveComposition(_)
-                    | ResourceRef::DataSource(_)
-                    | ResourceRef::Deferred { .. }
-                    | ResourceRef::ParsedDeferred { .. } => None,
+                    | ResourceRef::DataSource(_) => None,
+                    ResourceRef::Deferred {
+                        resource: _resource,
+                        deferred: _deferred,
+                    } => None,
                 };
                 // Source-range hint for attribute position lookups. Without
                 // this, a `for`-body diagnostic like `mode = "aaa"` would
@@ -1149,8 +1150,15 @@ impl DiagnosticEngine {
                         ));
                     }
 
-                    if let ResourceRef::Resource(resource) | ResourceRef::Deferred { resource, .. } =
-                        rref
+                    let ignore_changes_resource = match rref {
+                        ResourceRef::Resource(resource) => Some(resource),
+                        ResourceRef::Deferred {
+                            resource,
+                            deferred: _deferred,
+                        } => Some(resource),
+                        ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
+                    };
+                    if let Some(resource) = ignore_changes_resource
                         && let Err(errors) = carina_core::resource::resolve_ignore_changes(
                             resource,
                             &validated_schema,
@@ -2127,9 +2135,9 @@ impl DiagnosticEngine {
 /// parses). Callers that fall back to `None` get document-wide search —
 /// the historic behavior — which is still correct when there's no
 /// ambiguity.
-fn resource_source_range(
+fn resource_source_range<D: carina_core::parser::DeferredForPhaseTraversal>(
     doc: &Document,
-    ctx: ResourceContext<'_>,
+    ctx: ResourceContext<'_, carina_core::resource::ModuleSource, D>,
     provider: &str,
     resource_type: &str,
     authored_direct_start: Option<u32>,
@@ -2138,9 +2146,8 @@ fn resource_source_range(
     let lines: Vec<&str> = text.lines().collect();
 
     let start = match ctx {
-        // `DeferredForExpression.line` is 1-indexed (pest line_col). Convert to 0-indexed.
-        ResourceContext::Deferred(deferred) => deferred.line.saturating_sub(1) as u32,
-        ResourceContext::ParsedDeferred(deferred) => deferred.line.saturating_sub(1) as u32,
+        // Deferred-loop lines are 1-indexed (pest line_col). Convert to 0-indexed.
+        ResourceContext::Deferred(deferred) => D::deferred_line(deferred).saturating_sub(1) as u32,
         ResourceContext::Direct => {
             if let Some(start) = authored_direct_start {
                 start

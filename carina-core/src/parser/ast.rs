@@ -259,11 +259,15 @@ impl ParsedDeferredForExpression {
             iterable_state,
             ParsedDeferredForIterableState::Deferred
         ));
-        let iterable_resolution = match &iterable {
-            Value::Concrete(_) => {
-                DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+        let iterable_resolution = if super::functions::contains_module_argument(&iterable) {
+            DeferredForIterableResolution::DependsOnEnclosingModuleArgument
+        } else {
+            match &iterable {
+                Value::Concrete(_) => {
+                    DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+                }
+                Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
             }
-            Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
         };
         let template_resource = match body {
             DeferredForBody::Resource(resource) => *resource,
@@ -599,16 +603,20 @@ impl ShapeMismatch {
     }
 }
 
-/// Origin of a resource yielded by [`ParsedFile::iter_all_resources`].
+/// Origin of a resource yielded by [`File::iter_all_resources`].
 ///
 /// `Direct` means the resource was declared at top-level and its iterable
-/// (if any) resolved at parse time. The deferred arms identify the template
-/// body before or after the post-module-expansion typestate seam.
+/// (if any) resolved at parse time. `Deferred` carries the phase-specific
+/// loop expression: parser files expose [`ParsedDeferredForExpression`], and
+/// module-resolved files expose [`DeferredForExpression`].
 #[derive(Debug)]
-pub enum ResourceContext<'a, S = ModuleSource> {
+pub enum ResourceContext<
+    'a,
+    S: 'a = ModuleSource,
+    D: DeferredForPhaseTraversal = ResolvedDeferredForPhase,
+> {
     Direct,
-    Deferred(&'a DeferredForExpression<S>),
-    ParsedDeferred(&'a ParsedDeferredForExpression),
+    Deferred(D::DeferredRef<'a, S>),
 }
 
 /// A resource yielded by [`File::iter_all_resources`], discriminated by
@@ -616,30 +624,29 @@ pub enum ResourceContext<'a, S = ModuleSource> {
 ///
 /// Part of the carina#3181 resource typestate split. The top-level arms borrow
 /// from [`File::resources`], [`File::compositions`], and
-/// [`File::data_sources`]. The deferred arms borrow the managed-resource
-/// template on either side of module resolution.
+/// [`File::data_sources`]. The deferred arm borrows the managed-resource
+/// template and the phase-specific loop expression.
 ///
 /// Read-only consumers use the `id`, `attributes`, and `binding` passthroughs;
 /// callers that branch on the kind match the enum arm directly.
 #[derive(Debug)]
-pub enum ResourceRef<'a, S = ModuleSource> {
+pub enum ResourceRef<
+    'a,
+    S: 'a = ModuleSource,
+    D: DeferredForPhaseTraversal = ResolvedDeferredForPhase,
+> {
     /// A top-level resource.
     Resource(&'a Resource<S>),
     /// A top-level composition (module-expansion synthetic node).
     LiveComposition(&'a LiveComposition),
     /// A top-level data source (`read`-keyword resource).
     DataSource(&'a DataSource<S>),
-    /// The template body of a resolved deferred `for` expression.
+    /// The managed-resource body of a deferred `for` expression. The
+    /// `deferred` field's type is selected by `D`, so a resolved file cannot
+    /// name or yield a parser-side loop body.
     Deferred {
         resource: &'a Resource<S>,
-        deferred: &'a DeferredForExpression<S>,
-    },
-    /// The managed-resource body of a parser-side deferred `for`
-    /// expression. Parser-side `read` and module-call bodies are not
-    /// resources and are never yielded.
-    ParsedDeferred {
-        resource: &'a Resource,
-        deferred: &'a ParsedDeferredForExpression,
+        deferred: D::DeferredRef<'a, S>,
     },
 }
 
@@ -647,42 +654,43 @@ pub enum ResourceRef<'a, S = ModuleSource> {
 /// transformations. The resolved deferred arm also exposes its denormalized
 /// attribute projection so callers can keep it synchronized after mutation.
 #[derive(Debug)]
-pub enum ResourceMut<'a> {
+pub enum ResourceMut<'a, D: DeferredForPhaseTraversal = ResolvedDeferredForPhase> {
     Resource(&'a mut Resource),
     LiveComposition(&'a mut LiveComposition),
     DataSource(&'a mut DataSource),
     Deferred {
         resource: &'a mut Resource,
-        attributes: &'a mut Vec<(String, Value)>,
+        attributes: D::DeferredAttributesMut<'a>,
     },
-    ParsedDeferred(&'a mut Resource),
 }
 
-impl<S> Copy for ResourceContext<'_, S> {}
+impl<'a, S: 'a, D: DeferredForPhaseTraversal> Copy for ResourceContext<'a, S, D> {}
 
-impl<S> Clone for ResourceContext<'_, S> {
+impl<'a, S: 'a, D: DeferredForPhaseTraversal> Clone for ResourceContext<'a, S, D> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<S> Copy for ResourceRef<'_, S> {}
+impl<'a, S: 'a, D: DeferredForPhaseTraversal> Copy for ResourceRef<'a, S, D> {}
 
-impl<S> Clone for ResourceRef<'_, S> {
+impl<'a, S: 'a, D: DeferredForPhaseTraversal> Clone for ResourceRef<'a, S, D> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'a, S> ResourceRef<'a, S> {
+impl<'a, S: 'a, D: DeferredForPhaseTraversal> ResourceRef<'a, S, D> {
     /// Stable identifier of this resource.
     pub fn id(&self) -> &'a ResourceId {
         match self {
             ResourceRef::Resource(r) => &r.id,
             ResourceRef::LiveComposition(v) => &v.id,
             ResourceRef::DataSource(d) => &d.id,
-            ResourceRef::Deferred { resource, .. } => &resource.id,
-            ResourceRef::ParsedDeferred { resource, .. } => &resource.id,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.id,
         }
     }
 
@@ -706,12 +714,10 @@ impl<'a, S> ResourceRef<'a, S> {
                     .collect(),
             ),
             ResourceRef::DataSource(d) => std::borrow::Cow::Borrowed(&d.attributes),
-            ResourceRef::Deferred { resource, .. } => {
-                std::borrow::Cow::Borrowed(&resource.attributes)
-            }
-            ResourceRef::ParsedDeferred { resource, .. } => {
-                std::borrow::Cow::Borrowed(&resource.attributes)
-            }
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => std::borrow::Cow::Borrowed(&resource.attributes),
         }
     }
 
@@ -721,8 +727,10 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::Resource(r) => r.binding.as_deref(),
             ResourceRef::LiveComposition(v) => v.binding.as_deref(),
             ResourceRef::DataSource(d) => d.binding.as_deref(),
-            ResourceRef::Deferred { resource, .. } => resource.binding.as_deref(),
-            ResourceRef::ParsedDeferred { resource, .. } => resource.binding.as_deref(),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => resource.binding.as_deref(),
         }
     }
 
@@ -737,8 +745,10 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::Resource(r) => &r.dependency_bindings,
             ResourceRef::LiveComposition(v) => &v.dependency_bindings,
             ResourceRef::DataSource(d) => &d.dependency_bindings,
-            ResourceRef::Deferred { resource, .. } => &resource.dependency_bindings,
-            ResourceRef::ParsedDeferred { resource, .. } => &resource.dependency_bindings,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.dependency_bindings,
         }
     }
 
@@ -750,8 +760,10 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::Resource(r) => Some(&r.directives),
             ResourceRef::LiveComposition(_) => None,
             ResourceRef::DataSource(d) => Some(&d.directives),
-            ResourceRef::Deferred { resource, .. } => Some(&resource.directives),
-            ResourceRef::ParsedDeferred { resource, .. } => Some(&resource.directives),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => Some(&resource.directives),
         }
     }
 
@@ -761,19 +773,21 @@ impl<'a, S> ResourceRef<'a, S> {
             ResourceRef::Resource(r) => &r.quoted_string_attrs,
             ResourceRef::LiveComposition(v) => &v.quoted_string_attrs,
             ResourceRef::DataSource(d) => &d.quoted_string_attrs,
-            ResourceRef::Deferred { resource, .. } => &resource.quoted_string_attrs,
-            ResourceRef::ParsedDeferred { resource, .. } => &resource.quoted_string_attrs,
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => &resource.quoted_string_attrs,
         }
     }
 
     /// Source context for this resource: top-level, resolved deferred, or
     /// parser-side deferred.
-    pub fn context(&self) -> ResourceContext<'a, S> {
+    pub fn context(&self) -> ResourceContext<'a, S, D> {
         match self {
-            ResourceRef::Deferred { deferred, .. } => ResourceContext::Deferred(deferred),
-            ResourceRef::ParsedDeferred { deferred, .. } => {
-                ResourceContext::ParsedDeferred(deferred)
-            }
+            ResourceRef::Deferred {
+                resource: _resource,
+                deferred,
+            } => ResourceContext::Deferred(*deferred),
             ResourceRef::Resource(_)
             | ResourceRef::LiveComposition(_)
             | ResourceRef::DataSource(_) => ResourceContext::Direct,
@@ -2982,35 +2996,52 @@ mod deferred_for_phase_private {
 /// caller's typestate.
 #[doc(hidden)]
 pub trait DeferredForPhaseTraversal: deferred_for_phase_private::Sealed {
-    fn resource_refs(&self) -> Box<dyn Iterator<Item = ResourceRef<'_>> + '_>;
-    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_>> + '_>;
+    type DeferredRef<'a, S: 'a>: Copy;
+    type DeferredAttributesMut<'a>;
+
+    fn resource_refs(&self) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, Self>> + '_>
+    where
+        Self: Sized;
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, Self>> + '_>
+    where
+        Self: Sized;
     fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_>> + '_>;
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str;
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize;
+
+    fn sync_deferred_attributes(attributes: Self::DeferredAttributesMut<'_>, resource: &Resource);
 }
 
 impl deferred_for_phase_private::Sealed for ParsedDeferredForPhase {}
 
 impl DeferredForPhaseTraversal for ParsedDeferredForPhase {
-    fn resource_refs(&self) -> Box<dyn Iterator<Item = ResourceRef<'_>> + '_> {
+    type DeferredRef<'a, S: 'a> = &'a ParsedDeferredForExpression;
+    type DeferredAttributesMut<'a> = ();
+
+    fn resource_refs(&self) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, Self>> + '_> {
         Box::new(
             self.expressions
                 .iter()
                 .filter_map(|deferred| match &deferred.body {
                     DeferredForBody::Resource(resource) => {
-                        Some(ResourceRef::ParsedDeferred { resource, deferred })
+                        Some(ResourceRef::Deferred { resource, deferred })
                     }
                     DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
                 }),
         )
     }
 
-    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_>> + '_> {
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, Self>> + '_> {
         Box::new(
             self.expressions
                 .iter_mut()
                 .filter_map(|deferred| match &mut deferred.body {
-                    DeferredForBody::Resource(resource) => {
-                        Some(ResourceMut::ParsedDeferred(resource))
-                    }
+                    DeferredForBody::Resource(resource) => Some(ResourceMut::Deferred {
+                        resource,
+                        attributes: (),
+                    }),
                     DeferredForBody::Read(_) | DeferredForBody::ModuleCall(_) => None,
                 }),
         )
@@ -3023,12 +3054,29 @@ impl DeferredForPhaseTraversal for ParsedDeferredForPhase {
                 .map(ParsedDeferredForExpression::site),
         )
     }
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str {
+        &deferred.header
+    }
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize {
+        deferred.line
+    }
+
+    fn sync_deferred_attributes(
+        _attributes: Self::DeferredAttributesMut<'_>,
+        _resource: &Resource,
+    ) {
+    }
 }
 
 impl deferred_for_phase_private::Sealed for ResolvedDeferredForPhase {}
 
 impl DeferredForPhaseTraversal for ResolvedDeferredForPhase {
-    fn resource_refs(&self) -> Box<dyn Iterator<Item = ResourceRef<'_>> + '_> {
+    type DeferredRef<'a, S: 'a> = &'a DeferredForExpression<S>;
+    type DeferredAttributesMut<'a> = &'a mut Vec<(String, Value)>;
+
+    fn resource_refs(&self) -> Box<dyn Iterator<Item = ResourceRef<'_, ModuleSource, Self>> + '_> {
         Box::new(
             self.expressions
                 .iter()
@@ -3039,7 +3087,7 @@ impl DeferredForPhaseTraversal for ResolvedDeferredForPhase {
         )
     }
 
-    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_>> + '_> {
+    fn resource_muts(&mut self) -> Box<dyn Iterator<Item = ResourceMut<'_, Self>> + '_> {
         Box::new(
             self.expressions
                 .iter_mut()
@@ -3052,6 +3100,18 @@ impl DeferredForPhaseTraversal for ResolvedDeferredForPhase {
 
     fn sites(&self) -> Box<dyn Iterator<Item = DeferredForSite<'_>> + '_> {
         Box::new(self.expressions.iter().map(DeferredForExpression::site))
+    }
+
+    fn deferred_header<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a str {
+        &deferred.header
+    }
+
+    fn deferred_line<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> usize {
+        deferred.line
+    }
+
+    fn sync_deferred_attributes(attributes: Self::DeferredAttributesMut<'_>, resource: &Resource) {
+        *attributes = resource.attributes.clone().into_iter().collect();
     }
 }
 
@@ -3462,7 +3522,7 @@ impl<E, D> File<E, D> {
 impl<E, D: DeferredForPhaseTraversal> File<E, D> {
     /// Iterate every resource reachable from the file, preserving the
     /// deferred-loop phase in each deferred resource arm.
-    pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_>> {
+    pub fn iter_all_resources(&self) -> impl Iterator<Item = ResourceRef<'_, ModuleSource, D>> {
         self.resources
             .iter()
             .map(ResourceRef::Resource)
@@ -3471,7 +3531,7 @@ impl<E, D: DeferredForPhaseTraversal> File<E, D> {
             .chain(self.deferred_for_phase.resource_refs())
     }
 
-    pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_>> {
+    pub fn iter_all_resources_mut(&mut self) -> impl Iterator<Item = ResourceMut<'_, D>> {
         self.resources
             .iter_mut()
             .map(ResourceMut::Resource)

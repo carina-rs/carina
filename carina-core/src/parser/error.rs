@@ -29,6 +29,7 @@ impl std::fmt::Display for DeferredForBodyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeferredForIterableResolution {
     StillDeferred,
+    DependsOnEnclosingModuleArgument,
     ConcreteAfterModuleArgumentSubstitution,
 }
 
@@ -252,6 +253,13 @@ fn format_deferred_for_body_unsupported(
              is still unresolved after module expansion, and only a managed resource body can be \
              deferred until apply. Iterate over a value known before module expansion, or put \
              managed resources directly in the loop body"
+        ),
+        DeferredForIterableResolution::DependsOnEnclosingModuleArgument => format!(
+            "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
+             still depends on an enclosing module argument at this module-expansion boundary, \
+             and replaying {body} after nested module expansion is not supported. Move the loop \
+             to the caller where that argument is supplied, or put managed resources directly \
+             in the loop body"
         ),
         DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution => format!(
             "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \

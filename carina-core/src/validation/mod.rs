@@ -904,11 +904,11 @@ fn resource_sink<'a, E, D: crate::parser::DeferredForPhaseTraversal>(
         Some(ResourceRef::DataSource(data_source)) => {
             schemas.get_for_data_source(data_source)?.schema()
         }
-        Some(
-            ResourceRef::Resource(resource)
-            | ResourceRef::Deferred { resource, .. }
-            | ResourceRef::ParsedDeferred { resource, .. },
-        ) => schemas.get_for(resource)?.schema(),
+        Some(ResourceRef::Resource(resource)) => schemas.get_for(resource)?.schema(),
+        Some(ResourceRef::Deferred {
+            resource,
+            deferred: _deferred,
+        }) => schemas.get_for(resource)?.schema(),
         None => return None,
     };
     let mut segments = path.segments().iter();
@@ -2786,9 +2786,11 @@ pub fn validate_resources<E, D: crate::parser::DeferredForPhaseTraversal>(
                 parsed
                     .iter_all_resources()
                     .filter_map(|resource| match resource {
-                        ResourceRef::Resource(resource)
-                        | ResourceRef::Deferred { resource, .. }
-                        | ResourceRef::ParsedDeferred { resource, .. } => Some(resource),
+                        ResourceRef::Resource(resource) => Some(resource),
+                        ResourceRef::Deferred {
+                            resource,
+                            deferred: _deferred,
+                        } => Some(resource),
                         ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
                     }),
                 registry,
@@ -2885,16 +2887,18 @@ pub fn validate_resources<E, D: crate::parser::DeferredForPhaseTraversal>(
             ResourceRef::DataSource(d) => {
                 (ValidatableKind::DataSource, registry.get_for_data_source(d))
             }
-            ResourceRef::Resource(m)
-            | ResourceRef::Deferred { resource: m, .. }
-            | ResourceRef::ParsedDeferred { resource: m, .. } => {
-                (ValidatableKind::Resource, registry.get_for(m))
-            }
+            ResourceRef::Resource(m) => (ValidatableKind::Resource, registry.get_for(m)),
+            ResourceRef::Deferred {
+                resource: m,
+                deferred: _deferred,
+            } => (ValidatableKind::Resource, registry.get_for(m)),
         };
         let managed_resource = match rref {
-            ResourceRef::Resource(resource)
-            | ResourceRef::Deferred { resource, .. }
-            | ResourceRef::ParsedDeferred { resource, .. } => Some(resource),
+            ResourceRef::Resource(resource) => Some(resource),
+            ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => Some(resource),
             ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
         };
         validate_resource(
@@ -3033,9 +3037,11 @@ fn validate_resource_ref_types_inner<E, D: crate::parser::DeferredForPhaseTraver
         let schema = match rref {
             ResourceRef::LiveComposition(_) => continue,
             ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-            ResourceRef::Resource(m)
-            | ResourceRef::Deferred { resource: m, .. }
-            | ResourceRef::ParsedDeferred { resource: m, .. } => registry.get_for(m),
+            ResourceRef::Resource(m) => registry.get_for(m),
+            ResourceRef::Deferred {
+                resource: m,
+                deferred: _deferred,
+            } => registry.get_for(m),
         };
         let Some(validated_schema) = schema else {
             continue;
@@ -3044,10 +3050,11 @@ fn validate_resource_ref_types_inner<E, D: crate::parser::DeferredForPhaseTraver
         let resource_location = match rref.context() {
             ResourceContext::Direct => resource_id.to_string(),
             ResourceContext::Deferred(deferred) => {
-                format!("for-body `{}` {}", deferred.header, resource_id)
-            }
-            ResourceContext::ParsedDeferred(deferred) => {
-                format!("for-body `{}` {}", deferred.header, resource_id)
+                format!(
+                    "for-body `{}` {}",
+                    D::deferred_header(deferred),
+                    resource_id
+                )
             }
         };
 
@@ -6416,9 +6423,9 @@ fn check_unused_bindings_in_resolved_file(
     check_unused_bindings_in_file_parts(parsed, resources, deferred_sites)
 }
 
-fn check_unused_bindings_in_file_parts<'a, D>(
+fn check_unused_bindings_in_file_parts<'a, D: crate::parser::DeferredForPhaseTraversal>(
     parsed: &'a crate::parser::File<crate::parser::ParsedExportParam, D>,
-    resources: Vec<ResourceRef<'a>>,
+    resources: Vec<ResourceRef<'a, crate::resource::ModuleSource, D>>,
     deferred_sites: Vec<crate::parser::DeferredForSite<'a>>,
 ) -> Vec<String> {
     let mut referenced: HashSet<String> = HashSet::new();

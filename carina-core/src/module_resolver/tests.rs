@@ -6769,8 +6769,9 @@ let resources = for item in itmes {
         &crate::schema::SchemaRegistry::new(),
     )
     .expect("undefined iterable remains deferred until finalization");
+    let identifier_scope_errors = crate::parser::check_identifier_scope(&loaded.parsed);
     assert!(matches!(
-        loaded.identifier_scope_errors.as_slice(),
+        identifier_scope_errors.as_slice(),
         [crate::parser::ParseError::Located { error, .. }]
             if matches!(error.as_ref(), crate::parser::ParseError::UndefinedDeferredIterable { name, .. } if name == "itmes")
     ));

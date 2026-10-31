@@ -381,21 +381,16 @@ fn resolve_upstream_exports_with_context(
 /// `for-body` prefix when the resource is a deferred-for template.
 /// Three checks emit the same string; centralized here so a future
 /// tweak to the wording lands in one place.
-fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
+fn resource_attr_location<D: crate::parser::DeferredForPhaseTraversal>(
+    rref: ResourceRef<'_, crate::resource::ModuleSource, D>,
+    attr_name: &str,
+) -> String {
     match rref.context() {
         ResourceContext::Direct => format!("{} attribute `{}`", rref.id(), attr_name),
         ResourceContext::Deferred(d) => {
             format!(
                 "for-body `{}` {} attribute `{}`",
-                d.header,
-                rref.id(),
-                attr_name
-            )
-        }
-        ResourceContext::ParsedDeferred(d) => {
-            format!(
-                "for-body `{}` {} attribute `{}`",
-                d.header,
+                D::deferred_header(d),
                 rref.id(),
                 attr_name
             )

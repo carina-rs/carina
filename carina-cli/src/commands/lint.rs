@@ -172,12 +172,10 @@ pub fn run_lint(
             carina_core::parser::ResourceRef::Resource(m) => schemas.get_for(m),
             carina_core::parser::ResourceRef::DataSource(d) => schemas.get_for_data_source(d),
             carina_core::parser::ResourceRef::LiveComposition(_) => None,
-            carina_core::parser::ResourceRef::Deferred { resource, .. } => {
-                schemas.get_for(resource)
-            }
-            carina_core::parser::ResourceRef::ParsedDeferred { resource, .. } => {
-                schemas.get_for(resource)
-            }
+            carina_core::parser::ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => schemas.get_for(resource),
         };
         if let Some(schema) = schema {
             let schema = schema.as_schema();

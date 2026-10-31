@@ -539,9 +539,13 @@ impl<'a> BindingIndex<'a> {
             // via `get_for`, data sources via `get_for_data_source`.
             // Compositions carry their own statically known attribute map.
             let target = match rref {
-                ResourceRef::Resource(m)
-                | ResourceRef::Deferred { resource: m, .. }
-                | ResourceRef::ParsedDeferred { resource: m, .. } => registry
+                ResourceRef::Resource(m) => registry
+                    .get_for(m)
+                    .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
+                ResourceRef::Deferred {
+                    resource: m,
+                    deferred: _deferred,
+                } => registry
                     .get_for(m)
                     .map(|schema| BindingTarget::Schema(schema.schema().as_schema())),
                 ResourceRef::DataSource(d) => registry

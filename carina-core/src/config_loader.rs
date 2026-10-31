@@ -328,13 +328,6 @@ pub struct LoadedConfig {
     /// authored reference graph.
     pub unresolved_parsed: UnresolvedConfigSnapshot,
     pub backend_file: Option<PathBuf>,
-    /// Identifier-scope errors surfaced by [`parser::check_identifier_scope`]
-    /// on the merged directory parse: ResourceRef roots in resources /
-    /// attribute / module / export values, including the distinct typed error
-    /// for a bare undefined deferred-`for` iterable. The loader does not
-    /// short-circuit on these errors so later validators can also run in a
-    /// single pass.
-    pub identifier_scope_errors: Vec<parser::ParseError>,
     /// Directory-wide declaration collisions. These are non-blocking at the
     /// load boundary so editor callers retain the parsed tree; validation
     /// commands decide whether to treat them as hard errors.
@@ -605,12 +598,6 @@ pub fn load_configuration_with_config(
         // (see `carina-cli/src/commands/mod.rs`); LSP follows the same
         // contract. See #2717.
 
-        // Identifier-scope checks are accumulated rather than short-
-        // circuited so `carina validate` can keep going and report every
-        // static error in one pass (#2102, #2126, #2138).
-        let mut identifier_scope_errors = parser::check_identifier_scope(&merged);
-        identifier_scope_errors.extend(parser::check_provider_instance_routing(&merged));
-
         // Phase transition: post-resolve, run rhs-driven inference over
         // every `exports { ... }` declaration so downstream consumers
         // retain origin and unchecked provenance per export (#2360 stage 2).
@@ -621,7 +608,6 @@ pub fn load_configuration_with_config(
             authored_bindings,
             unresolved_parsed: UnresolvedConfigSnapshot::from_parsed(unresolved_merged),
             backend_file,
-            identifier_scope_errors,
             duplicate_declarations,
         })
     } else {
@@ -861,11 +847,10 @@ fn parse_directory_with_overrides_impl(
     // Consumers (CLI, LSP) call finalize themselves after expansion.
     // See #2717.
 
-    // Identifier-scope validation is left to callers. LSP needs the
-    // ParsedFile even when a reference is unresolved, so it can surface
-    // the error as a diagnostic; CLI entry points call
-    // `parser::check_identifier_scope` themselves (see
-    // `load_configuration_with_config`).
+    // Identifier-scope and provider-routing validation are left to callers.
+    // LSP needs the ParsedFile even when a reference is unresolved, so it can
+    // surface the error as a diagnostic; CLI commands run both checks through
+    // the shared validation pipeline.
     Ok(DirectoryParseResult {
         parsed: merged,
         authored_bindings,
@@ -2513,6 +2498,59 @@ let orgs = upstream_state {
     }
 
     #[test]
+    fn nested_module_argument_iterable_reports_module_argument_classification() {
+        let fixture = tempfile::tempdir().expect("nested module-argument fixture");
+        fs::create_dir_all(fixture.path().join("a")).expect("module A directory");
+        fs::create_dir_all(fixture.path().join("b")).expect("module B directory");
+        fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("providers fixture");
+        fs::write(
+            fixture.path().join("main.crn"),
+            "let a = use { source = './a' }\na { names = ['x'] }\n",
+        )
+        .expect("root fixture");
+        fs::write(
+            fixture.path().join("a/main.crn"),
+            "arguments { names: list(String) }\n\
+             let b = use { source = '../b' }\n\
+             b { items = names }\n",
+        )
+        .expect("module A fixture");
+        fs::write(
+            fixture.path().join("b/main.crn"),
+            "arguments { items: list(String) }\n\
+             let reads = for i in items { read mock.test.ds { name = i } }\n",
+        )
+        .expect("module B fixture");
+
+        let error = resolve_deferred_for_fixture(&fixture)
+            .expect_err("nested deferred read replay must be rejected");
+        let crate::module_resolver::ModuleError::ParseInFile { path, error } = error.root_cause()
+        else {
+            panic!("expected a file-owned typed parse error, got {error:?}");
+        };
+        assert!(path.ends_with("b/main.crn"), "unexpected owner: {path:?}");
+        let crate::parser::ParseError::DeferredForBodyUnsupported(details) = error.as_ref() else {
+            panic!("expected a deferred-body error, got {error:?}");
+        };
+        assert_eq!(details.header, "for i in items");
+        assert_eq!(
+            details.body,
+            crate::parser::DeferredForBodyKind::Read {
+                resource_type: "mock.test.ds".to_string(),
+            }
+        );
+        assert_eq!(
+            details.iterable_resolution,
+            crate::parser::DeferredForIterableResolution::DependsOnEnclosingModuleArgument,
+            "an enclosing module-argument placeholder needs its own classification",
+        );
+        let message = error.to_string();
+        assert!(message.contains("module argument"), "{message}");
+        assert!(message.contains("Move the loop to the caller"), "{message}");
+    }
+
+    #[test]
     fn directory_validate_path_keeps_deferred_for_resource_placeholder() {
         let fixture = deferred_for_body_fixture(
             "let child = use { source = './child' }\n\
@@ -2621,75 +2659,6 @@ awscc.ec2.SecurityGroup {
             }
             other => panic!("unexpected error: {other}"),
         }
-
-        // Dotted references remain ordinary root identifier-scope
-        // diagnostics; a bare undefined iterable uses its distinct typed
-        // variant through the same pass.
-        let dir2 = create_temp_dir("undefined_for_iterable_cli");
-        fs::write(
-            dir2.join("main.crn"),
-            r#"for name, account_id in does_not_exist.accounts {
-  aws.s3.Bucket {
-    name = name
-  }
-}
-"#,
-        )
-        .unwrap();
-        let loaded = load_configuration_with_config(
-            &dir2,
-            &ProviderContext::default(),
-            &SchemaRegistry::new(),
-        )
-        .expect("load_configuration should not short-circuit on identifier-scope errors");
-        cleanup(&dir2);
-        assert_eq!(
-            loaded.identifier_scope_errors.len(),
-            1,
-            "expected one identifier-scope error, got {:?}",
-            loaded.identifier_scope_errors,
-        );
-        match &loaded.identifier_scope_errors[0] {
-            parser::ParseError::UndefinedIdentifier { name, .. } => {
-                assert_eq!(name, "does_not_exist");
-            }
-            other => panic!("unexpected error: {other}"),
-        }
-    }
-
-    // Acceptance for #2126. Per-file parse must not reject a ResourceRef
-    // whose root is declared in a sibling `.crn`. The check lives on the
-    // merged `ParsedFile` via `check_identifier_scope` (#2138).
-    #[test]
-    fn parse_directory_accepts_cross_file_resource_ref() {
-        let dir = create_temp_dir("cross_file_resource_ref");
-        fs::write(
-            dir.join("main.crn"),
-            r#"let attach = aws.organizations.attach {
-    target_id = caller.account_id
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            dir.join("backend.crn"),
-            r#"let caller = read aws.sts.caller_identity {}
-"#,
-        )
-        .unwrap();
-
-        let loaded = load_configuration_with_config(
-            &dir,
-            &ProviderContext::default(),
-            &SchemaRegistry::new(),
-        )
-        .expect("directory with cross-file ResourceRef must load without error");
-        cleanup(&dir);
-        assert!(
-            loaded.identifier_scope_errors.is_empty(),
-            "no identifier-scope errors expected, got: {:?}",
-            loaded.identifier_scope_errors,
-        );
     }
 
     #[test]

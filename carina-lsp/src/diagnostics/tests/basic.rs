@@ -9,6 +9,35 @@ fn analyze_rejects_a_mismatched_document_source_path() {
 }
 
 #[test]
+fn provider_instance_routing_is_reported_once_for_multifile_directory() {
+    let fixture = tempfile::tempdir().expect("provider-routing fixture");
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+        .expect("provider declaration");
+    let source = r#"mock.test.resource {
+  name = "example"
+  directives { provider = typo }
+}
+"#;
+    let main_path = fixture.path().join("main.crn");
+    std::fs::write(&main_path, source).expect("routed resource");
+
+    let diagnostics = test_engine().analyze(
+        &create_document_at(source, main_path.clone()),
+        Some(&main_path),
+    );
+    let routing_error = "`typo` is not a known provider instance";
+    let occurrences = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains(routing_error))
+        .count();
+
+    assert_eq!(
+        occurrences, 1,
+        "LSP must report the routing error exactly once: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn provider_config_enum_accepts_identity_or_configured_provider_namespace_only() {
     for (provider_name, raw) in [
         ("awscc", "awscc.Region.ap_northeast_1"),

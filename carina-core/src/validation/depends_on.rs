@@ -75,7 +75,9 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
+fn depends_on_of<'a, D: crate::parser::DeferredForPhaseTraversal>(
+    rref: ResourceRef<'a, crate::resource::ModuleSource, D>,
+) -> &'a [String] {
     rref.directives()
         .map_or(&[][..], |d| d.depends_on.as_slice())
 }
@@ -99,7 +101,7 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, ResourceRef<'_>> = parsed
+    let bindings_by_name: HashMap<&str, ResourceRef<'_, crate::resource::ModuleSource, D>> = parsed
         .iter_all_resources()
         .filter_map(|rref| rref.binding().map(|n| (n, rref)))
         .collect();

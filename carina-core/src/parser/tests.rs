@@ -103,8 +103,34 @@ fn iter_all_resources_yields_direct_then_deferred() {
     );
 
     // The for-expression template body comes last as a Deferred arm.
-    assert!(matches!(items[1], ResourceRef::Deferred { .. }));
+    let ResourceRef::Deferred { resource, deferred } = items[1] else {
+        panic!("expected a resolved deferred resource, got {:?}", items[1]);
+    };
+    assert_eq!(resource.id, deferred.template_resource.id);
     assert!(matches!(items[1].context(), ResourceContext::Deferred(_)));
+}
+
+#[test]
+fn resolved_resource_iterator_is_phase_exhaustive() {
+    let resolved = cross_deferred_for_resolution_seam(ParsedFile::default());
+
+    let kinds = resolved
+        .iter_all_resources()
+        .map(|resource| match resource {
+            ResourceRef::Resource(resource) => resource.id.resource_type.as_str(),
+            ResourceRef::LiveComposition(composition) => composition.id.resource_type.as_str(),
+            ResourceRef::DataSource(data_source) => data_source.id.resource_type.as_str(),
+            ResourceRef::Deferred { resource, deferred } => {
+                assert_eq!(
+                    resource.id.resource_type,
+                    deferred.template_resource.id.resource_type
+                );
+                resource.id.resource_type.as_str()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert!(kinds.is_empty());
 }
 
 /// carina#3181: `iter_all_resources` yields each resource exactly once
@@ -10127,11 +10153,19 @@ let calls = for x in src.list { child { item = x } }
             .all(|resource| resource.id().resource_type == "test.resource")
     );
     assert!(matches!(resources[0], ResourceRef::Resource(_)));
-    assert!(matches!(resources[1], ResourceRef::ParsedDeferred { .. }));
-    assert!(matches!(
-        resources[1].context(),
-        ResourceContext::ParsedDeferred(_)
-    ));
+    let ResourceRef::Deferred { resource, deferred } = resources[1] else {
+        panic!(
+            "expected a parser-side deferred resource, got {:?}",
+            resources[1]
+        );
+    };
+    assert_eq!(resource.id.resource_type, "test.resource");
+    assert_eq!(deferred.header, "for x in src.list");
+    assert!(matches!(deferred.body, DeferredForBody::Resource(_)));
+    let ResourceContext::Deferred(context) = resources[1].context() else {
+        panic!("expected parser-side deferred context");
+    };
+    assert_eq!(context.header, "for x in src.list");
 }
 
 #[test]

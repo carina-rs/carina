@@ -219,19 +219,15 @@ fn validated_entries<E>(
             )
         })
         .map(|rref| match rref {
-            ResourceRef::Deferred { deferred: d, .. } => ValidatedEntry::DeferredLoop {
+            ResourceRef::Deferred {
+                resource: _resource,
+                deferred: d,
+            } => ValidatedEntry::DeferredLoop {
                 resource_type: d.resource_type.clone(),
                 target: &d.target,
                 header: &d.header,
                 file: d.file.as_deref(),
                 line: d.line,
-            },
-            ResourceRef::ParsedDeferred { resource, deferred } => ValidatedEntry::DeferredLoop {
-                resource_type: resource.id.display_type(),
-                target: &deferred.target,
-                header: &deferred.header,
-                file: deferred.file.as_deref(),
-                line: deferred.line,
             },
             // Managed / Virtual / DataSource — all direct, classified
             // by whether the id has a resolved identity.
@@ -432,6 +428,22 @@ fn check_upstream_state_sources(
 mod tests {
     use super::*;
 
+    fn unknown_provider_instance_fixture() -> tempfile::TempDir {
+        let fixture = tempfile::tempdir().expect("provider-routing fixture");
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("write provider declaration");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"mock.test.resource {
+  name = "example"
+  directives { provider = typo }
+}
+"#,
+        )
+        .expect("write routed resource");
+        fixture
+    }
+
     fn resolve_file_for_test(
         parsed: carina_core::parser::ParsedFile,
     ) -> carina_core::parser::ModuleResolvedParsedFile {
@@ -482,6 +494,110 @@ backend s3 {
         assert!(
             error.contains("Invalid attribute 'region' for backend type 's3'"),
             "unrelated backend validation error is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_reports_multifile_unknown_provider_instance_once() {
+        let fixture = unknown_provider_instance_fixture();
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let routing_error = "`typo` is not a known provider instance";
+        let occurrences = errors
+            .iter()
+            .map(|error| error.matches(routing_error).count())
+            .sum::<usize>();
+
+        assert_eq!(
+            occurrences, 1,
+            "validate must report the routing error exactly once: {errors:#?}",
+        );
+    }
+
+    #[test]
+    fn plan_validation_reports_multifile_unknown_provider_instance_once() {
+        let fixture = unknown_provider_instance_fixture();
+        let loaded = load_configuration_with_config(
+            fixture.path(),
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("load provider-routing fixture");
+        let providers = ProviderLoad::for_test(Vec::new(), &loaded.parsed.providers);
+
+        let error = match providers.validate_config_pair(
+            loaded.parsed,
+            loaded.unresolved_parsed,
+            fixture.path(),
+            false,
+            &loaded.duplicate_declarations,
+        ) {
+            Ok(_) => panic!("plan validation must reject the unknown provider instance"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        let routing_error = "`typo` is not a known provider instance";
+
+        assert_eq!(
+            rendered.matches(routing_error).count(),
+            1,
+            "plan validation must report the routing error exactly once: {rendered}",
+        );
+    }
+
+    #[test]
+    fn validate_pipeline_reports_multifile_undefined_iterable_reference() {
+        let fixture = tempfile::tempdir().expect("undefined iterable fixture");
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n")
+            .expect("write provider declaration");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"for name, account_id in does_not_exist.accounts {
+  mock.test.resource {
+    name = name
+  }
+}
+"#,
+        )
+        .expect("write undefined iterable fixture");
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+        let occurrences = errors
+            .iter()
+            .filter(|error| error.contains("Undefined identifier `does_not_exist`"))
+            .count();
+
+        assert_eq!(
+            occurrences, 1,
+            "the owning validation pipeline must report the scope error once: {errors:#?}",
+        );
+    }
+
+    #[test]
+    fn validate_pipeline_accepts_cross_file_resource_reference_scope() {
+        let fixture = tempfile::tempdir().expect("cross-file reference fixture");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"provider mock {}
+let attach = mock.test.resource {
+  name = caller.name
+}
+"#,
+        )
+        .expect("write reference consumer");
+        std::fs::write(
+            fixture.path().join("bindings.crn"),
+            "let caller = mock.test.resource { name = 'caller' }\n",
+        )
+        .expect("write reference producer");
+
+        let errors = validate_with_factories(fixture.path(), Vec::new());
+
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.contains("Undefined identifier `caller`")),
+            "cross-file binding must be in scope in the owning pipeline: {errors:#?}",
         );
     }
 
