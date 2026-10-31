@@ -453,6 +453,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         binding: ForBinding,
         template_resource: DeferredForTemplateResource<S, T>,
     ) -> Self {
+        let template_resource = template_resource.into_materialized_for_target(&target);
         let deferred_effect_id = deferred_effect_id(&target, &template_resource);
         Self {
             file,
@@ -7010,6 +7011,47 @@ mod substitute_placeholder_tests {
         };
         assert_eq!(template.id().identity_str(), Some("right[?]"));
         assert_eq!(template.binding(), Some("right[?]"));
+
+        let expression = parsed
+            .into_resource_expression(&[])
+            .unwrap_or_else(|_| panic!("resource template must resolve"));
+        assert_eq!(
+            expression.template_resource_id().identity_str(),
+            Some("right[?]")
+        );
+        assert_eq!(expression.template_resource_binding(), Some("right[?]"));
+        assert_eq!(expression.deferred_effect_id().identity_str(), "right");
+    }
+
+    #[test]
+    fn parsed_deferred_for_conversion_rederives_template_identity_from_its_target() {
+        let target = DeferredForTarget::bound("right").expect("valid target");
+        let body = DeferredForBody::resource(
+            &target,
+            Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
+                "mock",
+                "test.resource",
+                None,
+            ),
+        );
+        let mut parsed = ParsedDeferredForExpression::new(
+            None,
+            1,
+            SourceSpan::dummy(),
+            "for item in upstream.items".to_string(),
+            target,
+            Value::resource_ref("upstream", "items", Vec::new()),
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".to_string()),
+            body,
+        );
+
+        let DeferredForBody::Resource(template) = &mut parsed.body else {
+            panic!("fixture body must remain a resource")
+        };
+        template.resource.id =
+            ResourceId::with_provider_identity("mock", "test.resource", "wrong[?]", None);
+        template.resource.binding = Some("wrong[?]".to_string());
 
         let expression = parsed
             .into_resource_expression(&[])
