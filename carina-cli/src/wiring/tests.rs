@@ -18,6 +18,26 @@ use carina_core::resource::{
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
 
+struct FailingAwsCredentialSource {
+    calls: Arc<AtomicUsize>,
+}
+
+impl carina_plugin_host::AwsCredentialSource for FailingAwsCredentialSource {
+    fn current(
+        &self,
+    ) -> BoxFuture<
+        '_,
+        Result<carina_plugin_host::AwsCredentials, carina_plugin_host::AwsCredentialError>,
+    > {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(carina_plugin_host::AwsCredentialError::NotFound(
+                "CLI credential preflight sentinel".to_string(),
+            ))
+        })
+    }
+}
+
 fn comparison_provider_for_resources(
     schemas: &SchemaRegistry,
     resources: &[Resource],
@@ -1685,6 +1705,79 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_aws_preflight_is_typed_and_stops_before_guest_loading() {
+    let user_dirs = carina_core::TestUserDirs::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let source_path = tmp.path().join("aws-provider.wasm");
+    let installed_path = tmp
+        .path()
+        .join(".carina/providers/file/aws-provider/aws-provider.wasm");
+    std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+    std::fs::write(&source_path, b"AWS fixture").unwrap();
+    std::fs::write(&installed_path, b"AWS fixture").unwrap();
+    let config = ProviderConfig {
+        name: "aws".into(),
+        source: Some(format!("file://{}", source_path.display()).parse().unwrap()),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let grants = TrustedLocalGrantInputs::new(vec![format!("{}=aws", source_path.display())], None);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let credential_source: Arc<dyn carina_plugin_host::AwsCredentialSource> =
+        Arc::new(FailingAwsCredentialSource {
+            calls: Arc::clone(&calls),
+        });
+    let guest_started = Arc::new(AtomicBool::new(false));
+    let observed_guest = Arc::clone(&guest_started);
+
+    let result = build_factories_from_providers_impl_using(
+        &user_dirs,
+        &[config],
+        tmp.path(),
+        true,
+        &grants,
+        move |verified| {
+            assert_eq!(
+                verified.identity().trust().class(),
+                carina_provider_resolver::ProviderTrustClass::Aws
+            );
+            let credential_source = Arc::clone(&credential_source);
+            let observed_guest = Arc::clone(&observed_guest);
+            async move {
+                let _capabilities = preflight_aws_runtime_capabilities(credential_source)
+                    .await
+                    .map_err(RuntimeProviderLoadError::AwsCredentials)?;
+                observed_guest.store(true, Ordering::SeqCst);
+                Err(RuntimeProviderLoadError::Wasm(
+                    carina_plugin_host::WasmProviderLoadError::Other(
+                        "guest loader should not be reached".to_string(),
+                    ),
+                ))
+            }
+        },
+    );
+
+    let Err(AppError::AwsCredentials(error)) = result else {
+        panic!("AWS preflight must retain its typed AppError")
+    };
+    assert!(matches!(
+        error.credential_error(),
+        carina_plugin_host::AwsCredentialError::NotFound(_)
+    ));
+    let rendered = error.to_string();
+    assert!(rendered.contains("CLI credential preflight sentinel"));
+    assert!(rendered.contains("AWS_PROFILE"));
+    assert!(rendered.contains("aws sso login"));
+    assert!(rendered.contains("AWS_ACCESS_KEY_ID"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!guest_started.load(Ordering::SeqCst));
+}
+
 #[test]
 fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
     let inputs = TrustedLocalGrantInputs::new(Vec::new(), Some("not-a-grant".into()));
@@ -2246,7 +2339,13 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
         tmp.path(),
         true,
         &trusted_inputs,
-        |_verified| async { panic!("trusted identity mismatch must fail before the WASM loader") },
+        |_verified| async {
+            panic!("trusted identity mismatch must fail before the WASM loader");
+            #[allow(unreachable_code)]
+            Err(carina_plugin_host::WasmProviderLoadError::Other(
+                "unreachable loader result".to_string(),
+            ))
+        },
     );
     let Err(error) = result else {
         panic!("trusted provider kind mismatch must be fatal")

@@ -76,6 +76,7 @@ fi
 # Workspace crate dirs (matches Cargo.toml [workspace] members).
 crates=(
     carina-cli
+    carina-credentials-aws
     carina-core
     carina-lsp
     carina-plugin-host

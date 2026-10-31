@@ -1,11 +1,11 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use carina_core::effect::PlanOp;
 use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
@@ -24,7 +24,10 @@ use carina_core::resource::{
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
-use carina_plugin_host::{GuestCallBudget, WasmProviderFactory};
+use carina_plugin_host::{
+    AwsCredentialError, AwsCredentialSource, AwsCredentials, GuestCallBudget, RuntimeCapabilities,
+    WasmProviderFactory, WasmProviderLoadError,
+};
 use carina_provider_resolver::{
     LockFile, ProviderLoadIdentity, ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
 };
@@ -222,6 +225,20 @@ fn http_wasm_path() -> Option<PathBuf> {
     None
 }
 
+fn aws_http_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in &[
+        "carina_provider_mock_http_aws.wasm",
+        "carina-provider-mock-http-aws.wasm",
+    ] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 macro_rules! skip_if_no_wasm {
     () => {
         match wasm_path() {
@@ -252,6 +269,75 @@ macro_rules! skip_if_no_http_wasm {
     };
 }
 
+macro_rules! skip_if_no_aws_http_wasm {
+    () => {
+        match aws_http_wasm_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: AWS HTTP probe WASM binary not found. Build with: \
+                     cargo build -p carina-provider-mock-http --target wasm32-wasip2"
+                );
+                return;
+            }
+        }
+    };
+}
+
+struct FixedAwsCredentialSource(Result<AwsCredentials, AwsCredentialError>);
+
+impl AwsCredentialSource for FixedAwsCredentialSource {
+    fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>> {
+        let result = self.0.clone();
+        Box::pin(async move { result })
+    }
+}
+
+struct SequenceAwsCredentialSource {
+    results: Mutex<VecDeque<Result<AwsCredentials, AwsCredentialError>>>,
+}
+
+impl SequenceAwsCredentialSource {
+    fn new(results: impl IntoIterator<Item = Result<AwsCredentials, AwsCredentialError>>) -> Self {
+        Self {
+            results: Mutex::new(results.into_iter().collect()),
+        }
+    }
+}
+
+impl AwsCredentialSource for SequenceAwsCredentialSource {
+    fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>> {
+        let result = self
+            .results
+            .lock()
+            .expect("credential response queue must not be poisoned")
+            .pop_front()
+            .expect("credential response queue must contain one result per guest call");
+        Box::pin(async move { result })
+    }
+}
+
+fn test_aws_credentials(access_key_id: &str) -> AwsCredentials {
+    AwsCredentials::new(
+        access_key_id,
+        "host-secret-sentinel",
+        Some("host-session-sentinel".to_string()),
+        None,
+    )
+}
+
+fn default_runtime_capabilities(class: ProviderTrustClass) -> RuntimeCapabilities {
+    match class {
+        ProviderTrustClass::Aws => RuntimeCapabilities::Aws {
+            credentials: Arc::new(FixedAwsCredentialSource(Ok(test_aws_credentials(
+                "AKIADEFAULT",
+            )))),
+        },
+        ProviderTrustClass::GitHub => RuntimeCapabilities::GitHub,
+        ProviderTrustClass::Untrusted => RuntimeCapabilities::Untrusted,
+    }
+}
+
 /// Build a `WasmProviderFactory` using a per-test temporary cache directory.
 ///
 /// Tests in this binary run in parallel; if they all shared
@@ -268,9 +354,29 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
         load,
         cache.path(),
         locked_egress.as_ref(),
+        RuntimeCapabilities::Untrusted,
     )
     .await
     .expect("Failed to load WASM provider");
+    (factory, cache)
+}
+
+async fn load_aws_http_factory(
+    wasm: &std::path::Path,
+    credentials: Arc<dyn AwsCredentialSource>,
+) -> (WasmProviderFactory, tempfile::TempDir) {
+    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
+    let wasm_bytes = std::fs::read(wasm).expect("Failed to read AWS HTTP probe WASM provider");
+    let load = mock_http_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        RuntimeCapabilities::Aws { credentials },
+    )
+    .await
+    .expect("Failed to load AWS HTTP probe WASM provider");
     (factory, cache)
 }
 
@@ -290,6 +396,7 @@ async fn load_http_factory_with_class(
         load,
         cache.path(),
         locked_egress.as_ref(),
+        default_runtime_capabilities(class),
     )
     .await
     .expect("Failed to load HTTP probe WASM provider");
@@ -341,6 +448,24 @@ async fn load_schema_http_factory(
             .await
             .expect("Failed to load HTTP probe WASM provider");
     (factory, cache)
+}
+
+fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDataSource {
+    let resource =
+        DataSource::with_provider("mock_http", "test.aws_credentials", "credentials", None);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    carina_core::executor::prepare_provider_ready_data_source(resource, &preparation)
+        .expect("credential probe data source should pass the checked host boundary")
 }
 
 fn resource_with_int_attribute(
@@ -746,6 +871,167 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn schema_only_loads_an_aws_world_without_a_credential_source() {
+    let path = skip_if_no_aws_http_wasm!();
+    let cache = tempfile::tempdir().expect("create schema-only cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
+        mock_http_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
+        cache.path(),
+    )
+    .await
+    .expect("schema-only loading must link the non-credentialing stub");
+
+    assert!(
+        factory
+            .schemas()
+            .iter()
+            .any(|schema| schema.parts().resource_type == "test.aws_credentials")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_aws_kinds_cannot_instantiate_an_aws_world() {
+    let path = skip_if_no_aws_http_wasm!();
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+
+    for class in [ProviderTrustClass::GitHub, ProviderTrustClass::Untrusted] {
+        let cache = tempfile::tempdir().expect("create non-AWS cache tempdir");
+        let load = mock_http_load_with_class(&wasm_bytes, class);
+        let locked_egress = explicit_test_egress(&load, cache.path());
+        let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            load,
+            cache.path(),
+            locked_egress.as_ref(),
+            default_runtime_capabilities(class),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a non-AWS runtime must reject the AWS credential import"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            WasmProviderLoadError::AwsCredentialsRequired
+        ));
+        assert_eq!(
+            error.to_string(),
+            "this provider requires AWS credentials, which only an AWS-kind provider can receive"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_credential_import_returns_the_sources_credentials() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(FixedAwsCredentialSource(Ok(AwsCredentials::new(
+        "AKIAFROMHOST",
+        "host-secret-sentinel",
+        Some("host-session-sentinel".to_string()),
+        None,
+    ))));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let state = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("the guest should receive host credentials");
+
+    assert_eq!(
+        state.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "AKIAFROMHOST".into()
+        )))
+    );
+    assert_eq!(
+        state.attributes.get("has_session_token"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_credential_source_error_reaches_the_guest_as_a_wit_error() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(FixedAwsCredentialSource(Err(AwsCredentialError::NotFound(
+        "credential-source-not-found-sentinel".to_string(),
+    ))));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let error = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect_err("the guest should surface the typed source failure");
+
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("credential-source-not-found-sentinel"),
+        "unexpected guest error: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_guest_calls_observe_refreshed_aws_credentials() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(SequenceAwsCredentialSource::new([
+        Ok(AwsCredentials::new(
+            "AKIAEXPIRING",
+            "first-secret",
+            None,
+            Some(SystemTime::now() + Duration::from_secs(1)),
+        )),
+        Ok(AwsCredentials::new(
+            "AKIAREFRESHED",
+            "second-secret",
+            None,
+            None,
+        )),
+    ]));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let first = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("first guest credential request should succeed");
+    let second = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("second guest credential request should succeed");
+
+    assert_eq!(
+        first.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "AKIAEXPIRING".into()
+        )))
+    );
+    assert_eq!(
+        second.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "AKIAREFRESHED".into()
+        )))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn initialized_reference_scope_is_kept_per_provider_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -1043,16 +1329,16 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
     );
     assert!(
         rendered.contains("mock_http")
-            && rendered.contains("untrusted")
             && rendered.contains("169.254.169.254")
-            && rendered.contains("--trust-local-provider")
-            && rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
+            && rendered.contains("instance-metadata address")
             && rendered.contains("create call"),
         "unexpected metadata denial: {rendered}"
     );
     assert!(
         !rendered.contains("WASM guest trapped")
             && !rendered.contains("timed out")
+            && !rendered.contains("--trust-local-provider")
+            && !rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
             && !rendered.contains('\n'),
         "the denial must retain its dedicated non-timeout diagnostic: {rendered}"
     );
@@ -1125,17 +1411,18 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
             && rendered.contains("create call:")
             && rendered.contains("provider 'mock_http'")
             && rendered.contains("file:///test-providers/mock_http.wasm")
-            && rendered.contains(
-                "is untrusted, so it gets no credentials and no instance-metadata access"
-            )
             && rendered.contains("request to resolved-metadata.invalid was denied")
-            && rendered.contains("--trust-local-provider"),
+            && rendered.contains(
+                "instance-metadata address 169.254.169.254 is not available to this provider"
+            ),
         "unexpected post-resolution metadata denial: {rendered}"
     );
     assert!(
         !rendered.contains("not_sent")
             && !rendered.contains("WASM guest trapped")
             && !rendered.contains("timed out")
+            && !rendered.contains("--trust-local-provider")
+            && !rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
             && !rendered.contains('\n'),
         "the post-resolution denial must remain an outer typed trap: {rendered}"
     );

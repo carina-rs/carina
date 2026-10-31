@@ -435,6 +435,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             fresh_verified,
             cache.path(),
             Some(&locked_egress),
+            carina_plugin_host::RuntimeCapabilities::Untrusted,
         )
         .await
         .expect("load mock HTTP WASM provider")
@@ -510,6 +511,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
             replacement_verified,
             cache.path(),
             Some(&locked_egress),
+            carina_plugin_host::RuntimeCapabilities::Untrusted,
         )
         .await
         .expect("load replacement mock HTTP WASM provider")

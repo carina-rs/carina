@@ -9,6 +9,10 @@ license = "MIT"
 name = "carina-provider-mock-http"
 path = "src/main.rs"
 
+[[bin]]
+name = "carina-provider-mock-http-aws"
+path = "src/aws.rs"
+
 [dependencies]
 carina-plugin-sdk = { path = "../carina-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
