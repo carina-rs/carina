@@ -11559,17 +11559,27 @@ fn resolve_block_names_detailed<S, P: PlaceholderKind>(
 ) -> Vec<BlockNameConflict> {
     resources
         .iter_mut()
-        .filter_map(|resource| {
-            let schema = registry.get_for(resource)?;
-            Some(resolve_attribute_block_names(
+        .flat_map(|resource| {
+            resolve_managed_attribute_block_names(
                 &resource.id,
                 &mut resource.attributes,
                 None,
-                schema.as_schema(),
-            ))
+                registry,
+            )
         })
-        .flatten()
         .collect()
+}
+
+fn resolve_managed_attribute_block_names<P: PlaceholderKind>(
+    id: &ResourceId,
+    attributes: &mut IndexMap<String, Value<P>>,
+    authored_attributes: Option<&IndexMap<String, Value<P>>>,
+    registry: &SchemaRegistry,
+) -> Vec<BlockNameConflict> {
+    let Some(schema) = registry.get(&id.provider, &id.resource_type, SchemaKind::Resource) else {
+        return Vec::new();
+    };
+    resolve_attribute_block_names(id, attributes, authored_attributes, schema.as_schema())
 }
 
 fn resolve_block_names_detailed_with_authored<S, P: PlaceholderKind>(
@@ -11579,20 +11589,18 @@ fn resolve_block_names_detailed_with_authored<S, P: PlaceholderKind>(
 ) -> Vec<BlockNameConflict> {
     resources
         .iter_mut()
-        .filter_map(|resource| {
-            let schema = registry.get_for(resource)?;
+        .flat_map(|resource| {
             let authored_attributes = authored
                 .iter()
                 .find(|candidate| candidate.id == resource.id)
                 .map(|candidate| &candidate.attributes);
-            Some(resolve_attribute_block_names(
+            resolve_managed_attribute_block_names(
                 &resource.id,
                 &mut resource.attributes,
                 authored_attributes,
-                schema.as_schema(),
-            ))
+                registry,
+            )
         })
-        .flatten()
         .collect()
 }
 
@@ -11632,16 +11640,9 @@ fn resolve_file_block_names<
                 ));
             }
             crate::parser::ResourceMut::Deferred { id, attributes } => {
-                if let Some(schema) =
-                    registry.get(&id.provider, &id.resource_type, SchemaKind::Resource)
-                {
-                    conflicts.extend(resolve_attribute_block_names(
-                        id,
-                        attributes,
-                        None,
-                        schema.as_schema(),
-                    ));
-                }
+                conflicts.extend(resolve_managed_attribute_block_names(
+                    id, attributes, None, registry,
+                ));
             }
             crate::parser::ResourceMut::DataSource(data_source) => {
                 if let Some(schema) = registry.get_for_data_source(data_source) {
@@ -11707,18 +11708,14 @@ where
                 ));
             }
             crate::parser::ResourceMut::Deferred { id, attributes } => {
-                if let Some(schema) =
-                    registry.get(&id.provider, &id.resource_type, SchemaKind::Resource)
-                {
-                    let authored_attributes =
-                        managed_resource_by_id(authored, id).map(|resource| &resource.attributes);
-                    conflicts.extend(resolve_attribute_block_names(
-                        id,
-                        attributes,
-                        authored_attributes,
-                        schema.as_schema(),
-                    ));
-                }
+                let authored_attributes =
+                    managed_resource_by_id(authored, id).map(|resource| &resource.attributes);
+                conflicts.extend(resolve_managed_attribute_block_names(
+                    id,
+                    attributes,
+                    authored_attributes,
+                    registry,
+                ));
             }
             crate::parser::ResourceMut::DataSource(data_source) => {
                 if let Some(schema) = registry.get_for_data_source(data_source) {

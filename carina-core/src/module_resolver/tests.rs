@@ -6627,7 +6627,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         panic!("deferred test body must remain a resource")
     };
     let validated_cert = template_resource
-        .attributes
+        .attributes()
         .get("validated_cert")
         .expect("template attr preserved");
     match validated_cert {
@@ -6697,9 +6697,9 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
         panic!("deferred test body must remain a resource")
     };
 
-    assert_eq!(first.id.identity_str(), Some("first.assignments[?]"));
-    assert_eq!(second.id.identity_str(), Some("second.assignments[?]"));
-    assert_ne!(first.id, second.id);
+    assert_eq!(first.id().identity_str(), Some("first.assignments[?]"));
+    assert_eq!(second.id().identity_str(), Some("second.assignments[?]"));
+    assert_ne!(first.id(), second.id());
 }
 
 /// carina#3126 PR-B negative case: an `iterable_binding` that is NOT a
@@ -6913,7 +6913,7 @@ let second = for item in source.second {
     let comments = parsed
         .deferred_for_expressions()
         .iter()
-        .map(|deferred| deferred.template_resource().get_attr("comment"))
+        .map(|deferred| deferred.template_resource().attributes().get("comment"))
         .collect::<Vec<_>>();
     assert_eq!(
         comments,

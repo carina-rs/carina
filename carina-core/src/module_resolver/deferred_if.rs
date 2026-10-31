@@ -434,7 +434,7 @@ fn first_dropped_reference(
         }
         match deferred.body() {
             DeferredForBody::Resource(resource) => {
-                if let Some(binding) = resource.attributes.values().find_map(&find) {
+                if let Some(binding) = resource.attributes().values().find_map(&find) {
                     return Some(binding);
                 }
             }

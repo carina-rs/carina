@@ -256,11 +256,17 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
         }
     }
 
+    fn into_materialized_for_target(mut self, target: &DeferredForTarget) -> Self {
+        materialize_template_address(target, &mut self.resource);
+        self.display_type = self.resource.id.display_type();
+        self
+    }
+
     pub fn id(&self) -> &ResourceId {
         &self.resource.id
     }
 
-    pub(crate) fn as_resource(&self) -> &Resource<S, P> {
+    pub fn as_resource(&self) -> &Resource<S, P> {
         &self.resource
     }
 
@@ -284,16 +290,8 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
         &self.resource.attributes
     }
 
-    pub fn get_attr(&self, name: &str) -> Option<&Value<P>> {
-        self.resource.get_attr(name)
-    }
-
     pub fn directives(&self) -> &Directives {
         &self.resource.directives
-    }
-
-    pub fn prefixes(&self) -> &HashMap<String, String> {
-        &self.resource.prefixes
     }
 
     pub fn binding(&self) -> Option<&str> {
@@ -306,14 +304,6 @@ impl<S, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
 
     pub fn module_source(&self) -> Option<&S> {
         self.resource.module_source.as_ref()
-    }
-
-    pub fn default_tag_keys(&self) -> &crate::resource::DefaultTagKeys {
-        &self.resource.default_tag_keys
-    }
-
-    pub fn loop_provenance(&self) -> &crate::resource::LoopProvenance {
-        &self.resource.loop_provenance
     }
 
     pub fn quoted_string_attrs(&self) -> &HashSet<String> {
@@ -368,14 +358,6 @@ impl<S: Clone, P: PlaceholderKind> DeferredForTemplateResource<S, P> {
 
     pub(crate) fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Resource<S, P> {
         self.resource.instantiate_with_identity(identity)
-    }
-}
-
-impl<S, P: PlaceholderKind> std::ops::Deref for DeferredForTemplateResource<S, P> {
-    type Target = Resource<S, P>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.resource
     }
 }
 
@@ -539,12 +521,6 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
     }
 }
 
-impl<S: Clone, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
-    pub fn materialize_template_resource(&self) -> Resource<S, T> {
-        self.template_resource.resource.clone()
-    }
-}
-
 /// Typed parser-side body of a deferred `for` expression.
 ///
 /// Every grammar-supported body kind is retained until module expansion has
@@ -563,6 +539,15 @@ impl<P: PlaceholderKind> DeferredForBody<P> {
         resource: Resource<ModuleSource, P>,
     ) -> Self {
         Self::Resource(Box::new(DeferredForTemplateResource::new(target, resource)))
+    }
+
+    fn into_materialized_for_target(self, target: &DeferredForTarget) -> Self {
+        match self {
+            Self::Resource(resource) => {
+                Self::Resource(Box::new((*resource).into_materialized_for_target(target)))
+            }
+            Self::Read(_) | Self::ModuleCall(_) => self,
+        }
     }
 }
 
@@ -608,6 +593,7 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
         binding: ForBinding,
         body: DeferredForBody<P>,
     ) -> Self {
+        let body = body.into_materialized_for_target(&target);
         Self {
             file,
             line,
@@ -4361,7 +4347,7 @@ impl ParserDeferredForPhaseAudit for ParsedDeferredForPhase<ParserPlaceholder> {
             visit(&expression.iterable)?;
             match expression.body() {
                 DeferredForBody::Resource(resource) => {
-                    for value in resource.attributes.values() {
+                    for value in resource.attributes().values() {
                         visit(value)?;
                     }
                 }
@@ -4604,7 +4590,7 @@ impl<E> File<E, ParserPlaceholder, ParserPlaceholder, ParsedDeferredForPhase<Par
                     self.deferred_for_phase.expressions.iter().filter_map(
                         |deferred| match &deferred.body {
                             DeferredForBody::Resource(resource) => {
-                                Some((resource.id.clone(), resource.attributes.clone()))
+                                Some((resource.id().clone(), resource.attributes().clone()))
                             }
                             DeferredForBody::Read(data_source) => {
                                 Some((data_source.id.clone(), data_source.attributes.clone()))
@@ -5265,7 +5251,7 @@ impl ParserBoundaryDeferredPhase for ParsedDeferredForPhase<ParserPlaceholder> {
                 DeferredForBody::Resource(resource) => {
                     collect_deferred_for_resource_placeholders(
                         &deferred.header,
-                        resource,
+                        resource.as_resource(),
                         deferred_template,
                         errors,
                     );
@@ -5309,7 +5295,7 @@ impl ParserBoundaryDeferredPhase
             );
             collect_deferred_for_resource_placeholders(
                 &deferred.header,
-                &deferred.template_resource,
+                deferred.template_resource.as_resource(),
                 deferred_template,
                 errors,
             );
@@ -6996,6 +6982,91 @@ mod substitute_placeholder_tests {
     }
 
     #[test]
+    fn parsed_deferred_for_rederives_template_identity_from_its_target() {
+        let body_target = DeferredForTarget::bound("wrong").expect("valid body target");
+        let owning_target = DeferredForTarget::bound("right").expect("valid owning target");
+        let body = DeferredForBody::resource(
+            &body_target,
+            Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
+                "mock",
+                "test.resource",
+                None,
+            ),
+        );
+
+        let parsed = ParsedDeferredForExpression::new(
+            None,
+            1,
+            SourceSpan::dummy(),
+            "for item in upstream.items".to_string(),
+            owning_target,
+            Value::resource_ref("upstream", "items", Vec::new()),
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".to_string()),
+            body,
+        );
+        let DeferredForBody::Resource(template) = parsed.body() else {
+            panic!("fixture body must remain a resource")
+        };
+        assert_eq!(template.id().identity_str(), Some("right[?]"));
+        assert_eq!(template.binding(), Some("right[?]"));
+
+        let expression = parsed
+            .into_resource_expression(&[])
+            .unwrap_or_else(|_| panic!("resource template must resolve"));
+        assert_eq!(
+            expression.template_resource_id().identity_str(),
+            Some("right[?]")
+        );
+        assert_eq!(expression.template_resource_binding(), Some("right[?]"));
+        assert_eq!(expression.deferred_effect_id().identity_str(), "right");
+    }
+
+    #[test]
+    fn parsed_deferred_for_preserves_an_unbound_template_pending_identity() {
+        let target = DeferredForTarget::Unbound {
+            template: UnboundLoopTemplate::new(
+                crate::resource::LoopSource::authored(
+                    std::path::Path::new("main.crn"),
+                    SourceSpan::dummy(),
+                    "for item in upstream.items",
+                    crate::resource::LoopKind::For,
+                ),
+                crate::resource::LegacyLoopAddress::new("_for0"),
+            ),
+        };
+        let template = DeferredForTemplateResource::new(
+            &target,
+            Resource::<ModuleSource, ParserPlaceholder>::pending_with_provider(
+                "mock",
+                "test.resource",
+                None,
+            ),
+        );
+        let pending_id = template.id().clone();
+        let parsed = ParsedDeferredForExpression::new(
+            None,
+            1,
+            SourceSpan::dummy(),
+            "for item in upstream.items".to_string(),
+            target,
+            Value::resource_ref("upstream", "items", Vec::new()),
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".to_string()),
+            DeferredForBody::Resource(Box::new(template)),
+        );
+        let DeferredForBody::Resource(template) = parsed.body() else {
+            panic!("fixture body must remain a resource")
+        };
+        assert_eq!(template.id(), &pending_id);
+
+        let expression = parsed
+            .into_resource_expression(&[])
+            .unwrap_or_else(|_| panic!("resource template must resolve"));
+        assert_eq!(expression.template_resource_id(), &pending_id);
+    }
+
+    #[test]
     fn saved_deferred_for_rejects_non_object_template_resource_without_panicking() {
         for malformed in [
             serde_json::json!(5),
@@ -7178,7 +7249,6 @@ mod substitute_placeholder_tests {
             Some("children[?]")
         );
         assert_eq!(expression.template_resource_binding(), Some("children[?]"));
-        let materialized = expression.materialize_template_resource();
         let resource_type = expression.resource_type();
         let resource_shaped = ResourceShapedWire {
             header: &expression.header,
@@ -7186,7 +7256,7 @@ mod substitute_placeholder_tests {
             target: expression.target(),
             iterable: &expression.iterable,
             binding: &expression.binding,
-            template_resource: &materialized,
+            template_resource: expression.template_resource().as_resource(),
         };
 
         assert_eq!(

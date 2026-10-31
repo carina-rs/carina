@@ -2265,7 +2265,7 @@ for item in source.arn {
             panic!("deferred fixture body must be a resource")
         };
         assert!(matches!(
-            template.attributes.get("comment"),
+            template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
         ));
 
@@ -2278,7 +2278,7 @@ for item in source.arn {
             panic!("deferred fixture body must be a resource")
         };
         assert!(matches!(
-            template.attributes.get("comment"),
+            template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
     }

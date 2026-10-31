@@ -569,7 +569,8 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
     );
     let template_count = parsed.deferred_for_expressions()[0]
         .template_resource()
-        .get_attr("count")
+        .attributes()
+        .get("count")
         .expect("template count");
     assert!(matches!(
         template_count,
@@ -970,7 +971,7 @@ fn iter_all_resources_yields_direct_then_deferred() {
     let ResourceRef::Deferred { resource, deferred } = items[1] else {
         panic!("expected a resolved deferred resource, got {:?}", items[1]);
     };
-    assert_eq!(&resource.id, deferred.template_resource_id());
+    assert_eq!(resource.id(), deferred.template_resource_id());
     assert!(matches!(items[1].context(), ResourceContext::Deferred(_)));
 }
 
@@ -986,10 +987,10 @@ fn resolved_resource_iterator_is_phase_exhaustive() {
             ResourceRef::DataSource(data_source) => data_source.id.resource_type.as_str(),
             ResourceRef::Deferred { resource, deferred } => {
                 assert_eq!(
-                    resource.id.resource_type,
+                    resource.id().resource_type,
                     deferred.template_resource_id().resource_type
                 );
-                resource.id.resource_type.as_str()
+                resource.id().resource_type.as_str()
             }
         })
         .collect::<Vec<_>>();
@@ -11662,7 +11663,7 @@ let resources = for x in src.list {
         panic!("expected a deferred resource body")
     };
     assert_eq!(
-        template.directives.prevent_destroy_setting(),
+        template.directives().prevent_destroy_setting(),
         PreventDestroy::Unspecified,
         "a non-literal false must not opt out of schema-default protection"
     );
@@ -11743,7 +11744,7 @@ let calls = for x in src.list { child { item = x } }
             resources[1]
         );
     };
-    assert_eq!(resource.id.resource_type, "test.resource");
+    assert_eq!(resource.id().resource_type, "test.resource");
     assert_eq!(deferred.header, "for x in src.list");
     assert!(matches!(deferred.body(), DeferredForBody::Resource(_)));
     let ResourceContext::Deferred(context) = resources[1].context() else {
@@ -15053,7 +15054,7 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         panic!("deferred fixture body must be a resource")
     };
     assert_eq!(
-        template.directives.depends_on,
+        template.directives().depends_on,
         vec!["role".to_string()],
         "for-body resource template should carry directives.depends_on"
     );
@@ -17596,7 +17597,7 @@ mod loop_var_field_access_matrix {
         let tmpl = p.deferred_for_expressions()[0].template_resource();
         assert!(
             matches!(
-                tmpl.get_attr("name"),
+                tmpl.attributes().get("name"),
                 Some(Value::Deferred(DeferredValue::Access(access)))
                     if matches!(
                         access.base(),
@@ -17609,7 +17610,7 @@ mod loop_var_field_access_matrix {
                     )
             ),
             "deferred template must carry postfix Access; got {:?}",
-            tmpl.get_attr("name")
+            tmpl.attributes().get("name")
         );
 
         let mut items = IndexMap::new();
@@ -17671,7 +17672,10 @@ mod loop_var_field_access_matrix {
             let DeferredForBody::Resource(template_resource) = deferred.body() else {
                 panic!("deferred fixture body must be a resource")
             };
-            let name = template_resource.get_attr("name").expect("template name");
+            let name = template_resource
+                .attributes()
+                .get("name")
+                .expect("template name");
             assert!(
                 matches!(
                     access_root(name),
@@ -17712,7 +17716,8 @@ mod loop_var_field_access_matrix {
             let root = loop_access_root(
                 deferred
                     .template_resource()
-                    .get_attr("name")
+                    .attributes()
+                    .get("name")
                     .expect("expanded template name"),
             );
             assert!(matches!(

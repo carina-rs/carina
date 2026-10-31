@@ -2603,7 +2603,7 @@ let orgs = upstream_state {
         assert_eq!(deferred.resource_type(), "mock.test.resource");
         assert_eq!(deferred.template_resource_binding(), Some("res_items[?]"));
         assert!(matches!(
-            deferred.template_resource().get_attr("comment"),
+            deferred.template_resource().attributes().get("comment"),
             Some(Value::Deferred(crate::resource::DeferredValue::Secret(_)))
         ));
     }
