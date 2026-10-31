@@ -667,6 +667,10 @@ impl std::error::Error for DestroyDependencyAnalysisError {
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// Provider installation, egress consent, or initialization failed.
+    #[error(transparent)]
+    Init(Box<crate::commands::init::InitError>),
+
     /// User-owned Carina directories could not be resolved safely.
     #[error(transparent)]
     UserDirs(#[from] carina_core::UserDirsError),
@@ -1007,6 +1011,12 @@ pub enum AppError {
     /// Heartbeat renewal proved that another process can now own the state lock.
     #[error("State lock was lost; state may be behind the cloud. Cause: {error}")]
     StateLockLost { error: BackendError },
+}
+
+impl From<crate::commands::init::InitError> for AppError {
+    fn from(error: crate::commands::init::InitError) -> Self {
+        Self::Init(Box::new(error))
+    }
 }
 
 impl AppError {

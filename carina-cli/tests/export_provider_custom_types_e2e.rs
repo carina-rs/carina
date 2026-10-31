@@ -51,7 +51,11 @@ let admin_access_roles = ["admin-role", "audit-role"]
             _temp: temp,
             project,
         };
-        assert_success("carina init", &scenario.carina(&["init", "."]));
+        let source = format!("file://{}", provider_source.display());
+        assert_success(
+            "carina init",
+            &scenario.carina(&["init", ".", "--accept-egress", &source]),
+        );
         scenario
     }
 

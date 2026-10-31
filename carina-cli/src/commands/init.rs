@@ -13,6 +13,22 @@ use crate::commands::{
 };
 use carina_core::hint::ProjectCommand;
 
+#[derive(Debug, thiserror::Error)]
+pub enum InitError {
+    #[error(transparent)]
+    AcceptedEgress(#[from] carina_provider_resolver::AcceptedEgressSourceError),
+    #[error(transparent)]
+    ProviderResolution(#[from] carina_provider_resolver::ResolveAllError),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for InitError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
 pub async fn run_init(
     user_dirs: &carina_core::UserDirs,
     path: &Path,
@@ -20,7 +36,14 @@ pub async fn run_init(
     locked: bool,
     migrate_state: bool,
     force: bool,
-) -> Result<(), String> {
+    accept_egress: &[String],
+) -> Result<(), InitError> {
+    let base_dir = get_base_dir(path);
+    let accepted_egress = carina_provider_resolver::AcceptedEgressSources::parse_os(
+        accept_egress,
+        std::env::var_os("CARINA_ACCEPT_EGRESS").as_deref(),
+        base_dir,
+    )?;
     run_init_with_provider_resolver(
         path,
         upgrade,
@@ -28,9 +51,14 @@ pub async fn run_init(
         migrate_state,
         force,
         |install_lock, providers, mode| {
-            carina_provider_resolver::resolve_all(user_dirs, install_lock, providers, mode)
-                .map(|resolved| resolved.len())
-                .map_err(|error| error.to_string())
+            carina_provider_resolver::resolve_all_with_egress(
+                user_dirs,
+                install_lock,
+                providers,
+                mode,
+                &accepted_egress,
+            )
+            .map(|resolved| resolved.len())
         },
     )
     .await
@@ -46,10 +74,12 @@ async fn run_init_with_provider_resolver(
         &ProviderInstallLock,
         &[carina_core::parser::ProviderConfig],
         LockMode,
-    ) -> Result<usize, String>,
-) -> Result<(), String> {
+    ) -> Result<usize, carina_provider_resolver::ResolveAllError>,
+) -> Result<(), InitError> {
     if upgrade && locked {
-        return Err("--upgrade and --locked are mutually exclusive".to_string());
+        return Err(InitError::Other(
+            "--upgrade and --locked are mutually exclusive".to_string(),
+        ));
     }
     let mode = if upgrade {
         LockMode::Upgrade
@@ -90,7 +120,7 @@ async fn run_init_with_provider_resolver(
         .map(|p| crate::commands::missing_provider_source_message(&p.name))
         .collect();
     if !missing_source.is_empty() {
-        return Err(missing_source.join("\n"));
+        return Err(InitError::Other(missing_source.join("\n")));
     }
 
     if !loaded.parsed.providers.is_empty() {
@@ -301,7 +331,6 @@ mod tests {
                     http,
                 )
                 .map(|resolved| resolved.len())
-                .map_err(|error| error.to_string())
             },
         )
         .await
@@ -330,7 +359,6 @@ mod tests {
                     github_http,
                 )
                 .map(|resolved| resolved.len())
-                .map_err(|error| error.to_string())
             },
         )
         .await
@@ -572,7 +600,6 @@ mod tests {
                     &http,
                 )
                 .map(|resolved| resolved.len())
-                .map_err(|error| error.to_string())
             },
         )
         .await

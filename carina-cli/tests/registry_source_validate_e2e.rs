@@ -79,7 +79,7 @@ fn directory_validate_loads_registry_source_from_lock_and_cache() {
         "invalid WASM must fail validation: {rendered}"
     );
     assert!(
-        rendered.contains("Failed to load WASM component"),
+        rendered.contains("failed to read provider component"),
         "{rendered}"
     );
     assert!(rendered.contains("carina-providers.lock"), "{rendered}");
@@ -145,7 +145,7 @@ fn directory_validate_rejects_allowlisted_registry_source_without_trust_record()
         "{rendered}"
     );
     assert!(
-        !rendered.contains("Failed to load WASM component"),
+        !rendered.contains("failed to read provider component"),
         "{rendered}"
     );
 }
