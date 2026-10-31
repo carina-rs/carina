@@ -183,7 +183,7 @@ fn format_total_apply_line(elapsed: Duration) -> String {
 
 struct BootstrapCreateContext<'a> {
     backend: &'a dyn StateBackend,
-    parsed: &'a carina_core::parser::InferredFile,
+    parsed: &'a carina_core::parser::ExpandedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
     normalizer: &'a dyn ProviderNormalizer,
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
@@ -329,7 +329,9 @@ fn format_partial_state_bucket_create_warning(
     )
 }
 
-fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
+fn bootstrap_resolved_bindings(
+    parsed: &carina_core::parser::ExpandedInferredFile,
+) -> ResolvedBindings {
     let managed_current = HashMap::new();
     let remote_bindings = HashMap::new();
     let wait_aliases: Vec<WaitAliasSpec> = parsed
@@ -1080,7 +1082,7 @@ pub(crate) async fn persist_exports_only(
     data_source_values: &DataSourceValues,
     pre_resolve_compositions: &[carina_core::resource::LiveComposition],
     export_params: &carina_core::validation::ExportsCheckedPreApply<
-        carina_core::parser::InferredExportParam,
+        carina_core::parser::ExpandedInferredExportParam,
     >,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
@@ -1649,7 +1651,7 @@ fn reload_apply_configuration_after_bootstrap(
 }
 
 async fn load_apply_provider_inputs<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -1683,8 +1685,9 @@ async fn create_state_bucket_bootstrap_provider<R>(
     Ok((provider, normalizer))
 }
 
-type CheckedApplyExports =
-    carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>;
+type CheckedApplyExports = carina_core::validation::ExportsCheckedPreApply<
+    carina_core::parser::ExpandedInferredExportParam,
+>;
 
 enum SourceApplyAfterHeartbeat {
     Done(Option<Duration>),
@@ -1694,7 +1697,7 @@ enum SourceApplyAfterHeartbeat {
 
 struct SourceApplyPersistExports {
     validated_config: ValidatedConfig<
-        crate::wiring::ExpandedCanonicalResources<carina_core::parser::InferredExportParam>,
+        crate::wiring::ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
     >,
     state_file: Option<StateFile>,
     resources: Vec<Resource>,
@@ -2527,7 +2530,7 @@ where
 
 fn import_identifiers_from_current_config<S>(
     plan: &carina_core::plan::Plan<S>,
-    parsed: &carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::ExpandedInferredFile,
 ) -> HashMap<ResourceId, Value> {
     let mut identifiers = HashMap::new();
     let bindings = bootstrap_resolved_bindings(parsed);
@@ -2652,7 +2655,7 @@ fn rehydrate_desired_plan_file(
 
 fn rehydrate_desired_plan_file_from_parts(
     plan_file: &mut ReloadedPlanFile,
-    parsed: &carina_core::parser::InferredFile,
+    parsed: &carina_core::parser::ExpandedInferredFile,
     provider_inputs: &ResolvedProviderInputs,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
@@ -2981,7 +2984,14 @@ async fn run_apply_from_plan_with_observer_factory(
         InspectedPlanFile::Verified(plan) => {
             let parsed_backend = loaded_current_config
                 .ok()
-                .map(|config| config.parsed.backend);
+                .map(|config| {
+                    config
+                        .parsed
+                        .backend
+                        .map(carina_core::parser::BackendConfig::into_expanded)
+                        .transpose()
+                })
+                .transpose()?;
             (
                 ProviderBoundPlanFile::verified(plan, providers),
                 parsed_backend,
@@ -2991,7 +3001,17 @@ async fn run_apply_from_plan_with_observer_factory(
             let current_config = loaded_current_config.map_err(|source| {
                 saved_plan_secret_evaluation_error(AppError::Config(source), apply_target)
             })?;
-            let parsed_backend = Some(current_config.parsed.backend.clone());
+            let parsed_backend = Some(
+                current_config
+                    .parsed
+                    .backend
+                    .clone()
+                    .map(carina_core::parser::BackendConfig::into_expanded)
+                    .transpose()
+                    .map_err(|source| {
+                        saved_plan_secret_evaluation_error(source.into(), apply_target)
+                    })?,
+            );
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;
             let duplicate_declarations = current_config.duplicate_declarations;

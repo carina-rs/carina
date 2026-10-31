@@ -1771,9 +1771,9 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
 
 fn post_create_unknown() -> Value {
     Value::Deferred(DeferredValue::Unknown(
-        crate::resource::UnknownReason::PendingReRead(crate::resource::PendingReRead::incomplete(
-            "producer read-back was incomplete",
-        )),
+        crate::resource::ApplyTimeUnknown::PendingReRead(
+            crate::resource::PendingReRead::incomplete("producer read-back was incomplete"),
+        ),
     ))
 }
 

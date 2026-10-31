@@ -12,8 +12,8 @@ use crate::binding_index::{BindingValueSource, ResolvedBindings};
 use crate::resource::State;
 use crate::resource::{
     AccessMissPolicy, ConcreteValue, DataSource, DeferredValue, InterpolationPart, LiveComposition,
-    PlanInputCurrent, Resource, ResourceId, Value, ValueAccessError, ValuePathSegmentResult,
-    apply_value_path_segment,
+    NoPlaceholder, PlaceholderKind, PlanInputCurrent, Resource, ResourceId, Value,
+    ValueAccessError, ValuePathSegmentResult, apply_value_path_segment,
 };
 
 /// Resolve all ResourceRef values in resources using current state.
@@ -56,7 +56,7 @@ pub fn resolve_refs_with_state(
 /// plan path — it additionally stamps any surviving
 /// `ResourceRef` whose root binding is named in
 /// `bindings_upstream_keys` as
-/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))` so plan
+/// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))` so plan
 /// display can render it as `(known after upstream apply: <ref>)`
 /// instead of the raw dot-form.
 pub fn resolve_refs_with_state_and_remote(
@@ -70,7 +70,7 @@ pub fn resolve_refs_with_state_and_remote(
 /// Same input/output shape (pre-built `ResolvedBindings`), with the
 /// addition of `unresolved_upstream_bindings`: the set of upstream-
 /// state binding names whose surviving refs should be stamped as
-/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))` for display.
+/// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))` for display.
 /// `apply` continues to call the strict variant. See #2366 / RFC #2371.
 pub fn resolve_refs_for_plan(
     resources: &mut [Resource],
@@ -161,7 +161,7 @@ pub fn resolve_data_source_refs(
 /// Plan-only counterpart of [`resolve_data_source_refs`]. Mirrors
 /// [`resolve_refs_for_plan`]: takes the set of upstream-binding
 /// names whose surviving refs should be stamped as
-/// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))`.
+/// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))`.
 pub fn resolve_data_source_refs_for_plan(
     data_sources: &mut [DataSource],
     bindings: &ResolvedBindings,
@@ -292,14 +292,14 @@ fn stamp_unresolved_upstream(
             if upstream_binding_names.contains(path.binding()) =>
         {
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamExport { path },
+                crate::resource::ApplyTimeUnknown::UpstreamExport { path },
             ))
         }
         Value::Deferred(DeferredValue::BindingRef { binding })
             if upstream_binding_names.contains(binding.as_str()) =>
         {
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::UpstreamAllExports { binding },
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports { binding },
             ))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
@@ -408,6 +408,7 @@ fn stamp_unresolved_upstream(
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => value,
+        Value::Deferred(DeferredValue::Placeholder(never)) => match never {},
     }
 }
 
@@ -445,24 +446,27 @@ pub fn resolve_value_for_plan(
 ///
 /// If the referenced binding or attribute is not found, the value is returned as-is.
 /// Returns an error if a builtin function fails with fully-resolved arguments.
-pub fn resolve_ref_value(value: &Value, bindings: &ResolvedBindings) -> Result<Value, String> {
+pub fn resolve_ref_value<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &ResolvedBindings<P>,
+) -> Result<Value<P>, String> {
     resolve_ref_value_inner(value, bindings, None)
 }
 
 /// Three-state result used by null/missing coalescing. A missing value is not
 /// interchangeable with a value whose producing snapshot is still incomplete.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ValueResolution {
-    Present(Value),
+pub enum ValueResolution<P: PlaceholderKind = NoPlaceholder> {
+    Present(Value<P>),
     Absent,
-    Unknown(Value),
+    Unknown(Value<P>),
 }
 
 /// Resolve a value while preserving the distinction required by `??`.
-pub fn resolve_ref_value_status(
-    value: &Value,
-    bindings: &ResolvedBindings,
-) -> Result<ValueResolution, String> {
+pub fn resolve_ref_value_status<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &ResolvedBindings<P>,
+) -> Result<ValueResolution<P>, String> {
     resolve_ref_value_status_inner(value, bindings, None, false)
 }
 
@@ -471,17 +475,20 @@ pub fn resolve_ref_value_status(
 /// Export validation uses this entry point because a reference may become an
 /// argument to `decrypt()` (or another context-sensitive builtin) only after
 /// its binding has been substituted.
-pub fn resolve_ref_value_with_config(
-    value: &Value,
-    bindings: &ResolvedBindings,
+pub fn resolve_ref_value_with_config<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &ResolvedBindings<P>,
     config: &crate::parser::ProviderContext,
-) -> Result<Value, String> {
+) -> Result<Value<P>, String> {
     resolve_ref_value_inner(value, bindings, Some(config))
 }
 
 /// Select the miss policy for a path-shaped reference. A missing source is not
 /// evidence of a partially-known local value, so it uses the strict policy.
-fn binding_access_miss_policy(binding: &str, bindings: &ResolvedBindings) -> AccessMissPolicy {
+fn binding_access_miss_policy<P: PlaceholderKind>(
+    binding: &str,
+    bindings: &ResolvedBindings<P>,
+) -> AccessMissPolicy {
     let Some(source) = bindings.source(binding) else {
         return AccessMissPolicy::Error;
     };
@@ -499,12 +506,12 @@ fn missing_access(error: &ValueAccessError) -> bool {
     )
 }
 
-fn resolve_ref_value_status_inner(
-    value: &Value,
-    bindings: &ResolvedBindings,
+fn resolve_ref_value_status_inner<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &ResolvedBindings<P>,
     config: Option<&crate::parser::ProviderContext>,
     allow_absent_default: bool,
-) -> Result<ValueResolution, String> {
+) -> Result<ValueResolution<P>, String> {
     match value {
         Value::Deferred(DeferredValue::Coalesce {
             value: left,
@@ -645,16 +652,19 @@ fn resolve_ref_value_status_inner(
                 Ok(ValueResolution::Present(resolved))
             }
         }
+        Value::Deferred(DeferredValue::Placeholder(_)) => {
+            Ok(ValueResolution::Unknown(value.clone()))
+        }
     }
 }
 
 /// Resolve a required expression without interpreting a direct miss as the
 /// absence of an enclosing coalesce operand.
-fn resolve_required_value_status(
-    value: &Value,
-    bindings: &ResolvedBindings,
+fn resolve_required_value_status<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &ResolvedBindings<P>,
     config: Option<&crate::parser::ProviderContext>,
-) -> Result<ValueResolution, String> {
+) -> Result<ValueResolution<P>, String> {
     let resolved = resolve_ref_value_inner(value, bindings, config)?;
     if resolved.is_fully_resolved() {
         Ok(ValueResolution::Present(resolved))
@@ -663,11 +673,11 @@ fn resolve_required_value_status(
     }
 }
 
-fn resolve_ref_value_inner(
-    value: &Value,
-    bindings: &ResolvedBindings,
+fn resolve_ref_value_inner<P: PlaceholderKind>(
+    value: &Value<P>,
+    bindings: &ResolvedBindings<P>,
     config: Option<&crate::parser::ProviderContext>,
-) -> Result<Value, String> {
+) -> Result<Value<P>, String> {
     match value {
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             match resolve_ref_value_status_inner(value, bindings, config, false)? {
@@ -709,21 +719,21 @@ fn resolve_ref_value_inner(
         }
         Value::Deferred(DeferredValue::BindingRef { .. }) => Ok(value.clone()),
         Value::Concrete(ConcreteValue::List(items)) => {
-            let resolved: Result<Vec<Value>, String> = items
+            let resolved: Result<Vec<Value<P>>, String> = items
                 .iter()
                 .map(|v| resolve_ref_value_inner(v, bindings, config))
                 .collect();
             Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let mut resolved: IndexMap<String, Value> = IndexMap::new();
+            let mut resolved: IndexMap<String, Value<P>> = IndexMap::new();
             for (k, v) in map {
                 resolved.insert(k.clone(), resolve_ref_value_inner(v, bindings, config)?);
             }
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let resolved_parts: Result<Vec<InterpolationPart>, String> = parts
+            let resolved_parts: Result<Vec<InterpolationPart<P>>, String> = parts
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
@@ -740,7 +750,7 @@ fn resolve_ref_value_inner(
             source_line,
         }) => {
             // First, resolve all arguments
-            let resolved_args: Result<Vec<crate::resource::FunctionArgument>, String> = args
+            let resolved_args: Result<Vec<crate::resource::FunctionArgument<P>>, String> = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
@@ -763,7 +773,25 @@ fn resolve_ref_value_inner(
                 // supposed to surface that as a parse error, so treat any
                 // closure here as a resolver-level invariant break.
                 use crate::eval_value::EvalValue;
-                let eval_args: Vec<EvalValue> = resolved_args
+                let Ok(expanded_args) = resolved_args
+                    .iter()
+                    .cloned()
+                    .map(crate::resource::FunctionArgument::try_into_expanded)
+                    .collect::<Result<Vec<_>, _>>()
+                else {
+                    return Ok(Value::Deferred(DeferredValue::FunctionCall {
+                        name: *name,
+                        args: resolved_args,
+                        source_line: *source_line,
+                    }));
+                };
+                let parser_args = expanded_args
+                    .into_iter()
+                    .map(crate::resource::FunctionArgument::into_placeholder_type)
+                    .collect::<Vec<crate::resource::FunctionArgument<
+                        crate::resource::ParserPlaceholder,
+                    >>>();
+                let eval_args: Vec<EvalValue> = parser_args
                     .iter()
                     .map(crate::parser::function_argument_as_eval)
                     .collect();
@@ -776,6 +804,9 @@ fn resolve_ref_value_inner(
                 match evaluated {
                     Ok(result) => result
                         .into_value()
+                        .map_err(|error| format!("{name}(): {error}"))?
+                        .into_expanded()
+                        .map(Value::into_placeholder_type)
                         .map_err(|error| format!("{name}(): {error}")),
                     Err(e) => Err(format!("{}(): {}", name, e)),
                 }
@@ -818,13 +849,35 @@ fn resolve_ref_value_inner(
 
             let default_config = crate::parser::ProviderContext::default();
             let config = config.unwrap_or(&default_config);
+            let Ok(expanded_args) = resolved_args
+                .iter()
+                .cloned()
+                .map(crate::resource::FunctionArgument::try_into_expanded)
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                    function: function.clone(),
+                    functions: functions.clone(),
+                    args: resolved_args,
+                    source_line: *source_line,
+                }));
+            };
+            let parser_args = expanded_args
+                .into_iter()
+                .map(crate::resource::FunctionArgument::into_placeholder_type)
+                .collect::<Vec<crate::resource::FunctionArgument<
+                    crate::resource::ParserPlaceholder,
+                >>>();
             crate::parser::evaluate_resolved_user_function(
                 function,
                 functions,
-                &resolved_args,
+                &parser_args,
                 config,
                 source_line.get().unwrap_or(function.body.source_line),
             )
+            .map_err(|error| error.to_string())?
+            .into_expanded()
+            .map(Value::into_placeholder_type)
             .map_err(|error| error.to_string())
         }
         Value::Deferred(DeferredValue::Access(access)) => {
@@ -864,6 +917,7 @@ fn resolve_ref_value_inner(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
+        Value::Deferred(DeferredValue::Placeholder(_)) => Ok(value.clone()),
     }
 }
 
@@ -1004,7 +1058,7 @@ mod tests {
 
     #[test]
     fn coalesce_does_not_treat_explicit_unknown_as_absent() {
-        let unknown_reason = crate::resource::UnknownReason::PendingReRead(
+        let unknown_reason = crate::resource::ApplyTimeUnknown::PendingReRead(
             crate::resource::PendingReRead::incomplete("provider read incomplete"),
         );
         let expression = coalesce(
@@ -1026,7 +1080,7 @@ mod tests {
             name: crate::builtins::BuiltinFunction::upper,
             args: vec![
                 Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::PendingReRead(
+                    crate::resource::ApplyTimeUnknown::PendingReRead(
                         crate::resource::PendingReRead::incomplete("producer still running"),
                     ),
                 ))
@@ -2073,7 +2127,7 @@ mod tests {
 
     #[test]
     fn test_unresolved_ref_stays_as_is() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let ref_value = Value::resource_ref("nonexistent".to_string(), "id".to_string(), vec![]);
 
@@ -2109,7 +2163,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpolation_partially_unresolved() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("subnet-".into()),
@@ -2130,7 +2184,7 @@ mod tests {
 
     #[test]
     fn test_resolve_interpolation_with_non_string_types() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let interp = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("port-".into()),
@@ -2206,7 +2260,7 @@ mod tests {
 
     #[test]
     fn test_resolve_function_call_join() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         let func = Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::join,
@@ -2521,7 +2575,7 @@ mod tests {
 
     #[test]
     fn test_resolve_function_call_unresolved_ref_kept() {
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
 
         // If a ResourceRef in the args can't be resolved, the FunctionCall is kept
         let func = Value::Deferred(DeferredValue::FunctionCall {
@@ -2629,7 +2683,7 @@ mod tests {
     #[test]
     fn resolve_builtin_error_propagated_when_args_resolved() {
         // env() with a var name that is extremely unlikely to be set should propagate error
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
         let value = Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::env,
             args: vec![
@@ -2660,7 +2714,7 @@ mod tests {
     #[test]
     fn resolve_builtin_with_unresolved_ref_stays_as_function_call() {
         // join("-", vpc.tags) should stay as FunctionCall when vpc.tags is unresolved
-        let bindings = ResolvedBindings::default();
+        let bindings: ResolvedBindings = ResolvedBindings::default();
         let value = Value::Deferred(DeferredValue::FunctionCall {
             name: crate::builtins::BuiltinFunction::join,
             args: vec![
@@ -3114,10 +3168,10 @@ mod tests {
 
     /// `resolve_refs_for_plan` stamps any surviving `ResourceRef` whose
     /// root binding is in `remote_bindings.keys()` as
-    /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport { path }))`.
+    /// `Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport { path }))`.
     #[test]
     fn test_resolve_refs_for_plan_stamps_top_level_unresolved_upstream() {
-        use crate::resource::UnknownReason;
+        use crate::resource::ApplyTimeUnknown;
         let mut resources = vec![make_resource(
             "web-sg",
             None,
@@ -3137,7 +3191,7 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("vpc_id") {
-            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+            Some(Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
                 path,
             }))) => {
                 assert_eq!(path.to_dot_string(), "network.vpc.vpc_id");
@@ -3190,7 +3244,7 @@ mod tests {
     /// `(known after upstream apply: bootstrap)` form. #2876.
     #[test]
     fn test_resolve_refs_for_plan_stamps_upstream_all_exports_ref() {
-        use crate::resource::UnknownReason;
+        use crate::resource::ApplyTimeUnknown;
         let mut resources = vec![make_resource(
             "consumer",
             None,
@@ -3208,9 +3262,9 @@ mod tests {
             .unwrap();
 
         match resources[0].get_attr("raw") {
-            Some(Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
-                binding,
-            }))) => {
+            Some(Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports { binding },
+            ))) => {
                 assert_eq!(binding, "bootstrap");
             }
             other => panic!(
@@ -3226,7 +3280,7 @@ mod tests {
     /// above. #2876.
     #[test]
     fn test_resolve_refs_for_plan_stamps_upstream_all_exports_inside_list() {
-        use crate::resource::UnknownReason;
+        use crate::resource::ApplyTimeUnknown;
         let mut resources = vec![make_resource(
             "consumer",
             None,
@@ -3256,7 +3310,7 @@ mod tests {
                     .iter()
                     .map(|v| match v {
                         Value::Deferred(DeferredValue::Unknown(
-                            UnknownReason::UpstreamAllExports { binding },
+                            ApplyTimeUnknown::UpstreamAllExports { binding },
                         )) => binding.as_str(),
                         other => panic!("expected UpstreamAllExports, got {:?}", other),
                     })

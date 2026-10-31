@@ -193,7 +193,8 @@ use crate::config_loader::UnresolvedConfigSnapshot;
 use crate::parser::display_string_literal;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver,
-    RawEnumIdentifier, Resource, ResourceId, Value, ValueString,
+    ModuleSource, NoPlaceholder, ParserPlaceholder, PlaceholderKind, RawEnumIdentifier, Resource,
+    ResourceId, Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::{CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value};
@@ -314,6 +315,22 @@ pub(crate) fn no_lookup() -> CustomTypeLookup<'static> {
     &|_declared_type, _value| Ok(())
 }
 
+fn value_without_placeholders<P: PlaceholderKind>(value: &Value<P>) -> Option<Value> {
+    value
+        .clone()
+        .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
+        .ok()
+}
+
+fn attributes_without_placeholders<P: PlaceholderKind>(
+    attributes: &HashMap<String, Value<P>>,
+) -> Option<HashMap<String, Value>> {
+    attributes
+        .iter()
+        .map(|(name, value)| Some((name.clone(), value_without_placeholders(value)?)))
+        .collect()
+}
+
 /// Walk an [`AttributeType`] and apply `lookup` to every identified refined node
 /// reached. Pushes any returned error into `errors`, tagged with
 /// `attr_name` so it points back at the user-visible attribute. Used
@@ -321,9 +338,9 @@ pub(crate) fn no_lookup() -> CustomTypeLookup<'static> {
 /// validators that the schema's own closure cannot carry (e.g. WASM
 /// plugins, where the real validator lives behind the factory's
 /// `validate_custom_type`).
-fn walk_custom_lookup(
+fn walk_custom_lookup<P: PlaceholderKind>(
     attr_type: &AttributeType,
-    value: &Value,
+    value: &Value<P>,
     attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -341,9 +358,9 @@ fn walk_custom_lookup(
     );
 }
 
-fn walk_custom_lookup_on_path<'a>(
+fn walk_custom_lookup_on_path<'a, P: PlaceholderKind>(
     attr_type: &'a AttributeType,
-    value: &Value,
+    value: &Value<P>,
     attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
@@ -399,6 +416,7 @@ fn walk_custom_lookup_on_path<'a>(
             | Value::Deferred(DeferredValue::ResourceRef { .. })
             | Value::Deferred(DeferredValue::Interpolation(_))
             | Value::Deferred(DeferredValue::Unknown(_))
+            | Value::Deferred(DeferredValue::Placeholder(_))
     ) {
         return;
     }
@@ -552,16 +570,19 @@ fn walk_custom_lookup_on_path<'a>(
     }
 }
 
-fn run_identified_lookup(
+fn run_identified_lookup<P: PlaceholderKind>(
     attribute_type: &AttributeType,
     identity: Option<&TypeIdentity>,
-    value: &Value,
+    value: &Value<P>,
     attr_name: Option<&str>,
     lookup: CustomTypeLookup<'_>,
     errors: &mut Vec<TypeError>,
 ) {
+    let Some(value) = value_without_placeholders(value) else {
+        return;
+    };
     if identity.is_some()
-        && let Err(e) = lookup(attribute_type, value)
+        && let Err(e) = lookup(attribute_type, &value)
     {
         errors.push(match attr_name {
             Some(attr_name) => e.with_attribute(attr_name),
@@ -1565,16 +1586,16 @@ impl RootlessType {
         }
     }
 
-    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+    pub fn validate<P: PlaceholderKind>(&self, value: &Value<P>) -> Result<(), TypeError> {
         self.schema.validate(value)
     }
 
     /// Validate a rootless value and bridge any callback-free identified
     /// refinements through an owning provider lookup. Native callbacks run in
     /// the structural pass and are skipped by the lookup walk.
-    pub(crate) fn validate_with_lookup(
+    pub(crate) fn validate_with_lookup<P: PlaceholderKind>(
         &self,
-        value: &Value,
+        value: &Value<P>,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
         if let Err(error) = self.schema.validate(value) {
@@ -1616,11 +1637,11 @@ impl RootlessType {
 
     /// Canonicalize one provider-configuration value without accepting a
     /// resource-path cursor that carries different ancestry.
-    pub fn canonicalize_provider_config(
+    pub fn canonicalize_provider_config<P: PlaceholderKind>(
         &self,
         provider_name: &str,
-        value: Value,
-    ) -> Result<Value, TypeError> {
+        value: Value<P>,
+    ) -> Result<Value<P>, TypeError> {
         crate::value::canonicalize_provider_config_with_type_and_ancestry(
             provider_name,
             value,
@@ -1774,7 +1795,7 @@ impl Schema {
 
     /// Validate a `Value` against this schema's `root`, resolving
     /// any `Ref` it encounters by looking it up in `defs`.
-    pub(crate) fn validate(&self, value: &Value) -> Result<(), TypeError> {
+    pub(crate) fn validate<P: PlaceholderKind>(&self, value: &Value<P>) -> Result<(), TypeError> {
         self.validate_attr(&self.root, value)
     }
 
@@ -2024,26 +2045,26 @@ impl Schema {
     }
 
     /// Validate one recursive child against this rootless schema's definitions.
-    pub(crate) fn validate_attr(
+    pub(crate) fn validate_attr<P: PlaceholderKind>(
         &self,
         attr: &AttributeType,
-        value: &Value,
+        value: &Value<P>,
     ) -> Result<(), TypeError> {
         validate_attr_with_defs(attr, value, &self.defs)
     }
 }
 
-fn validate_attr_with_defs(
+fn validate_attr_with_defs<P: PlaceholderKind>(
     attr: &AttributeType,
-    value: &Value,
+    value: &Value<P>,
     defs: &BTreeMap<String, AttributeType>,
 ) -> Result<(), TypeError> {
     validate_attr_with_defs_and_ancestry(attr, value, defs, FieldAncestry::WRITABLE)
 }
 
-pub(crate) fn validate_attr_with_defs_and_ancestry(
+pub(crate) fn validate_attr_with_defs_and_ancestry<P: PlaceholderKind>(
     attr: &AttributeType,
-    value: &Value,
+    value: &Value<P>,
     defs: &BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
 ) -> Result<(), TypeError> {
@@ -2071,9 +2092,9 @@ pub(crate) fn validate_attr_with_defs_and_ancestry(
     )
 }
 
-fn validate_attr_with_defs_on_path<'a>(
+fn validate_attr_with_defs_on_path<'a, P: PlaceholderKind>(
     attr: &'a AttributeType,
-    value: &Value,
+    value: &Value<P>,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
@@ -2103,9 +2124,9 @@ fn validate_attr_with_defs_on_path<'a>(
 /// computation has rejected a value. This walker is deliberately off the
 /// success path: acceptance is exactly `fit.is_some()`, while the established
 /// shape-based Union error attribution remains unchanged.
-fn validation_error_with_defs_on_path<'a>(
+fn validation_error_with_defs_on_path<'a, P: PlaceholderKind>(
     attr: &'a AttributeType,
-    value: &Value,
+    value: &Value<P>,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
@@ -2153,7 +2174,7 @@ fn validation_error_with_defs_on_path<'a>(
             } else if let Some(ConcreteValueRef::StringList(items)) = value.as_concrete() {
                 validate_list_length(*length, items.len())?;
                 for (i, item) in items.iter().enumerate() {
-                    let item = Value::Concrete(ConcreteValue::String(item.clone()));
+                    let item: Value<P> = Value::Concrete(ConcreteValue::String(item.clone()));
                     if let Err(inner_err) =
                         validate_attr_with_defs_and_ancestry(inner, &item, defs, ancestry)
                     {
@@ -3119,7 +3140,10 @@ impl AttributeType {
     /// Phase 2 of RFC #2972: the pre-Phase-2 `ResourceRef` short-circuit
     /// is gone — deferred values are filtered by the dispatcher in
     /// [`Self::validate`] and cannot reach this path.
-    fn resolve_enum_input(identity: &TypeIdentity, value: ConcreteValueRef<'_>) -> Value {
+    fn resolve_enum_input<P: PlaceholderKind>(
+        identity: &TypeIdentity,
+        value: ConcreteValueRef<'_, P>,
+    ) -> Value {
         let owned = value.to_owned_value();
         crate::utils::expand_enum_shorthand(&owned, identity)
     }
@@ -3165,7 +3189,7 @@ impl AttributeType {
     /// independently re-projected. Lists may legitimately mix concrete
     /// and deferred elements (e.g. `[vpc.id, "literal"]`).
     #[cfg(test)]
-    pub(crate) fn validate(&self, value: &Value) -> Result<(), TypeError> {
+    pub(crate) fn validate<P: PlaceholderKind>(&self, value: &Value<P>) -> Result<(), TypeError> {
         validate_attr_with_defs(self, value, empty_defs_for_schema_walks())
     }
 
@@ -3173,7 +3197,7 @@ impl AttributeType {
     /// walker has selected the leaf type. Keeping Struct/Union/List/Map out of
     /// this dispatcher prevents a second walker from silently re-rooting at
     /// writable ancestry.
-    fn validate_leaf_value(&self, value: &Value) -> Result<(), TypeError> {
+    fn validate_leaf_value<P: PlaceholderKind>(&self, value: &Value<P>) -> Result<(), TypeError> {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
             return self
                 .validate_leaf_value(inner)
@@ -3250,7 +3274,10 @@ impl AttributeType {
     /// path — they were filtered at the dispatcher in [`Self::validate`].
     /// The pre-Phase-2 `Value::Concrete(ConcreteValue::String(_)) | Value::Deferred(DeferredValue::ResourceRef{ .. }) |
     /// Value::Deferred(DeferredValue::Interpolation(_))` arm is now structurally unrepresentable.
-    fn validate_primitive(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
+    fn validate_primitive<P: PlaceholderKind>(
+        &self,
+        value: ConcreteValueRef<'_, P>,
+    ) -> Result<(), TypeError> {
         match (&self.kind, value) {
             (
                 AttrTypeKind::String {
@@ -3311,14 +3338,14 @@ impl AttributeType {
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`]. Pre-Phase-2
     /// `Value::Deferred(DeferredValue::Interpolation)` and `Value::Deferred(DeferredValue::ResourceRef)` short-circuits
     /// are gone — the dispatcher filters deferred values.
-    fn validate_enum(
+    fn validate_enum<P: PlaceholderKind>(
         identity: &TypeIdentity,
         values: Option<&[String]>,
         dsl_aliases: &[(String, String)],
         dsl_map: DslMap<'_>,
         validate: Option<&CustomValidator>,
         to_dsl: Option<&DslTransform>,
-        value: ConcreteValueRef<'_>,
+        value: ConcreteValueRef<'_, P>,
     ) -> Result<(), TypeError> {
         let prefix = identity.dotted_prefix();
         let prefix_ref = prefix.as_deref();
@@ -4311,9 +4338,9 @@ struct UnionFit<'a> {
 /// Ref paths are retained only while examining the same value node. Container
 /// descent starts a fresh path because it consumes one value level, allowing a
 /// recursive schema to revisit the same definition for a child value.
-fn fit_value_to_type_on_path<'a>(
+fn fit_value_to_type_on_path<'a, P: PlaceholderKind>(
     attr: &'a AttributeType,
-    value: &Value,
+    value: &Value<P>,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
@@ -4327,9 +4354,9 @@ fn fit_value_to_type_on_path<'a>(
     fit
 }
 
-pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
+pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind>(
     attr: &'a AttributeType,
-    value: &Value,
+    value: &Value<P>,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
@@ -4458,7 +4485,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
             for item in items {
-                let item = Value::Concrete(ConcreteValue::String(item.clone()));
+                let item: Value<P> = Value::Concrete(ConcreteValue::String(item.clone()));
                 let child = fit_value_to_type_on_path(
                     element_type,
                     &item,
@@ -4589,9 +4616,9 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a>(
     }
 }
 
-fn fit_union_members_on_path<'a>(
+fn fit_union_members_on_path<'a, P: PlaceholderKind>(
     members: &'a [AttributeType],
-    value: &Value,
+    value: &Value<P>,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
@@ -4645,7 +4672,11 @@ impl UnionFailureRank {
 struct RecognizedStructFields(IndexSet<String>);
 
 impl RecognizedStructFields {
-    fn new(fields: &[StructField], map: &IndexMap<String, Value>, ancestry: FieldAncestry) -> Self {
+    fn new<P: PlaceholderKind>(
+        fields: &[StructField],
+        map: &IndexMap<String, Value<P>>,
+        ancestry: FieldAncestry,
+    ) -> Self {
         Self(
             map.keys()
                 .filter(|field| struct_field_for_key(fields, field, ancestry).is_some())
@@ -4714,9 +4745,9 @@ impl UnionMemberJudgement {
 /// one member, such as canonicalization's closest-member selector, retain the
 /// declaration-order strict-max tie-break. Diagnostic selection preserves all
 /// co-maximal failures instead.
-fn union_member_judgement_on_path<'a>(
+fn union_member_judgement_on_path<'a, P: PlaceholderKind>(
     member: &'a AttributeType,
-    value: ConcreteValueRef<'_>,
+    value: ConcreteValueRef<'_, P>,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
@@ -4832,9 +4863,9 @@ impl BestUnionMemberFailures {
         }
     }
 
-    fn into_error(
+    fn into_error<P: PlaceholderKind>(
         self,
-        value: ConcreteValueRef<'_>,
+        value: ConcreteValueRef<'_, P>,
         members: UnionMembers<'_>,
         ancestry: FieldAncestry,
     ) -> TypeError {
@@ -4962,9 +4993,9 @@ fn describe_struct_union_members(
 /// member returned `None`, and exists so provider-output enum failures retain
 /// the same leaf error as a non-Union enum. It uses the established diagnostic
 /// rank and declaration-order tie break without turning shape into acceptance.
-pub(crate) fn closest_union_member_for_value_on_path<'a>(
+pub(crate) fn closest_union_member_for_value_on_path<'a, P: PlaceholderKind>(
     union: &'a AttributeType,
-    value: ConcreteValueRef<'_>,
+    value: ConcreteValueRef<'_, P>,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
     visited_refs: &mut Vec<&'a str>,
@@ -4998,10 +5029,10 @@ pub(crate) fn closest_union_member_for_value_on_path<'a>(
 /// retained in declaration order. Both Validation-only callers use this
 /// routine. Canonicalization consumes the richer [`Fit`] witness directly, so
 /// it never has to select the member again.
-pub(crate) fn select_union_member_on_path<'a>(
+pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind>(
     members: &'a [AttributeType],
-    original: &Value,
-    value: ConcreteValueRef<'_>,
+    original: &Value<P>,
+    value: ConcreteValueRef<'_, P>,
     expected: String,
     defs: &'a BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
@@ -5086,9 +5117,9 @@ pub(crate) fn struct_field_for_key<'a>(
         .find(|field| field.name == key || ancestry.block_name(field) == Some(key))
 }
 
-fn struct_field_is_present(
+fn struct_field_is_present<P: PlaceholderKind>(
     fields: &[StructField],
-    map: &IndexMap<String, Value>,
+    map: &IndexMap<String, Value<P>>,
     expected: &StructField,
     ancestry: FieldAncestry,
 ) -> bool {
@@ -5122,17 +5153,17 @@ fn validate_struct_field_assignment(
 /// Keeping required-field checks, canonical/`block_name` lookup, unknown-key
 /// rejection, and suggestions behind one function prevents the standalone and
 /// schema-aware validators from acquiring different notions of a valid struct.
-fn validate_struct_fields<M, V>(
+fn validate_struct_fields<P: PlaceholderKind, M, V>(
     struct_name: &str,
     fields: &[StructField],
-    map: &IndexMap<String, Value>,
+    map: &IndexMap<String, Value<P>>,
     ancestry: FieldAncestry,
     missing_required: M,
     mut validate_value: V,
 ) -> Result<(), TypeError>
 where
     M: Fn(&StructField) -> TypeError,
-    V: FnMut(&str, &StructField, &Value) -> Result<(), TypeError>,
+    V: FnMut(&str, &StructField, &Value<P>) -> Result<(), TypeError>,
 {
     for field in fields {
         if ancestry.effective_input_mode(field).is_required()
@@ -6597,7 +6628,7 @@ impl TypeError {
     }
 }
 
-impl Value {
+impl<P: PlaceholderKind> Value<P> {
     pub fn type_name(&self) -> String {
         match self {
             Value::Concrete(ConcreteValue::String(_)) => "String".to_string(),
@@ -6630,11 +6661,12 @@ impl Value {
             Value::Deferred(DeferredValue::Secret(_)) => "Secret".to_string(),
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret".to_string(),
             Value::Deferred(DeferredValue::Unknown(_)) => "Unknown".to_string(),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
         }
     }
 }
 
-impl ConcreteValueRef<'_> {
+impl<P: PlaceholderKind> ConcreteValueRef<'_, P> {
     /// Concrete-axis name used in type-mismatch diagnostics. Mirrors
     /// the labels [`Value::type_name`] produces for the same axis.
     fn type_name(&self) -> &'static str {
@@ -6669,11 +6701,15 @@ impl ConcreteValueRef<'_> {
             ConcreteValueRef::Float(f) => Value::Concrete(ConcreteValue::Float(f)),
             ConcreteValueRef::Bool(b) => Value::Concrete(ConcreteValue::Bool(b)),
             ConcreteValueRef::Duration(d) => Value::Concrete(ConcreteValue::Duration(d)),
-            ConcreteValueRef::List(items) => Value::Concrete(ConcreteValue::List(items.to_vec())),
+            ConcreteValueRef::List(_) => {
+                unreachable!("container values do not reach scalar validation")
+            }
             ConcreteValueRef::StringList(items) => {
                 Value::Concrete(ConcreteValue::StringList(items.to_vec()))
             }
-            ConcreteValueRef::Map(map) => Value::Concrete(ConcreteValue::Map(map.clone())),
+            ConcreteValueRef::Map(_) => {
+                unreachable!("container values do not reach scalar validation")
+            }
         }
     }
 }
@@ -6697,8 +6733,8 @@ pub mod validators {
     ///     validators::validate_exclusive_required(attributes, &["option_a", "option_b"])
     /// }
     /// ```
-    pub fn validate_exclusive_required(
-        attributes: &HashMap<String, Value>,
+    pub fn validate_exclusive_required<P: PlaceholderKind>(
+        attributes: &HashMap<String, Value<P>>,
         fields: &[&str],
     ) -> Result<(), Vec<TypeError>> {
         let present_fields: Vec<&str> = fields
@@ -7528,7 +7564,7 @@ impl<'a> EffectiveAttribute<'a> {
     }
 
     /// Validate an authored value with this attribute's effective ancestry.
-    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+    pub fn validate<P: PlaceholderKind>(&self, value: &Value<P>) -> Result<(), TypeError> {
         self.value_type().validate(value)
     }
 
@@ -7670,7 +7706,7 @@ impl<'a> EffectiveType<'a> {
 
     /// Validate an authored value without discarding the reference path that
     /// determines nested field modes.
-    pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+    pub fn validate<P: PlaceholderKind>(&self, value: &Value<P>) -> Result<(), TypeError> {
         validate_attr_with_defs_and_ancestry(self.attr_type, value, self.defs, self.field_ancestry)
     }
 
@@ -8096,9 +8132,9 @@ impl ValidatedResourceSchema {
             .validate_values_with_origins(attributes, is_string_literal)
     }
 
-    pub(crate) fn validate_with_origins_and_lookup(
+    pub(crate) fn validate_with_origins_and_lookup<P: PlaceholderKind>(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -9750,9 +9786,9 @@ impl ResourceSchema {
     /// refined primitive identity reached during traversal so
     /// provider-supplied validators that the schema itself cannot
     /// carry (WASM plugin path) still get to reject bad values.
-    fn validate_values_with_origins_and_lookup(
+    fn validate_values_with_origins_and_lookup<P: PlaceholderKind>(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -9835,9 +9871,9 @@ impl ResourceSchema {
         }
     }
 
-    fn validate_inner(
+    fn validate_inner<P: PlaceholderKind>(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -9868,7 +9904,8 @@ impl ResourceSchema {
 
         // Run custom validator if present
         if let Some(validator) = self.validator()
-            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+            && let Some(attributes) = attributes_without_placeholders(attributes)
+            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
         {
             errors.append(&mut validation_errors);
         }
@@ -9880,9 +9917,9 @@ impl ResourceSchema {
         }
     }
 
-    fn validate_value_entries(
+    fn validate_value_entries<P: PlaceholderKind>(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
         mode: ValueEntryValidation,
@@ -10107,9 +10144,9 @@ fn nested_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn match_block_field<'a>(
+fn match_block_field<'a, P: PlaceholderKind>(
     key: &str,
-    value: &Value,
+    value: &Value<P>,
     fields: &[BlockFieldRef<'a>],
     defs: &BTreeMap<String, AttributeType>,
 ) -> Option<BlockFieldMatch<'a>> {
@@ -10154,12 +10191,12 @@ fn block_name_conflict(
     }
 }
 
-fn value_for_field<'a>(
-    map: &'a IndexMap<String, Value>,
+fn value_for_field<'a, P: PlaceholderKind>(
+    map: &'a IndexMap<String, Value<P>>,
     field: BlockFieldRef<'_>,
     fields: &[BlockFieldRef<'_>],
     defs: &BTreeMap<String, AttributeType>,
-) -> Option<&'a Value> {
+) -> Option<&'a Value<P>> {
     if let Some(value) = map.get(field.name) {
         return Some(value);
     }
@@ -10172,9 +10209,9 @@ fn value_for_field<'a>(
     .then_some(value)
 }
 
-fn resolve_block_names_in_map(
-    map: &mut IndexMap<String, Value>,
-    authored_map: Option<&IndexMap<String, Value>>,
+fn resolve_block_names_in_map<P: PlaceholderKind>(
+    map: &mut IndexMap<String, Value<P>>,
+    authored_map: Option<&IndexMap<String, Value<P>>>,
     fields: &[BlockFieldRef<'_>],
     context: BlockNameResolutionContext<'_>,
     parent_path: &str,
@@ -10229,9 +10266,9 @@ fn resolve_block_names_in_map(
     }
 }
 
-fn resolve_block_names_in_value(
-    value: &mut Value,
-    authored_value: Option<&Value>,
+fn resolve_block_names_in_value<P: PlaceholderKind>(
+    value: &mut Value<P>,
+    authored_value: Option<&Value<P>>,
     attr_type: &AttributeType,
     ancestry: FieldAncestry,
     context: BlockNameResolutionContext<'_>,
@@ -10330,10 +10367,10 @@ fn block_fields(schema: &ResourceSchema) -> Vec<BlockFieldRef<'_>> {
         .collect()
 }
 
-fn resolve_attribute_block_names(
+fn resolve_attribute_block_names<P: PlaceholderKind>(
     resource_id: &ResourceId,
-    attributes: &mut IndexMap<String, Value>,
-    authored_attributes: Option<&IndexMap<String, Value>>,
+    attributes: &mut IndexMap<String, Value<P>>,
+    authored_attributes: Option<&IndexMap<String, Value<P>>>,
     schema: &ResourceSchema,
 ) -> Vec<BlockNameConflict> {
     let fields = block_fields(schema);
@@ -10353,8 +10390,8 @@ fn resolve_attribute_block_names(
     conflicts
 }
 
-fn find_block_name_alias_in_map(
-    map: &IndexMap<String, Value>,
+fn find_block_name_alias_in_map<P: PlaceholderKind>(
+    map: &IndexMap<String, Value<P>>,
     fields: &[BlockFieldRef<'_>],
     defs: &BTreeMap<String, AttributeType>,
     resource_id: &str,
@@ -10389,8 +10426,8 @@ fn find_block_name_alias_in_map(
     None
 }
 
-fn find_block_name_alias_in_value(
-    value: &Value,
+fn find_block_name_alias_in_value<P: PlaceholderKind>(
+    value: &Value<P>,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
     ancestry: FieldAncestry,
@@ -10450,8 +10487,8 @@ fn find_block_name_alias_in_value(
 /// This uses the same field matcher as the rename pass, including the narrow
 /// ambiguous-name rule for parser-produced lists. Union values are left to
 /// normal schema validation.
-pub(crate) fn find_resource_block_name_alias<S>(
-    resource: &Resource<S>,
+pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind>(
+    resource: &Resource<S, P>,
     schema: &ResourceSchema,
 ) -> Option<BlockNameConflict> {
     find_block_name_alias_in_map(
@@ -10463,8 +10500,8 @@ pub(crate) fn find_resource_block_name_alias<S>(
     )
 }
 
-fn resolve_block_names_detailed(
-    resources: &mut [Resource],
+fn resolve_block_names_detailed<S, P: PlaceholderKind>(
+    resources: &mut [Resource<S, P>],
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
     resources
@@ -10482,9 +10519,9 @@ fn resolve_block_names_detailed(
         .collect()
 }
 
-fn resolve_block_names_detailed_with_authored(
-    resources: &mut [Resource],
-    authored: &[Resource],
+fn resolve_block_names_detailed_with_authored<S, P: PlaceholderKind>(
+    resources: &mut [Resource<S, P>],
+    authored: &[Resource<S, P>],
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
     resources
@@ -10523,8 +10560,12 @@ fn resolve_block_names(
     }
 }
 
-fn resolve_file_block_names<E>(
-    parsed: &mut crate::parser::File<E>,
+fn resolve_file_block_names<
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+>(
+    parsed: &mut crate::parser::File<E, P, T>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
     let mut conflicts = resolve_block_names_detailed(&mut parsed.resources, registry);
@@ -10554,8 +10595,8 @@ fn resolve_file_block_names<E>(
 }
 
 fn resolve_file_block_names_with_authored<E, A>(
-    parsed: &mut crate::parser::File<E>,
-    authored: &crate::parser::File<A>,
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    authored: &crate::parser::File<A, ParserPlaceholder, ParserPlaceholder>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
     let mut conflicts = resolve_block_names_detailed_with_authored(
@@ -10602,8 +10643,12 @@ fn resolve_file_block_names_with_authored<E, A>(
 
 /// Resolve block names in one evaluated file, including deferred-for
 /// templates that can materialize after refresh.
-pub fn resolve_file_block_names_with_schemas<E>(
-    parsed: &mut crate::parser::File<E>,
+pub fn resolve_file_block_names_with_schemas<
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+>(
+    parsed: &mut crate::parser::File<E, P, T>,
     registry: &SchemaRegistry,
 ) -> Result<(), Vec<BlockNameConflict>> {
     let conflicts = resolve_file_block_names(parsed, registry);
@@ -10620,11 +10665,16 @@ pub fn resolve_file_block_names_with_schemas<E>(
 /// This raw primitive returns plain values and carries no pairing guarantee.
 /// Only carina-cli's validated-wiring transition may mint its canonical
 /// resource pair from these values.
+pub type ParserStageBlockNameResolution<E> = (
+    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    Vec<Resource<ModuleSource, ParserPlaceholder>>,
+);
+
 pub fn resolve_config_block_names<E>(
-    mut parsed: crate::parser::File<E>,
+    mut parsed: crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<(crate::parser::File<E>, Vec<Resource>), Vec<BlockNameConflict>> {
+) -> Result<ParserStageBlockNameResolution<E>, Vec<BlockNameConflict>> {
     let mut unresolved = unresolved.into_inner();
     let mut conflicts = resolve_file_block_names_with_authored(&mut parsed, &unresolved, registry);
     let mut seen = conflicts.iter().cloned().collect::<HashSet<_>>();
@@ -11435,9 +11485,9 @@ impl<'a> OwnerBoundResourceSchema<'a> {
 
     /// Validate authored resource values with custom-type routing derived from
     /// this schema's registered owner.
-    pub fn validate_with_resolver(
+    pub fn validate_with_resolver<P: PlaceholderKind>(
         self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Value<P>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         resolver: &dyn crate::parser::CustomTypeResolver,
     ) -> Result<(), Vec<TypeError>> {
@@ -11545,9 +11595,9 @@ impl SchemaRegistry {
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].
-    pub fn get_for<S>(
+    pub fn get_for<S, P: crate::resource::PlaceholderKind>(
         &self,
-        resource: &crate::resource::Resource<S>,
+        resource: &crate::resource::Resource<S, P>,
     ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,
@@ -11557,9 +11607,9 @@ impl SchemaRegistry {
     }
 
     /// Look up the `DataSource` schema for a given [`DataSource`].
-    pub fn get_for_data_source<S>(
+    pub fn get_for_data_source<S, P: crate::resource::PlaceholderKind>(
         &self,
-        resource: &crate::resource::DataSource<S>,
+        resource: &crate::resource::DataSource<S, P>,
     ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,

@@ -6337,7 +6337,8 @@ mod tests {
     use super::*;
     use carina_core::provider::SentRecord;
     use carina_core::resource::{
-        AccessPath, ConcreteValue, Current, DeferredValue, InterpolationPart, UnknownReason,
+        AccessPath, ApplyTimeUnknown, ConcreteValue, Current, DeferredValue, InterpolationPart,
+        ModuleSource,
     };
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -7170,7 +7171,11 @@ mod tests {
         resource.set_attr("before", test_string_value("before"));
         resource.set_attr(
             "pending",
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
+            Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "pending".to_string(),
+                },
+            )),
         );
         resource.set_attr("middle", test_string_value("middle"));
         resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
@@ -7215,7 +7220,11 @@ mod tests {
 
     #[tokio::test]
     async fn wasm_serializable_resources_restores_duplicate_resource_ids_by_position() {
-        let first_hidden = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex));
+        let first_hidden: Value = Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "pending".to_string(),
+            },
+        ));
         let second_hidden = Value::resource_ref("peer", "identifier", vec![]);
 
         let mut first = Resource::new("test.t", "shared");
@@ -7261,7 +7270,7 @@ mod tests {
     async fn wasm_serializable_resources_strips_values_in_nested_wrappers() {
         let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
         let unknown = || {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
                 path: upstream_path.clone(),
             }))
         };
@@ -7360,7 +7369,11 @@ mod tests {
         resource.set_attr("peer", Value::resource_ref("peer", "identifier", vec![]));
         resource.set_attr(
             "pending",
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
+            Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "pending".to_string(),
+                },
+            )),
         );
         let mut resources = vec![resource];
         let before = resources[0].attributes.clone();
@@ -7663,8 +7676,10 @@ mod tests {
     fn malformed_normalized_state_output_is_atomic() {
         use wit_types::PersistedValue as WitValue;
 
-        let first_id = Resource::with_provider("mock", "test.resource", "first", None).id;
-        let second_id = Resource::with_provider("mock", "test.resource", "second", None).id;
+        let first_id =
+            Resource::<ModuleSource>::with_provider("mock", "test.resource", "first", None).id;
+        let second_id =
+            Resource::<ModuleSource>::with_provider("mock", "test.resource", "second", None).id;
         let original_value = Value::Concrete(carina_core::resource::ConcreteValue::String(
             "original".into(),
         ));
@@ -7720,7 +7735,8 @@ mod tests {
         use argon2::Argon2;
         use wit_types::PersistedValue as WitValue;
 
-        let id = Resource::with_provider("mock", "test.resource", "legacy", None).id;
+        let id =
+            Resource::<ModuleSource>::with_provider("mock", "test.resource", "legacy", None).id;
         let material = b"\"wire-legacy\"";
         let salt = b"carina:mock.test.resource:legacy:comment";
         let mut output = [0_u8; 32];
@@ -7767,7 +7783,7 @@ mod tests {
 
     #[test]
     fn invalid_state_key_error_names_the_operation_once() {
-        let id = Resource::with_provider("mock", "test.resource", "only", None).id;
+        let id = Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
         let expected = HashMap::from([("expected".to_string(), id)]);
 
         let error = validate_wit_state_result_keys("normalize_state", &expected, Vec::new())
@@ -7779,7 +7795,7 @@ mod tests {
 
     #[test]
     fn single_state_result_rejects_more_than_one_entry() {
-        let id = Resource::with_provider("mock", "test.resource", "only", None).id;
+        let id = Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
         let state = wit_types::PersistedState {
             identifier: None,
             attributes: Vec::new(),
@@ -8827,8 +8843,13 @@ mod tests {
     async fn redirect_response_is_surfaced_and_follow_up_is_rechecked() {
         use wasmtime_wasi::p2::Pollable;
 
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("failed to bind loopback test server");
+        let listener = match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
+                return;
+            }
+        };
         let server_address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {

@@ -15,9 +15,12 @@ use crate::parser::{
     evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_for_target,
 };
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
+};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin,
-    LoopKind, LoopSource, Resource, UnboundLoopTemplate, UnknownReason, Value,
+    ConcreteValue, DeferredValue, ForLoopElement, LegacyLoopAddress, LoopElementOrigin, LoopKind,
+    LoopSource, UnboundLoopTemplate,
 };
 
 /// Binding pattern for a for expression
@@ -91,11 +94,6 @@ fn parse_deferred_resource_template(
     source_file: &std::path::Path,
 ) -> Result<Option<Box<Resource>>, ParseError> {
     let mut template_ctx = ctx.child_scope();
-    let bind = |ctx: &mut ParseContext, name: &str, value: Value| {
-        if name != "_" {
-            ctx.set_variable(name.to_string(), value);
-        }
-    };
     let bind_value = |ctx: &mut ParseContext, name: &str| {
         if name != "_" {
             ctx.set_variable(
@@ -107,19 +105,11 @@ fn parse_deferred_resource_template(
     match binding {
         ForBinding::Simple(value) => bind_value(&mut template_ctx, value),
         ForBinding::Indexed(index, value) => {
-            bind(
-                &mut template_ctx,
-                index,
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
-            );
+            bind_value(&mut template_ctx, index);
             bind_value(&mut template_ctx, value);
         }
         ForBinding::Map(key, value) => {
-            bind(
-                &mut template_ctx,
-                key,
-                Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
-            );
+            bind_value(&mut template_ctx, key);
             bind_value(&mut template_ctx, value);
         }
     }

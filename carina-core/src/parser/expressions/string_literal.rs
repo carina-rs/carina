@@ -3,10 +3,14 @@
 //! Handles both single-quoted (literal-only) and double-quoted
 //! (interpolated) string forms, plus the related unescape routines.
 
+use crate::parser::ParsedValue as Value;
 use crate::parser::{ParseContext, ParseError, Rule, first_inner, parse_expression};
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value, ValueString,
+    ConcreteValue, DeferredValue, InterpolationPart as GenericInterpolationPart, ParserPlaceholder,
+    ValueString,
 };
+
+type InterpolationPart = GenericInterpolationPart<ParserPlaceholder>;
 
 /// Encode a string value as canonical, parseable Carina source.
 ///
@@ -164,7 +168,7 @@ pub(crate) fn parse_string_value(
                     has_interpolation = true;
                     // Grammar makes the inner expression optional so
                     // mid-edit `${}` doesn't poison the AST. An empty
-                    // interpolation lands as `Value::Deferred(DeferredValue::Unknown(EmptyInterpolation))`
+                    // interpolation lands as `Value::Deferred(DeferredValue::Placeholder(EmptyInterpolation))`
                     // — the LSP surfaces it as a diagnostic; downstream
                     // resolvers carry it as an unresolved value. See #2480.
                     let value = match inner.into_inner().next() {
@@ -176,8 +180,8 @@ pub(crate) fn parse_string_value(
                             )?;
                             parse_expression(expr_pair, ctx)?
                         }
-                        None => Value::Deferred(DeferredValue::Unknown(
-                            UnknownReason::EmptyInterpolation,
+                        None => Value::Deferred(DeferredValue::Placeholder(
+                            ParserPlaceholder::EmptyInterpolation,
                         )),
                     };
                     parts.push(InterpolationPart::Expr(value));

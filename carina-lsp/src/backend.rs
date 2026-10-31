@@ -972,6 +972,8 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()
+        .into_expanded()
+        .unwrap()
         .providers
         .into_iter()
         .next()

@@ -21,8 +21,10 @@
 //! See #2230 for the design discussion.
 
 use crate::parser::{PendingValueSlot, ResourceTypePath};
-use crate::resource::{PathSegment, Subscript, Value};
+use crate::resource::{ParserPlaceholder, PathSegment, Subscript, Value as GenericValue};
 use indexmap::IndexMap;
+
+type Value = GenericValue<ParserPlaceholder>;
 
 /// Parser-only representation of a structural binding used as an operand.
 ///
@@ -210,17 +212,15 @@ impl StructuralHandle {
     pub(crate) fn access_base_value(&self) -> Value {
         let binding = self.canonical_binding_name();
         match &self.kind {
-            StructuralHandleKind::ModuleParameter => {
-                Value::Deferred(crate::resource::DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
-                        name: binding.to_string(),
-                        source_line: (0).into(),
-                        diagnostic_name: None,
-                    },
-                ))
-            }
+            StructuralHandleKind::ModuleParameter => Value::Deferred(
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+                    name: binding.to_string(),
+                    source_line: (0).into(),
+                    diagnostic_name: None,
+                }),
+            ),
             StructuralHandleKind::FunctionParameter => Value::Deferred(
-                crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::FnParam {
+                crate::resource::DeferredValue::Placeholder(ParserPlaceholder::FnParam {
                     name: binding.to_string(),
                 }),
             ),
@@ -295,7 +295,7 @@ pub(crate) enum EvalValue {
     /// Deferred-for loop value before the iterable is available. Keeping the
     /// authored binding name on the evaluator axis lets a postfix chain retain
     /// `item.missing` for plan display without resurrecting the removed
-    /// path-carrying `UnknownReason` variant.
+    /// path-carrying `ApplyTimeUnknown` variant.
     DeferredForValue { binding: String },
 
     /// A partially applied function. Lives strictly inside the evaluator.
@@ -389,8 +389,8 @@ impl EvalValue {
     /// Stamp a neutral module-parameter placeholder with the authored use
     /// site. Other evaluator values pass through unchanged.
     pub(crate) fn with_reference_source_line(mut self, line: usize) -> Self {
-        if let Self::User(Value::Deferred(crate::resource::DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { source_line, .. },
+        if let Self::User(Value::Deferred(crate::resource::DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument { source_line, .. },
         ))) = &mut self
         {
             *source_line = line.into();
@@ -465,10 +465,8 @@ impl EvalValue {
                 ))
             }
             Self::ComputedWithStructuralHandles { value, metadata } => Ok((value, Some(metadata))),
-            Self::DeferredForValue { .. } => Ok((
-                Value::Deferred(crate::resource::DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue,
-                )),
+            Self::DeferredForValue { binding } => Ok((
+                Value::Deferred(crate::resource::DeferredValue::BindingRef { binding }),
                 None,
             )),
             Self::Closure {
@@ -539,8 +537,8 @@ impl EvalValue {
                 crate::resource::DeferredValue::BindingRef { binding },
             )),
             Self::ComputedWithStructuralHandles { value, .. } => Ok(value),
-            Self::DeferredForValue { .. } => Ok(Value::Deferred(
-                crate::resource::DeferredValue::Unknown(crate::resource::UnknownReason::ForValue),
+            Self::DeferredForValue { binding } => Ok(Value::Deferred(
+                crate::resource::DeferredValue::BindingRef { binding },
             )),
             Self::Closure {
                 name,

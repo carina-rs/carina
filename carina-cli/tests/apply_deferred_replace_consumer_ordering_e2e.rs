@@ -40,6 +40,9 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }];
+    let parsed = parsed
+        .into_expanded()
+        .expect("provider fixture has no parser placeholders");
     let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -252,7 +255,17 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         .insert("validation_records[0]".to_string());
     let consumer_from = consumer_current_state(&consumer.id);
 
-    let template_resource = mock_resource("validation_records", "validation_records");
+    let template_resource: carina_core::resource::Resource<
+        carina_core::resource::ModuleSource,
+        carina_core::resource::LoopSlot,
+    > = carina_core::resource::Resource::with_provider(
+        "mock",
+        "test.resource",
+        carina_core::resource::ResourceIdentity::try_from("validation_records".to_string())
+            .unwrap(),
+        None,
+    )
+    .with_binding("validation_records");
     let template = DeferredForExpression {
         file: Some("main.crn".to_string()),
         line: 1,

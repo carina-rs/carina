@@ -4,6 +4,7 @@ use std::path::Path;
 use indexmap::IndexMap;
 
 use crate::parser::{ConsumerArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock};
+use crate::resource::ParserPlaceholder;
 use crate::static_type::ConsumerStaticType;
 
 use super::resolver::{StrictTypeResolution, TypeResolutionPolicy};
@@ -14,7 +15,7 @@ use super::resolver::{StrictTypeResolution, TypeResolutionPolicy};
 pub struct ResolvedModuleSignature {
     pub arguments: Vec<ConsumerArgumentParameter>,
     pub attributes: IndexMap<String, Option<ConsumerStaticType>>,
-    pub requires: Vec<RequireBlock>,
+    pub requires: Vec<RequireBlock<ParserPlaceholder>>,
 }
 
 /// Imported module alias to its resolved argument/output signature.

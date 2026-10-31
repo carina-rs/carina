@@ -12,13 +12,15 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ProviderContext, ResourceContext,
-    ResourceRef, ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
+    ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ParsedValue as Value,
+    ProviderContext, ResourceContext, ResourceRef, ResourceTypePath, SourceFileId, SourceSpan,
+    TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
-    CompositionCallPath, ConcreteValue, DeferredValue, EnumValueResolver, RawEnumIdentifier,
-    ReferencePath, ReferencePathRef, Resource, Value,
+    CompositionCallPath, ConcreteValue, DeferredValue, EnumValueResolver, ModuleSource,
+    NoPlaceholder, ParserPlaceholder, PlaceholderKind, RawEnumIdentifier, ReferencePath,
+    ReferencePathRef, Resource as GenericResource, Value as GenericValue,
 };
 use crate::schema::{
     AttributeType, BindingKind, BindingShadowsEnumMemberError, FieldAncestry, SchemaRegistry,
@@ -368,12 +370,12 @@ pub struct ValidationTypeContext<'a> {
     pub module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     provider_context: typecheck::TypecheckProviderContext<'a>,
     scope_bindings: BindingIndex<'a>,
-    inference_bindings: inference::InferenceBindings,
+    inference_bindings: inference::InferenceBindings<ParserPlaceholder>,
 }
 
 impl<'a> ValidationTypeContext<'a> {
     pub fn new<E>(
-        file: &'a crate::parser::File<E>,
+        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
         schemas: &'a SchemaRegistry,
         provider_context: &'a LoadedProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -390,7 +392,7 @@ impl<'a> ValidationTypeContext<'a> {
     /// no loaded provider custom-type catalog. Structural checks still run,
     /// while provider-owned leaves never reach the resolver.
     pub fn new_providerless<E>(
-        file: &'a crate::parser::File<E>,
+        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
         schemas: &'a SchemaRegistry,
         provider_context: &'a ProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -404,7 +406,7 @@ impl<'a> ValidationTypeContext<'a> {
     }
 
     fn with_provider_context<E>(
-        file: &'a crate::parser::File<E>,
+        file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
         schemas: &'a SchemaRegistry,
         provider_context: typecheck::TypecheckProviderContext<'a>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
@@ -500,25 +502,33 @@ impl std::error::Error for BindingUseReport {}
 /// ```
 #[derive(Debug)]
 pub struct ResolvedFile<E> {
-    inner: crate::parser::File<E>,
+    inner: crate::parser::File<E, NoPlaceholder, crate::resource::LoopSlot>,
 }
 
 impl<E> ResolvedFile<E> {
-    pub fn as_file(&self) -> &crate::parser::File<E> {
+    pub fn as_file(&self) -> &crate::parser::File<E, NoPlaceholder, crate::resource::LoopSlot> {
         &self.inner
     }
 
-    pub fn into_file(self) -> crate::parser::File<E> {
+    pub fn into_file(self) -> crate::parser::File<E, NoPlaceholder, crate::resource::LoopSlot> {
         self.inner
     }
 }
 
 impl<E> std::ops::Deref for ResolvedFile<E> {
-    type Target = crate::parser::File<E>;
+    type Target = crate::parser::File<E, NoPlaceholder, crate::resource::LoopSlot>;
 
     fn deref(&self) -> &Self::Target {
         self.as_file()
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveFileError {
+    #[error(transparent)]
+    BindingUse(#[from] BindingUseReport),
+    #[error(transparent)]
+    LeftoverPlaceholder(#[from] crate::resource::LeftoverPlaceholder),
 }
 
 impl BindingUseReport {
@@ -736,16 +746,16 @@ fn reference_value_mismatch(
 fn deferred_value_mismatch(
     value: &Value,
     target: crate::schema::TypeInSchema<'_>,
-    inference_bindings: &inference::InferenceBindings,
+    inference_bindings: &inference::InferenceBindings<ParserPlaceholder>,
     schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_>,
     authored_binding: &str,
 ) -> Option<BindingResolutionError> {
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+        GenericValue::Deferred(DeferredValue::ResourceRef { path }) => {
             reference_value_mismatch(ReferencePathRef::Access(path), target, bindings)
         }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+        GenericValue::Deferred(DeferredValue::BindingRef { binding }) => {
             reference_value_mismatch(ReferencePathRef::Binding(binding), target, bindings)
         }
         Value::Deferred(
@@ -757,7 +767,8 @@ fn deferred_value_mismatch(
             | DeferredValue::Access(_)
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => check_deferred_access_type(value, target, inference_bindings, schemas, bindings)
             .err()
             .map(|error| match error {
@@ -1274,22 +1285,48 @@ pub fn check_bare_binding_uses<E>(
 /// Success wraps the exact checked file without exposing a mutable provenance
 /// channel, so no later caller can pair an unrelated file with a detached
 /// proof. On failure the report contains every authored finding.
-pub fn resolve_bare_binding_uses<E>(
-    file: crate::parser::File<E>,
+pub fn resolve_bare_binding_uses<E: crate::parser::IntoExpandedExportParam>(
+    file: crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
     schemas: &SchemaRegistry,
     provider_context: &LoadedProviderContext,
     module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
-) -> Result<ResolvedFile<E>, BindingUseReport> {
+) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
     let report = {
         let context =
             ValidationTypeContext::new(&file, schemas, provider_context, module_signatures);
         check_bare_binding_uses(&file, &context)
     };
     if !report.is_ready() {
-        return Err(report);
+        return Err(report.into());
     }
 
-    Ok(ResolvedFile { inner: file })
+    Ok(ResolvedFile {
+        inner: file.into_expanded()?,
+    })
+}
+
+/// Cross the parser-placeholder boundary for an evaluated file and its
+/// canonical authored-resource snapshot as one validation transition.
+pub type ResolvedFileWithUnresolvedResources<E> = (
+    ResolvedFile<E>,
+    Vec<crate::resource::Resource<crate::resource::ModuleSource>>,
+);
+
+pub fn resolve_bare_binding_uses_with_unresolved_resources<
+    E: crate::parser::IntoExpandedExportParam,
+>(
+    file: crate::parser::File<E, ParserPlaceholder, ParserPlaceholder>,
+    unresolved: Vec<crate::resource::Resource<crate::resource::ModuleSource, ParserPlaceholder>>,
+    schemas: &SchemaRegistry,
+    provider_context: &LoadedProviderContext,
+    module_signatures: &crate::module_resolver::ResolvedModuleSignatures,
+) -> Result<ResolvedFileWithUnresolvedResources<E::Expanded>, ResolveFileError> {
+    let resolved = resolve_bare_binding_uses(file, schemas, provider_context, module_signatures)?;
+    let unresolved = unresolved
+        .into_iter()
+        .map(crate::resource::Resource::into_expanded)
+        .collect::<Result<_, _>>()?;
+    Ok((resolved, unresolved))
 }
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
     let value = values.next()?;
@@ -1334,60 +1371,62 @@ fn unique_union_map_member<'a>(
 /// available signature and deliberately receive `None`: the function's result
 /// sink says nothing sound about its input positions. Secrets preserve their
 /// enclosing sink and interpolation expressions use a string sink.
-pub(crate) fn visit_refs_with_sink<'a>(
-    value: &Value,
+pub(crate) fn visit_refs_with_sink<'a, P: PlaceholderKind>(
+    value: &GenericValue<P>,
     sink: Option<RefSink<'a>>,
     f: &mut impl FnMut(
         ReferencePathRef<'_>,
         Option<RefSink<'a>>,
         crate::resource::ResourceRefUsage,
-        Option<&Value>,
+        Option<&GenericValue<P>>,
     ),
 ) {
     visit_refs_with_sink_inner(value, sink, crate::resource::ResourceRefUsage::Required, f);
 }
 
-fn visit_refs_with_sink_inner<'a>(
-    value: &Value,
+fn visit_refs_with_sink_inner<'a, P: PlaceholderKind>(
+    value: &GenericValue<P>,
     sink: Option<RefSink<'a>>,
     usage: crate::resource::ResourceRefUsage,
     f: &mut impl FnMut(
         ReferencePathRef<'_>,
         Option<RefSink<'a>>,
         crate::resource::ResourceRefUsage,
-        Option<&Value>,
+        Option<&GenericValue<P>>,
     ),
 ) {
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+        GenericValue::Deferred(DeferredValue::ResourceRef { path }) => {
             f(ReferencePathRef::Access(path), sink, usage, None)
         }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+        GenericValue::Deferred(DeferredValue::BindingRef { binding }) => {
             f(ReferencePathRef::Binding(binding), sink, usage, None)
         }
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument { name, .. },
-        )) => f(ReferencePathRef::Binding(name), sink, usage, None),
-        Value::Concrete(ConcreteValue::List(items)) => {
+        GenericValue::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            if let Some(name) = placeholder.module_argument_name() {
+                f(ReferencePathRef::Binding(name), sink, usage, None);
+            }
+        }
+        GenericValue::Concrete(ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
             for item in items {
                 visit_refs_with_sink_inner(item, child_sink, usage, f);
             }
         }
-        Value::Concrete(ConcreteValue::Map(entries)) => {
+        GenericValue::Concrete(ConcreteValue::Map(entries)) => {
             for (key, value) in entries {
                 let child_sink = sink.and_then(|sink| sink.map_entry(key));
                 visit_refs_with_sink_inner(value, child_sink, usage, f);
             }
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+        GenericValue::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
                     visit_refs_with_sink_inner(value, Some(RefSink::String), usage, f);
                 }
             }
         }
-        Value::Deferred(
+        GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
             | DeferredValue::Unavailable { args, .. }
             | DeferredValue::ResolvedFunctionCall { args, .. },
@@ -1399,7 +1438,7 @@ fn visit_refs_with_sink_inner<'a>(
                 visit_refs_with_sink_inner(argument.walker_value(), None, usage, f);
             }
         }
-        Value::Deferred(DeferredValue::Access(access)) => {
+        GenericValue::Deferred(DeferredValue::Access(access)) => {
             if let Some(reference) = crate::resource::module_argument_reference_path(value) {
                 // Module parameters are typed value placeholders rather than
                 // structural references. Project their postfix chain through
@@ -1413,10 +1452,10 @@ fn visit_refs_with_sink_inner<'a>(
                 visit_refs_with_sink_inner(access.base(), None, usage, f);
             }
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => {
             visit_refs_with_sink_inner(inner, sink, usage, f)
         }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+        GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
             let value_usage = if value.is_coalesce_optional_operand() {
                 crate::resource::ResourceRefUsage::CoalesceValue
             } else {
@@ -1432,16 +1471,16 @@ fn visit_refs_with_sink_inner<'a>(
             visit_refs_with_sink_inner(value, sink, value_usage, f);
             visit_refs_with_sink_inner(default, sink, default_usage, f);
         }
-        Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Concrete(ConcreteValue::Int(_))
-        | Value::Concrete(ConcreteValue::Float(_))
-        | Value::Concrete(ConcreteValue::Bool(_))
-        | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_))
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => {}
+        GenericValue::Concrete(ConcreteValue::String(_))
+        | GenericValue::Concrete(ConcreteValue::EnumIdentifier(_))
+        | GenericValue::Concrete(ConcreteValue::CanonicalEnum(_))
+        | GenericValue::Concrete(ConcreteValue::Int(_))
+        | GenericValue::Concrete(ConcreteValue::Float(_))
+        | GenericValue::Concrete(ConcreteValue::Bool(_))
+        | GenericValue::Concrete(ConcreteValue::Duration(_))
+        | GenericValue::Concrete(ConcreteValue::StringList(_))
+        | GenericValue::Deferred(DeferredValue::RedactedSecret { .. })
+        | GenericValue::Deferred(DeferredValue::Unknown(_)) => {}
     }
 }
 
@@ -1514,7 +1553,8 @@ fn visit_computed_accesses_with_sink<'a>(
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_))
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => {}
+        | Value::Deferred(DeferredValue::Unknown(_))
+        | Value::Deferred(DeferredValue::Placeholder(_)) => {}
     }
 }
 
@@ -1555,7 +1595,7 @@ impl std::fmt::Display for DeferredAccessTypeError {
 pub fn check_deferred_access_type(
     value: &Value,
     expected: crate::schema::TypeInSchema<'_>,
-    bindings: &inference::InferenceBindings,
+    bindings: &inference::InferenceBindings<ParserPlaceholder>,
     schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_>,
 ) -> Result<(), DeferredAccessTypeError> {
@@ -2210,7 +2250,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
     ) {
         fn check_call(
             name: &str,
-            args: &[crate::resource::FunctionArgument],
+            args: &[crate::resource::FunctionArgument<ParserPlaceholder>],
             function: Option<&crate::parser::UserFunction>,
             result_context: Option<(&TypeExpr, &str)>,
             bindings: &BindingIndex<'_>,
@@ -2370,7 +2410,8 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
             | Value::Deferred(DeferredValue::ResourceRef { .. })
             | Value::Deferred(DeferredValue::BindingRef { .. })
             | Value::Deferred(DeferredValue::RedactedSecret { .. })
-            | Value::Deferred(DeferredValue::Unknown(_)) => {}
+            | Value::Deferred(DeferredValue::Unknown(_))
+            | Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
 
@@ -2536,8 +2577,8 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
 ///     let _ = validate_composition_ref_types_with_bindings(saved, bindings);
 /// }
 /// ```
-pub fn validate_composition_ref_types_with_bindings(
-    compositions: &[crate::resource::LiveComposition],
+pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
+    compositions: &[crate::resource::LiveComposition<P>],
     bindings: &BindingIndex<'_>,
 ) -> Vec<CompositionRefError> {
     let mut errors = Vec::new();
@@ -2727,8 +2768,8 @@ impl std::error::Error for AnonymousResourceSchemaError {}
 /// bound and anonymous resources alike. This check covers the distinct case
 /// where the provider was not declared or could not be loaded, and therefore
 /// no schema exists from which to derive an anonymous identity.
-pub fn validate_anonymous_resource_schemas<'a>(
-    resources: impl IntoIterator<Item = &'a Resource>,
+pub fn validate_anonymous_resource_schemas<'a, P: PlaceholderKind + 'a>(
+    resources: impl IntoIterator<Item = &'a GenericResource<ModuleSource, P>>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
 ) -> Vec<AnonymousResourceSchemaError> {
@@ -2753,14 +2794,94 @@ pub fn validate_anonymous_resource_schemas<'a>(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum ValidatableKind {
+    Resource,
+    DataSource,
+}
+
+struct ResourceValidationContext<'a> {
+    registry: &'a SchemaRegistry,
+    known_providers: &'a HashSet<String>,
+    provider_context: &'a ProviderContext,
+    all_errors: &'a mut Vec<String>,
+}
+
+fn validate_resource_values<P: PlaceholderKind>(
+    id: &crate::resource::ResourceId,
+    quoted_string_attrs: &HashSet<String>,
+    attributes: &IndexMap<String, GenericValue<P>>,
+    schema: Option<crate::schema::OwnerBoundResourceSchema<'_>>,
+    kind: ValidatableKind,
+    context: &mut ResourceValidationContext<'_>,
+) {
+    match schema {
+        Some(schema) => {
+            let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
+            if let Err(errors) = schema.validate_with_resolver(
+                &crate::resource::attrs_to_hashmap(attributes),
+                &is_string_literal,
+                context.provider_context.custom_type_resolver(),
+            ) {
+                context
+                    .all_errors
+                    .extend(errors.into_iter().map(|error| format!("{id}: {error}")));
+            }
+        }
+        None => {
+            let provider = id.provider.as_str();
+            let resource_type = id.resource_type.as_str();
+
+            // No matching-kind entry. Skip if provider is not loaded —
+            // schemas are simply not available, not a configuration error.
+            if !provider.is_empty() && !context.known_providers.contains(provider) {
+                return;
+            }
+            let has_managed = context.registry.has_managed(provider, resource_type);
+            let has_data_source = context.registry.has_data_source(provider, resource_type);
+            let kind_label = if provider.is_empty() {
+                resource_type.to_string()
+            } else {
+                format!("{provider}.{resource_type}")
+            };
+
+            match kind {
+                ValidatableKind::DataSource if has_managed => {
+                    // `read` used against a managed-only type
+                    context.all_errors.push(format!(
+                        "{} is a managed resource, not a data source. Remove the `read` keyword:\n  let <name> = {} {{ }}",
+                        kind_label, kind_label
+                    ));
+                }
+                ValidatableKind::Resource if has_data_source => {
+                    // No `read` against a data-source-only type
+                    context.all_errors.push(format!(
+                        "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
+                        kind_label, kind_label
+                    ));
+                }
+                _ => {
+                    context
+                        .all_errors
+                        .push(format!("Unknown resource type: {kind_label}"));
+                }
+            }
+        }
+    }
+}
+
 /// Validate resources against their schemas.
 ///
 /// Two-sided check: a `read` resource requires a `DataSource` registry entry,
 /// and a non-`read` resource requires a `Managed` registry entry. If the
 /// wrong-kind entry is present (e.g. `read` against a managed-only type),
 /// emit a kind-specific error explaining the mismatch.
-pub fn validate_resources<E>(
-    parsed: &crate::parser::File<E>,
+pub fn validate_resources<
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+>(
+    parsed: &crate::parser::File<E, P, T>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -2776,9 +2897,26 @@ pub fn validate_resources<E>(
                 parsed
                     .iter_all_resources()
                     .filter_map(|resource| match resource {
-                        ResourceRef::Resource(resource)
-                        | ResourceRef::Deferred { resource, .. } => Some(resource),
-                        ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
+                        ResourceRef::Resource(resource) => Some(resource),
+                        ResourceRef::LiveComposition(_)
+                        | ResourceRef::DataSource(_)
+                        | ResourceRef::Deferred { .. } => None,
+                    }),
+                registry,
+                known_providers,
+            )
+            .into_iter()
+            .map(|error| error.to_string()),
+        );
+        all_errors.extend(
+            validate_anonymous_resource_schemas(
+                parsed
+                    .iter_all_resources()
+                    .filter_map(|resource| match resource {
+                        ResourceRef::Deferred { resource, .. } => Some(resource),
+                        ResourceRef::Resource(_)
+                        | ResourceRef::LiveComposition(_)
+                        | ResourceRef::DataSource(_) => None,
                     }),
                 registry,
                 known_providers,
@@ -2795,86 +2933,66 @@ pub fn validate_resources<E>(
     // and data sources route to the same schema-lookup body but render
     // different kind-mismatch diagnostics when the registry entry of the
     // *opposite* kind exists.
-    enum ValidatableKind {
-        Resource,
-        DataSource,
-    }
-    for rref in parsed.iter_all_resources() {
-        // A deferred for-expression template body is always managed —
-        // `for` bodies never carry `read` / composition.
-        let (kind, schema) = match rref {
-            ResourceRef::LiveComposition(_) => continue,
-            ResourceRef::DataSource(d) => {
-                (ValidatableKind::DataSource, registry.get_for_data_source(d))
-            }
-            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
-                (ValidatableKind::Resource, registry.get_for(m))
-            }
+    {
+        let mut context = ResourceValidationContext {
+            registry,
+            known_providers,
+            provider_context,
+            all_errors: &mut all_errors,
         };
-        let id = rref.id();
-        let quoted_string_attrs = rref.quoted_string_attrs();
-
-        match schema {
-            Some(schema) => {
-                let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
-                if let Err(errors) = schema.validate_with_resolver(
-                    &rref.resolved_attributes(),
-                    &is_string_literal,
-                    provider_context.custom_type_resolver(),
-                ) {
-                    for error in errors {
-                        all_errors.push(format!("{}: {}", id, error));
-                    }
-                }
-                if matches!(kind, ValidatableKind::Resource) {
-                    let resource = match rref {
-                        ResourceRef::Resource(resource)
-                        | ResourceRef::Deferred { resource, .. } => resource,
-                        ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => {
-                            unreachable!("managed validation kind must carry a resource")
-                        }
-                    };
-                    if let Err(errors) = crate::resource::resolve_ignore_changes(resource, &schema)
+        for rref in parsed.iter_all_resources() {
+            // A deferred for-expression template body is always managed —
+            // `for` bodies never carry `read` / composition.
+            match rref {
+                ResourceRef::LiveComposition(_) => {}
+                ResourceRef::DataSource(resource) => validate_resource_values(
+                    &resource.id,
+                    &resource.quoted_string_attrs,
+                    &resource.attributes,
+                    registry.get_for_data_source(resource),
+                    ValidatableKind::DataSource,
+                    &mut context,
+                ),
+                ResourceRef::Resource(resource) => {
+                    let schema = registry.get_for(resource);
+                    validate_resource_values(
+                        &resource.id,
+                        &resource.quoted_string_attrs,
+                        &resource.attributes,
+                        schema,
+                        ValidatableKind::Resource,
+                        &mut context,
+                    );
+                    if let Some(schema) = schema
+                        && let Err(errors) =
+                            crate::resource::resolve_ignore_changes(resource, &schema)
                     {
-                        all_errors
-                            .extend(errors.into_iter().map(|error| format!("{}: {}", id, error)));
+                        context.all_errors.extend(
+                            errors
+                                .into_iter()
+                                .map(|error| format!("{}: {}", resource.id, error)),
+                        );
                     }
                 }
-            }
-            None => {
-                let provider = id.provider.as_str();
-                let resource_type = id.resource_type.as_str();
-
-                // No matching-kind entry. Skip if provider is not loaded —
-                // schemas are simply not available, not a configuration error.
-                if !provider.is_empty() && !known_providers.contains(provider) {
-                    continue;
-                }
-                let has_managed = registry.has_managed(provider, resource_type);
-                let has_data_source = registry.has_data_source(provider, resource_type);
-                let kind_label = if provider.is_empty() {
-                    resource_type.to_string()
-                } else {
-                    format!("{}.{}", provider, resource_type)
-                };
-
-                match kind {
-                    ValidatableKind::DataSource if has_managed => {
-                        // `read` used against a managed-only type
-                        all_errors.push(format!(
-                            "{} is a managed resource, not a data source. Remove the `read` keyword:\n  let <name> = {} {{ }}",
-                            kind_label, kind_label
-                        ));
-                    }
-                    ValidatableKind::Resource if has_data_source => {
-                        // No `read` against a data-source-only type
-                        all_errors.push(format!(
-                            "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
-                            kind_label, kind_label
-                        ));
-                    }
-                    _ => {
-                        all_errors.push(format!("Unknown resource type: {}", kind_label));
+                ResourceRef::Deferred { resource, .. } => {
+                    let schema = registry.get_for(resource);
+                    validate_resource_values(
+                        &resource.id,
+                        &resource.quoted_string_attrs,
+                        &resource.attributes,
+                        schema,
+                        ValidatableKind::Resource,
+                        &mut context,
+                    );
+                    if let Some(schema) = schema
+                        && let Err(errors) =
+                            crate::resource::resolve_ignore_changes(resource, &schema)
+                    {
+                        context.all_errors.extend(
+                            errors
+                                .into_iter()
+                                .map(|error| format!("{}: {}", resource.id, error)),
+                        );
                     }
                 }
             }
@@ -2910,6 +3028,12 @@ fn validate_resource_ref_types_inner<E>(
     let inference_bindings = inference::bindings_from_parsed(parsed);
 
     for rref in parsed.iter_all_resources() {
+        let deferred_binding = match rref {
+            ResourceRef::Deferred { deferred, .. } => Some(&deferred.binding),
+            ResourceRef::Resource(_)
+            | ResourceRef::LiveComposition(_)
+            | ResourceRef::DataSource(_) => None,
+        };
         // A deferred for-expression template body is always managed.
         let schema = match rref {
             ResourceRef::LiveComposition(_) => continue,
@@ -2939,6 +3063,14 @@ fn validate_resource_ref_types_inner<E>(
                 attr_value,
                 sink,
                 &mut |reference, sink, usage, _candidate_value| {
+                    if deferred_binding.is_some_and(|binding| {
+                        binding
+                            .names()
+                            .into_iter()
+                            .any(|name| name == reference.binding())
+                    }) {
+                        return;
+                    }
                     let Some(source) = resolve_resource_reference(
                         resource_id,
                         reference,
@@ -3045,7 +3177,7 @@ enum DeferredIterableShape {
 
 fn deferred_iterable_shape(
     value: &Value,
-    bindings: &inference::InferenceBindings,
+    bindings: &inference::InferenceBindings<ParserPlaceholder>,
     schemas: &SchemaRegistry,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
     match value {
@@ -3072,14 +3204,15 @@ fn deferred_iterable_shape(
             | DeferredValue::Secret(_)
             | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Coalesce { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => infer_type_from_value_to_iterable_shape(value, bindings, schemas),
     }
 }
 
 fn infer_type_from_value_to_iterable_shape(
     value: &Value,
-    bindings: &inference::InferenceBindings,
+    bindings: &inference::InferenceBindings<ParserPlaceholder>,
     schemas: &SchemaRegistry,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
     inference::infer_type_from_value(value, bindings, schemas).map(|inferred| match inferred {
@@ -3139,7 +3272,7 @@ pub fn validate_deferred_for_iterable_types<E>(
 fn validate_deferred_for_iterable_types_with_bindings<E>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
-    bindings: &inference::InferenceBindings,
+    bindings: &inference::InferenceBindings<ParserPlaceholder>,
 ) -> Vec<DeferredForIterableTypeDiagnostic> {
     let mut diagnostics = Vec::new();
     for deferred in &parsed.deferred_for_expressions {
@@ -3171,9 +3304,13 @@ impl std::fmt::Display for DeferredIterableKind {
 fn validate_deferred_iterable_operand(
     value: &Value,
     expected: DeferredIterableKind,
-    bindings: &inference::InferenceBindings,
+    bindings: &inference::InferenceBindings<ParserPlaceholder>,
     schemas: &SchemaRegistry,
-    deferred: &crate::parser::DeferredForExpression,
+    deferred: &crate::parser::DeferredForExpression<
+        ModuleSource,
+        ParserPlaceholder,
+        ParserPlaceholder,
+    >,
     diagnostics: &mut Vec<DeferredForIterableTypeDiagnostic>,
 ) {
     match value {
@@ -3269,7 +3406,11 @@ fn validate_deferred_iterable_operand(
 }
 
 fn deferred_iterable_diagnostic(
-    deferred: &crate::parser::DeferredForExpression,
+    deferred: &crate::parser::DeferredForExpression<
+        ModuleSource,
+        ParserPlaceholder,
+        ParserPlaceholder,
+    >,
     message: String,
 ) -> DeferredForIterableTypeDiagnostic {
     DeferredForIterableTypeDiagnostic {
@@ -4400,7 +4541,13 @@ pub fn resolve_export_static_type_for_consumer(
 /// top-level `arguments` or `attributes` block marks the directory as a
 /// module whose provider configuration comes from its caller.
 #[must_use]
-pub fn is_module_definition<E>(parsed: &crate::parser::File<E>) -> bool {
+pub fn is_module_definition<
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+>(
+    parsed: &crate::parser::File<E, P, T>,
+) -> bool {
     !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
 }
 
@@ -4482,24 +4629,29 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 /// time. `Secret` is transparent — its inner value is unwrapped because
 /// the secret wrapper survives WASM serialization but the inner value
 /// must still be checked. carina#3182.
-pub fn value_contains_unresolved_ref(value: &Value) -> bool {
+pub fn value_contains_unresolved_ref<P: PlaceholderKind>(value: &GenericValue<P>) -> bool {
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::Coalesce { .. })
-        | Value::Deferred(DeferredValue::Interpolation(_))
-        | Value::Deferred(DeferredValue::FunctionCall { .. })
-        | Value::Deferred(DeferredValue::Unavailable { .. })
-        | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
-        | Value::Deferred(DeferredValue::Access(_))
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => true,
-        Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unresolved_ref(inner),
-        Value::Concrete(ConcreteValue::List(items)) => {
+        GenericValue::Deferred(DeferredValue::ResourceRef { .. })
+        | GenericValue::Deferred(DeferredValue::BindingRef { .. })
+        | GenericValue::Deferred(DeferredValue::Coalesce { .. })
+        | GenericValue::Deferred(DeferredValue::Interpolation(_))
+        | GenericValue::Deferred(DeferredValue::FunctionCall { .. })
+        | GenericValue::Deferred(DeferredValue::Unavailable { .. })
+        | GenericValue::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+        | GenericValue::Deferred(DeferredValue::Access(_))
+        | GenericValue::Deferred(DeferredValue::RedactedSecret { .. })
+        | GenericValue::Deferred(DeferredValue::Unknown(_))
+        | GenericValue::Deferred(DeferredValue::Placeholder(_)) => true,
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => {
+            value_contains_unresolved_ref(inner)
+        }
+        GenericValue::Concrete(ConcreteValue::List(items)) => {
             items.iter().any(value_contains_unresolved_ref)
         }
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(value_contains_unresolved_ref),
-        Value::Concrete(_) => false,
+        GenericValue::Concrete(ConcreteValue::Map(map)) => {
+            map.values().any(value_contains_unresolved_ref)
+        }
+        GenericValue::Concrete(_) => false,
     }
 }
 
@@ -4531,7 +4683,7 @@ pub fn validate_provider_config<E>(
         let Some(factory) = factories.iter().find(|f| f.name() == provider.name) else {
             continue;
         };
-        crate::executor::provider_ready::validate_and_canonicalize_provider_config(
+        crate::executor::provider_ready::validate_parser_provider_config(
             factory.as_ref(),
             &provider.name,
             &provider.attributes,
@@ -5233,17 +5385,17 @@ pub struct ModuleCallCheckInput<'a, 'bindings, E, C: ?Sized = LoadedProviderCont
 }
 
 /// Typed inputs for checks that become authoritative only after expansion.
-pub enum ExpandedModuleCallCheckInput<'a, 'bindings> {
+pub enum ExpandedModuleCallCheckInput<'a, 'bindings, P: PlaceholderKind = ParserPlaceholder> {
     BindingUses {
         binding_use_report: &'a BindingUseReport,
-        compositions: &'a [crate::resource::LiveComposition],
+        compositions: &'a [crate::resource::LiveComposition<P>],
     },
     References {
-        compositions: &'a [crate::resource::LiveComposition],
+        compositions: &'a [crate::resource::LiveComposition<P>],
         bindings: &'a BindingIndex<'bindings>,
     },
     Constraints {
-        compositions: &'a [crate::resource::LiveComposition],
+        compositions: &'a [crate::resource::LiveComposition<P>],
         constraint_reports: &'a crate::module_resolver::ModuleCallConstraintReports,
     },
 }
@@ -5765,9 +5917,9 @@ impl ModuleCallChecker<'_> {
         self.active_modules.remove(&guard);
     }
 
-    fn check_expanded(
+    fn check_expanded<P: PlaceholderKind>(
         &mut self,
-        compositions: &[crate::resource::LiveComposition],
+        compositions: &[crate::resource::LiveComposition<P>],
         bindings: &BindingIndex<'_>,
     ) {
         for error in validate_composition_ref_types_with_bindings(compositions, bindings) {
@@ -5826,10 +5978,10 @@ impl ModuleCallChecker<'_> {
         }
     }
 
-    fn check_expanded_binding_uses(
+    fn check_expanded_binding_uses<P: PlaceholderKind>(
         &mut self,
         report: &BindingUseReport,
-        compositions: &[crate::resource::LiveComposition],
+        compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for finding in report.findings() {
             let crate::parser::BindingUseOwner::ModuleArgument {
@@ -5875,10 +6027,10 @@ impl ModuleCallChecker<'_> {
         }
     }
 
-    fn check_constraints(
+    fn check_constraints<P: PlaceholderKind>(
         &mut self,
         reports: &crate::module_resolver::ModuleCallConstraintReports,
-        compositions: &[crate::resource::LiveComposition],
+        compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for report in reports {
             for outcome in &report.outcomes {
@@ -6020,6 +6172,7 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Access(_access)) => false,
         Value::Deferred(DeferredValue::Unknown(_reason)) => false,
         Value::Deferred(DeferredValue::RedactedSecret { hash: _hash }) => false,
+        Value::Deferred(DeferredValue::Placeholder(_placeholder)) => false,
         Value::Concrete(ConcreteValue::List(items)) => {
             items.iter().all(module_call_value_is_context_free)
         }
@@ -6094,8 +6247,8 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
 }
 
 /// Collect only findings whose authoritative inputs exist after expansion.
-pub fn check_expanded_module_calls(
-    input: ExpandedModuleCallCheckInput<'_, '_>,
+pub fn check_expanded_module_calls<P: PlaceholderKind>(
+    input: ExpandedModuleCallCheckInput<'_, '_, P>,
 ) -> Vec<ModuleCallFinding> {
     let provider_context = ProviderContext::default();
     let schemas = SchemaRegistry::new();
@@ -6195,13 +6348,13 @@ impl<P> CheckedExportValues<P> {
     }
 }
 
-fn resolve_and_validate_export_values<P>(
-    export_params: &[P],
-    bindings: &crate::binding_index::ResolvedBindings,
+fn resolve_and_validate_export_values<E, P: PlaceholderKind>(
+    export_params: &[E],
+    bindings: &crate::binding_index::ResolvedBindings<P>,
     config: typecheck::TypecheckProviderContext<'_>,
-) -> Result<Vec<P>, String>
+) -> Result<Vec<E>, String>
 where
-    P: crate::parser::ExportParamLike + Clone,
+    E: crate::parser::ExportParamLike<P> + Clone,
 {
     let mut checked = Vec::with_capacity(export_params.len());
     let mut errors = Vec::new();
@@ -6265,13 +6418,13 @@ where
 /// Resolve and structurally validate exports without loaded providers.
 /// Provider-owned custom-type leaves are left unchecked, while container
 /// shapes and provider-independent sibling values retain normal diagnostics.
-pub fn check_export_values_pre_apply_providerless<P>(
-    export_params: &[P],
-    bindings: &crate::binding_index::ResolvedBindings,
+pub fn check_export_values_pre_apply_providerless<E, P: PlaceholderKind>(
+    export_params: &[E],
+    bindings: &crate::binding_index::ResolvedBindings<P>,
     config: &ProviderContext,
-) -> Result<ExportsCheckedPreApply<P>, String>
+) -> Result<ExportsCheckedPreApply<E>, String>
 where
-    P: crate::parser::ExportParamLike + Clone,
+    E: crate::parser::ExportParamLike<P> + Clone,
 {
     let display_params = resolve_and_validate_export_values(
         export_params,
@@ -6287,13 +6440,13 @@ where
 /// Resolve every export through the pre-apply value binding graph, evaluate
 /// builtins that become concrete, and accumulate both secret-boundary and
 /// value-type errors in one pass.
-pub fn check_export_values_pre_apply<P>(
-    export_params: &[P],
-    bindings: &crate::binding_index::ResolvedBindings,
+pub fn check_export_values_pre_apply<E, P: PlaceholderKind>(
+    export_params: &[E],
+    bindings: &crate::binding_index::ResolvedBindings<P>,
     config: &LoadedProviderContext,
-) -> Result<ExportsCheckedPreApply<P>, String>
+) -> Result<ExportsCheckedPreApply<E>, String>
 where
-    P: crate::parser::ExportParamLike + Clone,
+    E: crate::parser::ExportParamLike<P> + Clone,
 {
     let display_params = resolve_and_validate_export_values(
         export_params,
@@ -6309,13 +6462,13 @@ where
 /// Resolve the original export expressions against the post-apply binding
 /// view. This is the only constructor for [`CheckedExportValues`], so a
 /// pre-apply display snapshot cannot be serialized into state by mistake.
-pub fn resolve_export_values_post_apply<P>(
-    export_params: &ExportsCheckedPreApply<P>,
-    bindings: &crate::binding_index::ResolvedBindings,
+pub fn resolve_export_values_post_apply<E, P: PlaceholderKind>(
+    export_params: &ExportsCheckedPreApply<E>,
+    bindings: &crate::binding_index::ResolvedBindings<P>,
     config: &LoadedProviderContext,
-) -> Result<CheckedExportValues<P>, String>
+) -> Result<CheckedExportValues<E>, String>
 where
-    P: crate::parser::ExportParamLike + Clone,
+    E: crate::parser::ExportParamLike<P> + Clone,
 {
     let params = resolve_and_validate_export_values(
         &export_params.original_params,

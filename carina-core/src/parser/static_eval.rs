@@ -7,7 +7,13 @@
 use super::ProviderContext;
 use super::error::ParseError;
 use crate::eval_value::EvalValue;
-use crate::resource::{AccessMissPolicy, ConcreteValue, DeferredValue, InterpolationPart, Value};
+use crate::parser::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
+use crate::resource::{
+    AccessMissPolicy, ConcreteValue, DeferredValue, InterpolationPart as GenericInterpolationPart,
+    ParserPlaceholder,
+};
+
+type InterpolationPart = GenericInterpolationPart<ParserPlaceholder>;
 
 /// Check whether a Value is fully static (no runtime dependencies).
 pub(crate) fn is_static_value(value: &Value) -> bool {
@@ -40,7 +46,8 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::Coalesce { .. })
         | Value::Deferred(DeferredValue::Unavailable { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => false,
+        | Value::Deferred(DeferredValue::Unknown(_))
+        | Value::Deferred(DeferredValue::Placeholder(_)) => false,
         Value::Deferred(DeferredValue::Secret(inner)) => is_static_value(inner),
     }
 }
@@ -109,7 +116,7 @@ pub(crate) fn evaluate_static_value(
                 });
             }
             // Recursively evaluate any nested FunctionCall arguments
-            let evaluated_args: Result<Vec<crate::resource::FunctionArgument>, ParseError> = args
+            let evaluated_args: Result<Vec<FunctionArgument>, ParseError> = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| evaluate_static_value(value.clone(), config))
@@ -192,7 +199,8 @@ pub(crate) fn evaluate_static_value(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
             | DeferredValue::RedactedSecret { .. }
-            | DeferredValue::Unknown(_),
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
         ) => Ok(value),
     }
 }

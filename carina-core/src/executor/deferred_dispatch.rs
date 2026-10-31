@@ -371,8 +371,8 @@ mod tests {
     use crate::binding_index::{BindingCompleteness, BindingValueSource};
     use crate::parser::ForBinding;
     use crate::resource::{
-        ConcreteValue, DeferredValue, ParsedIgnorePath, ParsedIgnorePathSegment, Resource,
-        UnknownReason, Value,
+        ConcreteValue, DeferredValue, LoopSlot, ParsedIgnorePath, ParsedIgnorePathSegment,
+        Resource, Value,
     };
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -381,7 +381,7 @@ mod tests {
         template_resource.binding = Some("children".to_string());
         template_resource.set_attr(
             "name",
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         );
         DeferredForExpression {
             file: None,
@@ -497,7 +497,9 @@ mod tests {
              }\n",
             &crate::parser::ProviderContext::default(),
         )
-        .expect("deferred unbound loop parses");
+        .expect("deferred unbound loop parses")
+        .into_expanded()
+        .expect("deferred-loop fixture contains no parser placeholders");
         let template = &parsed.deferred_for_expressions[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
@@ -556,7 +558,9 @@ mod tests {
             std::path::Path::new("main.crn"),
             &crate::parser::ProviderContext::default(),
         )
-        .expect("deferred unbound enum loop parses");
+        .expect("deferred unbound enum loop parses")
+        .into_expanded()
+        .expect("deferred-loop fixture contains no parser placeholders");
         let template = &parsed.deferred_for_expressions[0];
         let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::enum_identifier("foo"),
@@ -635,7 +639,9 @@ mod tests {
              }\n",
             &crate::parser::ProviderContext::default(),
         )
-        .expect("deferred unbound loop parses");
+        .expect("deferred unbound loop parses")
+        .into_expanded()
+        .expect("deferred-loop fixture contains no parser placeholders");
         let template = &parsed.deferred_for_expressions[0];
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(

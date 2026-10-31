@@ -18,8 +18,12 @@ use carina_core::parser::{
 use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ParserPlaceholder, Value as GenericValue,
+};
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
+
+type Value = GenericValue<ParserPlaceholder>;
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
@@ -905,9 +909,14 @@ impl DiagnosticEngine {
                 }
             };
             let resolved_buffer_resources = resolved_buffer.as_ref().map(|resolved| {
-                resolved
-                    .iter_all_resources()
-                    .collect::<Vec<carina_core::parser::ResourceRef<'_>>>()
+                resolved.iter_all_resources().collect::<Vec<
+                    carina_core::parser::ResourceRef<
+                        '_,
+                        carina_core::resource::ModuleSource,
+                        ParserPlaceholder,
+                        ParserPlaceholder,
+                    >,
+                >>()
             });
             let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
             if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
@@ -1363,11 +1372,8 @@ impl DiagnosticEngine {
                                 }
                                 (
                                     _,
-                                    Value::Deferred(DeferredValue::Unknown(
-                                        carina_core::resource::UnknownReason::ModuleArgument {
-                                            name,
-                                            ..
-                                        },
+                                    Value::Deferred(DeferredValue::Placeholder(
+                                        ParserPlaceholder::ModuleArgument { name, .. },
                                     )),
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_index,
@@ -2076,13 +2082,17 @@ impl DiagnosticEngine {
 /// parses). Callers that fall back to `None` get document-wide search —
 /// the historic behavior — which is still correct when there's no
 /// ambiguity.
-fn resource_source_range(
+fn resource_source_range<P, T>(
     doc: &Document,
-    ctx: carina_core::parser::ResourceContext<'_>,
+    ctx: carina_core::parser::ResourceContext<'_, carina_core::resource::ModuleSource, P, T>,
     provider: &str,
     resource_type: &str,
     authored_direct_start: Option<u32>,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32)>
+where
+    P: carina_core::resource::PlaceholderKind,
+    T: carina_core::resource::PlaceholderKind,
+{
     use carina_core::parser::ResourceContext;
     let text = doc.text();
     let lines: Vec<&str> = text.lines().collect();

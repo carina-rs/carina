@@ -6,19 +6,27 @@
 
 use super::ast::{
     AttributePath, AttributePathSegment, BareBindingKind, BareBindingSource, BareBindingUse,
-    BindingScopeId, BindingUseOwner, DeferredForExpression, ModuleCallId, ParsedBindingUses,
-    PendingFunctionTypeCheck, PendingValueSlot, ProviderConfig, ResourceAddress, SourceFileId,
-    SourceSpan, TypeExpr, UpstreamState, UserFunction, WaitBinding,
+    BindingScopeId, BindingUseOwner, DeferredForExpression as GenericDeferredForExpression,
+    ModuleCallId, ParsedBindingUses, PendingFunctionTypeCheck, PendingValueSlot, ResourceAddress,
+    SourceFileId, SourceSpan, TypeExpr, UpstreamState, UserFunction,
 };
 use super::error::{ParseError, ParseWarning};
+use super::{ParserProviderConfig as ProviderConfig, ParserWaitBinding as WaitBinding};
 use super::{ProviderContext, Rule};
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::{Resource, ResourceId, Value};
+use crate::resource::{
+    ModuleSource, ParserPlaceholder, Resource as GenericResource, ResourceId, Value as GenericValue,
+};
 use indexmap::IndexMap;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+
+type Value = GenericValue<ParserPlaceholder>;
+type Resource = GenericResource<ModuleSource, ParserPlaceholder>;
+type DeferredForExpression =
+    GenericDeferredForExpression<ModuleSource, ParserPlaceholder, ParserPlaceholder>;
 
 /// Parser-local lexical binding kind.
 ///
@@ -520,6 +528,10 @@ impl<'a> ExpressionMode<'a> {
     ) -> Option<PendingValueSlot> {
         let sink = self.sink.as_ref()?;
         let (binding, source) = match ctx.lookup_binding(name) {
+            ParseBindingRef::Value {
+                value: EvalValue::DeferredForValue { .. },
+                ..
+            } => return None,
             ParseBindingRef::Value {
                 declaration,
                 declared_type,

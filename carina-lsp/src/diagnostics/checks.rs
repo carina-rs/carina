@@ -7,14 +7,16 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use crate::document::Document;
 use crate::position;
 use carina_core::binding_index::{
-    BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings,
+    BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings as GenericResolvedBindings,
 };
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
     AttributeParameter, ModuleCall, ParsedExportParam, ParsedFile, SourceSpan,
     TopLevelBlockSourceSpan, TypeExpr,
 };
-use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+use carina_core::resource::{
+    ConcreteValue, DeferredValue, ParserPlaceholder, Value as GenericValue,
+};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::typecheck::{self, TypecheckInference};
@@ -23,6 +25,9 @@ use super::{
     DiagnosticEngine, ProviderValidationDeduplicator, carina_diagnostic, carina_diagnostic_range,
     parser_span_range,
 };
+
+type Value = GenericValue<ParserPlaceholder>;
+type ResolvedBindings = GenericResolvedBindings<ParserPlaceholder>;
 
 /// Directory parse plus the typed module-resolution outcome.
 pub(super) struct MergedParseResult {
@@ -51,7 +56,10 @@ fn source_span_position(span: SourceSpan) -> (u32, u32) {
 fn top_level_anonymous_resources_with_spans<'a>(
     doc: &Document,
     current_file: &'a ParsedFile,
-) -> Vec<(&'a carina_core::resource::Resource, TopLevelBlockSourceSpan)> {
+) -> Vec<(
+    &'a carina_core::resource::Resource<carina_core::resource::ModuleSource, ParserPlaceholder>,
+    TopLevelBlockSourceSpan,
+)> {
     let Ok(authored_spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
     else {
         return Vec::new();
@@ -181,9 +189,11 @@ fn value_depends_on_module_output(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::RedactedSecret { .. }) => {
-            false
-        }
+        | Value::Deferred(
+            DeferredValue::Unknown(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Placeholder(_),
+        ) => false,
     }
 }
 
@@ -282,6 +292,7 @@ impl<'a> ContextFreeValue<'a> {
                 | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
                 | Value::Deferred(DeferredValue::Access(_))
                 | Value::Deferred(DeferredValue::Unknown(_))
+                | Value::Deferred(DeferredValue::Placeholder(_))
                 | Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
                 Value::Concrete(ConcreteValue::List(items)) => {
                     items.iter().all(is_context_free)
@@ -517,10 +528,18 @@ fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -
 /// Whether `deferred` was parsed from the editor's current document.
 /// `DeferredForExpression.file` is stamped with the full source path, so we
 /// compare by basename to the LSP-supplied `current_file_name`.
-fn deferred_in_current_file(
-    deferred: &carina_core::parser::DeferredForExpression,
+fn deferred_in_current_file<P, T>(
+    deferred: &carina_core::parser::DeferredForExpression<
+        carina_core::resource::ModuleSource,
+        P,
+        T,
+    >,
     current_file_name: Option<&str>,
-) -> bool {
+) -> bool
+where
+    P: carina_core::resource::PlaceholderKind,
+    T: carina_core::resource::PlaceholderKind,
+{
     source_file_is_current(deferred.file.as_deref(), current_file_name)
 }
 
@@ -624,8 +643,11 @@ impl DiagnosticEngine {
 
     fn generated_identity_for_plain_resource(
         &self,
-        resource: &carina_core::resource::Resource,
-        providers: &[carina_core::parser::ProviderConfig],
+        resource: &carina_core::resource::Resource<
+            carina_core::resource::ModuleSource,
+            ParserPlaceholder,
+        >,
+        providers: &[carina_core::parser::ProviderConfig<ParserPlaceholder>],
     ) -> Option<String> {
         let mut candidate = vec![resource.clone()];
         let canonical =
@@ -1153,11 +1175,24 @@ impl DiagnosticEngine {
                 continue;
             };
 
+            let Ok(attributes) = provider
+                .attributes
+                .iter()
+                .map(|(name, value)| {
+                    value
+                        .clone()
+                        .into_expanded()
+                        .map(|value| (name.clone(), value))
+                })
+                .collect::<Result<indexmap::IndexMap<_, _>, _>>()
+            else {
+                continue;
+            };
             let validation =
                 carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
                     factory.as_ref(),
                     &provider.name,
-                    &provider.attributes,
+                    &attributes,
                 );
             if let Err(error) = validation {
                 if error.provider_error().is_some_and(|provider_error| {
@@ -2215,7 +2250,9 @@ impl DiagnosticEngine {
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
-        inference_bindings: &carina_core::validation::inference::InferenceBindings,
+        inference_bindings: &carina_core::validation::inference::InferenceBindings<
+            ParserPlaceholder,
+        >,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let semantic_params = parsed
@@ -2905,7 +2942,7 @@ impl DiagnosticEngine {
     ///
     /// The shared source lexer is used rather than an AST walk: the parser
     /// stamps the empty case as
-    /// `Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation))` but discards the
+    /// `Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::EmptyInterpolation))` but discards the
     /// source span, so the diagnostic range has to come from a source-level
     /// pass anyway. Sharing this lexer also keeps heredoc boundaries aligned
     /// with semantic tokens and completion.

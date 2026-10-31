@@ -19,9 +19,10 @@ use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{
-    LoadedProviderContext, ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState,
+    LoadedProviderContext, ParsedValue as Value, ProviderContext, ResourceContext, ResourceRef,
+    TypeExpr, UpstreamState,
 };
-use crate::resource::{DeferredValue, Subscript, Value};
+use crate::resource::{DeferredValue, ModuleSource, ParserPlaceholder, Subscript};
 use crate::schema::suggest_similar_name;
 use crate::static_type::ConsumerExportStaticType;
 #[cfg(test)]
@@ -378,7 +379,10 @@ fn resolve_upstream_exports_with_context(
 /// `for-body` prefix when the resource is a deferred-for template.
 /// Three checks emit the same string; centralized here so a future
 /// tweak to the wording lands in one place.
-fn resource_attr_location(rref: ResourceRef<'_>, attr_name: &str) -> String {
+fn resource_attr_location(
+    rref: ResourceRef<'_, ModuleSource, ParserPlaceholder, ParserPlaceholder>,
+    attr_name: &str,
+) -> String {
     match rref.context() {
         ResourceContext::Direct => format!("{} attribute `{}`", rref.id(), attr_name),
         ResourceContext::Deferred(d) => {
@@ -706,7 +710,8 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
                 | DeferredValue::RedactedSecret { .. }
-                | DeferredValue::Unknown(_),
+                | DeferredValue::Unknown(_)
+                | DeferredValue::Placeholder(_),
             ) => {}
         }
     }

@@ -19,7 +19,10 @@ use crate::parser::{
     parse_expression, parse_expression_eval, parse_module_call, parse_read_resource_expr,
     parse_resource_for_target,
 };
-use crate::resource::{ConcreteValue, DataSource, LoopKind, Resource, Value};
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
+};
+use crate::resource::{ConcreteValue, LoopKind};
 
 /// Result of parsing an if expression body: a managed resource, a data
 /// source, a module call, or a value.

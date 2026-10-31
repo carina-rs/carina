@@ -1143,6 +1143,8 @@ mod tests {
             &crate::parser::ProviderContext::default(),
         )
         .expect("unbound deferred fixture parses")
+        .into_expanded()
+        .expect("deferred-loop fixture contains no parser placeholders")
         .deferred_for_expressions
         .into_iter()
         .next()

@@ -7,18 +7,25 @@ use crate::parser::{
     LoadedProviderContext, ProviderContext, TypeExpr, validate_custom_type,
     validate_schema_custom_type_with_context,
 };
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind, Value};
 
 /// Static authority available while checking deferred computed values.
 /// Callers without a binding/schema view must say so explicitly rather than
 /// passing empty registries that look authoritative.
-#[derive(Clone, Copy)]
-pub enum TypecheckInference<'a> {
+pub enum TypecheckInference<'a, P: PlaceholderKind = NoPlaceholder> {
     Available {
-        bindings: &'a super::inference::InferenceBindings,
+        bindings: &'a super::inference::InferenceBindings<P>,
         schemas: &'a crate::schema::SchemaRegistry,
     },
     Unavailable,
+}
+
+impl<P: PlaceholderKind> Copy for TypecheckInference<'_, P> {}
+
+impl<P: PlaceholderKind> Clone for TypecheckInference<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 /// Provider authority available to internal value-checking pipelines.
@@ -55,11 +62,11 @@ impl<'a> TypecheckProviderContext<'a> {
         }
     }
 
-    pub(crate) fn check(
+    pub(crate) fn check<P: PlaceholderKind>(
         self,
         expected: &TypeExpr,
-        value: &Value,
-        inference: TypecheckInference<'_>,
+        value: &Value<P>,
+        inference: TypecheckInference<'_, P>,
     ) -> Result<(), TypeExprValueError> {
         match self {
             Self::Loaded(config) => check_type_expr_value(expected, value, config, inference),
@@ -186,11 +193,11 @@ impl fmt::Display for TypeExprValueError {
 ///
 /// Unresolved values defer until the binding/reference validation or
 /// evaluation phase that has their types.
-pub fn check_type_expr_value(
+pub fn check_type_expr_value<P: PlaceholderKind>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<P>,
     config: &LoadedProviderContext,
-    inference: TypecheckInference<'_>,
+    inference: TypecheckInference<'_, P>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -206,11 +213,11 @@ pub fn check_type_expr_value(
 /// Structural checks and provider-independent leaves run normally. A
 /// provider-owned custom-type leaf is accepted only after its scalar shape is
 /// checked; the provider resolver is never called.
-pub fn check_type_expr_value_providerless(
+pub fn check_type_expr_value_providerless<P: PlaceholderKind>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<P>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_>,
+    inference: TypecheckInference<'_, P>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -229,11 +236,11 @@ enum ProviderCustomTypeValidation {
 
 /// Raw parser seam retaining main's historical unloaded-context behaviour.
 /// Public validation callers must use a witness-carrying entry point above.
-fn check_type_expr_value_inner(
+fn check_type_expr_value_inner<P: PlaceholderKind>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<P>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_>,
+    inference: TypecheckInference<'_, P>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -244,11 +251,11 @@ fn check_type_expr_value_inner(
     )
 }
 
-fn check_type_expr_value_inner_with_mode(
+fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<P>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_>,
+    inference: TypecheckInference<'_, P>,
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> Result<(), TypeExprValueError> {
     match value {
@@ -273,7 +280,8 @@ fn check_type_expr_value_inner_with_mode(
         )
         | Value::Deferred(DeferredValue::Unavailable { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_)) => return Ok(()),
+        | Value::Deferred(DeferredValue::Unknown(_))
+        | Value::Deferred(DeferredValue::Placeholder(_)) => return Ok(()),
         Value::Deferred(DeferredValue::Access(_)) => {
             let inferred = match inference {
                 TypecheckInference::Available { bindings, schemas } => {
@@ -541,16 +549,16 @@ fn check_type_expr_value_inner_with_mode(
 /// Internal parser seam. Parser-produced bootstrap types defer before this
 /// function; public validation and resolver APIs must use one of the witness-
 /// carrying entry points above.
-pub(crate) fn check_type_expr_value_with_context(
+pub(crate) fn check_type_expr_value_with_context<P: PlaceholderKind>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<P>,
     config: &ProviderContext,
-    inference: TypecheckInference<'_>,
+    inference: TypecheckInference<'_, P>,
 ) -> Result<(), TypeExprValueError> {
     check_type_expr_value_inner(expected, value, config, inference)
 }
 
-fn mismatch(expected: &TypeExpr, value: &Value) -> TypeExprValueError {
+fn mismatch<P: PlaceholderKind>(expected: &TypeExpr, value: &Value<P>) -> TypeExprValueError {
     let hint = matches!(
         (expected, value),
         (TypeExpr::Bool, Value::Concrete(ConcreteValue::String(_)))
@@ -565,7 +573,11 @@ fn mismatch(expected: &TypeExpr, value: &Value) -> TypeExprValueError {
     }
 }
 
-fn validation_mismatch(expected: &TypeExpr, value: &Value, message: String) -> TypeExprValueError {
+fn validation_mismatch<P: PlaceholderKind>(
+    expected: &TypeExpr,
+    value: &Value<P>,
+    message: String,
+) -> TypeExprValueError {
     TypeExprValueError::Mismatch {
         path: Vec::new(),
         expected: Box::new(expected.clone()),
@@ -576,9 +588,9 @@ fn validation_mismatch(expected: &TypeExpr, value: &Value, message: String) -> T
     }
 }
 
-fn custom_type_validation_mismatch(
+fn custom_type_validation_mismatch<P: PlaceholderKind>(
     expected: &TypeExpr,
-    value: &Value,
+    value: &Value<P>,
     error: crate::parser::CustomTypeValidationError,
 ) -> TypeExprValueError {
     TypeExprValueError::CustomTypeValidation {
@@ -589,9 +601,9 @@ fn custom_type_validation_mismatch(
     }
 }
 
-fn identified_scalar_shape_is_supported(
+fn identified_scalar_shape_is_supported<P: PlaceholderKind>(
     identity: &crate::schema::TypeIdentity,
-    value: &Value,
+    value: &Value<P>,
     config: &ProviderContext,
     owner_routed: bool,
 ) -> bool {
@@ -779,7 +791,7 @@ mod tests {
 
     use super::*;
     use crate::parser::ResourceTypePath;
-    use crate::resource::{CanonicalEnumValue, InterpolationPart, UnknownReason};
+    use crate::resource::{ApplyTimeUnknown, CanonicalEnumValue, InterpolationPart};
     use crate::schema::TypeIdentity;
 
     fn check(expected: &TypeExpr, value: &Value) -> Result<(), TypeExprValueError> {
@@ -1126,7 +1138,11 @@ mod tests {
             args: Vec::new(),
             source_line: (0).into(),
         });
-        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+        let unknown = Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "upstream".to_string(),
+            },
+        ));
         let untyped_binding = Value::Deferred(DeferredValue::BindingRef {
             binding: "outside".to_string(),
         });

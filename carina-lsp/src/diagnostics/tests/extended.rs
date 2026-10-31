@@ -1867,7 +1867,7 @@ let suspended_b = mock.test.resource {
 #[test]
 fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
     let engine = test_engine_with_suspended_validation_provider();
-    let value = carina_core::resource::Value::Concrete(
+    let value = carina_core::resource::Value::<carina_core::resource::NoPlaceholder>::Concrete(
         carina_core::resource::ConcreteValue::String("suspended".into()),
     );
     let attributes = std::collections::HashMap::from([("probe".to_string(), value)]);
@@ -2112,7 +2112,9 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
     let attributes = std::collections::HashMap::from([
         (
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("record".into())),
+            Value::<carina_core::resource::NoPlaceholder>::Concrete(ConcreteValue::String(
+                "record".into(),
+            )),
         ),
         (
             "hosted_zone_id".to_string(),
@@ -5809,8 +5811,8 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
     use carina_core::parser::{ArgumentOrigin, TypeExpr};
     use carina_core::resource::{
         CompositionCall, CompositionCallPath, ConcreteValue, LiveComposition,
-        LiveCompositionArgument, LiveCompositionAttribute, LiveCompositionSignature, ResourceId,
-        Value,
+        LiveCompositionArgument, LiveCompositionAttribute, LiveCompositionSignature,
+        ParserPlaceholder, ResourceId, Value,
     };
     use indexmap::IndexMap;
 
@@ -5830,7 +5832,10 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         )
     }
 
-    fn composition(binding: &'static str, call_binding: &str) -> LiveComposition {
+    fn composition(
+        binding: &'static str,
+        call_binding: &str,
+    ) -> LiveComposition<ParserPlaceholder> {
         let source_file = std::path::PathBuf::from(format!("/{call_binding}.crn"));
         let parsed = carina_core::parser::parse_file(
             "let missing = use { source = '../missing' }\nmissing {}\n",

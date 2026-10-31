@@ -1510,6 +1510,7 @@ fn deferred_value_variant(value: &DeferredValue) -> &'static str {
         DeferredValue::Secret(_inner) => "Secret",
         DeferredValue::RedactedSecret { hash: _hash } => "RedactedSecret",
         DeferredValue::Unknown(_reason) => "Unknown",
+        DeferredValue::Placeholder(never) => match *never {},
     }
 }
 
@@ -2412,7 +2413,9 @@ mod tests {
         });
         let access = crate::resource::apply_postfix_access(
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "upstream".to_string(),
+                },
             )),
             crate::resource::PathSegment::Field {
                 name: "field".to_string(),
@@ -2432,7 +2435,9 @@ mod tests {
             }),
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue,
+                    crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                        binding: "upstream".to_string(),
+                    },
                 ))),
                 default: Box::new(Value::Concrete(ConcreteValue::Int(1))),
             }),
@@ -2462,7 +2467,9 @@ mod tests {
             )))),
             Value::Deferred(DeferredValue::RedactedSecret { hash }),
             Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "upstream".to_string(),
+                },
             )),
         ];
 

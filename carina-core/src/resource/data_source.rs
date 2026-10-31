@@ -15,8 +15,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Directives, ModuleSource, ProviderModuleSource, ResourceId, ResourceIdentity,
-    ResourceIdentityState, SavedModuleSource, Value,
+    Directives, LeftoverPlaceholder, ModuleSource, NoPlaceholder, ParserPlaceholder,
+    PlaceholderKind, ProviderModuleSource, ResourceId, ResourceIdentity, ResourceIdentityState,
+    SavedModuleSource, Value,
 };
 
 /// A read-only resource (data source).
@@ -53,11 +54,14 @@ use super::{
 /// let _: DataSource = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
-pub struct DataSource<S = ModuleSource> {
+#[serde(bound(
+    serialize = "S: Serialize, P: PlaceholderKind + Serialize",
+    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>"
+))]
+pub struct DataSource<S = ModuleSource, P: PlaceholderKind = NoPlaceholder> {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
-    pub attributes: IndexMap<String, Value>,
+    pub attributes: IndexMap<String, Value<P>>,
     /// `directives` meta-argument block — `depends_on` and
     /// `provider_instance` are meaningful for data sources too.
     #[serde(default)]
@@ -107,7 +111,7 @@ impl From<DataSource> for SavedDataSource {
     }
 }
 
-impl DataSource {
+impl<P: PlaceholderKind> DataSource<ModuleSource, P> {
     /// Create a pending data source with an empty attribute map.
     pub fn pending(resource_type: impl Into<String>) -> Self {
         Self {
@@ -184,7 +188,7 @@ impl DataSource {
     }
 }
 
-impl<S: Clone> DataSource<S> {
+impl<S: Clone, P: PlaceholderKind> DataSource<S, P> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_pending();
@@ -195,6 +199,32 @@ impl<S: Clone> DataSource<S> {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_with_identity(identity);
         data_source
+    }
+}
+
+impl<S> DataSource<S, ParserPlaceholder> {
+    pub(crate) fn into_expanded(self) -> Result<DataSource<S>, LeftoverPlaceholder> {
+        let DataSource {
+            id,
+            attributes,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        } = self;
+        Ok(DataSource {
+            id,
+            attributes: attributes
+                .into_iter()
+                .map(|(name, value)| value.into_expanded().map(|value| (name, value)))
+                .collect::<Result<_, _>>()?,
+            directives,
+            binding,
+            dependency_bindings,
+            module_source,
+            quoted_string_attrs,
+        })
     }
 }
 
@@ -220,18 +250,18 @@ impl<S> DataSource<S> {
             quoted_string_attrs,
         }
     }
+}
 
-    /// Get an attribute value by key.
-    pub fn get_attr(&self, key: &str) -> Option<&Value> {
+impl<S, P: PlaceholderKind> DataSource<S, P> {
+    pub fn get_attr(&self, key: &str) -> Option<&Value<P>> {
         self.attributes.get(key)
     }
 
-    /// Set an attribute value.
-    pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value<P>) {
         self.attributes.insert(key.into(), value);
     }
 
-    pub fn with_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
+    pub fn with_attribute(mut self, key: impl Into<String>, value: Value<P>) -> Self {
         self.attributes.insert(key.into(), value);
         self
     }

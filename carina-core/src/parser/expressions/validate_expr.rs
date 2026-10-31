@@ -5,7 +5,9 @@
 //! lives in `parser/mod.rs` (it moves in part 2 of #2262); only the
 //! parser logic and the [`CompareOp`] enum live here.
 
-use crate::parser::{ParseContext, ParseError, Rule, ValidateExpr, first_inner, next_pair};
+use crate::parser::{
+    ParseContext, ParseError, ParserValidateExpr as ValidateExpr, Rule, first_inner, next_pair,
+};
 
 /// Comparison operator used inside [`ValidateExpr::Compare`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

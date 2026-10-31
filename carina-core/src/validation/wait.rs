@@ -21,7 +21,7 @@
 use crate::parser::{File, ResourceRef};
 use crate::plan::PlanErrorKind;
 use crate::schema::{SchemaKind, SchemaRegistry};
-use crate::wait::predicate::resolve_wait_predicate;
+use crate::wait::predicate::validate_wait_predicate;
 
 enum WaitTarget {
     Pollable {
@@ -125,9 +125,9 @@ pub fn validate_wait_bindings<E>(
             // diagnostic from the upstream identifier-scope pass.
             continue;
         };
-        if let Err(error) = resolve_wait_predicate(
+        if let Err(error) = validate_wait_predicate(
             &wb.until_predicate.lhs_segments,
-            wb.until_predicate.rhs.clone(),
+            &wb.until_predicate.rhs,
             Some(schema.schema()),
         ) {
             let attribute = wb

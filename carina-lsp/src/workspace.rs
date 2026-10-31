@@ -58,6 +58,16 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
                     .map(ProviderInstanceKey::from)
                     .collect();
                 for provider in parsed.providers {
+                    let provider = ProviderConfig {
+                        name: provider.name,
+                        attributes: Default::default(),
+                        default_tags: Default::default(),
+                        source: provider.source,
+                        version: provider.version,
+                        revision: provider.revision,
+                        unresolved_attributes: Default::default(),
+                        binding: provider.binding,
+                    };
                     if seen.insert(ProviderInstanceKey::from(&provider)) {
                         dir_providers.push(provider);
                     }

@@ -3,7 +3,7 @@ use crate::binding_index::{IterableBindings, LivePreDataSourceReadInputs, Resolv
 use crate::resolver::resolve_refs_for_plan;
 use crate::resource::{
     ConcreteValue, DeferredValue, ForLoopElement, InterpolationPart, LoopKind, LoopOriginKind,
-    Resource, UnknownReason, Value,
+    NoPlaceholder, ParserPlaceholder, Resource, Value,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -19,6 +19,13 @@ fn known_opt(type_expr: TypeExpr) -> Option<TypeExpr> {
 
 fn expect_known(static_type: &TypeExpr) -> &TypeExpr {
     static_type
+}
+
+fn expanded_value(value: &Value<ParserPlaceholder>) -> Value<NoPlaceholder> {
+    value
+        .clone()
+        .into_expanded()
+        .expect("test value must contain no parser placeholder")
 }
 
 #[test]
@@ -972,8 +979,8 @@ fn parse_directory_module() {
     let sg = &result.resources[0];
     assert_eq!(
         sg.get_attr("vpc_id"),
-        Some(&Value::Deferred(DeferredValue::Unknown(
-            UnknownReason::ModuleArgument {
+        Some(&Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument {
                 name: "vpc_id".to_string(),
                 source_line: (13).into(),
                 diagnostic_name: None,
@@ -3022,8 +3029,12 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
     let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
     remote.insert("mgmt".to_string(), mgmt_attrs);
 
+    let expanded = parsed
+        .clone()
+        .into_expanded()
+        .expect("provider config must contain no parser placeholders");
     let resolved =
-        resolve_provider_attributes_with_remote(&parsed, &remote, &ProviderContext::default())
+        resolve_provider_attributes_with_remote(&expanded, &remote, &ProviderContext::default())
             .expect("resolve must succeed");
 
     let assume_role = resolved
@@ -3084,7 +3095,10 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
         }
     "#;
 
-    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default())
+        .unwrap()
+        .into_expanded()
+        .expect("provider config must contain no parser placeholders");
     let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     let error =
@@ -3116,7 +3130,10 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .unwrap()
+        .into_expanded()
+        .expect("provider config must contain no parser placeholders");
     let resolved = resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -3151,7 +3168,10 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default()).unwrap();
+    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
+        .unwrap()
+        .into_expanded()
+        .expect("provider config must contain no parser placeholders");
     let error = resolve_provider_attributes_with_remote(
         &parsed,
         &HashMap::new(),
@@ -3195,6 +3215,9 @@ fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them(
     });
     let remote = HashMap::new();
 
+    let parsed = parsed
+        .into_expanded()
+        .expect("provider config must contain no parser placeholders");
     let resolved =
         resolve_provider_attributes_with_remote(&parsed, &remote, &ProviderContext::default())
             .expect("default_tags do not participate in the provider-ready invariant");
@@ -3273,7 +3296,7 @@ fn provider_config_carries_unresolved_attributes_field() {
     use crate::parser::ast::ProviderConfig;
     use indexmap::IndexMap;
 
-    let pc = ProviderConfig {
+    let pc: ProviderConfig<NoPlaceholder> = ProviderConfig {
         name: "awscc".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -3808,7 +3831,7 @@ fn parse_string_escaped_interpolation() {
 #[test]
 fn parse_empty_interpolation_accepted_as_unknown() {
     // `${}` mid-edit must NOT abort parsing — instead it is stamped as
-    // `Value::Deferred(DeferredValue::Unknown(EmptyInterpolation))` so other diagnostics in the
+    // `Value::Deferred(DeferredValue::Placeholder(EmptyInterpolation))` so other diagnostics in the
     // file (sibling let bindings, type mismatches, etc.) keep running.
     // See #2480 — pre-fix, this input rejected the entire AST with
     // `expected primary` and made every let binding appear undefined.
@@ -3832,14 +3855,14 @@ fn parse_empty_interpolation_accepted_as_unknown() {
     let has_empty = parts.iter().any(|p| {
         matches!(
             p,
-            crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::EmptyInterpolation
+            crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::EmptyInterpolation
             )))
         )
     });
     assert!(
         has_empty,
-        "expected an InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(EmptyInterpolation))) in the parsed parts; got {:?}",
+        "expected an InterpolationPart::Expr(Value::Deferred(DeferredValue::Placeholder(EmptyInterpolation))) in the parsed parts; got {:?}",
         parts
     );
 }
@@ -3869,8 +3892,8 @@ fn parse_whitespace_only_interpolation_accepted_as_unknown() {
     let has_empty = parts.iter().any(|p| {
         matches!(
             p,
-            crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::EmptyInterpolation
+            crate::resource::InterpolationPart::Expr(Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::EmptyInterpolation
             )))
         )
     });
@@ -7459,7 +7482,7 @@ fn user_fn_typed_param_bool_mismatch() {
 #[test]
 fn typed_user_fn_accepts_value_unknown_in_deferred_for_body() {
     // RFC #2371 stage 3: a deferred for-expression binds the loop var
-    // to `Value::Deferred(DeferredValue::Unknown(ForValue))` during template parsing. If a typed
+    // to `Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value))` during template parsing. If a typed
     // user function is invoked with that placeholder, `check_fn_arg_type`
     // must skip the type check (the concrete type resolves at upstream
     // apply). Without the skip, parsing fails with `expects type 'String'`.
@@ -8394,7 +8417,7 @@ fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
     assert_eq!(crate::ValueDescription::of(value).to_string(), "string");
     assert_eq!(crate::value::format_value(value), "'hunter2SECRET'");
     assert_eq!(
-        crate::value::value_to_json(value).unwrap(),
+        crate::value::value_to_json(&expanded_value(value)).unwrap(),
         serde_json::json!(plaintext)
     );
 }
@@ -8447,7 +8470,7 @@ fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
         .variables
         .get("unresolved")
         .expect("unresolved binding");
-    let message = crate::value::value_to_json(value)
+    let message = crate::value::value_to_json(&expanded_value(value))
         .expect_err("reference remains unresolved")
         .to_string();
 
@@ -8477,7 +8500,7 @@ fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnosti
         .variables
         .get("unresolved")
         .expect("unresolved binding");
-    let message = crate::value::value_to_json(value)
+    let message = crate::value::value_to_json(&expanded_value(value))
         .expect_err("reference remains unresolved")
         .to_string();
 
@@ -8519,7 +8542,7 @@ fn parse_decrypt_uses_config_decryptor() {
         "secret(decrypt(...)) must be idempotent"
     );
     assert_eq!(crate::value::format_value(secret_val), "(secret)");
-    let state_value = crate::value::value_to_json(secret_val).unwrap();
+    let state_value = crate::value::value_to_json(&expanded_value(secret_val)).unwrap();
     let digest = state_value[crate::value::PERSISTED_SECRET_KEY]
         .as_str()
         .expect("Argon2id secret digest");
@@ -8552,7 +8575,7 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
         ))))
     );
     assert_eq!(crate::value::format_value(value), "(secret)");
-    let state_value = crate::value::value_to_json(value).unwrap();
+    let state_value = crate::value::value_to_json(&expanded_value(value)).unwrap();
     let digest = state_value[crate::value::PERSISTED_SECRET_KEY]
         .as_str()
         .expect("Argon2id secret digest");
@@ -8598,7 +8621,7 @@ fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
 
     let error = validate_custom_type(
         &TypeIdentity::bare("CustomType"),
-        &Value::Concrete(ConcreteValue::String("valid-data".into())),
+        &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("valid-data".into())),
         &config,
     )
     .expect_err("provider-owned bare types must be represented as SchemaType");
@@ -8646,7 +8669,7 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
         .expect("typed-error fixture schema must be registered");
     let error = schema
         .validate_with_resolver(
-            &std::collections::HashMap::from([(
+            &std::collections::HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String("value".into())),
             )]),
@@ -8681,7 +8704,7 @@ fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
 
     validate_schema_custom_type(
         &owned,
-        &Value::Concrete(ConcreteValue::String("widget-1".into())),
+        &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("widget-1".into())),
         &crate::parser::LoadedProviderContext::empty_for_test(),
     )
     .expect("the loaded fixture resolver accepts the annotation");
@@ -8703,7 +8726,7 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("test", identity),
-        &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        &Value::<NoPlaceholder>::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("do-not-leak".into()),
         )))),
         &config,
@@ -8741,7 +8764,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
     });
 
     for value in [
-        Value::Concrete(ConcreteValue::Int(-42)),
+        Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(-42)),
         Value::Concrete(ConcreteValue::Float(1.25)),
         Value::Concrete(ConcreteValue::String("literal".into())),
     ] {
@@ -8842,20 +8865,20 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
 
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
-        &Value::Concrete(ConcreteValue::Int(5)),
+        &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(5)),
         &config,
     )
     .expect("owner one must get its own verdict");
     validate_schema_custom_type(
         &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
-        &Value::Concrete(ConcreteValue::Int(7)),
+        &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(7)),
         &config,
     )
     .expect("owner two must get its own verdict");
     assert!(
         validate_schema_custom_type(
             &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
-            &Value::Concrete(ConcreteValue::Int(7)),
+            &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(7)),
             &config,
         )
         .is_err()
@@ -8863,7 +8886,7 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
     assert!(
         validate_schema_custom_type(
             &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
-            &Value::Concrete(ConcreteValue::Int(5)),
+            &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(5)),
             &config,
         )
         .is_err()
@@ -8913,14 +8936,14 @@ fn parse_custom_validator_rejects_invalid() {
     let owned = crate::parser::OwnedTypeIdentity::provider("test", identity);
     let valid_result = validate_schema_custom_type(
         &owned,
-        &Value::Concrete(ConcreteValue::String("valid-data".into())),
+        &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("valid-data".into())),
         &config,
     );
     assert!(valid_result.is_ok());
 
     let invalid_result = validate_schema_custom_type(
         &owned,
-        &Value::Concrete(ConcreteValue::String("invalid".into())),
+        &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("invalid".into())),
         &config,
     );
     assert!(invalid_result.is_err());
@@ -10189,9 +10212,12 @@ fn expand_deferred_for_with_remote_bindings() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
     assert_eq!(parsed.resources.len(), 0, "no resources before expansion"); // allow: direct — fixture test inspection
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     // Simulate loading upstream_state with actual values
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10265,8 +10291,11 @@ fn expand_deferred_for_no_remote_data_stays_deferred() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     // Empty remote_bindings — upstream hasn't been applied yet
     let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -10300,8 +10329,11 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10368,8 +10400,11 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10438,8 +10473,11 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 3);
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred templates must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10494,8 +10532,11 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10558,8 +10599,11 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.deferred_for_expressions.len(), 1);
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -10602,36 +10646,6 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
         "interpolation should contain substituted account id, got: {}",
         rendered
     );
-    // After expansion no `Value::Deferred(DeferredValue::Unknown(ForValue))` placeholder must
-    // remain in the resource tree — every for-binding occurrence is
-    // replaced by the resolved iterable element. RFC #2371 stage 3.
-    fn contains_for_unknown(v: &Value) -> bool {
-        use crate::resource::{InterpolationPart, UnknownReason};
-        match v {
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
-            | Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey))
-            | Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)) => true,
-            Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_for_unknown),
-            Value::Concrete(ConcreteValue::Map(m)) => m.values().any(contains_for_unknown),
-            Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|p| match p {
-                InterpolationPart::Expr(inner) => contains_for_unknown(inner),
-                InterpolationPart::Literal(_) => false,
-            }),
-            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => args
-                .iter()
-                .any(|argument| contains_for_unknown(argument.walker_value())),
-            Value::Deferred(DeferredValue::Secret(inner)) => contains_for_unknown(inner),
-            _ => false,
-        }
-    }
-    let leaked = parsed.resources[0]
-        .attributes
-        .values()
-        .any(contains_for_unknown);
-    assert!(
-        !leaked,
-        "for-binding Value::Deferred(DeferredValue::Unknown) placeholder must not leak into expanded resource"
-    );
 }
 
 #[test]
@@ -10650,7 +10664,10 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
@@ -10701,7 +10718,10 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("deferred template must contain no parser placeholders");
 
     let mut remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
     let mut orgs_attrs = HashMap::new();
@@ -11594,7 +11614,8 @@ fn nested_block_value_map_preserves_insertion_order() {
 
 #[test]
 fn parsed_export_param_keeps_optional_type_expr() {
-    let p = ParsedExportParam::dummy("vpc_id".to_string(), None, None);
+    let p: ParsedExportParam<ParserPlaceholder> =
+        ParsedExportParam::dummy("vpc_id".to_string(), None, None);
     assert!(p.static_type.is_none());
 }
 
@@ -13531,7 +13552,7 @@ fn parse_provider_expr_with_discard_pattern() {
 #[test]
 fn provider_config_named_instance_serde_round_trip() {
     use crate::parser::ast::ProviderConfig;
-    let original = ProviderConfig {
+    let original: ProviderConfig<NoPlaceholder> = ProviderConfig {
         name: "aws".to_string(),
         attributes: {
             let mut m = IndexMap::new();
@@ -13589,7 +13610,7 @@ fn provider_config_deserializes_legacy_plan_instance_shapes() {
 #[test]
 fn provider_config_default_instance_serde_round_trip() {
     use crate::parser::ast::ProviderConfig;
-    let original = ProviderConfig {
+    let original: ProviderConfig<NoPlaceholder> = ProviderConfig {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -14461,7 +14482,11 @@ fn postfix_grammar_keeps_for_expanded_resource_address_shape() {
     ));
 }
 
-fn assert_resource_reference_shape(value: &Value, binding: &str, attribute: &str) {
+fn assert_resource_reference_shape<P: crate::resource::PlaceholderKind>(
+    value: &Value<P>,
+    binding: &str,
+    attribute: &str,
+) {
     assert!(
         matches!(
             value,
@@ -14472,7 +14497,11 @@ fn assert_resource_reference_shape(value: &Value, binding: &str, attribute: &str
     );
 }
 
-fn resource_attribute(parsed: &ParsedFile, resource_type: &str, name: &str) -> Value {
+fn resource_attribute(
+    parsed: &ParsedFile,
+    resource_type: &str,
+    name: &str,
+) -> Value<ParserPlaceholder> {
     parsed
         .iter_all_resources()
         .find(|resource| resource.id().resource_type == resource_type)
@@ -15625,7 +15654,7 @@ fn invalid_secret_subscript_diagnostic_never_exposes_plaintext() {
 mod loop_var_field_access_matrix {
     use super::*;
 
-    fn first_name(src: &str) -> Value {
+    fn first_name(src: &str) -> Value<ParserPlaceholder> {
         let p = parse(src, &ProviderContext::default()).expect("parse");
         assert_eq!(
             p.deferred_for_expressions.len(),
@@ -15696,7 +15725,7 @@ mod loop_var_field_access_matrix {
     fn deferred_template_emits_postfix_access_then_substitutes() {
         // The deferred path: iterable is an unresolved upstream ref, so
         // the loop is deferred and the body's `o.k` is parsed to
-        // `Access(Unknown(ForValue), .k)`. Then expand with a concrete
+        // `Access(Placeholder(LoopSlot::Value), .k)`. Then expand with a concrete
         // iterable and assert substitute_placeholder applies the step.
         let src = r#"
             let up = upstream_state { source = "../x" }
@@ -15704,11 +15733,14 @@ mod loop_var_field_access_matrix {
                 aws.ec2.Subnet { name = o.k }
             }
         "#;
-        let mut p = parse(src, &ProviderContext::default()).expect("parse");
+        let p = parse(src, &ProviderContext::default()).expect("parse");
         assert_eq!(p.deferred_for_expressions.len(), 1, "loop deferred");
+        let mut p = p
+            .into_expanded()
+            .expect("deferred template must contain no parser placeholders");
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
-        // not a bare ForValue (which would lose the `.k`).
+        // not a bare loop slot (which would lose the `.k`).
         let tmpl = &p.deferred_for_expressions[0].template_resource;
         assert!(
             matches!(
@@ -15716,8 +15748,8 @@ mod loop_var_field_access_matrix {
                 Some(Value::Deferred(DeferredValue::Access(access)))
                     if matches!(
                         access.base(),
-                        Value::Deferred(DeferredValue::Unknown(
-                            crate::resource::UnknownReason::ForValue
+                        Value::Deferred(DeferredValue::Placeholder(
+                            crate::resource::LoopSlot::Value
                         ))
                     ) && matches!(
                         access.step(),
@@ -15761,7 +15793,10 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = item["missing"] }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let mut parsed = parsed
+            .into_expanded()
+            .expect("deferred template must contain no parser placeholders");
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
             Value::Concrete(ConcreteValue::String("value".into())),
@@ -15791,7 +15826,10 @@ mod loop_var_field_access_matrix {
                 mock.test.Thing { name = r.missing }
             }
         "#;
-        let mut parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let parsed = parse(src, &ProviderContext::default()).expect("parse deferred loop");
+        let mut parsed = parsed
+            .into_expanded()
+            .expect("deferred template must contain no parser placeholders");
         let item = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "present".to_string(),
             Value::Concrete(ConcreteValue::String("value".into())),
@@ -15818,9 +15856,7 @@ mod loop_var_field_access_matrix {
             name,
             Value::Deferred(DeferredValue::Access(access)) if matches!(
                 access.base(),
-                Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ForValue
-                ))
+                Value::Concrete(ConcreteValue::Map(_))
             ) && matches!(
                 access.step(),
                 crate::resource::PathSegment::Field { name } if name == "missing"

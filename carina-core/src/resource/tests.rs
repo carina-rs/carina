@@ -2,19 +2,133 @@ use super::*;
 use crate::explicit::ExplicitFields;
 use crate::parser::SourceSpan;
 
+type Value = super::Value<NoPlaceholder>;
+type ConcreteValue = super::ConcreteValue<NoPlaceholder>;
+type DeferredValue = super::DeferredValue<NoPlaceholder>;
+type InterpolationPart = super::InterpolationPart<NoPlaceholder>;
+type Resource = super::Resource<ModuleSource, NoPlaceholder>;
+type DataSource = super::DataSource<ModuleSource, NoPlaceholder>;
+type ParserValue = super::Value<ParserPlaceholder>;
+type ParserDeferredValue = super::DeferredValue<ParserPlaceholder>;
+type LoopValue = super::Value<LoopSlot>;
+type LoopDeferredValue = super::DeferredValue<LoopSlot>;
+
+#[test]
+fn into_expanded_rejects_leftover_function_parameter() {
+    let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::FnParam {
+            name: "input".to_string(),
+        },
+    ));
+
+    let error = value
+        .into_expanded()
+        .expect_err("a function parameter must be substituted before expansion completes");
+
+    assert!(matches!(
+        error.placeholder(),
+        ParserPlaceholder::FnParam { name } if name == "input"
+    ));
+}
+
+#[test]
+fn into_expanded_rejects_leftover_function_local() {
+    let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::FnLocal {
+            name: "local".to_string(),
+        },
+    ));
+
+    let error = value
+        .into_expanded()
+        .expect_err("a function local must be substituted before expansion completes");
+
+    assert!(matches!(
+        error.placeholder(),
+        ParserPlaceholder::FnLocal { name } if name == "local"
+    ));
+}
+
+#[test]
+fn into_expanded_rejects_leftover_module_argument() {
+    let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::ModuleArgument {
+            name: "region".to_string(),
+            source_line: (17).into(),
+            diagnostic_name: Some("forwarded_region".to_string()),
+        },
+    ));
+
+    let error = value
+        .into_expanded()
+        .expect_err("a module argument must be substituted before expansion completes");
+
+    assert!(matches!(
+        error.placeholder(),
+        ParserPlaceholder::ModuleArgument { name, .. } if name == "region"
+    ));
+}
+
+#[test]
+fn into_expanded_rejects_empty_interpolation_with_existing_wording() {
+    let value = ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::EmptyInterpolation,
+    ));
+
+    let error = value
+        .into_expanded()
+        .expect_err("an empty interpolation must never cross the expansion boundary");
+
+    assert_eq!(
+        error.to_string(),
+        "empty interpolation `${}` — fill in the expression or remove it"
+    );
+}
+
+#[test]
+fn loop_placeholder_uses_the_existing_unknown_wire_shape() {
+    let value = LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value));
+
+    let encoded = serde_json::to_value(&value).expect("serialize loop placeholder");
+    assert_eq!(encoded, serde_json::json!({ "Unknown": "ForValue" }));
+
+    let decoded: LoopValue =
+        serde_json::from_value(encoded).expect("deserialize loop placeholder in a template");
+    assert!(matches!(
+        decoded,
+        LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value))
+    ));
+}
+
+#[test]
+fn expanded_value_deserialization_reports_typed_loop_placeholder_error() {
+    let error = serde_json::from_value::<Value>(serde_json::json!({ "Unknown": "ForIndex" }))
+        .expect_err("an expanded value cannot contain a loop slot");
+
+    assert!(
+        error
+            .to_string()
+            .contains("for-loop placeholder is not allowed outside a deferred for-loop template"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn module_argument_source_location_is_not_value_data() {
-    let located = Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-        name: "r".to_string(),
-        source_line: (17).into(),
-        diagnostic_name: None,
-    }));
-    let same_operand_other_line =
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
+    let located = ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::ModuleArgument {
+            name: "r".to_string(),
+            source_line: (17).into(),
+            diagnostic_name: None,
+        },
+    ));
+    let same_operand_other_line = ParserValue::Deferred(ParserDeferredValue::Placeholder(
+        ParserPlaceholder::ModuleArgument {
             name: "r".to_string(),
             source_line: (23).into(),
             diagnostic_name: None,
-        }));
+        },
+    ));
 
     assert_eq!(located, same_operand_other_line);
     let encoded = serde_json::to_string(&located).expect("serialize parser placeholder");
@@ -1799,7 +1913,11 @@ fn pair_list_elements_handles_unknown_and_mixed_shapes_in_both_paths() {
         "id".to_string(),
         Value::Concrete(ConcreteValue::Int(7)),
     )])));
-    let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
+    let unknown = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: "deferred".to_string(),
+        },
+    ));
     let defs = crate::schema::empty_defs_for_schema_walks();
 
     for len in [3, HASH_THRESHOLD] {
@@ -3266,10 +3384,10 @@ fn unknown_never_equals_unknown() {
     // suppress real diffs between two attributes that both happen to
     // be "unresolved upstream" of the same binding.
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let a = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: path.clone(),
     }));
-    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let b = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path,
     }));
     assert_ne!(
@@ -3280,7 +3398,11 @@ fn unknown_never_equals_unknown() {
 
 #[test]
 fn unknown_never_equals_concrete() {
-    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
+    let a = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: "deferred".to_string(),
+        },
+    ));
     let b = Value::Concrete(ConcreteValue::String("anything".into()));
     assert_ne!(a, b);
     assert_ne!(b, a);
@@ -3289,12 +3411,28 @@ fn unknown_never_equals_concrete() {
 #[test]
 fn unknown_for_variants_never_equal() {
     assert_ne!(
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey))
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "deferred".to_string(),
+            }
+        )),
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "deferred".to_string(),
+            }
+        ))
     );
     assert_ne!(
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)),
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "left".to_string(),
+            }
+        )),
+        Value::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::UpstreamAllExports {
+                binding: "right".to_string(),
+            }
+        ))
     );
 }
 
@@ -3307,10 +3445,10 @@ fn unknown_hash_is_deterministic_per_path() {
         h.finish()
     }
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let a = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: path.clone(),
     }));
-    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let b = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path,
     }));
     assert_eq!(
@@ -3330,22 +3468,25 @@ fn unknown_hash_differs_per_path() {
     }
     let p1 = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
     let p2 = AccessPath::with_fields("network", "vpc", vec!["cidr_block".into()]);
-    let a = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let a = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: p1,
     }));
-    let b = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let b = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: p2,
     }));
     assert_ne!(hash_of(&a), hash_of(&b));
 }
 
 #[test]
-fn unknown_hash_does_not_panic_for_for_variants() {
+fn unknown_hash_does_not_panic_for_apply_time_variants() {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)).hash_into(&mut h);
-    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForIndex)).hash_into(&mut h);
-    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)).hash_into(&mut h);
+    Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: "deferred".to_string(),
+        },
+    ))
+    .hash_into(&mut h);
     let _ = h.finish();
 }
 
@@ -3355,14 +3496,14 @@ fn unknown_round_trips_through_saved_plan_serde() {
     // order to substitute their loop key/value at apply time. Runtime
     // provider/state conversion still rejects Unknown through value_to_json.
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let value = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: path.clone(),
     }));
     let json = serde_json::to_string(&value).expect("serialize saved-plan unknown");
     let decoded: Value = serde_json::from_str(&json).expect("deserialize saved-plan unknown");
     assert!(matches!(
         decoded,
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: decoded_path,
         })) if decoded_path == path
     ));
@@ -3388,29 +3529,33 @@ fn deserializing_reference_rooted_access_canonicalizes_the_reference() {
 #[test]
 fn upstream_unknown_wire_tags_remain_stable() {
     let path = AccessPath::new("network", "vpc_id");
-    let export = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+    let export = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
         path: path.clone(),
     }));
     let export_json =
         r#"{"Unknown":{"UpstreamRef":{"path":{"binding":"network","attribute":"vpc_id"}}}}"#;
     assert_eq!(serde_json::to_string(&export).unwrap(), export_json);
     match serde_json::from_str::<Value>(export_json).unwrap() {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: decoded_path,
         })) => assert_eq!(decoded_path, path),
         other => panic!("expected UpstreamExport, got {other:?}"),
     }
 
-    let all_exports = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports {
-        binding: "network".into(),
-    }));
+    let all_exports = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: "network".into(),
+        },
+    ));
     let all_exports_json = r#"{"Unknown":{"UpstreamBareRef":{"binding":"network"}}}"#;
     assert_eq!(
         serde_json::to_string(&all_exports).unwrap(),
         all_exports_json
     );
     match serde_json::from_str::<Value>(all_exports_json).unwrap() {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamAllExports { binding })) => {
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
+            binding,
+        })) => {
             assert_eq!(binding, "network")
         }
         other => panic!("expected UpstreamAllExports, got {other:?}"),
@@ -3532,7 +3677,11 @@ fn as_deferred_returns_projection_for_deferred_variants() {
             "Secret",
         ),
         (
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey)),
+            Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "deferred".to_string(),
+                },
+            )),
             "Unknown",
         ),
     ];
@@ -3705,7 +3854,11 @@ mod navigate_value_path_tests {
     fn deferred_hop_is_not_reported_as_a_concrete_navigation_result() {
         let root = map(&[(
             "nested",
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamAllExports {
+                    binding: "deferred".to_string(),
+                },
+            )),
         )]);
         let path = AccessPath::with_fields("o", "nested", vec!["name".into()]);
 

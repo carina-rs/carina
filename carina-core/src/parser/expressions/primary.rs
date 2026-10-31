@@ -6,6 +6,7 @@
 //! access chains, and value-position `if` expressions.
 
 use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::parser::ParsedValue as Value;
 use crate::parser::context::{ExpressionMode, ParseBindingRef};
 use crate::parser::expressions::if_expr::parse_if_value_expr_with_mode;
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -16,7 +17,7 @@ use crate::parser::{
     parse_expression_eval_with_mode,
 };
 use crate::resource::{
-    AccessMissPolicy, AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, Value,
+    AccessMissPolicy, AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript,
     ValuePathSegmentResult, ValueString, apply_value_path_segment,
 };
 use indexmap::IndexMap;
@@ -123,7 +124,6 @@ pub(crate) fn apply_postfix_path_segment(
     step: PathSegment,
     line: usize,
 ) -> Result<EvalValue, ParseError> {
-    let mut display_root = None;
     let base = match value {
         EvalValue::User(base) => base,
         EvalValue::StructuralHandle(handle) => {
@@ -167,10 +167,9 @@ pub(crate) fn apply_postfix_path_segment(
                 });
         }
         EvalValue::DeferredForValue { binding } => {
-            display_root = Some(binding);
-            Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ForValue,
-            ))
+            return Ok(EvalValue::from_value(
+                crate::resource::parser_deferred_for_access(binding, step, line),
+            ));
         }
         EvalValue::Closure {
             name,
@@ -188,10 +187,6 @@ pub(crate) fn apply_postfix_path_segment(
     };
     apply_value_path_segment(base, step, line, AccessMissPolicy::Error)
         .and_then(ValuePathSegmentResult::into_value)
-        .map(|value| match display_root {
-            Some(root) => value.with_access_display_root(root),
-            None => value,
-        })
         .map(EvalValue::from_value)
         .map_err(|error| ParseError::InvalidExpression {
             line,

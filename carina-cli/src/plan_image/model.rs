@@ -1322,11 +1322,14 @@ mod tests {
              }\n",
         )
         .expect("write deferred loop fixture");
-        let mut parsed = carina_core::config_loader::parse_directory(
+        let parsed = carina_core::config_loader::parse_directory(
             fixture.path(),
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("parse deferred loop fixture");
+        let mut parsed = parsed
+            .into_expanded()
+            .expect("deferred loop fixture must contain no parser placeholders");
         let template = parsed
             .deferred_for_expressions
             .pop()

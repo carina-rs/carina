@@ -433,9 +433,9 @@ impl<'a> DependencyAnalyzer<'a> {
         }
     }
 
-    fn collect_from_resource_ref<S>(
+    fn collect_from_resource_ref<S, P: crate::resource::PlaceholderKind>(
         &self,
-        resource: ResourceRef<'_, S>,
+        resource: ResourceRef<'_, S, P>,
         analysis: &mut DependencyAnalysis,
         child: usize,
     ) {

@@ -118,8 +118,8 @@ use crate::provider::{
     ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UpdateRequest,
 };
 use crate::resource::{
-    ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart, ModuleSource,
-    ResolvedResource, Resource, ResourceId, SavedModuleSource, State, UnknownReason, Value,
+    ApplyTimeUnknown, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
+    ModuleSource, ResolvedResource, Resource, ResourceId, SavedModuleSource, State, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -709,7 +709,7 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
     }
 }
 
-fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
+fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => f(reason),
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -748,6 +748,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

@@ -9,6 +9,7 @@ use indexmap::IndexMap;
 
 use crate::binding_index::BindingNameSet;
 use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
+#[cfg(test)]
 use crate::resource::Value;
 use crate::schema::SchemaRegistry;
 
@@ -961,7 +962,7 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 /// `parse(input, config)` wrapper) pay zero overhead.
 #[derive(Clone, PartialEq)]
 struct DirectorySeedState {
-    variables: IndexMap<String, Value>,
+    variables: IndexMap<String, parser::ParsedValue>,
     metadata: crate::parser::ParserBindingMetadata,
 }
 
@@ -2105,20 +2106,22 @@ for account_id in orgs.accounts {
                     )])),
                 )]),
             )]));
-        config
+        let mut parsed = config
             .parsed
+            .into_expanded()
+            .expect("directory fixture must contain no parser placeholders");
+        parsed
             .expand_deferred_for_expressions(&bindings)
             .expect("resolved upstream iterable expands");
 
-        assert!(config.parsed.deferred_for_expressions.is_empty());
+        assert!(parsed.deferred_for_expressions.is_empty());
         assert!(
-            config
-                .parsed
+            parsed
                 .warnings
                 .iter()
                 .all(|warning| warning.kind != crate::parser::WarningKind::DeferredFor),
             "resolved loop retained stale warnings: {:?}",
-            config.parsed.warnings,
+            parsed.warnings,
         );
         cleanup(&dir);
     }

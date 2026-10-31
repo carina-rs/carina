@@ -3,9 +3,10 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use super::ParserWaitBinding as WaitBinding;
 use super::ProviderContext;
 use super::Rule;
-use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction, WaitBinding};
+use super::ast::{ParsedFile, ParserBindingMetadata, UpstreamState, UserFunction};
 use super::blocks::attributes::{
     ParsedArgumentsBlock, parse_arguments_block, parse_attributes_block, parse_exports_block,
 };
@@ -30,7 +31,10 @@ use super::resolve::{
 use crate::eval_value::{
     EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
 };
-use crate::resource::{DataSource, LegacyLoopAddress, LoopKind, Resource, Value};
+use crate::parser::{
+    ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
+};
+use crate::resource::{LegacyLoopAddress, LoopKind};
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1208,8 +1212,8 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
             SeedKind::ModuleParameter => {
                 ctx.set_variable(
                     seed.name().to_string(),
-                    Value::Deferred(crate::resource::DeferredValue::Unknown(
-                        crate::resource::UnknownReason::ModuleArgument {
+                    Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                        crate::resource::ParserPlaceholder::ModuleArgument {
                             name: seed.name().to_string(),
                             source_line: (0).into(),
                             diagnostic_name: None,

@@ -282,7 +282,9 @@ mod tests {
             std::path::Path::new("main.crn"),
             &crate::parser::ProviderContext::default(),
         )
-        .expect("unbound deferred loop parses");
+        .expect("unbound deferred loop parses")
+        .into_expanded()
+        .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions[0].clone();
         let scheduler_key = template.target.scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));

@@ -19,8 +19,8 @@ use crate::parser::{
     ResourceTypePath, TypeExpr,
 };
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
-    ResourceId, ResourceIdentity, UnknownReason, Value,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, ParserPlaceholder,
+    RawEnumIdentifier, Resource, ResourceId, ResourceIdentity, Value,
 };
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
 
@@ -49,8 +49,8 @@ fn resolve_modules_with_config(
 }
 
 fn reconcile_anonymous_module_instances(
-    resources: &mut [Resource],
-    compositions: &mut [crate::resource::LiveComposition],
+    resources: &mut [Resource<crate::resource::ModuleSource, ParserPlaceholder>],
+    compositions: &mut [crate::resource::LiveComposition<ParserPlaceholder>],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
     crate::module_resolver::reconcile_anonymous_module_instances(
@@ -62,15 +62,22 @@ fn reconcile_anonymous_module_instances(
 }
 
 fn module_arguments(
-    values: impl IntoIterator<Item = (String, Value)>,
-) -> HashMap<String, ModuleArgument> {
+    values: impl IntoIterator<Item = (String, Value<ParserPlaceholder>)>,
+) -> HashMap<String, ModuleArgument<ParserPlaceholder>> {
     values
         .into_iter()
         .map(|(name, value)| (name, ModuleArgument::new(value)))
         .collect()
 }
 
-fn resolve_anonymous_loop_module_fixture(module_body: &str, root_body: &str) -> ParsedFile {
+fn resolve_anonymous_loop_module_fixture(
+    module_body: &str,
+    root_body: &str,
+) -> crate::parser::File<
+    crate::parser::ParsedExportParam<crate::resource::NoPlaceholder>,
+    crate::resource::NoPlaceholder,
+    crate::resource::LoopSlot,
+> {
     let root = tempfile::tempdir().expect("temporary module fixture");
     let module_dir = root.path().join("modules/network");
     fs::create_dir_all(&module_dir).expect("create module directory");
@@ -82,6 +89,8 @@ fn resolve_anonymous_loop_module_fixture(module_body: &str, root_body: &str) -> 
         .expect("root fixture parses");
     resolve_modules(&mut parsed, root.path()).expect("module fixture expands");
     parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders")
 }
 
 fn loop_module_identity_registry() -> crate::schema::SchemaRegistry {
@@ -284,6 +293,9 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
         crate::parser::parse_file(root_source, &root_file, &ProviderContext::default())
             .expect("root fixture parses");
     resolve_modules(&mut parsed, root.path()).expect("nested loop module expands");
+    let mut parsed = parsed
+        .into_expanded()
+        .expect("expanded module fixture contains no parser placeholders");
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
         1,
@@ -1463,7 +1475,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         r
     };
 
-    let mut call_arguments: HashMap<String, Value> = HashMap::new();
+    let mut call_arguments: HashMap<String, Value<ParserPlaceholder>> = HashMap::new();
     call_arguments.insert(
         "region".to_string(),
         Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
@@ -1584,7 +1596,9 @@ let role = awscc.iam.Role {
     parsed
 }
 
-fn role_names(parsed: &ParsedFile) -> HashSet<String> {
+fn role_names<E, P: crate::resource::PlaceholderKind, T: crate::resource::PlaceholderKind>(
+    parsed: &crate::parser::File<E, P, T>,
+) -> HashSet<String> {
     parsed
         .resources
         .iter()
@@ -1790,6 +1804,13 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
         argument_bindings,
         HashSet::from(["first.origin".to_string(), "second.origin".to_string()]),
     );
+    let mut resources = ParsedFile {
+        resources,
+        ..ParsedFile::default()
+    }
+    .into_expanded()
+    .expect("expanded module resources contain no parser placeholders")
+    .resources;
 
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
@@ -2712,11 +2733,13 @@ fn test_substitute_arguments_unavailable_builtin_call() {
     let value = Value::Deferred(DeferredValue::Unavailable {
         name: crate::builtins::BuiltinFunction::upper,
         args: vec![
-            Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument {
-                name: "source".to_string(),
-                source_line: (0).into(),
-                diagnostic_name: None,
-            }))
+            Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::ModuleArgument {
+                    name: "source".to_string(),
+                    source_line: (0).into(),
+                    diagnostic_name: None,
+                },
+            ))
             .into(),
         ],
         reason: crate::resource::UnavailableReason::from_builtin_error(
@@ -4572,7 +4595,7 @@ fn resolve_default_arg_fixture(module_body: &str, root_body: &str) -> ParsedFile
     parsed
 }
 
-fn role_attr<'a>(parsed: &'a ParsedFile, attr: &str) -> &'a Value {
+fn role_attr<'a>(parsed: &'a ParsedFile, attr: &str) -> &'a Value<ParserPlaceholder> {
     parsed
         .resources
         .iter()
@@ -4803,8 +4826,8 @@ fn module_argument_postfix_access_preserves_deferred_caller_value() {
     use crate::resource::{PathSegment, Subscript};
 
     let value = crate::resource::apply_postfix_access(
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::UnknownReason::ModuleArgument {
+        Value::Deferred(DeferredValue::Placeholder(
+            ParserPlaceholder::ModuleArgument {
                 name: "items".to_string(),
                 source_line: (0).into(),
                 diagnostic_name: None,
@@ -5248,7 +5271,10 @@ m {}
         // walk order. Either is fine — the contract is that the loop
         // terminates without panicking and preserves a structured,
         // statically typed placeholder rather than inventing a value.
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::ModuleArgument { name, .. })) => {
+        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
+            name,
+            ..
+        })) => {
             assert!(
                 name == "a" || name == "b",
                 "expected cyclic argument to point at `a` or `b`, got: {name:?}"
@@ -7172,14 +7198,18 @@ fn argument_type_mismatch_error_shows_actual_value() {
     );
 }
 
-fn module_argument_type_error(arg_name: &str, type_expr: TypeExpr, value: Value) -> String {
+fn module_argument_type_error(
+    arg_name: &str,
+    type_expr: TypeExpr,
+    value: Value<ParserPlaceholder>,
+) -> String {
     module_argument_type_error_with_config(arg_name, type_expr, value, &ProviderContext::default())
 }
 
 fn module_argument_type_error_with_config(
     arg_name: &str,
     type_expr: TypeExpr,
-    value: Value,
+    value: Value<ParserPlaceholder>,
     config: &ProviderContext,
 ) -> String {
     let mut module = create_test_module();
@@ -7276,7 +7306,8 @@ fn decrypted_module_argument_is_secret_by_value_type() {
         &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
         &config,
     )
-    .expect("test decryptor");
+    .expect("test decryptor")
+    .into_placeholder_type::<ParserPlaceholder>();
 
     let message = module_argument_type_error_with_config("enabled", TypeExpr::Bool, value, &config);
 

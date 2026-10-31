@@ -879,7 +879,7 @@ fn saved_plan_apply_refills_ignored_readable_leaf_from_apply_time_read() {
         &fs::read_to_string(scenario.project.join("update.json")).expect("read saved plan"),
     )
     .expect("parse saved plan");
-    assert_eq!(saved["version"], serde_json::json!(31));
+    assert_eq!(saved["version"], serde_json::json!(32));
     assert!(
         !saved.to_string().contains("resolved_ignore_changes"),
         "saved plans must not persist schema-resolved ignore metadata: {saved:#}"

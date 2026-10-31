@@ -265,6 +265,7 @@ fn public_json_value(value: &Value) -> Result<serde_json::Value, &'static str> {
         Value::Deferred(DeferredValue::Unknown(_reason)) => {
             Err("the value contains an unknown value")
         }
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 

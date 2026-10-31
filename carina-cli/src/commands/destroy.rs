@@ -242,7 +242,7 @@ impl DestroyedInstances {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked_owned(
-    mut validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
+    mut validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -1360,7 +1360,7 @@ async fn run_destroy_locked(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked_with_ctx(
-    validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
+    validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     protected_bucket: Option<String>,
@@ -2160,6 +2160,9 @@ mod tests {
     #[tokio::test]
     async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -3055,7 +3058,7 @@ mod tests {
         use carina_state::{DeposedInstance, DeposedKey, ResourceState};
         use std::collections::{BTreeSet, HashMap};
 
-        let resource =
+        let resource: Resource =
             Resource::with_provider("awscc", "s3.Bucket", "state", None).with_binding("state");
         let mut row = ResourceState::new("s3.Bucket", "state", "awscc");
         row.binding = Some("state".to_string());

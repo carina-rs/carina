@@ -5,9 +5,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::{
-    ResourceTypePath, TypeExpr, display_double_quoted_literal_part, display_string_literal,
+    ParsedResource as Resource, ParsedValue as Value, ResourceTypePath, TypeExpr,
+    display_double_quoted_literal_part, display_string_literal,
 };
-use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
+use crate::resource::{ConcreteValue, DeferredValue};
 use crate::static_type::{ConsumerStaticType, consumer_static_type_label};
 
 /// Dependency between resources
@@ -224,6 +225,7 @@ fn format_value(value: &Value) -> String {
             "(secret)".to_string()
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
     }
 }
 
@@ -572,6 +574,7 @@ impl RootConfigSignature {
             Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
                 // Saved-plan placeholders never carry dependency expressions.
             }
+            Value::Deferred(DeferredValue::Placeholder(_)) => {}
         }
     }
 
@@ -1155,8 +1158,8 @@ impl ModuleSignature {
                     argument_types,
                 );
             }
-            Value::Deferred(DeferredValue::Unknown(
-                crate::resource::UnknownReason::ModuleArgument { name, .. },
+            Value::Deferred(DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::ModuleArgument { name, .. },
             )) => {
                 let target_type = argument_types
                     .get(name)
@@ -1171,6 +1174,11 @@ impl ModuleSignature {
                     },
                 );
             }
+            Value::Deferred(DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::FnParam { .. }
+                | crate::resource::ParserPlaceholder::FnLocal { .. }
+                | crate::resource::ParserPlaceholder::EmptyInterpolation,
+            )) => {}
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 // Other unknowns are upstream-deferred and carry no
                 // resource-binding edge.
@@ -1789,8 +1797,8 @@ mod tests {
             ),
             (
                 "module argument placeholder",
-                Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::UnknownReason::ModuleArgument {
+                Value::Deferred(DeferredValue::Placeholder(
+                    crate::resource::ParserPlaceholder::ModuleArgument {
                         name: "vpc".to_string(),
                         source_line: 1.into(),
                         diagnostic_name: None,

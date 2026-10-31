@@ -34,10 +34,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::parser::File;
-use crate::resource::{
-    AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Value,
-};
+use crate::parser::{File, ParsedValue as Value};
+use crate::resource::{AccessPath, ConcreteValue, DeferredValue, InterpolationPart, PathSegment};
 use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 
 /// One diagnostic for a deferred-populate-bound chained reference
@@ -251,6 +249,7 @@ fn collect_unsynchronized_refs(
         }
         Value::Deferred(
             DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_)
             | DeferredValue::BindingRef { .. }
             | DeferredValue::RedactedSecret { .. },
         ) => {
@@ -371,12 +370,18 @@ mod tests {
     use super::*;
     use crate::parser::{ParsedFile, WaitBinding};
     use crate::resource::{
-        AccessPath, ConcreteValue, DeferredValue, PathSegment, Resource, ResourceId, Subscript,
-        Value,
+        AccessPath, ConcreteValue as StagedConcreteValue, DeferredValue as StagedDeferredValue,
+        PathSegment, Resource as StagedResource, ResourceId, Subscript,
     };
     use crate::schema::{
         AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
     };
+
+    type Value = crate::resource::Value<crate::resource::ParserPlaceholder>;
+    type ConcreteValue = StagedConcreteValue<crate::resource::ParserPlaceholder>;
+    type DeferredValue = StagedDeferredValue<crate::resource::ParserPlaceholder>;
+    type Resource =
+        StagedResource<crate::resource::ModuleSource, crate::resource::ParserPlaceholder>;
 
     fn cert_schema_with_dvo_inner_field_deferred() -> ResourceSchema {
         ResourceSchema::new("acm.Certificate").attribute(

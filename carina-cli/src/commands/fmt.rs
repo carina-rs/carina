@@ -10,13 +10,16 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, find_crn_files_recursive, load_configuration,
 };
 use carina_core::formatter::{self, FormatConfig};
-use carina_core::parser::{ProviderConfig, UseStatement};
+use carina_core::parser::{ProviderConfig as GenericProviderConfig, UseStatement};
+use carina_core::resource::ParserPlaceholder;
 use carina_core::schema::collect_all_block_names;
 
 use crate::error::AppError;
 #[cfg(test)]
 use crate::wiring::LoadedProviderFactory;
 use crate::wiring::{FormattingProviderLoad, ProviderFactoryDiagnostic};
+
+type ProviderConfig = GenericProviderConfig<ParserPlaceholder>;
 
 /// Controls how formatting changes are applied and reported.
 #[derive(Debug, Eq, PartialEq)]

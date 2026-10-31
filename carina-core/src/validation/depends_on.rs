@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
 use crate::parser::{File, ResourceRef};
+use crate::resource::{ModuleSource, ParserPlaceholder};
+
+type ParsedResourceRef<'a> = ResourceRef<'a, ModuleSource, ParserPlaceholder, ParserPlaceholder>;
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +78,7 @@ impl DependsOnDiagnostic {
 ///
 /// `LiveComposition` carries no directives — [`ResourceRef::directives`]
 /// is `None` for that arm, treated here as an empty `depends_on` list.
-fn depends_on_of<'a>(rref: ResourceRef<'a>) -> &'a [String] {
+fn depends_on_of(rref: ParsedResourceRef<'_>) -> &[String] {
     rref.directives()
         .map_or(&[][..], |d| d.depends_on.as_slice())
 }
@@ -97,7 +100,7 @@ pub fn validate_depends_on<E>(parsed: &File<E>) -> Vec<DependsOnDiagnostic> {
 
     let mut diags = Vec::new();
 
-    let bindings_by_name: HashMap<&str, ResourceRef<'_>> = parsed
+    let bindings_by_name: HashMap<&str, ParsedResourceRef<'_>> = parsed
         .iter_all_resources()
         .filter_map(|rref| rref.binding().map(|n| (n, rref)))
         .collect();

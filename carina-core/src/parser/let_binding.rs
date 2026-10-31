@@ -23,7 +23,7 @@ use super::grammar::PreprocessedFile;
 use super::parse_expression_eval;
 use super::util::eval_type_name;
 use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
-use crate::resource::{DataSource, Resource};
+use crate::parser::{ParsedDataSource as DataSource, ParsedResource as Resource};
 
 /// Tuple returned by the let-binding parser. The RHS is `EvalValue`
 /// rather than `Value` so partial applications (closures) can survive

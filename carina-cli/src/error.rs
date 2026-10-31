@@ -712,6 +712,10 @@ pub enum AppError {
     #[error(transparent)]
     BindingUseReport(Box<carina_core::validation::BindingUseReport>),
 
+    /// A parser-only placeholder survived module and function expansion.
+    #[error(transparent)]
+    LeftoverPlaceholder(#[from] carina_core::resource::LeftoverPlaceholder),
+
     /// One core-owned module-call finding at its parser-authored location.
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),

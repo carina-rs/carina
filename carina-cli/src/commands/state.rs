@@ -355,13 +355,18 @@ pub async fn run_force_unlock(
     )?
     .parsed;
     let base_dir = get_base_dir(path);
+    let backend_config = parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
 
     // Administrative lock recovery uses the shared old-backend-on-drift
     // selector without emitting the read-command warning.
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
 
-    match BackendSelection::force_unlock(base_dir, parsed.backend.as_ref(), lock_id).await {
+    match BackendSelection::force_unlock(base_dir, backend_config.as_ref(), lock_id).await {
         Ok(()) => {
             println!("{}", "State has been successfully unlocked.".green().bold());
             Ok(())
@@ -407,12 +412,17 @@ async fn load_state_file(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let parsed = loaded.parsed;
+    let backend_config = parsed
+        .backend
+        .clone()
+        .map(carina_core::parser::BackendConfig::into_expanded)
+        .transpose()?;
 
     let base_dir = get_base_dir(path);
     let backend = resolve_backend_for_read(
         base_dir,
         path,
-        parsed.backend.as_ref(),
+        backend_config.as_ref(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::CommandBoundary { project_dir: path },
     )
@@ -1063,7 +1073,7 @@ async fn run_state_bucket_delete(
 }
 
 async fn load_state_bucket_delete_provider_inputs<E>(
-    parsed: &carina_core::parser::File<E>,
+    parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
@@ -1167,7 +1177,7 @@ pub async fn run_state_refresh(
 }
 
 pub(crate) async fn run_state_refresh_locked(
-    mut validated_config: ValidatedConfig<carina_core::parser::InferredFile>,
+    mut validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     base_dir: &std::path::Path,
@@ -1549,9 +1559,24 @@ pub(crate) async fn run_state_refresh_locked(
                 &data_source_values,
                 &state,
             );
+        let plan_input_current = carina_core::resource::into_plan_input_current_map(
+            managed_current.clone(),
+            ctx.schemas(),
+            &sorted_resources,
+        );
+        let export_bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+            carina_core::binding_index::LivePreApplyInputs {
+                managed: &sorted_resources,
+                compositions: &parsed.compositions,
+                managed_current: &plan_input_current,
+                data_source_values: &data_source_values,
+                remote_bindings: &empty_remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
         let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
-            &carina_core::binding_index::ResolvedBindings::for_validation(parsed),
+            &export_bindings,
             ctx.provider_context(),
         )
         .map_err(AppError::Validation)?;
@@ -2456,6 +2481,9 @@ mod tests {
     #[tokio::test]
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -2502,6 +2530,9 @@ mod tests {
                 binding: "unrelated".to_string(),
                 source: PathBuf::from("../unrelated"),
             });
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -2533,6 +2564,9 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test(
@@ -2651,6 +2685,9 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_prepares_resolved_upstream_provider_config() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &downstream,
@@ -2689,6 +2726,9 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider upstream fixture has no parser placeholders");
 
         let error = match load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -2713,6 +2753,9 @@ mod tests {
     async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         parsed.providers[0].name = "test".to_string();
+        let parsed = parsed
+            .into_expanded()
+            .expect("provider default-tags fixture has no parser placeholders");
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
             &base_dir,
@@ -2757,6 +2800,9 @@ mod tests {
                 .contains_key("default_tags"),
             "the fixture must exercise the parser shape used by bucket delete"
         );
+        let parsed = parsed
+            .into_expanded()
+            .expect("bucket-delete fixture has no leftover parser placeholders");
 
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
@@ -3065,7 +3111,7 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed
             .data_sources
@@ -3153,7 +3199,7 @@ mod tests {
             unresolved_attributes: IndexMap::new(),
             binding: None,
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
@@ -3222,7 +3268,7 @@ mod tests {
             call_path: crate::test_composition_call_path(),
             quoted_string_attrs: HashSet::new(),
         };
-        let mut parsed = carina_core::parser::InferredFile::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(carina_core::parser::ProviderConfig {
             name: "test".to_string(),
             attributes: IndexMap::new(),
@@ -3618,6 +3664,9 @@ mod tests {
         )
         .expect("test config should parse");
         assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        let parsed = parsed
+            .into_expanded()
+            .expect("state-refresh fixture must contain only loop slots");
 
         let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let source = parsed

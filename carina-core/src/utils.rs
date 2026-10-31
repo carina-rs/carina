@@ -1817,8 +1817,8 @@ mod tests {
             .expect("schema fixture must be valid"),
         );
 
-        let known = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
-        let unknown = Resource::with_provider("awscc", "iam.Unknown", "x", None);
+        let known: Resource = Resource::with_provider("awscc", "iam.RolePolicy", "rp", None);
+        let unknown: Resource = Resource::with_provider("awscc", "iam.Unknown", "x", None);
 
         let mut pd = indexmap::IndexMap::new();
         pd.insert(

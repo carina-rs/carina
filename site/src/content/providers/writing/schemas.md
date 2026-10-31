@@ -218,8 +218,8 @@ let schema = ResourceSchema::new("widget")
     .expect("the schema is valid");
 
 let color = schema.effective_attribute("color").unwrap();
-let black = Value::Concrete(ConcreteValue::String("#000000".into()));
-let red = Value::Concrete(ConcreteValue::String("#ff0000".into()));
+let black: Value = Value::Concrete(ConcreteValue::String("#000000".into()));
+let red: Value = Value::Concrete(ConcreteValue::String("#ff0000".into()));
 assert!(color.validate(&black).is_err());
 assert!(color.validate(&red).is_ok());
 ```

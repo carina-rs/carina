@@ -392,6 +392,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -754,6 +755,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
                 context: SerializationContext::WasmBoundary,
             })
         }
+        CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -1888,6 +1890,7 @@ fn proto_struct_field_to_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::resource::NoPlaceholder;
 
     fn find_error_in_chain<'a, T: std::error::Error + 'static>(
         error: &'a (dyn std::error::Error + 'static),
@@ -2934,15 +2937,15 @@ mod tests {
     /// pin the contract by asserting the variant + context survives.
     #[test]
     fn unknown_returns_err_in_core_to_wit_value() {
-        use carina_core::resource::{AccessPath, UnknownReason};
+        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_to_wit_value(&v).unwrap_err();
         match err {
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { path: p },
+                reason: ApplyTimeUnknown::UpstreamExport { path: p },
                 context: SerializationContext::WasmBoundary,
             } => assert_eq!(p, path),
             other => {
@@ -2964,16 +2967,16 @@ mod tests {
 
     #[test]
     fn unknown_returns_err_in_core_value_to_json() {
-        use carina_core::resource::{AccessPath, UnknownReason};
+        use carina_core::resource::{AccessPath, ApplyTimeUnknown};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
-        let v = CoreValue::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamExport {
+        let v = CoreValue::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path: path.clone(),
         }));
         let err = core_value_to_json(&v).unwrap_err();
         assert!(matches!(
             err,
             SerializationError::UnknownNotAllowed {
-                reason: UnknownReason::UpstreamExport { .. },
+                reason: ApplyTimeUnknown::UpstreamExport { .. },
                 context: SerializationContext::WasmBoundary,
             }
         ));
@@ -3633,7 +3636,7 @@ mod tests {
     #[test]
     fn test_state_roundtrip() {
         let id = CoreResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
-        let mut attrs = HashMap::new();
+        let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
             "name".into(),
             CoreValue::Concrete(ConcreteValue::String("my-bucket".into())),
@@ -5148,7 +5151,7 @@ mod tests {
         let err = registry
             .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
             .expect("decoded fixture must be owner-bound")
-            .validate_with_resolver(&HashMap::new(), &|_| false, &resolver)
+            .validate_with_resolver::<NoPlaceholder>(&HashMap::new(), &|_| false, &resolver)
             .unwrap_err();
         assert!(
             err.iter().any(|e| e
@@ -5943,7 +5946,7 @@ mod tests {
             .expect("decoded fixture must be owner-bound");
 
         // key/value pattern should fail
-        let mut attrs = HashMap::new();
+        let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
             "tags".to_string(),
             CoreValue::Concrete(ConcreteValue::Map(
@@ -5968,7 +5971,7 @@ mod tests {
         );
 
         // normal tags should pass
-        let mut attrs = HashMap::new();
+        let mut attrs: HashMap<String, CoreValue> = HashMap::new();
         attrs.insert(
             "tags".to_string(),
             CoreValue::Concrete(ConcreteValue::Map(

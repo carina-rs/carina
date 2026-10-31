@@ -1377,7 +1377,7 @@ fn test_build_state_for_resource_carries_typed_identifier() {
         .upsert_resource(rs)
         .expect("test state setup must be valid");
 
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let loaded = state.build_state_for_resource(&resource.id);
     let Current::Present(present) = loaded else {
         panic!("state row must load as present");
@@ -1390,7 +1390,7 @@ fn test_build_state_for_resource_distinguishes_absent_address() {
     use carina_core::resource::Resource;
 
     let state = StateFile::new();
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     assert!(matches!(
         state.build_state_for_resource(&resource.id),
         Current::Absent(_state)
@@ -3032,7 +3032,7 @@ fn test_from_provider_state_replaces_prior_top_level_list_when_resource_attrs_em
 fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative() {
     use carina_core::differ::{Diff, diff};
 
-    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
+    let resource: Resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
     let reordered_provider = State::existing(
         resource.id.clone(),
         HashMap::from([(
@@ -3104,7 +3104,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
 
 #[test]
 fn bodyless_refresh_preserves_whole_value_without_guessing_alignment() {
-    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
+    let resource: Resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
     let provider = State::existing(
         resource.id.clone(),
         HashMap::from([(
@@ -3354,14 +3354,14 @@ fn test_multi_provider_resources_do_not_collide() {
     );
 
     // Loaded identifiers remain provider-scoped.
-    let aws_res = Resource::with_provider("aws", "s3.Bucket", "main", None);
+    let aws_res: Resource = Resource::with_provider("aws", "s3.Bucket", "main", None);
     assert!(matches!(
         state.build_state_for_resource(&aws_res.id),
         Current::Present(ref present)
             if present.identifier().as_str() == "aws-bucket-id"
     ));
 
-    let awscc_res = Resource::with_provider("awscc", "s3.Bucket", "main", None);
+    let awscc_res: Resource = Resource::with_provider("awscc", "s3.Bucket", "main", None);
     assert!(matches!(
         state.build_state_for_resource(&awscc_res.id),
         Current::Present(ref present)
@@ -3499,7 +3499,7 @@ fn test_build_state_for_resource_existing() {
         )
         .expect("test state setup must be valid");
 
-    let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let resource: Resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let result = match state.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
@@ -3533,7 +3533,7 @@ fn persisted_secret_hash_enters_plan_state_as_a_typed_placeholder() {
         )
         .expect("test state setup must be valid");
 
-    let resource = Resource::with_provider("mock", "test.resource", "old", None);
+    let resource: Resource = Resource::with_provider("mock", "test.resource", "old", None);
     let loaded = match state.build_state_for_resource(&resource.id) {
         Current::Present(present) => present.state().clone(),
         Current::Absent(state) => panic!("expected present state, got {state:?}"),
@@ -3645,7 +3645,7 @@ fn state_file_persisted_attribute_type_preserves_serialized_bytes() {
 #[test]
 fn test_build_state_for_resource_not_found() {
     let state = StateFile::new();
-    let resource =
+    let resource: carina_core::resource::Resource =
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "missing", None);
     let result = match state.build_state_for_resource(&resource.id) {
         Current::Absent(state) => state.into_state(),
@@ -3941,7 +3941,7 @@ fn test_build_state_for_resource_without_identifier() {
         )
         .expect("test state setup must be valid");
 
-    let resource =
+    let resource: carina_core::resource::Resource =
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "pending", None);
     let result = state.build_state_for_resource(&resource.id);
 

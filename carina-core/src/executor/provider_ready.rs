@@ -22,9 +22,9 @@ use crate::module_resolver::{
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
 use crate::resource::{
-    ConcreteValue, DataSource, DeferredValue, LiveComposition, ProviderDataSource,
-    ProviderModuleSource, ProviderResource, ResolvedDataSource, ResolvedResource, Resource,
-    ResourceId, SavedComposition, Value,
+    ConcreteValue, DataSource, DeferredValue, LiveComposition, NoPlaceholder, ParserPlaceholder,
+    PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
+    ResolvedDataSource, ResolvedResource, Resource, ResourceId, SavedComposition, Value,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeError};
 use crate::value::SerializationError;
@@ -387,7 +387,7 @@ impl ProviderReadyDataSource {
 /// Failure while preparing a provider-facing resource.
 #[derive(Debug, Error)]
 pub enum ProviderPreparationError {
-    /// A deferred placeholder survived apply-time reference resolution.
+    /// An unresolved deferred value survived apply-time reference resolution.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
     /// A known value violates its resource schema or provider validator.
@@ -548,6 +548,52 @@ pub fn validate_and_canonicalize_provider_config(
     Ok(canonical)
 }
 
+pub(crate) fn validate_parser_provider_config(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    attributes: &IndexMap<String, Value<ParserPlaceholder>>,
+) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
+    let config_schema = factory.provider_config_attribute_types();
+    let serializable = attributes
+        .iter()
+        .filter(|(_, value)| !crate::validation::value_contains_unresolved_ref(value))
+        .map(|(name, value)| {
+            let value = value
+                .clone()
+                .try_map_placeholder::<NoPlaceholder, ()>(&mut |_placeholder| Err(()))
+                .expect("a provider value classified as resolved cannot contain a placeholder");
+            (name.clone(), value)
+        })
+        .collect();
+    let canonical =
+        canonicalize_provider_config_attributes(provider_name, &serializable, &config_schema)?;
+
+    let mut validation_attributes = attributes.clone();
+    for (name, value) in canonical.attributes() {
+        validation_attributes.insert(name.clone(), value.clone().into_placeholder_type());
+    }
+    validate_provider_config_attributes(
+        factory,
+        provider_name,
+        &validation_attributes,
+        &config_schema,
+    )?;
+
+    factory.validate_config(&canonical).map_err(|error| {
+        let error = if canonical.values().any(crate::value::contains_secret) {
+            error.with_redacted_message("configuration containing a secret failed validation")
+        } else {
+            error
+        };
+        ProviderConfigPreparationError::ProviderValidation {
+            provider: provider_name.to_string(),
+            error: ProviderConfigValidationError { error },
+        }
+    })?;
+
+    Ok(canonical)
+}
+
 /// Prepare provider configuration for construction and normalization.
 ///
 /// [`ResolvedProviderConfig`] carries the guarantee that every construction-
@@ -587,10 +633,10 @@ pub fn prepare_provider_ready_config(
 /// The static validation phase calls this directly because unresolved values
 /// are intentionally allowed there. Provider construction calls it only after
 /// proving the complete map resolved.
-fn validate_provider_config_attributes(
+fn validate_provider_config_attributes<P: PlaceholderKind>(
     factory: &dyn ProviderFactory,
     provider_name: &str,
-    attributes: &IndexMap<String, Value>,
+    attributes: &IndexMap<String, Value<P>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<(), ProviderConfigPreparationError> {
     let lookup = crate::parser::custom_type_lookup_for_factory(factory);
@@ -648,7 +694,7 @@ impl std::error::Error for ProviderValueConstraintErrors {}
 /// This is the sole constructor for [`ProviderReadyResource`]. It unwraps
 /// secrets for the provider, validates every newly known schema value
 /// (including provider custom types), re-runs the complete desired-side
-/// normalization pipeline, and finally proves no deferred placeholder remains.
+/// normalization pipeline, and finally proves no provider-ineligible deferred value remains.
 pub async fn prepare_provider_ready_resource(
     resource: Resource,
     context: &ProviderPreparationContext<'_>,
@@ -1706,7 +1752,7 @@ mod provider_config_tests {
 
         RootlessType::new(decoded)
             .validate_with_lookup(
-                &Value::Concrete(ConcreteValue::String("value".into())),
+                &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("value".into())),
                 &lookup,
             )
             .expect("the owning bridge validator must accept the value");
@@ -1761,7 +1807,7 @@ mod provider_config_tests {
 
         RootlessType::new(native_type)
             .validate_with_lookup(
-                &Value::Concrete(ConcreteValue::String("value".into())),
+                &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("value".into())),
                 &lookup,
             )
             .expect("the native callback must accept the value");
