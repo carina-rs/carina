@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_core::resource::{ResolvedResourceId, ResourceId};
+use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId, ResourceId};
 use carina_state::{ResourceState, StateFile};
 use tempfile::TempDir;
 
@@ -84,12 +84,10 @@ let distribution = mock.test.resource {{
                 .with_attribute("comment", serde_json::json!("dist-v1"))
                 .with_attribute("web_acl_arn", serde_json::json!("web-acl-old-id"));
         distribution.binding = Some("distribution".to_string());
-        distribution
-            .dependency_bindings
-            .insert(ResolvedResourceId::new(ResourceId::with_identity(
-                "mock.test.resource",
-                "web_acl",
-            )));
+        distribution.dependency_bindings =
+            PersistedDestroyDependencies::from_test_dependencies([ResolvedResourceId::new(
+                ResourceId::with_identity("mock.test.resource", "web_acl"),
+            )]);
         state
             .upsert_resource(distribution)
             .expect("test state setup must be valid");

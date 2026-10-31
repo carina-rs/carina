@@ -9,8 +9,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
-    ModuleConstraintId, PendingModuleConstraint, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, ResourceIdentity,
+    ModuleConstraintId, PendingModuleConstraint, PersistedDestroyDependencies, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
@@ -972,6 +972,9 @@ for account_id in orgs.accounts {
         backend_config: None,
         plan,
         sorted_resources: vec![resource.clone()],
+        sorted_value_destroy_dependencies: vec![Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: vec![resource],
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -1094,6 +1097,9 @@ async fn run_saved_plan_schema_fingerprint_case(
         backend_config: None,
         plan,
         sorted_resources: vec![resource.clone()],
+        sorted_value_destroy_dependencies: vec![Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: vec![resource],
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -1274,6 +1280,9 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -1498,6 +1507,9 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: vec![saved],
         data_sources: Vec::new(),
@@ -1589,6 +1601,9 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: vec![saved],
         data_sources: Vec::new(),
@@ -1709,6 +1724,9 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: vec![resource.clone()],
+        sorted_value_destroy_dependencies: vec![Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: vec![resource],
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -1760,6 +1778,160 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         persisted["version"],
         serde_json::json!(StateFile::CURRENT_VERSION),
         "the pending schema migration must be saved before drift can return early"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write() {
+    let user_dirs = carina_core::TestUserDirs::new();
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_path = tmp.path().join("carina.state.json");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    let lineage = "22222222-2222-2222-2222-222222222222";
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 20,
+            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+            "serial": 9,
+            "lineage": lineage,
+            "carina_version": "0.0.0-test",
+            "resources": [{
+                "resource_type": "test.resource",
+                "identity": "example",
+                "provider": "mock",
+                "binding": "example",
+                "dependency_bindings": ["dependency"],
+                "current": {
+                    "kind": "applied",
+                    "identifier": "example-id",
+                    "attributes": {"name": "planned"},
+                    "nested_write_only": {}
+                }
+            }],
+            "exports": {}
+        }))
+        .expect("serialize v20 state"),
+    )
+    .expect("write v20 state");
+    std::fs::write(
+        &mock_state_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "test.resource.example": { "name": "drifted" }
+        }))
+        .expect("serialize provider state"),
+    )
+    .expect("write provider state");
+
+    let mut dependency = Resource::with_provider("mock", "test.resource", "dependency", None);
+    dependency.binding = Some("dependency".to_string());
+    dependency.set_attr("name", string_value("dependency"));
+    let dependency_id = dependency.id.clone();
+    let mut example = Resource::with_provider("mock", "test.resource", "example", None);
+    example.binding = Some("example".to_string());
+    example.set_attr("name", string_value("planned"));
+    let example_id = example.id.clone();
+    let mut graph_file = carina_core::parser::ParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(
+        &mut graph_file,
+        &[dependency.clone(), example.clone()],
+        &[],
+    )
+    .expect("saved-plan migration graph resolves");
+    let legacy_dependency_projections = graph
+        .legacy_dependency_projection_index()
+        .expect("saved-plan migration projection resolves");
+    let planned_example = State::existing(
+        example_id.clone(),
+        HashMap::from([("name".to_string(), string_value("planned"))]),
+    )
+    .with_identifier("example-id");
+    let contents = PlanFileContents {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-31T00:00:00Z".to_string(),
+        source_path: tmp.path().display().to_string(),
+        state_lineage: Some(lineage.to_string()),
+        state_serial: Some(9),
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: vec![dependency.clone(), example.clone()],
+        sorted_value_destroy_dependencies: vec![Default::default(), Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_projections,
+        unresolved_resources: vec![dependency, example],
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        data_source_values: Vec::new(),
+        current_states: vec![
+            crate::commands::plan::CurrentStateEntry::managed(
+                dependency_id.clone(),
+                State::not_found(dependency_id.clone()),
+            ),
+            crate::commands::plan::CurrentStateEntry::managed(example_id, planned_example),
+        ],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let plan_file = record_with_builtin_mock_schemas(contents);
+    let backend =
+        Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
+    unsafe {
+        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
+    }
+
+    let observer_factory = fixture.observer_factory();
+    let result = run_apply_from_plan_locked(
+        &user_dirs,
+        inspected_saved_plan(plan_file),
+        &ProviderContext::default(),
+        true,
+        backend,
+        StateLock::disabled_for_test(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).expect("non-zero parallelism"),
+        false,
+    )
+    .await;
+
+    unsafe {
+        std::env::remove_var("CARINA_MOCK_STATE_FILE");
+    }
+    let error = result.expect_err("drift must still abort the saved-plan apply");
+    assert!(error.to_string().contains("drift"), "error: {error}");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).expect("read migrated state"))
+            .expect("parse migrated state");
+    assert_eq!(
+        persisted["version"],
+        serde_json::json!(StateFile::CURRENT_VERSION)
+    );
+    assert_eq!(
+        persisted["resources"][0]["dependency_bindings"],
+        serde_json::json!([{
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "dependency"
+        }])
     );
 }
 
@@ -1880,6 +2052,9 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -1975,6 +2150,9 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -3063,11 +3241,9 @@ fn seed_apply_cascade_state(
         .with_attribute("vpc_id", serde_json::json!("vpc-old"))
         .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
         .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-        subnet_state
-            .dependency_bindings
-            .insert(ResolvedResourceId::with_provider_identity(
-                "awscc", "ec2.Vpc", "vpc", None,
-            ));
+        subnet_state.dependency_bindings = PersistedDestroyDependencies::from_test_dependencies([
+            ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "vpc", None),
+        ]);
         state_file
             .upsert_resource(subnet_state)
             .expect("test state setup must be valid");
@@ -3969,6 +4145,14 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         backend_config: None,
         plan,
         sorted_resources: vec![target.clone(), consumer.clone()],
+        sorted_value_destroy_dependencies: vec![
+            Default::default(),
+            PersistedDestroyDependencies::from_test_dependencies([ResolvedResourceId::new(
+                target_id.clone(),
+            )]),
+        ],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: vec![target, consumer],
         compositions: Vec::new(),
         data_sources: vec![lookup.clone()],
@@ -4133,6 +4317,14 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         backend_config: None,
         plan,
         sorted_resources: vec![producer.clone(), consumer_for_sorted],
+        sorted_value_destroy_dependencies: vec![
+            Default::default(),
+            PersistedDestroyDependencies::from_test_dependencies([ResolvedResourceId::new(
+                producer_id.clone(),
+            )]),
+        ],
+        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: vec![producer, consumer_for_unresolved],
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
@@ -4217,6 +4409,9 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
@@ -4291,6 +4486,9 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -4400,6 +4598,9 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
+        sorted_value_destroy_dependencies: Vec::new(),
+        sorted_explicit_destroy_dependencies: Vec::new(),
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: Vec::new(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -4813,6 +5014,9 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         backend_config: None,
         plan,
         sorted_resources: vec![resource.clone()],
+        sorted_value_destroy_dependencies: vec![Default::default()],
+        sorted_explicit_destroy_dependencies: vec![Default::default()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: vec![resource],
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -5463,11 +5667,9 @@ awscc.ec2.Subnet {{
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state
-        .dependency_bindings
-        .insert(ResolvedResourceId::with_provider_identity(
-            "awscc", "ec2.Vpc", "vpc", None,
-        ));
+    subnet_state.dependency_bindings = PersistedDestroyDependencies::from_test_dependencies([
+        ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "vpc", None),
+    ]);
 
     let mut state_file = carina_state::StateFile::new();
     state_file
@@ -10441,6 +10643,9 @@ mod saved_plan_version_tests {
             backend_config: None,
             plan,
             sorted_resources: vec![resource.clone()],
+            sorted_value_destroy_dependencies: vec![Default::default()],
+            sorted_explicit_destroy_dependencies: vec![Default::default()],
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: vec![resource],
             compositions: Vec::new(),
             data_sources: Vec::new(),

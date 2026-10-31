@@ -1893,6 +1893,32 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Admit the metadata-only surface used by legacy state migration checks.
+///
+/// Protocol v13 changed provider initialization and create-operation WIT
+/// shapes, but retained the v12 `info`, schema, config-schema, completion, and
+/// identity-attribute function signatures. The schema JSON itself gained
+/// required fields and is upgraded by the dedicated decoders below. The
+/// migration checker invokes only those stable exports through Wasmtime's
+/// dynamic component API; it never constructs runtime bindings or calls
+/// `initialize`. Keep this compatibility window explicit rather than
+/// weakening the ordinary provider runtime gate above.
+pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), String> {
+    const LEGACY_SCHEMA_PROTOCOL_VERSION: u32 = 12;
+
+    if schema_only_protocol_version(info_json)? == LEGACY_SCHEMA_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    check_protocol_version(info_json)
+}
+
+/// Read the protocol stamp after the schema-only compatibility gate admits it.
+pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, String> {
+    let envelope: proto::ProviderInfoEnvelope =
+        serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
+    Ok(envelope.protocol_version)
+}
+
 /// Deserialize JSON to validated core resource schemas.
 pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, SchemaDecodeError> {
     let proto_schemas: Vec<proto::ResourceSchema> =
@@ -1920,6 +1946,111 @@ pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, 
         serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
     carina_core::protocol_convert::protocol_to_config_schema(proto_types)
         .map_err(SchemaDecodeError::protocol_conversion)
+}
+
+/// Decode the schema metadata surface admitted for a migration-only provider.
+///
+/// Protocol v12 used the same metadata exports as v13, but its JSON omitted
+/// the required `keyed_partial_update` and nested-struct `field_groups`
+/// fields. Upgrade those released bytes in memory; ordinary provider runtime
+/// loading continues to use [`json_to_attribute_types`] and remains strict.
+pub(crate) fn json_to_schema_only_attribute_types(
+    json: &str,
+    protocol_version: u32,
+) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
+    if protocol_version != 12 {
+        return json_to_attribute_types(json);
+    }
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+    upgrade_v12_schema_json_in_memory(&mut value);
+    let value = serde_json::to_string(&value).map_err(SchemaDecodeError::schema_json_parse)?;
+    let proto_types: BTreeMap<String, proto::AttributeType> =
+        serde_json::from_str(&value).map_err(SchemaDecodeError::schema_json_parse)?;
+    carina_core::protocol_convert::protocol_to_config_schema(proto_types)
+        .map_err(SchemaDecodeError::protocol_conversion)
+}
+
+/// Decode v12 resource-schema JSON into the v13 aggregate witness used only by
+/// the read-only migration checker. V12 had no reference-form declarations,
+/// so the compatibility envelope supplies an empty collection.
+pub(crate) fn json_to_schema_only_provider_schema(
+    json: &str,
+    config: CoreValidatedConfigSchema,
+    protocol_version: u32,
+) -> Result<CoreValidatedProviderSchemaWitness, SchemaDecodeError> {
+    if protocol_version != 12 {
+        return json_to_provider_schema(json, config);
+    }
+
+    let mut resources: serde_json::Value =
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+    upgrade_v12_schema_json_in_memory(&mut resources);
+    let envelope = serde_json::json!({
+        "resources": resources,
+        "reference_forms": [],
+    });
+    let envelope =
+        serde_json::to_string(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
+    let envelope: proto::ProviderSchemaEnvelope =
+        serde_json::from_str(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
+    carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
+        .map_err(SchemaDecodeError::protocol_conversion)
+}
+
+fn upgrade_v12_schema_json_in_memory(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                upgrade_v12_schema_json_in_memory(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object
+                .get("resource_type")
+                .is_some_and(serde_json::Value::is_string)
+                && object
+                    .get("attributes")
+                    .is_some_and(serde_json::Value::is_object)
+            {
+                let field_groups = object
+                    .remove("exclusive_required")
+                    .and_then(|value| value.as_array().cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|fields| {
+                        serde_json::json!({
+                            "kind": "exactly_one",
+                            "fields": fields,
+                        })
+                    })
+                    .collect();
+                object.insert(
+                    "field_groups".to_string(),
+                    serde_json::Value::Array(field_groups),
+                );
+            }
+            if object
+                .get("attr_type")
+                .is_some_and(serde_json::Value::is_object)
+                && object.get("name").is_some_and(serde_json::Value::is_string)
+                && object.contains_key("required")
+            {
+                object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
+            }
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
+                object.insert(
+                    "field_groups".to_string(),
+                    serde_json::Value::Array(Vec::new()),
+                );
+            }
+            for child in object.values_mut() {
+                upgrade_v12_schema_json_in_memory(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -2479,7 +2610,7 @@ mod tests {
         };
         let witness = ValidatedProviderSchemaWitness::new(
             vec![schema],
-            ValidatedConfigSchema::default(),
+            CoreValidatedConfigSchema::default(),
             ReferenceForms::from([(identity.clone(), form.clone())]),
         )
         .unwrap();
@@ -4532,6 +4663,14 @@ mod tests {
     }
 
     #[test]
+    fn schema_only_protocol_check_admits_v12_without_weakening_runtime_check() {
+        let info = r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#;
+
+        assert!(check_schema_only_protocol_version(info).is_ok());
+        assert!(check_protocol_version(info).is_err());
+    }
+
+    #[test]
     fn test_check_protocol_version_rejects_lower_version() {
         let err = check_protocol_version(
             r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":4}"#,
@@ -4588,49 +4727,6 @@ mod tests {
 
     #[test]
     fn released_protocol_v12_schema_fixtures_require_keyed_metadata_before_core_decode() {
-        fn upgrade_v12_fixture_in_memory(value: &mut serde_json::Value) {
-            match value {
-                serde_json::Value::Array(values) => {
-                    for value in values {
-                        upgrade_v12_fixture_in_memory(value);
-                    }
-                }
-                serde_json::Value::Object(object) => {
-                    if object.contains_key("resource_type") {
-                        let field_groups = object
-                            .remove("exclusive_required")
-                            .and_then(|value| value.as_array().cloned())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|fields| {
-                                serde_json::json!({
-                                    "kind": "exactly_one",
-                                    "fields": fields,
-                                })
-                            })
-                            .collect();
-                        object.insert(
-                            "field_groups".to_string(),
-                            serde_json::Value::Array(field_groups),
-                        );
-                    }
-                    if object.contains_key("attr_type") {
-                        object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
-                    }
-                    if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
-                        object.insert(
-                            "field_groups".to_string(),
-                            serde_json::Value::Array(Vec::new()),
-                        );
-                    }
-                    for child in object.values_mut() {
-                        upgrade_v12_fixture_in_memory(child);
-                    }
-                }
-                _ => {}
-            }
-        }
-
         let fixtures = [
             (
                 "acm.Certificate",
@@ -4666,7 +4762,7 @@ mod tests {
             // every older conversion rule after the required-field gate.
             let mut upgraded: serde_json::Value =
                 serde_json::from_str(json).expect("released fixture is valid JSON");
-            upgrade_v12_fixture_in_memory(&mut upgraded);
+            upgrade_v12_schema_json_in_memory(&mut upgraded);
             let upgraded = serde_json::to_string(&upgraded).expect("upgraded fixture serializes");
             let schemas = json_to_schemas(&upgraded).unwrap_or_else(|error| {
                 panic!(
@@ -5279,6 +5375,53 @@ mod tests {
                 .map(|t| t.shape_ref_free().expect("test schema is Ref-free")),
             Some(carina_core::schema::Shape::Duration)
         ));
+    }
+
+    #[test]
+    fn schema_only_v12_upgrade_distinguishes_fields_from_attribute_names() {
+        let config = json_to_schema_only_attribute_types(
+            r#"{
+                "attr_type":{"type":"String"},
+                "nested":{
+                    "type":"struct",
+                    "name":"Nested",
+                    "fields":[{
+                        "name":"value",
+                        "field_type":{"type":"String"},
+                        "required":false,
+                        "write_only":false
+                    }]
+                }
+            }"#,
+            12,
+        )
+        .expect("v12 config metadata must be upgraded in memory");
+        assert!(config.parts().contains_key("attr_type"));
+        assert!(config.parts().contains_key("nested"));
+
+        let witness = json_to_schema_only_provider_schema(
+            r#"[{
+                "resource_type":"test.FlowLog",
+                "attributes":{
+                    "resource_type":{
+                        "name":"resource_type",
+                        "attr_type":{"type":"String"},
+                        "required":true
+                    }
+                },
+                "exclusive_required":[]
+            }]"#,
+            CoreValidatedConfigSchema::default(),
+            12,
+        )
+        .expect("an attribute named resource_type must not be mistaken for a resource schema");
+        assert_eq!(witness.resources().len(), 1);
+        assert!(
+            witness.resources()[0]
+                .parts()
+                .attributes
+                .contains_key("resource_type")
+        );
     }
 
     #[test]

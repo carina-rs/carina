@@ -124,6 +124,24 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
         .iter()
         .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
+    let mut managed_group_names = parsed
+        .parser_binding_metadata
+        .structural_handles()
+        .iter()
+        .filter(|(_binding, handle)| handle.is_for_binding())
+        .map(|(binding, _handle)| binding.clone())
+        .collect::<HashSet<_>>();
+    for resource in parsed.iter_all_resources() {
+        if !matches!(
+            resource,
+            ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
+        ) {
+            continue;
+        }
+        if let Some(binding) = resource.binding() {
+            managed_group_names.extend(crate::resolved_graph::loop_group_bindings(binding));
+        }
+    }
 
     let mut check_resource = |binding: Option<&str>,
                               attributes: &indexmap::IndexMap<String, crate::resource::Value>,
@@ -187,6 +205,11 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
             }
 
             let Some(target) = bindings_by_name.get(dep_name.as_str()) else {
+                if matches!(operand, UnexpandedDependencyOperand::BareBinding(_))
+                    && managed_group_names.contains(dep_name.as_str())
+                {
+                    continue;
+                }
                 if matches!(operand, UnexpandedDependencyOperand::Handle(_)) {
                     continue;
                 }
@@ -406,6 +429,25 @@ mod tests {
             1,
             "expected exactly one duplicate warning per binding, got {:?}",
             warnings
+        );
+    }
+
+    #[test]
+    fn managed_for_group_is_a_valid_explicit_dependency() {
+        let src = r#"
+            let records = for name in ["one", "two"] {
+                aws.s3.Bucket { bucket_name = name }
+            }
+            let consumer = aws.s3.Bucket {
+                bucket_name = "consumer"
+                directives { depends_on = [records] }
+            }
+        "#;
+        let parsed = parse_and_resolve(src).unwrap();
+        let errors = diag_messages(&validate_depends_on(&parsed), Severity::Error);
+        assert!(
+            errors.is_empty(),
+            "expanded managed groups are valid dependency targets: {errors:?}",
         );
     }
 

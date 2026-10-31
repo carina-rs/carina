@@ -696,6 +696,95 @@ impl IntoIterator for ResolvedDependencies {
     }
 }
 
+/// Managed-resource rows that may be persisted as destroy-ordering edges.
+///
+/// Unlike [`ResolvedDependencies`], this set can never contain plan-scoped
+/// nodes such as data sources or waits. Non-empty values are minted only by
+/// the expanded-graph projection in [`crate::resolved_graph`]. State loading
+/// may deserialize the already-projected wire representation, but no public
+/// insertion or `FromIterator` route exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PersistedDestroyDependencies(BTreeSet<ResolvedResourceId>);
+
+impl PersistedDestroyDependencies {
+    pub(crate) fn from_graph_projection(
+        dependencies: impl IntoIterator<Item = ResolvedResourceId>,
+    ) -> Self {
+        Self(dependencies.into_iter().collect())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn contains(&self, dependency: &ResolvedResourceId) -> bool {
+        self.0.contains(dependency)
+    }
+
+    /// Union two values that have already crossed the graph-projection seam.
+    pub fn extend_projected(&mut self, dependencies: &Self) {
+        self.0.extend(dependencies.0.iter().cloned());
+    }
+
+    /// Project persisted row edges back to scheduler edges for delete plans.
+    pub fn to_resolved_dependencies(&self) -> ResolvedDependencies {
+        self.0.iter().cloned().collect()
+    }
+
+    /// Rewrite only the address spelling of already-projected rows.
+    ///
+    /// This supports state-format canonicalization without opening a route to
+    /// insert data-source or wait IDs into persisted dependencies.
+    pub fn try_map_addresses<E>(
+        self,
+        mut map: impl FnMut(ResolvedResourceId) -> Result<ResolvedResourceId, E>,
+    ) -> Result<Self, E> {
+        self.0
+            .into_iter()
+            .map(&mut map)
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map(Self)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn from_test_dependencies(
+        dependencies: impl IntoIterator<Item = ResolvedResourceId>,
+    ) -> Self {
+        Self::from_graph_projection(dependencies)
+    }
+}
+
+/// Exhaustive result of projecting one expanded graph source to state rows.
+///
+/// External/upstream values and literal module arguments deliberately produce
+/// `NoLocalDestroyEdge`; they are not represented by an accidental empty
+/// lookup or a silently dropped scheduler node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedDestroyDependencyProjection {
+    Managed(PersistedDestroyDependencies),
+    NoLocalDestroyEdge,
+}
+
+impl PersistedDestroyDependencyProjection {
+    pub fn into_dependencies(self) -> PersistedDestroyDependencies {
+        match self {
+            Self::Managed(dependencies) => dependencies,
+            Self::NoLocalDestroyEdge => PersistedDestroyDependencies::default(),
+        }
+    }
+}
+
 /// Attribute-level provenance for value-reference dependency edges.
 ///
 /// This is scheduler metadata, never a provider/state value. `Unknown` is
@@ -980,6 +1069,8 @@ pub struct ResolvedResource<S = ModuleSource> {
     resource: Resource<S>,
     value_dependencies: ResolvedDependencies,
     explicit_dependencies: ResolvedDependencies,
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
     value_dependency_reads: ResolvedDependencyReads,
 }
 
@@ -992,6 +1083,16 @@ struct ResolvedResourceWire<S> {
     value_dependencies: ResolvedDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     explicit_dependencies: ResolvedDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+    )]
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+    )]
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
     value_dependency_reads: ResolvedDependencyReads,
 }
@@ -1007,18 +1108,36 @@ pub struct SchemaUnresolvedResource<S = SavedModuleSource> {
     value_dependencies: ResolvedDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     explicit_dependencies: ResolvedDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+    )]
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+    )]
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
     value_dependency_reads: ResolvedDependencyReads,
 }
 
 impl<S> From<ResolvedResource<S>> for SchemaUnresolvedResource<S> {
     fn from(resource: ResolvedResource<S>) -> Self {
-        let (resource, value_dependencies, explicit_dependencies, value_dependency_reads) =
-            resource.into_parts();
+        let (
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        ) = resource.into_parts();
         Self {
             resource,
             value_dependencies,
             explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
             value_dependency_reads,
         }
     }
@@ -1053,6 +1172,10 @@ impl<S> SchemaUnresolvedResource<S> {
             self.value_dependencies,
             self.explicit_dependencies,
             self.value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            self.persisted_value_destroy_dependencies,
+            self.persisted_explicit_destroy_dependencies,
         ))
     }
 }
@@ -1061,13 +1184,23 @@ pub type SavedResolvedResource = ResolvedResource<SavedModuleSource>;
 
 impl From<ResolvedResource> for SavedResolvedResource {
     fn from(resource: ResolvedResource) -> Self {
-        let (resource, value_dependencies, explicit_dependencies, value_dependency_reads) =
-            resource.into_parts();
+        let (
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        ) = resource.into_parts();
         Self::from_resolved_parts_with_reads(
             resource.into(),
             value_dependencies,
             explicit_dependencies,
             value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
         )
     }
 }
@@ -1209,6 +1342,8 @@ impl<S> ResolvedResource<S> {
             resource,
             value_dependencies: ResolvedDependencies::default(),
             explicit_dependencies: ResolvedDependencies::default(),
+            persisted_value_destroy_dependencies: PersistedDestroyDependencies::default(),
+            persisted_explicit_destroy_dependencies: PersistedDestroyDependencies::default(),
             value_dependency_reads: ResolvedDependencyReads::default(),
         }
     }
@@ -1254,8 +1389,32 @@ impl<S> ResolvedResource<S> {
             resource,
             value_dependencies,
             explicit_dependencies,
+            persisted_value_destroy_dependencies: PersistedDestroyDependencies::default(),
+            persisted_explicit_destroy_dependencies: PersistedDestroyDependencies::default(),
             value_dependency_reads,
         }
+    }
+
+    pub(crate) fn with_persisted_destroy_dependencies(
+        mut self,
+        value_dependencies: PersistedDestroyDependencies,
+        explicit_dependencies: PersistedDestroyDependencies,
+    ) -> Self {
+        self.persisted_value_destroy_dependencies = value_dependencies;
+        self.persisted_explicit_destroy_dependencies = explicit_dependencies;
+        self
+    }
+
+    /// Restore graph-projected destroy edges from a current-format saved
+    /// plan. The opaque dependency values cannot be populated by ordinary
+    /// callers; this only reattaches projections previously minted by the
+    /// expanded graph and serialized alongside the resource.
+    pub fn with_saved_destroy_dependencies(
+        self,
+        value_dependencies: PersistedDestroyDependencies,
+        explicit_dependencies: PersistedDestroyDependencies,
+    ) -> Self {
+        self.with_persisted_destroy_dependencies(value_dependencies, explicit_dependencies)
     }
 
     /// Try to construct; returns `None` if identity is pending.
@@ -1337,12 +1496,16 @@ impl<S> ResolvedResource<S> {
         Resource<S>,
         ResolvedDependencies,
         ResolvedDependencies,
+        PersistedDestroyDependencies,
+        PersistedDestroyDependencies,
         ResolvedDependencyReads,
     ) {
         (
             self.resource,
             self.value_dependencies,
             self.explicit_dependencies,
+            self.persisted_value_destroy_dependencies,
+            self.persisted_explicit_destroy_dependencies,
             self.value_dependency_reads,
         )
     }
@@ -1361,6 +1524,10 @@ impl<S> ResolvedResource<S> {
             self.explicit_dependencies.clone(),
             self.value_dependency_reads.clone(),
         )
+        .with_persisted_destroy_dependencies(
+            self.persisted_value_destroy_dependencies.clone(),
+            self.persisted_explicit_destroy_dependencies.clone(),
+        )
     }
 
     pub fn value_dependencies(&self) -> &ResolvedDependencies {
@@ -1369,6 +1536,20 @@ impl<S> ResolvedResource<S> {
 
     pub fn explicit_dependencies(&self) -> &ResolvedDependencies {
         &self.explicit_dependencies
+    }
+
+    pub fn persisted_value_destroy_dependencies(&self) -> &PersistedDestroyDependencies {
+        &self.persisted_value_destroy_dependencies
+    }
+
+    pub fn persisted_explicit_destroy_dependencies(&self) -> &PersistedDestroyDependencies {
+        &self.persisted_explicit_destroy_dependencies
+    }
+
+    pub fn persisted_destroy_dependencies(&self) -> PersistedDestroyDependencies {
+        let mut dependencies = self.persisted_value_destroy_dependencies.clone();
+        dependencies.extend_projected(&self.persisted_explicit_destroy_dependencies);
+        dependencies
     }
 
     pub(crate) fn known_dependency_reads(
@@ -1461,6 +1642,8 @@ impl<S> TryFrom<ResolvedResourceWire<S>> for ResolvedResource<S> {
             resource: wire.resource,
             value_dependencies: wire.value_dependencies,
             explicit_dependencies: wire.explicit_dependencies,
+            persisted_value_destroy_dependencies: wire.persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies: wire.persisted_explicit_destroy_dependencies,
             value_dependency_reads: wire.value_dependency_reads,
         })
     }
@@ -1472,6 +1655,9 @@ impl<S> From<ResolvedResource<S>> for ResolvedResourceWire<S> {
             resource: resource.resource,
             value_dependencies: resource.value_dependencies,
             explicit_dependencies: resource.explicit_dependencies,
+            persisted_value_destroy_dependencies: resource.persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies: resource
+                .persisted_explicit_destroy_dependencies,
             value_dependency_reads: resource.value_dependency_reads,
         }
     }
@@ -6496,14 +6682,20 @@ pub struct PersistedDirectives {
     pub create_before_destroy: bool,
     #[serde(default)]
     pub prevent_destroy: bool,
-    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
-    pub depends_on: ResolvedDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty"
+    )]
+    pub depends_on: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
 }
 
 impl PersistedDirectives {
-    pub fn from_resolved(directives: &Directives, depends_on: ResolvedDependencies) -> Self {
+    pub fn from_resolved(
+        directives: &Directives,
+        depends_on: PersistedDestroyDependencies,
+    ) -> Self {
         let Directives {
             force_delete,
             create_before_destroy,
@@ -6679,6 +6871,32 @@ pub enum SavedModuleSource {
     },
 }
 
+/// Module provenance required only while interpreting pre-v21 dependency
+/// names. Live configuration and saved plans carry different source types,
+/// but both retain the instance-qualified scope used by the old writer.
+pub trait LegacyDependencyModuleSource {
+    fn legacy_dependency_scope_prefix(&self) -> Option<&str>;
+}
+
+impl LegacyDependencyModuleSource for ModuleSource {
+    fn legacy_dependency_scope_prefix(&self) -> Option<&str> {
+        self.legacy_dependency_scope_prefix()
+    }
+}
+
+impl LegacyDependencyModuleSource for SavedModuleSource {
+    fn legacy_dependency_scope_prefix(&self) -> Option<&str> {
+        match self {
+            Self::Root => None,
+            Self::Module {
+                instance,
+                scope_key,
+                ..
+            } => Some(scope_key.as_deref().unwrap_or(instance)),
+        }
+    }
+}
+
 /// Source marker for resources after module provenance has been deliberately
 /// removed at the provider boundary.
 ///
@@ -6817,6 +7035,16 @@ impl ModuleSource {
         match self {
             Self::Root => None,
             Self::Module(module) => Some(module),
+        }
+    }
+
+    /// Instance-qualified prefix used to interpret dependency names written by
+    /// pre-v21 state. Historical module rows sometimes recorded an argument
+    /// name without this prefix, so migration probes this scope before root.
+    pub fn legacy_dependency_scope_prefix(&self) -> Option<&str> {
+        match self {
+            Self::Root => None,
+            Self::Module(module) => Some(module.scope.key()),
         }
     }
 

@@ -13,8 +13,8 @@ use carina_core::provider::{
     ProviderResult, ReadOutcome, ReadRequest, Sent, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
-    Directives, PersistedDirectives, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, Value,
+    Directives, PersistedDestroyDependencies, PersistedDirectives, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
 use carina_core::schema::{StructField, TypeIdentity};
 use carina_core::value::canonicalize_resources_with_schemas;
@@ -7398,7 +7398,8 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let mut prior = association_state(old_name, "rtb-private", "subnet-a");
     let route_table_id =
         ResolvedResourceId::with_provider_identity("awscc", "ec2.RouteTable", "private_rtb", None);
-    prior.dependency_bindings.insert(route_table_id.clone());
+    prior.dependency_bindings =
+        PersistedDestroyDependencies::from_test_dependencies([route_table_id.clone()]);
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -8059,11 +8060,9 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     .with_attribute("vpc_id", serde_json::json!("vpc-old"))
     .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
     .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
-    subnet_state
-        .dependency_bindings
-        .insert(ResolvedResourceId::with_provider_identity(
-            "awscc", "ec2.Vpc", "vpc", None,
-        ));
+    subnet_state.dependency_bindings = PersistedDestroyDependencies::from_test_dependencies([
+        ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "vpc", None),
+    ]);
 
     let mut state_file = StateFile::new();
     state_file

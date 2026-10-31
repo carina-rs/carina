@@ -94,7 +94,8 @@ pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, CurrentInstance, DeposedAttributes, DeposedInstance, DeposedKey,
-    ImportTargetDisposition, LegacyDependencyMigrationError, LoadedOrphans, LoadedState,
+    ImportTargetDisposition, LegacyDependencyMigrationError, LegacyDependencyMigrationReport,
+    LegacyDependencyNames, LegacyDestroyOrderingWarning, LoadedOrphans, LoadedState,
     MigratedStateFile, MigrationInfo, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind,
     OutcomeUnknownRow, PreviousSecretHashAuthority, PublishedExports, ResourceState,
     ResourceStateEncodingError, RowBasis, StateFile, check_and_migrate, check_and_migrate_bytes,

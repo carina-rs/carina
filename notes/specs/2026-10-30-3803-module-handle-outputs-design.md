@@ -302,14 +302,57 @@ The structural separation is:
 - State may store typed dependency metadata for destroy order, but no handle value/output/export.
 - Saved plans may store resolved scheduler/reference IDs, but no structural handle or Handle output.
 
-Persist current/deposed dependency metadata as `BTreeSet<ResolvedResourceId>`, not binding strings. Migrate legacy
-rows by indexing binding/origin metadata to each target row's full ID; ambiguity or absence is an error, never a
-dropped edge. This changes wire shape, so take the next free `StateFile` version (20 at this base) and update all
-state writeback, refresh, import, moved, orphan-destroy, and migration paths.
+Persist current/deposed dependency metadata as `PersistedDestroyDependencies`, an opaque set of
+`ResolvedResourceId`, not binding strings. State writers can receive this type only from the expanded-graph
+projection described below. This changes the state wire shape to version 21 and updates state writeback, refresh,
+import, moved, orphan-destroy, and migration paths.
 
-Saved-plan shape does change. Base `PlanFile::CURRENT_VERSION` is 31
-(`carina-cli/src/commands/plan.rs:1317`); 32 is reserved for protocol v13 and 33 for #4132. Inspect current main and
-take the next free number (34 if unchanged), never hard-code the assumption here. Old saved plans are unsupported.
+Saved-plan shape also changes. Keep its version number in the single `PlanFile::CURRENT_VERSION` constant; tests
+and encoders reference that constant instead of repeating the integer. Select the merge-time value from current
+main. Old saved plans remain unsupported.
+
+## Legacy dependency migration
+
+The dependency snapshot written by main before this change was kind-blind. It recorded binding names from managed
+resources, `upstream_state`, data sources, compositions, waits, and historically unprefixed module arguments in
+the same string collection. Those names are not row edges and cannot be migrated correctly by parsing each string
+as a resource address.
+
+The v21 writer therefore accepts only `PersistedDestroyDependencies`. The expanded typed graph constructs it by
+projecting every dependency source to managed-resource rows. Managed resources are leaves. Data sources project
+the managed resources used by their inputs; compositions project their underlying targets; waits project their
+target and explicit dependencies. The projection is transitive, so a downstream distribution that reads a wait
+on a certificate retains the certificate edge and never persists the synthetic `__wait` ID. Loop collection
+bindings project every materialized managed member. An exhaustive typed result records that upstream/external
+values and literal arguments have no local destroy edge. Passing `value_dependencies().clone()` directly to a
+state writer does not type-check.
+
+Loading pre-v21 state follows the existing keyed chain through v19 → v20 and then stops in an unwritable in-memory
+typestate. The v20 → v21 transition requires either the live expanded graph or the equivalent projection saved in
+a plan. It carries every v20 field through, including token-less create-outcome-unknown rows. Source-less commands
+such as `state list`, `state show`, and `state lookup` may inspect the pending typestate, display
+`dependencies not yet migrated (legacy: ...)`, and never write it.
+
+Configuration-aware commands classify each legacy name against state rows first and then the current expanded
+graph. For a row inside a module instance, resolution tries that instance's scope before root because old releases
+stored module-local dependency and argument spellings inconsistently. A configured row fails with a typed
+`LegacyDependencyMigrationError` when a name is missing or ambiguous. A saved plan persists the graph's
+already-classified legacy-name projection so `apply --plan` cannot fall back to the old kind-blind strings.
+
+An orphan or deposed row is different: deletion must remain possible after its former module or dependency has
+left the configuration. Classification retains every known managed edge and returns a typed
+`LegacyDestroyOrderingWarning` for each unresolved name. Planning and apply/destroy output display that warning
+before state can be rewritten. Scheduling uses the known edges. The warning is operation-scoped rather than state
+data: v21 persists the known managed IDs only, never the unresolved name. Thus an unresolved name can leave memory
+only after it has been surfaced, while the v21 format remains free of dependency strings.
+
+`carina state migrate --check DIR --state-url COPY` exercises the same transition without credentials, provider
+initialization, CRUD/data-source calls, upstream-state reads, backend access, locks, network access, cache writes,
+or state writes. It loads only provider metadata from exact installed artifacts; repeatable
+`--provider-schema KIND=/absolute/provider.wasm` overrides allow checking copied states against explicitly selected
+artifacts. The schema-only host admits the released protocol-v12 metadata function signatures and upgrades their
+older schema JSON in memory, while the ordinary runtime loader continues to require the current protocol. The
+command reports configured-row errors and orphan/deposed warnings and explicitly states that no state was written.
 
 ## Consumers to update
 
@@ -360,7 +403,8 @@ replace an end-to-end criterion.
 10. Save/reload P3: resolved scheduler IDs round-trip; saved compositions contain no handle output.
 11. Mock-apply and inspect provider requests, state JSON, and plan JSON: handles occur in no payload/value/export;
     addresses occur only in graph metadata; handle outputs do not alter anonymous identity hashes.
-12. Test state migration/destroy order for legacy, module, loop, deposed, and missing targets; missing fails explicitly.
+12. Test state migration/destroy order for legacy, module, loop, deposed, and missing targets. Missing configured
+    targets fail explicitly; unresolved orphan/deposed names retain known edges and appear in plan/apply/destroy warnings.
 13. Match CLI/LSP directory diagnostics and ranges; complete resource attributes after `child.r.` for both forms.
 14. Migrate fixtures/snapshots, Ref/String unit tests, and site examples; finish with the repository grep.
 

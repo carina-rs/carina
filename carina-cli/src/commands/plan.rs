@@ -19,12 +19,13 @@ use carina_core::parser::{
 use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
 use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
 use carina_core::provider_source::ProviderSource;
+use carina_core::resolved_graph::LegacyDependencyProjectionIndex;
 #[cfg(test)]
 use carina_core::resource::DeferredValue;
 use carina_core::resource::{
     CompositionSourceIdentityResolver, ConcreteValue, Current, LiveComposition, ModuleSource,
-    Resource, ResourceId, SavedComposition, SavedCompositionOriginId, SavedDataSource,
-    SavedModuleSource, SavedResource, State, Value,
+    PersistedDestroyDependencies, Resource, ResourceId, SavedComposition, SavedCompositionOriginId,
+    SavedDataSource, SavedModuleSource, SavedResource, State, Value,
 };
 use carina_core::schema::SchemaKind;
 #[cfg(test)]
@@ -454,6 +455,9 @@ mod provider_scope_evidence_tests {
             backend_config: None,
             plan: Plan::new(),
             sorted_resources: Vec::new(),
+            sorted_value_destroy_dependencies: Vec::new(),
+            sorted_explicit_destroy_dependencies: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -645,6 +649,16 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// Pre-resolution resources sorted by dependencies and keyed with their
     /// paired resolved IDs (for post-apply state saving).
     pub sorted_resources: Vec<Resource<S>>,
+    /// Graph-projected managed-row value edges paired by index with
+    /// `sorted_resources`. Saved-plan apply reattaches these opaque values
+    /// before state writeback so waits and data sources never leak into state.
+    pub sorted_value_destroy_dependencies: Vec<PersistedDestroyDependencies>,
+    /// Graph-projected managed-row explicit edges paired by index with
+    /// `sorted_resources`.
+    pub sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
+    /// Complete legacy-name projection from the expanded typed graph.
+    /// Required by saved-plan apply when the locked state is still v20.
+    pub legacy_dependency_projections: LegacyDependencyProjectionIndex,
     /// Pre-resolution resources captured before ResourceRef substitution and
     /// stored in the same order as `sorted_resources`.
     ///
@@ -747,6 +761,9 @@ impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -771,6 +788,9 @@ impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
                 .into_iter()
                 .map(SavedResource::from)
                 .collect(),
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources: unresolved_resources
                 .into_iter()
                 .map(SavedResource::from)
@@ -806,6 +826,9 @@ impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -827,6 +850,9 @@ impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
             backend_config,
             plan: plan.into(),
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -881,7 +907,7 @@ pub struct PlanFile {
     evidence: ProviderEvidence,
 }
 
-/// Private format-33 wire representation.
+/// Private current-format wire representation.
 ///
 /// Field order is intentionally identical to the historical `PlanFile`
 /// serialization order. Evidence is mandatory and is never defaulted.
@@ -897,6 +923,9 @@ struct PlanFileWire {
     backend_config: Option<BackendConfig>,
     plan: UnresolvedSavedPlan,
     sorted_resources: Vec<SavedResource>,
+    sorted_value_destroy_dependencies: Vec<PersistedDestroyDependencies>,
+    sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
+    legacy_dependency_projections: LegacyDependencyProjectionIndex,
     unresolved_resources: Vec<SavedResource>,
     compositions: Vec<SavedComposition>,
     #[serde(default)]
@@ -1272,6 +1301,9 @@ impl From<PlanFile> for PlanFileWire {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1298,6 +1330,9 @@ impl From<PlanFile> for PlanFileWire {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1329,6 +1364,9 @@ impl TryFrom<PlanFileWire> for PlanFile {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -1353,6 +1391,9 @@ impl TryFrom<PlanFileWire> for PlanFile {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -2102,6 +2143,9 @@ impl PlanFile {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies: _sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies: _sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections: _legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -2182,6 +2226,46 @@ impl PlanFile {
 
         for (index, resource) in self.sorted_resources.iter().enumerate() {
             require_identity(&resource.id, &format!("sorted_resources[{index}]"))?;
+        }
+        if self.sorted_value_destroy_dependencies.len() != self.sorted_resources.len()
+            || self.sorted_explicit_destroy_dependencies.len() != self.sorted_resources.len()
+        {
+            return Err(format!(
+                "Invalid saved plan: destroy-dependency projection counts must match {} sorted resources",
+                self.sorted_resources.len()
+            ));
+        }
+        let configured_managed_ids = self
+            .sorted_resources
+            .iter()
+            .map(|resource| &resource.id)
+            .collect::<HashSet<_>>();
+        for (kind, projections) in [
+            (
+                "sorted_value_destroy_dependencies",
+                &self.sorted_value_destroy_dependencies,
+            ),
+            (
+                "sorted_explicit_destroy_dependencies",
+                &self.sorted_explicit_destroy_dependencies,
+            ),
+        ] {
+            for (index, dependencies) in projections.iter().enumerate() {
+                for dependency in dependencies.iter() {
+                    if !configured_managed_ids.contains(dependency.as_inner()) {
+                        return Err(format!(
+                            "Invalid saved plan: {kind}[{index}] contains non-managed dependency `{dependency}`"
+                        ));
+                    }
+                }
+            }
+        }
+        for dependency in self.legacy_dependency_projections.managed_dependencies() {
+            if !configured_managed_ids.contains(dependency.as_inner()) {
+                return Err(format!(
+                    "Invalid saved plan: legacy dependency projection contains non-managed dependency `{dependency}`"
+                ));
+            }
         }
         for (index, resource) in self.unresolved_resources.iter().enumerate() {
             require_identity(&resource.id, &format!("unresolved_resources[{index}]"))?;
@@ -3071,6 +3155,14 @@ pub(crate) enum ReloadedCompositionRehydrationError {
 }
 
 impl UnresolvedReloadedPlanFile {
+    pub(crate) fn sorted_resources(&self) -> &[SavedResource] {
+        &self.contents.sorted_resources
+    }
+
+    pub(crate) fn legacy_dependency_projections(&self) -> &LegacyDependencyProjectionIndex {
+        &self.contents.legacy_dependency_projections
+    }
+
     pub(crate) fn verify_schema_fingerprints(
         &self,
         references: &PlanSchemaReferences,
@@ -3110,6 +3202,9 @@ impl UnresolvedReloadedPlanFile {
             backend_config,
             plan,
             sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -3140,6 +3235,9 @@ impl UnresolvedReloadedPlanFile {
             backend_config,
             plan: plan.resolve_with_schemas(schemas)?,
             sorted_resources: resolve_resources(sorted_resources)?,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_projections,
             unresolved_resources: resolve_resources(unresolved_resources)?,
             compositions,
             data_sources,
@@ -3188,6 +3286,14 @@ impl ReloadedPlanFile {
 
     pub(crate) fn sorted_resources(&self) -> &[SavedResource] {
         &self.contents.sorted_resources
+    }
+
+    pub(crate) fn sorted_value_destroy_dependencies(&self) -> &[PersistedDestroyDependencies] {
+        &self.contents.sorted_value_destroy_dependencies
+    }
+
+    pub(crate) fn sorted_explicit_destroy_dependencies(&self) -> &[PersistedDestroyDependencies] {
+        &self.contents.sorted_explicit_destroy_dependencies
     }
 
     pub(crate) fn sorted_resources_mut(&mut self) -> &mut Vec<SavedResource> {
@@ -3553,6 +3659,9 @@ mod managed_current_serde_tests {
             backend_config: None,
             plan: carina_core::plan::Plan::new(),
             sorted_resources: Vec::new(),
+            sorted_value_destroy_dependencies: Vec::new(),
+            sorted_explicit_destroy_dependencies: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -4282,6 +4391,17 @@ fn build_plan_file_contents<E>(
             &redacted_managed_states,
         )?,
         sorted_resources: redacted_sorted_resources,
+        sorted_value_destroy_dependencies: ctx
+            .sorted_resources
+            .iter()
+            .map(|resource| resource.persisted_value_destroy_dependencies().clone())
+            .collect(),
+        sorted_explicit_destroy_dependencies: ctx
+            .sorted_resources
+            .iter()
+            .map(|resource| resource.persisted_explicit_destroy_dependencies().clone())
+            .collect(),
+        legacy_dependency_projections: ctx.legacy_dependency_projections.clone(),
         unresolved_resources: ctx
             .unresolved_resources
             .iter()
@@ -6632,6 +6752,7 @@ mod run_plan_out_tests {
                 updated.clone(),
             ])
             .unwrap(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: [created, updated]
                 .into_iter()
                 .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
@@ -7009,6 +7130,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: vec![deferred_data_source],
@@ -7094,6 +7216,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: vec![prepared],
             data_sources: Vec::new(),
@@ -7147,6 +7270,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -7213,6 +7337,7 @@ mod run_plan_out_tests {
             plan: Plan::new(),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),

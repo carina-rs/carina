@@ -1785,6 +1785,16 @@ pub(crate) mod version_checked_bindings {
         info_json: String,
     }
 
+    /// Dynamically addressed metadata exports shared by protocol v12 and v13.
+    ///
+    /// Keeping the component instance unbound is the important distinction
+    /// from [`WasmBindings`]: Wasmtime never attempts to interpret v12 CRUD or
+    /// initialization signatures as the v13 runtime world.
+    pub(super) struct SchemaOnlyBindings {
+        instance: wasmtime::component::Instance,
+        info_json: String,
+    }
+
     impl ProtocolCheckedInstance {
         async fn instantiate(
             store: &mut GuestStore,
@@ -1831,6 +1841,14 @@ pub(crate) mod version_checked_bindings {
         store: &mut Store<HostState>,
         instance: &wasmtime::component::Instance,
     ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
+        untyped_string_func(store, instance, "info")
+    }
+
+    fn untyped_string_func(
+        store: &mut Store<HostState>,
+        instance: &wasmtime::component::Instance,
+        export: &str,
+    ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
         let provider = instance
             .get_export_index(&mut *store, None, PROVIDER_INTERFACE_EXPORT)
             .ok_or_else(|| {
@@ -1838,14 +1856,100 @@ pub(crate) mod version_checked_bindings {
                     "no exported instance named `{PROVIDER_INTERFACE_EXPORT}`"
                 ))
             })?;
-        let info = instance
-            .get_export_index(&mut *store, Some(&provider), "info")
+        let function = instance
+            .get_export_index(&mut *store, Some(&provider), export)
             .ok_or_else(|| {
                 wasmtime::Error::msg(format!(
-                    "instance export `{PROVIDER_INTERFACE_EXPORT}` does not have export `info`"
+                    "instance export `{PROVIDER_INTERFACE_EXPORT}` does not have export `{export}`"
                 ))
             })?;
-        instance.get_typed_func::<(), (String,)>(&mut *store, &info)
+        instance.get_typed_func::<(), (String,)>(&mut *store, &function)
+    }
+
+    fn untyped_identity_attributes_func(
+        store: &mut Store<HostState>,
+        instance: &wasmtime::component::Instance,
+    ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (Vec<String>,)>> {
+        let provider = instance
+            .get_export_index(&mut *store, None, PROVIDER_INTERFACE_EXPORT)
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "no exported instance named `{PROVIDER_INTERFACE_EXPORT}`"
+                ))
+            })?;
+        let function = instance
+            .get_export_index(&mut *store, Some(&provider), "identity-attributes")
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "instance export `{PROVIDER_INTERFACE_EXPORT}` does not have export `identity-attributes`"
+                ))
+            })?;
+        instance.get_typed_func::<(), (Vec<String>,)>(&mut *store, &function)
+    }
+
+    impl SchemaOnlyBindings {
+        pub(super) async fn instantiate(
+            store: &mut GuestStore,
+            component: &Component,
+            linker: &Linker<HostState>,
+        ) -> Result<Self, WasmBindingCreationError> {
+            let pre = linker
+                .instantiate_pre(component)
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let instance = store
+                .call(|store| pre.instantiate_async(store))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "instantiate",
+                    source,
+                })?
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let info = store
+                .call(|store| std::future::ready(untyped_info_func(store, &instance)))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "info",
+                    source,
+                })?
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let (info_json,) = store
+                .call(|store| info.call_async(store, ()))
+                .await
+                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
+                    operation: "info",
+                    source,
+                })?
+                .map_err(WasmBindingCreationError::InfoCall)?;
+            wasm_convert::check_schema_only_protocol_version(&info_json)
+                .map_err(WasmBindingCreationError::ProtocolVersion)?;
+            Ok(Self {
+                instance,
+                info_json,
+            })
+        }
+
+        pub(super) fn info_json(&self) -> &str {
+            &self.info_json
+        }
+
+        pub(super) async fn call_string_export(
+            &self,
+            store: &mut Store<HostState>,
+            export: &'static str,
+        ) -> wasmtime::Result<String> {
+            let function = untyped_string_func(store, &self.instance, export)?;
+            let (value,) = function.call_async(store, ()).await?;
+            Ok(value)
+        }
+
+        pub(super) async fn call_identity_attributes(
+            &self,
+            store: &mut Store<HostState>,
+        ) -> wasmtime::Result<Vec<String>> {
+            let function = untyped_identity_attributes_func(store, &self.instance)?;
+            let (value,) = function.call_async(store, ()).await?;
+            Ok(value)
+        }
     }
 
     impl WasmBindings {
@@ -2374,7 +2478,7 @@ pub(crate) mod version_checked_bindings {
     }
 }
 
-use version_checked_bindings::WasmBindings;
+use version_checked_bindings::{SchemaOnlyBindings, WasmBindings};
 
 /// Build `StoreLimits` used for every WASM plugin store.
 ///
@@ -2640,6 +2744,43 @@ async fn create_instance_with_http(
             error.instantiation_context("Failed to instantiate WASM component (HTTP)")
         })?;
 
+    Ok((store, bindings))
+}
+
+/// Instantiate only the stable provider metadata interface.
+///
+/// The store is deliberately kind-less: it receives neither AWS nor GitHub
+/// credentials, and the existing HTTP hook rejects every provider-specific
+/// destination for `kind == None`. Supplying the HTTP imports still lets
+/// providers compiled with the HTTP-enabled world instantiate; no metadata
+/// call is granted network access.
+async fn create_schema_only_bindings(
+    engine: &Engine,
+    component: &Component,
+    label: Arc<ProviderLabel>,
+) -> Result<(GuestStore, SchemaOnlyBindings), WasmProviderLoadError> {
+    let budget = GuestCallBudget::PRODUCTION;
+    let mut store = GuestStore::new_with_http_test_route(
+        engine,
+        label,
+        None,
+        Some(WasiHttpCtx::new()),
+        build_store_limits(),
+        budget,
+        None,
+    );
+    let mut linker = Linker::new(engine);
+    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
+        WasmProviderLoadError::from(format!("Failed to add WASI to linker: {error}"))
+    })?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| {
+        WasmProviderLoadError::from(format!("Failed to add wasi:http to linker: {error}"))
+    })?;
+    let bindings = SchemaOnlyBindings::instantiate(&mut store, component, &linker)
+        .await
+        .map_err(|failure| {
+            single_attempt_load_error(engine, component, InstantiationWorld::HttpEnabled, failure)
+        })?;
     Ok((store, bindings))
 }
 
@@ -3722,6 +3863,21 @@ pub struct WasmProviderFactory {
     _epoch_ticker: EpochTicker,
 }
 
+/// Provider metadata loaded without constructing runtime protocol bindings.
+///
+/// This factory exists only for read-only configuration analysis. Its schema
+/// and identity methods are usable, while the runtime constructor fails
+/// closed. In particular, loading it calls neither `initialize` nor any CRUD
+/// export, and the kind-less guest store receives no provider credentials.
+pub struct SchemaOnlyWasmProviderFactory {
+    name: String,
+    display_name: String,
+    version: String,
+    schema_witness: Arc<ValidatedProviderSchemaWitness>,
+    cached_config_completions: ProviderConfigCompletions,
+    cached_identity_attributes: Vec<String>,
+}
+
 #[derive(Debug)]
 struct WasmMetadataCallError {
     source: wasmtime::Error,
@@ -4280,6 +4436,122 @@ impl WasmProviderFactory {
     }
 }
 
+impl SchemaOnlyWasmProviderFactory {
+    /// Load only schema metadata from resolver-verified provider bytes.
+    pub async fn from_bytes(
+        load: VerifiedLoad,
+        _user_dirs: &UserDirs,
+    ) -> Result<Self, WasmProviderLoadError> {
+        let configured = ConfiguredProvider::new(load.identity());
+        let engine = WasmProviderFactory::create_engine()?;
+        // A migration check is a literal read-only operation. Do not reuse the
+        // ordinary precompile cache: a cold cache would create directories and
+        // publish native code even though the command promises no writes.
+        let component =
+            WasmProviderFactory::load_component_from_bytes(&engine, load.bytes().as_bytes())?;
+        Self::bring_up_component(engine, component, configured).await
+    }
+
+    async fn bring_up_component(
+        engine: Engine,
+        component: Component,
+        configured: ConfiguredProvider,
+    ) -> Result<Self, WasmProviderLoadError> {
+        let _epoch_ticker = EpochTicker::start(engine.clone());
+        let (mut store, bindings) =
+            create_schema_only_bindings(&engine, &component, Arc::clone(&configured.label)).await?;
+        let info_json = bindings.info_json();
+        let protocol_version = wasm_convert::schema_only_protocol_version(info_json)
+            .map_err(WasmProviderLoadError::from)?;
+        let (reported_name, display_name, version) = wasm_convert::json_to_provider_info(info_json)
+            .map_err(|source| {
+                WasmProviderLoadError::metadata("Failed to decode provider info", source)
+            })?;
+        if reported_name != configured.label.name {
+            return Err(WasmProviderLoadError::ProviderNameMismatch {
+                configured: configured.label.name.clone(),
+                reported: reported_name,
+            });
+        }
+        let name = configured.label.name.clone();
+
+        let schemas_json = store
+            .call(|store| bindings.call_string_export(store, "schemas"))
+            .await
+            .map_err(|source| wall_budget_load_error("schemas", source))?
+            .map_err(|source| metadata_call_error(&name, &version, "schemas", source))?;
+        let config_completions_json = store
+            .call(|store| bindings.call_string_export(store, "provider-config-completions"))
+            .await
+            .map_err(|source| wall_budget_load_error("provider-config-completions", source))?
+            .map_err(|source| {
+                metadata_call_error(&name, &version, "provider-config-completions", source)
+            })?;
+        let cached_config_completions =
+            decode_config_completions_json(&config_completions_json, &name, &version)?;
+        let cached_identity_attributes = store
+            .call(|store| bindings.call_identity_attributes(store))
+            .await
+            .map_err(|source| wall_budget_load_error("identity-attributes", source))?
+            .map_err(|source| {
+                metadata_call_error(&name, &version, "identity-attributes", source)
+            })?;
+        let provider_config_types_json = store
+            .call(|store| bindings.call_string_export(store, "provider-config-attribute-types"))
+            .await
+            .map_err(|source| wall_budget_load_error("provider-config-attribute-types", source))?
+            .map_err(|source| {
+                metadata_call_error(&name, &version, "provider-config-attribute-types", source)
+            })?;
+        let provider_config_types = wasm_convert::json_to_schema_only_attribute_types(
+            &provider_config_types_json,
+            protocol_version,
+        )
+        .map_err(|source| {
+            WasmProviderLoadError::metadata(
+                format!(
+                    "provider '{name}' {version} emitted provider config attribute types this host cannot decode"
+                ),
+                source,
+            )
+        })?;
+        let schema_witness = wasm_convert::json_to_schema_only_provider_schema(
+            &schemas_json,
+            provider_config_types,
+            protocol_version,
+        )
+        .map_err(|error| provider_schema_decode_error(&name, &version, error))?;
+
+        Ok(Self {
+            name,
+            display_name,
+            version,
+            schema_witness: Arc::new(schema_witness),
+            cached_config_completions,
+            cached_identity_attributes,
+        })
+    }
+
+    pub fn verify_version(&self, constraint_raw: &str) -> Result<(), String> {
+        let requirement = semver::VersionReq::parse(constraint_raw)
+            .map_err(|error| format!("Invalid version constraint '{constraint_raw}': {error}"))?;
+        let actual = semver::Version::parse(&self.version).map_err(|error| {
+            format!(
+                "Provider '{}' reports invalid version '{}': {error}",
+                self.name, self.version
+            )
+        })?;
+        if requirement.matches(&actual) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Provider '{}' version {actual} does not satisfy constraint '{constraint_raw}'",
+                self.name
+            ))
+        }
+    }
+}
+
 impl WasmProviderFactory {
     /// Replace the runtime-instantiation mapper used at the `ProviderFactory`
     /// boundary. Installed-artifact loaders use this to attach resolver
@@ -4357,6 +4629,71 @@ impl WasmProviderFactory {
             ));
         }
         Ok(())
+    }
+}
+
+impl ProviderFactory for SchemaOnlyWasmProviderFactory {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        self.schema_witness.config().clone()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &CanonicalProviderConfigAttributes,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn validate_custom_type(
+        &self,
+        _identity: &TypeIdentity,
+        _value: &CanonicalCustomTypeValue,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String {
+        carina_core::utils::extract_region_from_attrs(attributes, "ap-northeast-1")
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &ProviderReadyConfig,
+        _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+        Box::pin(async {
+            Err(ProviderError::internal(
+                "schema-only provider metadata cannot initialize a provider runtime",
+            ))
+        })
+    }
+
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        self.schema_witness.resources().to_vec()
+    }
+
+    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+        self.schema_witness.as_ref().clone()
+    }
+
+    fn identity_attributes(&self) -> Vec<&str> {
+        self.cached_identity_attributes
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn config_completions(&self) -> HashMap<String, Vec<CompletionValue>> {
+        self.cached_config_completions.clone()
     }
 }
 
@@ -6875,6 +7212,58 @@ mod tests {
                 .await
                 .expect("mock WASM provider should load"),
         )
+    }
+
+    #[tokio::test]
+    async fn schema_only_factory_is_uncached_and_cannot_create_a_runtime() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+        let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let user_dirs = carina_core::TestUserDirs::new();
+        assert!(!user_dirs.compiled_wasm_cache_dir().exists());
+
+        let factory = SchemaOnlyWasmProviderFactory::from_bytes(
+            VerifiedLoad::for_test(wasm_bytes, test_load_identity("mock")),
+            &user_dirs,
+        )
+        .await
+        .expect("schema-only mock provider should load");
+
+        assert_eq!(factory.name(), "mock");
+        assert!(!factory.schemas().is_empty());
+        assert!(
+            !user_dirs.compiled_wasm_cache_dir().exists(),
+            "metadata-only loading must not publish a precompile cache entry"
+        );
+
+        let saved_configs: carina_core::parser::SavedProviderConfigs =
+            serde_json::from_str("[]").expect("empty saved provider config fixture");
+        let configs = carina_core::parser::ResolvedProviderConfigs::try_from(saved_configs)
+            .expect("empty provider config fixture crosses the checked saved seam");
+        let config = carina_core::executor::prepare_provider_ready_config(
+            &factory,
+            configs.provider_or_implicit("mock").as_ref(),
+        )
+        .expect("empty mock config is provider-ready");
+        let error = match factory.create_initialized_provider(None, &config).await {
+            Ok(_) => panic!("schema-only metadata must not create a runtime provider"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("schema-only provider metadata cannot initialize a provider runtime")
+        );
     }
 
     #[tokio::test]

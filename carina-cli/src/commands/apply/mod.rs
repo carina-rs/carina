@@ -1073,6 +1073,13 @@ pub(crate) async fn load_state_persist_if_migrated(
         None => Ok(None),
         Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
         Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
+            state.complete_legacy_dependency_migration_without_names();
+            if state.requires_legacy_dependency_migration() {
+                // v20 dependency names are an intentionally unwritable
+                // typestate. The expanded graph later classifies them before
+                // any state mutation or persistence is allowed.
+                return Ok(Some(state));
+            }
             match lock {
                 StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
                 StateLockRef::Disabled(disabled) => {
@@ -1103,6 +1110,12 @@ pub(crate) async fn prune_legacy_data_source_rows_persist_if_changed(
         return Ok(());
     };
     if state.remove_legacy_data_source_rows(data_sources) == 0 {
+        return Ok(());
+    }
+    if state.requires_legacy_dependency_migration() {
+        // The pre-v21 typestate is intentionally not serializable. The
+        // expanded-graph phase below persists this parser-aware cleanup
+        // together with the configuration-aware dependency migration.
         return Ok(());
     }
     match lock {
@@ -2110,7 +2123,14 @@ async fn run_apply_locked_owned(
                 moved_origins,
                 prev_explicit,
                 wait_aliases,
+                legacy_dependency_projections: _,
+                migrated_legacy_state,
+                legacy_dependency_migration: _,
             } = artifacts;
+            let legacy_state_migrated = migrated_legacy_state.is_some();
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             render_plan_errors_and_abort(&plan, project_dir)?;
             #[cfg(any(test, feature = "test-utils"))]
             capture_live_apply_plan_for_test(&plan)?;
@@ -2164,6 +2184,25 @@ async fn run_apply_locked_owned(
                 );
 
                 if export_changes.is_empty() {
+                    if legacy_state_migrated {
+                        println!(
+                            "{}",
+                            "Persisting configuration-aware state dependency migration.".cyan()
+                        );
+                        let pre_resolve_compositions_noop = parsed.compositions.clone();
+                        return Ok(SourceApplyAfterHeartbeat::PersistExports(Box::new(
+                            SourceApplyPersistExports {
+                                validated_config: validated_expansion,
+                                state_file,
+                                resources: paired_unresolved_resources,
+                                compositions: pre_resolve_compositions_noop,
+                                checked_exports: checked_exports_pre_apply,
+                                wait_aliases,
+                                managed_current,
+                                data_source_values,
+                            },
+                        )));
+                    }
                     println!("{}", "No changes needed.".green());
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
@@ -3307,8 +3346,38 @@ async fn run_apply_from_plan_locked_owned(
     let removed_legacy_data_source_rows = state_file
         .as_mut()
         .is_some_and(|state| state.remove_legacy_data_source_rows(&legacy_data_source_origins) > 0);
+    if let Some(state) = state_file.as_mut() {
+        state.complete_legacy_dependency_migration_without_names();
+        if state.requires_legacy_dependency_migration() {
+            let migration = try_with_lock!(
+                state
+                    .migrate_legacy_dependencies(
+                        inspected_plan.legacy_dependency_projections(),
+                        inspected_plan.sorted_resources(),
+                    )
+                    .map_err(|error| AppError::Backend(error.into()))
+            );
+            // Saved-plan migration is persisted before drift detection can
+            // return. Emit orphan/deposed uncertainty at that same boundary
+            // so no unresolved legacy spelling can disappear from state
+            // without being shown to the operator.
+            for warning in migration.warnings() {
+                for legacy_name in &warning.legacy_names {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "Warning: destroy ordering for {} is partially unknown: legacy dependency {:?} no longer resolves.",
+                            warning.row, legacy_name
+                        )
+                        .yellow()
+                    );
+                }
+            }
+        }
+    }
     if (pending_migration.is_some() || removed_legacy_data_source_rows)
         && let Some(state) = state_file.as_mut()
+        && !state.requires_legacy_dependency_migration()
     {
         match lock.as_ref() {
             StateLockRef::Held(held) => {
@@ -3429,10 +3498,36 @@ async fn run_apply_from_plan_locked_owned(
 
             let plan = rehydrated_plan_file.plan();
             let sorted_resources = rehydrated_plan_file.sorted_resources();
+            let saved_value_destroy_dependencies = rehydrated_plan_file
+                .reloaded_plan_file()
+                .sorted_value_destroy_dependencies()
+                .to_vec();
+            let saved_explicit_destroy_dependencies = rehydrated_plan_file
+                .reloaded_plan_file()
+                .sorted_explicit_destroy_dependencies()
+                .to_vec();
+            if sorted_resources.len() != saved_value_destroy_dependencies.len()
+                || sorted_resources.len() != saved_explicit_destroy_dependencies.len()
+            {
+                return Err(AppError::Config(format!(
+                    "saved plan destroy-dependency projection count does not match its {} sorted resources; create a new plan",
+                    sorted_resources.len()
+                )));
+            }
             let resolved_sorted_resources = ResolvedResource::collect_resolved_with_schemas(
                 sorted_resources.iter().cloned(),
                 wiring.schemas(),
-            )?;
+            )?
+            .into_iter()
+            .zip(saved_value_destroy_dependencies)
+            .zip(saved_explicit_destroy_dependencies)
+            .map(|((resource, value_dependencies), explicit_dependencies)| {
+                resource.with_saved_destroy_dependencies(
+                    value_dependencies,
+                    explicit_dependencies,
+                )
+            })
+            .collect::<Vec<_>>();
             let plan_compositions = rehydrated_plan_file.compositions();
             let plan_data_sources = rehydrated_plan_file.data_sources();
             let plan_data_source_origins: &[SavedDataSource] =

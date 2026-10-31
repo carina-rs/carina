@@ -674,7 +674,7 @@ fn create_plan_parts(
             continue;
         }
         let binding = orphan.binding().map(str::to_owned);
-        let explicit_dependencies = persisted_directives.depends_on;
+        let explicit_dependencies = persisted_directives.depends_on.to_resolved_dependencies();
         let mut dependencies = state.dependency_bindings.clone();
         dependencies.extend(explicit_dependencies.iter().cloned());
         plan.add(Effect::Delete {
@@ -930,7 +930,14 @@ fn pending_replace_from_parts(
     } else {
         None
     };
-    let (to, value_dependencies, explicit_dependencies, value_dependency_reads) = to.into_parts();
+    let (
+        to,
+        value_dependencies,
+        explicit_dependencies,
+        persisted_value_destroy_dependencies,
+        persisted_explicit_destroy_dependencies,
+        value_dependency_reads,
+    ) = to.into_parts();
     let create = apply_temporary_name(to, temporary_name.as_ref());
     let dependencies = from.dependency_bindings.clone();
     let delete = ReplacementDelete {
@@ -948,6 +955,10 @@ fn pending_replace_from_parts(
             value_dependencies,
             explicit_dependencies.clone(),
             value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
         ),
         delete,
         create_before_destroy,
@@ -1125,8 +1136,14 @@ fn mark_pending_create_before_destroy(
         return Ok(());
     }
 
-    let (mut create, value_dependencies, explicit_dependencies, value_dependency_reads) =
-        pending.create.clone().into_parts();
+    let (
+        mut create,
+        value_dependencies,
+        explicit_dependencies,
+        persisted_value_destroy_dependencies,
+        persisted_explicit_destroy_dependencies,
+        value_dependency_reads,
+    ) = pending.create.clone().into_parts();
     create.directives.create_before_destroy = true;
     let from = State::existing(
         pending.delete.id.as_inner().clone(),
@@ -1140,6 +1157,10 @@ fn mark_pending_create_before_destroy(
         value_dependencies,
         explicit_dependencies,
         value_dependency_reads,
+    )
+    .with_persisted_destroy_dependencies(
+        persisted_value_destroy_dependencies,
+        persisted_explicit_destroy_dependencies,
     );
     pending.create_before_destroy = true;
     pending.delete.directives.create_before_destroy = true;

@@ -565,13 +565,27 @@ fn imported_module_bare_handle_errors_name_the_owning_file() {
 }
 
 #[test]
-fn validate_rejects_structural_kinds_that_depends_on_cannot_honor() {
+fn validate_accepts_for_group_in_depends_on() {
+    let fixture = tempfile::tempdir().expect("temporary project");
+    write_file(
+        fixture.path(),
+        "decl.crn",
+        "let xs = for n in [\"a\", \"b\"] { mock.test.resource { name = n } }\n",
+    );
+    write_file(
+        fixture.path(),
+        "use.crn",
+        "mock.test.resource {\n  name = \"consumer\"\n  directives { depends_on = [xs] }\n}\n",
+    );
+    write_file(fixture.path(), "providers.crn", "provider mock {}\n");
+
+    let output = run(fixture.path(), &["validate", "."]);
+    assert_success("validate for-group depends_on", &output);
+}
+
+#[test]
+fn validate_rejects_non_managed_structural_kinds_that_depends_on_cannot_honor() {
     for (declaration, binding, kind) in [
-        (
-            "let xs = for n in [\"a\", \"b\"] { mock.test.resource { name = n } }",
-            "xs",
-            "for binding",
-        ),
         (
             "let src = mock.test.resource { name = \"src\" }\nlet ready = wait src { until = src.name == \"src\" }",
             "ready",

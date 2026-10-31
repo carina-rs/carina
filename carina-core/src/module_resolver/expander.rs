@@ -621,6 +621,12 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     .iter()
                     .filter_map(|c| c.binding_name.clone()),
             )
+            // Parser-classified structural `let` names include collection
+            // bindings such as `let records = for ...`. Expanded resources
+            // carry concrete addresses (`records[0]`, `records[1]`), so their
+            // binding fields alone cannot preserve the group root needed by
+            // `depends_on = [records]` across a module boundary.
+            .chain(module.structural_bindings.iter().cloned())
             // Nested compositions may already carry a multi-segment binding
             // (`middle.inner`). When this module is itself expanded, refs to
             // that exact binding must gain the new outer prefix as well.
@@ -654,6 +660,19 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // Expand managed resources with substituted values.
         let mut resources: Vec<Resource> = Vec::new();
         let mut expanded_parser_metadata = crate::parser::ParserBindingMetadata::default();
+        for (binding, handle) in module.parser_binding_metadata.structural_handles() {
+            if !handle.is_for_binding() {
+                continue;
+            }
+            let binding = apply_instance_prefix(instance_prefix, binding);
+            expanded_parser_metadata.insert_structural_handle(
+                binding.clone(),
+                crate::eval_value::UnexpandedStructuralHandle::new(
+                    UnexpandedStructuralHandleKind::For,
+                    binding,
+                ),
+            );
+        }
         let mut expanded_binding_uses = module.bare_binding_uses().clone();
         for resource in &module.resources {
             let source_file = module
@@ -1177,14 +1196,19 @@ fn prefix_explicit_dependencies(
                 .map(crate::parser::UnexpandedDependencyOperand::Handle)
             }
             crate::parser::UnexpandedDependencyOperand::BareBinding(binding) => {
-                Err(ArgumentSubstitutionError {
-                    source_file: Some(arguments.caller_source_file.to_path_buf()),
-                    line: arguments.default_line,
-                    message: format!(
-                        "{boundary}.depends_on: expected a managed resource handle; got unresolved binding '{binding}'"
-                    ),
-                    parse_error: None,
-                })
+                let binding = binding.as_str();
+                let (root, suffix) = binding
+                    .split_once('.')
+                    .map_or((binding, None), |(root, suffix)| (root, Some(suffix)));
+                let binding = if intra_module_bindings.contains(root) {
+                    let prefixed = apply_instance_prefix(instance_prefix, root);
+                    suffix.map_or(prefixed.clone(), |suffix| format!("{prefixed}.{suffix}"))
+                } else {
+                    binding.to_string()
+                };
+                Ok(crate::parser::UnexpandedDependencyOperand::BareBinding(
+                    binding.into(),
+                ))
             }
             crate::parser::UnexpandedDependencyOperand::AttributeSelection {
                 binding,

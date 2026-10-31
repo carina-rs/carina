@@ -908,6 +908,25 @@ fn snapshot_delete_orphan() {
 }
 
 #[test]
+fn snapshot_legacy_orphan_unknown_destroy_ordering() {
+    let (plan, current_states, schemas, _moved) =
+        build_plan_and_states_from_fixture("legacy_orphan_unknown_destroy_ordering");
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_deposed_delete() {
     let fp = build_plan_from_fixture_name("deposed_delete");
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(

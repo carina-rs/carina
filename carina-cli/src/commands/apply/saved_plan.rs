@@ -305,6 +305,26 @@ pub(super) enum ReloadedProviderBoundPlanFile {
     },
 }
 
+impl ReloadedProviderBoundPlanFile {
+    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+        match self {
+            Self::Verified { plan, .. } => plan.plan_file.sorted_resources(),
+            Self::NeedsSecretVerification { plan, .. } => plan.plan_file.sorted_resources(),
+        }
+    }
+
+    pub(super) fn legacy_dependency_projections(
+        &self,
+    ) -> &carina_core::resolved_graph::LegacyDependencyProjectionIndex {
+        match self {
+            Self::Verified { plan, .. } => plan.plan_file.legacy_dependency_projections(),
+            Self::NeedsSecretVerification { plan, .. } => {
+                plan.plan_file.legacy_dependency_projections()
+            }
+        }
+    }
+}
+
 /// Placeholder-free saved plan awaiting provider-schema verification.
 pub(super) struct ReloadedVerifiedPlanFile {
     plan_file: UnresolvedReloadedPlanFile,
@@ -1315,6 +1335,9 @@ mod tests {
             backend_config: None,
             plan: Plan::new(),
             sorted_resources: Vec::new(),
+            sorted_value_destroy_dependencies: Vec::new(),
+            sorted_explicit_destroy_dependencies: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -1794,6 +1817,9 @@ mod tests {
             backend_config: None,
             plan: plan.clone(),
             sorted_resources: Vec::new(),
+            sorted_value_destroy_dependencies: Vec::new(),
+            sorted_explicit_destroy_dependencies: Vec::new(),
+            legacy_dependency_projections: Default::default(),
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: vec![data_source.clone()],

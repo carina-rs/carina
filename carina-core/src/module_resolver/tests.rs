@@ -8066,6 +8066,105 @@ let child = consumer_module { peer = source }
 }
 
 #[test]
+fn module_wait_dependency_on_for_group_prefixes_and_resolves_every_member() {
+    let tmp = tempfile::tempdir().expect("temporary wait-for-group fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("resources.crn"),
+        r#"let target = mock.test.Target { name = "target" }
+let records = for record_name in ["one", "two"] {
+  mock.test.Record { name = record_name }
+}
+"#,
+    )
+    .expect("write module resources");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait target {
+  until      = target.status == "ready"
+  depends_on = [records]
+}
+"#,
+    )
+    .expect("write module wait");
+    fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  target_name: String = ready.name\n}\n",
+    )
+    .expect("write module output");
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  marker: String = \"fixture\"\n}\n",
+    )
+    .expect("write module argument");
+
+    let root_source = r#"let consumer_module = use { source = "../consumer" }
+let child = consumer_module {}
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse_file(root_source, &root.join("main.crn"), &context)
+        .expect("root parses with its source path");
+    let mut parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module with a wait over a for group expands");
+
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding == "child.ready")
+        .expect("expanded wait")
+        .clone();
+    assert_eq!(wait.depends_on.diagnostic_references(), ["child.records"]);
+
+    let expected = parsed
+        .resources
+        .iter()
+        .filter(|resource| {
+            resource
+                .binding
+                .as_deref()
+                .is_some_and(|binding| binding.starts_with("child.records["))
+        })
+        .filter_map(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .collect::<crate::resource::ResolvedDependencies>();
+    assert_eq!(expected.len(), 2, "both loop members must be materialized");
+
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index =
+        crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
+            .expect("expanded graph registers the prefixed loop group");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("wait dependency resolves to the complete managed group");
+    assert_eq!(resolved_wait.explicit_dependencies, expected);
+
+    let live_projection = index
+        .project_legacy_dependency("child.records", "legacy loop-group fixture")
+        .expect("the v20 collection spelling projects through the live graph")
+        .into_dependencies();
+    assert_eq!(live_projection.to_resolved_dependencies(), expected);
+    let saved_projection = index
+        .legacy_dependency_projection_index()
+        .expect("saved plans retain every legacy-addressable projection");
+    let saved_projection = saved_projection
+        .project_legacy_dependency("child.records", "saved legacy loop-group fixture")
+        .expect("the collection spelling survives the saved-plan boundary")
+        .into_dependencies();
+    assert_eq!(saved_projection.to_resolved_dependencies(), expected);
+}
+
+#[test]
 fn p3_unannotated_handle_output_orders_the_consumer_wait_after_the_producer() {
     let tmp = tempfile::tempdir().expect("temporary P3 handle-output fixture");
     let producer = tmp.path().join("producer");

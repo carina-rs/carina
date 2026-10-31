@@ -25,6 +25,11 @@ pub(in crate::parser) fn parse_dependency_operand(
 ) -> Result<UnexpandedDependencyOperand, ParseError> {
     let line = expression.line_col().0;
     match super::super::parse_expression_eval(expression, ctx)? {
+        EvalValue::UnexpandedStructuralHandle(handle) if handle.is_for_binding() => {
+            Ok(UnexpandedDependencyOperand::BareBinding(
+                handle.canonical_binding_name().into_owned().into(),
+            ))
+        }
         EvalValue::UnexpandedStructuralHandle(handle) => {
             let Some(handle) = handle.resource_handle() else {
                 return Err(invalid_operand(line, boundary, handle.kind().description()));
@@ -88,9 +93,11 @@ pub(in crate::parser) fn parse_dependency_operand(
             boundary,
             crate::validation::typecheck::value_kind_name(&value),
         )),
+        EvalValue::DeferredForValue { binding } => {
+            Ok(UnexpandedDependencyOperand::BareBinding(binding.into()))
+        }
         EvalValue::PendingValue(_)
         | EvalValue::ComputedWithUnexpandedStructuralHandles { .. }
-        | EvalValue::DeferredForValue { .. }
         | EvalValue::Closure { .. } => Err(ParseError::InvalidExpression {
             line,
             message: format!("{boundary}: expected a managed resource handle"),

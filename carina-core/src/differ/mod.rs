@@ -280,6 +280,17 @@ impl Orphan {
         &self.directives
     }
 
+    /// Refresh graph-classified destroy metadata after a legacy state file
+    /// crosses the configuration-aware migration seam.
+    pub fn set_destroy_metadata(
+        &mut self,
+        dependencies: crate::resource::ResolvedDependencies,
+        directives: PersistedDirectives,
+    ) {
+        self.current.set_dependency_bindings(dependencies);
+        self.directives = directives;
+    }
+
     /// Project this persisted-only resource into the minimal desired-resource
     /// shape used by binding resolution. Provider state remains authoritative
     /// for its values; the projection exists only so a data-source input can
@@ -484,6 +495,19 @@ impl Orphans {
 
     pub fn get(&self, id: &ResourceId) -> Option<&Orphan> {
         self.by_id.get(id)
+    }
+
+    pub fn set_destroy_metadata(
+        &mut self,
+        id: &ResourceId,
+        dependencies: crate::resource::ResolvedDependencies,
+        directives: PersistedDirectives,
+    ) -> bool {
+        let Some(orphan) = self.by_id.get_mut(id) else {
+            return false;
+        };
+        orphan.set_destroy_metadata(dependencies, directives);
+        true
     }
 
     pub(crate) fn get_mut(&mut self, id: &ResourceId) -> Option<&mut Orphan> {

@@ -1,7 +1,9 @@
 //! The single fallible transition from authored dependency operands to
 //! complete scheduler addresses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
 
 use crate::eval_value::UnexpandedResourceHandle;
 use crate::parser::{
@@ -10,7 +12,8 @@ use crate::parser::{
 };
 use crate::resource::{
     AccessMissPolicy, AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart,
-    LiveCompositionAttribute, PathSegment, ResolvedDataSource, ResolvedDependencies,
+    LiveCompositionAttribute, PathSegment, PersistedDestroyDependencies,
+    PersistedDestroyDependencyProjection, ResolvedDataSource, ResolvedDependencies,
     ResolvedDependencyReads, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
     ResourceIdentity, Value, resolve_resource_ignore_changes,
 };
@@ -42,6 +45,8 @@ pub enum ExpandedGraphResolutionError {
     HandleCycle { cycle: String },
     #[error("composition dependency cycle: {cycle}")]
     CompositionCycle { cycle: String },
+    #[error("destroy-dependency projection cycle: {cycle}")]
+    DestroyProjectionCycle { cycle: String },
     #[error(
         "{owner}: module handle output '{reference}' is a resource handle, not a value; select one of its attributes"
     )]
@@ -167,12 +172,102 @@ impl ExpandedTargets {
 #[derive(Debug, Clone)]
 pub struct ExpandedBindingIndex {
     targets: ExpandedTargets,
+    /// Every bound `for` name projected to all of its expanded managed rows.
+    /// Exact resource bindings remain in `targets`; this map is consulted only
+    /// when an explicit dependency names the collection binding itself.
+    managed_groups: HashMap<String, ResolvedDependencies>,
     handle_outputs: HashMap<String, ResolvedHandleTarget>,
     composition_dependencies: HashMap<String, ResolvedDependencies>,
+    /// Managed-row closure for every plan-scoped data-source and wait ID.
+    destroy_closures: HashMap<ResolvedResourceId, PersistedDestroyDependencies>,
+    /// Instance-qualified module argument values used only by the v20 state
+    /// migration classifier. Literal arguments are recorded explicitly as a
+    /// no-local-edge projection.
+    legacy_argument_projections: HashMap<String, PersistedDestroyDependencyProjection>,
+    managed_ids: HashSet<ResolvedResourceId>,
     /// Declared upstream-state bindings are value sources, not scheduler
     /// nodes. They are classified here so value-reference provenance can be
     /// consumed without treating a known non-node as a missing dependency.
     upstream_bindings: HashSet<String>,
+}
+
+/// Saved-plan copy of the expanded graph's legacy-name classification.
+///
+/// The plan format needs this projection because `carina plan --out` is
+/// read-only: it may classify a v20 state in memory without rewriting that
+/// state. A later `apply --plan` can therefore encounter the same legacy
+/// names even when the source configuration is no longer parseable. Values
+/// contain only already-projected managed-row edges or an explicit
+/// no-local-edge result; plan validation checks every managed ID before this
+/// index is accepted by state migration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LegacyDependencyProjectionIndex(BTreeMap<String, PersistedDestroyDependencyProjection>);
+
+mod legacy_dependency_projector_sealed {
+    pub trait Sealed {}
+}
+
+/// Closed interface consumed by the v20 state migration classifier.
+///
+/// Only a live expanded graph or its saved-plan projection can implement this
+/// interface, so dependency sets cannot be minted from the old kind-blind
+/// string snapshot.
+pub trait LegacyDependencyProjector: legacy_dependency_projector_sealed::Sealed {
+    fn project_legacy_dependency(
+        &self,
+        reference: &str,
+        owner: &str,
+    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError>;
+
+    /// Mint an edge to a row whose identity was proven by the state-row
+    /// classifier rather than the current configuration graph.
+    fn project_legacy_state_row(&self, id: ResolvedResourceId) -> PersistedDestroyDependencies {
+        PersistedDestroyDependencies::from_graph_projection(std::iter::once(id))
+    }
+}
+
+impl legacy_dependency_projector_sealed::Sealed for ExpandedBindingIndex {}
+impl legacy_dependency_projector_sealed::Sealed for LegacyDependencyProjectionIndex {}
+
+impl LegacyDependencyProjectionIndex {
+    pub fn project_legacy_dependency(
+        &self,
+        reference: &str,
+        owner: &str,
+    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
+        self.0.get(reference).cloned().ok_or_else(|| {
+            ExpandedGraphResolutionError::MissingDependency {
+                owner: owner.to_string(),
+                reference: reference.to_string(),
+            }
+        })
+    }
+
+    /// Iterate every managed row mentioned by the saved projection so the
+    /// saved-plan decoder can prove that no data-source or synthetic wait ID
+    /// entered this graph-only type.
+    pub fn managed_dependencies(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.0
+            .values()
+            .flat_map(|projection| match projection {
+                PersistedDestroyDependencyProjection::Managed(dependencies) => {
+                    Some(dependencies.iter())
+                }
+                PersistedDestroyDependencyProjection::NoLocalDestroyEdge => None,
+            })
+            .flatten()
+    }
+}
+
+impl LegacyDependencyProjector for LegacyDependencyProjectionIndex {
+    fn project_legacy_dependency(
+        &self,
+        reference: &str,
+        owner: &str,
+    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
+        self.project_legacy_dependency(reference, owner)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,16 +469,22 @@ impl ExpandedBindingIndex {
         &self,
         operand: &UnexpandedDependencyOperand,
         owner: &str,
-    ) -> Result<ResolvedResourceId, ExpandedGraphResolutionError> {
+    ) -> Result<ResolvedDependencies, ExpandedGraphResolutionError> {
         match operand {
-            UnexpandedDependencyOperand::Handle(handle) => self.resolve_handle(handle, owner),
-            UnexpandedDependencyOperand::BareBinding(binding) => self
-                .managed_target(binding.as_str(), owner)
-                .map(|(id, _resource_type)| id),
+            UnexpandedDependencyOperand::Handle(handle) => {
+                Ok(std::iter::once(self.resolve_handle(handle, owner)?).collect())
+            }
+            UnexpandedDependencyOperand::BareBinding(binding) => {
+                if let Some(group) = self.managed_groups.get(binding.as_str()) {
+                    return Ok(group.clone());
+                }
+                self.managed_target(binding.as_str(), owner)
+                    .map(|(id, _resource_type)| std::iter::once(id).collect())
+            }
             UnexpandedDependencyOperand::AttributeSelection { binding, attribute } => {
                 let reference = format!("{binding}.{attribute}");
                 self.managed_target(&reference, owner)
-                    .map(|(id, _resource_type)| id)
+                    .map(|(id, _resource_type)| std::iter::once(id).collect())
             }
         }
     }
@@ -409,6 +510,111 @@ impl ExpandedBindingIndex {
             owner: owner.to_string(),
             reference: binding.to_string(),
         })
+    }
+
+    fn project_resolved_dependencies(
+        &self,
+        dependencies: &ResolvedDependencies,
+        owner: &str,
+    ) -> Result<PersistedDestroyDependencies, ExpandedGraphResolutionError> {
+        let mut projected = PersistedDestroyDependencies::default();
+        for dependency in dependencies.iter() {
+            if self.managed_ids.contains(dependency) {
+                projected.extend_projected(&PersistedDestroyDependencies::from_graph_projection(
+                    std::iter::once(dependency.clone()),
+                ));
+                continue;
+            }
+            let closure = self.destroy_closures.get(dependency).ok_or_else(|| {
+                ExpandedGraphResolutionError::MissingDependency {
+                    owner: owner.to_string(),
+                    reference: dependency.to_string(),
+                }
+            })?;
+            projected.extend_projected(closure);
+        }
+        Ok(projected)
+    }
+
+    /// Classify one legacy binding snapshot against the expanded typed graph.
+    ///
+    /// The result is exhaustive: external values and literal module
+    /// arguments are a typed `NoLocalDestroyEdge`, while managed resources,
+    /// data sources, waits, and compositions produce their managed-row
+    /// closure. Missing names remain errors for the state layer to classify as
+    /// configured-row failures or orphan warnings.
+    pub fn project_legacy_dependency(
+        &self,
+        reference: &str,
+        owner: &str,
+    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
+        if let Some(target) = self.handle_outputs.get(reference) {
+            return Ok(PersistedDestroyDependencyProjection::Managed(
+                PersistedDestroyDependencies::from_graph_projection(std::iter::once(
+                    target.id.clone(),
+                )),
+            ));
+        }
+        if let Some(target) = self.targets.get(reference) {
+            let dependencies: ResolvedDependencies = std::iter::once(target.id().clone()).collect();
+            return self
+                .project_resolved_dependencies(&dependencies, owner)
+                .map(PersistedDestroyDependencyProjection::Managed);
+        }
+        if let Some(dependencies) = self.managed_groups.get(reference) {
+            return self
+                .project_resolved_dependencies(dependencies, owner)
+                .map(PersistedDestroyDependencyProjection::Managed);
+        }
+        if let Some(dependencies) = self.composition_dependencies.get(reference) {
+            return self
+                .project_resolved_dependencies(dependencies, owner)
+                .map(PersistedDestroyDependencyProjection::Managed);
+        }
+        if let Some(projection) = self.legacy_argument_projections.get(reference) {
+            return Ok(projection.clone());
+        }
+        if self.upstream_bindings.contains(reference) {
+            return Ok(PersistedDestroyDependencyProjection::NoLocalDestroyEdge);
+        }
+        Err(ExpandedGraphResolutionError::MissingDependency {
+            owner: owner.to_string(),
+            reference: reference.to_string(),
+        })
+    }
+
+    /// Freeze every legacy-addressable name after the expanded graph has
+    /// projected its plan-scoped nodes to managed state rows.
+    pub fn legacy_dependency_projection_index(
+        &self,
+    ) -> Result<LegacyDependencyProjectionIndex, ExpandedGraphResolutionError> {
+        let references = self
+            .targets
+            .bindings
+            .keys()
+            .chain(self.targets.identities.keys())
+            .chain(self.managed_groups.keys())
+            .chain(self.handle_outputs.keys())
+            .chain(self.composition_dependencies.keys())
+            .chain(self.legacy_argument_projections.keys())
+            .chain(self.upstream_bindings.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let projections = references
+            .into_iter()
+            .map(|reference| {
+                self.project_legacy_dependency(&reference, "saved-plan legacy projection")
+                    .map(|projection| (reference, projection))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(LegacyDependencyProjectionIndex(projections))
+    }
+
+    /// Mint a persisted edge from a state row proven managed by the state
+    /// migration classifier. This is the only non-deserialization route for a
+    /// legacy orphan row that is absent from the current graph.
+    pub fn project_legacy_state_row(&self, id: ResolvedResourceId) -> PersistedDestroyDependencies {
+        PersistedDestroyDependencies::from_graph_projection(std::iter::once(id))
     }
 
     fn resolve_value_dependencies<'a>(
@@ -480,8 +686,12 @@ impl ExpandedBindingIndex {
         )?;
         let mut explicit_dependencies = ResolvedDependencies::default();
         for operand in &resource.directives.depends_on {
-            explicit_dependencies.insert(self.resolve_explicit_operand(operand, &owner)?);
+            explicit_dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
         }
+        let persisted_value_destroy_dependencies =
+            self.project_resolved_dependencies(&value_dependencies, &owner)?;
+        let persisted_explicit_destroy_dependencies =
+            self.project_resolved_dependencies(&explicit_dependencies, &owner)?;
         resource.dependency_bindings.clear();
         resource.directives.depends_on = Default::default();
         Ok(ResolvedResource::from_resolved_parts_with_reads(
@@ -489,6 +699,10 @@ impl ExpandedBindingIndex {
             value_dependencies,
             explicit_dependencies,
             value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
         ))
     }
 
@@ -515,14 +729,24 @@ impl ExpandedBindingIndex {
 
         let evaluated = self.resolve_resource(evaluated, schemas)?;
         let authored = self.resolve_resource(authored, schemas)?;
-        let (evaluated, _, _, _) = evaluated.into_parts();
-        let (_, value_dependencies, explicit_dependencies, value_dependency_reads) =
-            authored.into_parts();
+        let (evaluated, _, _, _, _, _) = evaluated.into_parts();
+        let (
+            _,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        ) = authored.into_parts();
         Ok(ResolvedResource::from_resolved_parts_with_reads(
             evaluated,
             value_dependencies,
             explicit_dependencies,
             value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
         ))
     }
 
@@ -544,7 +768,7 @@ impl ExpandedBindingIndex {
         )?;
         let mut explicit_dependencies = ResolvedDependencies::default();
         for operand in &data_source.directives.depends_on {
-            explicit_dependencies.insert(self.resolve_explicit_operand(operand, &owner)?);
+            explicit_dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
         }
         data_source.dependency_bindings.clear();
         data_source.directives.depends_on = Default::default();
@@ -564,7 +788,7 @@ impl ExpandedBindingIndex {
         let (target_id, _resource_type) = self.managed_target(wait.target.as_str(), &owner)?;
         let mut explicit_dependencies = ResolvedDependencies::default();
         for operand in &wait.depends_on {
-            explicit_dependencies.insert(self.resolve_explicit_operand(operand, &owner)?);
+            explicit_dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
         }
         let id = wait_scheduler_id(wait.binding.as_str());
         Ok(ResolvedWaitBinding {
@@ -606,9 +830,19 @@ impl ExpandedBindingIndex {
             }
         }
         for operand in &template.template_resource.directives.depends_on {
-            dependencies.insert(self.resolve_explicit_operand(operand, &owner)?);
+            dependencies.extend(self.resolve_explicit_operand(operand, &owner)?);
         }
         Ok(dependencies)
+    }
+}
+
+impl LegacyDependencyProjector for ExpandedBindingIndex {
+    fn project_legacy_dependency(
+        &self,
+        reference: &str,
+        owner: &str,
+    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
+        self.project_legacy_dependency(reference, owner)
     }
 }
 
@@ -620,6 +854,30 @@ pub fn wait_scheduler_id(binding: &str) -> ResolvedResourceId {
 
 fn resource_type_of(id: &ResolvedResourceId) -> ResourceTypePath {
     ResourceTypePath::new(id.provider(), id.resource_type())
+}
+
+pub(crate) fn loop_group_bindings(binding: &str) -> Vec<String> {
+    let mut groups = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in binding.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '[' if index > 0 => groups.push(binding[..index].to_string()),
+            _ => {}
+        }
+    }
+    groups
 }
 
 fn resolve_pending_output(
@@ -763,6 +1021,53 @@ fn resolve_composition_dependencies(
     Ok(dependencies)
 }
 
+fn project_destroy_closure(
+    id: &ResolvedResourceId,
+    managed_ids: &HashSet<ResolvedResourceId>,
+    ephemeral_dependencies: &HashMap<ResolvedResourceId, ResolvedDependencies>,
+    projected: &mut HashMap<ResolvedResourceId, PersistedDestroyDependencies>,
+    visiting: &mut Vec<ResolvedResourceId>,
+) -> Result<PersistedDestroyDependencies, ExpandedGraphResolutionError> {
+    if managed_ids.contains(id) {
+        return Ok(PersistedDestroyDependencies::from_graph_projection(
+            std::iter::once(id.clone()),
+        ));
+    }
+    if let Some(existing) = projected.get(id) {
+        return Ok(existing.clone());
+    }
+    if visiting.iter().any(|entry| entry == id) {
+        visiting.push(id.clone());
+        return Err(ExpandedGraphResolutionError::DestroyProjectionCycle {
+            cycle: visiting
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" -> "),
+        });
+    }
+    let dependencies = ephemeral_dependencies.get(id).ok_or_else(|| {
+        ExpandedGraphResolutionError::MissingDependency {
+            owner: format!("destroy projection for '{id}'"),
+            reference: id.to_string(),
+        }
+    })?;
+    visiting.push(id.clone());
+    let mut closure = PersistedDestroyDependencies::default();
+    for dependency in dependencies.iter() {
+        closure.extend_projected(&project_destroy_closure(
+            dependency,
+            managed_ids,
+            ephemeral_dependencies,
+            projected,
+            visiting,
+        )?);
+    }
+    visiting.pop();
+    projected.insert(id.clone(), closure.clone());
+    Ok(closure)
+}
+
 /// Resolve all module handle outputs and build the address index used by every
 /// subsequent resource, data-source, and wait transition.
 pub fn resolve_expanded_graph<E, D>(
@@ -776,6 +1081,13 @@ pub fn resolve_expanded_graph<E, D>(
         .map(str::to_string)
         .collect::<HashSet<_>>();
     let mut targets = ExpandedTargets::default();
+    let mut managed_groups = parsed
+        .parser_binding_metadata
+        .structural_handles()
+        .iter()
+        .filter(|(_binding, handle)| handle.is_for_binding())
+        .map(|(binding, _handle)| (binding.clone(), ResolvedDependencies::default()))
+        .collect::<HashMap<_, _>>();
     for resource in managed {
         let Some(id) = ResolvedResourceId::try_new(resource.id.clone()) else {
             return Err(crate::resource::ResolvedResourceError::from(
@@ -793,6 +1105,9 @@ pub fn resolve_expanded_graph<E, D>(
         };
         if let Some(binding) = &resource.binding {
             targets.insert_binding(binding.clone(), target.clone())?;
+            for group in loop_group_bindings(binding) {
+                managed_groups.entry(group).or_default().insert(id.clone());
+            }
         }
         targets.insert_identity(id.identity_str().to_string(), target)?;
     }
@@ -902,10 +1217,99 @@ pub fn resolve_expanded_graph<E, D>(
         )?;
     }
 
-    Ok(ExpandedBindingIndex {
+    let managed_ids = managed
+        .iter()
+        .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
+        .collect::<HashSet<_>>();
+    let mut index = ExpandedBindingIndex {
         targets,
+        managed_groups,
         handle_outputs,
         composition_dependencies,
+        destroy_closures: HashMap::new(),
+        legacy_argument_projections: HashMap::new(),
+        managed_ids,
         upstream_bindings,
-    })
+    };
+
+    // Build scheduler dependencies for every plan-scoped node first, then
+    // recursively project those nodes to managed state rows. Managed resource
+    // references are leaves: a consumer depends on that row, not recursively
+    // on everything the row itself consumes.
+    let mut ephemeral_dependencies = HashMap::new();
+    for data_source in data_sources {
+        let owner = data_source
+            .binding
+            .clone()
+            .unwrap_or_else(|| data_source.id.to_string());
+        let (mut dependencies, _reads) = index.resolve_value_dependencies(
+            data_source.attributes.values(),
+            data_source.dependency_bindings.iter(),
+            &owner,
+        )?;
+        for operand in &data_source.directives.depends_on {
+            dependencies.extend(index.resolve_explicit_operand(operand, &owner)?);
+        }
+        let id = ResolvedResourceId::try_new(data_source.id.clone()).ok_or_else(|| {
+            crate::resource::ResolvedResourceError::from(
+                crate::resource::PendingResourceIdentityError::new(data_source.id.clone()),
+            )
+        })?;
+        ephemeral_dependencies.insert(id, dependencies);
+    }
+    for wait in &parsed.wait_bindings {
+        let owner = format!("wait '{}'", wait.binding);
+        let (target_id, _resource_type) = index.managed_target(wait.target.as_str(), &owner)?;
+        let mut dependencies: ResolvedDependencies = std::iter::once(target_id).collect();
+        for operand in &wait.depends_on {
+            dependencies.extend(index.resolve_explicit_operand(operand, &owner)?);
+        }
+        ephemeral_dependencies.insert(wait_scheduler_id(wait.binding.as_str()), dependencies);
+    }
+    let ephemeral_ids = ephemeral_dependencies.keys().cloned().collect::<Vec<_>>();
+    for id in ephemeral_ids {
+        project_destroy_closure(
+            &id,
+            &index.managed_ids,
+            &ephemeral_dependencies,
+            &mut index.destroy_closures,
+            &mut Vec::new(),
+        )?;
+    }
+
+    // Historical module argument snapshots were sometimes stored without
+    // their instance prefix. The migration layer tries the owning row's scope
+    // first; these qualified aliases map that spelling back to the actual
+    // call-site value and its managed closure.
+    for composition in &parsed.compositions {
+        for (argument_name, argument) in &composition.signature.arguments {
+            let reference = format!("{}.{}", composition.instance, argument_name);
+            let owner = format!("module argument '{reference}'");
+            let (dependencies, _reads) = match index.resolve_value_dependencies(
+                std::iter::once(argument.value()),
+                std::iter::empty(),
+                &owner,
+            ) {
+                Ok(resolved) => resolved,
+                // This index entry exists only for legacy-state migration.
+                // An otherwise unused unresolved module argument must retain
+                // its normal terminal constraint error; if a legacy row
+                // actually names this argument, the classifier below will
+                // still fail closed because no projection was recorded.
+                Err(ExpandedGraphResolutionError::MissingDependency { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let projected = index.project_resolved_dependencies(&dependencies, &owner)?;
+            let projection = if projected.is_empty() {
+                PersistedDestroyDependencyProjection::NoLocalDestroyEdge
+            } else {
+                PersistedDestroyDependencyProjection::Managed(projected)
+            };
+            index
+                .legacy_argument_projections
+                .insert(reference, projection);
+        }
+    }
+
+    Ok(index)
 }

@@ -7,7 +7,9 @@ use crate::explicit::{ExplicitFields, PendingPaths};
 use crate::plan::{
     PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
-use crate::resource::{ConcreteValue, PersistedDirectives, ResolvedResourceId, Resource};
+use crate::resource::{
+    ConcreteValue, PersistedDestroyDependencies, PersistedDirectives, ResolvedResourceId, Resource,
+};
 
 fn diff_test(
     desired: &Resource,
@@ -2443,7 +2445,7 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
         existing_state(orphan_id.clone(), HashMap::new()).with_identifier("service-123");
     let dependency_id = ResolvedResourceId::with_identity("example.Dependency", "x");
     let directives = crate::resource::PersistedDirectives {
-        depends_on: std::iter::once(dependency_id.clone()).collect(),
+        depends_on: PersistedDestroyDependencies::from_test_dependencies([dependency_id.clone()]),
         ..Default::default()
     };
     let orphans = Orphans::from([Orphan::from_state(
@@ -2662,7 +2664,9 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
     let directives_map = HashMap::from([(
         consumer_id.clone(),
         crate::resource::PersistedDirectives {
-            depends_on: std::iter::once(resolved_id(&dependency_id)).collect(),
+            depends_on: PersistedDestroyDependencies::from_test_dependencies([resolved_id(
+                &dependency_id,
+            )]),
             ..Default::default()
         },
     )]);
@@ -3955,12 +3959,9 @@ fn data_source_wait_is_rejected_at_the_expanded_graph_boundary() {
     let data_sources = vec![lookup];
     let mut parsed: crate::parser::ParsedFile = Default::default();
     parsed.wait_bindings.push(wait.clone());
-    let index =
+    let error =
         crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &data_sources)
-            .expect("binding and identity namespaces must retain lookup precedence");
-    let error = index
-        .resolve_wait_binding(&wait)
-        .expect_err("a data source cannot be a wait target");
+            .expect_err("a data source cannot be a wait target");
     assert!(
         matches!(
             &error,
@@ -4249,10 +4250,7 @@ fn wait_with_unknown_target_is_rejected_at_the_expanded_graph_boundary() {
 
     let mut parsed: crate::parser::ParsedFile = Default::default();
     parsed.wait_bindings.push(wait.clone());
-    let index = crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
-        .expect("empty graph index builds");
-    let error = index
-        .resolve_wait_binding(&wait)
+    let error = crate::resolved_graph::resolve_expanded_graph(&mut parsed, &resources, &[])
         .expect_err("missing wait target must fail graph resolution");
     assert!(
         matches!(

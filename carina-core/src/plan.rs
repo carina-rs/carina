@@ -3,14 +3,14 @@
 //! A Plan is an ordered list of Effects to be executed.
 //! No side effects occur until the Plan is applied.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    ChangedCreateOnly, Effect, EffectWithSource, MoveAuthority, SavedEffect, TemporaryName,
-    UnresolvedSavedEffect,
+    ChangedCreateOnly, Effect, EffectGeneration, EffectWithSource, MoveAuthority, SavedEffect,
+    TemporaryName, UnresolvedSavedEffect,
 };
 use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
@@ -567,6 +567,35 @@ pub struct IgnoredChangeSummary {
     count: usize,
 }
 
+/// Completeness of the historical ordering attached to one Delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DestroyOrdering {
+    Known,
+    PartiallyUnknown { legacy_names: BTreeSet<String> },
+}
+
+/// Typed association between a Delete generation and its ordering status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestroyOrderingNotice {
+    id: ResolvedResourceId,
+    generation: EffectGeneration,
+    ordering: DestroyOrdering,
+}
+
+impl DestroyOrderingNotice {
+    pub fn id(&self) -> &ResolvedResourceId {
+        &self.id
+    }
+
+    pub fn generation(&self) -> &EffectGeneration {
+        &self.generation
+    }
+
+    pub fn ordering(&self) -> &DestroyOrdering {
+        &self.ordering
+    }
+}
+
 impl IgnoredChangeSummary {
     pub fn resource_id(&self) -> &ResourceId {
         &self.resource_id
@@ -598,6 +627,10 @@ pub struct Plan<S = ModuleSource> {
     /// call because their persisted identifiers are unusable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     abandoned_deposed: Vec<AbandonedDeposedGeneration>,
+    /// Display-only evidence that one legacy orphan/deposed Delete could not
+    /// recover every historical edge. Known edges stay on the Delete itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    destroy_ordering_notices: Vec<DestroyOrderingNotice>,
 }
 
 impl<S> Default for Plan<S> {
@@ -609,6 +642,7 @@ impl<S> Default for Plan<S> {
             permanent_name_overrides: Vec::new(),
             errors: Vec::new(),
             abandoned_deposed: Vec::new(),
+            destroy_ordering_notices: Vec::new(),
         }
     }
 }
@@ -630,6 +664,8 @@ pub struct UnresolvedSavedPlan {
     errors: Vec<PlanError>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     abandoned_deposed: Vec<AbandonedDeposedGeneration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    destroy_ordering_notices: Vec<DestroyOrderingNotice>,
 }
 
 impl From<SavedPlan> for UnresolvedSavedPlan {
@@ -641,6 +677,7 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         } = plan;
         Self {
             effects: effects
@@ -652,6 +689,7 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         }
     }
 }
@@ -713,6 +751,7 @@ impl UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         } = self;
         Ok(Plan {
             effects: effects
@@ -724,6 +763,7 @@ impl UnresolvedSavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         })
     }
 }
@@ -737,6 +777,7 @@ impl From<Plan> for SavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         } = plan;
         Self {
             effects: effects.into_iter().map(SavedEffect::from).collect(),
@@ -745,6 +786,7 @@ impl From<Plan> for SavedPlan {
             permanent_name_overrides,
             errors,
             abandoned_deposed,
+            destroy_ordering_notices,
         }
     }
 }
@@ -819,6 +861,26 @@ impl<S> Plan<S> {
         &self.ignored_change_summaries
     }
 
+    pub fn record_partially_unknown_destroy_ordering(
+        &mut self,
+        id: ResolvedResourceId,
+        generation: EffectGeneration,
+        legacy_names: BTreeSet<String>,
+    ) {
+        if legacy_names.is_empty() {
+            return;
+        }
+        self.destroy_ordering_notices.push(DestroyOrderingNotice {
+            id,
+            generation,
+            ordering: DestroyOrdering::PartiallyUnknown { legacy_names },
+        });
+    }
+
+    pub fn destroy_ordering_notices(&self) -> &[DestroyOrderingNotice] {
+        &self.destroy_ordering_notices
+    }
+
     /// Refresh update inputs for ignored paths from the apply-time read.
     ///
     /// Other updates keep their plan-time source after drift verification;
@@ -881,6 +943,7 @@ impl<S> Plan<S> {
             permanent_name_overrides: _permanent_name_overrides,
             errors: _errors,
             abandoned_deposed: _abandoned_deposed,
+            destroy_ordering_notices: _destroy_ordering_notices,
         } = self;
 
         effects

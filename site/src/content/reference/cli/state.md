@@ -16,6 +16,10 @@ with `carina-backend.lock`. While a backend migration is pending, `list`,
 An explicit `--state-url` bypasses project backend resolution and reads exactly
 the supplied URL.
 
+When a pre-v21 state still contains legacy dependency names, source-less
+inspection commands display `dependencies not yet migrated (legacy: ...)` on
+the affected rows. Inspection never completes or writes that migration.
+
 ## Subcommands
 
 ### `list`
@@ -232,6 +236,60 @@ carina state refresh [OPTIONS] [PATH]
 | Flag | Description |
 |------|-------------|
 | `--lock <BOOL>` | Enable/disable state locking (default: `true`) |
+
+### `migrate`
+
+Check whether a copied pre-v21 state can migrate its legacy dependency names
+against the current configuration.
+
+```bash
+carina state migrate \
+  --check /absolute/path/to/infra \
+  --state-url /absolute/path/to/copied-state.json
+```
+
+The command is read-only and offline. It does not open the configured backend,
+acquire a lock, read `upstream_state`, initialize providers, call provider
+operations, access the network, create a WASM cache entry, or write the input
+state. It loads only provider schema and identity metadata from the exact
+artifacts already installed for the configuration.
+
+Use `--provider-schema` to select an explicit local artifact instead. The path
+must be absolute, the provider kind must be declared by the configuration, and
+the option is repeatable for configurations with multiple provider kinds.
+Local provider trust remains an explicit global option. For example, an
+`awscc` plus `aws` configuration can be checked with:
+
+```bash
+carina \
+  --trust-local-provider /absolute/path/to/awscc.wasm=aws \
+  --trust-local-provider /absolute/path/to/aws.wasm=aws \
+  state migrate \
+  --check /absolute/path/to/infra \
+  --state-url /absolute/path/to/copied-state.json \
+  --provider-schema awscc=/absolute/path/to/awscc.wasm \
+  --provider-schema aws=/absolute/path/to/aws.wasm
+```
+
+Supply overrides only for provider kinds declared by that directory. The
+trust suffix is the credential class (`aws` for both AWS providers), but the
+metadata-only checker does not receive credentials. Released protocol-v12
+provider artifacts are supported on this command's metadata-only path; normal
+plan/apply provider loading remains on the current protocol.
+
+A successful check reports the number of classified rows and any
+orphan/deposed warnings, followed by `no state was written`. A missing or
+ambiguous dependency on a row still present in configuration is an error. For
+an orphan or deposed row, known ordering edges remain usable and every
+unresolved legacy name is printed as a warning.
+
+#### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--check <DIR>` | Directory containing the current multi-file `.crn` configuration |
+| `--state-url <URL>` | Copied legacy state to inspect (`file://path` or a bare local path) |
+| `--provider-schema <KIND=PATH>` | Use an absolute local provider artifact for schema metadata; repeat for each declared kind that needs an override |
 
 ### `forget`
 

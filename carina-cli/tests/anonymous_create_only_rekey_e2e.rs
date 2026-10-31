@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use carina_core::resource::ResolvedResourceId;
+use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId};
 use carina_state::{ResourceState, StateFile, check_and_migrate};
 use tempfile::TempDir;
 
@@ -325,7 +325,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let initial_identity = initial_row.identity.as_str().to_string();
     assert_eq!(
         initial_row.dependency_bindings,
-        [changed.cluster_dependency()].into_iter().collect(),
+        PersistedDestroyDependencies::from_test_dependencies([changed.cluster_dependency(),]),
         "the anonymous row must retain its dependency metadata before the move"
     );
 
@@ -340,7 +340,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     );
     assert_eq!(
         refreshed_row.dependency_bindings,
-        [changed.cluster_dependency()].into_iter().collect(),
+        PersistedDestroyDependencies::from_test_dependencies([changed.cluster_dependency(),]),
     );
 
     let replacement_plan = changed.carina(&["plan"]);
@@ -372,7 +372,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let replaced_identity = replaced_row.identity.as_str().to_string();
     assert_eq!(
         replaced_row.dependency_bindings,
-        [changed.cluster_dependency()].into_iter().collect(),
+        PersistedDestroyDependencies::from_test_dependencies([changed.cluster_dependency(),]),
         "Move+Replace writeback must preserve dependency metadata on the re-keyed row"
     );
 
@@ -393,7 +393,7 @@ fn anonymous_create_only_replacement_rekeys_state_to_the_new_identity() {
     let fresh_identity = fresh_row.identity.as_str().to_string();
     assert_eq!(
         fresh_row.dependency_bindings,
-        [fresh.cluster_dependency()].into_iter().collect(),
+        PersistedDestroyDependencies::from_test_dependencies([fresh.cluster_dependency()]),
     );
 
     assert_eq!(

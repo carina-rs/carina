@@ -625,6 +625,9 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_projections: _,
+                migrated_legacy_state: _,
+                legacy_dependency_migration: _,
             } = diagnostics.into_artifacts();
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
@@ -672,6 +675,9 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_projections: _,
+                migrated_legacy_state: _,
+                legacy_dependency_migration: _,
             } = artifacts;
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)

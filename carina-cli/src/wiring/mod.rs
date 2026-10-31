@@ -72,7 +72,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -265,6 +265,10 @@ pub struct PlanContext {
     pub provider: ProviderRouter,
     /// Evaluated desired resources after the identity-resolution boundary.
     pub sorted_resources: Vec<ResolvedResource>,
+    /// Legacy-name classifier projected from the same expanded graph that
+    /// produced `sorted_resources`. Saved plans retain it so applying a plan
+    /// can finish a pending v20 state migration without reloading source.
+    pub legacy_dependency_projections: carina_core::resolved_graph::LegacyDependencyProjectionIndex,
     /// Pre-value-resolution snapshots with the same resolved identities.
     pub unresolved_resources: Vec<UnresolvedResource>,
     /// Module compositions after plan-time constraint evaluation. Pending
@@ -430,6 +434,22 @@ pub enum LoadedProviderArtifact {
 pub struct ProviderLoad {
     context: WiringContext,
     load_errors: HashMap<String, String>,
+}
+
+/// Schema-only provider load used exclusively by `state migrate --check`.
+///
+/// This type has no transition into [`ValidatedConfig`], so a metadata-only
+/// factory can never reach planning or execution. Its sole output is the
+/// expanded, provider-I/O-free view consumed by legacy dependency
+/// classification.
+pub(crate) struct MigrationCheckProviderLoad {
+    context: WiringContext,
+    load_errors: HashMap<String, String>,
+}
+
+pub(crate) struct MigrationCheckConfig {
+    context: WiringContext,
+    resources: carina_core::parser::ModuleResolvedInferredFile,
 }
 
 /// Provider wiring whose loader diagnostics have been checked exactly once.
@@ -1110,6 +1130,62 @@ impl ProviderLoad {
     }
 }
 
+impl MigrationCheckProviderLoad {
+    pub(crate) fn load(
+        user_dirs: &carina_core::UserDirs,
+        providers: &[ProviderConfig],
+        base_dir: &Path,
+        schema_overrides: &HashMap<String, PathBuf>,
+    ) -> Result<Self, AppError> {
+        let effective = schema_check_provider_configs(providers, schema_overrides)?;
+        let (factories, load_errors) =
+            build_schema_only_factories_from_providers(user_dirs, &effective, base_dir)?;
+        Ok(Self {
+            context: WiringContext::new(factories, &effective),
+            load_errors,
+        })
+    }
+
+    pub(crate) fn validate_evaluated_config(
+        self,
+        parsed: carina_core::parser::InferredFile,
+        base_dir: &Path,
+        duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
+    ) -> Result<MigrationCheckConfig, AppError> {
+        let Self {
+            context,
+            load_errors,
+        } = self;
+        let load_failures = sorted_provider_load_errors(&load_errors);
+        if !load_failures.is_empty() {
+            return Err(crate::commands::collapse_errors(load_failures));
+        }
+        let parsed = match crate::commands::validate_and_resolve_errors_inner(
+            &ValidationPipelineAccess::new(),
+            parsed,
+            base_dir,
+            &context,
+            &HashMap::new(),
+            true,
+            duplicate_declarations,
+            crate::commands::ConfigNameResolution::EvaluatedOnly,
+        ) {
+            Ok(crate::commands::ResolvedConfig::Evaluated { parsed }) => *parsed,
+            Ok(crate::commands::ResolvedConfig::Paired { .. }) => {
+                unreachable!("evaluated-only migration validation returned pair")
+            }
+            Err(errors) => {
+                return Err(crate::commands::collapse_errors(errors.into_vec()));
+            }
+        };
+        let parsed = resolve_file_binding_uses(parsed, base_dir, &context)?.into_file();
+        Ok(MigrationCheckConfig {
+            context,
+            resources: parsed,
+        })
+    }
+}
+
 impl CompleteProviderLoad {
     /// Validate the current config once and retain its canonical pair with the
     /// exact complete load that will verify and execute a saved plan.
@@ -1513,34 +1589,161 @@ impl ValidatedConfig<carina_core::parser::ModuleResolvedInferredFile> {
         reconcile_modules: bool,
     ) -> StateBlockClaims {
         let Self { wiring, resources } = self;
-        let ctx = wiring.context();
-        let resources = &mut resources.inner;
-        reconcile_prefixed_names(&mut resources.resources, state_file);
-        let state_block_claims = resolve_state_block_claims(
-            &resources.state_blocks,
+        reconcile_evaluated_identities_with_ctx(
+            wiring.context(),
+            &mut resources.inner,
             state_file,
-            &resources.resources,
-            ctx.schemas(),
-        );
-        if reconcile_modules && let Some(state) = state_file.as_ref() {
-            module_resolver::reconcile_anonymous_module_instances(
-                &mut resources.resources,
-                &mut resources.compositions,
-                &|provider, resource_type| {
-                    state
-                        .resources_by_type(provider, resource_type)
-                        .into_iter()
-                        .map(|resource| resource.identity.to_string())
-                        .collect()
-                },
-                &state_block_claims,
-            );
-        }
-        crate::commands::shared::state_writeback::apply_name_overrides(
+            reconcile_modules,
+        )
+    }
+}
+
+fn reconcile_evaluated_identities_with_ctx(
+    ctx: &WiringContext,
+    resources: &mut carina_core::parser::ModuleResolvedInferredFile,
+    state_file: &Option<StateFile>,
+    reconcile_modules: bool,
+) -> StateBlockClaims {
+    reconcile_prefixed_names(&mut resources.resources, state_file);
+    let state_block_claims = resolve_state_block_claims(
+        &resources.state_blocks,
+        state_file,
+        &resources.resources,
+        ctx.schemas(),
+    );
+    if reconcile_modules && let Some(state) = state_file.as_ref() {
+        module_resolver::reconcile_anonymous_module_instances(
             &mut resources.resources,
-            state_file,
+            &mut resources.compositions,
+            &|provider, resource_type| {
+                state
+                    .resources_by_type(provider, resource_type)
+                    .into_iter()
+                    .map(|resource| resource.identity.to_string())
+                    .collect()
+            },
+            &state_block_claims,
         );
-        state_block_claims
+    }
+    crate::commands::shared::state_writeback::apply_name_overrides(
+        &mut resources.resources,
+        state_file,
+    );
+    state_block_claims
+}
+
+impl MigrationCheckConfig {
+    pub(crate) fn data_sources(&self) -> &[carina_core::resource::DataSource] {
+        &self.resources.data_sources
+    }
+
+    /// Reconcile and expand the configuration using only values already
+    /// present in the copied state being checked.
+    ///
+    /// This deliberately does not share the plan/apply deferred-expansion
+    /// transition: that transition owns refreshed provider results and needs
+    /// a runtime provider for stability classification. A migration check is
+    /// offline and read-only, so it projects persisted managed and historical
+    /// data-source rows into the same typed [`ResolvedBindings`] view without
+    /// ever constructing a provider router.
+    pub(crate) fn prepare_from_copied_state(
+        &mut self,
+        state_file: &Option<StateFile>,
+    ) -> Result<(), AppError> {
+        reconcile_evaluated_identities_with_ctx(
+            &self.context,
+            &mut self.resources,
+            state_file,
+            true,
+        );
+        self.canonicalize_and_compute_identifiers()?;
+
+        let Some(state_file) = state_file.as_ref() else {
+            return Ok(());
+        };
+
+        // Expansion can expose a binding consumed by another deferred loop.
+        // Iterate to a fixed point; an unavailable upstream declaration stays
+        // deferred because no remote state is read on this command path.
+        loop {
+            let before = self.resources.deferred_for_expressions().len();
+            if before == 0 {
+                break;
+            }
+
+            let managed_current = self
+                .resources
+                .resources
+                .iter()
+                .map(|resource| {
+                    (
+                        resource.id.clone(),
+                        state_file.build_state_for_resource(&resource.id),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let managed_current = carina_core::resource::into_plan_input_current_map(
+                managed_current,
+                self.context.schemas(),
+                &self.resources.resources,
+            );
+            let data_source_values =
+                DataSourceValues::from_data_sources(&self.resources.data_sources, |data_source| {
+                    match state_file.build_state_for_resource(&data_source.id) {
+                        Current::Present(present) => DataSourceValue::read(present.state().clone()),
+                        Current::MissingIdentifier(state) => {
+                            DataSourceValue::read(state.state().clone())
+                        }
+                        Current::Absent(_)
+                        | Current::CreateInFlight(_)
+                        | Current::CreateOutcomeUnknown(_) => {
+                            DataSourceValue::deferred_to_apply(Vec::new())
+                        }
+                    }
+                });
+            let wait_aliases = self
+                .resources
+                .wait_bindings
+                .iter()
+                .map(WaitAliasSpec::from)
+                .collect::<Vec<_>>();
+            let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
+                managed: &self.resources.resources,
+                compositions: &self.resources.compositions,
+                managed_current: &managed_current,
+                data_source_values: &data_source_values,
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &wait_aliases,
+            });
+            self.resources
+                .expand_deferred_for_expressions(&bindings.project_iterable_bindings())
+                .map_err(|error| AppError::Validation(error.to_string()))?;
+
+            let after = self.resources.deferred_for_expressions().len();
+            if after == before {
+                break;
+            }
+            self.canonicalize_and_compute_identifiers()?;
+        }
+        Ok(())
+    }
+
+    fn canonicalize_and_compute_identifiers(&mut self) -> Result<(), AppError> {
+        let providers = self.resources.providers.clone();
+        let canonical = carina_core::value::canonicalize_resources_with_schemas(
+            &mut self.resources.resources,
+            self.context.schemas(),
+        )?;
+        compute_anonymous_identifiers_result_with_ctx(
+            &self.context,
+            canonical,
+            &providers,
+            identifier::AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        )
+    }
+
+    pub(crate) fn into_resources(self) -> carina_core::parser::ModuleResolvedInferredFile {
+        self.resources
     }
 }
 
@@ -1906,6 +2109,125 @@ fn build_factories_from_providers(
     carina_provider_resolver::validate_lock_constraints(base_dir, providers)?;
 
     build_factories_from_providers_impl(user_dirs, providers, base_dir, true)
+}
+
+fn schema_check_provider_configs(
+    providers: &[ProviderConfig],
+    overrides: &HashMap<String, PathBuf>,
+) -> Result<Vec<ProviderConfig>, AppError> {
+    let mut effective = providers.to_vec();
+    for (name, path) in overrides {
+        let Some(config) = effective
+            .iter_mut()
+            .find(|config| config.name == *name && config.is_default())
+        else {
+            return Err(AppError::Validation(format!(
+                "provider schema override names undeclared default provider '{name}'"
+            )));
+        };
+        let source = format!("file://{}", path.display())
+            .parse::<ProviderSource>()
+            .map_err(|error| AppError::Validation(error.to_string()))?;
+        config.source = Some(source);
+        // The explicitly trusted artifact is the complete selection. A
+        // source lock's revision/version constraint does not describe it.
+        config.version = None;
+        config.revision = None;
+    }
+    Ok(effective)
+}
+
+/// Load only provider schema metadata, with no runtime protocol binding or
+/// provider initialization.
+fn build_schema_only_factories_from_providers(
+    user_dirs: &carina_core::UserDirs,
+    providers: &[ProviderConfig],
+    base_dir: &Path,
+) -> Result<ProviderFactoryLoad, AppError> {
+    #[cfg(test)]
+    record_tracked_provider_load();
+
+    let grant_inputs =
+        TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
+    let grants = grant_inputs.get()?;
+    let mut factories = Vec::new();
+    let mut load_errors = HashMap::new();
+    let mut attempted_default_sources = HashSet::new();
+
+    for config in providers {
+        let Some(source) = provider_factory_source(config) else {
+            continue;
+        };
+        if config.is_default() && !attempted_default_sources.insert(config.name.clone()) {
+            load_errors.insert(
+                config.name.clone(),
+                format!(
+                    "Provider kind '{}' is declared more than once with a source; declare exactly one top-level `provider {}` block.",
+                    config.name, config.name
+                ),
+            );
+            continue;
+        }
+
+        let installed = match source {
+            ProviderSource::File(_) => {
+                carina_provider_resolver::find_file_provider_source(base_dir, config)
+                    .map_err(carina_provider_resolver::FindInstalledProviderError::from)
+            }
+            ProviderSource::Remote(_) => {
+                carina_provider_resolver::find_installed_provider(base_dir, config)
+            }
+        };
+        let installed = match installed {
+            Ok(installed) => installed,
+            Err(error) => {
+                load_errors.insert(
+                    config.name.clone(),
+                    format!("Provider '{}' {error}", config.name),
+                );
+                continue;
+            }
+        };
+        let loaded = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(installed.load_with(
+                user_dirs,
+                grants,
+                |verified| async move {
+                    let artifact = verified.artifact().clone();
+                    carina_plugin_host::SchemaOnlyWasmProviderFactory::from_bytes(
+                        verified, user_dirs,
+                    )
+                    .await
+                    .map(|factory| (factory, artifact))
+                },
+            ))
+        });
+        match loaded {
+            Ok((factory, artifact)) => {
+                if let Some(constraint) = &config.version
+                    && let Err(message) = factory.verify_version(&constraint.raw)
+                {
+                    load_errors.insert(config.name.clone(), message);
+                    continue;
+                }
+                factories.push(LoadedProviderFactory::new(Box::new(factory), artifact));
+            }
+            Err(error) => {
+                let error = match take_unverified_official_load_error(error) {
+                    Ok(unverified) => return Err(AppError::from(unverified)),
+                    Err(error) => error,
+                };
+                if let Some(mismatch) =
+                    source_provider_kind_mismatch_from_load_error(source, &error)
+                {
+                    return Err(mismatch);
+                }
+                load_errors.insert(config.name.clone(), error.to_string());
+            }
+        }
+    }
+
+    Ok((factories, load_errors))
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -4163,6 +4485,31 @@ impl AddressedState {
             saved_attrs: self.saved_attrs,
         }
     }
+
+    fn refresh_destroy_metadata_from_state(&mut self, state_file: &StateFile) {
+        let source_by_target =
+            ProjectedStateRead::from_pairs(Some(state_file), &self.moved_pairs).source_by_target;
+        for (desired, current) in &mut self.managed_current {
+            let source = source_by_target
+                .get(desired)
+                .map_or(desired, |id| id.as_inner());
+            let Some(row) = state_file.find_resource_for_id(source) else {
+                continue;
+            };
+            current.set_dependency_bindings(row.dependency_bindings.to_resolved_dependencies());
+        }
+        let orphan_ids = self.orphans.keys().cloned().collect::<Vec<_>>();
+        for orphan_id in orphan_ids {
+            let Some(row) = state_file.find_resource_for_id(&orphan_id) else {
+                continue;
+            };
+            self.orphans.set_destroy_metadata(
+                &orphan_id,
+                row.dependency_bindings.to_resolved_dependencies(),
+                row.directives.clone(),
+            );
+        }
+    }
 }
 
 /// Persisted-state reads projected from each desired address back to the row
@@ -4267,8 +4614,12 @@ impl<'state> ProjectedStateRead<'state> {
             .iter()
             .filter_map(|resource| {
                 let state = state_file.find_resource_for_id(self.source_for(&resource.id))?;
-                (!state.dependency_bindings.is_empty())
-                    .then(|| (resource.id.clone(), state.dependency_bindings.clone()))
+                (!state.dependency_bindings.is_empty()).then(|| {
+                    (
+                        resource.id.clone(),
+                        state.dependency_bindings.to_resolved_dependencies(),
+                    )
+                })
             })
             .collect()
     }
@@ -5607,6 +5958,11 @@ pub(crate) struct PostExpansionArtifacts<R> {
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub prev_explicit: HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub wait_aliases: Vec<WaitAliasSpec>,
+    pub legacy_dependency_projections: carina_core::resolved_graph::LegacyDependencyProjectionIndex,
+    /// Graph-classified replacement for a pre-v21 state. Apply/refresh owners
+    /// install this value before any write; read-only plan simply drops it.
+    pub migrated_legacy_state: Option<StateFile>,
+    pub legacy_dependency_migration: carina_state::LegacyDependencyMigrationReport,
 }
 
 impl<R> PostExpansionArtifacts<R> {
@@ -5622,6 +5978,9 @@ impl<R> PostExpansionArtifacts<R> {
             moved_origins,
             prev_explicit,
             wait_aliases,
+            legacy_dependency_projections,
+            migrated_legacy_state,
+            legacy_dependency_migration,
         } = self;
         PostExpansionArtifacts {
             expanded_resources: map(expanded_resources),
@@ -5634,6 +5993,9 @@ impl<R> PostExpansionArtifacts<R> {
             moved_origins,
             prev_explicit,
             wait_aliases,
+            legacy_dependency_projections,
+            migrated_legacy_state,
+            legacy_dependency_migration,
         }
     }
 }
@@ -5827,6 +6189,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             moved_origins,
             prev_explicit: addressed.prev_explicit,
             wait_aliases,
+            legacy_dependency_projections: Default::default(),
+            migrated_legacy_state: None,
+            legacy_dependency_migration: Default::default(),
         };
         return Ok(PostExpansionOutcome::Diagnostics(
             PostExpansionDiagnostics::new(artifacts, errors),
@@ -5861,6 +6226,28 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     // constructed.
     let expanded_graph = expanded_resources
         .resolve_expanded_graph(override_aware_resources.resources(), &data_sources_for_plan)?;
+    let legacy_dependency_projections = expanded_graph.legacy_dependency_projection_index()?;
+    let (migrated_legacy_state, legacy_dependency_migration) = if state_file
+        .as_ref()
+        .is_some_and(StateFile::requires_legacy_dependency_migration)
+    {
+        let mut migrated = state_file
+            .as_ref()
+            .expect("checked legacy state presence")
+            .clone();
+        let report = migrated
+            .migrate_legacy_dependencies(&expanded_graph, override_aware_resources.resources())
+            .map_err(|error| AppError::Backend(error.into()))?;
+        addressed.refresh_destroy_metadata_from_state(&migrated);
+        (Some(migrated), report)
+    } else {
+        (None, Default::default())
+    };
+    let state_file = if migrated_legacy_state.is_some() {
+        &migrated_legacy_state
+    } else {
+        state_file
+    };
     compositions = expanded_resources.parsed().compositions.clone();
     for target in &mut deferred_create_targets {
         target.dependencies = expanded_graph
@@ -5960,6 +6347,36 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         &outcome_unknown_import_replacements,
     )?;
     add_deposed_delete_effects(&mut plan, state_file, &addressed.moved_pairs);
+    for warning in legacy_dependency_migration.warnings() {
+        let id = addressed
+            .moved_pairs
+            .iter()
+            .find_map(|(from, to)| (from == &warning.row).then(|| to.clone()))
+            .unwrap_or_else(|| warning.row.clone());
+        let generation = warning
+            .generation
+            .as_ref()
+            .map_or(carina_core::effect::EffectGeneration::Current, |key| {
+                carina_core::effect::EffectGeneration::Deposed(key.clone())
+            });
+        let has_delete = plan.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Delete {
+                    id: delete_id,
+                    generation: delete_generation,
+                    ..
+                } if delete_id == &id && delete_generation == &generation
+            )
+        });
+        if has_delete {
+            plan.record_partially_unknown_destroy_ordering(
+                id,
+                generation,
+                warning.legacy_names.clone(),
+            );
+        }
+    }
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
     override_aware_resources.apply_plan_stability(&plan_input_current, &plan, context.schemas());
 
@@ -6007,6 +6424,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             moved_origins,
             prev_explicit,
             wait_aliases,
+            legacy_dependency_projections,
+            migrated_legacy_state,
+            legacy_dependency_migration,
         },
         resources,
     }))
@@ -7298,6 +7718,9 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         moved_origins,
         prev_explicit,
         wait_aliases: _,
+        legacy_dependency_projections,
+        migrated_legacy_state: _,
+        legacy_dependency_migration: _,
     } = artifacts;
     let expansion_trace = expanded_resources.parsed().expansion_trace.clone();
     Ok(ExpandedPlanContext::new(
@@ -7312,6 +7735,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
             // resources have no binding and kept this evaluated view, producing
             // the bound/anonymous saved-plan divergence.
             sorted_resources,
+            legacy_dependency_projections,
             unresolved_resources,
             compositions,
             data_sources,
@@ -8111,7 +8535,7 @@ pub(crate) fn deposed_delete_effects_for_row(
                 generation: EffectGeneration::Deposed(deposed.key.clone()),
                 directives: Default::default(),
                 binding: row.binding.clone(),
-                dependencies: deposed.dependency_bindings.clone(),
+                dependencies: deposed.dependency_bindings.to_resolved_dependencies(),
                 explicit_dependencies: ResolvedDependencies::default(),
                 blocked_by_updates: blocked_by_current_resume.clone(),
             }),

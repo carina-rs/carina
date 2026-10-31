@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::resource::{DeferredValue, PendingReRead, ReReadReason};
+use carina_core::resource::{DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -66,8 +66,33 @@ fn diff(
     )
 }
 
+fn migrate_legacy_with_config(
+    mut state: StateFile,
+    resources: &[Resource],
+) -> Result<(StateFile, LegacyDependencyMigrationReport), LegacyDependencyMigrationError> {
+    let mut parsed: carina_core::parser::ParsedFile = Default::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(&mut parsed, resources, &[])
+        .expect("legacy migration fixture graph must resolve");
+    let report = state.migrate_legacy_dependencies(&graph, resources)?;
+    Ok((state, report))
+}
+
+fn finish_legacy_dependency_migration(state: StateFile) -> StateFile {
+    if !state.requires_legacy_dependency_migration() {
+        return state;
+    }
+    let (state, report) = migrate_legacy_with_config(state, &[])
+        .expect("source-independent migration fixture must cross the v20 dependency seam");
+    assert!(
+        report.warnings().is_empty(),
+        "migration fixture contains an unresolved legacy dependency: {:?}",
+        report.warnings()
+    );
+    state
+}
+
 #[test]
-fn v19_migrates_through_v20_to_v21_without_rewriting_resource_data() {
+fn v19_migrates_to_unwritable_v20_then_graph_aware_v21_without_losing_row_data() {
     let json = serde_json::json!({
         "version": 19,
         "exports_version": PublishedExports::CURRENT_VERSION,
@@ -96,6 +121,12 @@ fn v19_migrates_through_v20_to_v21_without_rewriting_resource_data() {
         Some(MigrationInfo { from: 19, to: 21 })
     );
     let state = migrated.into_state();
+    assert_eq!(state.version, 20);
+    assert!(state.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&state).is_err());
+    let (state, report) = migrate_legacy_with_config(state, &[])
+        .expect("an empty legacy dependency snapshot is graph-migratable");
+    assert_eq!(report.migrated_rows(), 0);
     assert_eq!(state.version, 21);
     assert_eq!(state.serial, 7);
     assert_eq!(state.lineage, "v19-lineage");
@@ -145,6 +176,9 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
     let state = check_and_migrate(&json.to_string())
         .expect("v20 outcome-unknown state must load")
         .into_state();
+    assert_eq!(state.version, 20);
+    let (state, _report) = migrate_legacy_with_config(state, &[])
+        .expect("token-less outcome rows must survive graph-aware migration");
     assert_eq!(state.version, 21);
     let id = ResourceId::with_provider_identity(
         "mock",
@@ -166,7 +200,7 @@ fn create_outcome_unknown_row_round_trips_without_identifier_or_token() {
     assert_eq!(row.binding.as_deref(), Some("unknown_binding"));
     assert_eq!(row.deposed.len(), 1);
 
-    let encoded = serde_json::to_value(&state).expect("v20 state must serialize");
+    let encoded = serde_json::to_value(&state).expect("v21 state must serialize");
     assert_eq!(encoded["version"], serde_json::json!(21));
     assert_eq!(
         encoded["resources"][0]["current"],
@@ -444,7 +478,7 @@ fn v15_migrates_to_current_and_round_trips_all_current_instance_variants() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     assert!(matches!(
         state.resources()[0].current(),
         CurrentInstance::None
@@ -512,7 +546,7 @@ fn v17_migrates_nested_write_only_records_to_empty() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     assert!(state.resources()[0].nested_write_only().is_empty());
     assert!(state.resources()[1].nested_write_only().is_empty());
     let encoded = serde_json::to_value(&state).expect("migrated state serializes");
@@ -560,7 +594,7 @@ fn v18_migrates_partial_read_detail_to_incomplete_reread_reason() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     let marker = state.resources()[0]
         .partial_read()
         .expect("legacy marker survives migration");
@@ -659,7 +693,7 @@ fn v18_empty_partial_read_marker_migrates_to_no_marker() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = migrated.into_state();
+    let state = finish_legacy_dependency_migration(migrated.into_state());
     assert!(
         state.resources()[0].partial_read().is_none(),
         "an empty legacy marker must not survive migration"
@@ -1355,7 +1389,7 @@ fn upsert_resource_preserves_existing_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: fixture_dependencies(["igw"]),
+        dependency_bindings: fixture_persisted_dependencies(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -1414,7 +1448,7 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
             "cidr_block".to_string(),
             serde_json::json!("10.255.0.0/16"),
         )])),
-        dependency_bindings: fixture_dependencies(["igw"]),
+        dependency_bindings: fixture_persisted_dependencies(["igw"]),
     });
     state
         .upsert_resource(existing)
@@ -1525,12 +1559,13 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
         children: HashMap::from([("cidr_block".to_string(), ExplicitFields::Leaf)]),
     };
     resource.binding = Some("vpc".to_string());
-    resource.dependency_bindings.insert(resolved_dependency(
-        "mock",
-        "test.Dependency",
-        "internet",
-        None,
-    ));
+    resource.dependency_bindings =
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+            "mock",
+            "test.Dependency",
+            "internet",
+            None,
+        )]);
     resource.set_write_only_attributes_for_test(vec!["token".to_string()]);
     resource.set_partial_read_for_test(PartialReadMarker::new(
         PendingReRead::incomplete("partial"),
@@ -1544,7 +1579,7 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
             "cidr_block".to_string(),
             serde_json::json!("10.0.0.0/16"),
         )])),
-        dependency_bindings: fixture_dependencies(["network"]),
+        dependency_bindings: fixture_persisted_dependencies(["network"]),
     });
     state
         .upsert_resource(resource)
@@ -1917,7 +1952,7 @@ fn test_build_saved_attrs() {
 
 #[test]
 fn test_resource_state_serialization_with_binding_and_deps() {
-    let dependencies = ResolvedDependencies::from_iter([
+    let dependencies = PersistedDestroyDependencies::from_test_dependencies([
         resolved_dependency("aws", "ec2.Vpc", "vpc", None),
         resolved_dependency("aws", "ec2.Subnet", "subnet", None),
     ]);
@@ -3665,9 +3700,11 @@ fn test_migrate_v6_empty_struct_to_unrecorded() {
             }
         ]
     }"#;
-    let state = check_and_migrate(v6)
-        .expect("migration should succeed")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(v6)
+            .expect("migration should succeed")
+            .into_state(),
+    );
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     let rs = state
         .resources
@@ -4515,6 +4552,10 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         resource.clone(),
         fixture_dependencies(["my_vpc"]),
         Default::default(),
+    )
+    .with_saved_destroy_dependencies(
+        fixture_persisted_dependencies(["my_vpc"]),
+        Default::default(),
     );
     let rs = resource_state_from_provider_state_for_resource_and_schema_for_test(
         &resolved_resource,
@@ -4526,7 +4567,10 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     )
     .unwrap();
     assert_eq!(rs.binding, Some("my_subnet".to_string()));
-    assert_eq!(rs.dependency_bindings, fixture_dependencies(["my_vpc"]));
+    assert_eq!(
+        rs.dependency_bindings,
+        fixture_persisted_dependencies(["my_vpc"])
+    );
 }
 
 #[test]
@@ -4557,9 +4601,9 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     let mut rs = ResourceState::try_applied("ec2.Subnet", "orphan-subnet", "awscc", "subnet-123")
         .expect("fixture identifier is non-empty");
     rs.binding = Some("my_subnet".to_string());
-    rs.dependency_bindings = fixture_dependencies(["my_vpc"]);
+    rs.dependency_bindings = fixture_persisted_dependencies(["my_vpc"]);
     rs.directives.prevent_destroy = true;
-    rs.directives.depends_on = fixture_dependencies(["security_group"]);
+    rs.directives.depends_on = fixture_persisted_dependencies(["security_group"]);
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -4598,7 +4642,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     assert!(orphan.directives().prevent_destroy);
     assert_eq!(
         orphan.directives().depends_on,
-        fixture_dependencies(["security_group"])
+        fixture_persisted_dependencies(["security_group"])
     );
     assert_eq!(
         orphan_state.dependency_bindings,
@@ -4630,7 +4674,7 @@ fn test_build_orphans_pairs_provider_state_with_typed_host_metadata() {
     assert!(refreshed.directives().prevent_destroy);
     assert_eq!(
         refreshed.directives().depends_on,
-        fixture_dependencies(["security_group"])
+        fixture_persisted_dependencies(["security_group"])
     );
     assert_eq!(
         refreshed_state.dependency_bindings,
@@ -4976,11 +5020,13 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
 
 #[test]
 fn v12_persisted_values_migrate_to_tagged_enum_encoding_in_every_state_tree() {
-    let state = check_and_migrate(include_str!(
-        "../../tests/fixtures/state-v12-tagged-enum-json.json"
-    ))
-    .expect("v12 fixture should migrate")
-    .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(include_str!(
+            "../../tests/fixtures/state-v12-tagged-enum-json.json"
+        ))
+        .expect("v12 fixture should migrate")
+        .into_state(),
+    );
 
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     let row = state
@@ -5044,7 +5090,7 @@ fn v13_resource_secret_markers_migrate_to_structural_tags_but_exports_stay_liter
             to: StateFile::CURRENT_VERSION,
         })
     );
-    let state = outcome.into_state();
+    let state = finish_legacy_dependency_migration(outcome.into_state());
     let row = state
         .find_resource("mock", "test.Resource", "main")
         .expect("fixture resource exists");
@@ -5151,9 +5197,11 @@ fn v13_raw_row_salted_secret_still_verifies_after_structural_migration() {
         }],
         "exports": {},
     });
-    let state = check_and_migrate(&json.to_string())
-        .expect("v13 raw legacy state migrates")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(&json.to_string())
+            .expect("v13 raw legacy state migrates")
+            .into_state(),
+    );
     let hash = state.resources()[0]
         .persisted_attributes()
         .expect("migrated row has persisted attributes")
@@ -5359,9 +5407,9 @@ fn v11_state_migrates_to_current_and_upgrades_raw_legacy_secrets_at_row_load() {
             to: StateFile::CURRENT_VERSION,
         })
     );
-    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
-    let row = outcome
-        .state()
+    assert_eq!(outcome.state().version, 20);
+    let state = finish_legacy_dependency_migration(outcome.into_state());
+    let row = state
         .find_resource("mock", "test.resource", "legacy")
         .expect("legacy row should survive migration");
     let encoded = row
@@ -5499,9 +5547,11 @@ fn v9_deposed_entries_round_trip() {
         ]
     }"#;
 
-    let state = check_and_migrate(json)
-        .expect("v9 state with deposed entries should load")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(json)
+            .expect("v9 state with deposed entries should load")
+            .into_state(),
+    );
     let serialized = serde_json::to_value(&state).expect("state should serialize");
     let reloaded = StateFile::from_json_str(&serialized.to_string())
         .expect("serialized v9 state should reload");
@@ -5585,7 +5635,7 @@ fn test_build_orphans_excludes_desired() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::try_applied("ec2.Subnet", "kept-subnet", "awscc", "subnet-456")
         .expect("fixture identifier is non-empty");
-    rs.dependency_bindings = fixture_dependencies(["my_vpc"]);
+    rs.dependency_bindings = fixture_persisted_dependencies(["my_vpc"]);
     state
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -5672,6 +5722,34 @@ fn fixture_dependencies<const N: usize>(identities: [&str; N]) -> ResolvedDepend
         .collect()
 }
 
+fn fixture_persisted_dependencies<const N: usize>(
+    identities: [&str; N],
+) -> PersistedDestroyDependencies {
+    PersistedDestroyDependencies::from_test_dependencies(
+        identities
+            .into_iter()
+            .map(|identity| resolved_dependency("mock", "test.Dependency", identity, None)),
+    )
+}
+
+#[test]
+fn v20_without_dependency_names_can_complete_before_a_mutating_command_early_write() {
+    let json = state_json_with_resources(
+        20,
+        vec![persisted_resource("mock", "test.Resource", "independent")],
+    );
+    let mut state = check_and_migrate(&json)
+        .expect("v20 state without dependency names must load")
+        .into_state();
+
+    assert!(state.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&state).is_err());
+    assert!(state.complete_legacy_dependency_migration_without_names());
+    assert!(!state.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&state).is_ok());
+    assert!(!state.complete_legacy_dependency_migration_without_names());
+}
+
 #[test]
 fn v20_dependency_migration_resolves_root_module_loop_origin_and_deposed_edges() {
     let mut root = persisted_resource("mock", "test.Root", "root_target");
@@ -5705,11 +5783,18 @@ fn v20_dependency_migration_resolves_root_module_loop_origin_and_deposed_edges()
     }]);
 
     let json = state_json_with_resources(20, vec![root, module, loop_target, origin, consumer]);
-    let migrated = check_and_migrate(&json)
-        .expect("every legacy address has one exact persisted origin")
+    let loaded = check_and_migrate(&json)
+        .expect("legacy dependency names must load into the unwritable typestate")
         .into_state();
+    assert!(loaded.requires_legacy_dependency_migration());
+    assert!(serde_json::to_value(&loaded).is_err());
+    let configured_consumer =
+        Resource::with_provider("mock", "test.Consumer", "consumer", None).with_binding("consumer");
+    let (migrated, report) = migrate_legacy_with_config(loaded, &[configured_consumer])
+        .expect("every legacy address has one exact persisted origin");
+    assert!(report.warnings().is_empty());
     let consumer = &migrated.resources()[4];
-    let expected = ResolvedDependencies::from_iter([
+    let expected = PersistedDestroyDependencies::from_test_dependencies([
         resolved_dependency("mock", "test.Root", "root_target", None),
         resolved_dependency(
             "mock",
@@ -5723,7 +5808,7 @@ fn v20_dependency_migration_resolves_root_module_loop_origin_and_deposed_edges()
     assert_eq!(consumer.dependency_bindings, expected);
     assert_eq!(
         consumer.directives.depends_on,
-        ResolvedDependencies::from_iter([resolved_dependency(
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
             "mock",
             "test.Module",
             "module_instance.target",
@@ -5732,7 +5817,7 @@ fn v20_dependency_migration_resolves_root_module_loop_origin_and_deposed_edges()
     );
     assert_eq!(
         consumer.deposed[0].dependency_bindings,
-        ResolvedDependencies::from_iter([resolved_dependency(
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
             "mock",
             "test.Loop",
             "module_instance.items[0]",
@@ -5753,17 +5838,21 @@ fn v20_dependency_migration_rejects_missing_target_with_row_and_text() {
     consumer["dependency_bindings"] = serde_json::json!(["gone_target"]);
     let json = state_json_with_resources(20, vec![consumer]);
 
-    let error = check_and_migrate(&json).expect_err("missing edges must never be dropped");
+    let state = check_and_migrate(&json)
+        .expect("legacy strings load before configuration-aware classification")
+        .into_state();
+    let configured =
+        Resource::with_provider("mock", "test.Consumer", "consumer", None).with_binding("consumer");
+    let error = migrate_legacy_with_config(state, &[configured])
+        .expect_err("missing edges on configured rows must never be dropped");
     assert!(matches!(
         error,
-        BackendError::LegacyDependencyMigration(
-            LegacyDependencyMigrationError::Missing {
-                row_index: 0,
-                ref row,
-                ref location,
-                ref dependency,
-            }
-        ) if row.contains("test.Consumer")
+        LegacyDependencyMigrationError::Missing {
+            row_index: 0,
+            ref row,
+            ref location,
+            ref dependency,
+        } if row.contains("test.Consumer")
             && location == "resources[0].dependency_bindings"
             && dependency == "gone_target"
     ));
@@ -5780,22 +5869,77 @@ fn v20_dependency_migration_rejects_ambiguous_binding_with_row_and_text() {
     consumer["directives"] = serde_json::json!({ "depends_on": ["shared"] });
     let json = state_json_with_resources(20, vec![first, second, consumer]);
 
-    let error = check_and_migrate(&json).expect_err("ambiguous edges must never be guessed");
+    let state = check_and_migrate(&json)
+        .expect("legacy strings load before configuration-aware classification")
+        .into_state();
+    let configured =
+        Resource::with_provider("mock", "test.Consumer", "consumer", None).with_binding("consumer");
+    let error = migrate_legacy_with_config(state, &[configured])
+        .expect_err("ambiguous edges on configured rows must never be guessed");
     assert!(matches!(
         error,
-        BackendError::LegacyDependencyMigration(
-            LegacyDependencyMigrationError::Ambiguous {
-                row_index: 2,
-                ref row,
-                ref location,
-                ref dependency,
-                ref candidates,
-            }
-        ) if row.contains("test.Consumer")
+        LegacyDependencyMigrationError::Ambiguous {
+            row_index: 2,
+            ref row,
+            ref location,
+            ref dependency,
+            ref candidates,
+        } if row.contains("test.Consumer")
             && location == "resources[2].directives.depends_on"
             && dependency == "shared"
             && candidates.len() == 2
     ));
+}
+
+#[test]
+fn v20_dependency_migration_keeps_known_orphan_edges_and_reports_each_unknown_generation() {
+    let mut target = persisted_resource("mock", "test.Target", "remaining");
+    target["binding"] = serde_json::json!("remaining");
+    let mut orphan = persisted_resource("mock", "test.Orphan", "removed_module.consumer");
+    orphan["binding"] = serde_json::json!("removed_module.consumer");
+    orphan["dependency_bindings"] = serde_json::json!(["remaining", "removed_module.gone"]);
+    orphan["deposed"] = serde_json::json!([{
+        "key": "old-generation",
+        "identifier": "orphan-old",
+        "attributes": {},
+        "dependency_bindings": ["removed_module.old_gone"]
+    }]);
+    let json = state_json_with_resources(20, vec![target, orphan]);
+    let state = check_and_migrate(&json)
+        .expect("orphan legacy names load into the migration typestate")
+        .into_state();
+    let configured_target =
+        Resource::with_provider("mock", "test.Target", "remaining", None).with_binding("remaining");
+
+    let (migrated, report) = migrate_legacy_with_config(state, &[configured_target])
+        .expect("unresolved orphan names are warnings rather than migration failures");
+    assert_eq!(report.warnings().len(), 2);
+    assert!(report.warnings().iter().any(|warning| {
+        warning.generation.is_none()
+            && warning.legacy_names == BTreeSet::from(["removed_module.gone".to_string()])
+    }));
+    assert!(report.warnings().iter().any(|warning| {
+        warning
+            .generation
+            .as_ref()
+            .is_some_and(|key| key.as_str() == "old-generation")
+            && warning.legacy_names == BTreeSet::from(["removed_module.old_gone".to_string()])
+    }));
+
+    let orphan = &migrated.resources()[1];
+    assert_eq!(
+        orphan.dependency_bindings,
+        PersistedDestroyDependencies::from_test_dependencies([resolved_dependency(
+            "mock",
+            "test.Target",
+            "remaining",
+            None,
+        )])
+    );
+    assert!(orphan.deposed[0].dependency_bindings.is_empty());
+    let encoded = serde_json::to_string(&migrated).expect("v21 state must be writable");
+    assert!(!encoded.contains("removed_module.gone"));
+    assert!(!encoded.contains("removed_module.old_gone"));
 }
 
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
@@ -6381,7 +6525,7 @@ fn test_check_and_migrate_older_version_migrates() {
         "resources": []
     }"#;
 
-    let result = check_and_migrate(json).unwrap().into_state();
+    let result = finish_legacy_dependency_migration(check_and_migrate(json).unwrap().into_state());
     assert_eq!(
         result.version,
         StateFile::CURRENT_VERSION,
@@ -6452,7 +6596,11 @@ fn test_check_and_migrate_returns_migration_info_for_older_version() {
         .expect("migration info should be present for v6 → v7");
     assert_eq!(migration.from, 6);
     assert_eq!(migration.to, StateFile::CURRENT_VERSION);
-    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
+    assert_eq!(outcome.state().version, 20);
+    assert_eq!(
+        finish_legacy_dependency_migration(outcome.into_state()).version,
+        StateFile::CURRENT_VERSION
+    );
 }
 
 #[test]
@@ -8503,7 +8651,9 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
         }}"#,
         ver = 14,
     );
-    let state = check_and_migrate(&json).expect("load state").into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(&json).expect("load state").into_state(),
+    );
     let r = &state.resources[2];
     assert_eq!(r.identity.as_str(), "_accounts.registry_prod");
     assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
@@ -8592,9 +8742,11 @@ fn v5_state_read_converts_desired_keys_to_explicit_leaves() {
         }]
     }"#;
 
-    let state = check_and_migrate(v5)
-        .expect("migration must succeed")
-        .into_state();
+    let state = finish_legacy_dependency_migration(
+        check_and_migrate(v5)
+            .expect("migration must succeed")
+            .into_state(),
+    );
     assert_eq!(state.version, StateFile::CURRENT_VERSION);
     assert_eq!(state.resources.len(), 1);
 
@@ -8714,8 +8866,8 @@ fn v9_legacy_list_survives_current_lift_stays_conservative_and_self_heals_on_wri
     }"#;
     let outcome = check_and_migrate(json).expect("v9 state must lift without a custom migration");
     assert_eq!(outcome.migration.unwrap().from, 9);
-    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
-    let state = outcome.state;
+    assert_eq!(outcome.state.version, 20);
+    let state = finish_legacy_dependency_migration(outcome.state);
     let row = state
         .find_resource("mock", "listener.Listener", "listener")
         .expect("legacy row");

@@ -15,8 +15,8 @@ use carina_core::parser::{
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::resource::{
-    ConcreteValue, Directives, ResolvedDependencies, ResolvedResource, ResolvedResourceId,
-    Resource, ResourceId, ResourceIdentity, State, Value,
+    ConcreteValue, Directives, PersistedDestroyDependencies, ResolvedDependencies,
+    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use carina_state::{ResourceState, StateFile};
 use indexmap::IndexMap;
@@ -119,12 +119,10 @@ provider mock {}
         .with_attribute("name", serde_json::json!("old-validation-token"))
         .with_attribute("identifier", serde_json::json!("old-validation-id"));
         validation.binding = Some("validation_records[0]".to_string());
-        validation
-            .dependency_bindings
-            .insert(ResolvedResourceId::new(ResourceId::with_identity(
-                "mock.test.resource",
-                "cert",
-            )));
+        validation.dependency_bindings =
+            PersistedDestroyDependencies::from_test_dependencies([ResolvedResourceId::new(
+                ResourceId::with_identity("mock.test.resource", "cert"),
+            )]);
         state
             .upsert_resource(validation)
             .expect("test state setup must be valid");
@@ -136,12 +134,10 @@ provider mock {}
                 .with_attribute("identifier", serde_json::json!("consumer-id"))
                 .with_attribute("web_acl_arn", serde_json::json!("old-validation-id"));
         consumer.binding = Some("consumer".to_string());
-        consumer
-            .dependency_bindings
-            .insert(ResolvedResourceId::new(ResourceId::with_identity(
-                "mock.test.resource",
-                "validation_records[0]",
-            )));
+        consumer.dependency_bindings =
+            PersistedDestroyDependencies::from_test_dependencies([ResolvedResourceId::new(
+                ResourceId::with_identity("mock.test.resource", "validation_records[0]"),
+            )]);
         state
             .upsert_resource(consumer)
             .expect("test state setup must be valid");
@@ -332,6 +328,9 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         }),
         plan,
         sorted_resources: sorted_resources.clone(),
+        sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: sorted_resources,
         compositions: vec![],
         data_sources: vec![],

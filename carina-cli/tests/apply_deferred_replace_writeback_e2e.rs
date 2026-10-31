@@ -279,6 +279,9 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         }),
         plan,
         sorted_resources: sorted_resources.clone(),
+        sorted_value_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
+        sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: sorted_resources,
         compositions: vec![],
         data_sources: vec![],
@@ -347,7 +350,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
             ("name".to_string(), serde_json::json!("main-old")),
             ("status".to_string(), serde_json::json!("STALE")),
         ]),
-        ResolvedDependencies::default(),
+        Default::default(),
     ));
     state
         .upsert_resource(row)
@@ -399,6 +402,9 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         }),
         plan,
         sorted_resources: vec![],
+        sorted_value_destroy_dependencies: vec![],
+        sorted_explicit_destroy_dependencies: vec![],
+        legacy_dependency_projections: Default::default(),
         unresolved_resources: vec![],
         compositions: vec![],
         data_sources: vec![],

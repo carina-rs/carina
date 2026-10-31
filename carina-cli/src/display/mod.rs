@@ -12,7 +12,9 @@ use carina_core::detail_rows::{
 #[cfg(test)]
 use carina_core::effect::DeletedInstanceKey;
 use carina_core::effect::Effect;
-use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayInfo};
+use carina_core::plan::{
+    DeferredSummaryAction, DestroyOrdering, Plan, PlanSummaryPart, ReplaceDisplayInfo,
+};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
@@ -361,6 +363,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
         expansion_trace,
         provider,
     )?);
+    append_destroy_ordering_warnings(&mut out, plan);
 
     // Show deferred for-expressions
     for deferred in summary.residual_deferred_for() {
@@ -512,8 +515,32 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
         None, // ExpansionTrace doesn't apply to destroy plans (no compositions in state)
         provider,
     )?);
+    append_destroy_ordering_warnings(&mut out, plan);
 
     Ok(out)
+}
+
+fn append_destroy_ordering_warnings<S>(out: &mut String, plan: &Plan<S>) {
+    for notice in plan.destroy_ordering_notices() {
+        match notice.ordering() {
+            DestroyOrdering::Known => {}
+            DestroyOrdering::PartiallyUnknown { legacy_names } => {
+                for legacy_name in legacy_names {
+                    writeln!(
+                        out,
+                        "{}",
+                        format!(
+                            "Warning: destroy ordering for {} is partially unknown: legacy dependency {:?} no longer resolves.",
+                            notice.id(),
+                            legacy_name,
+                        )
+                        .yellow()
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
 }
 
 /// Holds shared state and configuration for recursive tree rendering.

@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use carina_core::provider::{NestedWriteOnlyRecord, PersistedAttributes};
+#[cfg(test)]
+use carina_core::resource::PersistedDestroyDependencies;
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{LeafPath, LeafPathSegment};
-use carina_state::{CurrentInstance, ResourceState, StateFile};
+use carina_state::{CurrentInstance, LegacyDependencyNames, ResourceState, StateFile};
 use serde::Serialize;
 
 const STATE_SHOW_SCHEMA_VERSION: u32 = 1;
@@ -29,8 +31,22 @@ pub(crate) struct StateShowResource {
     pub(crate) provider: String,
     pub(crate) resource_type: String,
     pub(crate) protected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dependency_migration: Option<StateShowDependencyMigration>,
     pub(crate) current: StateShowCurrent,
     pub(crate) deposed: Vec<StateShowDeposed>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct StateShowDependencyMigration {
+    pub(crate) status: StateShowDependencyMigrationStatus,
+    pub(crate) legacy_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StateShowDependencyMigrationStatus {
+    NotYetMigrated,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,7 +86,7 @@ impl StateShowDocument {
         let resources = state
             .resources()
             .iter()
-            .map(StateShowResource::from_row)
+            .map(|row| StateShowResource::from_row(row, state.legacy_dependency_names_for(row)))
             .collect::<Result<Vec<_>, StateShowOutputError>>()?;
 
         Ok(Self {
@@ -90,7 +106,10 @@ impl StateShowDocument {
 }
 
 impl StateShowResource {
-    pub(crate) fn from_row(row: &ResourceState) -> Result<Self, StateShowOutputError> {
+    pub(crate) fn from_row(
+        row: &ResourceState,
+        legacy_dependencies: Option<LegacyDependencyNames>,
+    ) -> Result<Self, StateShowOutputError> {
         let resource = row.binding.as_deref().unwrap_or(row.identity.as_str());
         let current = match row.current() {
             CurrentInstance::None => StateShowCurrent {
@@ -149,6 +168,10 @@ impl StateShowResource {
             provider: row.provider.clone(),
             resource_type: row.resource_type.clone(),
             protected: row.protected,
+            dependency_migration: legacy_dependencies.map(|legacy| StateShowDependencyMigration {
+                status: StateShowDependencyMigrationStatus::NotYetMigrated,
+                legacy_names: legacy.iter().map(str::to_owned).collect(),
+            }),
             current,
             deposed: row
                 .deposed
@@ -377,14 +400,14 @@ mod tests {
             "mock-deposed-id".to_string(),
             Some("secondary".to_string()),
             HashMap::from([("name".to_string(), json!("old"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "mock",
-                "test.resource",
-                "dependency",
-                None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity(
+                    "mock",
+                    "test.resource",
+                    "dependency",
+                    None,
+                ),
+            ]),
         ));
         let applied = crate::fixture_resource_state_metadata(
             applied,

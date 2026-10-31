@@ -20,9 +20,11 @@ use carina_core::provider::{
     ObservedCreate, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
     UnknownCreateOutcome,
 };
+#[cfg(test)]
+use carina_core::resource::PersistedDestroyDependencies;
 use carina_core::resource::{
-    ConcreteValue, Current, ModuleSource, ResolvedDependencies, ResolvedResource,
-    ResolvedResourceId, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, ModuleSource, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_core::value::PersistedExportValue;
@@ -937,7 +939,6 @@ struct ReplacementDeleteInput<'a> {
     identifier: &'a str,
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
-    fallback_dependency_bindings: ResolvedDependencies,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
@@ -1110,9 +1111,7 @@ fn planned_depose<S>(
     let dependency_bindings = existing
         .map(|rs| rs.dependency_bindings.clone())
         .filter(|bindings| !bindings.is_empty())
-        .or_else(|| current_state.map(|state| state.dependency_bindings.clone()))
-        .filter(|bindings| !bindings.is_empty())
-        .unwrap_or(delete.fallback_dependency_bindings);
+        .unwrap_or_else(|| desired_resource.persisted_destroy_dependencies());
 
     PlannedDepose {
         id: delete.id.clone(),
@@ -1134,7 +1133,6 @@ fn delete_input_from_effect<'a, S>(
         id,
         identifier,
         generation,
-        dependencies,
         ..
     } = effect
     else {
@@ -1145,7 +1143,6 @@ fn delete_input_from_effect<'a, S>(
         identifier: identifier.as_str(),
         provider_instance: id.as_inner().provider_instance.clone(),
         generation,
-        fallback_dependency_bindings: dependencies.clone(),
         previous_attributes,
     })
 }
@@ -1156,7 +1153,6 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
         identifier: delete.identifier.as_str(),
         provider_instance: delete.id.as_inner().provider_instance.clone(),
         generation: &CURRENT_GENERATION,
-        fallback_dependency_bindings: delete.dependencies.clone(),
         previous_attributes: None,
     }
 }
@@ -1256,7 +1252,6 @@ fn plan_displaced_identifier_deposes<S>(
                 identifier: displaced_identifier,
                 provider_instance: existing.directives.provider_instance.clone(),
                 generation: &EffectGeneration::Current,
-                fallback_dependency_bindings: existing.dependency_bindings.clone(),
                 previous_attributes: None,
             },
             upsert.resource,
@@ -4208,14 +4203,14 @@ mod apply_state_save_tests {
                     "old-id".to_string(),
                     None,
                     HashMap::from([("name".to_string(), serde_json::json!("old"))]),
-                    [ResolvedResourceId::with_provider_identity(
-                        "mock",
-                        "test.Dependency",
-                        "dependency",
-                        None,
-                    )]
-                    .into_iter()
-                    .collect(),
+                    PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "mock",
+                            "test.Dependency",
+                            "dependency",
+                            None,
+                        ),
+                    ]),
                 ),
             )
             .expect("deposed fixture is valid");
@@ -4659,14 +4654,9 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             None,
             HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "aws",
-                "acm.Certificate",
-                "cert",
-                None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None),
+            ]),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -4902,14 +4892,9 @@ mod apply_state_save_tests {
         .expect("fixture identifier is non-empty")
         .with_attribute("name", serde_json::json!("old.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
-        existing
-            .dependency_bindings
-            .insert(ResolvedResourceId::with_provider_identity(
-                "aws",
-                "acm.Certificate",
-                "cert",
-                None,
-            ));
+        existing.dependency_bindings = PersistedDestroyDependencies::from_test_dependencies([
+            ResolvedResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None),
+        ]);
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -5088,14 +5073,9 @@ mod apply_state_save_tests {
         let mut existing = ResourceState::try_applied("ec2.Vpc", "main", "awscc", "vpc-old")
             .expect("fixture identifier is non-empty")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
-        existing
-            .dependency_bindings
-            .insert(ResolvedResourceId::with_provider_identity(
-                "awscc",
-                "ec2.InternetGateway",
-                "igw",
-                None,
-            ));
+        existing.dependency_bindings = PersistedDestroyDependencies::from_test_dependencies([
+            ResolvedResourceId::with_provider_identity("awscc", "ec2.InternetGateway", "igw", None),
+        ]);
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -5144,14 +5124,14 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             row.deposed[0].dependency_bindings,
-            [ResolvedResourceId::with_provider_identity(
-                "awscc",
-                "ec2.InternetGateway",
-                "igw",
-                None,
-            )]
-            .into_iter()
-            .collect()
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity(
+                    "awscc",
+                    "ec2.InternetGateway",
+                    "igw",
+                    None,
+                ),
+            ])
         );
     }
 
@@ -6453,14 +6433,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-                    [ResolvedResourceId::with_provider_identity(
-                        "aws",
-                        "acm.Certificate",
-                        "cert",
-                        None,
-                    )]
-                    .into_iter()
-                    .collect(),
+                    PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "aws",
+                            "acm.Certificate",
+                            "cert",
+                            None,
+                        ),
+                    ]),
                 ),
             },
         )
@@ -6495,14 +6475,9 @@ mod apply_state_save_tests {
             "old-record-id".to_string(),
             Some("east".to_string()),
             HashMap::from([("name".to_string(), serde_json::json!("stale"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "mock",
-                "test.Dependency",
-                "old",
-                None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("mock", "test.Dependency", "old", None),
+            ]),
         ));
         let mut state = StateFile::new();
         state
@@ -6518,14 +6493,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("fresh"))]),
-                    [ResolvedResourceId::with_provider_identity(
-                        "mock",
-                        "test.Dependency",
-                        "new",
-                        None,
-                    )]
-                    .into_iter()
-                    .collect(),
+                    PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "mock",
+                            "test.Dependency",
+                            "new",
+                            None,
+                        ),
+                    ]),
                 ),
             },
         )
@@ -6553,14 +6528,14 @@ mod apply_state_save_tests {
                     "old-record-id".to_string(),
                     Some("west".to_string()),
                     HashMap::from([("name".to_string(), serde_json::json!("newer"))]),
-                    [ResolvedResourceId::with_provider_identity(
-                        "mock",
-                        "test.Dependency",
-                        "newer",
-                        None,
-                    )]
-                    .into_iter()
-                    .collect(),
+                    PersistedDestroyDependencies::from_test_dependencies([
+                        ResolvedResourceId::with_provider_identity(
+                            "mock",
+                            "test.Dependency",
+                            "newer",
+                            None,
+                        ),
+                    ]),
                 ),
             },
         )
@@ -6580,14 +6555,14 @@ mod apply_state_save_tests {
         );
         assert_eq!(
             deposed.dependency_bindings,
-            [ResolvedResourceId::with_provider_identity(
-                "mock",
-                "test.Dependency",
-                "newer",
-                None,
-            )]
-            .into_iter()
-            .collect()
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity(
+                    "mock",
+                    "test.Dependency",
+                    "newer",
+                    None,
+                ),
+            ])
         );
     }
 
@@ -6626,14 +6601,9 @@ mod apply_state_save_tests {
             "older-record-id".to_string(),
             None,
             HashMap::from([("name".to_string(), serde_json::json!("older"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "aws",
-                "acm.Certificate",
-                "cert",
-                None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None),
+            ]),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -6888,14 +6858,9 @@ mod apply_state_save_tests {
                 .expect("fixture identifier is non-empty")
                 .with_attribute("bucket_name", serde_json::json!("old-name"))
                 .with_attribute("comment", persisted_secret.as_json().clone());
-        existing
-            .dependency_bindings
-            .insert(ResolvedResourceId::with_provider_identity(
-                "awscc",
-                "s3.Bucket",
-                "logs",
-                None,
-            ));
+        existing.dependency_bindings = PersistedDestroyDependencies::from_test_dependencies([
+            ResolvedResourceId::with_provider_identity("awscc", "s3.Bucket", "logs", None),
+        ]);
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -7072,14 +7037,9 @@ mod export_writeback_tests {
                 BTreeSet::from(["computed".to_string()]),
             )),
         );
-        row.dependency_bindings = [ResolvedResourceId::with_provider_identity(
-            "mock",
-            "test.Resource",
-            "upstream",
-            None,
-        )]
-        .into_iter()
-        .collect();
+        row.dependency_bindings = PersistedDestroyDependencies::from_test_dependencies([
+            ResolvedResourceId::with_provider_identity("mock", "test.Resource", "upstream", None),
+        ]);
         let mut state = StateFile::new();
         state
             .upsert_resource(row)

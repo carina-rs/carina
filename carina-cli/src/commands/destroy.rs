@@ -21,12 +21,12 @@ use carina_core::effect::deps::{
 use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::plan::{Plan, PlanError};
 use carina_core::provider::Provider;
-#[cfg(test)]
-use carina_core::resource::State;
 use carina_core::resource::{
     ConcreteValue, Current, ResolvedDependencies, ResolvedResource, ResolvedResourceId, Resource,
     ResourceId, Value,
 };
+#[cfg(test)]
+use carina_core::resource::{PersistedDestroyDependencies, State};
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
@@ -577,6 +577,35 @@ async fn run_destroy_locked_owned(
         &all_resources,
         &parsed.data_sources,
     )?;
+    let legacy_dependency_migration = if state_file
+        .as_ref()
+        .is_some_and(StateFile::requires_legacy_dependency_migration)
+    {
+        let report = state_file
+            .as_mut()
+            .expect("checked legacy state presence")
+            .migrate_legacy_dependencies(&destroy_graph, &parsed.resources)
+            .map_err(|error| AppError::Backend(error.into()))?;
+        if let Some(state) = state_file.as_ref() {
+            for (id, current) in &mut managed_current {
+                if let Some(row) = state.find_resource_for_id(id) {
+                    current.set_dependency_bindings(
+                        row.dependency_bindings.to_resolved_dependencies(),
+                    );
+                }
+            }
+        }
+        mid_run_writer
+            .write_schema_migration(
+                state_file
+                    .as_mut()
+                    .expect("legacy migration retains the state file"),
+            )
+            .await?;
+        report
+    } else {
+        Default::default()
+    };
     let known_non_effect_targets: ResolvedDependencies = parsed
         .data_sources
         .iter()
@@ -715,6 +744,28 @@ async fn run_destroy_locked_owned(
     let mut destroy_plan = Plan::new();
     for idx in &display_order {
         destroy_plan.add(delete_effects[*idx].clone());
+    }
+    for warning in legacy_dependency_migration.warnings() {
+        let generation = warning.generation.as_ref().map_or(
+            EffectGeneration::Current,
+            |key| EffectGeneration::Deposed(key.clone()),
+        );
+        if destroy_plan.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Delete {
+                    id,
+                    generation: effect_generation,
+                    ..
+                } if id == &warning.row && effect_generation == &generation
+            )
+        }) {
+            destroy_plan.record_partially_unknown_destroy_ordering(
+                warning.row.clone(),
+                generation,
+                warning.legacy_names.clone(),
+            );
+        }
     }
 
     let historical_display =
@@ -2852,14 +2903,9 @@ mod tests {
             "vpc-old".to_string(),
             Some("deposed".to_string()),
             HashMap::new(),
-            [ResolvedResourceId::with_provider_identity(
-                "awscc",
-                "ec2.Subnet",
-                "subnet",
-                None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Subnet", "subnet", None),
+            ]),
         ));
         let mut state_file = StateFile::new();
         state_file
@@ -3106,8 +3152,10 @@ mod tests {
         child.binding = Some("child".to_string());
         let parent_id =
             ResolvedResourceId::with_provider_identity("mock", "test.Parent", "parent", None);
-        child.directives.depends_on = [parent_id.clone()].into_iter().collect();
-        child.dependency_bindings = [parent_id.clone()].into_iter().collect();
+        child.directives.depends_on =
+            PersistedDestroyDependencies::from_test_dependencies([parent_id.clone()]);
+        child.dependency_bindings =
+            PersistedDestroyDependencies::from_test_dependencies([parent_id.clone()]);
 
         let mut state_file = StateFile::new();
         state_file.upsert_resource(parent).unwrap();
@@ -3368,11 +3416,9 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "awscc", "ec2.Vpc", "network", None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "network", None),
+            ]),
         ));
         state
             .upsert_resource(resource)
@@ -3411,22 +3457,18 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "awscc", "ec2.Vpc", "network", None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "network", None),
+            ]),
         ));
         resource.deposed.push(DeposedInstance::from_persisted_json(
             retained_key.clone(),
             "vpc-older".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "awscc", "ec2.Vpc", "network", None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "network", None),
+            ]),
         ));
         state
             .upsert_resource(resource)
@@ -3465,11 +3507,9 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
-            [ResolvedResourceId::with_provider_identity(
-                "awscc", "ec2.Vpc", "network", None,
-            )]
-            .into_iter()
-            .collect(),
+            PersistedDestroyDependencies::from_test_dependencies([
+                ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "network", None),
+            ]),
         ));
         state
             .upsert_resource(resource)

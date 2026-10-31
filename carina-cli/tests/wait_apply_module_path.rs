@@ -629,6 +629,23 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .map(|resource| expanded_graph.resolve_resource(resource, ctx.schemas()))
         .collect::<Result<Vec<_>, _>>()
         .expect("managed dependency resolution");
+    let distribution = resolved_resources_for_plan
+        .iter()
+        .find(|resource| resource.id.resource_type == "cloudfront.Distribution")
+        .expect("expanded fixture contains the distribution");
+    let certificate = resolved_resources_for_plan
+        .iter()
+        .find(|resource| resource.id.resource_type == "acm.Certificate")
+        .expect("expanded fixture contains the certificate");
+    let certificate_id = certificate.resolved_id();
+    assert_eq!(
+        distribution
+            .persisted_destroy_dependencies()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![&certificate_id],
+        "state dependency projection must flatten r.cert_issued to the managed certificate row"
+    );
     let resolved_data_sources = data_sources
         .iter()
         .cloned()
