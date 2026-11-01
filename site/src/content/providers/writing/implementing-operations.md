@@ -340,11 +340,22 @@ fn poll_create(
                 Ok(attempt.pending(CreateToken::OperationId(operation), 5))
             }
             Ok(CreateStatus::Done { id: widget_id }) => match identifier(&widget_id) {
-                // Record the identifier now and read the widget on the
-                // next poll, through the Poll::Issued arm above.
-                Ok(identifier) => Ok(attempt
-                    .issued(identifier)
-                    .pending_read_back(CreateToken::OperationId(operation), 1)),
+                Ok(identifier) => {
+                    let issued = attempt.issued(identifier);
+                    if poll_request.finality == PollFinality::FinalAttempt {
+                        // The operation completed at its deadline. Keep the
+                        // identifier and settle without starting another poll.
+                        Ok(issued.partial(
+                            request.resource.attributes,
+                            PartialReadDiagnostic {
+                                reason: "widget read-back is still pending".to_string(),
+                                missing_attributes: vec!["status".to_string()],
+                            },
+                        ))
+                    } else {
+                        Ok(issued.pending_read_back(CreateToken::OperationId(operation), 1))
+                    }
+                }
                 Err(err) => Err(attempt.preserve(
                     CreateToken::OperationId(operation),
                     5,
@@ -387,7 +398,9 @@ A `Starting` token retries the create with the same client token. Because the AP
 
 A rejected retry is `preserve`, not `untracked`. The first call may have created the widget, and the API can refuse the reused token for reasons of its own, for example because the configuration changed before a later apply resumed the create. `preserve` carries the same continuation plus the error, so Carina keeps the attempt while surfacing why this poll stopped. Any other failure keeps the attempt pending.
 
-When the operation finishes, the provider calls `attempt.issued(identifier)` and returns `pending_read_back` once more. That records the identifier right away, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. `poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. This example therefore returns `partial` when the issued read-back receives the final attempt. `resume_create` receives the same poll request when Carina resumes a persisted continuation; on its first call, the persisted token and identifier are authoritative but the inbound phase and delay are not.
+When the operation finishes, the provider calls `attempt.issued(identifier)`. On an ordinary poll it returns `pending_read_back`, which records the identifier, starts the host's read-back budget, and makes the next poll go to the `Poll::Issued` arm. If the operation completes on the final attempt, the example settles with `partial` immediately, preserving the identifier for the next refresh.
+
+`poll_request.finality` is `Continue` on ordinary polls and `FinalAttempt` on the one poll at the active deadline. Its rule follows the continuation the host sent: pending after a final attempt sent to the `Poll::Unissued` operation-phase continuation is over budget, even if that result starts read-back; pending in either phase after a final attempt sent to the `Poll::Issued` read-back continuation is a protocol violation. Returning from read-back to operation is always a violation. The example also returns `partial` when the issued read-back receives the final attempt and still cannot read the widget. `resume_create` receives the same poll request when Carina resumes a persisted continuation; on its first call, the persisted token and identifier are authoritative but the inbound phase and delay are not.
 
 A create for which the provider reported an identifier is `failed` with that identifier, so Carina records the identifier plus only observed or sent values, and the next plan re-checks it. `failed` also takes an `Observation`: what the provider saw when it read the widget, either `Observation::Read` with the read outcome or `Observation::ReadFailed` with the read error. The observation passed to `failed` says whether the resource was found and supplies any observed state Carina can record. `failed` returns a `CreateVerdict<CreateToken>`, and `.into()` turns it into the `PollVerdict<CreateToken>` that `poll_create` returns.
 

@@ -41,10 +41,9 @@ pub struct PollRequest {
 }
 
 /// Why a completed post-mutation read stopped being polled.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadBackEnd {
     /// No host-final read-back attempt produced this result.
-    #[default]
     ProviderReported,
     /// The provider returned a partial result to the host's final read-back poll.
     HostDeadline,
@@ -997,19 +996,5 @@ mod operation_poll_tests {
             ))
         );
         assert_eq!(elapsed.get(), Duration::from_secs(4));
-    }
-
-    #[test]
-    fn delete_pending_is_phase_less() {
-        let pending = crate::types::PendingDelete {
-            token: "delete-token",
-            poll_after_secs: 7,
-        };
-
-        let crate::types::PendingDelete {
-            token,
-            poll_after_secs,
-        } = pending;
-        assert_eq!((token, poll_after_secs), ("delete-token", 7));
     }
 }

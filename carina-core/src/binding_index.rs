@@ -1452,7 +1452,7 @@ impl AppliedOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialReadBack {
     operation: AppliedOperation,
-    pending: crate::resource::PendingReRead,
+    reason: String,
     missing_attributes: HashSet<String>,
     end: crate::provider::ReadBackEnd,
 }
@@ -1465,7 +1465,7 @@ impl PartialReadBack {
     ) -> Self {
         Self {
             operation,
-            pending: crate::resource::PendingReRead::incomplete(diagnostic.reason().to_string()),
+            reason: diagnostic.reason().to_string(),
             missing_attributes: diagnostic.missing_attributes().iter().cloned().collect(),
             end,
         }
@@ -1475,16 +1475,8 @@ impl PartialReadBack {
         self.operation
     }
 
-    pub fn pending(&self) -> &crate::resource::PendingReRead {
-        &self.pending
-    }
-
     pub(crate) fn reason(&self) -> &str {
-        match self.pending.reason() {
-            crate::resource::ReReadReason::Incomplete { detail }
-            | crate::resource::ReReadReason::ReadFailed { detail } => detail,
-            crate::resource::ReReadReason::NotFound => "resource was not found",
-        }
+        &self.reason
     }
 
     pub(crate) fn attribute_is_missing(&self, attribute: &str) -> bool {
@@ -1555,9 +1547,9 @@ pub struct ResolvedBinding<P: PlaceholderKind = crate::resource::NoPlaceholder> 
     pub source: BindingValueSource,
     pub completeness: BindingCompleteness,
     /// Attributes whose present values are authoritative even when the
-    /// surrounding snapshot is incomplete. These include desired/configured
-    /// attributes and provider outputs returned by a partial read-back;
-    /// outputs merged from an old or in-flight snapshot are excluded.
+    /// surrounding snapshot is incomplete. For managed resources these are
+    /// desired/configured attributes; provider outputs merged from an old or
+    /// in-flight snapshot are deliberately excluded.
     definitive_attributes: HashSet<String>,
     /// Attributes directly changed by a planned update. This records which
     /// refreshed keys were replaced/removed by the authored desired view.
@@ -1571,6 +1563,14 @@ pub struct ResolvedBinding<P: PlaceholderKind = crate::resource::NoPlaceholder> 
     /// which validate required pre-apply references must retain the taint so
     /// an unresolved reference cannot make a secret export appear public.
     removed_sensitive_attributes: HashSet<String>,
+}
+
+impl<P: PlaceholderKind> ResolvedBinding<P> {
+    /// Changed authored values describe the desired view, not a provider
+    /// snapshot: nested provider-filled fields can still be unpublished.
+    fn attribute_snapshot_is_known(&self, attribute: &str) -> bool {
+        !self.changed_attributes.contains(attribute) && self.completeness.attribute_known(attribute)
+    }
 }
 
 /// Attribute values whose provider plaintext has been reconciled with the
@@ -1649,8 +1649,7 @@ impl<P: PlaceholderKind> ResolvedBindings<P> {
     pub fn attribute_value_is_definitive(&self, name: &str, attribute: &str) -> bool {
         self.by_name.get(name).is_some_and(|binding| {
             binding.definitive_attributes.contains(attribute)
-                || (!binding.changed_attributes.contains(attribute)
-                    && binding.completeness.attribute_known(attribute))
+                || binding.attribute_snapshot_is_known(attribute)
         })
     }
 
@@ -2369,7 +2368,7 @@ impl ResolvedBindings {
         let mut definitive = true;
         value.visit_resource_refs(&mut |path| {
             definitive &= self.by_name.get(path.binding()).is_some_and(|binding| {
-                binding.completeness.attribute_known(path.attribute())
+                binding.attribute_snapshot_is_known(path.attribute())
                     && !binding.refreshable_attributes.contains(path.attribute())
             });
         });
@@ -2413,21 +2412,13 @@ impl ResolvedBindings {
             );
             merged.insert(k.clone(), value);
         }
-        let definitive_attributes = match &completeness {
-            BindingCompleteness::PartialReadBack(partial) => merged
-                .keys()
-                .filter(|attribute| !partial.attribute_is_missing(attribute))
-                .cloned()
-                .collect(),
-            BindingCompleteness::Complete | BindingCompleteness::Incomplete => HashSet::new(),
-        };
         self.by_name.insert(
             name.to_string(),
             ResolvedBinding {
                 attributes: merged,
                 source: BindingValueSource::Local,
                 completeness,
-                definitive_attributes,
+                definitive_attributes: HashSet::new(),
                 changed_attributes: HashSet::new(),
                 refreshable_attributes: HashSet::new(),
                 removed_sensitive_attributes: HashSet::new(),

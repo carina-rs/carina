@@ -2070,11 +2070,9 @@ pub(crate) fn fixture_read_outcome_for_identifier(
 ///     CreateOutcome::Success { state }
 /// }
 /// ```
-#[derive(Debug, Serialize)]
-#[serde(transparent)]
+#[derive(Debug)]
 pub struct CreateOutcome {
     kind: CreateOutcomeKind,
-    #[serde(skip)]
     read_back_end: ReadBackEnd,
 }
 
@@ -2091,11 +2089,9 @@ pub enum CreateOutcomeKind {
 }
 
 /// Result of a provider update operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone)]
 pub struct UpdateOutcome {
     kind: UpdateOutcomeKind,
-    #[serde(skip)]
     read_back_end: ReadBackEnd,
 }
 
@@ -2109,18 +2105,6 @@ pub enum UpdateOutcomeKind {
         state: AppliedState,
         diagnostic: PartialReadDiagnostic,
     },
-}
-
-impl PartialEq for CreateOutcome {
-    fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
-    }
-}
-
-impl PartialEq for UpdateOutcome {
-    fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
-    }
 }
 
 /// Diagnostic details for a partial post-mutation read.
@@ -4743,10 +4727,6 @@ impl UpdateOutcome {
             }
             None => Self::success(state),
         }
-    }
-
-    pub fn from_parts(state: AppliedState, diagnostic: PartialReadDiagnostic) -> Self {
-        Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
     }
 
     fn provider_reported(kind: UpdateOutcomeKind) -> Self {
@@ -9745,6 +9725,7 @@ mod tests {
             "read-back remained incomplete".to_string(),
             vec!["computed".to_string()],
         ));
+        let provider_kind = provider_outcome.as_ref().unwrap().kind().clone();
         let driven =
             futures::executor::block_on(carina_provider_protocol::drive_pending_infallible(
                 std::time::Duration::ZERO,
@@ -9777,16 +9758,10 @@ mod tests {
         let host_outcome = UpdateOutcome::from_host_completion(completed);
         assert_eq!(host_outcome.read_back_end(), ReadBackEnd::HostDeadline);
 
-        let encoded_outcome = serde_json::to_value(&host_outcome).unwrap();
-        let round_tripped_outcome: UpdateOutcome = serde_json::from_value(encoded_outcome).unwrap();
         assert_eq!(
-            round_tripped_outcome.read_back_end(),
-            ReadBackEnd::ProviderReported,
-            "serialized provider outcomes must not retain same-run host provenance",
-        );
-        assert_eq!(
-            host_outcome, round_tripped_outcome,
-            "host provenance is not part of provider outcome identity",
+            host_outcome.kind(),
+            &provider_kind,
+            "host provenance does not change the provider-reported outcome kind",
         );
 
         let writeback = host_outcome.into_state_for_writeback();

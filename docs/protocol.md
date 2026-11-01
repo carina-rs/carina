@@ -12,8 +12,9 @@ The read-back deadline starts only when the first `read-back` pending result
 arrives and is the earlier of that time plus the resource's read-back budget
 and the operation deadline. The schema may set a typed, non-zero
 `operation_config.read_back.timeout_secs`; otherwise the host uses two
-minutes. The read-back budget never extends or adds to the 15-minute default
-operation budget. Poll delays remain clamped to 1–300 seconds against the
+minutes. The read-back budget is clipped to the operation budget in effect,
+including any resource-specific override; it never extends that budget.
+Poll delays remain clamped to 1–300 seconds against the
 active deadline.
 
 At the active deadline the host sends exactly one `final-attempt`. The phase of

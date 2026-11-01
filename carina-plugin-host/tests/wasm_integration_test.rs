@@ -1620,7 +1620,7 @@ async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_succes
         "resumed-read-back-partial",
         None,
     );
-    let token = serde_json::json!({ "read_back": true }).to_string();
+    let token = serde_json::json!({ "phase": "read_back" }).to_string();
     let pending = persisted_create_for_resume(&id, &token, Some("mock-id"));
     let resource = resource_with_int_attribute(
         "test.short_budget",
@@ -1649,6 +1649,113 @@ async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_succes
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_round3_fresh_delete_recovers_pending_controls_from_identifier() {
+    let path = wasm_path().expect("build the WASM mock before running this test");
+    let (factory, _cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let provider = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let resource = resource_with_int_attribute(
+        "test.short_budget",
+        "fresh-delete",
+        "delete_pending_polls",
+        100,
+    );
+    let id = resource.id.clone();
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("create resource with asynchronous delete"),
+    );
+    drop(provider);
+    let (factory, _fresh_cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let fresh = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let identifier = AppliedIdentifier::new(created.identifier.unwrap()).unwrap();
+    let error = fresh
+        .provider()
+        .delete(&id, &identifier, delete_request_without_schema())
+        .await
+        .expect_err("a fresh instance must honor the pending delete and exhaust its budget");
+    assert!(error.to_string().contains("budget"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_round3_fresh_read_uses_updated_read_back_controls() {
+    let path = wasm_path().expect("build the WASM mock before running this test");
+    let (factory, _cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let provider = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let mut resource = resource_with_int_attribute("test.resource", "fresh-update", "value", 1);
+    let id = resource.id.clone();
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .unwrap(),
+    );
+    drop(provider);
+    let (factory, _update_cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let updater = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(1)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &["value".into(), "update_read_back_pending_polls".into()],
+    )
+    .await;
+    let updated = updater
+        .provider()
+        .update(&id, &identifier, request)
+        .await
+        .unwrap()
+        .into_state_for_writeback();
+    drop(updater);
+    let (factory, _read_cache) = load_factory(&path).await;
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let reader = factory
+        .create_initialized_provider(None, &config)
+        .await
+        .unwrap();
+    let identifier = AppliedIdentifier::new(updated.identifier.unwrap()).unwrap();
+    let state = reader
+        .provider()
+        .read(&id, &identifier, ReadRequest)
+        .await
+        .unwrap()
+        .into_state();
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into()))),
+        "a new instance must read the updated payload, not the create-time payload",
+    );
+    assert_ne!(
+        state.attributes.get("value"),
+        Some(&Value::Concrete(ConcreteValue::Int(1)))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_pending_update_polls_until_success() {
     const PENDING_POLLS: u32 = 2;
 
@@ -1667,6 +1774,7 @@ async fn test_wasm_pending_update_polls_until_success() {
             .await
             .expect("setup create should succeed"),
     );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_pending_polls",
@@ -1681,7 +1789,7 @@ async fn test_wasm_pending_update_polls_until_success() {
 
     let state = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("pending update should settle")
         .into_state_for_writeback();
@@ -1715,6 +1823,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
             .await
             .expect("setup create should succeed"),
     );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -1732,7 +1841,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
 
     let state = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("update read-back should settle within the default budget")
         .into_state_for_writeback();
@@ -1766,6 +1875,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
             .await
             .expect("setup create should succeed"),
     );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -1783,7 +1893,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
 
     let outcome = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("the final update attempt should return a partial success");
     let diagnostic = outcome
@@ -1793,9 +1903,10 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
     let partial = outcome.into_state_for_writeback();
     assert!(partial.partial_read.is_some());
 
+    let partial_identifier = AppliedIdentifier::new(partial.identifier.clone().unwrap()).unwrap();
     let refreshed = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &partial_identifier, ReadRequest)
         .await
         .expect("the next refresh should re-read the updated resource")
         .into_state();
@@ -1833,6 +1944,7 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
             .await
             .expect("setup create should succeed"),
     );
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
         "update_read_back_pending_polls",
@@ -1855,14 +1967,14 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
 
     let error = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
         .expect_err("read-back must not regress to operation pending");
     assert!(error.to_string().contains("polling protocol"), "{error}");
 
     let recovered = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &created_identifier, ReadRequest)
         .await
         .expect("the retained update identifier must remain usable for recovery")
         .into_state();
@@ -1889,16 +2001,17 @@ async fn test_wasm_pending_delete_polls_until_success() {
         "delete_pending_polls",
         i64::from(PENDING_POLLS),
     );
-    provider
+    let created = provider
         .provider()
         .create_for_test(&id, create_request_for_test(resource).await)
         .await
         .expect("setup create should succeed");
+    let identifier = created.identifier().clone();
 
     let delete_started = Instant::now();
     provider
         .provider()
-        .delete(&id, &mock_identifier(), delete_request_without_schema())
+        .delete(&id, &identifier, delete_request_without_schema())
         .await
         .expect("pending delete should settle");
     assert!(
@@ -1908,7 +2021,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
 
     let state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &identifier, ReadRequest)
         .await
         .expect("provider should remain usable")
         .into_state();
@@ -2398,6 +2511,7 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
         None,
     );
     let previous_token = serde_json::json!({
+        "phase": "operation",
         "remaining": 100,
         "polls_served": 0,
         "mode": "pending",
@@ -2476,6 +2590,7 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             None,
         );
         let token = serde_json::json!({
+            "phase": "operation",
             "remaining": 100,
             "polls_served": 0,
             "mode": mode,
@@ -2613,6 +2728,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     let resumed_id =
         ResourceId::with_provider_identity("mock", "test.short_budget", "canonical-resumed", None);
     let token = serde_json::json!({
+        "phase": "operation",
         "remaining": 100,
         "polls_served": 0,
         "mode": "resumed",
@@ -3598,6 +3714,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     );
 
     // Prepare all four patch variants through the checked core seam.
+    let created_identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr(
         "color",
         Value::Concrete(ConcreteValue::String("blue".into())),
@@ -3617,7 +3734,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
         .expect("update should succeed")
         .into_state_for_writeback();
@@ -3662,10 +3779,11 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Value::Concrete(ConcreteValue::String("reassert:reassert_token".into()))
     );
 
+    let updated_identifier = AppliedIdentifier::new(updated.identifier.clone().unwrap()).unwrap();
     // Read to verify update persisted in memory
     let read_state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &updated_identifier, ReadRequest)
         .await
         .expect("read should not error")
         .into_state();
@@ -3677,14 +3795,14 @@ async fn test_wasm_mock_provider_update_and_delete() {
     // Delete
     provider
         .provider()
-        .delete(&id, &mock_identifier(), delete_request_without_schema())
+        .delete(&id, &updated_identifier, delete_request_without_schema())
         .await
         .expect("delete should succeed");
 
     // Read after delete - should return empty state (no identifier, no attributes)
     let deleted_state = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &updated_identifier, ReadRequest)
         .await
         .expect("read should not error")
         .into_state();
@@ -3809,11 +3927,12 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
         ),
         ("payload".into(), cloud_payload.clone()),
     ]);
-    provider
+    let created = provider
         .provider()
         .create_for_test(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should seed the mock cloud store");
+    let created_identifier = created.identifier().clone();
 
     let (persisted_secret, _) = redacted_secret_and_legacy_marker("cloud-secret");
     let from = State::existing(
@@ -3832,21 +3951,23 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
             ),
         ]),
     )
-    .with_identifier("mock-id");
+    .with_identifier(created_identifier.as_str());
     resource.set_attr(
         "color",
         Value::Concrete(ConcreteValue::String("blue".into())),
     );
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
-    provider
+    let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update(&id, &created_identifier, request)
         .await
-        .expect("update should preserve the unchanged persisted attribute");
+        .expect("update should preserve the unchanged persisted attribute")
+        .into_state_for_writeback();
+    let updated_identifier = AppliedIdentifier::new(updated.identifier.unwrap()).unwrap();
 
     let read = provider
         .provider()
-        .read(&id, &mock_identifier(), ReadRequest)
+        .read(&id, &updated_identifier, ReadRequest)
         .await
         .expect("read after update should succeed")
         .into_state();

@@ -437,6 +437,7 @@ fn assert_fully_resolved(
             },
             path.binding(),
             bindings,
+            value,
         )),
         Value::Deferred(DeferredValue::BindingRef { binding }) => Err(unresolved_binding_message(
             attribute_key,
@@ -445,6 +446,7 @@ fn assert_fully_resolved(
             },
             binding,
             bindings,
+            value,
         )),
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
             Err(SerializationError::UnresolvedCoalesce {
@@ -461,6 +463,7 @@ fn assert_fully_resolved(
                 },
                 leaf.unwrap_or(""),
                 bindings,
+                value,
             ))
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
@@ -470,6 +473,7 @@ fn assert_fully_resolved(
                 UnresolvedSite::Interpolation,
                 leaf.unwrap_or(""),
                 bindings,
+                value,
             ))
         }
         Value::Deferred(
@@ -483,6 +487,7 @@ fn assert_fully_resolved(
                 },
                 leaf.unwrap_or(""),
                 bindings,
+                value,
             ))
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
@@ -494,6 +499,7 @@ fn assert_fully_resolved(
                 },
                 leaf.unwrap_or(""),
                 bindings,
+                value,
             ))
         }
         Value::Deferred(DeferredValue::Access(_)) => {
@@ -505,6 +511,7 @@ fn assert_fully_resolved(
                 },
                 leaf.unwrap_or(""),
                 bindings,
+                value,
             ))
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
@@ -538,6 +545,7 @@ fn unresolved_binding_message(
     site: UnresolvedSite,
     referenced_binding: &str,
     bindings: &ResolvedBindings,
+    referenced_value: &Value,
 ) -> String {
     let opener = match &site {
         UnresolvedSite::Ref { path } => format!(
@@ -557,9 +565,19 @@ fn unresolved_binding_message(
         ),
     };
 
-    let remediation = match bindings.completeness(referenced_binding) {
-        Some(BindingCompleteness::PartialReadBack(partial))
-            if partial.end() == ReadBackEnd::HostDeadline =>
+    let partial = match bindings.completeness(referenced_binding) {
+        Some(BindingCompleteness::PartialReadBack(partial)) => {
+            let mut references_missing_attribute = false;
+            referenced_value.visit_resource_refs(&mut |path| {
+                references_missing_attribute |= path.binding() == referenced_binding
+                    && partial.attribute_is_missing(path.attribute());
+            });
+            references_missing_attribute.then_some(partial)
+        }
+        _ => None,
+    };
+    let remediation = match partial {
+        Some(partial) if partial.end() == ReadBackEnd::HostDeadline =>
         {
             format!(
                 "`{referenced_binding}` was {} but its read-back did not complete within the configured budget: {}. \
@@ -568,7 +586,7 @@ fn unresolved_binding_message(
                 partial.reason(),
             )
         }
-        Some(BindingCompleteness::PartialReadBack(partial)) => format!(
+        Some(partial) => format!(
             "`{referenced_binding}` was {}, but the read-back was incomplete: {}; \
              the value will be filled on the next apply or refresh.",
             partial.operation().past_tense(),
@@ -1756,6 +1774,46 @@ mod assert_fully_resolved_tests {
             err.contains("wait"),
             "error must point at `wait` as the workaround; got: {err}",
         );
+    }
+
+    #[test]
+    fn round3_unlisted_attribute_of_partial_binding_uses_ordinary_guidance() {
+        for end in [ReadBackEnd::ProviderReported, ReadBackEnd::HostDeadline] {
+            let diagnostic = PartialReadDiagnostic::new(
+                "DVO is not populated yet".into(),
+                vec!["domain_validation_options".into()],
+            )
+            .unwrap();
+            let mut bindings = ResolvedBindings::default();
+            bindings.set_with_completeness(
+                "cert",
+                HashMap::new(),
+                BindingValueSource::Local,
+                BindingCompleteness::PartialReadBack(
+                    crate::binding_index::PartialReadBack::from_diagnostic(
+                        crate::binding_index::AppliedOperation::Create,
+                        &diagnostic,
+                        end,
+                    ),
+                ),
+            );
+            let reference = Value::resource_ref("cert", "unlisted", vec![]);
+            for value in [
+                reference.clone(),
+                Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
+                    reference,
+                )])),
+                Value::Deferred(DeferredValue::BindingRef {
+                    binding: "cert".into(),
+                }),
+            ] {
+                let error = assert_fully_resolved(&value, "records", &bindings)
+                    .expect_err("unresolved unlisted reference");
+                assert!(error.contains("add a `wait` block"), "{error}");
+                assert!(!error.contains("read-back"), "{error}");
+                assert!(!error.contains(diagnostic.reason()), "{error}");
+            }
+        }
     }
 
     #[test]

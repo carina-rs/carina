@@ -67,14 +67,16 @@ impl Scenario {
     }
 }
 
-fn wasm_mock_path() -> Option<PathBuf> {
+fn wasm_mock_path() -> PathBuf {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
+        .parent()
+        .expect("CLI crate has a workspace parent")
         .to_path_buf();
     ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
         .into_iter()
         .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
         .find(|path| path.is_file())
+        .expect("WASM mock missing: build carina-provider-mock for wasm32-wasip2 before running read_back_e2e")
 }
 
 fn assert_success(label: &str, output: &Output) {
@@ -112,13 +114,42 @@ fn assert_string_attribute(
 }
 
 #[test]
+fn round3_secret_plaintext_never_appears_in_state_or_identifier() {
+    let wasm_path = wasm_mock_path();
+    let scenario = Scenario::from_fixture("read_back_within_budget", &wasm_path);
+    scenario.init();
+    let plaintexts = [
+        "round3-create-secret-plaintext",
+        "round3-update-secret-plaintext",
+    ];
+    for plaintext in plaintexts {
+        fs::write(
+            scenario.project.join("producer.crn"),
+            format!(
+                "let within_source = mock.test.read_back {{\n  create_read_back_pending_polls = 1\n  present = secret(\"{plaintext}\")\n}}\n"
+            ),
+        )
+        .unwrap();
+        let apply = scenario.apply();
+        assert_success("apply with a secret attribute", &apply);
+        let state = fs::read_to_string(scenario.project.join("carina.state.json")).unwrap();
+        let output = output_text(&apply);
+        for secret in plaintexts {
+            assert!(
+                !state.contains(secret),
+                "secret plaintext leaked into persisted state"
+            );
+            assert!(
+                !output.contains(secret),
+                "secret plaintext leaked into output"
+            );
+        }
+    }
+}
+
+#[test]
 fn read_back_completion_reaches_cross_file_dependent_in_same_apply() {
-    let Some(wasm_path) = wasm_mock_path() else {
-        eprintln!(
-            "skipping read-back CLI test: build carina-provider-mock for wasm32-wasip2 first"
-        );
-        return;
-    };
+    let wasm_path = wasm_mock_path();
     let scenario = Scenario::from_fixture("read_back_within_budget", &wasm_path);
     scenario.init();
 
@@ -131,12 +162,7 @@ fn read_back_completion_reaches_cross_file_dependent_in_same_apply() {
 
 #[test]
 fn exhausted_read_back_is_retried_by_the_next_real_apply() {
-    let Some(wasm_path) = wasm_mock_path() else {
-        eprintln!(
-            "skipping read-back CLI test: build carina-provider-mock for wasm32-wasip2 first"
-        );
-        return;
-    };
+    let wasm_path = wasm_mock_path();
     let scenario = Scenario::from_fixture("read_back_budget_exhausted", &wasm_path);
     scenario.init();
 
