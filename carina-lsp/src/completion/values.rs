@@ -2018,9 +2018,9 @@ impl CompletionProvider {
         // Custom types: built-in types + provider-extracted types (deduplicated).
         // Internal registry is snake_case; the LSP surface is PascalCase.
         let mut seen_custom = std::collections::HashSet::new();
-        let custom: Vec<CompletionItem> = carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES
+        let custom: Vec<CompletionItem> = carina_core::parser::builtin_bare_custom_types()
             .iter()
-            .map(|s| s.to_string())
+            .cloned()
             .chain(self.custom_type_names.iter().cloned())
             .filter(|name| seen_custom.insert(name.clone()))
             .map(|snake| {

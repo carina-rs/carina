@@ -4879,7 +4879,7 @@ fn unresolved_bare_type_errors(
     match ty {
         TypeExpr::Simple(name)
             if config.custom_types_loaded()
-                && !crate::parser::BUILTIN_BARE_CUSTOM_TYPES.contains(&name.as_str()) =>
+                && !crate::parser::builtin_bare_custom_types().contains(name) =>
         {
             errors.push(TypeResolutionError::unresolved_custom_type(
                 crate::parser::snake_to_pascal(name),

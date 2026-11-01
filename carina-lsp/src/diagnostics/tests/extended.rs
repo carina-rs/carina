@@ -3688,6 +3688,43 @@ let name = parts |> join("-")
 }
 
 #[test]
+fn builtin_custom_type_annotations_validate_attribute_values() {
+    let engine = test_engine();
+    for (type_name, valid_value, invalid_value) in [
+        ("Email", "\"user@example.com\"", "\"not-an-email\""),
+        ("PositiveInt", "1", "0"),
+        (
+            "HttpsUrl",
+            "\"https://example.com:8443/keys?q=1#key\"",
+            "\"http://example.com\"",
+        ),
+    ] {
+        for (value, valid) in [(valid_value, true), (invalid_value, false)] {
+            let source = format!("attributes {{\n    value: {type_name} = {value}\n}}");
+            let doc = create_document(&source);
+            let diagnostics = engine.analyze(&doc, None);
+            if valid {
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            } else {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.severity == Some(DiagnosticSeverity::WARNING)
+                            && diagnostic.message.contains(type_name)
+                    }),
+                    "{source}: {diagnostics:?}"
+                );
+            }
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| !diagnostic.message.to_lowercase().contains("unknown")),
+                "{type_name} must resolve as a built-in: {diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn attributes_block_ipv4_address_invalid() {
     let engine = test_engine();
     let doc = create_document(

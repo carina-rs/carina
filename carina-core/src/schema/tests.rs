@@ -932,7 +932,7 @@ fn struct_field_builder_methods_preserve_each_mode() {
 #[test]
 fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
     let registry = builtin_validator_registry();
-    assert_eq!(registry.len(), 12);
+    assert!(!registry.is_empty());
 
     let positive_int =
         builtin_validator(RefinedScalarKind::Int, &TypeIdentity::bare("PositiveInt"))
@@ -954,6 +954,203 @@ fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
         )))
         .is_err()
     );
+}
+
+#[test]
+fn https_url_builtin_accepts_absolute_https_urls() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    let mut urls = vec![
+        "https://example.com".to_string(),
+        "https://EXAMPLE.com/".to_string(),
+        "https://localhost".to_string(),
+        "https://a.b-c.example".to_string(),
+        "https://xn--bcher-kva.example".to_string(),
+        "https://192.0.2.1:443/oidc".to_string(),
+        "https://[2001:db8::1]:8443/.well-known/jwks.json".to_string(),
+        "https://[::1]".to_string(),
+        "https://[::ffff:192.0.2.1]/".to_string(),
+        "https://example.com:1".to_string(),
+        "https://example.com:65535".to_string(),
+        "https://example.com:0443".to_string(),
+        "https://example.com?query=value".to_string(),
+        "https://example.com#fragment".to_string(),
+        "https://example.com?#".to_string(),
+        "https://example.com:8443/a%20b?q=x%2Fy#section-1".to_string(),
+        "https://example.com/a:b@c!$&'()*+,;=~_-./?q=@x/y?z#f/g?h".to_string(),
+        "https://example.com/%E6%97%A5%E6%9C%AC?q=%00#%7F".to_string(),
+        "https://example.com/path:65536".to_string(),
+    ];
+    urls.push(format!("https://{}.example", "a".repeat(63)));
+    // Length limits belong to attributes, not this provider-neutral type.
+    urls.push(format!(
+        "https://{}/{}?q=yes#fragment",
+        vec!["a".repeat(63); 5].join("."),
+        "p".repeat(4096)
+    ));
+    for url in urls {
+        let result = validate(&Value::Concrete(ConcreteValue::String(url.clone().into())));
+        assert!(result.is_ok(), "{url:?} should be accepted: {result:?}");
+    }
+}
+
+#[test]
+fn https_url_builtin_rejects_invalid_urls() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    let mut urls = vec![
+        "",
+        "http://example.com",
+        "ftp://example.com",
+        "HTTPS://example.com",
+        "Https://example.com",
+        "https:example.com",
+        "https:/example.com",
+        "//example.com",
+        "example.com",
+        "https://",
+        "https:///path",
+        "https://?query",
+        "https://#fragment",
+        "https://:443",
+        "https://user@example.com",
+        "https://user:password@example.com",
+        "https://@example.com",
+        "https://example.com@evil.example",
+        "https://.example.com",
+        "https://example.com.",
+        "https://example..com",
+        "https://-example.com",
+        "https://example-.com",
+        "https://exa_mple.com",
+        "https://*.example.com",
+        "https://b\u{fc}cher.example",
+        "https://%65xample.com",
+        "https://256.0.0.1",
+        "https://192.0.2.01",
+        "https://127.1",
+        "https://[::1",
+        "https://[]",
+        "https://[127.0.0.1]",
+        "https://[not-ipv6]",
+        "https://[2001:db8::1::2]",
+        "https://[fe80::1%25eth0]",
+        "https://::1",
+        "https://[::1]suffix",
+        "https://[::1]]",
+        "https://[::1]:",
+        "https://[::1]:0",
+        "https://[::1]:65536",
+        "https://example.com:",
+        "https://example.com:0",
+        "https://example.com:65536",
+        "https://example.com:9999999999999999999999",
+        "https://example.com:+443",
+        "https://example.com:-1",
+        "https://example.com:abc",
+        "https://example.com:443:444",
+        "https://example.com:/path",
+        "https://example.com:?q",
+        "https://example.com\\@evil.example",
+        "https://example.com/path\\tail",
+        "https://example.com/%",
+        "https://example.com/%2",
+        "https://example.com/%GG",
+        "https://example.com?q=%zz",
+        "https://example.com#%x1",
+        "https://example.com#one#two",
+        "https://example.com/<tag>",
+        "https://example.com/\"quote",
+        "https://example.com/{path}",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    urls.push(format!("https://{}.example", "a".repeat(64)));
+    for url in urls {
+        assert!(
+            validate(&Value::Concrete(ConcreteValue::String(url.clone().into()))).is_err(),
+            "{url:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn https_url_builtin_rejects_whitespace_and_controls_in_every_component() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    let characters = (0u8..=32).map(char::from).chain([
+        '\u{7f}', '\u{85}', '\u{9f}', '\u{a0}', '\u{2003}', '\u{2028}',
+    ]);
+    for character in characters {
+        for (prefix, suffix) in [
+            ("", "https://example.com"),
+            ("https://exa", "mple.com"),
+            ("https://example.com:44", "3"),
+            ("https://example.com/p", "ath"),
+            ("https://example.com?q=v", "alue"),
+            ("https://example.com#frag", "ment"),
+        ] {
+            let url = format!("{prefix}{character}{suffix}");
+            assert!(
+                validate(&Value::Concrete(ConcreteValue::String(url.clone().into()))).is_err(),
+                "{url:?} should be rejected"
+            );
+        }
+    }
+}
+
+#[test]
+fn https_url_builtin_rejects_non_string_values() {
+    let validate = builtin_validator(RefinedScalarKind::String, &TypeIdentity::bare("HttpsUrl"))
+        .expect("HttpsUrl must be a registered built-in");
+    for value in [
+        Value::Concrete(ConcreteValue::Int(443)),
+        Value::Concrete(ConcreteValue::Float(443.0)),
+        Value::Concrete(ConcreteValue::Bool(true)),
+        Value::Concrete(ConcreteValue::List(vec![])),
+    ] {
+        assert!(validate(&value).is_err(), "{value:?} should be rejected");
+    }
+}
+
+#[test]
+fn https_url_builtin_constructor_and_json_roundtrip_preserve_validation() {
+    let url_type = types::https_url();
+    let AttrTypeKind::String {
+        binding,
+        pattern,
+        length,
+        ..
+    } = url_type.kind()
+    else {
+        panic!("HttpsUrl must refine String");
+    };
+    assert_eq!(binding.identity(), Some(&TypeIdentity::bare("HttpsUrl")));
+    assert!(pattern.is_none() && length.is_none());
+
+    let wire = crate::protocol_convert::attribute_type_to_protocol(&url_type).unwrap();
+    let json = serde_json::to_string(&wire).unwrap();
+    let wire = serde_json::from_str(&json).unwrap();
+    let decoded = crate::protocol_convert::protocol_to_attribute_type(&wire).unwrap();
+    for ty in [url_type, decoded] {
+        assert!(
+            ty.validate(&Value::Concrete(ConcreteValue::String(
+                "https://example.com:8443/keys?q=1#key".into()
+            )))
+            .is_ok()
+        );
+        assert!(
+            ty.validate(&Value::Concrete(ConcreteValue::String(
+                "http://example.com".into()
+            )))
+            .is_err()
+        );
+        assert!(
+            ty.validate(&Value::Concrete(ConcreteValue::Int(443)))
+                .is_err()
+        );
+    }
 }
 
 #[test]

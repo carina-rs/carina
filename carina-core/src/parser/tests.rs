@@ -9349,6 +9349,49 @@ fn type_expr_display_simple_is_pascal_case() {
 // --- Issue #1285: Validate fn call arguments for custom types ---
 
 #[test]
+fn user_fn_https_url_custom_type_validates_arguments() {
+    for (url, valid) in [
+        ("https://example.com:8443/oidc?q=1#keys", true),
+        ("http://example.com", false),
+        ("https://user@example.com", false),
+    ] {
+        let input =
+            format!("fn f(url: HttpsUrl) {{ url }}\nlet b = aws.s3_bucket {{ name = f({url:?}) }}");
+        let result = parse(&input, &ProviderContext::default());
+        if valid {
+            assert!(result.is_ok(), "{url:?}: {result:?}");
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("parameter 'url': expected HttpsUrl"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn user_fn_https_url_custom_type_validates_return_values() {
+    for (url, valid) in [
+        ("https://[2001:db8::1]/keys", true),
+        ("https://example.com:65536/keys", false),
+    ] {
+        let input =
+            format!("fn f(): HttpsUrl {{ {url:?} }}\nlet b = aws.s3_bucket {{ name = f() }}");
+        let result = parse(&input, &ProviderContext::default());
+        if valid {
+            assert!(result.is_ok(), "{url:?}: {result:?}");
+        } else {
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("return value: expected HttpsUrl"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
 fn user_fn_custom_type_cidr_arg_valid() {
     let input = r#"
         fn f(x: Ipv4Cidr) { x }

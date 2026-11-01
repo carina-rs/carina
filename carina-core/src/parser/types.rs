@@ -72,23 +72,25 @@ pub(super) fn parse_type_expr(
     }
 }
 
-/// The set of bare PascalCase custom types built into the DSL itself.
-/// These are accepted in a type position regardless of which providers
-/// (if any) have registered, because their validators live in
-/// `carina-core` rather than in any provider — see the matching arms in
-/// [`crate::parser::functions::validate_custom_type`].
-pub const BUILTIN_BARE_CUSTOM_TYPES: &[&str] = &[
-    "ipv4_cidr",
-    "ipv4_address",
-    "ipv6_cidr",
-    "ipv6_address",
-    "http_response_status_code",
-    "redirect_host",
-    "redirect_path",
-    "redirect_port",
-    "redirect_protocol",
-    "redirect_query",
-];
+/// Snake-case names of the bare custom types built into the DSL, sorted for
+/// deterministic tooling output. Every registered core refinement is accepted
+/// in a type position without a provider.
+///
+/// Names come from [`crate::schema::builtin_validator_registry`], the same
+/// constructor-backed source used to validate values and reconstruct validators
+/// across process boundaries.
+pub fn builtin_bare_custom_types() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names: Vec<_> = crate::schema::builtin_validator_registry()
+            .keys()
+            .map(|(_, identity)| pascal_to_snake(&identity.kind))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    })
+}
 
 /// Resolve a snake-cased bare custom-type annotation without discarding its
 /// schema owner.
@@ -102,7 +104,7 @@ pub(crate) fn resolve_known_bare_custom_type(
     snake: &str,
     config: &ProviderContext,
 ) -> Option<TypeExpr> {
-    if BUILTIN_BARE_CUSTOM_TYPES.contains(&snake) {
+    if builtin_bare_custom_types().iter().any(|name| name == snake) {
         return Some(TypeExpr::Simple(snake.to_string()));
     }
     let pascal = snake_to_pascal(snake);
@@ -441,25 +443,39 @@ mod tests {
     #[test]
     fn parse_type_expr_str_rejects_unknown_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
-        // No validators registered → only the BUILTIN_BARE_CUSTOM_TYPES
-        // set is valid. A clearly-fake name is rejected.
+        // No provider validators registered → only core built-ins are valid.
+        // A clearly-fake name is rejected.
         assert_eq!(parse_type_expr_str("TotallyMadeUpType", &ctx), None);
         // A historical-but-removed name is rejected the same way — the
         // bug-headline example from carina#3239.
         assert_eq!(parse_type_expr_str("IamOidcProviderArn", &ctx), None);
     }
 
-    /// Built-in DSL custom types (the `BUILTIN_BARE_CUSTOM_TYPES` set)
+    /// Built-in DSL custom types from the core validator registry
     /// are always accepted, even when no provider has registered any
     /// validators — they are part of `carina-core` itself.
     #[test]
     fn parse_type_expr_str_accepts_builtins_when_custom_types_are_loaded() {
         let ctx = loaded_context(Default::default());
-        for snake in BUILTIN_BARE_CUSTOM_TYPES {
+        for snake in builtin_bare_custom_types() {
             let name = snake_to_pascal(snake);
             assert!(
                 matches!(parse_type_expr_str(&name, &ctx), Some(TypeExpr::Simple(_))),
                 "built-in custom type '{name}' must parse with loaded custom types"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_type_expr_str_accepts_every_builtin_validator_when_custom_types_are_loaded() {
+        let ctx = loaded_context(Default::default());
+        for (_, identity) in crate::schema::builtin_validator_registry().keys() {
+            assert!(identity.provider.is_none() && identity.segments.is_empty());
+            let name = &identity.kind;
+            assert_eq!(
+                parse_type_expr_str(name, &ctx),
+                Some(TypeExpr::Simple(pascal_to_snake(name))),
+                "registered built-in {name} must be accepted without a provider"
             );
         }
     }

@@ -11928,6 +11928,36 @@ pub mod types {
         )
     }
 
+    /// Absolute HTTPS URL with a DNS, IPv4, or bracketed IPv6 host.
+    ///
+    /// Requires the lowercase `https://` scheme and forbids userinfo, whitespace,
+    /// and control characters. An optional decimal port must be in `1..=65535`.
+    /// Paths, queries, and fragments use ASCII URL characters or percent escapes.
+    /// Length caps and restrictions on ports or queries belong to attributes.
+    ///
+    /// ```
+    /// # use carina_core::schema::validate_https_url;
+    /// assert!(validate_https_url("https://example.com").is_ok());
+    /// assert!(validate_https_url("https://[2001:db8::1]:8443/keys?q=1#key").is_ok());
+    /// assert!(validate_https_url("http://example.com").is_err());
+    /// assert!(validate_https_url("https://user@example.com").is_err());
+    /// ```
+    pub fn https_url() -> AttributeType {
+        AttributeType::refined_string_with_validator(
+            TypeIdentity::bare("HttpsUrl"),
+            None,
+            None,
+            legacy_validator(|value| {
+                if let Value::Concrete(ConcreteValue::String(s)) = value {
+                    validate_https_url(s.expose_plaintext())
+                } else {
+                    Err("Expected string".to_string())
+                }
+            }),
+            None,
+        )
+    }
+
     /// HTTP response status code restricted to 2XX/4XX/5XX (3-digit string).
     ///
     /// Informational (1XX) and redirect (3XX) codes are excluded by design —
@@ -12089,7 +12119,8 @@ impl fmt::Display for RefinedScalarKind {
 ///
 /// The registry is built from the same constructors providers use, so schema
 /// construction and process-boundary reconstruction cannot drift onto two
-/// hand-maintained identity lists.
+/// hand-maintained identity lists. DSL type names are derived from this registry
+/// by [`crate::parser::builtin_bare_custom_types`].
 pub fn builtin_validator_registry()
 -> &'static HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator> {
     static REGISTRY: OnceLock<HashMap<(RefinedScalarKind, TypeIdentity), CustomValidator>> =
@@ -12102,6 +12133,7 @@ pub fn builtin_validator_registry()
             types::ipv6_address(),
             types::ipv6_cidr(),
             types::email(),
+            types::https_url(),
             types::http_response_status_code(),
             types::redirect_protocol(),
             types::redirect_host(),
@@ -12351,6 +12383,131 @@ pub fn validate_email(email: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Validate an absolute URL with the lowercase `https://` scheme.
+///
+/// DNS labels contain 1–63 ASCII letters, digits, or hyphens, with no leading or
+/// trailing hyphen; a single-label host is allowed, but a trailing dot is not.
+/// Dotted numeric hosts must be standard IPv4 addresses. IPv6 literals must be
+/// bracketed and cannot contain a zone identifier. An optional port is decimal
+/// and in `1..=65535` (leading zeros are allowed).
+///
+/// Optional path, query, and fragment follow RFC 3986 character and percent-escape
+/// syntax. Literal whitespace and control characters are rejected everywhere;
+/// percent-encoded bytes are not decoded. No overall length limit is imposed.
+pub fn validate_https_url(url: &str) -> Result<(), String> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("HTTPS URL must not contain whitespace or control characters".to_string());
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| "Expected an absolute URL starting with lowercase https://".to_string())?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    if authority.contains('@') {
+        return Err("HTTPS URL must not contain userinfo".to_string());
+    }
+
+    let port = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, after_host) = bracketed
+            .split_once(']')
+            .ok_or_else(|| "HTTPS URL IPv6 host must have a closing bracket".to_string())?;
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| "HTTPS URL has an invalid IPv6 host".to_string())?;
+        if after_host.is_empty() {
+            None
+        } else {
+            Some(after_host.strip_prefix(':').ok_or_else(|| {
+                "HTTPS URL allows only a port after the bracketed host".to_string()
+            })?)
+        }
+    } else {
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        if host.is_empty() {
+            return Err("HTTPS URL must have a host".to_string());
+        }
+        if host.contains('.') && host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            host.parse::<std::net::Ipv4Addr>()
+                .map_err(|_| "HTTPS URL has an invalid IPv4 host".to_string())?;
+        } else {
+            for label in host.split('.') {
+                if !(1..=63).contains(&label.len())
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                {
+                    return Err("HTTPS URL host labels must contain 1–63 ASCII letters, digits, or hyphens and cannot start or end with a hyphen".to_string());
+                }
+            }
+        }
+        port
+    };
+
+    if let Some(port) = port
+        && (port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || !port.parse::<u16>().is_ok_and(|n| n > 0))
+    {
+        return Err("HTTPS URL port must be a decimal integer in 1..=65535".to_string());
+    }
+
+    let (path_and_query, fragment) = suffix.split_once('#').unwrap_or((suffix, ""));
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
+    if !valid_https_url_component(path, false)
+        || !valid_https_url_component(query, true)
+        || !valid_https_url_component(fragment, true)
+    {
+        return Err(
+            "HTTPS URL path, query, and fragment must use URL characters and valid percent escapes"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn valid_https_url_component(component: &str, allow_question_mark: bool) -> bool {
+    let mut bytes = component.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            if !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+                || !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+            {
+                return false;
+            }
+        } else if !(byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'/'
+            )
+            || (allow_question_mark && byte == b'?'))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Validate a 3-digit HTTP response status code restricted to 2XX/4XX/5XX.

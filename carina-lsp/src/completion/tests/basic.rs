@@ -1002,8 +1002,8 @@ fn type_completion_includes_basic_types() {
     );
 
     // Built-in custom types should always appear (no provider needed)
-    for snake in carina_core::parser::BUILTIN_BARE_CUSTOM_TYPES {
-        let builtin_custom = carina_core::parser::snake_to_pascal(snake);
+    for (_, identity) in carina_core::schema::builtin_validator_registry().keys() {
+        let builtin_custom = &identity.kind;
         assert!(
             labels.contains(&builtin_custom.as_str()),
             "Type completions should include built-in custom type '{}'. Got: {:?}",
