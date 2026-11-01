@@ -163,7 +163,7 @@ pub const fn egress_json_bytes<const N: usize>(json: &str) -> [u8; N] {
     output
 }
 
-/// Decode the version-13 `desired-resource` record into the SDK's typed view.
+/// Decode the version-16 `desired-resource` record into the SDK's typed view.
 ///
 /// This is public only because [`crate::export_provider!`] expands in the
 /// provider crate. Provider implementations receive [`crate::DesiredResource`]
@@ -192,7 +192,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource.id, resource.resource.attributes.iter())
 }
 
-/// Render one error chain for protocol-v13 metadata's string-only failure
+/// Render one error chain for protocol-v16 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -220,14 +220,14 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-13 WIT resource records.
+/// Return the honest directive default for protocol-16 WIT resource records.
 ///
-/// Protocol 13 does not transport directives on create, poll-create,
+/// Protocol 16 does not transport directives on create, poll-create,
 /// resume-create, read-data-source, or normalize-desired requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Delete-request directives are transported separately after host resolution.
 #[doc(hidden)]
-pub fn protocol_13_default_resource_directives() -> proto::Directives {
+pub fn protocol_16_default_resource_directives() -> proto::Directives {
     proto::Directives::default()
 }
 
@@ -842,7 +842,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v13 metadata exports return a bare string rather
+                // Protocol v16 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure
@@ -2297,7 +2297,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
@@ -2315,7 +2315,7 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2347,7 +2347,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2395,7 +2395,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_13_default_resource_directives();
+                    let directives = helpers::protocol_16_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2616,7 +2616,7 @@ macro_rules! export_provider {
                                 resource,
                                 deferred,
                             } = desired;
-                            let directives = helpers::protocol_13_default_resource_directives();
+                            let directives = helpers::protocol_16_default_resource_directives();
                             let resource = wit_to_proto_resource(&resource, directives).map_err(|error| {
                                 boundary_decode_to_provider_error(
                                     "normalize_desired",
@@ -2838,7 +2838,7 @@ mod tests {
 
     #[test]
     fn wit_resource_protocol_directives_are_all_false_without_transport() {
-        let directives = protocol_13_default_resource_directives();
+        let directives = protocol_16_default_resource_directives();
 
         assert!(!directives.force_delete);
         assert!(!directives.create_before_destroy);

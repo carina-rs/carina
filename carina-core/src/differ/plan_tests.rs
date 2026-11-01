@@ -700,6 +700,264 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
     assert!(plan.effects().is_empty(), "unexpected plan: {plan:?}");
 }
 
+fn nested_create_only_schema() -> ResourceSchema {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    ResourceSchema::new("example.Widget").attribute(
+        AttributeSchema::required(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional("immutable", AttributeType::string())
+                        .create_only()
+                        .build(),
+                    StructField::required("mutable", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    )
+}
+
+fn nested_config(mutable: &str, immutable: Option<&str>) -> Value {
+    let mut fields = IndexMap::from([(
+        "mutable".to_string(),
+        Value::Concrete(ConcreteValue::String(mutable.into())),
+    )]);
+    if let Some(immutable) = immutable {
+        fields.insert(
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::String(immutable.into())),
+        );
+    }
+    Value::Concrete(ConcreteValue::Map(fields))
+}
+
+fn nested_create_only_plan(
+    desired_mutable: &str,
+    current_mutable: &str,
+    authored_immutable: bool,
+) -> Plan {
+    let desired = Resource::new("example.Widget", "widget")
+        .with_attribute("config", nested_config(desired_mutable, None));
+    let id = desired.id.clone();
+    let schema = nested_create_only_schema();
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        schema
+            .validate()
+            .expect("nested create-only fixture schema must be valid"),
+    );
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                nested_config(current_mutable, Some("provider-or-authored")),
+            )]),
+        ),
+    )]);
+    let mut config_children = HashMap::from([("mutable".to_string(), ExplicitFields::Leaf)]);
+    if authored_immutable {
+        config_children.insert("immutable".to_string(), ExplicitFields::Leaf);
+    }
+    let prev_explicit = HashMap::from([(
+        id,
+        ExplicitFields::Struct {
+            children: HashMap::from([(
+                "config".to_string(),
+                ExplicitFields::Struct {
+                    children: config_children,
+                },
+            )]),
+        },
+    )]);
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+
+    create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &registry,
+        &empty_lifted_saved_attrs(),
+        &prev_explicit,
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn removing_authored_nested_create_only_field_plans_replacement() {
+    let plan = nested_create_only_plan("same", "same", true);
+
+    assert!(!plan.has_errors(), "unexpected errors: {:?}", plan.errors());
+    assert_eq!(plan.summary().replace, 1, "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().update, 0, "unexpected plan: {plan:?}");
+}
+
+#[test]
+fn provider_filled_nested_create_only_field_does_not_replace() {
+    let plan = nested_create_only_plan("new", "old", false);
+
+    assert!(!plan.has_errors(), "unexpected errors: {:?}", plan.errors());
+    assert_eq!(plan.summary().replace, 0, "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().update, 1, "unexpected plan: {plan:?}");
+}
+
+fn plan_nested_create_only_with_authoring(
+    schema: ResourceSchema,
+    desired_config: Value,
+    current_config: Value,
+    authoring: ExplicitFields,
+) -> Plan {
+    let desired =
+        Resource::new("example.Widget", "widget").with_attribute("config", desired_config);
+    let id = desired.id.clone();
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        schema.validate().expect("valid nested create-only schema"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(
+            id.clone(),
+            existing_state(
+                id.clone(),
+                HashMap::from([("config".to_string(), current_config)]),
+            ),
+        )]),
+        &registry,
+        std::slice::from_ref(&desired),
+    );
+    create_plan(
+        &[desired],
+        &[],
+        &HintProvider { hints: Vec::new() },
+        &current,
+        &HashMap::new(),
+        &registry,
+        &empty_lifted_saved_attrs(),
+        &HashMap::from([(id, authoring)]),
+        &Orphans::new(),
+        &[],
+    )
+}
+
+#[test]
+fn authored_empty_struct_removes_nested_create_only_only_with_authoring_evidence() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    for recorded in [true, false] {
+        let schema = ResourceSchema::new("example.Widget").attribute(
+            AttributeSchema::required(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("immutable", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        );
+        let current_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::String("authored-or-provider".into())),
+        )])));
+        let authoring = if recorded {
+            ExplicitFields::Struct {
+                children: HashMap::from([(
+                    "config".to_string(),
+                    ExplicitFields::Struct {
+                        children: HashMap::from([("immutable".to_string(), ExplicitFields::Leaf)]),
+                    },
+                )]),
+            }
+        } else {
+            ExplicitFields::Unrecorded
+        };
+        let plan = plan_nested_create_only_with_authoring(
+            schema,
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            current_config,
+            authoring,
+        );
+
+        assert!(!plan.has_errors(), "unexpected plan: {plan:?}");
+        assert_eq!(plan.summary().replace, usize::from(recorded), "{plan:?}");
+        assert_eq!(plan.summary().update, 0, "{plan:?}");
+        if !recorded {
+            assert!(
+                plan.effects().is_empty(),
+                "no authored removal is recorded: {plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_empty_nested_create_only_struct_does_not_replace_mutable_update() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let schema = ResourceSchema::new("example.Widget").attribute(
+        AttributeSchema::required(
+            "config",
+            AttributeType::struct_(
+                "Config",
+                vec![
+                    StructField::optional(
+                        "immutable",
+                        AttributeType::struct_(
+                            "Immutable",
+                            vec![StructField::optional("key", AttributeType::string()).build()],
+                        ),
+                    )
+                    .create_only()
+                    .build(),
+                    StructField::required("mutable", AttributeType::string()).build(),
+                ],
+            ),
+        )
+        .build(),
+    );
+    let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "mutable".to_string(),
+            Value::Concrete(ConcreteValue::String("new".into())),
+        ),
+        (
+            "immutable".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        ),
+    ])));
+    let current_config = nested_config("old", None);
+    let authoring = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "config".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([("mutable".to_string(), ExplicitFields::Leaf)]),
+            },
+        )]),
+    };
+    let plan =
+        plan_nested_create_only_with_authoring(schema, desired_config, current_config, authoring);
+
+    assert!(!plan.has_errors(), "unexpected plan: {plan:?}");
+    assert_eq!(plan.summary().replace, 0, "{plan:?}");
+    assert_eq!(plan.summary().update, 1, "{plan:?}");
+}
+
 struct HintProvider {
     hints: Vec<crate::wait::BindingPattern>,
 }

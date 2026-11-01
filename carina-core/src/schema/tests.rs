@@ -854,7 +854,7 @@ fn attribute_builder_methods_preserve_each_mode() {
     assert!(optional.default.is_some());
     assert!(optional.write_only);
     assert!(optional.create_only);
-    assert!(optional.identity);
+    assert_eq!(optional.identity_mode, IdentityMode::Required);
     assert_eq!(optional.description, Some("optional description"));
     assert_eq!(optional.provider_name, Some("Optional"));
     assert_eq!(optional.block_name, Some("optional_block"));
@@ -874,7 +874,7 @@ fn attribute_builder_methods_preserve_each_mode() {
     assert_eq!(required.declared_input_mode, InputMode::Required);
     assert!(required.write_only);
     assert!(required.create_only);
-    assert!(required.identity);
+    assert_eq!(required.identity_mode, IdentityMode::Required);
     assert_eq!(required.description, Some("required description"));
     assert_eq!(required.provider_name, Some("Required"));
     assert_eq!(required.block_name, Some("required_block"));
@@ -893,12 +893,23 @@ fn attribute_builder_methods_preserve_each_mode() {
     assert_eq!(provider_populated.description, Some("output description"));
     assert_eq!(provider_populated.provider_name, Some("Output"));
     assert!(provider_populated.deferred_populate);
+
+    let when_present = AttributeSchema::optional("when_present", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    let when_present = when_present.parts();
+    assert_eq!(when_present.declared_input_mode, InputMode::Optional);
+    assert!(when_present.create_only);
+    assert_eq!(when_present.identity_mode, IdentityMode::WhenPresent);
 }
 
 #[test]
 fn struct_field_builder_methods_preserve_each_mode() {
     let optional = StructField::optional("optional", AttributeType::string())
         .write_only()
+        .create_only()
+        .identity()
         .with_description("optional description")
         .with_provider_name("Optional")
         .with_block_name("optional_block")
@@ -907,6 +918,8 @@ fn struct_field_builder_methods_preserve_each_mode() {
     let optional = optional.parts();
     assert_eq!(optional.declared_input_mode, InputMode::Optional);
     assert!(optional.write_only);
+    assert!(optional.create_only);
+    assert_eq!(optional.identity_mode, IdentityMode::Required);
     assert_eq!(optional.description, Some("optional description"));
     assert_eq!(optional.provider_name, Some("Optional"));
     assert_eq!(optional.block_name, Some("optional_block"));
@@ -914,6 +927,8 @@ fn struct_field_builder_methods_preserve_each_mode() {
 
     let required = StructField::required("required", AttributeType::string())
         .write_only()
+        .create_only()
+        .identity()
         .with_description("required description")
         .with_provider_name("Required")
         .with_block_name("required_block")
@@ -922,6 +937,8 @@ fn struct_field_builder_methods_preserve_each_mode() {
     let required = required.parts();
     assert_eq!(required.declared_input_mode, InputMode::Required);
     assert!(required.write_only);
+    assert!(required.create_only);
+    assert_eq!(required.identity_mode, IdentityMode::Required);
     assert_eq!(required.description, Some("required description"));
     assert_eq!(required.provider_name, Some("Required"));
     assert_eq!(required.block_name, Some("required_block"));
@@ -942,6 +959,90 @@ fn struct_field_builder_methods_preserve_each_mode() {
     assert_eq!(provider_populated.provider_name, Some("Output"));
     assert_eq!(provider_populated.block_name, Some("output_block"));
     assert!(provider_populated.deferred_populate);
+
+    let when_present = StructField::optional("when_present", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    let when_present = when_present.parts();
+    assert_eq!(when_present.declared_input_mode, InputMode::Optional);
+    assert!(when_present.create_only);
+    assert_eq!(when_present.identity_mode, IdentityMode::WhenPresent);
+}
+
+#[test]
+fn identity_paths_are_typed_and_include_top_level_and_nested_fields() {
+    let schema = ResourceSchema::new("test.Budget")
+        .attribute(
+            AttributeSchema::required("account_id", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required(
+                "budget",
+                AttributeType::struct_(
+                    "BudgetData",
+                    vec![
+                        StructField::required("budget_name", AttributeType::string())
+                            .create_only()
+                            .identity()
+                            .build(),
+                        StructField::optional("limit", AttributeType::int()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("identity fields are immutable user input");
+
+    let paths = schema.identity_paths();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(
+        paths[0].segments(),
+        &[IdentityPathSegment::Attribute("account_id".to_string())]
+    );
+    assert_eq!(
+        paths[1].segments(),
+        &[
+            IdentityPathSegment::Attribute("budget".to_string()),
+            IdentityPathSegment::StructField("budget_name".to_string()),
+        ]
+    );
+    assert_eq!(paths[0].to_string(), "account_id");
+    assert_eq!(paths[1].to_string(), "budget.budget_name");
+}
+
+#[test]
+fn schema_admission_rejects_identity_below_provider_populated_ancestor() {
+    let error = ResourceSchema::new("test.Output")
+        .attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::struct_(
+                    "Output",
+                    vec![
+                        StructField::optional("provider_key", AttributeType::string())
+                            .create_only()
+                            .identity()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect_err("effective provider output cannot declare identity");
+
+    assert!(
+        error.issues().any(|(path, message)| {
+            path == "output.provider_key"
+                && message.contains("identity field appears below a provider-populated ancestor")
+        }),
+        "{error}",
+    );
 }
 
 #[test]
@@ -1548,6 +1649,219 @@ fn schema_admission_rejects_write_only_fields_inside_union_members() {
 }
 
 #[test]
+fn schema_admission_rejects_create_only_fields_inside_union_members() {
+    let error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::union(vec![AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional("immutable", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    ],
+                )]),
+            )
+            .build(),
+        ),
+    );
+
+    assert!(error.contains("config"), "{error}");
+    assert!(
+        error.contains("union members cannot be create-only-bearing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_identity_without_create_only_witness() {
+    let mut attribute = AttributeSchema::optional("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    attribute.create_only = false;
+    let attribute_error = admission_error(ResourceSchema::new("test.Widget").attribute(attribute));
+    assert!(
+        attribute_error.contains("identity requires create-only"),
+        "{attribute_error}"
+    );
+
+    let mut field = StructField::optional("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    field.create_only = false;
+    let field_error = admission_error(ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field])).build(),
+    ));
+    assert!(
+        field_error.contains("identity requires create-only"),
+        "{field_error}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_when_present_identity_without_optional_create_only_witness() {
+    let mut attribute = AttributeSchema::optional("name", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    attribute.create_only = false;
+    let attribute_error = admission_error(ResourceSchema::new("test.Widget").attribute(attribute));
+    assert!(
+        attribute_error.contains("identity requires create-only"),
+        "{attribute_error}"
+    );
+
+    let mut required_attribute = AttributeSchema::required("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    required_attribute.identity_mode = IdentityMode::WhenPresent;
+    let required_attribute_error =
+        admission_error(ResourceSchema::new("test.Widget").attribute(required_attribute));
+    assert!(
+        required_attribute_error.contains("when-present identity requires optional input"),
+        "{required_attribute_error}"
+    );
+
+    let mut field = StructField::optional("name", AttributeType::string())
+        .create_only()
+        .identity_when_present()
+        .build();
+    field.create_only = false;
+    let field_error = admission_error(ResourceSchema::new("test.Widget").attribute(
+        AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field])).build(),
+    ));
+    assert!(
+        field_error.contains("identity requires create-only"),
+        "{field_error}"
+    );
+
+    let mut required_field = StructField::required("name", AttributeType::string())
+        .create_only()
+        .identity()
+        .build();
+    required_field.identity_mode = IdentityMode::WhenPresent;
+    let required_field_error = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_("Config", vec![required_field]),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        required_field_error.contains("when-present identity requires optional input"),
+        "{required_field_error}"
+    );
+}
+
+#[test]
+fn schema_admission_applies_existing_identity_rules_to_when_present_mode() {
+    let provider_populated = admission_error(
+        ResourceSchema::new("test.Output").attribute(
+            AttributeSchema::provider_populated(
+                "output",
+                AttributeType::struct_(
+                    "Output",
+                    vec![
+                        StructField::optional("provider_key", AttributeType::string())
+                            .create_only()
+                            .identity_when_present()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        provider_populated.contains("identity field appears below a provider-populated ancestor"),
+        "{provider_populated}"
+    );
+
+    let non_scalar = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .create_only()
+                .identity_when_present()
+                .build(),
+        ),
+    );
+    assert!(
+        non_scalar.contains("identity value must have a scalar or enum type"),
+        "{non_scalar}"
+    );
+
+    let below_collection = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "items",
+                AttributeType::list(AttributeType::struct_(
+                    "Item",
+                    vec![
+                        StructField::optional("key", AttributeType::string())
+                            .create_only()
+                            .identity_when_present()
+                            .build(),
+                    ],
+                )),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        below_collection
+            .contains("identity cannot be declared inside a list, map, or union element"),
+        "{below_collection}"
+    );
+}
+
+#[test]
+fn schema_admission_rejects_non_scalar_identity_leaves() {
+    let top_level = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
+                .create_only()
+                .identity()
+                .build(),
+        ),
+    );
+    assert!(
+        top_level.contains("identity value must have a scalar or enum type"),
+        "{top_level}"
+    );
+
+    let nested = admission_error(
+        ResourceSchema::new("test.Widget").attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional(
+                            "names",
+                            AttributeType::list(AttributeType::string()),
+                        )
+                        .create_only()
+                        .identity()
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    assert!(
+        nested.contains("identity value must have a scalar or enum type"),
+        "{nested}"
+    );
+}
+
+#[test]
 fn schema_admission_rejects_provider_populated_fields_marked_write_only() {
     let mut field = StructField::provider_populated("secret", AttributeType::string()).build();
     field.write_only = true;
@@ -1680,7 +1994,7 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 }
 
 #[test]
-fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v16() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
         ResourceSchema::new("test.Widget").attribute(
@@ -1699,12 +2013,12 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v13() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v13"), "{error}");
+    assert!(error.contains("protocol v16"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
 #[test]
-fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
+fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
@@ -1732,7 +2046,7 @@ fn config_schema_admission_enforces_scalar_and_v13_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v13"), "{rendered}");
+    assert!(rendered.contains("protocol v16"), "{rendered}");
 }
 
 #[test]
@@ -13125,7 +13439,7 @@ fn schema_fingerprint_fixture_with(
     } else {
         Value::Concrete(ConcreteValue::Map(default_map))
     };
-    let mut first = AttributeSchema::optional(
+    let first = AttributeSchema::optional(
         "first",
         AttributeType::list(AttributeType::struct_(
             "Nested",
@@ -13143,16 +13457,21 @@ fn schema_fingerprint_fixture_with(
     } else {
         "first_block"
     });
-    if change != Some(FingerprintChange::CreateOnly) {
-        first = first.create_only();
-    }
-    if change != Some(FingerprintChange::WriteOnly) {
-        first = first.write_only();
-    }
-    if change != Some(FingerprintChange::Identity) {
-        first = first.identity();
-    }
-    let first = first.build();
+    let first = if change == Some(FingerprintChange::WriteOnly) {
+        first
+    } else {
+        first.write_only()
+    };
+    let first = if change == Some(FingerprintChange::CreateOnly) {
+        first.build()
+    } else {
+        let first = first.create_only();
+        if change == Some(FingerprintChange::Identity) {
+            first.build()
+        } else {
+            first.identity().build()
+        }
+    };
 
     let second_type = if change == Some(FingerprintChange::AttributeType) {
         AttributeType::bool()
@@ -13417,6 +13736,42 @@ fn resource_schema_semantic_fingerprint_covers_nested_write_only() {
         write_only.semantic_fingerprint(),
         "nested write-only observability changes saved-plan compatibility",
     );
+}
+
+#[test]
+fn resource_schema_semantic_fingerprint_covers_nested_create_only_and_identity() {
+    let schema_with_field = |field: StructField| {
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field]))
+                    .build(),
+            )
+            .semantic_fingerprint()
+    };
+
+    let mutable =
+        schema_with_field(StructField::optional("natural_key", AttributeType::string()).build());
+    let create_only = schema_with_field(
+        StructField::optional("natural_key", AttributeType::string())
+            .create_only()
+            .build(),
+    );
+    let identity = schema_with_field(
+        StructField::optional("natural_key", AttributeType::string())
+            .create_only()
+            .identity()
+            .build(),
+    );
+    let when_present = schema_with_field(
+        StructField::optional("natural_key", AttributeType::string())
+            .create_only()
+            .identity_when_present()
+            .build(),
+    );
+
+    assert_ne!(mutable, create_only);
+    assert_ne!(create_only, identity);
+    assert_ne!(identity, when_present);
 }
 
 #[test]

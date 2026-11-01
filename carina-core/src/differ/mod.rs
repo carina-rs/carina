@@ -137,10 +137,23 @@ pub fn managed_binding_stability(
             );
             continue;
         }
-        let create_only = schema.as_schema().create_only_attributes();
-        if changed_attributes
-            .iter()
-            .any(|attribute| create_only.contains(&attribute.as_str()))
+        let authored_views = comparison::project_authored_attribute_views(
+            desired.comparison_attributes(),
+            current_attributes,
+            comparison_saved.get(&resource.id),
+            prev_explicit.get(&resource.id),
+            Some(schema.as_schema()),
+            context,
+        );
+        if !plan::find_changed_create_only(
+            &changed_attributes,
+            authored_views.current(),
+            authored_views.removal_evidence(),
+            &desired,
+            schema.as_schema(),
+            context,
+        )
+        .is_empty()
         {
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;

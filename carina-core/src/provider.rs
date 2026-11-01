@@ -11214,12 +11214,11 @@ mod tests {
                                 let attribute =
                                     match (write_only_mask & bit != 0, create_only_mask & bit != 0)
                                     {
-                                        (false, false) => builder,
-                                        (true, false) => builder.write_only(),
-                                        (false, true) => builder.create_only(),
-                                        (true, true) => builder.write_only().create_only(),
-                                    }
-                                    .build();
+                                        (false, false) => builder.build(),
+                                        (true, false) => builder.write_only().build(),
+                                        (false, true) => builder.create_only().build(),
+                                        (true, true) => builder.write_only().create_only().build(),
+                                    };
                                 schema = schema.attribute(attribute);
                                 if changed_mask & bit != 0 {
                                     changed.push((*key).to_string());

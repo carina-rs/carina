@@ -625,10 +625,19 @@ impl DiagnosticEngine {
                 .root_expanded_semantic_file(current_file_path)
         {
             let directory = result.directory.root_expanded();
+            let expanded_identity_graph =
+                merged_result
+                    .as_ref()
+                    .and_then(|result| match &result.module_resolution {
+                        checks::MergedModuleResolution::Expanded { graph } => Some(graph.as_ref()),
+                        checks::MergedModuleResolution::ConstraintFailed { .. }
+                        | checks::MergedModuleResolution::Unowned { .. } => None,
+                    });
             diagnostics.extend(self.loop_anonymous_identity_diagnostics(
                 doc,
                 &current_file,
                 &directory,
+                expanded_identity_graph,
                 base_path,
             ));
         }

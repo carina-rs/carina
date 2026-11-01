@@ -45,6 +45,12 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
             .create_only()
             .build()
     };
+    let identity_string = |name| {
+        AttributeSchema::optional(name, AttributeType::string())
+            .create_only()
+            .identity()
+            .build()
+    };
     let aws = |schema| ("aws".to_string(), schema);
     let awscc = |schema| ("awscc".to_string(), schema);
     let schemas = vec![
@@ -94,7 +100,9 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
         aws(ResourceSchema::new("acm.CertificateValidation")
             .attribute(create_only_string("certificate_arn"))
             .attribute(create_only_string("validation_record_id"))),
-        aws(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
+        aws(ResourceSchema::new("iam.Role")
+            .attribute(identity_string("role_name"))
+            .with_unique_name_attribute("role_name")),
         aws(ResourceSchema::new("route53.RecordSet")
             .attribute(create_only_string("hosted_zone_id"))
             .attribute(create_only_string("name"))
@@ -171,7 +179,11 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
                         .build(),
                 ),
         ),
-        awscc(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
+        awscc(
+            ResourceSchema::new("iam.Role")
+                .attribute(identity_string("role_name"))
+                .with_unique_name_attribute("role_name"),
+        ),
         awscc(
             ResourceSchema::new("issue3885.Role")
                 .attribute(create_only_string("role_name"))
@@ -187,7 +199,11 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
                     AttributeSchema::optional("policy_document", AttributeType::string()).build(),
                 ),
         ),
-        awscc(ResourceSchema::new("logs.LogGroup").attribute(create_only_string("log_group_name"))),
+        awscc(
+            ResourceSchema::new("logs.LogGroup")
+                .attribute(identity_string("log_group_name"))
+                .with_unique_name_attribute("log_group_name"),
+        ),
         awscc(ResourceSchema::new("s3.Bucket").attribute(create_only_string("bucket_name"))),
         awscc(
             ResourceSchema::new("sso.Assignment")

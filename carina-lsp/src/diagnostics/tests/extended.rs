@@ -9,7 +9,7 @@ mutable attributes for multiple 'mock.test.resource' declarations using provider
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
 fn anonymous_loop_engine() -> DiagnosticEngine {
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -28,6 +28,58 @@ fn anonymous_loop_engine() -> DiagnosticEngine {
         ))
         .validate()
         .expect("stable-identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.identity")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("declared-identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.optional_identity")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .identity_when_present()
+                    .build(),
+            )
+            .validate()
+            .expect("when-present identity fixture schema must be valid"),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.composite_identity")
+            .attribute(
+                AttributeSchema::optional("scope", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "identity_details",
+                    AttributeType::struct_(
+                        "IdentityDetails",
+                        vec![
+                            StructField::optional("name", AttributeType::string())
+                                .create_only()
+                                .identity()
+                                .build(),
+                        ],
+                    ),
+                )
+                .with_block_name("identity_detail")
+                .build(),
+            )
+            .validate()
+            .expect("composite identity fixture schema must be valid"),
     );
     custom_engine(schemas)
 }
@@ -182,6 +234,222 @@ fn anonymous_loop_identical_identity_diagnostic_has_exact_range() {
             .message
             .contains("to = mock.test.resource 'resource[1]'")
     );
+}
+
+#[test]
+fn anonymous_loop_missing_declared_identity_uses_the_loop_range() {
+    let source = "for ignored in ['one'] {\n  mock.test.identity {}\n}\n";
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(2, 1))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.identity' cannot derive an address because ",
+            "identity value 'name' is not available as a written value or authored expression ",
+            "at plan time. Write the identity value or give the resource a name with `let`.",
+        )
+    );
+}
+
+#[test]
+fn anonymous_secret_declared_identity_reports_the_shared_incomplete_error() {
+    let source = concat!(
+        "mock.test.identity {\n",
+        "  name = secret(\"must-not-reach-the-address-hash\")\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(0, 18))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.identity' cannot derive an address because ",
+            "identity value 'name' is not available as a written value or authored expression ",
+            "at plan time. Write the identity value or give the resource a name with `let`.",
+        )
+    );
+}
+
+#[test]
+fn anonymous_absent_when_present_identity_matches_validate_and_is_complete() {
+    let diagnostics = analyze_anonymous_loop_source("mock.test.optional_identity {}\n");
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("not available as a written value or authored expression")),
+        "validate accepts absence for when-present identity, so the LSP must too: {diagnostics:#?}",
+    );
+
+    let diagnostics = analyze_anonymous_loop_source(concat!(
+        "mock.test.optional_identity {\n",
+        "  name = secret(\"known only at apply\")\n",
+        "}\n",
+    ));
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+    assert!(
+        diagnostic.message.contains("identity value 'name'"),
+        "a written unknown must still report incomplete identity: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn anonymous_written_unknown_when_present_identity_matches_validate_error() {
+    let source = concat!(
+        "mock.test.optional_identity {\n",
+        "  name = secret(\"known only at apply\")\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.optional_identity' cannot derive an address ",
+            "because identity value 'name' is not available as a written value or authored ",
+            "expression at plan time. Write the identity value or give the resource a name with ",
+            "`let`.",
+        )
+    );
+}
+
+#[test]
+fn incomplete_declared_identity_with_block_alias_is_anchored_from_typed_member() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let source = concat!(
+        "mock.test.composite_identity {\n",
+        "  identity_detail = {\n",
+        "    name = 'nested'\n",
+        "  }\n",
+        "}\n",
+    );
+    let path = temp.path().join("main.crn");
+    std::fs::write(&path, source).expect("write main fixture");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+
+    let diagnostics =
+        anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity value 'scope' is not available")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 0);
+    assert_eq!(matching[0].range.start.character, 0);
+}
+
+#[test]
+fn equal_declared_identity_under_two_module_instances_marks_every_call() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let child = temp.path().join("child");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::write(child.join("arguments.crn"), "arguments { scope: String }\n")
+        .expect("write child arguments");
+    std::fs::write(
+        child.join("resources.crn"),
+        "mock.test.identity { name = 'same' }\n",
+    )
+    .expect("write child resource");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+    let source = concat!(
+        "let child = use { source = './child' }\n",
+        "let first = child { scope = 'one' }\n",
+        "let second = child { scope = 'two' }\n",
+    );
+    let path = temp.path().join("main.crn");
+    std::fs::write(&path, source).expect("write root fixture");
+
+    let diagnostics =
+        anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let collisions = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("equal declared identity values")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(collisions.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(collisions[0].range.start.line, 1);
+    assert_eq!(collisions[1].range.start.line, 2);
+}
+
+#[test]
+fn cross_module_declared_identity_collision_reports_every_origin_loop() {
+    let temp = tempfile::tempdir().expect("create diagnostic fixture");
+    let child = temp.path().join("child");
+    std::fs::create_dir(&child).expect("create child module");
+    std::fs::write(child.join("arguments.crn"), "arguments { scope: String }\n")
+        .expect("write child arguments");
+    std::fs::write(
+        child.join("resources.crn"),
+        "mock.test.identity { name = 'same' }\n",
+    )
+    .expect("write child resource");
+    std::fs::write(temp.path().join("providers.crn"), "provider mock {}\n")
+        .expect("write provider fixture");
+    let source = concat!(
+        "let child = use { source = './child' }\n",
+        "for scope in ['one'] {\n",
+        "  child { scope = scope }\n",
+        "}\n",
+        "for scope in ['two'] {\n",
+        "  child { scope = scope }\n",
+        "}\n",
+    );
+    let path = temp.path().join("main.crn");
+    std::fs::write(&path, source).expect("write root fixture");
+
+    let diagnostics =
+        anonymous_loop_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let collisions = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("equal declared identity values even though their module-scoped")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(collisions.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(collisions[0].range.start.line, 1);
+    assert_eq!(collisions[1].range.start.line, 4);
+    assert!(collisions.iter().all(|diagnostic| diagnostic.message == concat!(
+        "Anonymous resources of type 'mock.test.identity' on the same provider route have equal ",
+        "declared identity values even though their module-scoped addresses differ. Give one of ",
+        "them a name with `let`.",
+    )));
 }
 
 #[test]

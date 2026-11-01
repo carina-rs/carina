@@ -2868,11 +2868,12 @@ impl AnonymousReconciliationStateView {
                 projected_id.resource_type(),
                 carina_core::schema::SchemaKind::Resource,
             ) {
-                AnonymousIdStateInfo::try_from_state_attributes(
+                AnonymousIdStateInfo::try_from_state_row(
                     state_row_id.clone(),
                     projected_target.cloned(),
                     schema.schema(),
                     &attribute_values,
+                    &state_resource.name_overrides,
                 )
             } else {
                 AnonymousIdStateInfo::try_without_comparable_attributes(
@@ -2989,7 +2990,8 @@ fn reconcile_anonymous_identifiers_with_ctx(
         &|provider, resource_type| state_view.entries_by_type(claims, provider, resource_type),
         &|binding| state_view.entries_by_binding(claims, binding),
         claims,
-    )?)
+    )
+    .map_err(Box::new)?)
 }
 
 fn detect_legacy_loop_moves_with_ctx(

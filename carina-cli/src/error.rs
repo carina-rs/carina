@@ -1031,6 +1031,12 @@ pub enum AppError {
     #[error(transparent)]
     ComparisonResolution(#[from] carina_core::provider::ComparisonResolutionError),
 
+    /// Anonymous state reconciliation found no safe unique legacy row.
+    #[error(transparent)]
+    AnonymousIdentifierReconciliation(
+        #[from] Box<carina_core::identifier::AnonymousIdentifierReconciliationError>,
+    ),
+
     /// A module argument constraint became decidable during an operation.
     #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
