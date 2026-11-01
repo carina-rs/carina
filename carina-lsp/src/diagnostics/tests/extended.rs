@@ -2231,47 +2231,49 @@ fn module_argument_directives_remain_valid_in_module_diagnostics() {
 fn directive_value_errors_use_authored_ranges_in_lsp() {
     for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
         for expression in ["peer.arn", "bad"] {
-            let fixture = tempfile::tempdir().unwrap();
-            std::fs::write(fixture.path().join("flags.crn"), "let bad = 1\n").unwrap();
-            std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
-            let prefix = if expression == "bad" {
-                "let doc = <<EOF\nalpha\nbeta\nEOF\n"
-            } else {
-                ""
-            };
-            let directive_line = prefix.lines().count() as u32 + 4;
-            let source = format!(
-                "{prefix}let peer = mock.test.resource {{ name = 'peer' }}\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{\n    {directive} = {expression}\n  }}\n}}\n"
-            );
-            let path = fixture.path().join("resources.crn");
-            std::fs::write(&path, &source).unwrap();
-            let engine = custom_engine(authored_binding_regression_schemas());
-            let diagnostics =
-                engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
-            let errors = diagnostics
-                .iter()
-                .filter(|diagnostic| {
-                    diagnostic
-                        .message
-                        .contains(&format!("directives.{directive}"))
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(errors.len(), 1, "{diagnostics:#?}");
-            assert!(errors[0].message.starts_with("directives."), "{errors:#?}");
-            assert_eq!(
-                errors[0].severity,
-                Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
-            );
-            assert_eq!(errors[0].range.start.line, directive_line);
-            assert_eq!(
-                errors[0].range.start.character,
-                (directive.len() + 7) as u32
-            );
-            assert_eq!(errors[0].range.end.line, directive_line, "{errors:#?}");
-            assert_eq!(
-                errors[0].range.end.character,
-                errors[0].range.start.character + expression.len() as u32
-            );
+            for trailing in ["", " // comment", " /* comment */", " /* comment\nmore */"] {
+                let fixture = tempfile::tempdir().unwrap();
+                std::fs::write(fixture.path().join("flags.crn"), "let bad = 1\n").unwrap();
+                std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+                let prefix = if expression == "bad" {
+                    "let doc = <<EOF\nalpha\nbeta\nEOF\n"
+                } else {
+                    ""
+                };
+                let directive_line = prefix.lines().count() as u32 + 4;
+                let source = format!(
+                    "{prefix}let peer = mock.test.resource {{ name = 'peer' }}\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{\n    {directive} = {expression}{trailing}\n  }}\n}}\n"
+                );
+                let path = fixture.path().join("resources.crn");
+                std::fs::write(&path, &source).unwrap();
+                let engine = custom_engine(authored_binding_regression_schemas());
+                let diagnostics =
+                    engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+                let errors = diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic
+                            .message
+                            .contains(&format!("directives.{directive}"))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+                assert!(errors[0].message.starts_with("directives."), "{errors:#?}");
+                assert_eq!(
+                    errors[0].severity,
+                    Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+                );
+                assert_eq!(errors[0].range.start.line, directive_line);
+                assert_eq!(
+                    errors[0].range.start.character,
+                    (directive.len() + 7) as u32
+                );
+                assert_eq!(errors[0].range.end.line, directive_line, "{errors:#?}");
+                assert_eq!(
+                    errors[0].range.end.character,
+                    errors[0].range.start.character + expression.len() as u32
+                );
+            }
         }
     }
 }

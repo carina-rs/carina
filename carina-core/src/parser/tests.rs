@@ -2720,6 +2720,37 @@ fn parse_directives_default_when_absent() {
 }
 
 #[test]
+fn directive_value_spans_trim_trailing_trivia_after_heredoc() {
+    let source_file = std::path::Path::new("directive-locations.crn");
+    let value_prefix = "    prevent_destroy = ";
+    for prefix in ["", "let doc = <<EOT\nbody\nEOT\n"] {
+        for trailing in [
+            "\n",
+            " // comment\n",
+            " /* comment */\n",
+            " /* comment\nmore */\n",
+        ] {
+            let input = format!(
+                "{prefix}let flag = true\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{\n{value_prefix}flag{trailing}  }}\n}}\n"
+            );
+            let parsed = parse_file(&input, source_file, &ProviderContext::default()).unwrap();
+            let mut directives = parsed.resources[0].directives.clone();
+            let mut sources = Vec::new();
+            directives.map_expressions(|expression| sources.push(expression.source().clone()));
+            assert_eq!(sources.len(), 1, "{input}");
+            let (file, span) = sources[0].authored_location().unwrap();
+            assert_eq!(file, source_file);
+            let line = prefix.lines().count() + 5;
+            let column = value_prefix.len() + 1;
+            assert_eq!(span.start_line(), line, "{input}");
+            assert_eq!(span.start_column(), column, "{input}");
+            assert_eq!(span.end_line(), line, "{input}");
+            assert_eq!(span.end_column(), column + "flag".len(), "{input}");
+        }
+    }
+}
+
+#[test]
 fn parse_prevent_destroy_preserves_literal_true_and_false_as_explicit() {
     for (literal, expected) in [
         ("true", PreventDestroy::Explicit(true)),

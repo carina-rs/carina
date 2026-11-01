@@ -470,7 +470,7 @@ fn parse_directives(
         let line = value_pair.line_col().0;
 
         if let Some(directive) = LifecycleDirective::from_name(&key) {
-            let source = ctx.diagnostic_source_span(&value_pair);
+            let source = ctx.directive_value_source_span(&value_pair);
             let value = parse_expression(value_pair, ctx)?;
             directives.set(directive, DirectiveExpr::new(value, source));
             continue;

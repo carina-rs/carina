@@ -205,14 +205,31 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         &self,
         pair: &pest::iterators::Pair<'_, super::Rule>,
     ) -> DiagnosticSourceSpan {
+        let span = pair.as_span();
+        self.diagnostic_source_range(span.start()..span.end())
+    }
+
+    /// Only directive values exclude trailing trivia consumed by pest's
+    /// expression wrappers; other diagnostics retain their original pair span.
+    pub(super) fn directive_value_source_span(
+        &self,
+        pair: &pest::iterators::Pair<'_, super::Rule>,
+    ) -> DiagnosticSourceSpan {
+        self.diagnostic_source_range(SourceSpan::preprocessed_range(pair))
+    }
+
+    fn diagnostic_source_range(&self, range: std::ops::Range<usize>) -> DiagnosticSourceSpan {
         let AuthoredDiagnosticSource { path, file } = &self.diagnostic_source;
-        let span = SourceSpan::from_pest(pair, file);
+        // Map the last included byte before restoring the exclusive end. The
+        // following preprocessed byte can map to a heredoc's closing marker.
+        let start = file.original_position(range.start);
+        let end = file.original_position(range.end.saturating_sub(1));
         DiagnosticSourceSpan::authored(
             path.clone(),
-            span.start_line(),
-            span.start_column(),
-            span.end_line(),
-            span.end_column(),
+            start.line(),
+            start.column(),
+            end.line(),
+            end.column() + 1,
         )
     }
 }
