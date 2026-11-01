@@ -129,7 +129,7 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
         .parsed
         .clone()
         .into_parsed()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider fixture has no parser placeholders");
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::default(),

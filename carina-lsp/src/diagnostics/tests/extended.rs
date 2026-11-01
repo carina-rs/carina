@@ -8,6 +8,865 @@ const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is d
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
+fn unique_list_scope_fixture(second_body: &str) -> (String, Vec<Diagnostic>) {
+    unique_list_declaration_scope_fixture(second_body, false)
+}
+
+fn unique_list_declaration_scope_fixture(
+    second_body: &str,
+    let_bound: bool,
+) -> (String, Vec<Diagnostic>) {
+    let source = if let_bound {
+        format!(
+            "let a = mock.test.UniqueLists {{ name = \"a\" }}\nlet b = mock.test.UniqueLists {{ name = \"b\"\n  {second_body}\n}}\n"
+        )
+    } else {
+        format!(
+            "mock.test.UniqueLists {{\n  name = \"first\"\n  tags_list = [\"ok\"]\n  modes = [allow]\n  values = [\"first\"]\n}}\nmock.test.UniqueLists {{\n  name = \"second\"\n  {second_body}\n}}\n"
+        )
+    };
+    let diagnostics = unique_list_source_diagnostics(&source);
+    (source, diagnostics)
+}
+
+fn unique_list_source_diagnostics(source: &str) -> Vec<Diagnostic> {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ListElements, ResourceSchema, StructField,
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.UniqueLists")
+            .with_unique_name_attribute("name")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "tags_list",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "modes",
+                    AttributeType::list(AttributeType::enum_(
+                        carina_core::schema::TypeIdentity::new(Some("mock"), ["test"], "Mode"),
+                        Some(vec!["allow".into()]),
+                        vec![],
+                        None,
+                        None,
+                    )),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "values",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        None,
+                        ListElements::Unique,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "Rule",
+                        vec![
+                            StructField::required("label", AttributeType::string()).build(),
+                            StructField::optional(
+                                "tags",
+                                AttributeType::list(AttributeType::string()),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "unique_rules",
+                    AttributeType::refined_list(
+                        AttributeType::struct_(
+                            "UniqueRule",
+                            vec![StructField::required("label", AttributeType::string()).build()],
+                        ),
+                        true,
+                        None,
+                        ListElements::Unique,
+                    ),
+                )
+                .with_block_name("unique_rule")
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "matrix",
+                    AttributeType::refined_list(
+                        AttributeType::list(AttributeType::string()),
+                        true,
+                        None,
+                        ListElements::Unique,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Other")
+            .with_unique_name_attribute("name")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    analyze_with_buffer(&engine, directory.path(), "main.crn", source)
+}
+
+#[test]
+fn round7_unknown_attribute_suggests_existing_id_attribute_in_directory() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Subnet")
+            .attribute(AttributeSchema::optional("vpc_id", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = "mock.test.Subnet {\n  vpc = \"vpc-123\"\n}\n";
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", source);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute 'vpc'");
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(error.range.start, Position::new(1, 2));
+    assert_eq!(
+        error.message,
+        "Unknown attribute 'vpc', did you mean 'vpc_id'?"
+    );
+}
+
+const ROUND7_HEREDOC_BINDING_PREFIX: &str = "let text = <<EOT\nlet b = fake { }\nEOT\n";
+const ROUND7_FOR_BINDING_PREFIX: &str =
+    "for x in [\"p\"] {\n  let b = x\n  mock.test.Other { name = b }\n}\n";
+const ROUND7_IF_BINDING_PREFIX: &str =
+    "if true {\n  let b = \"p\"\n  mock.test.Other { name = b }\n}\n";
+
+fn assert_round7_unused_binding_anchor(prefix: &str) {
+    let source = format!("{prefix}let b = mock.test.Other {{ name = \"b\" }}\n");
+    let diagnostics = unique_list_source_diagnostics(&source);
+    let warning = only_message_diagnostic(&diagnostics, "Unused let binding 'b'");
+    let line = prefix.lines().count() as u32;
+    assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        warning.range,
+        Range::new(Position::new(line, 4), Position::new(line, 5)),
+        "{diagnostics:#?}"
+    );
+}
+
+fn assert_round7_duplicate_binding_anchor(prefix: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("sibling.crn"),
+        "let b = \"sibling\"\n",
+    )
+    .unwrap();
+    let source = format!("{prefix}let b = \"buffer\"\n");
+    std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+    let diagnostics = analyze_with_buffer(&test_engine(), directory.path(), "main.crn", &source);
+    let error = only_message_diagnostic(&diagnostics, "duplicate binding 'b'");
+    let line = prefix.lines().count() as u32;
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(line, 4), Position::new(line, 5)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round7_unused_binding_ignores_heredoc_binding_text() {
+    assert_round7_unused_binding_anchor(ROUND7_HEREDOC_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_unused_binding_ignores_for_local_binding() {
+    assert_round7_unused_binding_anchor(ROUND7_FOR_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_unused_binding_ignores_if_local_binding() {
+    assert_round7_unused_binding_anchor(ROUND7_IF_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_duplicate_binding_ignores_heredoc_binding_text() {
+    assert_round7_duplicate_binding_anchor(ROUND7_HEREDOC_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_duplicate_binding_ignores_for_local_binding() {
+    assert_round7_duplicate_binding_anchor(ROUND7_FOR_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_duplicate_binding_ignores_if_local_binding() {
+    assert_round7_duplicate_binding_anchor(ROUND7_IF_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_second_pass_range_ends_at_indented_content_end() {
+    let (source, diagnostics) =
+        unique_list_declaration_scope_fixture("tag_list = \"\u{65e5}\u{672c}\u{8a9e}\"   ", true);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
+    let line = source.lines().nth(2).unwrap();
+    assert_eq!(
+        error.range,
+        Range::new(
+            Position::new(2, 2),
+            Position::new(2, line.trim_end().chars().count() as u32),
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round6_let_scope_ignores_for_local_binding() {
+    let source = concat!(
+        "for x in [\"p\"] {\n",
+        "  let b = x\n",
+        "  mock.test.Other { name = b }\n",
+        "}\n",
+        "let b = mock.test.UniqueLists { name = \"b\"\n",
+        "  tags_list = [\"ok\", 5]\n",
+        "}\n",
+    );
+    let diagnostics = unique_list_source_diagnostics(source);
+    let error = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(5, 21), Position::new(5, 22)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round6_let_scope_ignores_if_local_binding() {
+    let source = concat!(
+        "if true {\n",
+        "  let b = \"p\"\n",
+        "  mock.test.Other { name = b }\n",
+        "}\n",
+        "let b = mock.test.UniqueLists { name = \"b\"\n",
+        "  tags_list = [\"ok\", 5]\n",
+        "}\n",
+    );
+    let diagnostics = unique_list_source_diagnostics(source);
+    let error = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(5, 21), Position::new(5, 22)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round6_let_scope_ignores_multiline_string_binding_text() {
+    for prefix in [
+        "let text = \"\nlet b = mock.test.Other {\n  name = example\n}\n\"\n",
+        "let text = <<EOT\nlet b = mock.test.Other {\n  name = example\n}\nEOT\n",
+    ] {
+        let source = format!(
+            "{prefix}let b = mock.test.UniqueLists {{ name = \"b\"\n  tags_list = [\"ok\", 5]\n}}\n"
+        );
+        let diagnostics = unique_list_source_diagnostics(&source);
+        let error = only_message_diagnostic(&diagnostics, "expected String");
+        assert_eq!(
+            error.range,
+            Range::new(Position::new(6, 21), Position::new(6, 22)),
+            "{source}: {diagnostics:#?}"
+        );
+        assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+    }
+}
+
+#[test]
+fn round6_unknown_attribute_has_one_core_suggestion_for_anonymous_resource() {
+    assert_unknown_attribute_suggestion(false);
+}
+
+#[test]
+fn round6_unknown_attribute_has_one_core_suggestion_for_let_bound_resource() {
+    assert_unknown_attribute_suggestion(true);
+}
+
+fn assert_unknown_attribute_suggestion(let_bound: bool) {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("tag_list = true", let_bound);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    let line = if let_bound { 2 } else { 8 };
+    assert_eq!(
+        error.range.start,
+        Position::new(line, 2),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.range.end.line, line, "{diagnostics:#?}");
+    assert_eq!(
+        error.message, "Unknown attribute 'tag_list', did you mean 'tags_list'?",
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round6_unknown_attribute_with_resource_reference_keeps_core_suggestion() {
+    for header in ["mock.test.UniqueLists", "let b = mock.test.UniqueLists"] {
+        let source = format!(
+            "let a = mock.test.Other {{ name = \"a\" }}\n{header} {{ name = \"b\"\n  tag_list = a.name\n}}\n"
+        );
+        let diagnostics = unique_list_source_diagnostics(&source);
+        let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
+        assert_eq!(
+            error.message, "Unknown attribute 'tag_list', did you mean 'tags_list'?",
+            "{diagnostics:#?}"
+        );
+        assert_eq!(error.range.start, Position::new(2, 2), "{diagnostics:#?}");
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    }
+}
+
+#[test]
+fn round7_block_unknown_attribute_uses_its_anonymous_attribute_header() {
+    assert_block_unknown_attribute_header(false);
+}
+
+#[test]
+fn round7_block_unknown_attribute_uses_its_let_bound_attribute_header() {
+    assert_block_unknown_attribute_header(true);
+}
+
+fn assert_block_unknown_attribute_header(let_bound: bool) {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("typo { }", let_bound);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute 'typo'");
+    let header_line = if let_bound { 2 } else { 8 };
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(header_line, 2), Position::new(header_line, 6)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.range.end.line, header_line, "{diagnostics:#?}");
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round6_indexed_field_group_block_uses_its_header_range() {
+    let diagnostics =
+        indexed_field_group_diagnostics("rules {\n    allow = \"yes\"\n    deny = \"no\"\n  }");
+    let error = only_message_diagnostic(&diagnostics, "rules[0]: exactly one of");
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(3, 2), Position::new(3, 7)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round6_indexed_field_group_inline_items_keep_element_ranges() {
+    let diagnostics = indexed_field_group_diagnostics("rules = [\n    {},\n    {}\n  ]");
+    for (index, line) in [(0, 4), (1, 5)] {
+        let error =
+            only_message_diagnostic(&diagnostics, &format!("rules[{index}]: exactly one of"));
+        assert_eq!(
+            error.range,
+            Range::new(Position::new(line, 4), Position::new(line, 6)),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    }
+}
+
+fn indexed_field_group_diagnostics(body: &str) -> Vec<Diagnostic> {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, FieldGroup, FieldGroupKind, ResourceSchema, StructField,
+    };
+    let rule = AttributeType::struct_with_field_groups(
+        "Rule",
+        vec![
+            StructField::optional("allow", AttributeType::string()).build(),
+            StructField::optional("deny", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::new(FieldGroupKind::ExactlyOne, ["allow", "deny"]).unwrap()],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.FieldGroups")
+            .with_unique_name_attribute("name")
+            .with_def("Rule", rule)
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::ref_("Rule")),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let source = format!(
+        "let a = mock.test.FieldGroups {{ name = \"a\" }}\nlet b = mock.test.FieldGroups {{\n  name = \"b\"\n  {body}\n}}\n"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+    analyze_with_buffer(
+        &custom_engine(schemas),
+        directory.path(),
+        "main.crn",
+        &source,
+    )
+}
+
+#[test]
+fn round5_let_bound_plain_list_error_stays_in_second_resource() {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("tags_list = [\"ok\", 5]", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(diagnostic.range.start.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round5_let_bound_duplicate_stays_in_second_resource() {
+    let (_, diagnostics) =
+        unique_list_declaration_scope_fixture("values = [\"repo\", \"repo\"]", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    assert_eq!(diagnostic.range.start.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round5_let_bound_struct_list_error_stays_in_second_resource() {
+    let (_, diagnostics) =
+        unique_list_declaration_scope_fixture("rules {\n    label = 5\n  }", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(diagnostic.range.start.line, 3, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 3, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round8_struct_item_errors_include_full_leaf_path() {
+    for (body, paths) in [
+        ("rules {\n    label = 5\n  }", vec!["rules[0].label"]),
+        (
+            "rules {\n    label = \"ok\"\n  }\n  rules {\n    label = 5\n  }",
+            vec!["rules[1].label"],
+        ),
+        (
+            "rules {\n    label = \"ok\"\n    tags = [5, 6]\n  }",
+            vec!["rules[0].tags[0]", "rules[0].tags[1]"],
+        ),
+    ] {
+        let (_, diagnostics) = unique_list_declaration_scope_fixture(body, true);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected String"))
+            .collect();
+        assert_eq!(errors.len(), paths.len(), "{diagnostics:#?}");
+        for path in paths {
+            assert!(
+                errors.iter().any(|diagnostic| diagnostic.message
+                    == format!("Type mismatch: expected String, got Int for '{path}'")),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn round5_let_bound_unknown_attribute_is_reported_once() {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("typo = true", true);
+    let diagnostic = only_message_diagnostic(&diagnostics, "Unknown attribute 'typo'");
+    assert_eq!(diagnostic.range.start.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.range.end.line, 2, "{diagnostics:#?}");
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round5_indexed_list_errors_use_element_spans() {
+    for body in [
+        "tags_list = [\"ok\", 5, 6]",
+        "matrix = [[\"ok\", 5, 6]]",
+        "rules = [5, 6]",
+        "rules {\n    label = \"ok\"\n    tags = [\"ok\", 5, 6]\n  }",
+    ] {
+        let (source, diagnostics) = unique_list_scope_fixture(body);
+        let mut errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("Type mismatch"))
+            .collect();
+        errors.sort_by_key(|diagnostic| diagnostic.range.start);
+        assert_eq!(errors.len(), 2, "{body}: {diagnostics:#?}");
+        for (diagnostic, element) in errors.iter().zip(["5", "6"]) {
+            let prefix = &source[..source.rfind(element).unwrap()];
+            let line = prefix.bytes().filter(|&byte| byte == b'\n').count() as u32;
+            let start = prefix.rsplit('\n').next().unwrap().chars().count() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(Position::new(line, start), Position::new(line, start + 1)),
+                "{body}: {diagnostics:#?}"
+            );
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        }
+        assert_ne!(errors[0].range, errors[1].range);
+    }
+}
+
+#[test]
+fn round5_indexed_list_errors_keep_paths_without_element_spans() {
+    for (body, path) in [
+        ("tags_list = concat([5, 6], [\"ok\"])", "tags_list"),
+        ("matrix = [concat([5, 6], [\"ok\"])]", "matrix[0]"),
+    ] {
+        let (_, diagnostics) = unique_list_scope_fixture(body);
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected String"))
+            .collect();
+        assert_eq!(errors.len(), 2, "{body}: {diagnostics:#?}");
+        for index in [1, 2] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(&format!("{path}[{index}]"))),
+                "{body}: {diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_unique_lists_continue_to_allow_duplicate_elements() {
+    for body in [
+        "tags_list = [\"ok\", \"ok\"]",
+        "rules {\n    label = \"ok\"\n  }\n  rules {\n    label = \"ok\"\n  }",
+    ] {
+        let (_, diagnostics) = unique_list_scope_fixture(body);
+        assert!(diagnostics.is_empty(), "{body}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn round5_unique_list_block_alias_reports_one_duplicate() {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture(
+        "unique_rule {\n    label = \"repo\"\n  }\n  unique_rule {\n    label = \"repo\"\n  }",
+        true,
+    );
+    let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    assert_eq!(duplicate.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(duplicate.range.start.line, 5, "{diagnostics:#?}");
+    assert_eq!(duplicate.range.end.line, 6, "{diagnostics:#?}");
+}
+
+#[test]
+fn unique_list_item_errors_stay_in_the_second_resource() {
+    for (body, message) in [
+        ("tags_list = [\"ok\", 5]", "expected String"),
+        ("modes = [allow, invalid]", "invalid"),
+    ] {
+        let body = format!("{body}\n  values = [\"repo\", \"repo\"]");
+        let (_, diagnostics) = unique_list_scope_fixture(&body);
+        let diagnostic = only_message_diagnostic(&diagnostics, message);
+        assert_eq!(diagnostic.range.start.line, 8, "{diagnostics:?}");
+        assert_eq!(diagnostic.range.end.line, 8, "{diagnostics:?}");
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
+        assert_eq!(duplicate.range.start.line, 9, "{diagnostics:?}");
+        assert_eq!(duplicate.range.end.line, 9, "{diagnostics:?}");
+    }
+}
+
+#[test]
+fn unique_list_count_error_stays_in_the_second_resource() {
+    use carina_core::schema::{AttributeType, ListElements, ValidatedConfigSchema};
+    let schema = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+        "values".to_string(),
+        AttributeType::refined_list(
+            AttributeType::string(),
+            true,
+            Some((Some(1), None)),
+            ListElements::Unique,
+        ),
+    )]))
+    .unwrap();
+    let effective_type = schema.effective_type("values").unwrap();
+    let document = create_document(
+        "mock.test.UniqueLists {\n  values = [\"ok\"]\n}\nmock.test.UniqueLists {\n  values = []\n}\n",
+    );
+    let resource = document
+        .parsed()
+        .unwrap()
+        .iter_all_resources()
+        .nth(1)
+        .unwrap();
+    let attributes = resource.attributes();
+    let text = document.text();
+    let source = DiagnosticSource::new(&document, &text);
+    let (diagnostics, reported_duplicate) = test_engine().validate_container_value(
+        &source,
+        "values",
+        attributes.get("values").unwrap(),
+        &effective_type,
+        None,
+        Some((3, 6)),
+    );
+    let diagnostic = only_message_diagnostic(&diagnostics, "outside allowed range");
+    assert_eq!(diagnostic.range.start.line, 4, "{diagnostics:?}");
+    assert!(!reported_duplicate);
+}
+
+#[test]
+fn unique_list_item_errors_retain_the_attribute_suffix() {
+    for (body, attribute, message) in [
+        ("tags_list = [\"ok\", 5]", "tags_list[1]", "expected String"),
+        ("modes = [allow, invalid]", "modes[1]", "invalid"),
+    ] {
+        let (_, diagnostics) = unique_list_scope_fixture(body);
+        let diagnostic = only_message_diagnostic(&diagnostics, message);
+        assert!(
+            diagnostic.message.contains(&format!("for '{attribute}'")),
+            "{diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn unique_list_duplicates_stay_in_the_second_resource() {
+    let (source, diagnostics) = unique_list_scope_fixture("values = [\"repo\", \"repo\"]");
+    let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    let start = source.lines().nth(8).unwrap().rfind("\"repo\"").unwrap() as u32;
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(8, start), Position::new(8, start + 6)),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn unique_list_item_error_does_not_suppress_a_resolved_duplicate() {
+    let (_, diagnostics) = unique_list_scope_fixture("matrix = [[\"${1 + 0}\"], [\"1\"], [5]]");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("expected String")),
+        "{diagnostics:?}"
+    );
+    let duplicate = only_message_diagnostic(&diagnostics, "Duplicate list element");
+    assert_eq!(duplicate.range.start.line, 8, "{diagnostics:?}");
+    assert_eq!(duplicate.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let schema = ResourceSchema::new("test.UniqueLists")
+        .attribute(
+            AttributeSchema::optional(
+                "matrix",
+                AttributeType::refined_list(
+                    AttributeType::list(AttributeType::string()),
+                    true,
+                    None,
+                    ListElements::Unique,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let document = create_document(
+        "mock.test.UniqueLists {\n  matrix = [split(\",\", \"repo\"), [\"repo\"], [5]]\n}\n",
+    );
+    let resource = document
+        .parsed()
+        .unwrap()
+        .iter_all_resources()
+        .next()
+        .unwrap();
+    let attributes = resource.attributes();
+    let value = attributes.get("matrix").unwrap();
+    let effective_attribute = schema.effective_attribute("matrix").unwrap();
+    let effective_type = effective_attribute.value_type();
+    let engine = test_engine();
+    let text = document.text();
+    let source = DiagnosticSource::new(&document, &text);
+    let (diagnostics, reported_duplicate) = engine.validate_container_value(
+        &source,
+        "matrix",
+        value,
+        &effective_type,
+        None,
+        Some((0, 3)),
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert!(diagnostics[0].message.contains("expected String"));
+    assert!(
+        !reported_duplicate,
+        "an item error must not suppress a duplicate in a later pass"
+    );
+    let evaluated = carina_core::parser::evaluate_static_value_for_validation(
+        value,
+        document.provider_context(),
+    )
+    .unwrap();
+    let errors = effective_type.validate_collect(&evaluated);
+    assert!(
+        errors.iter().any(|(_, error)| matches!(
+            error,
+            TypeError::DuplicateListElement {
+                value: _,
+                index: _,
+                first_index: _,
+                attribute: _
+            }
+        )),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn unique_list_diagnostics_use_canonical_values_in_a_directory() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        carina_provider_mock::unique_list_schema()
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    for (claims, duplicate) in [
+        ("repo, context, repo", true),
+        ("repo, mock.actions.OidcSubject.ClaimKey.repo", true),
+        ("repo, mock.actions.OidcSubject.ClaimKey.context", false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = format!("mock.actions.OidcSubject {{\n  claim_keys = [{claims}]\n}}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        if duplicate {
+            let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+            assert!(diagnostic.message.contains("repo"), "{diagnostic:?}");
+            assert!(diagnostic.message.contains("claim_keys"), "{diagnostic:?}");
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+            let duplicate = claims.rsplit(", ").next().unwrap();
+            let start = source.lines().nth(1).unwrap().rfind(duplicate).unwrap() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(
+                    Position::new(1, start),
+                    Position::new(1, start + duplicate.len() as u32)
+                )
+            );
+        } else {
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn unique_list_diagnostics_cover_computed_and_nested_lists_in_a_directory() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ListElements, ResourceSchema, StructField,
+    };
+    let list =
+        AttributeType::refined_list(AttributeType::string(), true, None, ListElements::Unique);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.UniqueLists")
+            .attribute(AttributeSchema::optional("values", list.clone()).build())
+            .attribute(
+                AttributeSchema::optional("matrix", AttributeType::list(list.clone())).build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "nested",
+                    AttributeType::struct_(
+                        "Nested",
+                        vec![StructField::required("values", list).build()],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    for body in [
+        "values = split(\",\", \"repo,repo\")",
+        "values = [\"repo\",\n    \"repo\"]",
+        "nested = {\n    values = [\"repo\", \"repo\"]\n  }",
+        "matrix = [[\"repo\", \"repo\"]]",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = format!("mock.test.UniqueLists {{\n  {body}\n}}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        assert!(!diagnostics.is_empty(), "{body}: {diagnostics:?}");
+        let diagnostic = only_message_diagnostic(&diagnostics, "Duplicate list element");
+        assert_eq!(
+            diagnostic.severity,
+            Some(DiagnosticSeverity::ERROR),
+            "{body}: {diagnostics:?}"
+        );
+        if let Some(offset) = source.rfind("\"repo\"") {
+            let before = &source[..offset];
+            let line = before.bytes().filter(|&byte| byte == b'\n').count() as u32;
+            let start = before.rsplit('\n').next().unwrap().len() as u32;
+            assert_eq!(
+                diagnostic.range,
+                Range::new(Position::new(line, start), Position::new(line, start + 6)),
+                "{body}: {diagnostics:?}"
+            );
+        }
+    }
+}
+
 fn anonymous_loop_engine() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
@@ -918,8 +1777,9 @@ fn authored_binding_regression_schemas() -> SchemaRegistry {
                 )
                 .build(),
             )
+            .attribute(AttributeSchema::provider_populated("arn", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::provider_populated("arn", AttributeType::string()).build(),
+                AttributeSchema::provider_populated("protected", AttributeType::bool()).build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -928,32 +1788,503 @@ fn authored_binding_regression_schemas() -> SchemaRegistry {
 }
 
 #[test]
-fn prevent_destroy_non_literal_uses_the_shared_parser_warning_in_lsp() {
-    let engine = custom_engine(authored_binding_regression_schemas());
-    let source = r#"provider mock {}
-let allow_destroy = false
-mock.test.resource {
-  name = "example"
-  directives { prevent_destroy = allow_destroy }
-}
-"#;
-
-    let diagnostics = engine.analyze(&create_document(source), None);
-
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic
+fn invalid_module_directive_argument_is_reported_at_call_site() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        std::fs::write(fixture.path().join("module/main.crn"), format!("arguments {{ flag: Bool }}\nlet r = mock.test.resource {{ name = 'r' directives {{ {directive} = flag }} }}\n")).unwrap();
+        std::fs::write(
+            fixture.path().join("providers.crn"),
+            "provider mock {}\nlet peer = mock.test.resource { name = 'peer' }\n",
+        )
+        .unwrap();
+        let source =
+            "let m = use { source = './module' }\nlet instance = m { flag = peer.protected }\n";
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, source).unwrap();
+        let diagnostics = custom_engine(authored_binding_regression_schemas())
+            .analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains(&format!("directives.{directive}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            errors[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(errors[0].range.start.line, 1);
+        assert_eq!(errors[0].range.start.character, 26);
+        assert!(
+            !errors[0]
                 .message
-                .contains("only a literal `false` opts out of schema-default protection")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
-    assert_eq!(
-        warnings[0].severity,
-        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+                .contains(&fixture.path().display().to_string()),
+            "{errors:#?}"
+        );
+        assert!(errors[0].message.starts_with("directives."), "{errors:#?}");
+        assert!(
+            errors[0].message.contains("a resource reference"),
+            "{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn defaulted_protection_opt_out_is_reported_at_the_omitting_call_site() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    for nested in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        std::fs::write(fixture.path().join("module/main.crn"), "arguments { protect: Bool = false }\nlet r = mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = protect } }\n").unwrap();
+        let module = if nested {
+            std::fs::create_dir(fixture.path().join("outer")).unwrap();
+            std::fs::write(fixture.path().join("outer/main.crn"), "arguments { protect: Bool = false }\nlet inner = use { source = '../module' }\nlet child = inner { protect = protect }\n").unwrap();
+            "./outer"
+        } else {
+            "./module"
+        };
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = format!("let m = use {{ source = '{module}' }}\nlet instance = m {{}}\n");
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, &source).unwrap();
+        let mut schemas = authored_binding_regression_schemas();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.default_prevent_destroy")
+                .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+                .default_prevent_destroy()
+                .validate()
+                .unwrap(),
+        );
+        let diagnostics =
+            custom_engine(schemas).analyze(&create_document_at(&source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("default of argument `protect`"))
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert_eq!(errors[0].range.start.line, 1);
+        assert!(
+            errors[0].message.contains(module) && errors[0].message.contains("protect = false"),
+            "{errors:#?}"
+        );
+        assert!(
+            !errors[0]
+                .message
+                .contains(&fixture.path().display().to_string()),
+            "{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn default_opt_out_diagnostics_keep_all_resources_at_one_omitting_call() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    for anonymous in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        let first = if anonymous { "" } else { "let first = " };
+        let second = if anonymous { "" } else { "let second = " };
+        std::fs::write(fixture.path().join("module/main.crn"), format!("arguments {{ protect: Bool = false }}\n{first}mock.test.default_prevent_destroy {{ name = 'first' directives {{ prevent_destroy = protect }} }}\n{second}mock.test.default_prevent_destroy {{ name = 'second' directives {{ prevent_destroy = protect }} }}\n")).unwrap();
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = "let m = use { source = './module' }\nlet instance = m {}\n";
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, source).unwrap();
+        let mut schemas = authored_binding_regression_schemas();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.default_prevent_destroy")
+                .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+                .default_prevent_destroy()
+                .validate()
+                .unwrap(),
+        );
+        let diagnostics =
+            custom_engine(schemas).analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("false came from"))
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2, "{diagnostics:#?}");
+        if !anonymous {
+            for resource in ["instance.first", "instance.second"] {
+                assert!(
+                    errors.iter().any(|error| error.message.contains(resource)),
+                    "{errors:#?}"
+                );
+            }
+        }
+        assert_eq!(errors[0].range, errors[1].range);
+        assert_eq!(errors[0].range.start.line, 1);
+        assert!(
+            errors.iter().all(
+                |error| error.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            )
+        );
+    }
+}
+
+#[test]
+fn default_control_values_only_taint_dependent_directives_in_lsp() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    for (arguments, body, error_expected) in [
+        (
+            "flags: list(Bool) = [false]",
+            "for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }",
+            false,
+        ),
+        (
+            "flags: list(Bool) = [false]",
+            "for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }",
+            true,
+        ),
+        (
+            "enabled: Bool = true",
+            "if enabled { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }",
+            false,
+        ),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        std::fs::write(
+            fixture.path().join("module/main.crn"),
+            format!("arguments {{ {arguments} }}\nlet child = {body}\n"),
+        )
+        .unwrap();
+        let source = "let m = use { source = './module' }\nlet instance = m {}\n";
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, source).unwrap();
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let mut schemas = authored_binding_regression_schemas();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.default_prevent_destroy")
+                .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+                .default_prevent_destroy()
+                .validate()
+                .unwrap(),
+        );
+        let diagnostics =
+            custom_engine(schemas).analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors.len(),
+            usize::from(error_expected),
+            "{body}: {diagnostics:#?}"
+        );
+        if error_expected {
+            assert!(errors[0].message.contains("default of argument `flags`"));
+            assert_eq!(errors[0].range.start.line, 1);
+        }
+    }
+}
+
+#[test]
+fn default_opt_out_diagnostics_only_anchor_calls_that_omitted_values() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("inner")).unwrap();
+    std::fs::create_dir(fixture.path().join("outer")).unwrap();
+    std::fs::write(fixture.path().join("inner/main.crn"), "arguments { protect: Bool = false }\nlet r = mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = protect } }\n").unwrap();
+    let outer = "arguments { label: String }\nlet inner = use { source = '../inner' }\nlet child = inner {}\n";
+    let outer_path = fixture.path().join("outer/main.crn");
+    std::fs::write(&outer_path, outer).unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let root =
+        "let outer = use { source = './outer' }\nlet instance = outer { label = 'explicit' }\n";
+    let root_path = fixture.path().join("call.crn");
+    std::fs::write(&root_path, root).unwrap();
+    let mut schemas = authored_binding_regression_schemas();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.default_prevent_destroy")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .default_prevent_destroy()
+            .validate()
+            .unwrap(),
     );
-    assert_eq!(warnings[0].range.start.line, 4);
+    let engine = custom_engine(schemas);
+    let root_diagnostics = engine.analyze(
+        &create_document_at(root, root_path.clone()),
+        Some(&root_path),
+    );
+    assert!(
+        root_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("false came from")),
+        "the outer caller did not omit protect: {root_diagnostics:#?}"
+    );
+    let outer_diagnostics = engine.analyze(
+        &create_document_at(outer, outer_path.clone()),
+        Some(&outer_path),
+    );
+    let errors = outer_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("false came from"))
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{outer_diagnostics:#?}");
+    assert_eq!(errors[0].range.start.line, 2);
+}
+
+#[test]
+fn directive_argument_exemptions_reject_computed_and_non_bool_loop_values_in_lsp() {
+    for (arguments, body) in [
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = \"${protect}\" } }",
+        ),
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = length([protect]) } }",
+        ),
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = protect ?? false } }",
+        ),
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = if protect { true } else { false } } }",
+        ),
+        (
+            "flags: list(Bool)",
+            "for flag in flags { mock.test.resource { name = 'r' directives { prevent_destroy = lookup({ keep = flag }, 'keep', false) } } }",
+        ),
+        (
+            "names: list(String)",
+            "for flag in names { mock.test.resource { name = 'r' directives { prevent_destroy = flag } } }",
+        ),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("arguments.crn"),
+            format!("arguments {{ {arguments} }}\n"),
+        )
+        .unwrap();
+        let path = fixture.path().join("resource.crn");
+        std::fs::write(&path, body).unwrap();
+        let diagnostics = custom_engine(authored_binding_regression_schemas())
+            .analyze(&create_document_at(body, path.clone()), Some(&path));
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("directives.prevent_destroy")
+                && diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+            "{diagnostics:#?}"
+        );
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("directives.prevent_destroy"))
+            .unwrap();
+        let expected = if arguments == "names: list(String)" {
+            "got String"
+        } else {
+            "cannot be checked until the module is instantiated"
+        };
+        assert!(error.message.contains(expected), "{error:#?}");
+        assert!(!error.message.contains("unknown until apply"), "{error:#?}");
+    }
+}
+
+#[test]
+fn non_local_loop_directive_dependencies_are_errors_in_lsp() {
+    for expression in [
+        "lookup({ value = flag }, 'value', peer.protected)",
+        "flag ?? false",
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("providers.crn"),
+            "provider mock {}\nlet peer = mock.test.resource { name = 'peer' }\n",
+        )
+        .unwrap();
+        let source = format!(
+            "for flag in peer.items {{\n  mock.test.resource {{ name = 'r' directives {{ prevent_destroy = {expression} }} }}\n}}\n"
+        );
+        let path = fixture.path().join("loops.crn");
+        std::fs::write(&path, &source).unwrap();
+        let diagnostics = custom_engine(authored_binding_regression_schemas())
+            .analyze(&create_document_at(&source, path.clone()), Some(&path));
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("directives.prevent_destroy"))
+            .unwrap_or_else(|| panic!("{expression}: non-local loop directive must be diagnosed before apply: {diagnostics:#?}"));
+        assert_eq!(
+            error.severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(error.range.start.line, 1);
+        assert!(
+            error
+                .message
+                .contains("loop directive must depend only on the current element"),
+            "{error:#?}"
+        );
+        assert!(!error.message.contains("unknown until apply"), "{error:#?}");
+    }
+}
+
+#[test]
+fn standalone_module_directive_arguments_must_be_bool_in_lsp() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        for kind in ["String", "Int"] {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(
+                fixture.path().join("arguments.crn"),
+                format!("arguments {{ flag: {kind} }}\n"),
+            )
+            .unwrap();
+            let source = format!(
+                "let r = mock.test.resource {{\n  name = 'r'\n  directives {{ {directive} = flag }}\n}}\n"
+            );
+            let path = fixture.path().join("resource.crn");
+            std::fs::write(&path, &source).unwrap();
+            let diagnostics = custom_engine(authored_binding_regression_schemas())
+                .analyze(&create_document_at(&source, path.clone()), Some(&path));
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains(&format!("directives.{directive}"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{kind}: {diagnostics:#?}");
+            assert_eq!(errors[0].range.start.line, 2);
+            assert!(
+                errors[0].message.contains(&format!("got {kind}")),
+                "{errors:#?}"
+            );
+            assert!(
+                errors[0].message.contains("mock.test.resource"),
+                "{errors:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn module_argument_iterable_directives_are_valid_in_lsp() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments { flags: list(Bool) }\n",
+    )
+    .unwrap();
+    let source = "for flag in flags {\n  mock.test.resource { name = 'r' directives { prevent_destroy = flag create_before_destroy = flag force_delete = flag } }\n}\n";
+    let path = fixture.path().join("resource.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = custom_engine(authored_binding_regression_schemas())
+        .analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn instantiated_module_loop_directives_are_valid_in_lsp() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("module")).unwrap();
+    std::fs::write(
+        fixture.path().join("module/arguments.crn"),
+        "arguments { flags: list(Bool) }\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.path().join("module/resources.crn"), "for flag in flags { mock.test.resource { name = 'r' directives { prevent_destroy = flag create_before_destroy = flag force_delete = flag } } }\n").unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = "let m = use { source = './module' }\nlet instance = m { flags = [true] }\n";
+    let path = fixture.path().join("calls.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = custom_engine(authored_binding_regression_schemas())
+        .analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics.iter().all(|diagnostic| diagnostic.severity
+            != Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn module_argument_directives_remain_valid_in_module_diagnostics() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments { flag: Bool }\n",
+    )
+    .unwrap();
+    let source = "let r = mock.test.resource {\n  name = 'r'\n  directives { prevent_destroy = flag create_before_destroy = flag force_delete = flag }\n}\n";
+    let path = fixture.path().join("resource.crn");
+    std::fs::write(&path, source).unwrap();
+    let engine = custom_engine(authored_binding_regression_schemas());
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn directive_value_errors_use_authored_ranges_in_lsp() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        for expression in ["peer.arn", "bad"] {
+            for trailing in ["", " // comment", " /* comment */", " /* comment\nmore */"] {
+                let fixture = tempfile::tempdir().unwrap();
+                std::fs::write(fixture.path().join("flags.crn"), "let bad = 1\n").unwrap();
+                std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+                let prefix = if expression == "bad" {
+                    "let doc = <<EOF\nalpha\nbeta\nEOF\n"
+                } else {
+                    ""
+                };
+                let directive_line = prefix.lines().count() as u32 + 4;
+                let source = format!(
+                    "{prefix}let peer = mock.test.resource {{ name = 'peer' }}\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{\n    {directive} = {expression}{trailing}\n  }}\n}}\n"
+                );
+                let path = fixture.path().join("resources.crn");
+                std::fs::write(&path, &source).unwrap();
+                let engine = custom_engine(authored_binding_regression_schemas());
+                let diagnostics =
+                    engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+                let errors = diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic
+                            .message
+                            .contains(&format!("directives.{directive}"))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+                assert!(errors[0].message.starts_with("directives."), "{errors:#?}");
+                assert_eq!(
+                    errors[0].severity,
+                    Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+                );
+                assert_eq!(errors[0].range.start.line, directive_line);
+                assert_eq!(
+                    errors[0].range.start.character,
+                    (directive.len() + 7) as u32
+                );
+                assert_eq!(errors[0].range.end.line, directive_line, "{errors:#?}");
+                assert_eq!(
+                    errors[0].range.end.character,
+                    errors[0].range.start.character + expression.len() as u32
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -3071,7 +4402,6 @@ fn find_let_binding_position_with_multibyte_leading_whitespace() {
     // Regression test for issue #724: find_let_binding_position uses byte offset
     // as character column. When multi-byte whitespace (e.g., full-width space U+3000)
     // appears before "let", the byte offset differs from the character offset.
-    let engine = test_engine();
 
     // U+3000 (ideographic space) is 3 bytes in UTF-8 but 1 character.
     // Rust's str::trim() strips it as Unicode whitespace.
@@ -3080,11 +4410,26 @@ fn find_let_binding_position_with_multibyte_leading_whitespace() {
     // name_col should be char 1 + 4 = 5 (correct)
     // Bug produces byte 3 + 4 = 7 (wrong)
     let text = "\u{3000}let my_var = awscc.ec2.Vpc { }";
-    let result = engine.with_run_for_test(|run| run.find_let_binding_position(text, "my_var"));
+    let result = text
+        .find("my_var")
+        .map(|offset| (0, crate::position::byte_offset_to_char_offset(text, offset)));
     assert_eq!(
         result,
         Some((0, 5)),
         "Column should be character offset (5), not byte offset (7)"
+    );
+}
+
+#[test]
+fn unused_binding_position_after_multibyte_comment() {
+    // U+3000 is valid in a comment and occupies three UTF-8 bytes but one column.
+    let source = "/*\u{3000}*/ let my_var = mock.test.Other { name = \"b\" }\n";
+    let diagnostics = unique_list_source_diagnostics(source);
+    let warning = only_message_diagnostic(&diagnostics, "Unused let binding 'my_var'");
+    assert_eq!(
+        warning.range,
+        Range::new(Position::new(0, 10), Position::new(0, 16)),
+        "{diagnostics:#?}"
     );
 }
 
@@ -6983,18 +8328,77 @@ let child = imported {
     let path = root.join("main.crn");
     let document = create_document_at(source, path.clone());
     let diagnostics = engine.analyze(&document, Some(&path));
-    let diagnostic = diagnostics
+    let matching = diagnostics
         .iter()
-        .find(|diagnostic| {
-            diagnostic
-                .message
-                .contains("depends_on parameter 'peer' received a value")
+        .filter(|diagnostic| {
+            diagnostic.message
+                == "module call 'child': argument 'peer': expected resource handle mock.test.Thing; got String"
         })
-        .unwrap_or_else(|| panic!("missing substitution diagnostic: {diagnostics:#?}"));
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+    let diagnostic = matching[0];
 
     assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(diagnostic.range.start.line, 5, "{diagnostic:#?}");
     assert_eq!(diagnostic.range.end.line, 5, "{diagnostic:#?}");
+}
+
+#[test]
+fn typed_identity_values_do_not_satisfy_resource_handle_arguments() {
+    let tmp = tempfile::tempdir().expect("create typed-identity boundary fixture");
+    let module = tmp.path().join("consumer");
+    std::fs::create_dir(&module).expect("create consumer module");
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  vpc: aws.ec2.Vpc\n}\n",
+    )
+    .expect("write consumer signature");
+
+    let source = r#"let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let wrong = aws.ec2.SecurityGroup {
+  name = "wrong"
+}
+
+let imported = use { source = "./consumer" }
+
+let by_vpc_id = imported {
+  vpc = main_vpc.vpc_id
+}
+
+let by_group_id = imported {
+  vpc = wrong.group_id
+}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), source).expect("write caller fixture");
+
+    let diagnostics = analyze_with_buffer(
+        &module_boundary_identity_engine(),
+        tmp.path(),
+        "main.crn",
+        source,
+    );
+    let expected = [
+        (
+            "module call 'by_vpc_id': argument 'vpc': expected resource handle aws.ec2.Vpc; got aws.ec2.Vpc.Id",
+            Range::new(Position::new(11, 8), Position::new(11, 23)),
+        ),
+        (
+            "module call 'by_group_id': argument 'vpc': expected resource handle aws.ec2.Vpc; got aws.ec2.SecurityGroup.Id",
+            Range::new(Position::new(15, 8), Position::new(15, 22)),
+        ),
+    ];
+    for (message, range) in expected {
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(matching[0].range, range, "diagnostic: {:#?}", matching[0]);
+    }
 }
 
 #[test]
@@ -9580,7 +10984,7 @@ fn single_quoted_interpolation_like_sequence_emits_warning_at_span() {
 }
 
 #[test]
-fn non_literal_prevent_destroy_warning_is_directory_scoped() {
+fn folded_false_prevent_destroy_is_valid_across_files() {
     let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
     let resource = r#"let account = mock.test.resource {
   name = "example"
@@ -9599,26 +11003,16 @@ fn non_literal_prevent_destroy_warning_is_directory_scoped() {
     let path = fixture.path().join("resources.crn");
     let diagnostics =
         test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic
-                .message
-                .contains("only a literal `false` opts out of schema-default protection")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
-    let warning = warnings[0];
-
-    assert_eq!(
-        warning.severity,
-        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.prevent_destroy")),
+        "{diagnostics:#?}"
     );
-    assert_eq!(warning.range.start.line, 2);
 }
 
 #[test]
-fn sibling_true_prevent_destroy_expression_does_not_warn() {
+fn sibling_true_prevent_destroy_expression_is_valid() {
     let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
     let resource = r#"let account = mock.test.resource {
   name = "example"
@@ -9634,18 +11028,11 @@ fn sibling_true_prevent_destroy_expression_does_not_warn() {
     let path = fixture.path().join("resources.crn");
     let diagnostics =
         test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic
-                .message
-                .contains("only a literal `false` opts out of schema-default protection")
-        })
-        .collect::<Vec<_>>();
-
     assert!(
-        warnings.is_empty(),
-        "the directory-resolved true value enables protection without an opt-out warning: {diagnostics:#?}"
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.prevent_destroy")),
+        "{diagnostics:#?}"
     );
 }
 
@@ -13412,11 +14799,190 @@ fn structural_ref_engine() -> DiagnosticEngine {
         "mock",
         (ResourceSchema::new("test.resource")
             .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build()))
+            .attribute(AttributeSchema::optional("parent", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build()))
         .validate()
         .expect("schema fixture must be valid"),
     );
     custom_engine(schemas)
+}
+
+#[test]
+fn inferred_and_declared_handle_exports_have_exact_state_boundary_diagnostics() {
+    let root = tempfile::tempdir().expect("create handle-export fixture");
+    std::fs::write(
+        root.path().join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write resource fixture");
+    let exports = r#"exports {
+  inferred = instance
+  declared: mock.compute.Instance = instance
+}
+"#;
+    std::fs::write(root.path().join("exports.crn"), exports).expect("write exports fixture");
+
+    let diagnostics = analyze_with_buffer(
+        &structural_ref_engine(),
+        root.path(),
+        "exports.crn",
+        exports,
+    );
+    let expected = [
+        (
+            "export 'inferred': inferred resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
+            Range::new(Position::new(1, 2), Position::new(1, 10)),
+        ),
+        (
+            "export 'declared': resource handle mock.compute.Instance cannot cross a state boundary; export an identity value such as mock.compute.Instance.Id instead",
+            Range::new(Position::new(2, 2), Position::new(2, 10)),
+        ),
+    ];
+    for (message, range) in expected {
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(matching[0].range, range, "diagnostic: {:#?}", matching[0]);
+    }
+}
+
+#[test]
+fn one_line_multifile_handle_export_is_an_error_anchored_by_parser_span() {
+    let root = tempfile::tempdir().expect("create one-line handle-export fixture");
+    std::fs::write(
+        root.path().join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write sibling resource fixture");
+    let exports = "exports { inferred = instance }\n";
+    std::fs::write(root.path().join("exports.crn"), exports).expect("write one-line exports");
+
+    let diagnostics = analyze_with_buffer(
+        &structural_ref_engine(),
+        root.path(),
+        "exports.crn",
+        exports,
+    );
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.message.contains(
+                "inferred resource handle mock.compute.Instance cannot cross a state boundary",
+            )
+        })
+        .unwrap_or_else(|| panic!("missing one-line handle boundary error: {diagnostics:#?}"));
+
+    assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 10), Position::new(0, 18)),
+    );
+}
+
+#[test]
+fn sibling_file_handle_export_is_not_misanchored_in_the_analyzed_buffer() {
+    let root = tempfile::tempdir().expect("create cross-file handle-export fixture");
+    std::fs::write(
+        root.path().join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write sibling resource fixture");
+    std::fs::write(
+        root.path().join("exports.crn"),
+        "exports {\n  inferred = instance\n}\n",
+    )
+    .expect("write sibling exports fixture");
+    let main = "\n";
+    std::fs::write(root.path().join("main.crn"), main).expect("write analyzed buffer fixture");
+
+    let diagnostics = analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", main);
+
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("cannot cross a state boundary")),
+        "a sibling export must not be anchored in main.crn: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn module_handle_output_attribute_diagnostics_use_the_underlying_schema_and_range() {
+    let root = tempfile::tempdir().expect("create module-handle reference fixture");
+    let module = root.path().join("module");
+    std::fs::create_dir(&module).expect("create module fixture");
+    std::fs::write(
+        module.join("resources.crn"),
+        "let instance = mock.compute.Instance { name = \"instance\" }\n",
+    )
+    .expect("write module resource");
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  r = instance\n}\n",
+    )
+    .expect("write module handle output");
+
+    let source = r#"let imported = use { source = "./module" }
+let child = imported {}
+
+mock.test.resource {
+  name = "unknown"
+  parent = child.r.missing
+}
+
+mock.test.resource {
+  name = "mismatch"
+  count = child.r.arn
+}
+
+mock.test.resource {
+  name = "bare"
+  parent = child.r
+}
+"#;
+    std::fs::write(root.path().join("main.crn"), source).expect("write caller fixture");
+
+    let diagnostics =
+        analyze_with_buffer(&structural_ref_engine(), root.path(), "main.crn", source);
+    let unknown = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message
+                == "Unknown attribute 'missing' on 'child.r' (type 'mock.compute.Instance')"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unknown.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(unknown[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        unknown[0].range,
+        Range::new(Position::new(5, 19), Position::new(5, 26)),
+    );
+
+    let mismatch = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("child.r.arn")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(mismatch.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(mismatch[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(mismatch[0].range.start.line, 10);
+
+    let bare = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("child.r")
+                && diagnostic.message.contains("expected String")
+                && diagnostic.message.contains("got mock.compute.Instance")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(bare.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(bare[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(bare[0].range.start.line, 15);
 }
 
 #[test]
@@ -15232,4 +16798,132 @@ fn settlement_loaded_error_from_another_file_stays_out_of_the_current_document()
     });
     let doc = create_document_at("", "/project/current.crn".into());
     assert!(DiagnosticEngine::publish_type_diagnostics(terminal, &doc).is_empty());
+}
+
+fn custom_value_depends_on_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("route53.RecordSet")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "id",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::new(
+                            Some("aws"),
+                            ["route53", "RecordSet"],
+                            "Id",
+                        )),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    custom_engine(schemas)
+}
+
+#[test]
+fn depends_on_resolves_dotted_argument_type_before_validation() {
+    let source = "arguments { rec: aws.route53.RecordSet.Id }\nlet consumer = aws.route53.RecordSet { name = 'consumer' directives { depends_on = [rec] } }\n";
+    let document = create_document(source);
+    assert!(matches!(
+        document.parsed().unwrap().arguments[0].static_type,
+        TypeExpr::DottedUnresolved(_)
+    ));
+    let diagnostics = custom_value_depends_on_engine().analyze(&document, None);
+    let expected =
+        "directives.depends_on: expected a managed resource handle; got aws.route53.RecordSet.Id";
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        matching[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn depends_on_rejects_custom_value_argument_from_sibling_file() {
+    let module = tempfile::tempdir().unwrap();
+    let main = "let consumer = aws.route53.RecordSet {\n  name = 'consumer'\n  directives { depends_on = [rec] }\n}\n";
+    std::fs::write(module.path().join("main.crn"), main).unwrap();
+    std::fs::write(
+        module.path().join("arguments.crn"),
+        "arguments { rec: aws.route53.RecordSet.Id }\n",
+    )
+    .unwrap();
+    let diagnostics = analyze_with_buffer(
+        &custom_value_depends_on_engine(),
+        module.path(),
+        "main.crn",
+        main,
+    );
+    let expected =
+        "directives.depends_on: expected a managed resource handle; got aws.route53.RecordSet.Id";
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == expected)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        matching[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reference_constraints_validate_offline_in_a_directory_configuration() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::reference(
+                        TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+                        Some("^alias/[a-z]+$".into()),
+                        Some((Some(8), Some(12))),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider test {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    for (value, valid) in [
+        ("alias/abc", true),
+        ("alias/a", false),
+        ("key/abc", false),
+        ("alias/abcdefghij", false),
+    ] {
+        let source = format!("test.keys.Resource {{ key = '{value}' }}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        assert_eq!(diagnostics.is_empty(), valid, "{value}: {diagnostics:?}");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("no declaration")),
+            "resolver identity must not trigger custom validation: {diagnostics:?}"
+        );
+    }
 }

@@ -62,6 +62,16 @@ impl Scenario {
         .expect("write resource configuration with peer");
     }
 
+    fn write_resources_with_dependent_peer(&self, name: &str) {
+        fs::write(
+            self.project.join("resources.crn"),
+            format!(
+                "let account = mock.test.default_prevent_destroy {{\n  name = \"{name}\"\n}}\n\nlet peer = mock.test.resource {{\n  name = \"peer\"\n  parent = account.name\n}}\n"
+            ),
+        )
+        .expect("write protected resource with dependent peer");
+    }
+
     fn write_resources_with_tagged_peer(&self, name: &str, setting: Option<bool>, peer_tag: &str) {
         let directives = setting.map_or_else(String::new, |value| {
             format!("  directives {{ prevent_destroy = {value} }}\n")
@@ -245,29 +255,40 @@ fn schema_default_protects_remove_replace_and_destroy_until_explicit_opt_out() {
 }
 
 #[test]
-fn non_literal_false_is_valid_but_does_not_opt_out() {
+fn destroy_dependency_on_kept_prevent_destroy_target_reaches_typed_refusal() {
+    let scenario = Scenario::new();
+    scenario.write_resources_with_dependent_peer("account-v1");
+    assert_success("carina init", &scenario.run(&["init", "."]));
+    assert_success(
+        "initial apply",
+        &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
+    );
+
+    let destroy = scenario.run(&["destroy", ".", "--auto-approve", "--lock=false"]);
+    assert_schema_default_refusal("destroy with kept dependency target", &destroy);
+    assert!(
+        !output_text(&destroy).contains("Failed to analyze destroy dependencies"),
+        "a dependency on an existing kept target is not missing:\n{}",
+        output_text(&destroy)
+    );
+}
+
+#[test]
+fn folded_false_opts_out_of_schema_default() {
     let scenario = Scenario::new();
     scenario.write_resource_with_expression("account-v1");
     assert_success("carina init", &scenario.run(&["init", "."]));
     let validate = scenario.run(&["validate", "."]);
     assert_success("carina validate", &validate);
-    let validate_output = output_text(&validate);
-    assert!(
-        validate_output.contains("only a literal `false` opts out of schema-default protection"),
-        "validate must warn about the ignored non-literal opt-out:\n{validate_output}"
-    );
     assert_success(
         "initial apply",
         &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
     );
 
     scenario.write_resource_with_expression("account-v2");
-    let plan = scenario.run(&["plan", "."]);
-    assert_schema_default_refusal("non-literal false replacement plan", &plan);
-    let plan_output = output_text(&plan);
-    assert!(
-        plan_output.contains("only a literal `false` opts out of schema-default protection"),
-        "plan must warn about the ignored non-literal opt-out:\n{plan_output}"
+    assert_success(
+        "folded false replacement plan",
+        &scenario.run(&["plan", "."]),
     );
 }
 
@@ -605,7 +626,11 @@ fn export_only_apply_preserves_resource_rows_byte_for_byte() {
         .iter_mut()
         .find(|row| row["identity"] == "account")
         .expect("account state row");
-    row["dependency_bindings"] = json!(["historical-only"]);
+    row["dependency_bindings"] = json!([{
+        "provider": "mock",
+        "resource_type": "test.resource",
+        "identity": "historical-only"
+    }]);
     fs::write(
         scenario.project.join("carina.state.json"),
         serde_json::to_vec_pretty(&seeded).expect("serialize seeded state"),
@@ -654,7 +679,11 @@ fn directive_only_apply_changes_only_directives_on_selected_rows() {
 
     let mut seeded = scenario.state_json();
     for row in seeded["resources"].as_array_mut().expect("state resources") {
-        row["dependency_bindings"] = json!(["historical-only"]);
+        row["dependency_bindings"] = json!([{
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "historical-only"
+        }]);
     }
     fs::write(
         scenario.project.join("carina.state.json"),

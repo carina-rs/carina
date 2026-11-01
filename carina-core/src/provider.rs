@@ -660,7 +660,14 @@ pub struct SentAttributes {
 }
 
 impl SentAttributes {
-    pub(crate) fn from_resource<S>(resource: &Resource<S>) -> Self {
+    pub(crate) fn from_resource<S, D>(
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Self {
         Self::only(resource.attributes.keys().cloned().collect())
     }
 
@@ -690,7 +697,15 @@ impl SentAttributes {
         )
     }
 
-    fn from_create_sent<S>(sent: &Sent, resource: &Resource<S>) -> Self {
+    fn from_create_sent<S, D>(
+        sent: &Sent,
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Self {
         match sent {
             Sent::AllRequestAttributes => Self::from_resource(resource),
             Sent::Only(attributes) => Self::only(attributes.clone()),
@@ -2268,9 +2283,14 @@ impl FreshPendingCreate {
     }
 
     /// Desired values and send evidence retained by this fresh continuation.
-    pub fn sent_desired_attributes_for<'a, S>(
+    pub fn sent_desired_attributes_for<'a, S, D>(
         &self,
-        resource: &'a Resource<S>,
+        resource: &'a Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> SentDesiredAttributes<'a> {
         SentDesiredAttributes::new(
             resource.attributes.iter(),
@@ -2588,7 +2608,15 @@ impl SentRecord {
     /// Recover attribute send evidence while it is still retained in request
     /// form. Persisted continuations intentionally omit ordinary observable
     /// attribute names, so they cannot claim a sent desired basis.
-    fn sent_attributes_for<S>(&self, resource: &Resource<S>) -> Option<SentAttributes> {
+    fn sent_attributes_for<S, D>(
+        &self,
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    ) -> Option<SentAttributes> {
         match self {
             Self::Request(sent) => Some(SentAttributes::from_create_sent(sent, resource)),
             Self::Persisted(_envelope) => None,
@@ -2704,9 +2732,14 @@ impl ObservedCreate {
 
     /// Resolved desired values and send evidence retained by the accepted
     /// create observation.
-    pub fn sent_desired_attributes_for<'a, S>(
+    pub fn sent_desired_attributes_for<'a, S, D>(
         &'a self,
-        fallback_resource: &'a Resource<S>,
+        fallback_resource: &'a Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> Option<SentDesiredAttributes<'a>> {
         let sent = self.sent.sent_attributes_for(fallback_resource)?;
         Some(match self.resolved_desired_attributes.as_ref() {
@@ -4887,6 +4920,33 @@ pub trait Provider: Send + Sync {
     /// Name of this Provider (e.g., "aws")
     fn name(&self) -> &str;
 
+    /// Resolve comparison keys in this initialized instance. An unsupported
+    /// identity is an error for each request, never a successful raw echo.
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [crate::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(requests
+                .iter()
+                .map(|request| {
+                    Err(crate::references::ReferenceError::InvalidReference(
+                        ProviderError::invalid_input(format!(
+                            "unsupported reference identity {}",
+                            request.ty
+                        ))
+                        .into(),
+                    ))
+                })
+                .collect())
+        })
+    }
+
     /// Read the current provider-side state of an existing resource.
     ///
     /// `identifier` is the validated, non-empty cloud-side identifier (e.g.
@@ -5365,12 +5425,17 @@ impl std::error::Error for DefaultTagEncodingError {}
 ///
 /// Records which tag keys came from defaults as host-owned provenance on the
 /// resource, separate from provider-facing attributes.
-pub fn merge_default_tags<S>(
+pub fn merge_default_tags<S, D>(
     config: &ProviderConfig<
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >,
-    resources: &mut [Resource<S>],
+    resources: &mut [Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
     registry: &SchemaRegistry,
 ) -> ProviderResult<()> {
     if config.default_tags.is_empty() {
@@ -5593,7 +5658,7 @@ impl InitializedProvider {
 /// Provider normalizers without CRUD-capable initialized instances.
 ///
 /// Normalizer-only loading returns this type. It deliberately has no API that
-/// can mint a [`crate::differ::ComparisonContext`].
+/// can mint a [`crate::differ::ComparisonSchema`].
 pub struct NormalizerRouter {
     normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
 }
@@ -5732,7 +5797,7 @@ impl From<ComparisonResolutionError> for ProviderError {
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedComparison<'a> {
     owner_schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    context: crate::differ::ComparisonContext<'a>,
+    context: crate::differ::ComparisonSchema<'a>,
 }
 
 impl<'a> ResolvedComparison<'a> {
@@ -5740,8 +5805,73 @@ impl<'a> ResolvedComparison<'a> {
         self.owner_schema
     }
 
-    pub fn context(&self) -> &crate::differ::ComparisonContext<'a> {
+    pub fn context(&self) -> &crate::differ::ComparisonSchema<'a> {
         &self.context
+    }
+}
+
+/// Resolve the schema and comparison context for a resource without exposing
+/// provider CRUD. Runtime planning implements this with initialized providers;
+/// metadata-only workflows use [`MetadataComparisonResolver`] so identity
+/// reconciliation cannot accidentally initialize or dispatch a provider.
+pub trait ResourceComparisonResolver {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError>;
+}
+
+/// Comparison resolver for schema-only, provider-I/O-free workflows.
+///
+/// Provider routes are admitted explicitly from the finalized resource set.
+/// Reference scope remains unavailable because obtaining account/region scope
+/// may require provider initialization; ordinary typed and transformed values
+/// still use the same production comparison implementation.
+pub struct MetadataComparisonResolver {
+    routes: HashSet<ProviderInstanceKey>,
+    reference_scope: ReferenceScope,
+}
+
+impl MetadataComparisonResolver {
+    pub fn new<'a>(ids: impl IntoIterator<Item = &'a ResourceId>) -> Self {
+        Self {
+            routes: ids.into_iter().map(ProviderInstanceKey::from).collect(),
+            reference_scope: ReferenceScope::Unavailable,
+        }
+    }
+}
+
+impl ResourceComparisonResolver for MetadataComparisonResolver {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        let schema = registry
+            .get(
+                &id.provider,
+                &id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: id.clone() })?;
+        let route = ProviderInstanceKey::from(id);
+        if !self.routes.contains(&route) {
+            return Err(ComparisonResolutionError::UnknownProviderInstance { instance: route });
+        }
+        if route.provider() != schema.owner() {
+            return Err(ComparisonResolutionError::SchemaOwnerMismatch {
+                id: id.clone(),
+                owner: schema.owner().to_string(),
+            });
+        }
+        Ok(ResolvedComparison {
+            owner_schema: schema,
+            context: crate::differ::ComparisonSchema::from_scope_and_forms(
+                &self.reference_scope,
+                schema.reference_forms(),
+            ),
+        })
     }
 }
 
@@ -5797,7 +5927,7 @@ impl ResolvedComparisonTable {
         );
         Ok(ResolvedComparison {
             owner_schema,
-            context: crate::differ::ComparisonContext::from_scope_and_forms(
+            context: crate::differ::ComparisonSchema::from_scope_and_forms(
                 &data.scope,
                 &data.reference_forms,
             ),
@@ -5949,6 +6079,18 @@ impl ProviderRouter {
         }
     }
 
+    pub async fn resolve_references_for(
+        &self,
+        resource: &ResourceId,
+        requests: &[crate::references::ReferenceRequest],
+    ) -> ProviderResult<
+        Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+    > {
+        self.get_provider_or_error(resource)?
+            .resolve_references(requests)
+            .await
+    }
+
     /// Register the kind's default instance (resources with
     /// `provider_instance = None` route here).
     pub fn add_provider(&mut self, kind: String, provider: InitializedProvider) {
@@ -6028,7 +6170,7 @@ impl ProviderRouter {
         &'a self,
         id: &ResourceId,
         schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
+    ) -> ProviderResult<crate::differ::ComparisonSchema<'a>> {
         self.resolve_comparison(id, schema)
             .map(|resolved| resolved.context)
             .map_err(ProviderError::from)
@@ -6100,8 +6242,18 @@ impl ProviderRouter {
         })?;
         Ok(ResolvedComparison {
             owner_schema: schema,
-            context: crate::differ::ComparisonContext::from_initialized_provider(provider, schema),
+            context: crate::differ::ComparisonSchema::from_initialized_provider(provider, schema),
         })
+    }
+}
+
+impl ResourceComparisonResolver for ProviderRouter {
+    fn comparison_for<'a>(
+        &'a self,
+        registry: &'a SchemaRegistry,
+        id: &ResourceId,
+    ) -> Result<ResolvedComparison<'a>, ComparisonResolutionError> {
+        ProviderRouter::comparison_for(self, registry, id)
     }
 }
 
@@ -6313,6 +6465,7 @@ impl CustomTypeCanonicalizationError {
 pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option<&TypeIdentity> {
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
+        RawShape::Reference { .. } => None,
         RawShape::String { identity, .. }
         | RawShape::Int { identity, .. }
         | RawShape::Float { identity, .. } => identity,
@@ -6335,6 +6488,11 @@ pub fn identified_custom_type_scalar_kind(
 ) -> Result<Option<RefinedScalarKind>, crate::parser::UnloadedSchemaType> {
     Ok(match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(unloaded) => return Err(unloaded.clone()),
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(RefinedScalarKind::String),
         RawShape::String {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::String),
@@ -6361,6 +6519,11 @@ pub fn identified_custom_type_scalar_kind(
 fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => None,
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(RefinedScalarKind::String),
         RawShape::String { .. } => Some(RefinedScalarKind::String),
         RawShape::Int { .. } => Some(RefinedScalarKind::Int),
         RawShape::Float { .. } => Some(RefinedScalarKind::Float),
@@ -6389,7 +6552,8 @@ pub fn canonicalize_custom_type_value(
         RawShape::UnloadedSchemaType(_) => {
             return Err(CustomTypeCanonicalizationError::ProvidersNotLoaded);
         }
-        RawShape::String { .. }
+        RawShape::Reference { .. }
+        | RawShape::String { .. }
         | RawShape::Int { .. }
         | RawShape::Float { .. }
         | RawShape::Bool
@@ -6542,14 +6706,16 @@ pub fn canonicalize_custom_type_value(
             )))
         }
         (
-            RawShape::String { .. }
+            RawShape::Reference { .. }
+            | RawShape::String { .. }
             | RawShape::Int { .. }
             | RawShape::Float { .. }
             | RawShape::Enum { .. },
             Value::Deferred(_),
         ) => Ok(None),
         (
-            RawShape::String { .. }
+            RawShape::Reference { .. }
+            | RawShape::String { .. }
             | RawShape::Int { .. }
             | RawShape::Float { .. }
             | RawShape::Enum { .. },
@@ -6609,7 +6775,7 @@ impl std::fmt::Display for CanonicalCustomTypeValue {
 /// Factory for creating and configuring a Provider.
 ///
 /// Each provider crate implements this trait to encapsulate provider-specific
-/// logic (region validation, region extraction, provider instantiation, schemas).
+/// logic (configuration validation, provider instantiation, schemas).
 /// The CLI uses factories instead of hardcoded provider name matching.
 pub trait ProviderFactory: Send + Sync {
     /// Provider name (e.g., "aws", "awscc")
@@ -6678,10 +6844,6 @@ pub trait ProviderFactory: Send + Sync {
     ) -> ProviderResult<()> {
         Ok(())
     }
-
-    /// Extract region from config in SDK format (e.g., "ap-northeast-1").
-    /// Returns a default region if none is configured.
-    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String;
 
     /// Create a provider instance from configuration attributes.
     ///
@@ -6908,6 +7070,13 @@ fn collect_type_names_from_type(
 
     match attr_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => {}
+        RawShape::Reference {
+            identity,
+            pattern: _pattern,
+            length: _length,
+        } => {
+            names.insert(identity.clone());
+        }
         RawShape::String {
             identity: Some(id), ..
         }
@@ -6962,6 +7131,11 @@ fn local_custom_validator(
 ) -> Option<&crate::schema::CustomValidator> {
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => None,
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => None,
         RawShape::String { validate, .. }
         | RawShape::Int { validate, .. }
         | RawShape::Float { validate, .. }
@@ -6988,6 +7162,10 @@ fn validate_declared_custom_type_locally(
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, crate::schema::TypeError> {
     declared_type.validate_identified_scalar_value(value)?;
+    // Reference identities choose the plan resolver, never guest validation.
+    if matches!(declared_type.raw_shape(), RawShape::Reference { .. }) {
+        return Ok(None);
+    }
     canonicalize_custom_type_value(declared_type, value)
         .map_err(CustomTypeCanonicalizationError::into_type_error)
 }
@@ -7342,11 +7520,11 @@ where
             BTreeMap::<(TypeIdentity, RefinedScalarKind), crate::parser::OwnedTypeIdentity>::new();
         for (owner, indexed) in &self.index {
             for (identity, declarations) in &indexed.declarations {
-                let owned = crate::parser::OwnedTypeIdentity::from_declaration(
+                let owned = crate::parser::OwnedTypeIdentity::from_schema_declaration(
                     owner,
-                    crate::parser::IdentifiedCustomTypeDeclaration::new(&declarations[0])
-                        .expect("validated identified declarations have a scalar kind"),
-                );
+                    &declarations[0],
+                )
+                .expect("validated identified declarations have a scalar kind");
                 declarations_by_identity
                     .entry((identity.clone(), owned.scalar_kind()))
                     .and_modify(|existing| {
@@ -8105,10 +8283,6 @@ mod tests {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -8262,10 +8436,6 @@ mod tests {
             _attributes: &CanonicalProviderConfigAttributes,
         ) -> ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -11675,7 +11845,8 @@ mod tests {
 
         let context = router
             .comparison_context_for(&id, schema)
-            .expect("the named provider instance must supply its scope");
+            .expect("the named provider instance must supply its scope")
+            .observation();
         let name = string_value("processor");
         let west_arn = string_value("arn:aws:lambda:us-west-2:123456789012:function:processor");
         let east_arn = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");
@@ -11861,9 +12032,6 @@ mod tests {
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
-            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
-                "us-east-1".to_string()
-            }
             fn create_provider(
                 &self,
                 _binding: Option<&str>,
@@ -11955,9 +12123,6 @@ mod tests {
                 _attrs: &CanonicalProviderConfigAttributes,
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
-            }
-            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
-                "ap-northeast-1".to_string()
             }
             fn create_provider(
                 &self,

@@ -363,7 +363,8 @@ mod tests {
                 .with_identifier("example-id"),
             ),
             to: ResolvedResource::new(
-                Resource::new("test.Widget", "example").with_attribute("value", new),
+                (Resource::new("test.Widget", "example").with_attribute("value", new))
+                    .into_value_snapshot(),
             ),
             changed_attributes: vec!["value".to_string()],
         };
@@ -382,6 +383,9 @@ mod tests {
             &historical,
             None,
             &provider,
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
         )
         .expect("diff display test must use the production comparison path")
     }

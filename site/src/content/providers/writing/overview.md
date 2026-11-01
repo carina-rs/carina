@@ -113,20 +113,34 @@ Every call must return quickly. The host stops a call whose WebAssembly code has
 
 Post-create and post-update reads have a separate host-owned budget. It starts at the first `read-back` pending result, defaults to two minutes, and is clipped to the operation's original deadline, so it never extends the operation. A resource schema can set a non-zero `operation_config.read_back.timeout_secs`. The host marks the one poll at the active deadline as `final-attempt` in `poll_create`, `resume_create`, and `poll_update`. The phase of the continuation sent that request controls the result: pending after a final attempt sent to an `operation` continuation is over budget, even if the response moves to `read-back`; pending in either phase after a final attempt sent to a `read-back` continuation is a protocol violation. Returning from `read-back` to `operation` at any time is also a violation. Do not put attempt counters in a read-back token—the host owns the deadline and finality.
 
-A pending create is also saved in state. If Carina is interrupted, the next apply calls `resume_create` with the saved token instead of creating the resource again. The token is stored and passed around, so it must hold only what the provider needs to find the operation again, never request values or secrets. State retains the token and identifier but not poll scheduling metadata, so the first resumed call's inbound phase and delay are non-authoritative; recover the real phase from the token or cloud operation, and set it on any pending result you return.
+A pending create is also saved in state. If Carina is interrupted, the next apply calls `resume_create` with the saved token instead of creating the resource again. The token is stored and passed around, so it must hold only what the provider needs to find the operation again, never request values or secrets. State retains the token and identifier but no poll scheduling metadata, so the host sends `operating` on the first resume call. A saved read-back token with an identifier can resume from a fresh provider instance through an identifier-bearing handle. Its next pending or preserved result reports read-back progress. SDK dispatch rejects only a backward transition: host progress is read-back while the token is operation-phase. For create poll and resume this returns `Undetermined` and keeps the previous continuation; update decoding rejects the same backward pairing. An identifier-less read-back token ends create polling with `READ_BACK_WITHOUT_IDENTIFIER`.
 
 Create results go through a typestate in the SDK, so a provider must say what it knows. There is no conversion from a plain error into a create result; every failure has to be classified:
 
 - `untracked` means nothing was created. Use it only when you know the API never accepted the request, for example when local validation failed or the API rejected it outright. Carina keeps no record of the resource.
-- If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `CreateAttempt::pending(token, sent, poll_after_secs)`, which carries no identifier, and settle it in `poll_create`. If a call has a usable continuation but stops with an error, preserve it with the signature for that handle: `CreateAttempt::preserve(token, sent, poll_after_secs, error)`, or `PollAttempt::preserve(token, poll_after_secs, error)`, `ResumeAttempt::preserve(token, poll_after_secs, error)`, `IssuedCreate::preserve(token, poll_after_secs, error)`, or `ResumedCreate::preserve(token, poll_after_secs, error)`. Carina then keeps the attempt and the error instead of forgetting a resource that may exist.
-- Call `issued` as soon as you see the resource's identifier. An `IssuedCreate` can then end or transition through `succeeded`, `partial`, `failed`, `discarded`, `pending`, `pending_read_back`, `preserve`, or `canonicalize`; only an explicit `discarded` leaves no record. `canonicalize` replaces the provisional identifier and returns a finishing handle that cannot go back to pending.
+- If the request may have reached the API but you have no identifier (a timeout, or a server error with no ID), return `pending` with an operation payload and settle it in `poll_create`. When a usable continuation also has an error to report, return `preserve`. Carina keeps the attempt and the error.
+- Call `issued` as soon as you see the resource's identifier. An `IssuedCreate` can then end or transition through `succeeded`, `partial`, `failed`, `discarded`, `pending`, `preserve`, or `canonicalize`; only an explicit `discarded` leaves no record. `canonicalize` replaces the provisional identifier and returns a finishing handle that cannot go back to pending.
 - `discarded` means the provider removed the resource it had created, so Carina keeps no record of it. If the resource may still exist, report it with `failed` instead.
+
+Create and update tokens implement `PhasedToken` with an associated operation payload `type Operation`, an infallible `from_operation`, a consuming `into_operation`, and a borrowed `operation` view. The default `phase()` derives `Operation` from `Some` and `ReadBack` from `None`; providers do not write a second phase match. Identifier-bearing `pending` and `preserve` accept the full token. Handles without an identifier take `T::Operation` directly, and `Poll::Unissued` / `Resume::Unissued` carry that payload. Provider code constructs operation payloads without a fallible wrapper; only SDK dispatch narrows host tokens. Updates use `Pending::new(token, poll_after_secs)` and derive their phase through `Pending::phase()`. `Never` implements the trait for providers that never defer an operation.
+
+For a token type `T: PhasedToken`, the continuation signatures are:
+
+| Handle | `pending` | `preserve` |
+|--------|-----------|------------|
+| `CreateAttempt` | `(T::Operation, Sent, u32) -> CreateStep<T>` | `(T::Operation, Sent, u32, ProviderError) -> CreateVerdict<T>` |
+| `PollAttempt` | `(T::Operation, u32) -> CreateStep<T>` | `(T::Operation, u32, ProviderError) -> PollVerdict<T>` |
+| `ResumeAttempt` | `(T::Operation, u32) -> ResumeStep<T>` | `(T::Operation, u32, ProviderError) -> ResumeVerdict<T>` |
+| `IssuedCreate` | `(T, u32) -> CreateStep<T>` | `(T, u32, ProviderError) -> CreateVerdict<T>` |
+| `ResumedCreate` | `(T, u32) -> ResumeStep<T>` | `(T, u32, ProviderError) -> ResumeVerdict<T>` |
+
+Each method consumes its handle. The `u32` is the poll delay in seconds.
 
 ## The sandbox
 
 A provider runs with no filesystem access. It sees only these environment variables:
 
-- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
+- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's header names to stderr, shows values only for a fixed allowlist of non-credential headers (`host`, `content-type`, `content-length`, `transfer-encoding`, `expect`, `user-agent`, `x-amz-date`), redacts all other header values, and removes userinfo, fragments and query values from URIs.
 - `AWS_REGION`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL`, only for an AWS-kind provider. AWS credential variables are never passed; the AWS world receives credentials through its typed import.
 - `GITHUB_TOKEN`, only when the same user-owned record exists for the exact `carina-rs/github` artifact (including its official GitHub source), or for a matching local build explicitly granted the `github` kind.
 
@@ -138,7 +152,7 @@ Cloud metadata addresses are withheld from every provider kind. The host may use
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 16, and the host also requires at least 16. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release. Protocol 16 changes the schema identity field to a required mode and uses declared identity hashing, so providers built for versions 14 or 15 must be rebuilt.
+The provider protocol is versioned. The current development version is 19, and the host also requires at least 19. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release. Protocol 19 adds per-leaf deferred handles for desired normalization; providers built for earlier development versions must be rebuilt.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

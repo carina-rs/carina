@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::output_style::Colorize;
 use aws_config::BehaviorVersion;
 use aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyError;
 use aws_sdk_iam::types::PolicyEvaluationDecisionType;
@@ -9,7 +10,6 @@ use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
-use colored::Colorize;
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,15 +401,21 @@ pub(crate) fn format_warnings(result: &IamPreflightResult) -> Option<String> {
     }
 }
 
-pub(crate) fn emit_warnings(result: &IamPreflightResult) {
+pub(crate) fn emit_warnings(
+    color_mode: crate::output_style::ColorMode,
+    result: &IamPreflightResult,
+) {
     if let Some(warning) = format_warnings(result) {
-        eprintln!("{}", warning.yellow());
+        eprintln!("{}", warning.yellow(color_mode));
     }
 }
 
-pub(crate) fn print_warnings(result: &IamPreflightResult) {
+pub(crate) fn print_warnings(
+    color_mode: crate::output_style::ColorMode,
+    result: &IamPreflightResult,
+) {
     if let Some(warning) = format_warnings(result) {
-        println!("{}", warning.yellow());
+        println!("{}", warning.yellow(color_mode));
     }
 }
 
@@ -773,11 +779,15 @@ mod tests {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-        ResolvedDataSource::new(resource)
+        ResolvedDataSource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     struct PermissionProvider {
@@ -971,9 +981,9 @@ mod tests {
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
-        plan.add(Effect::DeferredCreate(
-            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
-        ));
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
 
         let entries = collect_required_actions(
             &plan,
@@ -1014,9 +1024,9 @@ mod tests {
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
-        plan.add(Effect::DeferredCreate(
-            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
-        ));
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
 
         let mut schemas = SchemaRegistry::new();
         schemas.insert(

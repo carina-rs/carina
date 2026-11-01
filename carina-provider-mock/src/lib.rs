@@ -1,11 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
-use std::env;
+pub mod references;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::Arc;
 
 use carina_core::effect::PlanOp;
 use carina_core::parser::ProviderConfig;
@@ -31,6 +29,11 @@ use carina_core::schema::{
 };
 use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
 use serde::{Deserialize, Serialize};
+
+mod behavior;
+mod scope;
+pub use behavior::*;
+pub use scope::MockScope;
 
 pub const BUILTIN_PROVIDER_NAME: &str = "mock";
 const WRITE_ONLY_PASSWORD_ATTRIBUTE: &str = "password";
@@ -400,7 +403,35 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
                 .validate()
                 .expect("built-in mock resource schema must be valid")
         })
+        .chain(std::iter::once(references::resource_schema()))
         .collect()
+}
+
+/// Portable unique-list fixture shared by native diagnostics and the WASM mock.
+pub fn unique_list_schema() -> ResourceSchema {
+    use carina_core::schema::{ListElements, TypeIdentity};
+
+    let claim_keys = AttributeType::refined_list(
+        AttributeType::enum_(
+            TypeIdentity::new(Some("mock"), ["actions", "OidcSubject"], "ClaimKey"),
+            Some(vec!["repo".into(), "context".into()]),
+            Vec::new(),
+            None,
+            None,
+        ),
+        true,
+        Some((Some(1), None)),
+        ListElements::Unique,
+    );
+    ResourceSchema::new("actions.OidcSubject")
+        .attribute(AttributeSchema::required("claim_keys", claim_keys.clone()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "claim_keys_or_number",
+                AttributeType::union(vec![claim_keys, AttributeType::int()]),
+            )
+            .build(),
+        )
 }
 
 /// Identity schemas shared by the built-in and process mock providers.
@@ -533,24 +564,45 @@ pub fn builtin_schema_witness() -> ValidatedProviderSchemaWitness {
 }
 
 pub struct MockProvider {
-    state_file: PathBuf,
-    partial_create: Option<PartialConfig>,
-    partial_update: Option<PartialConfig>,
+    behavior: MockBehavior,
+    scope: MockScope,
+    telemetry: Arc<scope::UpdateTelemetry>,
 }
 
-#[derive(Clone, Debug)]
-struct PartialConfig {
-    resource_id_pattern: String,
-    missing_attributes: Vec<String>,
+/// One invocation owns the storage scope and update telemetry shared by all aliases.
+#[derive(Clone)]
+pub struct ConfiguredBuiltinMock {
+    behavior: MockBehavior,
+    scope: MockScope,
+    telemetry: Arc<scope::UpdateTelemetry>,
 }
 
-static ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
-static MAX_ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
-static MOCK_STATE_LOCK: Mutex<()> = Mutex::new(());
-static MOCK_STATE_WRITE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+impl ConfiguredBuiltinMock {
+    pub fn new(behavior: MockBehavior, scope: MockScope) -> Self {
+        let telemetry = Arc::new(scope::UpdateTelemetry::new(&behavior.observations));
+        Self {
+            behavior,
+            scope,
+            telemetry,
+        }
+    }
+    pub fn create_provider(&self) -> MockProvider {
+        MockProvider {
+            behavior: self.behavior.clone(),
+            scope: self.scope.clone(),
+            telemetry: self.telemetry.clone(),
+        }
+    }
+    pub fn create_normalizer(&self) -> MockNormalizer {
+        MockNormalizer {
+            observations: self.behavior.observations.clone(),
+        }
+    }
+}
 
-struct ActiveUpdateGuard {
-    resource: String,
+/// Normalization has no store and cannot initialize provider telemetry or CRUD.
+pub struct MockNormalizer {
+    observations: MockObservations,
 }
 
 struct ReadOutcomeGuard {
@@ -559,9 +611,9 @@ struct ReadOutcomeGuard {
 }
 
 impl ReadOutcomeGuard {
-    fn from_env() -> Self {
+    fn new(path: Option<PathBuf>) -> Self {
         Self {
-            path: env::var_os("CARINA_MOCK_READ_OUTCOME_PATH").map(PathBuf::from),
+            path,
             completed: false,
         }
     }
@@ -584,74 +636,65 @@ impl Drop for ReadOutcomeGuard {
     }
 }
 
-impl ActiveUpdateGuard {
-    fn enter(resource: String) -> Self {
-        let active = ACTIVE_UPDATES.fetch_add(1, Ordering::SeqCst) + 1;
-        MAX_ACTIVE_UPDATES.fetch_max(active, Ordering::SeqCst);
-        write_max_active();
-        append_update_trace("start", &resource, Some(active));
-        Self { resource }
-    }
-}
-
-impl Drop for ActiveUpdateGuard {
-    fn drop(&mut self) {
-        append_update_trace("finish", &self.resource, None);
-        ACTIVE_UPDATES.fetch_sub(1, Ordering::SeqCst);
+impl scope::ScopeLock<'_> {
+    fn load_states_for_operation(&self) -> ProviderResult<MockStates> {
+        self.load()
+            .map_err(|error| ProviderError::internal_caused_by("Failed to load mock state", error))
     }
 }
 
 impl MockProvider {
-    pub fn new() -> Self {
-        let state_file = env::var_os("CARINA_MOCK_STATE_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(".carina/state.json"));
-        if env::var_os("CARINA_MOCK_MAX_ACTIVE_PATH").is_some() {
-            ACTIVE_UPDATES.store(0, Ordering::SeqCst);
-            MAX_ACTIVE_UPDATES.store(0, Ordering::SeqCst);
-            write_max_active();
-        }
-        if env::var_os("CARINA_MOCK_UPDATE_TRACE_PATH").is_some() {
-            reset_update_trace();
-        }
-        Self {
-            state_file,
-            partial_create: partial_create_config_from_env(),
-            partial_update: partial_update_config_from_env(),
-        }
-    }
-
-    pub fn with_partial_create_for(
-        mut self,
-        resource_id_pattern: impl Into<String>,
-        missing_attributes: Vec<String>,
-    ) -> Self {
-        self.partial_create = Some(PartialConfig {
-            resource_id_pattern: resource_id_pattern.into(),
-            missing_attributes,
-        });
-        self
-    }
-
-    pub fn with_partial_update_for(
-        mut self,
-        resource_id_pattern: impl Into<String>,
-        missing_attributes: Vec<String>,
-    ) -> Self {
-        self.partial_update = Some(PartialConfig {
-            resource_id_pattern: resource_id_pattern.into(),
-            missing_attributes,
-        });
-        self
-    }
-
-    fn load_states(&self) -> io::Result<MockStates> {
-        let content = match fs::read_to_string(&self.state_file) {
-            Ok(content) => content,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
-            Err(error) => return Err(error),
+    fn resolve_reference_requests(
+        &self,
+        requests: Vec<carina_plugin_sdk::types::ReferenceRequest>,
+    ) -> ProviderResult<
+        Vec<
+            Result<
+                carina_plugin_sdk::types::ReferenceOutcome,
+                carina_plugin_sdk::types::ReferenceError,
+            >,
+        >,
+    > {
+        let table = match &self.behavior.reference_table {
+            Some(table) => serde_json::from_str(table).map_err(|error| {
+                ProviderError::invalid_input_caused_by("Invalid mock reference table", error)
+            })?,
+            None => references::ReferenceTable::new(),
         };
-        Self::decode_state_file(&content)
+        Ok(references::resolve(&table, requests))
+    }
+
+    fn canonicalize_mock_reference_write(
+        &self,
+        id: &ResourceId,
+        attributes: &mut HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        if id.resource_type != "test.reference" || self.behavior.reference_echo_alias {
+            return Ok(());
+        }
+        for name in ["key", "fixed_key"] {
+            let Some(Value::Concrete(ConcreteValue::String(raw))) = attributes.get(name) else {
+                continue;
+            };
+            let request = carina_plugin_sdk::types::ReferenceRequest {
+                ty: carina_plugin_sdk::types::TypeIdentity {
+                    provider: "mock".into(),
+                    segments: vec!["keys".into(), "Key".into()],
+                    kind: "Reference".into(),
+                },
+                value: raw.expose_plaintext().into(),
+            };
+            let mut results = self.resolve_reference_requests(vec![request])?;
+            if let Some(Ok(carina_plugin_sdk::types::ReferenceOutcome::Resolved(value))) =
+                results.pop()
+            {
+                attributes.insert(
+                    name.into(),
+                    Value::Concrete(ConcreteValue::String(value.into())),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn decode_state_file(content: &str) -> io::Result<MockStates> {
@@ -716,41 +759,10 @@ impl MockProvider {
         Ok(decoded)
     }
 
-    fn load_states_for_operation(&self) -> ProviderResult<MockStates> {
-        self.load_states()
-            .map_err(|error| ProviderError::internal_caused_by("Failed to load mock state", error))
-    }
-
-    fn lock_state_file() -> ProviderResult<MutexGuard<'static, ()>> {
-        MOCK_STATE_LOCK
+    fn lock_state_file(&self) -> ProviderResult<scope::ScopeLock<'_>> {
+        self.scope
             .lock()
-            .map_err(|_| ProviderError::internal("Mock state lock is poisoned"))
-    }
-
-    fn save_states(&self, states: &MockStates) -> Result<(), std::io::Error> {
-        if let Some(parent) = self.state_file.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = carina_core::utils::pretty_with_newline(&MockStateFileRef {
-            version: MOCK_STATE_VERSION,
-            states,
-        })?;
-        let sequence = MOCK_STATE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let file_name = self
-            .state_file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("mock-state.json");
-        let temporary = self.state_file.with_file_name(format!(
-            ".{file_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::write(&temporary, content)?;
-        if let Err(error) = fs::rename(&temporary, &self.state_file) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-        Ok(())
+            .map_err(|error| ProviderError::internal_caused_by("Failed to lock mock state", error))
     }
 
     fn resource_key(id: &ResourceId) -> Option<String> {
@@ -766,27 +778,18 @@ impl MockProvider {
         })
     }
 
-    fn partial_create_config_for(&self, id: &ResourceId) -> Option<&PartialConfig> {
-        let config = self.partial_create.as_ref()?;
+    fn partial_create_config_for(&self, id: &ResourceId) -> Option<&PartialResult> {
+        let config = self.behavior.partial_create.as_ref()?;
         Self::partial_config_matches(config, id).then_some(config)
     }
 
-    fn partial_update_config_for(&self, id: &ResourceId) -> Option<&PartialConfig> {
-        let config = self.partial_update.as_ref()?;
+    fn partial_update_config_for(&self, id: &ResourceId) -> Option<&PartialResult> {
+        let config = self.behavior.partial_update.as_ref()?;
         Self::partial_config_matches(config, id).then_some(config)
     }
 
-    fn partial_config_matches(config: &PartialConfig, id: &ResourceId) -> bool {
-        let Some(identity) = id.identity_str() else {
-            return false;
-        };
-        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
-        let Some(short) = Self::resource_key(id) else {
-            return false;
-        };
-        config.resource_id_pattern == "*"
-            || config.resource_id_pattern == full
-            || config.resource_id_pattern == short
+    fn partial_config_matches(config: &PartialResult, id: &ResourceId) -> bool {
+        config.selector.matches(id)
     }
 
     fn append_delete_log(path: PathBuf, key: &str) -> Result<(), std::io::Error> {
@@ -805,8 +808,8 @@ impl MockProvider {
         file.write_all(format!("{op} {key}\n").as_bytes())
     }
 
-    fn append_op_log_if_configured(op: &str, id: &ResourceId) -> ProviderResult<()> {
-        if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
+    fn append_op_log_if_configured(&self, op: &str, id: &ResourceId) -> ProviderResult<()> {
+        if let Some(path) = self.behavior.observations.operation_log.clone() {
             let key = Self::resolved_resource_key(id)?;
             Self::append_op_log(path, op, &key).map_err(|e| {
                 ProviderError::internal_caused_by("Failed to append operation log", e)
@@ -815,8 +818,8 @@ impl MockProvider {
         Ok(())
     }
 
-    fn append_update_request_if_configured(request: &UpdateRequest) -> ProviderResult<()> {
-        let Some(path) = env::var_os("CARINA_MOCK_UPDATE_REQUEST_LOG").map(PathBuf::from) else {
+    fn append_update_request_if_configured(&self, request: &UpdateRequest) -> ProviderResult<()> {
+        let Some(path) = self.behavior.observations.update_request_log.clone() else {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
@@ -866,47 +869,33 @@ impl MockProvider {
             })
     }
 
-    fn append_normalizer_log_if_configured(op: &str, id: &ResourceId) -> ProviderResult<()> {
-        if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
-            let key = Self::resource_key(id).unwrap_or_else(|| id.to_string());
-            Self::append_op_log(path, op, &key).map_err(|error| {
-                ProviderError::internal_caused_by("Failed to append operation log", error)
-            })?;
-        }
-        Ok(())
-    }
-
-    fn create_fail_error_for(id: &ResourceId) -> Option<ProviderError> {
-        let target = env::var("CARINA_MOCK_CREATE_FAIL_FOR").ok()?;
+    fn create_fail_error_for(&self, id: &ResourceId) -> Option<ProviderError> {
+        let target = self.behavior.create_fail_for.as_ref()?;
         let key = Self::resource_key(id)?;
-        (target == key).then(|| {
+        (target == &key).then(|| {
             ProviderError::internal(format!(
                 "CARINA_MOCK_CREATE_FAIL_FOR requested create failure for {key}"
             ))
         })
     }
 
-    fn update_fail_error_for(id: &ResourceId) -> Option<ProviderError> {
-        let target = env::var("CARINA_MOCK_UPDATE_FAIL_FOR").ok()?;
-        let identity = id.identity_str()?;
-        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
+    fn update_fail_error_for(&self, id: &ResourceId) -> Option<ProviderError> {
+        let target = self.behavior.update_fail_for.as_ref()?;
         let key = Self::resource_key(id)?;
-        (target == "*" || target == full || target == key).then(|| {
+        (target.matches(id)).then(|| {
             ProviderError::internal(format!(
                 "CARINA_MOCK_UPDATE_FAIL_FOR requested update failure for {key}"
             ))
         })
     }
 
-    fn delete_fail_error_for(id: &ResourceId, identifier: &str) -> Option<ProviderError> {
-        let target = env::var("CARINA_MOCK_DELETE_FAIL_FOR").ok()?;
-        let identity = id.identity_str()?;
-        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
+    fn delete_fail_error_for(&self, id: &ResourceId, identifier: &str) -> Option<ProviderError> {
+        let target = self.behavior.delete_fail_for.as_ref()?;
         let key = Self::resource_key(id)?;
-        if target != "*" && target != full && target != key {
+        if !target.matches(id) {
             return None;
         }
-        if let Ok(target_identifier) = env::var("CARINA_MOCK_DELETE_FAIL_IDENTIFIER")
+        if let Some(target_identifier) = &self.behavior.delete_fail_identifier
             && target_identifier != identifier
         {
             return None;
@@ -916,12 +905,10 @@ impl MockProvider {
         )))
     }
 
-    fn delete_timeout_error_for(id: &ResourceId) -> Option<ProviderError> {
-        let target = env::var("CARINA_MOCK_DELETE_TIMEOUT_FOR").ok()?;
-        let identity = id.identity_str()?;
-        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
+    fn delete_timeout_error_for(&self, id: &ResourceId) -> Option<ProviderError> {
+        let target = self.behavior.delete_timeout_for.as_ref()?;
         let key = Self::resource_key(id)?;
-        (target == "*" || target == full || target == key).then(|| {
+        (target.matches(id)).then(|| {
             ProviderError::timeout(format!(
                 "Operation timed out: CARINA_MOCK_DELETE_TIMEOUT_FOR matched {key}"
             ))
@@ -945,7 +932,7 @@ impl MockProvider {
         {
             attrs.entry(attribute.to_string()).or_insert_with(|| {
                 PersistedValue::encode_provider_value(
-                    &Value::Concrete(ConcreteValue::String(value.into())),
+                    &Value::Concrete(ConcreteValue::String(value.clone().into())),
                     None,
                 )
                 .expect("mock generated attribute is persistable")
@@ -966,7 +953,7 @@ impl MockProvider {
         {
             attrs
                 .entry(attribute.to_string())
-                .or_insert_with(|| Value::Concrete(ConcreteValue::String(value.into())));
+                .or_insert_with(|| Value::Concrete(ConcreteValue::String(value.clone().into())));
         }
     }
 
@@ -1026,17 +1013,16 @@ impl MockProvider {
     }
 
     fn add_server_list_update_out_of_band_element(
+        &self,
         id: &ResourceId,
         attributes: &mut HashMap<String, Value>,
     ) {
         if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE {
             return;
         }
-        let Ok(key) = env::var("CARINA_MOCK_UPDATE_SERVER_LIST_OUT_OF_BAND_KEY") else {
+        let Some(ServerListMutation { key, value }) = &self.behavior.server_list_mutation else {
             return;
         };
-        let value = env::var("CARINA_MOCK_UPDATE_SERVER_LIST_OUT_OF_BAND_VALUE")
-            .unwrap_or_else(|_| "enabled".to_string());
         let Some(Value::Concrete(ConcreteValue::List(items))) =
             attributes.get_mut(SERVER_ADDED_LIST_ATTRIBUTE)
         else {
@@ -1046,11 +1032,11 @@ impl MockProvider {
             [
                 (
                     "key".to_string(),
-                    Value::Concrete(ConcreteValue::String(key.into())),
+                    Value::Concrete(ConcreteValue::String(key.clone().into())),
                 ),
                 (
                     "value".to_string(),
-                    Value::Concrete(ConcreteValue::String(value.into())),
+                    Value::Concrete(ConcreteValue::String(value.clone().into())),
                 ),
             ]
             .into_iter()
@@ -1110,44 +1096,8 @@ impl MockProvider {
         true
     }
 
-    fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
-        let target = env::var("CARINA_MOCK_DELETE_DELAY_MS_FOR").ok()?;
-        if Some(target) != Self::resource_key(id) {
-            return None;
-        }
-        env::var("CARINA_MOCK_DELETE_DELAY_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|millis| *millis > 0)
-            .map(Duration::from_millis)
-    }
-
-    fn read_delay_for(id: &ResourceId) -> Option<Duration> {
-        let target = env::var("CARINA_MOCK_READ_DELAY_MS_FOR").ok()?;
-        if Some(target) != Self::resource_key(id) {
-            return None;
-        }
-        env::var("CARINA_MOCK_READ_DELAY_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|millis| *millis > 0)
-            .map(Duration::from_millis)
-    }
-
-    fn create_delay_for(id: &ResourceId) -> Option<Duration> {
-        let target = env::var("CARINA_MOCK_CREATE_DELAY_MS_FOR").ok()?;
-        if Some(target) != Self::resource_key(id) {
-            return None;
-        }
-        env::var("CARINA_MOCK_CREATE_DELAY_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|millis| *millis > 0)
-            .map(Duration::from_millis)
-    }
-
-    fn signal_ready(path_env: &str) -> ProviderResult<()> {
-        let Some(path) = env::var_os(path_env).map(PathBuf::from) else {
+    fn signal_ready(path: &Option<PathBuf>) -> ProviderResult<()> {
+        let Some(path) = path else {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
@@ -1160,63 +1110,60 @@ impl MockProvider {
         })
     }
 
-    async fn create_resource<S>(
+    async fn create_resource<S, D>(
         &self,
         id: ResourceId,
-        resource: Resource<S>,
+        resource: Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
         attempt: CreateAttempt,
     ) -> Result<CreateOutcome, CreateFailure> {
-        let mode = env::var("CARINA_MOCK_CREATE_MODE").unwrap_or_else(|_| "success".to_string());
-        if let Some(err) = Self::create_fail_error_for(&id) {
+        let mode = &self.behavior.create_mode;
+        if let Some(err) = self.create_fail_error_for(&id) {
             return Err(attempt.untracked(err));
         }
-        if mode == "untracked" {
-            return Err(attempt.untracked(ProviderError::api_error(
-                "builtin mock returned an untracked create verdict",
-            )));
-        }
-
-        let sent = match env::var("CARINA_MOCK_CREATE_SENT") {
-            Ok(raw) if raw != "all" => Sent::Only(
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|key| !key.is_empty())
-                    .map(ToString::to_string)
-                    .collect::<BTreeSet<_>>(),
-            ),
-            Ok(raw) => {
-                drop(raw);
-                Sent::AllRequestAttributes
+        let sent = self.behavior.create_sent.sent();
+        let fail_after_create = match mode {
+            CreateMode::Success => false,
+            CreateMode::Created => true,
+            CreateMode::Untracked => {
+                return Err(attempt.untracked(ProviderError::api_error(
+                    "builtin mock returned an untracked create verdict",
+                )));
             }
-            Err(error) => {
-                drop(error);
-                Sent::AllRequestAttributes
+            CreateMode::Pending | CreateMode::MalformedPending => {
+                let token = if *mode == CreateMode::MalformedPending {
+                    "not-a-decodable-mock-token"
+                } else {
+                    "builtin-mock-pending"
+                };
+                let pending = attempt.pending(PendingToken::new(token), sent, 1);
+                return Err(pending.preserve(ProviderError::timeout(
+                    "builtin mock create remains in progress",
+                )));
             }
         };
-        if mode == "pending" || mode == "malformed_pending" {
-            let token = if mode == "malformed_pending" {
-                "not-a-decodable-mock-token"
-            } else {
-                "builtin-mock-pending"
-            };
-            let pending = attempt.pending(PendingToken::new(token), sent, 1);
-            return Err(pending.preserve(ProviderError::timeout(
-                "builtin mock create remains in progress",
-            )));
-        }
 
-        if let Some(delay) = Self::create_delay_for(&id) {
-            if let Err(error) = Self::signal_ready("CARINA_MOCK_CREATE_READY_PATH") {
+        if let Some(delay) = self
+            .behavior
+            .create_delay
+            .as_ref()
+            .and_then(|delay| delay.for_resource(&id))
+        {
+            if let Err(error) = Self::signal_ready(&self.behavior.observations.create_ready) {
                 return Err(attempt.untracked(error));
             }
             tokio::time::sleep(delay).await;
         }
 
-        let _state_guard = match Self::lock_state_file() {
+        let state_guard = match self.lock_state_file() {
             Ok(guard) => guard,
             Err(error) => return Err(attempt.untracked(error)),
         };
-        let mut states = match self.load_states_for_operation() {
+        let mut states = match state_guard.load_states_for_operation() {
             Ok(states) => states,
             Err(error) => return Err(attempt.untracked(error)),
         };
@@ -1226,6 +1173,9 @@ impl MockProvider {
         };
 
         let mut persisted_values = resource.resolved_attributes();
+        if let Err(error) = self.canonicalize_mock_reference_write(&id, &mut persisted_values) {
+            return Err(attempt.untracked(error));
+        }
         Self::add_server_list_defaults(&id, &mut persisted_values);
         let attrs = persisted_values
             .iter()
@@ -1246,8 +1196,8 @@ impl MockProvider {
         }
 
         states.insert(key, attrs);
-        if let Err(error) = self
-            .save_states(&states)
+        if let Err(error) = state_guard
+            .save(&states)
             .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))
         {
             return Err(attempt.untracked(error));
@@ -1266,10 +1216,10 @@ impl MockProvider {
         let observed_state =
             AppliedState::from_identifier(id.clone(), identifier.clone(), state_attrs.clone());
         let issued = attempt.issued(identifier, sent);
-        if let Err(error) = Self::append_op_log_if_configured("create", &id) {
+        if let Err(error) = self.append_op_log_if_configured("create", &id) {
             return Err(issued.failed(Observation::Read(ReadOutcome::found(observed_state)), error));
         }
-        if mode == "created" {
+        if fail_after_create {
             return Err(issued.failed(
                 Observation::Read(ReadOutcome::found(observed_state)),
                 ProviderError::api_error("builtin mock failed after creating the resource"),
@@ -1289,13 +1239,18 @@ impl MockProvider {
         Ok(issued.succeeded(state_attrs))
     }
 
-    fn persist_resumed_resource<S>(
+    fn persist_resumed_resource<S, D>(
         &self,
         id: &ResourceId,
-        resource: &Resource<S>,
+        resource: &Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> ProviderResult<HashMap<String, Value>> {
-        let _state_guard = Self::lock_state_file()?;
-        let mut states = self.load_states_for_operation()?;
+        let state_guard = self.lock_state_file()?;
+        let mut states = state_guard.load_states_for_operation()?;
         let key = Self::resolved_resource_key(id)?;
         let mut persisted_values = resource.resolved_attributes();
         Self::add_server_list_defaults(id, &mut persisted_values);
@@ -1313,7 +1268,7 @@ impl MockProvider {
             })?;
         Self::populate_generated_attribute_json(id, &mut persisted);
         states.insert(key, persisted);
-        self.save_states(&states).map_err(|error| {
+        state_guard.save(&states).map_err(|error| {
             ProviderError::internal_caused_by(
                 "Failed to save builtin mock resumed-create state",
                 error,
@@ -1327,94 +1282,12 @@ impl MockProvider {
     }
 }
 
-fn partial_create_config_from_env() -> Option<PartialConfig> {
-    let resource_id_pattern = env::var("CARINA_MOCK_PARTIAL_CREATE_FOR").ok()?;
-    let missing_attributes = env::var("CARINA_MOCK_PARTIAL_CREATE_MISSING")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["computed".to_string()]);
-    Some(PartialConfig {
-        resource_id_pattern,
-        missing_attributes,
-    })
-}
-
-fn partial_update_config_from_env() -> Option<PartialConfig> {
-    let resource_id_pattern = env::var("CARINA_MOCK_PARTIAL_UPDATE_FOR").ok()?;
-    let missing_attributes = env::var("CARINA_MOCK_PARTIAL_UPDATE_MISSING")
-        .ok()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["computed".to_string()]);
-    Some(PartialConfig {
-        resource_id_pattern,
-        missing_attributes,
-    })
-}
-
-fn update_delay() -> Option<Duration> {
-    env::var("CARINA_MOCK_UPDATE_DELAY_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-        .map(Duration::from_millis)
-}
-
-fn write_max_active() {
-    let Some(path) = env::var_os("CARINA_MOCK_MAX_ACTIVE_PATH").map(PathBuf::from) else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, MAX_ACTIVE_UPDATES.load(Ordering::SeqCst).to_string());
-}
-
-fn update_trace_path() -> Option<PathBuf> {
-    env::var_os("CARINA_MOCK_UPDATE_TRACE_PATH").map(PathBuf::from)
-}
-
-fn reset_update_trace() {
-    let Some(path) = update_trace_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, "");
-}
-
-fn append_update_trace(event: &str, resource: &str, active: Option<usize>) {
-    let Some(path) = update_trace_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
-        return;
-    };
-    let line = if let Some(active) = active {
-        format!("{event} {resource} {active}\n")
-    } else {
-        format!("{event} {resource}\n")
-    };
-    let _ = file.write_all(line.as_bytes());
-}
-
-fn append_update_patch_log(id: &ResourceId, ops: &[PatchOp]) -> ProviderResult<()> {
-    let Some(path) = env::var_os("CARINA_MOCK_UPDATE_PATCH_LOG").map(PathBuf::from) else {
+fn append_update_patch_log(
+    path: &Option<PathBuf>,
+    id: &ResourceId,
+    ops: &[PatchOp],
+) -> ProviderResult<()> {
+    let Some(path) = path else {
         return Ok(());
     };
     if let Some(parent) = path.parent() {
@@ -1463,16 +1336,23 @@ impl MockProvider {
         &self,
         id: &ResourceId,
     ) -> ProviderResult<Option<HashMap<String, Value>>> {
-        Self::append_op_log_if_configured("read", id)?;
+        self.append_op_log_if_configured("read", id)?;
         let mut read_outcome = None;
-        if let Some(delay) = Self::read_delay_for(id) {
-            read_outcome = Some(ReadOutcomeGuard::from_env());
-            Self::signal_ready("CARINA_MOCK_READ_READY_PATH")?;
+        if let Some(delay) = self
+            .behavior
+            .read_delay
+            .as_ref()
+            .and_then(|delay| delay.for_resource(id))
+        {
+            read_outcome = Some(ReadOutcomeGuard::new(
+                self.behavior.observations.read_outcome.clone(),
+            ));
+            Self::signal_ready(&self.behavior.observations.read_ready)?;
             tokio::time::sleep(delay).await;
         }
 
-        let _state_guard = Self::lock_state_file()?;
-        let states = self.load_states_for_operation()?;
+        let state_guard = self.lock_state_file()?;
+        let states = state_guard.load_states_for_operation()?;
         let attributes = Self::resource_key(id).and_then(|key| {
             states.get(&key).map(|attrs| {
                 let mut attributes: HashMap<_, _> = attrs
@@ -1491,13 +1371,19 @@ impl MockProvider {
     }
 }
 
-impl Default for MockProvider {
-    fn default() -> Self {
-        Self::new()
+impl MockNormalizer {
+    fn append_normalizer_log_if_configured(&self, op: &str, id: &ResourceId) -> ProviderResult<()> {
+        if let Some(path) = self.observations.operation_log.clone() {
+            let key = MockProvider::resource_key(id).unwrap_or_else(|| id.to_string());
+            MockProvider::append_op_log(path, op, &key).map_err(|error| {
+                ProviderError::internal_caused_by("Failed to append operation log", error)
+            })?;
+        }
+        Ok(())
     }
 }
 
-impl ProviderNormalizer for MockProvider {
+impl ProviderNormalizer for MockNormalizer {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [carina_core::resource::ProviderResource],
@@ -1507,7 +1393,7 @@ impl ProviderNormalizer for MockProvider {
                 .iter()
                 .filter(|resource| resource.id.provider == BUILTIN_PROVIDER_NAME)
             {
-                Self::append_normalizer_log_if_configured("normalize_desired", &resource.id)?;
+                self.append_normalizer_log_if_configured("normalize_desired", &resource.id)?;
             }
             Ok(())
         })
@@ -1522,7 +1408,7 @@ impl ProviderNormalizer for MockProvider {
                 .iter()
                 .filter(|(id, _state)| id.provider == BUILTIN_PROVIDER_NAME)
             {
-                Self::append_normalizer_log_if_configured("normalize_state", id)?;
+                self.append_normalizer_log_if_configured("normalize_state", id)?;
             }
             Ok(())
         })
@@ -1538,7 +1424,7 @@ impl ProviderNormalizer for MockProvider {
                 .iter()
                 .filter(|(id, _state)| id.provider == BUILTIN_PROVIDER_NAME)
             {
-                Self::append_normalizer_log_if_configured("hydrate_read_state", id)?;
+                self.append_normalizer_log_if_configured("hydrate_read_state", id)?;
             }
             Ok(())
         })
@@ -1548,6 +1434,55 @@ impl ProviderNormalizer for MockProvider {
 impl Provider for MockProvider {
     fn name(&self) -> &str {
         "mock"
+    }
+
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [carina_core::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<
+                Result<
+                    carina_core::references::ReferenceOutcome,
+                    carina_core::references::ReferenceError,
+                >,
+            >,
+        >,
+    > {
+        Box::pin(async move {
+            use carina_core::references::{ReferenceError, ReferenceOutcome};
+            use carina_plugin_sdk::types::{
+                ReferenceError as WireError, TypeIdentity as WireIdentity,
+            };
+            let requests = requests
+                .iter()
+                .map(|request| carina_plugin_sdk::types::ReferenceRequest {
+                    ty: WireIdentity {
+                        provider: request.ty.provider.clone().unwrap_or_default(),
+                        segments: request.ty.segments.clone(),
+                        kind: request.ty.kind.clone(),
+                    },
+                    value: request.value.clone(),
+                })
+                .collect();
+            Ok(self
+                .resolve_reference_requests(requests)?
+                .into_iter()
+                .map(|result| match result {
+                    Ok(outcome) => ReferenceOutcome::from_guest(outcome),
+                    Err(WireError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
+                        ProviderError::from_wire(*error).into(),
+                    )),
+                    Err(WireError::Transient(error)) => Err(ReferenceError::Transient(
+                        ProviderError::from_wire(*error).into(),
+                    )),
+                    Err(WireError::InvalidReference(error)) => Err(
+                        ReferenceError::InvalidReference(ProviderError::from_wire(*error).into()),
+                    ),
+                })
+                .collect())
+        })
     }
 
     fn read(
@@ -1598,31 +1533,30 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
         Box::pin(async move {
             let id = request.id().clone();
-            let mode =
-                env::var("CARINA_MOCK_RESUME_MODE").unwrap_or_else(|_| "resumed".to_string());
-            match mode.as_str() {
-                "discarded" => {
+            let mode = &self.behavior.resume_mode;
+            match mode {
+                ResumeMode::Discarded => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
                     return Err(resume.discarded(ProviderError::not_found(
                         "builtin mock reports that the recorded create ended",
                     )));
                 }
-                "untracked" => {
+                ResumeMode::Untracked => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
                     return Err(resume.untracked(ProviderError::api_error(
                         "builtin mock lost the resume response",
                     )));
                 }
-                "undetermined" | "malformed_pending" => {
+                ResumeMode::Undetermined | ResumeMode::MalformedPending => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
                     return Err(resume.preserve(ProviderError::internal(
                         "builtin mock cannot determine the recorded create outcome",
                     )));
                 }
-                "pending" => {
+                ResumeMode::Pending => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
                     let next_token = PendingToken::new("builtin-mock-repending");
@@ -1634,8 +1568,8 @@ impl Provider for MockProvider {
                         "builtin mock create remains in progress",
                     )));
                 }
-                "resumed" | "resend" | "created_read_failed" => {}
-                unsupported => {
+                ResumeMode::Resumed | ResumeMode::Resend | ResumeMode::CreatedReadFailed => {}
+                ResumeMode::Unsupported(unsupported) => {
                     let (resume, create_request) = request.into_parts();
                     drop(create_request);
                     return Err(resume.preserve(ProviderError::invalid_input(format!(
@@ -1649,7 +1583,7 @@ impl Provider for MockProvider {
             let fallback_identifier =
                 AppliedIdentifier::new("mock-id").expect("mock provider identifier is non-empty");
 
-            if mode == "resend" {
+            if *mode == ResumeMode::Resend {
                 let attempt = match resume {
                     CoreResume::Unissued(attempt) => attempt.resend(),
                     CoreResume::Issued(resumed) => {
@@ -1676,7 +1610,7 @@ impl Provider for MockProvider {
                 Ok(attributes) => attributes,
                 Err(error) => return Err(resumed.preserve(error)),
             };
-            if mode == "created_read_failed" {
+            if *mode == ResumeMode::CreatedReadFailed {
                 return Err(resumed.failed(
                     Observation::ReadFailed(ProviderError::api_error(
                         "builtin mock post-apply read failed",
@@ -1701,8 +1635,10 @@ impl Provider for MockProvider {
         let identifier = identifier.as_str().to_string();
         Box::pin(async move {
             let key = Self::resolved_resource_key(&id)?;
-            let _active = ActiveUpdateGuard::enter(key.clone());
-            if update_trace_path().is_some() {
+            let _active = self
+                .telemetry
+                .enter_update(key.clone(), &self.behavior.observations);
+            if self.behavior.observations.update_trace.is_some() {
                 // This test hook is coupled to the executor's continuous-refill loop:
                 // it dispatches every currently ready future that fits before polling
                 // any of them. Yield once so that dispatch batch records all starts
@@ -1711,17 +1647,21 @@ impl Provider for MockProvider {
                 // those assertions. The executor itself is not wave-based.
                 tokio::task::yield_now().await;
             }
-            if let Some(delay) = update_delay() {
+            if let Some(delay) = self.behavior.update_delay {
                 tokio::time::sleep(delay).await;
             }
-            if let Some(error) = Self::update_fail_error_for(&id) {
+            if let Some(error) = self.update_fail_error_for(&id) {
                 return Err(error);
             }
-            Self::append_update_request_if_configured(&request)?;
-            append_update_patch_log(&id, &request.patch().ops)?;
+            self.append_update_request_if_configured(&request)?;
+            append_update_patch_log(
+                &self.behavior.observations.update_patch_log,
+                &id,
+                &request.patch().ops,
+            )?;
 
-            let _state_guard = Self::lock_state_file()?;
-            let mut states = self.load_states_for_operation()?;
+            let state_guard = self.lock_state_file()?;
+            let mut states = state_guard.load_states_for_operation()?;
             // Apply only the requested operations to the provider's current
             // value. In particular, a read may omit write-only leaves that
             // still exist in the backend and must survive an unrelated patch.
@@ -1751,7 +1691,8 @@ impl Provider for MockProvider {
             }
             // This test hook models a service-side addition after saved-plan
             // drift verification but before the update response is read back.
-            Self::add_server_list_update_out_of_band_element(&id, &mut attributes);
+            self.add_server_list_update_out_of_band_element(&id, &mut attributes);
+            self.canonicalize_mock_reference_write(&id, &mut attributes)?;
             Self::add_server_list_defaults(&id, &mut attributes);
 
             let partial_update = self.partial_update_config_for(&id);
@@ -1769,7 +1710,8 @@ impl Provider for MockProvider {
             }
 
             states.insert(key, attrs);
-            self.save_states(&states)
+            state_guard
+                .save(&states)
                 .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
 
             Self::strip_unobservable_nested_write_only(&mut attributes);
@@ -1779,9 +1721,12 @@ impl Provider for MockProvider {
                     attributes.remove(attr);
                 }
             }
-            Self::append_op_log_if_configured("update", &id)?;
-            let applied_identifier =
-                env::var("CARINA_MOCK_UPDATE_RESULT_IDENTIFIER").unwrap_or(identifier);
+            self.append_op_log_if_configured("update", &id)?;
+            let applied_identifier = self
+                .behavior
+                .update_result_identifier
+                .clone()
+                .unwrap_or(identifier);
             let state =
                 AppliedState::new(id, applied_identifier, attributes).map_err(|source| {
                     ProviderError::internal_caused_by(
@@ -1811,32 +1756,38 @@ impl Provider for MockProvider {
         let identifier = identifier.as_str().to_string();
         Box::pin(async move {
             let key = Self::resolved_resource_key(&id)?;
-            if let Some(err) = Self::delete_fail_error_for(&id, &identifier) {
+            if let Some(err) = self.delete_fail_error_for(&id, &identifier) {
                 return Err(err);
             }
-            if let Some(err) = Self::delete_timeout_error_for(&id) {
+            if let Some(err) = self.delete_timeout_error_for(&id) {
                 return Err(err);
             }
 
-            if let Some(delay) = Self::delete_delay_for(&id) {
-                Self::signal_ready("CARINA_MOCK_DELETE_READY_PATH")?;
+            if let Some(delay) = self
+                .behavior
+                .delete_delay
+                .as_ref()
+                .and_then(|delay| delay.for_resource(&id))
+            {
+                Self::signal_ready(&self.behavior.observations.delete_ready)?;
                 tokio::time::sleep(delay).await;
             }
 
-            if let Some(path) = env::var_os("CARINA_MOCK_DELETE_LOG").map(PathBuf::from) {
+            if let Some(path) = self.behavior.observations.delete_log.clone() {
                 Self::append_delete_log(path, &key).map_err(|e| {
                     ProviderError::internal_caused_by("Failed to append delete log", e)
                 })?;
             }
 
-            let _state_guard = Self::lock_state_file()?;
-            let mut states = self.load_states_for_operation()?;
+            let state_guard = self.lock_state_file()?;
+            let mut states = state_guard.load_states_for_operation()?;
 
             states.remove(&key);
-            self.save_states(&states)
+            state_guard
+                .save(&states)
                 .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
 
-            Self::append_op_log_if_configured("delete", &id)?;
+            self.append_op_log_if_configured("delete", &id)?;
             Ok(())
         })
     }
@@ -1850,12 +1801,7 @@ impl Provider for MockProvider {
 mod tests {
     use super::*;
     use carina_core::resource::NoPlaceholder;
-
-    use std::ffi::{OsStr, OsString};
-    use std::sync::Mutex;
     use std::time::Instant;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn delete_request_without_schema() -> DeleteRequest {
         DeleteRequest::resolve(
@@ -1918,48 +1864,9 @@ mod tests {
         );
     }
 
-    struct EnvGuard {
-        name: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
-            let previous = env::var_os(name);
-            // SAFETY: EnvGuard is used only while ENV_LOCK is held in these tests.
-            unsafe {
-                env::set_var(name, value);
-            }
-            Self { name, previous }
-        }
-
-        fn unset(name: &'static str) -> Self {
-            let previous = env::var_os(name);
-            // SAFETY: EnvGuard is used only while ENV_LOCK is held in these tests.
-            unsafe {
-                env::remove_var(name);
-            }
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: EnvGuard values are declared after the ENV_LOCK guard, so
-            // they are dropped before the lock is released.
-            unsafe {
-                if let Some(previous) = &self.previous {
-                    env::set_var(self.name, previous);
-                } else {
-                    env::remove_var(self.name);
-                }
-            }
-        }
-    }
-
     fn string_value(value: impl Into<String>) -> Value {
         let value: String = value.into();
-        Value::Concrete(ConcreteValue::String(value.into()))
+        Value::Concrete(ConcreteValue::String(value.clone().into()))
     }
 
     async fn dispatch_mock_create(
@@ -2046,16 +1953,168 @@ mod tests {
     }
 
     #[test]
-    fn builtin_mock_exercises_every_create_and_resume_verdict_mode() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _legacy_create_failure = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
-        let _operation_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
+    fn threaded_mock_instances_keep_behavior_and_logs_separate() {
         let tmp = tempfile::tempdir().unwrap();
-        let provider = MockProvider {
-            state_file: tmp.path().join("mock-state.json"),
-            partial_create: None,
-            partial_update: None,
+        let a_log = tmp.path().join("a.log");
+        let b_log = tmp.path().join("b.log");
+        let a = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                create_mode: CreateMode::Created,
+                observations: MockObservations {
+                    operation_log: Some(a_log.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(tmp.path().join("a.json")).unwrap(),
+        )
+        .create_provider();
+        let b = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    operation_log: Some(b_log.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(tmp.path().join("b.json")).unwrap(),
+        )
+        .create_provider();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker = |provider: MockProvider, barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                barrier.wait();
+                let id = ResourceId::with_provider_identity("mock", "test.resource", "same", None);
+                let resource = Resource::with_provider("mock", "test.resource", "same", None)
+                    .with_attribute("name", string_value("same"));
+                runtime
+                    .block_on(dispatch_mock_create(&provider, id, resource))
+                    .map(CreateOutcome::into_kind)
+                    .map_err(|error| Box::new(CreateFailure::into_kind(error)))
+            })
         };
+        let a = worker(a, barrier.clone());
+        let b = worker(b, barrier);
+        let a = a.join().unwrap();
+        let b = b.join().unwrap();
+        assert!(
+            matches!(
+                a,
+                Err(ref error)
+                    if matches!(
+                        **error,
+                        CreateFailureKind::Created {
+                            created: _,
+                            error: _
+                        }
+                    )
+            ),
+            "instance A must retain its created verdict, got {a:?}"
+        );
+        assert!(
+            matches!(b, Ok(CreateOutcomeKind::Success { state: _ })),
+            "instance B must retain its success verdict, got {b:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(a_log).unwrap(),
+            "create test.resource.same\n"
+        );
+        assert_eq!(
+            fs::read_to_string(b_log).unwrap(),
+            "create test.resource.same\n"
+        );
+        assert!(tmp.path().join("a.json").exists());
+        assert!(tmp.path().join("b.json").exists());
+    }
+
+    #[test]
+    fn file_scope_preserves_concurrent_transactions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_path = tmp.path().join("shared.json");
+        let shared_scope = MockScope::file(shared_path.clone()).unwrap();
+        let shared_mock = ConfiguredBuiltinMock::new(MockBehavior::default(), shared_scope);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|threads| {
+            for worker in 0..2 {
+                let configured = shared_mock.clone();
+                let barrier = barrier.clone();
+                threads.spawn(move || {
+                    let provider = configured.create_provider();
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                        .unwrap();
+                    barrier.wait();
+                    for item in 0..8 {
+                        let identity = carina_core::resource::ResourceIdentity::try_from(format!(
+                            "worker-{worker}-{item}"
+                        ))
+                        .unwrap();
+                        let id = ResourceId::with_provider_identity(
+                            "mock",
+                            "test.resource",
+                            identity.clone(),
+                            None,
+                        );
+                        let resource =
+                            Resource::with_provider("mock", "test.resource", identity, None)
+                                .with_attribute("name", string_value("transaction"));
+                        runtime
+                            .block_on(dispatch_mock_create(&provider, id, resource))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let states =
+            MockProvider::decode_state_file(&fs::read_to_string(shared_path).unwrap()).unwrap();
+        assert_eq!(
+            states.len(),
+            16,
+            "file transactions must not lose another provider's writes"
+        );
+
+        assert!(!tmp.path().join("shared.json.lock").exists());
+    }
+
+    #[test]
+    fn normalizer_construction_does_not_initialize_storage_or_telemetry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store.json");
+        let maximum = tmp.path().join("max");
+        let trace = tmp.path().join("trace");
+        let configured = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    max_active: Some(maximum.clone()),
+                    update_trace: Some(trace.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(store.clone()).unwrap(),
+        );
+        fs::write(&maximum, "already observed").unwrap();
+        fs::write(&trace, "existing trace").unwrap();
+        let _normalizer = configured.create_normalizer();
+        assert!(!store.exists());
+        assert_eq!(fs::read_to_string(maximum).unwrap(), "already observed");
+        assert_eq!(fs::read_to_string(trace).unwrap(), "existing trace");
+        assert!(MockScope::file(std::path::PathBuf::from("relative.json")).is_err());
+    }
+
+    #[test]
+    fn builtin_mock_exercises_every_create_and_resume_verdict_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -2067,7 +2126,12 @@ mod tests {
             ("pending", "in_flight"),
             ("malformed_pending", "in_flight"),
         ] {
-            let mode_guard = EnvGuard::set("CARINA_MOCK_CREATE_MODE", mode);
+            let provider = ConfiguredBuiltinMock::new(
+                decode_controls(&[("CARINA_MOCK_CREATE_MODE".to_owned(), mode.into())].into())
+                    .behavior,
+                provider.scope.clone(),
+            )
+            .create_provider();
             let identity = format!("create-{mode}");
             let id = ResourceId::with_provider_identity(
                 "mock",
@@ -2127,10 +2191,16 @@ mod tests {
                     )
                 }
             }
-            drop(mode_guard);
         }
 
-        let create_mode = EnvGuard::set("CARINA_MOCK_CREATE_MODE", "pending");
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                create_mode: CreateMode::Pending,
+                ..MockBehavior::default()
+            },
+            provider.scope.clone(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "resume-modes", None);
         let resource = Resource::with_provider("mock", "test.resource", "resume-modes", None)
             .with_attribute("name", string_value("resume-modes"));
@@ -2162,7 +2232,6 @@ mod tests {
                 )
             }
         };
-        drop(create_mode);
 
         for (mode, expected) in [
             ("resumed", "resumed"),
@@ -2172,7 +2241,12 @@ mod tests {
             ("malformed_pending", "in_flight"),
             ("resend", "resent"),
         ] {
-            let mode_guard = EnvGuard::set("CARINA_MOCK_RESUME_MODE", mode);
+            let provider = ConfiguredBuiltinMock::new(
+                decode_controls(&[("CARINA_MOCK_RESUME_MODE".to_owned(), mode.into())].into())
+                    .behavior,
+                provider.scope.clone(),
+            )
+            .create_provider();
             let request = runtime.block_on(async {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let module_gate =
@@ -2247,7 +2321,6 @@ mod tests {
                     panic!("expected {expected}, got in flight {pending:?}: {error}")
                 }
             }
-            drop(mode_guard);
         }
     }
 
@@ -2275,7 +2348,7 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("mock provider fixture must not retain parser placeholders")
         .providers
         .into_iter()
@@ -2315,11 +2388,11 @@ mod tests {
     fn state_file_ends_with_trailing_newline() {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
-        let provider = MockProvider {
-            state_file: state_file.clone(),
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(state_file.clone()).unwrap(),
+        )
+        .create_provider();
         let mut states = HashMap::new();
         let mut entry = HashMap::new();
         entry.insert(
@@ -2327,7 +2400,7 @@ mod tests {
             serde_json::from_value(serde_json::json!("v")).unwrap(),
         );
         states.insert("aws.s3.Bucket.b".to_string(), entry);
-        provider.save_states(&states).unwrap();
+        provider.lock_state_file().unwrap().save(&states).unwrap();
         let bytes = fs::read(&state_file).unwrap();
         assert_eq!(
             bytes.last().copied(),
@@ -2361,11 +2434,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let provider = MockProvider {
-            state_file,
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(state_file).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -2437,16 +2510,13 @@ mod tests {
 
     #[test]
     fn fresh_v2_state_round_trip_keeps_marker_shaped_plaintext_plain() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _op_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
-        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
-        let provider = MockProvider {
-            state_file: state_file.clone(),
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(state_file.clone()).unwrap(),
+        )
+        .create_provider();
         let marker = valid_legacy_marker_shaped_string("mock-v2-collision");
         let plain = string_value(marker.clone());
         let id = ResourceId::with_provider_identity("mock", "test.resource", "collision", None);
@@ -2497,11 +2567,11 @@ mod tests {
     fn read_omits_write_only_password() {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
-        let provider = MockProvider {
-            state_file,
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(state_file).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "hidden", None);
         let resource = Resource::with_provider("mock", "test.resource", "hidden", None)
             .with_attribute("name", string_value("hidden"))
@@ -2532,11 +2602,11 @@ mod tests {
     fn corrupt_or_invalid_state_file_is_reported() {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
-        let provider = MockProvider {
-            state_file: state_file.clone(),
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(state_file.clone()).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "broken", None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -2577,16 +2647,13 @@ mod tests {
 
     #[test]
     fn versioned_state_file_round_trips() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _op_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
-        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
-        let provider = MockProvider {
-            state_file: state_file.clone(),
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(state_file.clone()).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "versioned", None);
         let payload = Value::Concrete(ConcreteValue::Map(
             [("$x".to_string(), string_value("kept"))]
@@ -2620,15 +2687,12 @@ mod tests {
 
     #[test]
     fn canonical_enum_survives_create_then_read() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _op_log = EnvGuard::unset("CARINA_MOCK_OP_LOG");
-        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
         let tmp = tempfile::tempdir().unwrap();
-        let provider = MockProvider {
-            state_file: tmp.path().join("mock-state.json"),
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "enum", None);
         let canonical: carina_core::value::PersistedValue =
             serde_json::from_value(serde_json::json!({
@@ -2672,7 +2736,8 @@ mod tests {
 
     #[test]
     fn required_permissions_returns_empty_vec() {
-        let provider = MockProvider::default();
+        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
+            .create_provider();
         let id = ResourceId::with_provider_identity("mock", "foo", "example", None);
         assert_eq!(
             provider
@@ -2708,17 +2773,20 @@ mod tests {
 
     #[test]
     fn op_log_records_successful_create_update_delete_in_order() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let log_path = tmp.path().join("op.log");
-        let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
-        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
-        let provider = MockProvider {
-            state_file,
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    operation_log: Some(log_path.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(state_file).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "web-acl-new", None);
         let resource = Resource::with_provider("mock", "test.resource", "web-acl-new", None)
             .with_attribute("name", string_value("web-acl-new"))
@@ -2800,17 +2868,20 @@ mod tests {
 
     #[test]
     fn op_log_records_provider_reads() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let log_path = tmp.path().join("op.log");
-        let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
-        let _create_fail = EnvGuard::unset("CARINA_MOCK_CREATE_FAIL_FOR");
-        let provider = MockProvider {
-            state_file,
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    operation_log: Some(log_path.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(state_file).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "read-me", None);
         let resource = Resource::with_provider("mock", "test.resource", "read-me", None)
             .with_attribute("name", string_value("read-me"));
@@ -2840,22 +2911,31 @@ mod tests {
     fn op_log_records_normalizer_calls() {
         use carina_core::provider::ProviderNormalizer;
 
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("op.log");
-        let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
-        let provider = MockProvider {
-            state_file: tmp.path().join("mock-state.json"),
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    operation_log: Some(log_path.clone()),
+                    ..MockObservations::default()
+                },
+                ..MockBehavior::default()
+            },
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
         let mut resources =
             vec![Resource::with_provider("mock", "test.resource", "normalize-me", None).into()];
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         runtime
-            .block_on(provider.normalize_desired(&mut resources))
+            .block_on(
+                MockNormalizer {
+                    observations: provider.behavior.observations.clone(),
+                }
+                .normalize_desired(&mut resources),
+            )
             .expect("normalizer should succeed");
 
         assert_eq!(
@@ -2866,17 +2946,21 @@ mod tests {
 
     #[test]
     fn create_fail_for_returns_error_without_op_log_entry() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let log_path = tmp.path().join("op.log");
-        let _op_log = EnvGuard::set("CARINA_MOCK_OP_LOG", log_path.as_os_str());
-        let _create_fail = EnvGuard::set("CARINA_MOCK_CREATE_FAIL_FOR", "test.resource.blocked");
-        let provider = MockProvider {
-            state_file,
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    operation_log: Some(log_path.clone()),
+                    ..MockObservations::default()
+                },
+                create_fail_for: Some("test.resource.blocked".to_owned()),
+                ..MockBehavior::default()
+            },
+            MockScope::file(state_file).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "blocked", None);
         let resource = Resource::with_provider("mock", "test.resource", "blocked", None)
             .with_attribute("name", string_value("blocked"));
@@ -2907,27 +2991,31 @@ mod tests {
     }
 
     #[test]
-    fn delete_delay_env_var_delays_matching_resource_delete() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn delete_delay_delays_matching_resource_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
-        let provider = MockProvider {
-            state_file,
-            partial_create: None,
-            partial_update: None,
-        };
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(state_file).unwrap(),
+        )
+        .create_provider();
         let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
 
-        // SAFETY: This test serializes access to the process environment with
-        // ENV_LOCK and clears the variables before releasing the lock.
-        unsafe {
-            env::set_var("CARINA_MOCK_DELETE_DELAY_MS_FOR", "test.resource.slow");
-            env::set_var("CARINA_MOCK_DELETE_DELAY_MS", "25");
-        }
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                delete_delay: Some(SelectedDelay {
+                    address: "test.resource.slow".to_owned(),
+                    duration: std::time::Duration::from_millis(25),
+                }),
+                ..MockBehavior::default()
+            },
+            provider.scope.clone(),
+        )
+        .create_provider();
 
         let started = Instant::now();
         let identifier =
@@ -2937,14 +3025,8 @@ mod tests {
             .unwrap();
         let elapsed = started.elapsed();
 
-        // SAFETY: See the set_var safety note above; ENV_LOCK is still held.
-        unsafe {
-            env::remove_var("CARINA_MOCK_DELETE_DELAY_MS_FOR");
-            env::remove_var("CARINA_MOCK_DELETE_DELAY_MS");
-        }
-
         assert!(
-            elapsed >= Duration::from_millis(25),
+            elapsed >= std::time::Duration::from_millis(25),
             "matching delete should be delayed by at least 25ms, elapsed {elapsed:?}"
         );
     }

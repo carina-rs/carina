@@ -9,11 +9,11 @@ use crate::binding_index::{
     AppliedOperation, BindingCompleteness, PartialReadBack, ResolvedBindings,
     SecretPreservingAttributes,
 };
-use crate::differ::{AttrComparison, LeafProvenance, TypedAttr, secret_grafted_comparison_view};
+use crate::differ::secret_grafted_comparison_view;
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
-    CheckInput, ProviderPreparationContext, ResolvedCheckInput, managed_update_schema,
-    prepare_provider_ready_resource_after_resolution,
+    CheckInput, DataSourceCheckInput, ProviderPreparationContext, ResolvedCheckInput,
+    ResourceCheckInput, managed_update_schema, prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
     AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
@@ -22,9 +22,11 @@ use crate::provider::{
     UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
+#[cfg(test)]
+use crate::resource::Resource;
 use crate::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, Resource,
-    ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, ResourceId, State,
+    Value,
 };
 use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
@@ -189,7 +191,7 @@ pub(super) async fn refresh_pending_states<S: Clone>(
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource<S: Clone>(
-    input: Result<CheckInput<Resource<S>>, String>,
+    input: Result<ResourceCheckInput<S>, String>,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<(ProviderReadyResource, SecretPreservingAttributes), EffectFailureKind> {
     let bindings = context.bindings();
@@ -295,9 +297,14 @@ fn needs_apply_resolution(value: &Value) -> bool {
 }
 
 pub(super) fn resolve_data_source<S: Clone>(
-    input: Result<CheckInput<DataSource<S>>, String>,
+    input: Result<DataSourceCheckInput<S>, String>,
     context: &ProviderPreparationContext<'_>,
-) -> Result<ResolvedCheckInput<DataSource<S>>, ReportedError> {
+) -> Result<
+    ResolvedCheckInput<
+        DataSource<S, crate::resource::NoPlaceholder, crate::resource::AbsoluteBindingAddress, ()>,
+    >,
+    ReportedError,
+> {
     let bindings = context.bindings();
     let checked = match input.map_err(ReportedError::message)? {
         CheckInput::Authored(source) => {
@@ -361,7 +368,9 @@ pub(super) fn resolved_resource(
     resource: Resource,
 ) -> Result<crate::resource::ResolvedResource, SerializationError> {
     crate::resource::assert_resource_fully_resolved(&resource)?;
-    Ok(crate::resource::ResolvedResource::new(resource))
+    Ok(crate::resource::ResolvedResource::new(
+        resource.with_dependency_phase(()),
+    ))
 }
 
 /// Reject a resolved attribute value that still carries an unresolved
@@ -1127,14 +1136,16 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(to.as_inner(), ctx.runtime_authored);
-            let resolve_source = check_input
+            let resolve_source_attributes = check_input
                 .as_ref()
                 .ok()
                 .and_then(|input| match input {
                     CheckInput::Authored(_) => None,
-                    CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
+                    CheckInput::PlanNormalized { authored, .. } => {
+                        Some(authored.attributes.clone())
+                    }
                 })
-                .unwrap_or_else(|| to.as_inner().clone());
+                .unwrap_or_else(|| to.attributes.clone());
             let (resolved_to, resolved_desired_attributes) =
                 match resolve_resource(check_input, preparation).await {
                     Ok(r) => r,
@@ -1178,61 +1189,63 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 .schemas()
                 .get_for(resolved_resource)
                 .expect("managed_update_schema proved that the owner-bound schema exists");
-            let comparison = match ctx
-                .comparison_provider
-                .comparison_context_for(id, owner_schema)
-            {
-                Ok(comparison) => comparison,
-                Err(error) => {
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure: EffectFailureKind::provider(error),
-                            refresh: None,
-                        },
-                    );
-                }
-            };
+            let mut candidates = HashMap::new();
             for (key, new_value) in &resolved_resource.attributes {
-                if effective_changed.iter().any(|k| k == key) {
+                if effective_changed.contains(key)
+                    || resolve_source_attributes.get(key) == Some(new_value)
+                {
                     continue;
                 }
-                // The plan already decided literal attributes. Reconsider a
-                // key only when resolution or provider normalization changed
-                // its desired value at apply time; otherwise raw provider
-                // defaults could turn an unrelated saved-plan update into a
-                // wider patch than the plan authorized.
-                if resolve_source.attributes.get(key) == Some(new_value) {
-                    continue;
+                if let Some(value) =
+                    secret_grafted_comparison_view(new_value, resolve_source_attributes.get(key))
+                {
+                    candidates.insert(key.clone(), value.into_owned());
                 }
-                let type_info = schema.attributes.get(key).map(|attr| TypedAttr {
-                    attr_type: &attr.attr_type,
-                    defs: &schema.defs,
-                });
-                let Some(comparison_value) =
-                    secret_grafted_comparison_view(new_value, resolve_source.attributes.get(key))
-                else {
-                    continue;
-                };
-                // Apply-time augmentation detects newly resolved observable
-                // references. The plan already decided the unobservable leaf
-                // half, and keys it marked changed were skipped above.
-                let changed = crate::differ::key_should_enter_patch_with_ignores(
-                    key,
-                    Some(schema),
-                    LeafProvenance::DecidedByPlan { key_changed: false },
-                    AttrComparison {
-                        from: from.attributes.get(key),
-                        to: comparison_value.as_ref(),
-                        saved: None,
-                        type_info,
-                    },
-                    resolved_to.ignore_changes(),
-                    &comparison,
+            }
+            if !candidates.is_empty() {
+                // A concrete plan value can be re-resolved from its authored
+                // ResourceRef at apply (PlanNormalized retains that origin).
+                // Patch membership is a planning decision, so compare fresh
+                // identities before checked request construction. Only keys
+                // actually changed by resolution enter this preparation.
+                let current = crate::resource::CanonicalComparisonAttributes::canonicalize(
+                    from.attributes
+                        .iter()
+                        .filter(|(key, _)| candidates.contains_key(*key))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    schema,
                 );
-                if changed {
-                    effective_changed.push(key.clone());
+                let desired = crate::resource::CanonicalComparisonAttributes::canonicalize_preserving_secret_shapes(candidates, schema);
+                let masked = resolved_to.ignore_changes().mask_comparison_attributes(
+                    &desired,
+                    &current,
+                    None,
+                    Some(schema),
+                );
+                let additional = crate::references::ReferencePreparation::default()
+                    .apply_time(&resolved_to, &masked, owner_schema, ctx.comparison_provider)
+                    .await;
+                match additional {
+                    Ok(additional) => effective_changed.extend(additional.value),
+                    Err(error) => {
+                        let failure = match error {
+                            crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
+                                EffectFailureKind::execution(error)
+                            }
+                            crate::differ::ApplyTimeComparisonError::Reference(error) => {
+                                EffectFailureKind::provider(error)
+                            }
+                        };
+                        return StartedBasicEffectResult::new(
+                            started_effect,
+                            started,
+                            BasicEffectResult::Failure {
+                                failure,
+                                refresh: None,
+                            },
+                        );
+                    }
                 }
             }
             let request = match UpdateRequest::checked(
@@ -1336,7 +1349,9 @@ mod process_basic_result_tests {
         outcome: BasicEffectResult,
         exec: &mut ExecutionState<'_, crate::resource::ModuleSource>,
     ) {
-        let effect = Effect::Create(crate::resource::ResolvedResource::new(resource));
+        let effect = Effect::Create(crate::resource::ResolvedResource::new(
+            resource.into_value_snapshot(),
+        ));
         process_basic_result(
             StartedBasicEffectResult::new(
                 super::super::wait::started_effect_for_test(
@@ -1438,7 +1453,9 @@ mod process_basic_result_tests {
 
         let resolved_attrs =
             SecretPreservingAttributes::from_provider_values(&HashMap::new(), &HashMap::new());
-        let effect = Effect::Create(crate::resource::ResolvedResource::new(resource));
+        let effect = Effect::Create(crate::resource::ResolvedResource::new(
+            resource.into_value_snapshot(),
+        ));
         process_basic_result(
             StartedBasicEffectResult::new(
                 super::super::wait::started_effect_for_test(

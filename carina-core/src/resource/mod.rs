@@ -10,6 +10,18 @@
 //! public live resource identities.
 
 pub(crate) mod binding_address;
+mod dependencies;
+pub use dependencies::{
+    DeferredDependencyPhase, DeferredDependencyTemplate, NotAManagedRow,
+    PersistedDestroyDependencies, PersistedDestroyDependencyProjection, ResolvedDependencies,
+    UnexpandedDependencyFields,
+};
+pub(crate) use dependencies::{
+    ResolvedDependencyReads, SYNTHETIC_TYPE_PREFIX, deserialize_persisted_destroy_dependencies,
+    retain_deferred_iterable_dependencies,
+};
+pub(crate) mod directive_expr;
+pub(crate) use directive_expr::Substituted;
 mod enum_value;
 mod ignore_changes;
 mod loop_origin;
@@ -31,7 +43,7 @@ use subtle::ConstantTimeEq;
 
 use crate::ValueDescription;
 use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
-use crate::differ::ComparisonContext;
+use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::effect::MoveAuthority;
 use crate::explicit::ExplicitFields;
 use crate::parser::display_string_literal;
@@ -47,10 +59,16 @@ pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindin
 pub(crate) use binding_address::{
     binding_with_index, binding_with_map_key, module_argument_placeholder,
 };
+pub use directive_expr::{
+    ArgumentValueOrigin, DirectiveExpr, DirectiveResolutionError, DirectiveResolutionErrors,
+    ExpansionError, LifecycleDirective, LoopDirective, LoopDirectiveExpr,
+    SerializableDirectivePhase,
+};
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
 };
 pub(crate) use enum_value::{enum_value_comparison_key, enum_values_equal};
+pub(crate) use ignore_changes::MaskedComparisonAttributes;
 pub(crate) use ignore_changes::value_at_leaf;
 pub use ignore_changes::{
     IgnoreChangeError, ParsedIgnorePath, ParsedIgnorePathSegment, ResolvedIgnoreChanges,
@@ -719,6 +737,10 @@ impl ResolvedResourceId {
         }
     }
 
+    pub(crate) fn binding_address(&self) -> AbsoluteBindingAddress {
+        RootScope::new().resolve(RelativeBindingName::new(self.identity_str()))
+    }
+
     pub fn display_type(&self) -> String {
         self.0.display_type()
     }
@@ -819,19 +841,277 @@ impl Borrow<ResourceId> for ResolvedResourceId {
 /// let resource = Resource::pending("test");
 /// let _: ResolvedResource = resource.into();
 /// ```
+///
+/// Resolved resources do not expose parser-phase dependency fields:
+///
+/// ```compile_fail,E0609
+/// use carina_core::resource::ResolvedResource;
+///
+/// let resource: &ResolvedResource = unimplemented!();
+/// let _ = &resource.as_inner().dependency_bindings;
+/// ```
+///
+/// ```compile_fail,E0609
+/// use carina_core::resource::ResolvedResource;
+///
+/// let resource: &ResolvedResource = unimplemented!();
+/// let _ = &resource.as_inner().dependencies.value_bindings;
+/// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "S: Serialize + Clone",
     deserialize = "S: Deserialize<'de>"
 ))]
-#[serde(try_from = "Resource<S>", into = "Resource<S>")]
-pub struct ResolvedResource<S = ModuleSource>(Resource<S>);
+#[serde(try_from = "ResolvedResourceWire<S>", into = "ResolvedResourceWire<S>")]
+pub struct ResolvedResource<S = ModuleSource> {
+    resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+    value_dependencies: ResolvedDependencies,
+    explicit_dependencies: ResolvedDependencies,
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+#[serde(from = "SchemaUnresolvedResource<S>")]
+struct ResolvedResourceWire<S> {
+    #[serde(flatten)]
+    resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    value_dependencies: ResolvedDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    explicit_dependencies: ResolvedDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+/// Saved-plan resource whose identity and dependencies are resolved but whose
+/// authored `ignore_changes` paths still await fingerprint-checked schemas.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+#[serde(from = "ResourceWithDependenciesWire<S>")]
+pub struct SchemaUnresolvedResource<S = SavedModuleSource> {
+    #[serde(flatten)]
+    resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    value_dependencies: ResolvedDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
+    explicit_dependencies: ResolvedDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+/// Decode resource fields directly so serde's caller can retain their paths.
+/// A flattened Resource buffers its fields before decoding them, which loses
+/// locations such as `Create.binding` when a checked address rejects a value.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "S: Deserialize<'de>"))]
+struct ResourceWithDependenciesWire<S> {
+    id: ResourceId,
+    attributes: IndexMap<String, Value>,
+    #[serde(default)]
+    directives: Directives,
+    #[serde(default)]
+    prefixes: HashMap<String, String>,
+    #[serde(default)]
+    binding: Option<AbsoluteBindingAddress>,
+    dependencies: (),
+    #[serde(default)]
+    module_source: Option<S>,
+    #[serde(default)]
+    default_tag_keys: DefaultTagKeys,
+    #[serde(default)]
+    loop_provenance: LoopProvenance,
+    #[serde(default)]
+    value_dependencies: ResolvedDependencies,
+    #[serde(default)]
+    explicit_dependencies: ResolvedDependencies,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(default)]
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+impl<S> From<ResourceWithDependenciesWire<S>> for SchemaUnresolvedResource<S> {
+    fn from(wire: ResourceWithDependenciesWire<S>) -> Self {
+        let ResourceWithDependenciesWire {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependencies,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        } = wire;
+        Self {
+            resource: Resource {
+                id,
+                attributes,
+                directives,
+                resolved_ignore_changes: ResolvedIgnoreChanges::default(),
+                prefixes,
+                binding,
+                dependencies,
+                module_source,
+                default_tag_keys,
+                loop_provenance,
+                quoted_string_attrs: HashSet::new(),
+            },
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        }
+    }
+}
+
+impl<S> From<SchemaUnresolvedResource<S>> for ResolvedResourceWire<S> {
+    fn from(resource: SchemaUnresolvedResource<S>) -> Self {
+        let SchemaUnresolvedResource {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        } = resource;
+        Self {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        }
+    }
+}
+
+impl<S> From<ResolvedResource<S>> for SchemaUnresolvedResource<S> {
+    fn from(resource: ResolvedResource<S>) -> Self {
+        let (
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        ) = resource.into_parts();
+        Self {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        }
+    }
+}
+
+impl<S> SchemaUnresolvedResource<S> {
+    pub fn id(&self) -> &ResourceId {
+        &self.resource.id
+    }
+
+    /// Borrow the saved-plan payload without weakening the fact that its
+    /// dependency addresses are already resolved.
+    pub fn as_resource(&self) -> &Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
+        &self.resource
+    }
+
+    pub fn value_dependencies(&self) -> &ResolvedDependencies {
+        &self.value_dependencies
+    }
+    pub fn explicit_dependencies(&self) -> &ResolvedDependencies {
+        &self.explicit_dependencies
+    }
+
+    pub fn resolve_with_schemas(
+        mut self,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<ResolvedResource<S>, ResolvedResourceError> {
+        if matches!(
+            self.resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) {
+            return Err(PendingResourceIdentityError::new(self.resource.id.clone()).into());
+        }
+        resolve_resource_ignore_changes(&mut self.resource, registry)?;
+        Ok(ResolvedResource::from_resolved_parts_with_reads(
+            self.resource,
+            self.value_dependencies,
+            self.explicit_dependencies,
+            self.value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            self.persisted_value_destroy_dependencies,
+            self.persisted_explicit_destroy_dependencies,
+        ))
+    }
+}
 
 pub type SavedResolvedResource = ResolvedResource<SavedModuleSource>;
 
 impl From<ResolvedResource> for SavedResolvedResource {
     fn from(resource: ResolvedResource) -> Self {
-        Self::new(resource.into_inner().into())
+        let (
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        ) = resource.into_parts();
+        Self::from_resolved_parts_with_reads(
+            resource.into(),
+            value_dependencies,
+            explicit_dependencies,
+            value_dependency_reads,
+        )
+        .with_persisted_destroy_dependencies(
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+        )
     }
 }
 
@@ -841,6 +1121,12 @@ impl From<ResolvedResource> for SavedResolvedResource {
 #[error("resource '{id}' still has a pending identity")]
 pub struct PendingResourceIdentityError {
     id: ResourceId,
+}
+
+impl PendingResourceIdentityError {
+    pub fn new(id: ResourceId) -> Self {
+        Self { id }
+    }
 }
 
 /// A resource could not enter the schema-resolved planning boundary.
@@ -896,11 +1182,12 @@ impl From<PendingResourceIdentityError> for ResolvedResourceError {
 /// Re-resolve authored resource directives that depend on the provider schema.
 ///
 /// Deferred anonymous-loop templates intentionally still have pending identities
-/// when a saved plan is loaded. Bound templates instead expose their derived
-/// materialized address while directives are checked, so diagnostics name the
-/// template (for example, `items[?]`) rather than a pending placeholder.
-pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind, B: BindingAddress>(
-    resource: &mut Resource<S, P, B>,
+/// when a saved plan is loaded. Their directives must nevertheless be checked
+/// against the fingerprint-validated schemas before apply; identity validation
+/// remains the responsibility of [`ResolvedResource::resolve_with_schemas`]
+/// after the template has been materialized.
+pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind, B: BindingAddress, D>(
+    resource: &mut Resource<S, P, B, D>,
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), ResolvedResourceError> {
     let ignore_changes = if resource.directives.ignore_changes.is_empty() {
@@ -926,7 +1213,7 @@ pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind, B: BindingA
 impl ResolvedResource {
     /// Construct a resource from an already-resolved id.
     pub fn from_id(id: ResolvedResourceId) -> Self {
-        Self(Resource::from_id(id.into_inner()))
+        Self::new(Resource::from_id(id.into_inner()).with_dependency_phase(()))
     }
 }
 
@@ -936,7 +1223,7 @@ impl<S> ResolvedResource<S> {
     /// Panics if identity is pending or authored `ignore_changes` paths do not
     /// match the attached resolved metadata. Raw DSL and saved-plan resources
     /// must enter through [`Self::resolve_with_schemas`] instead.
-    pub fn new(resource: Resource<S>) -> Self {
+    pub fn new(resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>) -> Self {
         assert!(
             matches!(
                 resource.id.identity_state(),
@@ -948,11 +1235,85 @@ impl<S> ResolvedResource<S> {
             resolved_ignore_changes_match(&resource),
             "ResolvedResource with ignore_changes requires schema resolution"
         );
-        Self(resource)
+        Self {
+            resource,
+            value_dependencies: ResolvedDependencies::default(),
+            explicit_dependencies: ResolvedDependencies::default(),
+            persisted_value_destroy_dependencies: PersistedDestroyDependencies::default(),
+            persisted_explicit_destroy_dependencies: PersistedDestroyDependencies::default(),
+            value_dependency_reads: ResolvedDependencyReads::default(),
+        }
+    }
+
+    /// Construct the post-expansion form after every dependency operand has
+    /// been resolved to a complete resource address.
+    pub fn from_resolved_parts(
+        resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        value_dependencies: ResolvedDependencies,
+        explicit_dependencies: ResolvedDependencies,
+    ) -> Self {
+        let value_dependency_reads = ResolvedDependencyReads::unknown_for(&value_dependencies);
+        Self::from_resolved_parts_with_reads(
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            value_dependency_reads,
+        )
+    }
+
+    pub(crate) fn from_resolved_parts_with_reads(
+        resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        value_dependencies: ResolvedDependencies,
+        explicit_dependencies: ResolvedDependencies,
+        value_dependency_reads: ResolvedDependencyReads,
+    ) -> Self {
+        assert!(
+            matches!(
+                resource.id.identity_state(),
+                ResourceIdentityState::Resolved(_)
+            ),
+            "ResolvedResource requires identity"
+        );
+        assert!(
+            resolved_ignore_changes_match(&resource),
+            "ResolvedResource with ignore_changes requires schema resolution"
+        );
+        Self {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies: PersistedDestroyDependencies::default(),
+            persisted_explicit_destroy_dependencies: PersistedDestroyDependencies::default(),
+            value_dependency_reads,
+        }
+    }
+
+    pub(crate) fn with_persisted_destroy_dependencies(
+        mut self,
+        value_dependencies: PersistedDestroyDependencies,
+        explicit_dependencies: PersistedDestroyDependencies,
+    ) -> Self {
+        self.persisted_value_destroy_dependencies = value_dependencies;
+        self.persisted_explicit_destroy_dependencies = explicit_dependencies;
+        self
+    }
+
+    /// Restore graph-projected destroy edges from a current-format saved
+    /// plan. The opaque dependency values cannot be populated by ordinary
+    /// callers; this only reattaches projections previously minted by the
+    /// expanded graph and serialized alongside the resource.
+    pub fn with_saved_destroy_dependencies(
+        self,
+        value_dependencies: PersistedDestroyDependencies,
+        explicit_dependencies: PersistedDestroyDependencies,
+    ) -> Self {
+        self.with_persisted_destroy_dependencies(value_dependencies, explicit_dependencies)
     }
 
     /// Try to construct; returns `None` if identity is pending.
-    pub fn try_new(resource: Resource<S>) -> Option<Self> {
+    pub fn try_new(
+        resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+    ) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self::new(resource)),
@@ -961,24 +1322,33 @@ impl<S> ResolvedResource<S> {
 
     /// Convert a whole resource collection at the pipeline boundary where
     /// identity assignment is complete.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn collect_resolved(
         resources: impl IntoIterator<Item = Resource<S>>,
-    ) -> Result<Vec<Self>, PendingResourceIdentityError> {
+    ) -> Result<Vec<Self>, crate::resolved_graph::ExpandedGraphResolutionError> {
+        let resources = resources.into_iter().collect::<Vec<_>>();
+        let index = crate::resolved_graph::ExpandedBindingIndex::for_test_resources(&resources)?;
         resources
             .into_iter()
-            .map(|resource| match resource.id.identity_state() {
-                ResourceIdentityState::Pending(_) => {
-                    Err(PendingResourceIdentityError { id: resource.id })
-                }
-                ResourceIdentityState::Resolved(_) => Ok(Self::new(resource)),
-            })
+            .map(|resource| index.resolve_resource(resource, &crate::schema::SchemaRegistry::new()))
             .collect()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn resolve_raw_fixture(
+        resource: Resource<S>,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<Self, crate::resolved_graph::ExpandedGraphResolutionError> {
+        let index = crate::resolved_graph::ExpandedBindingIndex::for_test_resources(
+            std::slice::from_ref(&resource),
+        )?;
+        index.resolve_resource(resource, schemas)
     }
 
     /// Convert resources at the planning boundary and resolve every authored
     /// ignore path against its managed resource schema.
     pub fn collect_resolved_with_schemas(
-        resources: impl IntoIterator<Item = Resource<S>>,
+        resources: impl IntoIterator<Item = Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>,
         registry: &crate::schema::SchemaRegistry,
     ) -> Result<Vec<Self>, ResolvedResourceError> {
         resources
@@ -988,7 +1358,7 @@ impl<S> ResolvedResource<S> {
     }
 
     pub fn resolve_with_schemas(
-        mut resource: Resource<S>,
+        mut resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
         registry: &crate::schema::SchemaRegistry,
     ) -> Result<Self, ResolvedResourceError> {
         if matches!(
@@ -1001,26 +1371,108 @@ impl<S> ResolvedResource<S> {
             .into());
         }
         resolve_resource_ignore_changes(&mut resource, registry)?;
-        Ok(Self(resource))
+        Ok(Self::new(resource))
     }
 
     /// Borrow the inner [`Resource`].
-    pub fn as_inner(&self) -> &Resource<S> {
-        &self.0
+    pub fn as_inner(&self) -> &Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
+        &self.resource
     }
 
     /// Borrow the underlying resource for provider-boundary consumers.
-    pub fn as_resource(&self) -> &Resource<S> {
+    pub fn as_resource(&self) -> &Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
         self.as_inner()
     }
 
     /// Consume and return the inner [`Resource`].
-    pub fn into_inner(self) -> Resource<S> {
-        self.0
+    pub fn into_inner(self) -> Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
+        self.resource
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        ResolvedDependencies,
+        ResolvedDependencies,
+        PersistedDestroyDependencies,
+        PersistedDestroyDependencies,
+        ResolvedDependencyReads,
+    ) {
+        (
+            self.resource,
+            self.value_dependencies,
+            self.explicit_dependencies,
+            self.persisted_value_destroy_dependencies,
+            self.persisted_explicit_destroy_dependencies,
+            self.value_dependency_reads,
+        )
+    }
+
+    /// Replace only the value-bearing resource payload while preserving the
+    /// already-resolved graph metadata. Used by redaction and rehydration,
+    /// which may rewrite attributes but must not discard dependency edges.
+    pub fn replace_inner(
+        &self,
+        resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+    ) -> Self {
+        assert_eq!(
+            resource.id, self.resource.id,
+            "replacing a resolved resource cannot change its address"
+        );
+        Self::from_resolved_parts_with_reads(
+            resource,
+            self.value_dependencies.clone(),
+            self.explicit_dependencies.clone(),
+            self.value_dependency_reads.clone(),
+        )
+        .with_persisted_destroy_dependencies(
+            self.persisted_value_destroy_dependencies.clone(),
+            self.persisted_explicit_destroy_dependencies.clone(),
+        )
+    }
+
+    pub fn value_dependencies(&self) -> &ResolvedDependencies {
+        &self.value_dependencies
+    }
+
+    pub fn explicit_dependencies(&self) -> &ResolvedDependencies {
+        &self.explicit_dependencies
+    }
+
+    pub fn persisted_value_destroy_dependencies(&self) -> &PersistedDestroyDependencies {
+        &self.persisted_value_destroy_dependencies
+    }
+
+    pub fn persisted_explicit_destroy_dependencies(&self) -> &PersistedDestroyDependencies {
+        &self.persisted_explicit_destroy_dependencies
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn persisted_destroy_dependencies(&self) -> PersistedDestroyDependencies {
+        let mut dependencies = self.persisted_value_destroy_dependencies.clone();
+        dependencies.extend_projected(&self.persisted_explicit_destroy_dependencies);
+        dependencies
+    }
+
+    pub(crate) fn known_dependency_reads(
+        &self,
+        dependency: &ResolvedResourceId,
+    ) -> Option<&BTreeSet<String>> {
+        if self.explicit_dependencies.contains(dependency) {
+            return None;
+        }
+        self.value_dependency_reads.known_attributes(dependency)
+    }
+
+    pub fn all_dependencies(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.value_dependencies
+            .iter()
+            .chain(self.explicit_dependencies.iter())
     }
 
     pub fn identity(&self) -> &ResourceIdentity {
-        match self.0.id.identity_state() {
+        match self.resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => {
                 unreachable!("ResolvedResource requires identity")
             }
@@ -1033,37 +1485,39 @@ impl<S> ResolvedResource<S> {
     }
 
     pub fn resolved_id(&self) -> ResolvedResourceId {
-        ResolvedResourceId(self.0.id.clone())
+        ResolvedResourceId(self.resource.id.clone())
     }
 
     pub fn ignore_changes(&self) -> &ResolvedIgnoreChanges {
-        &self.0.resolved_ignore_changes
+        &self.resource.resolved_ignore_changes
     }
 
     /// Set an attribute without weakening the resolved-identity invariant.
     pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
-        self.0.attributes.insert(key.into(), value);
+        self.resource.attributes.insert(key.into(), value);
     }
 }
 
 impl<S> Deref for ResolvedResource<S> {
-    type Target = Resource<S>;
+    type Target = Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.resource
     }
 }
 
-impl<S> From<ResolvedResource<S>> for Resource<S> {
+impl<S> From<ResolvedResource<S>> for Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
     fn from(resource: ResolvedResource<S>) -> Self {
-        resource.0
+        resource.resource
     }
 }
 
-impl<S> TryFrom<Resource<S>> for ResolvedResource<S> {
+impl<S> TryFrom<Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>> for ResolvedResource<S> {
     type Error = String;
 
-    fn try_from(resource: Resource<S>) -> Result<Self, Self::Error> {
+    fn try_from(
+        resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+    ) -> Result<Self, Self::Error> {
         if !resolved_ignore_changes_match(&resource) {
             return Err("ignore_changes requires schema resolution".to_string());
         }
@@ -1071,7 +1525,47 @@ impl<S> TryFrom<Resource<S>> for ResolvedResource<S> {
     }
 }
 
-fn resolved_ignore_changes_match<S>(resource: &Resource<S>) -> bool {
+impl<S> TryFrom<ResolvedResourceWire<S>> for ResolvedResource<S> {
+    type Error = String;
+
+    fn try_from(wire: ResolvedResourceWire<S>) -> Result<Self, Self::Error> {
+        if !resolved_ignore_changes_match(&wire.resource) {
+            return Err("ignore_changes requires schema resolution".to_string());
+        }
+        if matches!(
+            wire.resource.id.identity_state(),
+            ResourceIdentityState::Pending(_)
+        ) {
+            return Err("identity is required".to_string());
+        }
+        Ok(Self {
+            resource: wire.resource,
+            value_dependencies: wire.value_dependencies,
+            explicit_dependencies: wire.explicit_dependencies,
+            persisted_value_destroy_dependencies: wire.persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies: wire.persisted_explicit_destroy_dependencies,
+            value_dependency_reads: wire.value_dependency_reads,
+        })
+    }
+}
+
+impl<S> From<ResolvedResource<S>> for ResolvedResourceWire<S> {
+    fn from(resource: ResolvedResource<S>) -> Self {
+        Self {
+            resource: resource.resource,
+            value_dependencies: resource.value_dependencies,
+            explicit_dependencies: resource.explicit_dependencies,
+            persisted_value_destroy_dependencies: resource.persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies: resource
+                .persisted_explicit_destroy_dependencies,
+            value_dependency_reads: resource.value_dependency_reads,
+        }
+    }
+}
+
+fn resolved_ignore_changes_match<S, D>(
+    resource: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
+) -> bool {
     let authored = resource
         .directives
         .ignore_changes
@@ -1088,8 +1582,8 @@ fn resolved_ignore_changes_match<S>(resource: &Resource<S>) -> bool {
     authored == resolved
 }
 
-impl<S> AsRef<Resource<S>> for ResolvedResource<S> {
-    fn as_ref(&self) -> &Resource<S> {
+impl<S> AsRef<Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>> for ResolvedResource<S> {
+    fn as_ref(&self) -> &Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
         self.as_inner()
     }
 }
@@ -2529,7 +3023,7 @@ pub type ExpandedConcreteValue = ConcreteValue<NoPlaceholder, AbsoluteBindingAdd
 /// evaluation boundaries. A structural handle never becomes a public
 /// [`Value`]; only its canonical access base is exposed to reference walkers.
 ///
-/// [`crate::eval_value::StructuralHandleMetadata`] is intentionally separate:
+/// [`crate::eval_value::UnexpandedStructuralHandleMetadata`] is intentionally separate:
 /// it is a pre-classification tree for directory fixed-point parsing, whereas
 /// this enum represents one already-classified argument operand.
 #[derive(Debug, Clone, PartialEq)]
@@ -2542,7 +3036,7 @@ pub(crate) enum StructuralOperand<
         access_base: Option<Value<P, B>>,
     },
     Handle {
-        handle: crate::eval_value::StructuralHandle<B>,
+        handle: crate::eval_value::UnexpandedStructuralHandle<B>,
         access_base: Value<P, B>,
     },
     /// A bare module parameter forwarded across a nested argument boundary
@@ -2563,7 +3057,7 @@ pub(crate) enum StructuralOperandRef<
 > {
     Value(&'a Value<P, B>),
     Handle {
-        handle: &'a crate::eval_value::StructuralHandle<B>,
+        handle: &'a crate::eval_value::UnexpandedStructuralHandle<B>,
         access_base: &'a Value<P, B>,
     },
     Parameter {
@@ -2605,7 +3099,7 @@ impl<P: PlaceholderKind, B: BindingAddress> StructuralOperand<P, B> {
     }
 
     pub(crate) fn from_handle_with_access_base(
-        handle: crate::eval_value::StructuralHandle<B>,
+        handle: crate::eval_value::UnexpandedStructuralHandle<B>,
         access_base: Value<P, B>,
     ) -> Self {
         Self::Handle {
@@ -2621,7 +3115,7 @@ impl<P: PlaceholderKind, B: BindingAddress> StructuralOperand<P, B> {
         }
     }
 
-    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle<B>> {
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::UnexpandedStructuralHandle<B>> {
         match self {
             Self::Value { .. } | Self::Parameter { .. } => None,
             Self::Handle { handle, .. } => Some(handle),
@@ -2753,7 +3247,7 @@ impl<P: PlaceholderKind, B: BindingAddress> StructuralOperand<P, B> {
 }
 
 impl<B: BindingAddress> StructuralOperand<ParserPlaceholder, B> {
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle<B>) -> Self {
+    pub(crate) fn from_handle(handle: crate::eval_value::UnexpandedStructuralHandle<B>) -> Self {
         let access_base = handle.access_base_value();
         Self::Handle {
             handle,
@@ -2796,7 +3290,7 @@ impl<P: PlaceholderKind, B: BindingAddress> FunctionArgument<P, B> {
         self.operand.value()
     }
 
-    pub(crate) fn handle(&self) -> Option<&crate::eval_value::StructuralHandle<B>> {
+    pub(crate) fn handle(&self) -> Option<&crate::eval_value::UnexpandedStructuralHandle<B>> {
         self.operand.handle()
     }
 
@@ -2851,7 +3345,7 @@ impl<P: PlaceholderKind, B: BindingAddress> FunctionArgument<P, B> {
 }
 
 impl<B: BindingAddress> FunctionArgument<ParserPlaceholder, B> {
-    pub(crate) fn from_handle(handle: crate::eval_value::StructuralHandle<B>) -> Self {
+    pub(crate) fn from_handle(handle: crate::eval_value::UnexpandedStructuralHandle<B>) -> Self {
         Self {
             operand: StructuralOperand::from_handle(handle),
         }
@@ -5512,6 +6006,25 @@ pub enum PlaceholderTypeAuthority<'a> {
 pub trait PlaceholderKind:
     Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize
 {
+    /// Lifecycle settings follow the same authored-to-expanded phase as values.
+    type DirectiveBool<B: BindingAddress>: Clone + fmt::Debug + PartialEq + Default + Send + Sync;
+    type DirectivePreventDestroy<B: BindingAddress>: Clone
+        + fmt::Debug
+        + PartialEq
+        + Default
+        + Send
+        + Sync;
+
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self>;
+
+    fn map_absolute_directive_values(
+        directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    );
+
     fn module_argument_name(&self) -> Option<&str> {
         None
     }
@@ -5547,6 +6060,20 @@ impl PlaceholderKind for NoPlaceholder {
     fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
         match *self {}
     }
+    type DirectiveBool<B: BindingAddress> = bool;
+    type DirectivePreventDestroy<B: BindingAddress> = PreventDestroy;
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self> {
+        directive_expr::rebind_resolved_directives(directives, resolve)
+    }
+    fn map_absolute_directive_values(
+        _directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        _map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        // Lifecycle values are already resolved scalars in this phase.
+    }
 }
 
 impl fmt::Display for NoPlaceholder {
@@ -5569,6 +6096,14 @@ impl PlaceholderKind for LoopSlot {
     fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
         PlaceholderTypeAuthority::AwaitingSubstitution
     }
+    type DirectiveBool<B: BindingAddress> = LoopDirective<bool, B>;
+    type DirectivePreventDestroy<B: BindingAddress> = LoopDirective<PreventDestroy, B>;
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self> {
+        directive_expr::rebind_loop_directives(directives, resolve)
+    }
 
     fn loop_slot(&self) -> Option<LoopSlot> {
         Some(*self)
@@ -5585,9 +6120,30 @@ impl PlaceholderKind for LoopSlot {
             Self::Value => "(known after upstream apply)".to_string(),
         }
     }
+    fn map_absolute_directive_values(
+        directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        directives.map_expression_bindings(&mut |binding| map(&binding));
+    }
 }
 
 impl PlaceholderKind for ParserPlaceholder {
+    type DirectiveBool<B: BindingAddress> = Option<DirectiveExpr<B>>;
+    type DirectivePreventDestroy<B: BindingAddress> = Option<DirectiveExpr<B>>;
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self> {
+        directive_expr::rebind_authored_directives(directives, resolve)
+    }
+    fn map_absolute_directive_values(
+        directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        directives.map_expressions(|expression| expression.value.map_absolute_bindings(map));
+    }
+
     fn module_argument_name(&self) -> Option<&str> {
         match self {
             Self::ModuleArgument { name, .. } => Some(name),
@@ -5716,6 +6272,12 @@ impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::Placeholder(_),
             ) => None,
         }
+    }
+
+    pub(crate) fn references_loop_slot(&self) -> bool {
+        let mut found = false;
+        self.visit_placeholders(&mut |placeholder| found |= placeholder.loop_slot().is_some());
+        found
     }
 
     pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
@@ -6870,6 +7432,14 @@ pub fn contains_resource_ref<P: PlaceholderKind, B: BindingAddress>(value: &Valu
     found
 }
 
+/// Whether a desired value is an opaque leaf during normalization.
+///
+/// Concrete lists/maps remain structural even when they contain deferred children.
+/// Every deferred expression, including a secret wrapping a container, is opaque.
+pub fn is_deferred_desired_leaf(value: &Value) -> bool {
+    matches!(value, Value::Deferred(_))
+}
+
 /// Return whether `value` recursively contains
 /// `Value::Deferred(DeferredValue::Unknown)`.
 pub fn value_contains_unknown(value: &Value) -> bool {
@@ -7303,15 +7873,70 @@ impl<'a> SavedValueViews<'a> {
     pub(crate) fn same(value: &'a Value) -> Self {
         Self::new(value, value)
     }
+
+    pub(crate) fn projected(self) -> &'a Value {
+        self.projected
+    }
 }
 
-pub(crate) fn merge_with_saved(
+/// Borrow either concrete list representation at the comparison seam.
+/// Conversion is local to comparison and never rewrites a payload or state.
+/// Pair identical concrete items before probing other unordered candidates.
+/// Preparation and comparison share this pairing so a reordered echoed
+/// reference never requires resolution merely because another item came first.
+pub(crate) fn match_equal_concrete_items<A: Borrow<Value>, B: Borrow<Value>>(
+    a: &[A],
+    b: &[B],
+) -> (Vec<Option<usize>>, Vec<bool>) {
+    let mut matched_a = vec![None; a.len()];
+    let mut matched_b = vec![false; b.len()];
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (j, candidate) in b.iter().enumerate() {
+        buckets
+            .entry(candidate.borrow().canonical_hash())
+            .or_default()
+            .push(j);
+    }
+    for (i, item) in a.iter().enumerate() {
+        let item = item.borrow();
+        if !matches!(item, Value::Concrete(_)) || !item.is_fully_resolved() {
+            continue;
+        }
+        if let Some(j) = buckets.get(&item.canonical_hash()).and_then(|bucket| {
+            bucket
+                .iter()
+                .copied()
+                .find(|&j| !matched_b[j] && item == b[j].borrow())
+        }) {
+            matched_a[i] = Some(j);
+            matched_b[j] = true;
+        }
+    }
+    (matched_a, matched_b)
+}
+
+pub(crate) fn comparison_list_items(value: &Value) -> Option<std::borrow::Cow<'_, [Value]>> {
+    match value {
+        Value::Concrete(ConcreteValue::List(items)) => Some(std::borrow::Cow::Borrowed(items)),
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(
+            items
+                .iter()
+                .cloned()
+                .map(ConcreteValue::String)
+                .map(Value::Concrete)
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn merge_with_saved<R: ReferenceEquality>(
     desired: &Value,
     saved: SavedValueViews<'_>,
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Value {
     match (desired, saved.projected) {
         (
@@ -7354,14 +7979,14 @@ pub(crate) fn merge_with_saved(
     }
 }
 
-fn merge_maps(
+fn merge_maps<R: ReferenceEquality>(
     desired: &IndexMap<String, Value>,
     projected_saved: &IndexMap<String, Value>,
     raw_saved: &IndexMap<String, Value>,
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Value {
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => Some(children),
@@ -7381,6 +8006,12 @@ fn merge_maps(
             desired.contains_key(key) || !was_authored
         });
     }
+    for key in merged.keys() {
+        if !desired.contains_key(key) {
+            let paths = context.entry_paths(key, attr_type, defs);
+            context.at_paths(&paths).copied_saved();
+        }
+    }
     for (key, desired_value) in desired {
         let merged_value = match projected_saved.get(key) {
             Some(projected_saved_value) => {
@@ -7398,7 +8029,7 @@ fn merge_maps(
                         .unwrap_or(&ExplicitFields::Unrecorded),
                     map_entry_subtype(attr_type, key, defs),
                     defs,
-                    context,
+                    &context.at_paths(&context.entry_paths(key, attr_type, defs)),
                 )
             }
             None => desired_value.clone(),
@@ -7422,19 +8053,55 @@ fn merge_maps(
 /// (or equal scalar), then run the exact same global best-first commit phase.
 /// Hash collisions only add a candidate: [`similarity_score`] remains the
 /// authority before a candidate can be committed.
-pub(crate) fn pair_list_elements<D, S>(
+pub(crate) fn pair_list_elements<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<Option<usize>>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
-    commit_list_element_pairs(desired.len(), saved.len(), &candidates)
+    if !has_reference_leaves(attr_type, defs) {
+        let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
+        return commit_list_element_pairs(desired.len(), saved.len(), &candidates);
+    }
+    let (mut pairs, matched_saved) = match_equal_concrete_items(desired, saved);
+    let desired_indices = pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pair)| pair.is_none().then_some(i))
+        .collect::<Vec<_>>();
+    let saved_indices = matched_saved
+        .iter()
+        .enumerate()
+        .filter_map(|(i, matched)| (!matched).then_some(i))
+        .collect::<Vec<_>>();
+    let remaining_desired = desired_indices
+        .iter()
+        .map(|&i| desired[i].borrow())
+        .collect::<Vec<_>>();
+    let remaining_saved = saved_indices
+        .iter()
+        .map(|&i| saved[i].borrow())
+        .collect::<Vec<_>>();
+    let candidates = list_pair_candidates(
+        &remaining_desired,
+        &remaining_saved,
+        attr_type,
+        defs,
+        &context.with_indices(&context.remap_indices(&desired_indices, &saved_indices)),
+    );
+    for (i, pair) in
+        commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates)
+            .into_iter()
+            .enumerate()
+    {
+        pairs[desired_indices[i]] = pair.map(|index| saved_indices[index]);
+    }
+    pairs
 }
 
 /// A stable list-element pairing together with the evidence for that pairing.
@@ -7457,28 +8124,124 @@ pub(crate) enum ListElementPairing {
 /// A match is unique only when the selected saved element is the sole
 /// positive, highest-scoring candidate for that desired element. Global
 /// contention that forces a lower-scoring choice is therefore ambiguous too.
-pub(crate) fn pair_list_elements_with_uniqueness<D, S>(
+pub(crate) fn pair_list_elements_with_uniqueness<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<ListElementPairing>
 where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
-    let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
-    classify_list_element_pairs(&pairs, saved.len(), &candidates)
+    if !has_reference_leaves(attr_type, defs) {
+        let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
+        let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
+        return classify_list_element_pairs(&pairs, saved.len(), &candidates);
+    }
+    let (exact, matched_saved) = match_equal_concrete_items(desired, saved);
+    let desired_indices = exact
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pair)| pair.is_none().then_some(i))
+        .collect::<Vec<_>>();
+    let saved_indices = matched_saved
+        .iter()
+        .enumerate()
+        .filter_map(|(i, matched)| (!matched).then_some(i))
+        .collect::<Vec<_>>();
+    let remaining_desired = desired_indices
+        .iter()
+        .map(|&i| desired[i].borrow())
+        .collect::<Vec<_>>();
+    let remaining_saved = saved_indices
+        .iter()
+        .map(|&i| saved[i].borrow())
+        .collect::<Vec<_>>();
+    let candidates = list_pair_candidates(
+        &remaining_desired,
+        &remaining_saved,
+        attr_type,
+        defs,
+        &context.with_indices(&context.remap_indices(&desired_indices, &saved_indices)),
+    );
+    let pairs =
+        commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates);
+    let mut classified = vec![ListElementPairing::Unmatched; desired.len()];
+    for (i, pairing) in classify_list_element_pairs(&pairs, remaining_saved.len(), &candidates)
+        .into_iter()
+        .enumerate()
+    {
+        classified[desired_indices[i]] = match pairing {
+            ListElementPairing::Unique(index) => ListElementPairing::Unique(saved_indices[index]),
+            other => other,
+        };
+    }
+    for (i, value) in desired.iter().enumerate() {
+        if let Some(index) = exact[i] {
+            // Equal duplicates establish a stable merge pair, but cannot
+            // establish a unique authoring correspondence.
+            classified[i] = if desired
+                .iter()
+                .filter(|item| (*item).borrow() == value.borrow())
+                .count()
+                == 1
+                && saved
+                    .iter()
+                    .filter(|item| (*item).borrow() == value.borrow())
+                    .count()
+                    == 1
+            {
+                ListElementPairing::Unique(index)
+            } else {
+                ListElementPairing::Ambiguous
+            };
+        } else if saved.iter().any(|item| item.borrow() == value.borrow()) {
+            classified[i] = ListElementPairing::Ambiguous;
+        }
+    }
+    classified
 }
 
-fn list_pair_candidates<D, S>(
+/// Reference-bearing list elements need D4 pre-pairing before similarity
+/// probes. Keep ordinary list attribution and its score ordering unchanged.
+fn has_reference_leaves(
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> bool {
+    let mut pending = attr_type.into_iter().collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some(ty) = pending.pop() {
+        if !seen.insert(ty as *const AttributeType) {
+            continue;
+        }
+        match ty.shape_with_defs(defs) {
+            Shape::Reference { .. } => return true,
+            Shape::Struct { .. } => {
+                if let Some(fields) = crate::schema::struct_fields_with_defs(ty, defs) {
+                    pending.extend(fields.iter().map(|field| &field.field_type));
+                }
+            }
+            Shape::List { element_type, .. } => pending.push(element_type),
+            Shape::Map { value, .. } => pending.push(value),
+            Shape::Union => {
+                if let Some(members) = crate::schema::union_members_with_defs(ty, defs) {
+                    pending.extend(members.iter().flatten().map(|member| member.as_attr()));
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn list_pair_candidates<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7665,12 +8428,12 @@ struct PairCandidates {
     implicit_scores: Vec<usize>,
 }
 
-fn pair_candidates_quadratic<D, S>(
+fn pair_candidates_quadratic<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7686,7 +8449,7 @@ where
                 saved_value.borrow(),
                 attr_type,
                 defs,
-                context,
+                &context.at_paths(&context.index_paths(desired_index, saved_index)),
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -7717,12 +8480,12 @@ where
 /// but non-universal bucket can still make the worst case quadratic; the
 /// universal-field compression covers the common policy-statement shape while
 /// preserving exactly the same pairing decisions.
-fn pair_candidates_hashed<D, S>(
+fn pair_candidates_hashed<D, S, R: ReferenceEquality>(
     desired: &[D],
     saved: &[S],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> PairCandidates
 where
     D: Borrow<Value>,
@@ -7763,6 +8526,12 @@ where
     let mut universal_map_fields: HashMap<&str, HashMap<u64, &Value>> = HashMap::new();
     for (key, value_buckets) in &map_field_buckets {
         let field_type = map_entry_subtype(attr_type, key, defs);
+        // Universal-bucket compression must not invent current/current
+        // reference comparisons. Only unmatched cross-side operands are
+        // prepared, and a field absent from desired needs no identity lookup.
+        if has_reference_leaves(field_type, defs) {
+            continue;
+        }
         let Some(representative) = saved.first().and_then(|saved_value| {
             let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
                 return None;
@@ -7774,12 +8543,22 @@ where
         for (value_hash, bucket) in value_buckets {
             if bucket.len() != saved.len()
                 || !bucket.iter().copied().eq(0..saved.len())
-                || !saved.iter().all(|saved_value| {
+                || !saved.iter().enumerate().all(|(index, saved_value)| {
                     let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
                         return false;
                     };
                     map.get(*key).is_some_and(|value| {
-                        schema_aware_equal(representative, value, field_type, defs, context)
+                        schema_aware_equal(
+                            representative,
+                            value,
+                            field_type,
+                            defs,
+                            &context.at_path(
+                                &context
+                                    .at_path(&context.index_path(index))
+                                    .entry_path(key, attr_type, defs),
+                            ),
+                        )
                     })
                 })
             {
@@ -7793,17 +8572,19 @@ where
     }
 
     let mut universal_values = HashMap::new();
-    if let Some(representative) = saved.first().map(Borrow::borrow) {
+    if !has_reference_leaves(attr_type, defs)
+        && let Some(representative) = saved.first().map(Borrow::borrow)
+    {
         for (value_hash, bucket) in &value_buckets {
             if bucket.len() == saved.len()
                 && bucket.iter().copied().eq(0..saved.len())
-                && saved.iter().all(|saved_value| {
+                && saved.iter().enumerate().all(|(index, saved_value)| {
                     schema_aware_equal(
                         representative,
                         saved_value.borrow(),
                         attr_type,
                         defs,
-                        context,
+                        &context.at_path(&context.index_path(index)),
                     )
                 })
             {
@@ -7837,7 +8618,9 @@ where
                                                 representative,
                                                 field_type,
                                                 defs,
-                                                context,
+                                                &context.at_path(
+                                                    &context.entry_path(key, attr_type, defs),
+                                                ),
                                             )
                                         },
                                     )
@@ -7885,7 +8668,7 @@ where
                 saved[saved_index].borrow(),
                 attr_type,
                 defs,
-                context,
+                &context.at_paths(&context.index_paths(desired_index, saved_index)),
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -7901,11 +8684,11 @@ where
     }
 }
 
-fn pairing_hashes(
+fn pairing_hashes<R: ReferenceEquality>(
     value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<u64> {
     let mut hashes = vec![value.canonical_hash()];
     match value {
@@ -7941,11 +8724,11 @@ fn secret_state_pairing_hash() -> u64 {
     pairing_component_hash(0x08, &RedactedSecretHash::V2_MARKER_PREFIX)
 }
 
-fn append_schema_pairing_hashes(
+fn append_schema_pairing_hashes<R: ReferenceEquality>(
     value: &Value,
     attr_type: &AttributeType,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
     hashes: &mut Vec<u64>,
     depth: usize,
 ) {
@@ -7955,6 +8738,10 @@ fn append_schema_pairing_hashes(
     }
     match attr_type.shape_with_defs(defs) {
         Shape::UnloadedSchemaType(_) => {}
+        Shape::Reference { .. } => {
+            // Resolved equality must also be considered by multiset pairing.
+            hashes.push(pairing_component_hash(0x09, &0_u8));
+        }
         Shape::String {
             identity, to_dsl, ..
         } => {
@@ -7999,7 +8786,11 @@ fn append_schema_pairing_hashes(
                 ));
             }
         }
-        Shape::List { ordered, .. } => {
+        Shape::List {
+            ordered,
+            element_type: _element_type,
+            constraints: _constraints,
+        } => {
             if let Value::Concrete(ConcreteValue::List(items)) = value {
                 hashes.push(pairing_component_hash(0x03, &(ordered, items.len())));
             }
@@ -8059,14 +8850,14 @@ fn pairing_component_hash<T: Hash>(tag: u8, value: &T) -> u64 {
 
 /// Merge two lists using projected saved values for value pairing and raw saved values to
 /// corroborate stored-index authoring attribution.
-fn merge_lists(
+fn merge_lists<R: ReferenceEquality>(
     desired: &[Value],
     projected_saved: &[Value],
     raw_saved: &[Value],
     prior_explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> Vec<Value> {
     // `WholeValue` is the explicit whole-value fallback used when a carried row
     // cannot transfer a pending nested removal to a uniquely identified list
@@ -8086,7 +8877,10 @@ fn merge_lists(
 
     let item_type = list_element_type(attr_type, defs);
     let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs, context);
-    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, context);
+    let raw_paths = context.raw_saved_paths();
+    let raw_context = context.raw_saved_pair();
+    let raw_context = raw_context.at_paths(&raw_paths);
+    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, &raw_context);
     let projected_origins = if projected_saved.len() == raw_saved.len() {
         // Projection preserves order when it retains every stored element.
         // Keeping the direct index mapping also preserves the established
@@ -8095,7 +8889,15 @@ fn merge_lists(
             .map(ListElementPairing::Unique)
             .collect()
     } else {
-        pair_list_elements_with_uniqueness(projected_saved, raw_saved, item_type, defs, context)
+        let saved_paths = [context.right_path().into(), raw_paths[1].clone()];
+        let saved_context = context.saved_pair();
+        pair_list_elements_with_uniqueness(
+            projected_saved,
+            raw_saved,
+            item_type,
+            defs,
+            &saved_context.at_paths(&saved_paths),
+        )
     };
 
     projected_pairs
@@ -8136,7 +8938,7 @@ fn merge_lists(
                         authoring,
                         item_type,
                         defs,
-                        context,
+                        &context.at_paths(&context.index_paths(desired_index, projected_index)),
                     )
                 }
                 None => desired[desired_index].clone(),
@@ -8149,12 +8951,12 @@ fn merge_lists(
 /// For Maps: count matching key-value pairs.
 /// For equal scalars: return 1.
 /// Otherwise: return 0.
-fn similarity_score(
+fn similarity_score<R: ReferenceEquality>(
     a: &Value,
     b: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ComparisonContext<'_, R>,
 ) -> usize {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am
@@ -8167,7 +8969,7 @@ fn similarity_score(
                             bv,
                             map_entry_subtype(attr_type, k, defs),
                             defs,
-                            context,
+                            &context.at_paths(&context.entry_paths(k, attr_type, defs)),
                         )
                     })
                     .unwrap_or(false)
@@ -8215,6 +9017,19 @@ pub enum ProviderDirectiveSchema<'a> {
     Unavailable,
 }
 
+impl<'a> ProviderDirectiveSchema<'a> {
+    pub(crate) fn for_id(
+        schemas: &'a crate::schema::SchemaRegistry,
+        id: &ResourceId,
+        kind: crate::schema::SchemaKind,
+    ) -> Self {
+        match schemas.get(&id.provider, &id.resource_type, kind) {
+            Some(schema) => Self::Available(schema.schema().as_schema()),
+            None => Self::Unavailable,
+        }
+    }
+}
+
 impl PreventDestroyResolution {
     /// Return the protection provenance, or `None` when destruction is allowed.
     pub fn source(self) -> Option<PreventDestroySource> {
@@ -8252,28 +9067,32 @@ impl PreventDestroy {
 
 /// Carina-side directives for a resource.
 ///
+/// The default value phase contains only resolved lifecycle settings.
+/// [`AuthoredDirectives`] instead retains expressions until resource values
+/// cross the expansion boundary; it cannot be passed to runtime consumers.
+///
 /// These are instructions to Carina about how to handle the resource,
 /// not metadata about the resource itself. The provider-visible subset
 /// mirrors the WIT `directives` record; host-only fields remain outside it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "B: Serialize", deserialize = "B: Deserialize<'de>"))]
-pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
+#[serde(bound(
+    serialize = "B: Serialize, P: SerializableDirectivePhase<B>, P::DirectiveBool<B>: Serialize, P::DirectivePreventDestroy<B>: Serialize",
+    deserialize = "B: Deserialize<'de>, P: SerializableDirectivePhase<B>, P::DirectiveBool<B>: Deserialize<'de>, P::DirectivePreventDestroy<B>: Deserialize<'de>"
+))]
+pub struct Directives<
+    B: BindingAddress = AbsoluteBindingAddress,
+    P: PlaceholderKind = NoPlaceholder,
+> {
     /// If true, force-delete the resource (e.g., non-empty S3 buckets)
     #[serde(default)]
-    pub force_delete: bool,
+    pub force_delete: P::DirectiveBool<B>,
     /// If true, create the new resource before destroying the old one during replacement
     #[serde(default)]
-    pub create_before_destroy: bool,
+    pub create_before_destroy: P::DirectiveBool<B>,
     /// Authored destruction-protection setting. Private so effective policy
     /// can only be obtained through [`PreventDestroy::resolve`].
     #[serde(default)]
-    prevent_destroy: PreventDestroy,
-    /// Explicit ordering edges declared by the user. Each element is the
-    /// binding name of a sibling `let` (resource / wait / module).
-    /// Set semantics (deduplicated, order-insensitive); represented as
-    /// Vec to preserve source order for `carina fmt` round-tripping.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<B>,
+    prevent_destroy: P::DirectivePreventDestroy<B>,
     /// Parser-only source locations aligned with `depends_on`. This is skipped
     /// by serde and ignored by equality; programmatic callers should leave it
     /// at its default value.
@@ -8291,81 +9110,61 @@ pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
     pub provider_instance: Option<String>,
 }
 
-pub type AuthoredDirectives = Directives<RelativeBindingName>;
+/// Authored settings carry expressions, so consumers cannot read them as
+/// booleans or pass them to a provider before resolution.
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::AuthoredResource;
+/// fn force_delete(resource: &AuthoredResource) -> bool {
+///     resource.directives.force_delete
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::{AuthoredResource, ProviderDirectiveSchema};
+/// use carina_core::provider::ProviderDirectives;
+/// fn provider_directives(resource: &AuthoredResource) {
+///     ProviderDirectives::resolve(&resource.directives, ProviderDirectiveSchema::Unavailable);
+/// }
+/// ```
+pub type AuthoredDirectives<B = RelativeBindingName> = Directives<B, ParserPlaceholder>;
 pub type ExpandedDirectives = Directives<AbsoluteBindingAddress>;
 
-impl<B: BindingAddress> Directives<B> {
-    /// Move every directive field across a binding-address phase boundary.
-    ///
-    /// Callers resolve the public dependency addresses, while this defining
-    /// module alone carries the private authored destruction setting into the
-    /// new phase.
-    pub(crate) fn with_resolved_depends_on<C: BindingAddress>(
-        self,
-        depends_on: Vec<C>,
-    ) -> Directives<C> {
-        let Self {
-            force_delete,
-            create_before_destroy,
-            prevent_destroy,
-            depends_on: _depends_on,
-            depends_on_diagnostic_sources,
-            ignore_changes,
-            provider_instance,
-        } = self;
-        Directives {
-            force_delete,
-            create_before_destroy,
-            prevent_destroy,
-            depends_on,
-            depends_on_diagnostic_sources,
-            ignore_changes,
-            provider_instance,
-        }
-    }
-}
-
-impl Directives<RelativeBindingName> {
+impl<P: PlaceholderKind> Directives<RelativeBindingName, P> {
     fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> Directives<AbsoluteBindingAddress> {
-        let depends_on = self.depends_on.iter().cloned().map(resolve).collect();
-        self.with_resolved_depends_on(depends_on)
+    ) -> Directives<AbsoluteBindingAddress, P> {
+        P::rebind_directives(self, resolve)
     }
 }
 
-impl Directives<AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> Directives<AbsoluteBindingAddress, P> {
     pub(crate) fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
-        let Self {
-            force_delete: _force_delete,
-            create_before_destroy: _create_before_destroy,
-            prevent_destroy: _prevent_destroy,
-            depends_on,
-            depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
-            ignore_changes: _ignore_changes,
-            provider_instance: _provider_instance,
-        } = self;
-        for binding in depends_on {
-            *binding = map(binding);
-        }
+        P::map_absolute_directive_values(self, map);
     }
 }
 
-impl<B: BindingAddress> Default for Directives<B> {
+impl<B: BindingAddress, P: PlaceholderKind> Default for Directives<B, P> {
     fn default() -> Self {
         Self {
-            force_delete: false,
-            create_before_destroy: false,
-            prevent_destroy: PreventDestroy::default(),
-            depends_on: Vec::new(),
+            force_delete: Default::default(),
+            create_before_destroy: Default::default(),
+            prevent_destroy: Default::default(),
             depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
             ignore_changes: Vec::new(),
             provider_instance: None,
         }
+    }
+}
+
+impl<B: BindingAddress, P: PlaceholderKind> Directives<B, P> {
+    pub fn with_provider_instance(mut self, provider_instance: impl Into<String>) -> Self {
+        self.provider_instance = Some(provider_instance.into());
+        self
     }
 }
 
@@ -8382,8 +9181,12 @@ pub struct PersistedDirectives {
     pub create_before_destroy: bool,
     #[serde(default)]
     prevent_destroy: PreventDestroy,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<AbsoluteBindingAddress>,
+    #[serde(
+        default,
+        skip_serializing_if = "PersistedDestroyDependencies::is_empty",
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    pub depends_on: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_instance: Option<String>,
 }
@@ -8429,7 +9232,10 @@ impl Display for PersistedDirectiveField {
 enum PersistedDirectiveFieldValue {
     Boolean(bool),
     PreventDestroy(PreventDestroy),
-    DependsOn(BTreeSet<AbsoluteBindingAddress>),
+    DependsOn(
+        #[serde(deserialize_with = "deserialize_persisted_destroy_dependencies")]
+        PersistedDestroyDependencies,
+    ),
     ProviderInstance(Option<String>),
 }
 
@@ -8438,7 +9244,7 @@ impl PersistedDirectiveFieldValue {
         match self {
             Self::Boolean(value) => value.to_string(),
             Self::PreventDestroy(value) => prevent_destroy_label(*value).to_string(),
-            Self::DependsOn(bindings) => bindings_label(bindings),
+            Self::DependsOn(dependencies) => dependencies_label(dependencies),
             Self::ProviderInstance(provider_instance) => {
                 provider_instance_label(provider_instance.as_deref())
             }
@@ -8468,7 +9274,10 @@ impl PersistedDirectiveFieldChange {
     }
 }
 
-impl<B: BindingAddress> Directives<B> {
+impl<B: BindingAddress, P> Directives<B, P>
+where
+    P: PlaceholderKind<DirectiveBool<B> = bool, DirectivePreventDestroy<B> = PreventDestroy>,
+{
     pub fn with_force_delete(mut self, value: bool) -> Self {
         self.force_delete = value;
         self
@@ -8476,16 +9285,6 @@ impl<B: BindingAddress> Directives<B> {
 
     pub fn with_create_before_destroy(mut self, value: bool) -> Self {
         self.create_before_destroy = value;
-        self
-    }
-
-    pub fn with_depends_on(mut self, depends_on: Vec<B>) -> Self {
-        self.depends_on = depends_on;
-        self
-    }
-
-    pub fn with_provider_instance(mut self, provider_instance: impl Into<String>) -> Self {
-        self.provider_instance = Some(provider_instance.into());
         self
     }
 
@@ -8513,8 +9312,11 @@ impl PersistedDirectives {
     /// Project a desired resource into the exact directive shape written to
     /// state. Provider routing falls back to the resolved resource ID when the
     /// authored directive uses the provider kind's default instance.
-    pub fn desired_for<S>(resource: &Resource<S>) -> Self {
-        let mut desired = Self::from(&resource.directives);
+    pub fn desired_for<S>(resource: &ResolvedResource<S>) -> Self {
+        let mut desired = Self::from_resolved(
+            &resource.directives,
+            resource.persisted_explicit_destroy_dependencies().clone(),
+        );
         if desired.provider_instance.is_none() {
             desired.provider_instance = resource.id.provider_instance.clone();
         }
@@ -8566,13 +9368,11 @@ impl PersistedDirectives {
             });
         }
 
-        let current_depends_on = current_depends_on.iter().cloned().collect::<BTreeSet<_>>();
-        let desired_depends_on = desired_depends_on.iter().cloned().collect::<BTreeSet<_>>();
         if current_depends_on != desired_depends_on {
             fields.push(PersistedDirectiveFieldChange {
                 name: PersistedDirectiveField::DependsOn,
-                from: PersistedDirectiveFieldValue::DependsOn(current_depends_on),
-                to: PersistedDirectiveFieldValue::DependsOn(desired_depends_on),
+                from: PersistedDirectiveFieldValue::DependsOn(current_depends_on.clone()),
+                to: PersistedDirectiveFieldValue::DependsOn(desired_depends_on.clone()),
             });
         }
         if current_provider_instance != desired_provider_instance {
@@ -8619,12 +9419,12 @@ fn prevent_destroy_label(value: PreventDestroy) -> &'static str {
     }
 }
 
-fn bindings_label(bindings: &BTreeSet<AbsoluteBindingAddress>) -> String {
+fn dependencies_label(dependencies: &PersistedDestroyDependencies) -> String {
     format!(
         "[{}]",
-        bindings
+        dependencies
             .iter()
-            .map(AbsoluteBindingAddress::as_str)
+            .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -8634,13 +9434,15 @@ fn provider_instance_label(provider_instance: Option<&str>) -> String {
     provider_instance.unwrap_or("unspecified").to_string()
 }
 
-impl From<&ExpandedDirectives> for PersistedDirectives {
-    fn from(directives: &ExpandedDirectives) -> Self {
+impl PersistedDirectives {
+    pub fn from_resolved(
+        directives: &Directives,
+        depends_on: PersistedDestroyDependencies,
+    ) -> Self {
         let Directives {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on,
             depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
             ignore_changes: _ignore_changes,
             provider_instance,
@@ -8649,54 +9451,35 @@ impl From<&ExpandedDirectives> for PersistedDirectives {
             force_delete: *force_delete,
             create_before_destroy: *create_before_destroy,
             prevent_destroy: *prevent_destroy,
-            depends_on: depends_on.clone(),
+            depends_on,
             provider_instance: provider_instance.clone(),
         }
     }
 }
 
-impl From<ExpandedDirectives> for PersistedDirectives {
-    fn from(directives: ExpandedDirectives) -> Self {
-        Self::from(&directives)
-    }
-}
-
-impl From<&PersistedDirectives> for ExpandedDirectives {
+impl From<&PersistedDirectives> for Directives {
     fn from(directives: &PersistedDirectives) -> Self {
         let PersistedDirectives {
             force_delete,
             create_before_destroy,
             prevent_destroy,
-            depends_on,
+            depends_on: _depends_on,
             provider_instance,
         } = directives;
         Self {
             force_delete: *force_delete,
             create_before_destroy: *create_before_destroy,
             prevent_destroy: *prevent_destroy,
-            depends_on: depends_on.clone(),
-            depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
+            depends_on_diagnostic_sources: Default::default(),
             ignore_changes: Vec::new(),
             provider_instance: provider_instance.clone(),
         }
     }
 }
 
-impl From<PersistedDirectives> for ExpandedDirectives {
+impl From<PersistedDirectives> for Directives {
     fn from(directives: PersistedDirectives) -> Self {
         Self::from(&directives)
-    }
-}
-
-impl PartialEq<ExpandedDirectives> for PersistedDirectives {
-    fn eq(&self, other: &ExpandedDirectives) -> bool {
-        self == &Self::from(other)
-    }
-}
-
-impl PartialEq<PersistedDirectives> for ExpandedDirectives {
-    fn eq(&self, other: &PersistedDirectives) -> bool {
-        other == self
     }
 }
 
@@ -9092,13 +9875,14 @@ impl DefaultTagKeys {
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize",
-    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
+    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize, D: Serialize, Directives<B, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>, D: Deserialize<'de>, Directives<B, P>: Deserialize<'de>"
 ))]
 pub struct Resource<
     S = ModuleSource,
     P: PlaceholderKind = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
+    D = UnexpandedDependencyFields<B>,
 > {
     pub id: ResourceId,
     /// Source-order preserving map of attribute name → expression.
@@ -9111,8 +9895,8 @@ pub struct Resource<
     /// `directives` meta-argument block: Carina-side instructions for
     /// how to handle this resource (force-delete, create-before-destroy,
     /// prevent-destroy).
-    #[serde(default = "Directives::<B>::default")]
-    pub directives: Directives<B>,
+    #[serde(default = "Directives::<B, P>::default")]
+    pub directives: Directives<B, P>,
     /// Schema-resolved host lifecycle metadata. Persisted resources carry only
     /// the authored directive; every saved-plan load resolves it again after
     /// checking the provider schema fingerprint.
@@ -9131,8 +9915,7 @@ pub struct Resource<
     /// in the resource's attributes contributes a single entry, and
     /// iteration is alphabetically sorted so consumers (plan display,
     /// state files) see a deterministic order. See #2228.
-    #[serde(default)]
-    pub dependency_bindings: BTreeSet<B>,
+    pub dependencies: D,
     /// Module source info for resources that belong to a module
     #[serde(default)]
     pub module_source: Option<S>,
@@ -9172,7 +9955,7 @@ pub struct Resource<
 ///
 /// It has the same wire fields as [`Resource`], but its module provenance is
 /// display-only [`SavedModuleSource`] metadata rather than a live call path.
-pub type SavedResource = Resource<SavedModuleSource>;
+pub type SavedResource = Resource<SavedModuleSource, NoPlaceholder, AbsoluteBindingAddress, ()>;
 
 /// Parser/module-definition form before scope expansion.
 pub type AuthoredResource<S = ModuleSource> = Resource<S, ParserPlaceholder, RelativeBindingName>;
@@ -9207,7 +9990,7 @@ impl<S, P: PlaceholderKind> Resource<S, P, RelativeBindingName> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -9223,7 +10006,7 @@ impl<S, P: PlaceholderKind> Resource<S, P, RelativeBindingName> {
             resolved_ignore_changes,
             prefixes,
             binding: binding.map(&mut *resolve),
-            dependency_bindings: dependency_bindings.into_iter().map(resolve).collect(),
+            dependencies: dependencies.resolve_bindings(resolve),
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -9237,7 +10020,7 @@ impl<S, P: PlaceholderKind> Resource<S, P, RelativeBindingName> {
     }
 
     pub fn with_dependency_bindings(mut self, deps: BTreeSet<String>) -> Self {
-        self.dependency_bindings = deps.into_iter().map(RelativeBindingName::new).collect();
+        self.dependencies.value_bindings = deps.into_iter().map(RelativeBindingName::new).collect();
         self
     }
 }
@@ -9254,7 +10037,7 @@ impl<P: PlaceholderKind> Resource<ModuleSource, P, AbsoluteBindingAddress> {
             resolved_ignore_changes: _resolved_ignore_changes,
             prefixes: _prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
@@ -9267,10 +10050,7 @@ impl<P: PlaceholderKind> Resource<ModuleSource, P, AbsoluteBindingAddress> {
         if let Some(binding) = binding {
             *binding = map(binding);
         }
-        *dependency_bindings = std::mem::take(dependency_bindings)
-            .into_iter()
-            .map(|binding| map(&binding))
-            .collect();
+        dependencies.map_absolute_bindings(map);
         if let Some(source) = module_source {
             source.map_absolute_bindings(map);
         }
@@ -9279,18 +10059,21 @@ impl<P: PlaceholderKind> Resource<ModuleSource, P, AbsoluteBindingAddress> {
 
 /// Source-neutral resource payload exposed to provider normalizers and CRUD
 /// request construction.
-pub type ProviderResource = Resource<ProviderModuleSource>;
+pub type ProviderResource =
+    Resource<ProviderModuleSource, NoPlaceholder, AbsoluteBindingAddress, ()>;
 
-impl From<Resource> for ProviderResource {
-    fn from(resource: Resource) -> Self {
+impl<D> From<Resource<ModuleSource, NoPlaceholder, AbsoluteBindingAddress, D>>
+    for ProviderResource
+{
+    fn from(resource: Resource<ModuleSource, NoPlaceholder, AbsoluteBindingAddress, D>) -> Self {
         resource.into_provider_resource()
     }
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> From<Resource<ModuleSource, P, B>>
-    for Resource<SavedModuleSource, P, B>
+impl<P: PlaceholderKind, B: BindingAddress, D> From<Resource<ModuleSource, P, B, D>>
+    for Resource<SavedModuleSource, P, B, D>
 {
-    fn from(resource: Resource<ModuleSource, P, B>) -> Self {
+    fn from(resource: Resource<ModuleSource, P, B, D>) -> Self {
         let Resource {
             id,
             attributes,
@@ -9298,7 +10081,7 @@ impl<P: PlaceholderKind, B: BindingAddress> From<Resource<ModuleSource, P, B>>
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -9311,7 +10094,7 @@ impl<P: PlaceholderKind, B: BindingAddress> From<Resource<ModuleSource, P, B>>
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source: module_source.as_ref().map(SavedModuleSource::from),
             default_tag_keys,
             loop_provenance,
@@ -9320,8 +10103,11 @@ impl<P: PlaceholderKind, B: BindingAddress> From<Resource<ModuleSource, P, B>>
     }
 }
 
-impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
-    pub fn into_expanded(self) -> Result<Resource<S, NoPlaceholder, B>, LeftoverPlaceholder> {
+impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
+    pub fn into_expanded(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<Resource<S, NoPlaceholder, B, D>, ExpansionError> {
         let Resource {
             id,
             attributes,
@@ -9329,12 +10115,16 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
         } = self;
+        let directives = directives.resolve(
+            &id,
+            ProviderDirectiveSchema::for_id(schemas, &id, crate::schema::SchemaKind::Resource),
+        )?;
         let attributes = into_expanded_value_map(attributes, Some(&id))?;
         Ok(Resource {
             id,
@@ -9343,7 +10133,7 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -9352,10 +10142,12 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
     }
 }
 
-impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
+impl<S, B: BindingAddress, D> Resource<S, ParserPlaceholder, B, D> {
     pub(crate) fn into_loop_template(
         self,
-    ) -> Result<Resource<S, LoopSlot, B>, LeftoverPlaceholder> {
+        schemas: &crate::schema::SchemaRegistry,
+        element_type: Option<&crate::parser::TypeExpr>,
+    ) -> Result<Resource<S, LoopSlot, B, D>, ExpansionError> {
         let Resource {
             id,
             attributes,
@@ -9363,12 +10155,17 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
             quoted_string_attrs,
         } = self;
+        let directives = directives.into_loop_template(
+            &id,
+            ProviderDirectiveSchema::for_id(schemas, &id, crate::schema::SchemaKind::Resource),
+            element_type,
+        )?;
         let resource_id = id.to_string();
         Ok(Resource {
             id,
@@ -9380,12 +10177,12 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
                         .map(|value| (name.clone(), value))
                         .map_err(|error| error.in_resource_attribute(resource_id.clone(), name))
                 })
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<_, LeftoverPlaceholder>>()?,
             directives,
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies,
             module_source,
             default_tag_keys,
             loop_provenance,
@@ -9403,7 +10200,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             resolved_ignore_changes: ResolvedIgnoreChanges::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependencies: UnexpandedDependencyFields::default(),
             module_source: None,
             default_tag_keys: DefaultTagKeys::default(),
             loop_provenance: LoopProvenance::default(),
@@ -9456,7 +10253,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Resource<ModuleSource, P, B> {
     }
 }
 
-impl<S: Clone, P: PlaceholderKind, B: BindingAddress> Resource<S, P, B> {
+impl<S: Clone, P: PlaceholderKind, B: BindingAddress, D: Clone> Resource<S, P, B, D> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut resource = self.clone();
         resource.id = self.id.instantiate_pending();
@@ -9470,7 +10267,7 @@ impl<S: Clone, P: PlaceholderKind, B: BindingAddress> Resource<S, P, B> {
     }
 }
 
-impl<S> Resource<S> {
+impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
     /// Whether any value-bearing field contains a saved-plan secret marker.
     ///
     /// The exhaustive destructure keeps this security boundary compiler-checked
@@ -9483,7 +10280,7 @@ impl<S> Resource<S> {
             resolved_ignore_changes: _resolved_ignore_changes,
             prefixes: _prefixes,
             binding: _binding,
-            dependency_bindings: _dependency_bindings,
+            dependencies: _dependency_bindings,
             module_source: _module_source,
             default_tag_keys: _default_tag_keys,
             loop_provenance: _loop_provenance,
@@ -9503,7 +10300,7 @@ impl<S> Resource<S> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies: _,
             module_source: _,
             default_tag_keys,
             loop_provenance: _,
@@ -9516,7 +10313,7 @@ impl<S> Resource<S> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies: (),
             module_source: None,
             default_tag_keys,
             loop_provenance: LoopProvenance::default(),
@@ -9536,25 +10333,22 @@ impl<S> Resource<S> {
             resolved_ignore_changes,
             prefixes,
             binding,
-            dependency_bindings,
+            dependencies: (),
             module_source: _,
             default_tag_keys,
             loop_provenance: _,
             quoted_string_attrs,
         } = provider;
-        *self = Self {
-            id,
-            attributes,
-            directives,
-            resolved_ignore_changes,
-            prefixes,
-            binding,
-            dependency_bindings,
-            module_source,
-            default_tag_keys,
-            loop_provenance,
-            quoted_string_attrs,
-        };
+        self.id = id;
+        self.attributes = attributes;
+        self.directives = directives;
+        self.resolved_ignore_changes = resolved_ignore_changes;
+        self.prefixes = prefixes;
+        self.binding = binding;
+        self.module_source = module_source;
+        self.default_tag_keys = default_tag_keys;
+        self.loop_provenance = loop_provenance;
+        self.quoted_string_attrs = quoted_string_attrs;
     }
 
     /// Returns the attributes projected to a `HashMap<String, Value>`.
@@ -9618,7 +10412,7 @@ impl<S> Resource<S> {
     }
 }
 
-impl<S, P: PlaceholderKind, B: BindingAddress> Resource<S, P, B> {
+impl<S, P: PlaceholderKind, B: BindingAddress, D> Resource<S, P, B, D> {
     /// Returns the attributes projected to a `HashMap`.
     pub fn resolved_attributes(&self) -> HashMap<String, Value<P, B>> {
         self.attributes
@@ -9660,19 +10454,21 @@ impl<S, P: PlaceholderKind> Resource<S, P, AbsoluteBindingAddress> {
         mut self,
         deps: BTreeSet<AbsoluteBindingAddress>,
     ) -> Self {
-        self.dependency_bindings = deps;
+        self.dependencies.value_bindings = deps;
         self
     }
 }
 
 #[cfg(test)]
-impl<S> Resource<S> {
-    pub fn with_root_binding(self, binding: impl Into<String>) -> Self {
-        self.with_absolute_binding(
-            RootScope::new().resolve(RelativeBindingName::new(binding.into())),
-        )
+impl<S, D> Resource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
+    pub fn with_root_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(RootScope::new().resolve(RelativeBindingName::new(binding.into())));
+        self
     }
+}
 
+#[cfg(test)]
+impl<S> Resource<S, NoPlaceholder, AbsoluteBindingAddress> {
     pub fn with_root_dependency_bindings(self, deps: BTreeSet<String>) -> Self {
         let root = RootScope::new();
         self.with_absolute_dependency_bindings(
@@ -9687,6 +10483,55 @@ impl Resource {
     pub fn with_module_source(mut self, source: ModuleSource) -> Self {
         self.module_source = Some(source);
         self
+    }
+}
+
+impl<S, P: PlaceholderKind, B: BindingAddress, D> Resource<S, P, B, D> {
+    /// Retain the value and provenance view used for saved-plan origins.
+    /// Dependency metadata is owned separately by the graph-resolved payload.
+    pub fn into_value_snapshot(self) -> Resource<S, P, B, ()> {
+        self.with_dependency_phase(())
+    }
+
+    pub(crate) fn with_dependency_phase<E>(self, dependencies: E) -> Resource<S, P, B, E> {
+        let Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependencies: _,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        } = self;
+        Resource {
+            id,
+            attributes,
+            directives,
+            resolved_ignore_changes,
+            prefixes,
+            binding,
+            dependencies,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            quoted_string_attrs,
+        }
+    }
+}
+#[cfg(any(test, feature = "test-utils", feature = "test-support"))]
+impl<S, P: PlaceholderKind, B: BindingAddress> Resource<S, P, B> {
+    pub fn into_resolved_dependency_phase_for_test(self) -> Resource<S, P, B, ()> {
+        self.with_dependency_phase(())
+    }
+}
+#[cfg(test)]
+impl<S> Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
+    pub(crate) fn into_unexpanded_for_test(self) -> Resource<S> {
+        self.with_dependency_phase(Default::default())
     }
 }
 
@@ -10482,8 +11327,8 @@ mod enum_attr_tests {
 
 /// Check that a resource's attribute tree is free of provider-ineligible
 /// [`Value::Deferred`] payloads before provider dispatch.
-pub(crate) fn assert_resource_fully_resolved<S>(
-    resource: &Resource<S>,
+pub(crate) fn assert_resource_fully_resolved<S, D>(
+    resource: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
 ) -> Result<(), crate::value::SerializationError> {
     for value in resource.attributes.values() {
         assert_value_fully_resolved(value)?;
@@ -10861,10 +11706,7 @@ impl Current {
         }
     }
 
-    pub fn set_dependency_bindings(
-        &mut self,
-        dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
-    ) {
+    pub fn set_dependency_bindings(&mut self, dependency_bindings: PersistedDestroyDependencies) {
         match self {
             Self::Absent(state) => state.0.dependency_bindings = dependency_bindings,
             Self::Present(present) => {
@@ -10983,6 +11825,22 @@ impl UnschematizedComparisonAttributes {
 }
 
 impl CanonicalComparisonAttributes {
+    /// Secret-grafted apply views retain the authored hash material even when
+    /// provider normalization changed a secret's structural representation.
+    pub(crate) fn canonicalize_preserving_secret_shapes(
+        mut attributes: HashMap<String, Value>,
+        schema: &crate::schema::CompiledResourceSchema,
+    ) -> Self {
+        let secrets = attributes
+            .iter()
+            .filter(|(_, value)| crate::value::contains_secret(value))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
+        attributes.extend(secrets);
+        Self { attributes }
+    }
+
     /// Build the state-style canonical comparison view for one resource.
     pub fn canonicalize(
         mut attributes: HashMap<String, Value>,
@@ -11017,20 +11875,6 @@ impl CanonicalComparisonAttributes {
     pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
         self.attributes.get_mut(key)
     }
-
-    pub(crate) fn with_missing_values_from(
-        &self,
-        fallback: &Self,
-        mut include: impl FnMut(&str, &Value) -> bool,
-    ) -> Self {
-        let mut combined = self.clone();
-        for (key, value) in fallback {
-            if !combined.contains_key(key) && include(key, value) {
-                combined.attributes.insert(key.clone(), value.clone());
-            }
-        }
-        combined
-    }
 }
 
 impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
@@ -11052,6 +11896,21 @@ impl IntoIterator for CanonicalComparisonAttributes {
 }
 
 impl<'a> PlanInputDesired<'a> {
+    /// All planning callers use this sole ignore-mask constructor.
+    pub(crate) fn masked_comparison(
+        &self,
+        current: &CanonicalComparisonAttributes,
+        saved: Option<&CanonicalComparisonAttributes>,
+        schema: Option<&crate::schema::CompiledResourceSchema>,
+    ) -> MaskedComparisonAttributes {
+        self.authored.ignore_changes().mask_comparison_attributes(
+            &self.comparison_attributes,
+            current,
+            saved,
+            schema,
+        )
+    }
+
     pub fn authored(&self) -> &'a ResolvedResource {
         self.authored
     }
@@ -11114,10 +11973,10 @@ pub fn plan_input_desired_resources<'a>(
     }
 }
 
-pub fn into_plan_input_current_map<S>(
+pub fn into_plan_input_current_map<S, D>(
     mut current: HashMap<ResourceId, Current>,
     schemas: &crate::schema::SchemaRegistry,
-    resources: &[Resource<S>],
+    resources: &[Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>],
 ) -> HashMap<ResourceId, PlanInputCurrent> {
     crate::value::canonicalize_states_with_schemas(&mut current, schemas);
     crate::utils::lift_current_state_enum_leaves(&mut current, resources, schemas);
@@ -11139,10 +11998,10 @@ pub fn into_plan_input_current_map<S>(
 /// Borrowing counterpart used when a caller layers configured and orphan
 /// state. Each current value is cloned once into the canonicalized plan-input
 /// map; the source maps and resource graph are never deep-cloned first.
-pub fn plan_input_current_map_from_refs<'a, S: 'a>(
+pub fn plan_input_current_map_from_refs<'a, S: 'a, D: 'a>(
     current: impl IntoIterator<Item = (&'a ResourceId, &'a Current)>,
     schemas: &crate::schema::SchemaRegistry,
-    resources: impl IntoIterator<Item = &'a Resource<S>>,
+    resources: impl IntoIterator<Item = &'a Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>,
 ) -> HashMap<ResourceId, PlanInputCurrent> {
     let mut current = current
         .into_iter()
@@ -11204,7 +12063,8 @@ pub struct State {
     /// Used by the executor to determine delete ordering during replace operations.
     ///
     /// Set semantics (BTreeSet) — see Resource::dependency_bindings (#2228).
-    pub dependency_bindings: BTreeSet<AbsoluteBindingAddress>,
+    #[serde(deserialize_with = "deserialize_persisted_destroy_dependencies")]
+    pub dependency_bindings: PersistedDestroyDependencies,
     /// Present when this state came from a partial-success create.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_read: Option<PartialReadMarker>,
@@ -11217,7 +12077,7 @@ impl State {
             identifier: None,
             attributes: HashMap::new(),
             exists: false,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,
         }
     }
@@ -11228,7 +12088,7 @@ impl State {
             identifier: None,
             attributes,
             exists: true,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,
         }
     }
@@ -11238,19 +12098,9 @@ impl State {
         self
     }
 
-    pub fn with_dependency_bindings(mut self, deps: BTreeSet<AbsoluteBindingAddress>) -> Self {
+    pub fn with_dependency_bindings(mut self, deps: PersistedDestroyDependencies) -> Self {
         self.dependency_bindings = deps;
         self
-    }
-
-    #[cfg(test)]
-    pub fn with_root_dependency_bindings(self, deps: BTreeSet<String>) -> Self {
-        let root = RootScope::new();
-        self.with_dependency_bindings(
-            deps.into_iter()
-                .map(|binding| root.resolve(RelativeBindingName::new(binding)))
-                .collect(),
-        )
     }
 
     /// Reconstruct plan-time unknowns from the partial-read marker.

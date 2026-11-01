@@ -1,20 +1,123 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **16**.
+The current protocol and minimum supported provider protocol are both **19**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 19 | 19 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
+| 18 | 18 | Typed reference schema leaves and batched plan-time reference resolution. |
+| 17 | 17 | Required list element policy; portable canonical-value uniqueness validation. |
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
+## Version 19
+
+Protocol v19 replaces top-level deferred-name metadata with structural desired
+value trees. `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both
+19; providers built for earlier protocols must be rebuilt.
+
+`normalize-desired` receives and returns `list<desired-resource>`. Each record
+has an `id` and `attributes: list<tuple<string, desired-value>>`. The separate
+`desired-value` WIT variant contains scalars, JSON-backed lists/maps, and
+`deferred-val(u32)`. Ordinary `value` and `persisted-value` have no handle arm.
+Concrete containers stay visible even when they contain opaque leaves, so a
+normalizer can canonicalize known SANs and remove a known apex, add defaults
+inside known replication rules, or trim a known alias DNS name beside a secret
+or reference.
+
+The host replaces every deferred core leaf with a per-call slot number. This
+includes secrets, resource references, unknowns and other unresolved
+expressions. A secret wrapping a complete container remains one opaque leaf;
+its inner values are never exposed. Providers cannot inspect or fabricate
+leaves through the SDK view. Every issued slot must occur **exactly once** in
+the result, in its original resource and top-level attribute. Reordering within
+that attribute is allowed; dropping, duplicating, inventing or moving a handle
+across resources or attributes is an error. Resources correspond by list
+position, including pending or duplicate ids. The returned count must match, and
+each returned id must equal the id sent at that position.
+
+Within normalization `list-val`/`map-val` JSON, a handle is the singleton object
+`{"$carina_deferred": 0}` with an unsigned 32-bit slot. User object keys beginning
+with `$` gain one leading `$`: a literal `$carina_deferred` key is transported as
+`$$carina_deferred`. The decoder unescapes user keys once and does not reinterpret
+the resulting literal map as a handle. Duplicate object/attribute keys and
+malformed handle objects are rejected rather than silently collapsed.
+
+This escaping and handle interpretation apply **only** to desired normalization
+input/output. CRUD, configuration and persisted-state payloads/decoders remain
+unchanged. Create/update still receive actual secret values: top-level secrets
+use ordinary `secret-val`, and nested secrets use their operational JSON values.
+The ordinary protocol value type cannot contain a normalization handle.
+
+The host validates and decodes the entire result before writing any changes.
+It restores original deferred values at their returned positions and preserves
+resource identity and host metadata. Unchanged known leaves keep their original
+core scalar metadata at the same path, reserving those originals before any
+other matches. A moved leaf may reuse an unclaimed equal wire projection within
+its top-level attribute only when the paths have the same keys in the same
+positions; list index values may differ. Each original is consumed at most once.
+Thus list reordering preserves nested enum kinds and sensitivity without moving
+metadata between different fields. Renamed or edited known fields become plain
+values unless they match an unchanged original at the same path.
+Missing, duplicate, unknown, foreign or malformed handles, duplicate keys,
+resource-id mismatches and resource-count mismatches produce typed
+errors with resource/attribute/path context. Conversion errors preserve their
+typed source chains; secret payloads are never included in diagnostics.
+
+## Version 18
+
+Protocol v18 adds string-valued reference schema leaves and the initialized
+provider's `resolve-references` export. Requests carry a structured type
+identity and raw string; positional outcomes are a resolved canonical string,
+NotFound, or a typed AccessDenied, Transient, or InvalidReference failure.
+Core rejects batch length mismatches and empty resolved values for every
+provider, native or WASM. Guests
+validate their canonical value shapes. Reference validation remains offline;
+resolution runs only when preparing a planning comparison.
+
+The v18 development snapshot set both protocol constants to 18 and rejected
+older providers before schema or WIT decoding. Providers had to use the
+SDK-owned bindings for the updated WIT world.
+
+## Version 17
+
+Protocol v17 adds a required `elements` field to every list schema JSON record.
+Its closed values are `allow_duplicates` and `unique`; neither decoding nor
+encoding may omit the field. The core API exposes the same policy as
+`ListElements::{AllowDuplicates, Unique}` and requires callers of
+`AttributeType::refined_list(element_type, ordered, length, elements)` to choose
+explicitly. The `list` and `unordered_list` constructors allow duplicates.
+
+The shared schema validator checks uniqueness for authored desired values and
+provider configuration, including collect-all diagnostics and purpose-aware
+value fitting. Comparison uses canonical values, including resolved enum API
+values, so bare identifiers, qualified identifiers, and accepted enum aliases
+compare equally. Integer versus float spellings and struct block aliases versus
+canonical field keys remain distinct because canonicalization preserves them.
+Nested unordered lists inside an element compare in order.
+
+Elements containing secrets, environment-derived (diagnostic-sensitive) values,
+or unresolved values are excluded from duplicate comparison; known,
+nonsensitive elements in the same list are still checked. A secret wrapping the
+whole list is also excluded. Read-side values (provider read-back and persisted
+state) and wait-condition right-hand sides are not checked for uniqueness.
+List length constraints remain enforced in every case. Duplicate errors carry
+the value, duplicate index, first index, and attribute context through CLI and
+LSP diagnostics. Semantic schema fingerprints use encoding v8 to include this
+constraint.
+
+The v17 development snapshot set `PROTOCOL_VERSION` and
+`MIN_SUPPORTED_PROTOCOL_VERSION` to 17. A v17 host rejected v16 providers before
+decoding schemas and required providers to rebuild against that core/SDK.
+The WIT world was unchanged in v17.
+
 ## Version 16
 
-Protocol v16 makes declared anonymous identity a closed schema mode and changes
-its address semantics. `PROTOCOL_VERSION` and
-`MIN_SUPPORTED_PROTOCOL_VERSION` are both 16. A v16 host therefore rejects a
-v15 provider through the existing version check before attempting to decode
-its schemas. This is required because the v15 top-level `identity` boolean
+The historical v16 development snapshot made declared anonymous identity a
+closed schema mode and changed its address semantics. That snapshot set both
+protocol constants to 16 and rejected v15 providers before schema decoding.
+This was required because the v15 top-level `identity` boolean
 meant “add this value to the configured create-only hash inputs” and earlier
 providers could set it on mutable attributes. Interpreting that boolean with
 v16 semantics would silently change addresses or produce a misleading schema
@@ -73,7 +176,7 @@ not a create-only change. Adding an element with an authored create-only leaf
 is a create-only change and therefore replaces the resource.
 
 The WIT world is unchanged in v16; the incompatible representation is in the
-schema JSON records. Hosts and providers must both use protocol v16.
+schema JSON records. These requirements remain in protocol v19.
 
 ## Version 15
 
@@ -88,6 +191,33 @@ Update uses `pending-update` with a `pending-phase` of `operation` or
 share the phase-less `pending-operation` record for the token and poll interval.
 `poll-create`, `resume-create`, and `poll-update` receive a `poll-request`
 whose `finality` is `continue` or `final-attempt`.
+
+The guest SDK requires create and update tokens to implement `PhasedToken`.
+Identifier-bearing `IssuedCreate` and `ResumedCreate` handles derive both
+`pending` and `preserve` progress from the token's phase. Identifier-less
+create handles take `T::Operation`, the associated operation-phase payload;
+unissued poll and resume arms carry that payload directly. `from_operation`
+wraps it infallibly, while only SDK dispatch uses `into_operation` to narrow a
+decoded host token. `PhasedToken::phase()` derives its default from the borrowed
+`operation()` view (`Some` for operation, `None` for read-back), avoiding a
+separate phase match in provider implementations.
+Update continuations use `Pending::new(token, poll_after_secs)` and compute
+`Pending::phase()` from the token, without storing a separate mutable phase.
+The SDK does not serialize `Pending<T>` itself; guest glue serializes its token
+into the protocol's pending record.
+
+Guest decoding keeps the host's `create-progress` variant intact through
+create poll and resume dispatch. Phase validation rejects only the backward
+pairing: host progress is `reading-back`, but the token is in operation phase.
+Create poll and resume return `Undetermined` for that pairing, preserving the
+previous host continuation; update decoding rejects the same backward pairing.
+Operation progress with a read-back token is accepted when an identifier is
+available. The guest receives the identifier-bearing handle, and its next
+pending or preserved result reports read-back progress from the token.
+An identifier-less read-back token is permanently invalid: dispatch returns
+terminal `Untracked` with code `READ_BACK_WITHOUT_IDENTIFIER` before calling
+the provider. These SDK guarantees use the existing WIT variants and do not
+change the protocol version.
 
 The host starts the operation's existing deadline before the initial call.
 The read-back deadline starts only when the first `read-back` pending result
@@ -118,12 +248,13 @@ refresh.
 `resume-create` receives the same `poll-request` finality as `poll-create`; the
 host never fabricates the `sent` values that are absent from a persisted
 `resume-pending`. Persisted state retains the resume token and identifier, but
-not scheduling metadata, so the first resume call's inbound phase and delay are
-non-authoritative: the host sends `operating` with the persisted optional
-identifier. The provider recovers the operation from its token and any
-pending result it returns establishes the phase used by later polls. Delete
-continuations use the phase-less `pending-delete` record because delete has no
-post-apply read-back phase.
+not scheduling metadata. The current host sends `operating` with the persisted
+optional identifier on the first resume call. This placeholder is not evidence
+of a phase regression: a saved read-back token with an identifier can resume
+directly into read-back, including from a fresh provider instance. A returned
+pending or preserved result establishes the phase used by subsequent polls.
+Delete continuations use the phase-less `pending-delete` record because delete
+has no post-apply read-back phase.
 
 `OperationConfig.read_back` participates in semantic schema fingerprint
 encoding v6. Provider protocol and minimum supported protocol are both 15;
@@ -165,12 +296,9 @@ version is 14.
 Protocol v13 makes initialized reference scope, provider-declared reference
 forms, and recoverable create failures explicit transport data.
 
-The `normalize-desired` input is now
-`list<desired-resource { resource, deferred }>` rather than a plain resource
-list. `deferred` names the top-level attributes whose unresolved values the
-host withheld from `resource`. A returned resource must not contain an
-attribute named in its input's `deferred` list; the host rejects such a result
-and restores the original unresolved value (carina#4120).
+Version 13 introduced top-level deferred-name metadata for `normalize-desired`.
+Version 19 replaces that record shape with structural, exactly-once handles;
+the old deferred-name boundary is no longer accepted.
 
 `initialize` now returns an `initialize-result` containing a closed
 `reference-scope`: either the provider instance's `partition`, `region`, and
@@ -260,6 +388,24 @@ Saved-plan format 37 requires `file` (a relative path or null) and `line` on
 each deferred-for template so apply-time failures retain their source location.
 Absolute diagnostic paths are not persisted. Format 36 and older plans must
 be regenerated; there is no saved-plan backward compatibility.
+
+Saved-plan format 39 supersedes main format 38 and retains its resolved
+lifecycle directives and per-element loop expressions. It stores complete
+resolved dependency addresses,
+graph-projected managed-row destroy dependencies, and the exact legacy
+dependency migration classification approved during planning. Saved-plan apply
+replays that classification against locked legacy state before any write.
+Deferred effects carry compiled dependency templates; live module handles are
+consumed before saved compositions are encoded. Older plans must be regenerated
+with `carina plan --out`.
+
+State format 21 stores current and deposed dependencies and persisted
+`depends_on` directives as complete managed resource addresses. Pre-v21 state
+must pass configuration-aware legacy classification, warning reporting, and
+strict graph validation before it can be written as v21. Source-less inspection
+leaves that migration pending. `carina state migrate --check` checks a local
+state file offline without rewriting it; unresolved deferred loops report the
+reads required to classify their rows.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host

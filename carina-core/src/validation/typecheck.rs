@@ -553,7 +553,7 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             );
         }
         Value::Deferred(DeferredValue::ResourceRef { .. }) => {
-            return if matches!(expected, TypeExpr::StringLiteral(_)) {
+            return if matches!(expected, TypeExpr::StringLiteral(_) | TypeExpr::Ref(_)) {
                 Mismatch(mismatch(expected, value))
             } else {
                 Assignable
@@ -722,17 +722,7 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             Ok(resolved) => check(&resolved, value),
             Err(error) => Mismatch(validation_mismatch(expected, value, error.to_string())),
         },
-        TypeExpr::Ref(_) => match value {
-            Value::Concrete(ConcreteValue::String(_) | ConcreteValue::CanonicalEnum(_)) => {
-                Assignable
-            }
-            Value::Concrete(ConcreteValue::EnumIdentifier(identifier))
-                if is_qualified_enum_identifier(identifier.as_str()) =>
-            {
-                Assignable
-            }
-            _ => Mismatch(mismatch(expected, value)),
-        },
+        TypeExpr::Ref(_) => Mismatch(mismatch(expected, value)),
         TypeExpr::SchemaType { owned } => {
             use crate::schema::RefinedScalarKind;
             let supported = matches!(
@@ -883,6 +873,40 @@ fn mismatch<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
+pub(crate) fn value_kind_name<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> &'static str {
+    match value {
+        Value::Concrete(ConcreteValue::String(_)) => "String",
+        Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "enum",
+        Value::Concrete(ConcreteValue::Int(_)) => "Int",
+        Value::Concrete(ConcreteValue::Float(_)) => "Float",
+        Value::Concrete(ConcreteValue::Bool(_)) => "Bool",
+        Value::Concrete(ConcreteValue::Duration(_)) => "Duration",
+        Value::Concrete(ConcreteValue::List(_)) | Value::Concrete(ConcreteValue::StringList(_)) => {
+            "list"
+        }
+        Value::Concrete(ConcreteValue::Map(_)) => "map",
+        Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource attribute value",
+        Value::Deferred(DeferredValue::BindingRef { .. }) => "binding value",
+        Value::Deferred(DeferredValue::Coalesce { .. }) => "coalesce value",
+        Value::Deferred(DeferredValue::Interpolation(_)) => "String",
+        Value::Deferred(
+            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
+        ) => "function result",
+        Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable value",
+        Value::Deferred(DeferredValue::Access(_)) => "access value",
+        Value::Deferred(DeferredValue::ModuleIf(_)) => "conditional value",
+        Value::Deferred(DeferredValue::IntegerArithmetic(_)) => "Int",
+        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
+            "secret value"
+        }
+        Value::Deferred(DeferredValue::Unknown(_)) => "unknown value",
+        Value::Deferred(DeferredValue::Placeholder(_)) => "module argument value",
+    }
+}
+
 fn validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
@@ -990,11 +1014,25 @@ mod tests {
     }
 
     #[test]
-    fn ref_parameter_accepts_literal_and_attribute_string_values() {
+    fn ref_parameter_rejects_literal_and_attribute_values() {
         let expected = TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.Vpc"));
-        check(&expected, &string("vpc-123")).expect("literal provider ID");
-        check(&expected, &Value::resource_ref("vpc", "vpc_id", Vec::new()))
-            .expect("resource attribute provider ID");
+        for value in [
+            string("vpc-123"),
+            Value::resource_ref("vpc", "vpc_id", Vec::new()),
+        ] {
+            assert!(
+                matches!(
+                    check(&expected, &value),
+                    Err(TypeExprValueError::Mismatch {
+                        expected,
+                        ..
+                    }) if expected.as_ref() == &TypeExpr::Ref(
+                        ResourceTypePath::new("awscc", "ec2.Vpc")
+                    )
+                ),
+                "resource-type annotations accept handles only: {value:?}",
+            );
+        }
     }
 
     fn check_with_config(
@@ -1103,9 +1141,27 @@ mod tests {
 
     #[test]
     fn providerless_bare_annotation_defers_literal_validation() {
-        let expected =
-            crate::parser::parse_type_expr_str("Count", &ProviderContext::default()).unwrap();
-        providerless_check(&expected, &Value::Concrete(ConcreteValue::Int(3)))
+        let config = ProviderContext::default();
+        let expected = crate::parser::parse_type_expr_str("Count", &config).unwrap();
+        let value = Value::Concrete(ConcreteValue::Int(3));
+        let unloaded = check_type_expr_value_inner(
+            &expected,
+            &value,
+            TypecheckProviderContext::for_parser(&config),
+            TypecheckInference::Unavailable,
+        );
+        let providerless = check_type_expr_value_providerless(
+            &expected,
+            &value,
+            &config,
+            TypecheckInference::Unavailable,
+        );
+        assert_eq!(providerless, unloaded);
+        assert!(
+            matches!(providerless, TypeExprValueCheck::Deferred(_)),
+            "an unknown bare type must retain its deferred provider check"
+        );
+        providerless_check(&expected, &value)
             .expect("an unloaded bare declaration must defer in providerless mode");
     }
 
@@ -1614,7 +1670,6 @@ mod tests {
             crate::parser::bare_type_for_test("ipv4_address".to_string()),
             TypeExpr::List(Box::new(TypeExpr::String)),
             TypeExpr::Map(Box::new(TypeExpr::String)),
-            TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
             TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "VpcId")),
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
@@ -1630,6 +1685,14 @@ mod tests {
                 "resource reference should defer for {expected}"
             );
         }
+        assert!(
+            check(
+                &TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
+                &resource_ref,
+            )
+            .is_err(),
+            "a runtime resource reference is not a structural resource handle"
+        );
         assert!(check(&TypeExpr::StringLiteral("dev".to_string()), &resource_ref).is_err());
         assert!(
             check(
@@ -1658,7 +1721,6 @@ mod tests {
         for expected in [
             TypeExpr::String,
             crate::parser::bare_type_for_test("ipv4_address".to_string()),
-            TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")),
             TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "VpcId")),
             TypeExpr::SchemaType {
                 owned: crate::parser::OwnedTypeIdentity::provider(
@@ -1693,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_and_reference_types_accept_string_values_and_schema_validates() {
+    fn schema_identity_values_validate_but_handle_and_unresolved_types_reject_values() {
         let identity = TypeIdentity::from_schema_type("test", "network", "Id");
         let schema_type = TypeExpr::SchemaType {
             owned: crate::parser::OwnedTypeIdentity::provider(
@@ -1774,19 +1836,19 @@ mod tests {
             check_with_config(&schema_type, &canonical, &config).is_ok(),
             "canonical enum should satisfy {schema_type}"
         );
-        {
-            let expected = TypeExpr::Ref(ResourceTypePath::new("test", "network"));
+        let handle = TypeExpr::Ref(ResourceTypePath::new("test", "network"));
+        for value in [&raw, &qualified, &canonical] {
             assert!(
-                check_with_config(&expected, &raw, &config).is_err(),
-                "bare enum identifier must not satisfy {expected}"
+                check_with_config(&handle, value, &config).is_err(),
+                "no value representation may satisfy handle type {handle}"
             );
+        }
+        let identity =
+            TypeExpr::DottedUnresolved(ResourceTypePath::new("test", "network.MissingId"));
+        for value in [&raw, &qualified, &canonical] {
             assert!(
-                check_with_config(&expected, &qualified, &config).is_ok(),
-                "qualified enum identifier should satisfy {expected}"
-            );
-            assert!(
-                check_with_config(&expected, &canonical, &config).is_ok(),
-                "canonical enum should satisfy {expected}"
+                check_with_config(&identity, value, &config).is_err(),
+                "unresolved dotted types must be resolved before value checking: {identity}"
             );
         }
         let dotted = TypeExpr::DottedUnresolved(ResourceTypePath::new("test", "network.Id"));

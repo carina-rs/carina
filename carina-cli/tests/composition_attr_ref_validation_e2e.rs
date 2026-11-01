@@ -12,9 +12,7 @@ use std::sync::Arc;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-use indexmap::IndexMap;
 use tempfile::TempDir;
 
 struct AwsccTestFactory;
@@ -45,10 +43,6 @@ impl ProviderFactory for AwsccTestFactory {
         _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
 
     fn create_provider(
@@ -689,11 +683,11 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         carina_core::validation::inference::format_inference_error(failure.name, failure.error)
     })
     .collect::<Vec<_>>();
-    if let Err(message) = carina_core::validation::validate_export_param_ref_types_with_bindings(
+    if let Err(errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
         inferred_exports.parameters(),
         &bindings,
     ) {
-        diagnostics.extend(message.lines().map(str::to_owned));
+        diagnostics.extend(errors.into_iter().map(|error| error.to_string()));
     }
 
     assert_eq!(

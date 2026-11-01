@@ -869,7 +869,10 @@ mod producer_tests {
             .unwrap();
         assert!(
             matches!(
-                parsed.attribute_params[0].value,
+                parsed.attribute_params[0]
+                    .value
+                    .as_ref()
+                    .and_then(crate::parser::BoundaryExpression::value),
                 Some(crate::resource::Value::Deferred(
                     crate::resource::DeferredValue::ResolvedFunctionCall { .. }
                 ))

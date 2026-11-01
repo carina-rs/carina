@@ -17,20 +17,32 @@ use carina_cli::fixture_plan::{
     FixturePlan, build_fixture_plan_change_summary, build_plan_from_fixture_name_using,
     delete_instance_attributes_from_plan, provider_router_for_plan,
 };
+use carina_cli::output_style::ColorMode;
 
-fn build_plan_from_fixture_name(fixture: &str) -> FixturePlan {
-    build_plan_from_fixture_name_using(fixture, carina_cli::wiring::LoadedProviderFactory::for_test)
+fn build_plan_from_fixture_name(
+    runtime: &carina_cli::runtime::CommandRuntime,
+    fixture: &str,
+) -> FixturePlan {
+    build_plan_from_fixture_name_using(
+        runtime,
+        fixture,
+        carina_cli::wiring::LoadedProviderFactory::for_test,
+    )
+    .expect("fixture mock inputs must be valid")
 }
 
 /// Render a fixture the way the `plan-fixture` example does for a normal
 /// (non-destroy) plan and return the formatted output string.
 fn render_plan(fixture: &str, detail: DetailLevel) -> String {
-    let fp = build_plan_from_fixture_name(fixture);
+    let runtime = carina_cli::test_support::TestCommandRuntime::new();
+    let fp = build_plan_from_fixture_name(&runtime, fixture);
     let delete_attributes =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     let summary = build_fixture_plan_change_summary(&fp);
-    let provider = provider_router_for_plan(&fp.plan);
+    let provider =
+        provider_router_for_plan(&runtime, &fp.plan).expect("fixture mock inputs must be valid");
     format_plan_with_delete_instances(
+        ColorMode::Plain,
         &fp.plan,
         &summary,
         detail,
@@ -40,18 +52,27 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
         Some(&fp.prev_explicit),
         None,
         &provider,
+        fp.references.for_display(),
     )
     .expect("fixture plan must have an initialized provider route")
 }
 
 /// Render a fixture as a destroy plan, mirroring `plan-fixture --destroy`.
 fn render_destroy_plan(fixture: &str, detail: DetailLevel) -> String {
-    let fp = build_plan_from_fixture_name(fixture);
+    let runtime = carina_cli::test_support::TestCommandRuntime::new();
+    let fp = build_plan_from_fixture_name(&runtime, fixture);
     let delete_attributes =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
-    let provider = provider_router_for_plan(&fp.plan);
-    format_destroy_plan_with_delete_instances(&fp.plan, detail, &delete_attributes, &provider)
-        .expect("fixture destroy plan must have an initialized provider route")
+    let provider =
+        provider_router_for_plan(&runtime, &fp.plan).expect("fixture mock inputs must be valid");
+    format_destroy_plan_with_delete_instances(
+        ColorMode::Plain,
+        &fp.plan,
+        detail,
+        &delete_attributes,
+        &provider,
+    )
+    .expect("fixture destroy plan must have an initialized provider route")
 }
 
 fn assert_non_empty(output: &str, fixture: &str) {

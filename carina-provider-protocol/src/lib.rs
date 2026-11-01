@@ -1,4 +1,6 @@
 mod host_pattern;
+pub mod http_trace;
+pub mod normalization;
 pub mod types;
 
 pub use host_pattern::{HostPattern, HostPatternError};
@@ -8,10 +10,10 @@ use std::time::{Duration, Instant};
 
 /// Protocol version for host-plugin communication.
 /// Increment when making breaking changes to the protocol types or methods.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Oldest provider protocol version this host can load safely.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 16;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = PROTOCOL_VERSION;
 
 /// Default total budget for a provider operation that returns pending.
 pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(15 * 60);

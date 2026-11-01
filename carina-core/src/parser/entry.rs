@@ -29,7 +29,8 @@ use super::resolve::{
     finalize_provider_configs, resolve_provider_unresolved_attributes, resolve_resource_refs,
 };
 use crate::eval_value::{
-    EvalValue, EvalValueError, ParsedSinkValue, StructuralHandle, StructuralHandleMetadata,
+    EvalValue, EvalValueError, ParsedSinkValue, UnexpandedStructuralHandle,
+    UnexpandedStructuralHandleMetadata,
 };
 use crate::parser::{
     ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value,
@@ -50,12 +51,12 @@ pub(crate) struct BindingSeed<'a> {
 pub(crate) enum SeedKind<'a> {
     Value {
         value: &'a Value,
-        structural_handles: Option<&'a StructuralHandleMetadata>,
+        structural_handles: Option<&'a UnexpandedStructuralHandleMetadata>,
     },
-    ModuleParameter,
-    TypedStructural(&'a StructuralHandle),
+    ModuleParameter(&'a super::TypeExpr),
+    TypedStructural(&'a UnexpandedStructuralHandle),
     Provisional,
-    StructuralAlias(&'a StructuralHandle),
+    StructuralAlias(&'a UnexpandedStructuralHandle),
 }
 
 /// Source span of a top-level declaration keyword.
@@ -81,6 +82,93 @@ pub struct AnonymousResourceSourceSpan {
     pub span: TopLevelBlockSourceSpan,
 }
 
+/// Parser-backed spans for an attribute value or a literal descendant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttributeValueSourceSpans {
+    pub value: super::SourceSpan,
+    /// Present when the selected element uses nested block syntax.
+    pub block_header: Option<super::SourceSpan>,
+}
+
+/// Parser-backed statement and identifier spans for a top-level `let` binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LetBindingSourceSpans {
+    pub statement: super::SourceSpan,
+    pub name: super::SourceSpan,
+}
+
+/// Reusable syntax spans for editor lookups, collected in one grammar parse.
+#[derive(Debug, Default)]
+pub struct SourceSpanIndex {
+    let_bindings: HashMap<String, LetBindingSourceSpans>,
+    resource_members: Vec<SourceSpanNode>,
+}
+
+/// An owned syntax node retains source mappings without borrowing pest pairs.
+#[derive(Debug)]
+struct SourceSpanNode {
+    rule: Rule,
+    span: super::SourceSpan,
+    name: Option<String>,
+    children: Vec<Self>,
+}
+
+impl SourceSpanNode {
+    fn from_pair(pair: pest::iterators::Pair<'_, Rule>, file: &super::PreprocessedFile) -> Self {
+        let rule = pair.as_rule();
+        let name = if matches!(rule, Rule::attribute | Rule::map_entry | Rule::nested_block) {
+            pair.clone()
+                .into_inner()
+                .next()
+                .map(|key| key.as_str().trim_matches(['\'', '"']).to_string())
+        } else {
+            None
+        };
+        Self {
+            rule,
+            span: super::SourceSpan::from_pest(&pair, file),
+            name,
+            children: pair
+                .into_inner()
+                .map(|child| Self::from_pair(child, file))
+                .collect(),
+        }
+    }
+}
+
+impl SourceSpanIndex {
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
+        let file = super::preprocess_file(input)?;
+        let pairs = file.parse()?;
+        let let_bindings = collect_top_level_let_binding_spans(pairs.clone(), &file);
+        let resource_members = pairs
+            .flatten()
+            .filter(|pair| {
+                matches!(
+                    pair.as_rule(),
+                    Rule::anonymous_resource | Rule::resource_expr | Rule::read_resource_expr
+                )
+            })
+            .flat_map(|resource| resource.into_inner())
+            .filter(|pair| {
+                matches!(
+                    pair.as_rule(),
+                    Rule::block_content | Rule::attribute | Rule::nested_block
+                )
+            })
+            .map(|pair| SourceSpanNode::from_pair(pair, &file))
+            .collect();
+        Ok(Self {
+            let_bindings,
+            resource_members,
+        })
+    }
+
+    pub fn let_binding_spans(&self) -> &HashMap<String, LetBindingSourceSpans> {
+        &self.let_bindings
+    }
+}
+
 impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
@@ -95,7 +183,7 @@ impl<'a> BindingSeed<'a> {
     pub(crate) fn value_with_structural_handles(
         name: &'a str,
         value: &'a Value,
-        structural_handles: &'a StructuralHandleMetadata,
+        structural_handles: &'a UnexpandedStructuralHandleMetadata,
     ) -> Self {
         Self {
             name,
@@ -106,7 +194,7 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn typed_structural(name: &'a str, handle: &'a StructuralHandle) -> Self {
+    pub(crate) fn typed_structural(name: &'a str, handle: &'a UnexpandedStructuralHandle) -> Self {
         Self {
             name,
             kind: SeedKind::TypedStructural(handle),
@@ -120,14 +208,14 @@ impl<'a> BindingSeed<'a> {
         }
     }
 
-    pub(crate) fn module_parameter(name: &'a str) -> Self {
+    pub(crate) fn module_parameter(name: &'a str, declared_type: &'a super::TypeExpr) -> Self {
         Self {
             name,
-            kind: SeedKind::ModuleParameter,
+            kind: SeedKind::ModuleParameter(declared_type),
         }
     }
 
-    pub(crate) fn structural_alias(name: &'a str, handle: &'a StructuralHandle) -> Self {
+    pub(crate) fn structural_alias(name: &'a str, handle: &'a UnexpandedStructuralHandle) -> Self {
         Self {
             name,
             kind: SeedKind::StructuralAlias(handle),
@@ -241,6 +329,132 @@ pub(crate) fn top_level_let_binding_names(input: &str) -> Result<Vec<String>, Pa
     Ok(names)
 }
 
+/// Locate an authored attribute value or a literal descendant of it.
+///
+/// `scope` is a half-open range of zero-based source lines. Computed expressions
+/// have no literal descendants and return `None`. Grammar spans preserve quoted
+/// commas, comments, nested containers, and heredoc position mappings.
+pub fn attribute_value_source_span(
+    input: &str,
+    attribute: &str,
+    path: &crate::schema::FieldPath,
+    scope: Option<(u32, u32)>,
+) -> Result<Option<super::SourceSpan>, ParseError> {
+    Ok(attribute_value_source_spans(input, attribute, path, scope)?.map(|spans| spans.value))
+}
+
+/// Locate a value and, for nested block syntax, its header independently.
+///
+/// This lets diagnostics select the block header while whole-value errors
+/// such as duplicate elements retain the complete authored element span.
+pub fn attribute_value_source_spans(
+    input: &str,
+    attribute: &str,
+    path: &crate::schema::FieldPath,
+    scope: Option<(u32, u32)>,
+) -> Result<Option<AttributeValueSourceSpans>, ParseError> {
+    Ok(SourceSpanIndex::parse(input)?.attribute_value_source_spans(attribute, path, scope))
+}
+
+impl SourceSpanIndex {
+    /// Locate an attribute or literal descendant without reparsing the source.
+    pub fn attribute_value_source_spans(
+        &self,
+        attribute: &str,
+        path: &crate::schema::FieldPath,
+        scope: Option<(u32, u32)>,
+    ) -> Option<AttributeValueSourceSpans> {
+        use crate::schema::FieldPathStep;
+
+        fn peel(mut node: &SourceSpanNode) -> Option<&SourceSpanNode> {
+            while !matches!(node.rule, Rule::list | Rule::map | Rule::nested_block) {
+                let [child] = node.children.as_slice() else {
+                    return None;
+                };
+                node = child;
+            }
+            Some(node)
+        }
+
+        fn named_value<'a>(node: &'a SourceSpanNode, name: &str) -> Option<&'a SourceSpanNode> {
+            let node = if node.rule == Rule::block_content {
+                node.children.first()?
+            } else {
+                node
+            };
+            if !matches!(
+                node.rule,
+                Rule::attribute | Rule::map_entry | Rule::nested_block
+            ) || node.name.as_deref() != Some(name)
+            {
+                return None;
+            }
+            if node.rule == Rule::nested_block {
+                Some(node)
+            } else {
+                node.children.get(1)
+            }
+        }
+
+        fn descend<'a>(
+            node: &'a SourceSpanNode,
+            steps: &[FieldPathStep],
+        ) -> Option<&'a SourceSpanNode> {
+            let Some((step, rest)) = steps.split_first() else {
+                return Some(node);
+            };
+            let node = peel(node)?;
+            match step {
+                FieldPathStep::Index(index) if node.rule == Rule::list => {
+                    descend(node.children.get(*index)?, rest)
+                }
+                FieldPathStep::Field(name) => {
+                    let mut matches = node
+                        .children
+                        .iter()
+                        .filter_map(|child| named_value(child, name));
+                    let first = matches.next()?;
+                    if first.rule == Rule::nested_block
+                        && let Some((FieldPathStep::Index(index), rest)) = rest.split_first()
+                    {
+                        descend(std::iter::once(first).chain(matches).nth(*index)?, rest)
+                    } else {
+                        descend(first, rest)
+                    }
+                }
+                FieldPathStep::Index(_) => None,
+            }
+        }
+
+        let mut values = self.resource_members.iter().filter_map(|node| {
+            let line = (node.span.start_line() - 1) as u32;
+            if scope.is_some_and(|(start, end)| line < start || line >= end) {
+                return None;
+            }
+            named_value(node, attribute)
+        });
+        let first = values.next()?;
+        let selected = if first.rule == Rule::nested_block
+            && let Some((FieldPathStep::Index(index), rest)) = path.steps().split_first()
+        {
+            std::iter::once(first)
+                .chain(values)
+                .nth(*index)
+                .and_then(|pair| descend(pair, rest))
+        } else {
+            descend(first, path.steps())
+        };
+        selected.map(|node| AttributeValueSourceSpans {
+            value: node.span,
+            block_header: if node.rule == Rule::nested_block {
+                node.children.first().map(|name| name.span)
+            } else {
+                None
+            },
+        })
+    }
+}
+
 /// Return keyword spans for state blocks parsed as top-level statements.
 ///
 /// This uses the main DSL grammar rather than a textual keyword scan, so a
@@ -301,6 +515,53 @@ pub fn top_level_upstream_state_spans(
         }
         pair_contains_rule(statement, Rule::upstream_state_expr).then_some("let")
     })
+}
+
+/// Return complete statement and name spans keyed by top-level `let` binding name.
+///
+/// Only direct children of the file participate, so local bindings and binding
+/// text inside strings cannot change a resource's diagnostic scope.
+pub fn top_level_let_binding_spans(
+    input: &str,
+) -> Result<HashMap<String, LetBindingSourceSpans>, ParseError> {
+    let file = super::preprocess_file(input)?;
+    Ok(collect_top_level_let_binding_spans(file.parse()?, &file))
+}
+
+fn collect_top_level_let_binding_spans(
+    pairs: pest::iterators::Pairs<'_, Rule>,
+    file: &super::PreprocessedFile,
+) -> HashMap<String, LetBindingSourceSpans> {
+    let mut spans = HashMap::new();
+    for pair in pairs {
+        if pair.as_rule() != Rule::file {
+            continue;
+        }
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            let Some(binding) = statement.into_inner().next() else {
+                continue;
+            };
+            if binding.as_rule() != Rule::let_binding {
+                continue;
+            }
+            let Some(name) = binding.clone().into_inner().next() else {
+                continue;
+            };
+            if name.as_rule() == Rule::identifier {
+                spans.insert(
+                    name.as_str().to_string(),
+                    LetBindingSourceSpans {
+                        statement: super::SourceSpan::from_pest(&binding, file),
+                        name: super::SourceSpan::from_pest(&name, file),
+                    },
+                );
+            }
+        }
+    }
+    spans
 }
 
 /// Return type-name spans for authored top-level anonymous resources.
@@ -1264,8 +1525,8 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     EvalValue::computed(value.clone(), structural_handles.cloned()),
                 );
             }
-            SeedKind::ModuleParameter => {
-                ctx.set_variable(
+            SeedKind::ModuleParameter(declared_type) => {
+                ctx.set_argument_variable(
                     seed.name().to_string(),
                     Value::Deferred(crate::resource::DeferredValue::Placeholder(
                         crate::resource::ParserPlaceholder::ModuleArgument {
@@ -1273,6 +1534,7 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                             diagnostic: Default::default(),
                         },
                     )),
+                    Some(declared_type.clone()),
                 );
             }
             SeedKind::TypedStructural(handle) => {
@@ -1381,6 +1643,56 @@ pub(crate) fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_let_binding_spans_exclude_locals_and_restore_heredoc_positions() {
+        let binding = "let b = mock.test.Resource {\n  name = \"b\"\n  tags_list = [\"ok\", 5]\n}";
+        let source = format!(
+            "let text = <<EOT\nlet b = fake {{\n}}\nEOT\n\
+             for x in [\"p\"] {{\n  let b = x\n  mock.test.Other {{ name = b }}\n}}\n\
+             if true {{\n  let local_only = \"q\"\n  mock.test.Other {{ name = local_only }}\n}}\n\
+             {binding} # trailing trivia\nlet _ = \"discarded\"\n"
+        );
+        let spans = top_level_let_binding_spans(&source).unwrap();
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+        assert!(spans.contains_key("text"));
+        let binding_spans = spans.get("b").unwrap();
+        let span = binding_spans.statement;
+        assert_eq!(span.start_line(), 13);
+        assert_eq!(span.end_line(), 16);
+        assert_eq!(&source[span.start_byte()..span.end_byte()], binding);
+        let name = binding_spans.name;
+        assert_eq!(name.start_line(), 13);
+        assert_eq!(name.start_column(), 5);
+        assert_eq!(name.end_line(), 13);
+        assert_eq!(name.end_column(), 6);
+        assert_eq!(&source[name.start_byte()..name.end_byte()], "b");
+    }
+
+    #[test]
+    fn attribute_value_spans_distinguish_block_headers_from_inline_items() {
+        let path = crate::schema::FieldPath::new().push_index(0);
+        for (body, block_header) in [
+            ("rules {\n  label = \"block\"\n}", Some("rules")),
+            ("rules = [{\n  label = \"inline\"\n}]", None),
+        ] {
+            let source = format!("mock.test.Resource {{\n{body}\n}}\n");
+            let spans = attribute_value_source_spans(&source, "rules", &path, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                spans
+                    .block_header
+                    .map(|span| &source[span.start_byte()..span.end_byte()]),
+                block_header,
+            );
+            assert!(spans.value.end_line() > spans.value.start_line());
+            assert_eq!(
+                attribute_value_source_span(&source, "rules", &path, None).unwrap(),
+                Some(spans.value),
+            );
+        }
+    }
 
     #[test]
     fn top_level_span_api_preserves_unterminated_heredoc_line() {

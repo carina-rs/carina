@@ -1,51 +1,66 @@
-//! Terminal cursor visibility control for the whole command run
-//! (#3153, #3158).
+//! Terminal cursor visibility for the whole command run (#3153, #3158).
 //!
-//! `indicatif` manages line clearing and cursor *movement* but never emits
-//! DECTCEM hide/show. So while a `carina` command runs the terminal's caret
-//! stays visible; screenshots show a stray cursor and a parked caret reads
-//! as "the command is waiting for input".
+//! `indicatif` clears lines and moves the cursor but never emits DECTCEM
+//! hide/show. A visible caret during a command can look like an input prompt
+//! and appears in screenshots. One [`CursorGuard`] therefore hides it for the
+//! entire command lifetime, from CLI parsing until exit. #3153 originally hid
+//! it only during refresh; #3158 widened this to command-wide hiding to avoid
+//! flicker between provider loading, refresh, and printing the result.
 //!
-//! The cursor is hidden for the **entire command lifetime** — a single
-//! [`CursorGuard`] is constructed once at startup (`main.rs`, right after
-//! CLI parse) and held until process exit. #3153 originally scoped this to
-//! just the refresh-spinner phase, which made the cursor flicker (visible
-//! during provider load → hidden during refresh → visible again before the
-//! result printed); #3158 widened it to command-wide.
+//! Three restore paths cooperate through the invocation's [`CursorState`]:
 //!
-//! Three cooperating mechanisms manage the cursor, coordinated by one
-//! process-global [`CURSOR_HIDDEN`] flag so the restore sequence is emitted
-//! exactly once:
+//! 1. [`CursorGuard::drop`] restores on normal completion and `?` error unwind.
+//! 2. Explicit [`CursorState::restore`] calls cover `std::process::exit`, which
+//!    runs no destructors, including the shutdown supervisor's signal exits.
+//! 3. The executable's panic hook restores before delegating to the previous
+//!    hook, covering `panic = "abort"` where the guard cannot unwind.
 //!
-//! 1. [`CursorGuard`] — the command-lifetime RAII guard. Hides on
-//!    construct, restores on `Drop` (covers normal exit and `?`
-//!    error-unwind).
-//! 2. [`install_panic_restore_hook`] — a panic hook that covers the abnormal
-//!    panic exit path unwinding can't: a panic with `panic = "abort"` does
-//!    not unwind. SIGINT/SIGTERM cursor restoration is handled by the unified
-//!    shutdown supervisor before its signal-driven `std::process::exit` paths.
-//! 3. [`CursorReveal`] — a scoped *inverse* guard for interactive
-//!    confirmation prompts (apply/destroy "Enter a value:" / "Type 'yes'").
-//!    With the cursor hidden command-wide the user would otherwise type
-//!    blind; `CursorReveal` temporarily shows the cursor for the prompt and
-//!    re-hides it on drop. This is the one intentional, user-driven reveal
-//!    (not flicker — it is exactly where the user is being asked to type).
-
+//! Each claims the same atomic hidden flag with `swap(false)`, so only the
+//! first claimant emits the restore. Clones share that invocation's flag;
+//! separate invocations own independent state.
+//!
+//! [`CursorReveal`] temporarily shows the caret for synchronous apply/destroy
+//! confirmation prompts and re-hides it afterward, so the user can see where
+//! they type while the command-wide guard remains in place.
 use std::io::IsTerminal;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// DECTCEM cursor-hide control sequence (`ESC [ ? 25 l`).
 const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
 /// DECTCEM cursor-show control sequence (`ESC [ ? 25 h`).
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
-/// True between the moment the cursor is hidden and the moment it is
-/// restored. The restore is performed by whichever of the RAII guard, the
-/// explicit exit path, or the panic hook observes a `true → false`
-/// transition first (via [`AtomicBool::swap`]) — so the sequence is emitted
-/// exactly once no matter which exit path fires.
-static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// Invocation-owned flag, true from cursor hide until a restore claims it.
+/// The RAII guard, explicit exits, and panic hook share this claim-once state.
+#[derive(Clone, Default)]
+pub struct CursorState(Arc<AtomicBool>);
+
+impl CursorState {
+    /// Start with a visible cursor and no restore owed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Restore before `std::process::exit` or from the executable's panic hook.
+    ///
+    /// Every exit reachable while the command-wide guard is active must call
+    /// this, including early command errors (#3158). It is idempotent with the
+    /// guard and the other restore paths, so a path that also unwinds is safe.
+    pub fn restore(&self) {
+        self.restore_once();
+    }
+    /// Claim and perform a restore only when hidden; report whether it happened.
+    fn restore_once(&self) -> bool {
+        if !self.0.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        use std::io::Write;
+        let mut out = std::io::stderr();
+        let _ = out.write_all(CURSOR_SHOW);
+        let _ = out.flush();
+        true
+    }
+}
 
 /// Terminal mode shared by cursor handling and the progress backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +68,6 @@ pub enum ProgressMode {
     Tty,
     Plain,
 }
-
 impl ProgressMode {
     pub(crate) fn is_tty(self) -> bool {
         matches!(self, Self::Tty)
@@ -72,219 +86,130 @@ pub fn progress_mode() -> ProgressMode {
     })
 }
 
-/// Restore the cursor before a `std::process::exit`.
+/// Command-lifetime RAII guard that hides on construction and restores on drop.
 ///
-/// `process::exit` runs no destructors, so the command-wide [`CursorGuard`]'s
-/// `Drop` never fires, and it is not a panic so
-/// [`install_panic_restore_hook`]'s net does not catch it either. Every
-/// `process::exit` site that can be reached while the cursor is hidden —
-/// notably `main::handle_app_error`, the universal command-error path —
-/// must call this first, or the terminal is left with a hidden cursor on
-/// error (#3158: command-wide hiding makes this reachable from the very
-/// start of the run). Idempotent and claim-once with the guard/exit/panic
-/// paths, so calling it on a path that *also* unwinds is harmless.
-pub fn restore_cursor() {
-    restore_cursor_once();
-}
-
-/// Restore the cursor *iff* it is currently hidden, claiming the restore so
-/// no other path repeats it. `true` means this call performed the restore.
-fn restore_cursor_once() -> bool {
-    if !CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
-        return false;
-    }
-    use std::io::Write;
-    let mut out = std::io::stderr();
-    let _ = out.write_all(CURSOR_SHOW);
-    let _ = out.flush();
-    true
-}
-
-/// RAII guard that hides the terminal cursor for the lifetime of the
-/// command and restores it on drop.
-///
-/// Construction emits `\x1b[?25l` and arms [`CURSOR_HIDDEN`]; `Drop` emits
-/// `\x1b[?25h` (claiming the restore via [`restore_cursor_once`]) on the
-/// normal-completion and `?`-error-unwind paths. The abnormal exits are
-/// covered by explicit `restore_cursor()` calls and
-/// [`install_panic_restore_hook`] reading the same flag.
-///
-/// Hiding is gated on the shared stderr progress mode: when stderr is not a
-/// TTY (CI capture, redirection to a file) nothing is emitted. With
-/// `should_hide` false the guard is fully inert.
+/// Construction emits `\x1b[?25l` and arms the supplied [`CursorState`]. Drop
+/// emits `\x1b[?25h` only if it claims the hidden flag before an explicit exit
+/// or the panic hook. Hiding follows stderr's shared progress mode; a non-TTY
+/// guard is fully inert.
 pub struct CursorGuard<W: std::io::Write> {
+    state: CursorState,
     writer: W,
     should_hide: bool,
 }
-
 impl<W: std::io::Write> CursorGuard<W> {
-    /// Construct a guard over an explicit writer, hiding the cursor now iff
-    /// `should_hide`. Used by tests; production code uses [`Self::progress`].
-    pub(crate) fn new(mut writer: W, should_hide: bool) -> Self {
+    /// Hide now if enabled, using an explicit writer as the test seam.
+    pub(crate) fn new(state: CursorState, mut writer: W, should_hide: bool) -> Self {
         if should_hide {
             let _ = writer.write_all(CURSOR_HIDE);
             let _ = writer.flush();
-            CURSOR_HIDDEN.store(true, Ordering::SeqCst);
+            state.0.store(true, Ordering::SeqCst);
         }
         Self {
+            state,
             writer,
             should_hide,
         }
     }
 }
-
 impl CursorGuard<std::io::Stderr> {
-    /// Hide the cursor on the stderr progress terminal for the whole command,
-    /// restoring it on drop.
-    ///
-    /// Inert (writes nothing, ever) when stderr is not a terminal.
-    pub fn progress() -> Self {
-        Self::new(std::io::stderr(), progress_mode().is_tty())
+    /// Hide for the whole command on the stderr progress terminal.
+    /// Inert when stderr is not a terminal.
+    pub fn progress(state: &CursorState) -> Self {
+        Self::new(state.clone(), std::io::stderr(), progress_mode().is_tty())
     }
 }
-
 impl<W: std::io::Write> Drop for CursorGuard<W> {
     fn drop(&mut self) {
-        if !self.should_hide {
-            return;
-        }
-        // If the global flag is still set, this guard owns the restore;
-        // write the sequence to our own writer (the test seam) and clear
-        // the flag so the exit/panic net does not repeat it. If another
-        // path already claimed it, `swap` returned false and we stay silent.
-        if CURSOR_HIDDEN.swap(false, Ordering::SeqCst) {
+        // Use the guard's writer only if no exit/panic path already claimed
+        // the restore by clearing this invocation's flag.
+        if self.should_hide && self.state.0.swap(false, Ordering::SeqCst) {
             let _ = self.writer.write_all(CURSOR_SHOW);
             let _ = self.writer.flush();
         }
     }
 }
 
-/// Scoped *inverse* of [`CursorGuard`]: temporarily reveal the cursor while
-/// an interactive confirmation prompt is on screen, then re-hide it.
+/// Scoped inverse of [`CursorGuard`] for interactive confirmation prompts.
 ///
-/// With [`CursorGuard`] hiding the cursor command-wide, the apply/destroy
-/// confirmation prompts ("Enter a value:" / "Type 'yes' to confirm.")
-/// would have the user typing blind. Wrapping the prompt in a
-/// `CursorReveal` shows the caret for the duration of the prompt and
-/// restores the hidden state on drop. This is the single intentional,
-/// user-driven reveal — it lands exactly where the user is asked to type,
-/// so it is expected, not the #3158 flicker.
-///
-/// Coordination with [`CURSOR_HIDDEN`] / [`restore_cursor_once`]:
-///
-/// - On construct, if the cursor is currently hidden it is *claimed*
-///   (`swap(false)`) and `\x1b[?25h` is written — taking the flag away
-///   from the exit/panic net for the prompt's duration so they can't
-///   double-emit.
-/// - On drop, if this reveal performed the show, it re-hides
-///   (`\x1b[?25l`) and re-arms the flag, returning ownership to the
-///   command-wide guard.
-/// - If the cursor was not hidden at construct (non-TTY, or the
-///   command-wide guard is inert), the reveal is fully inert.
+/// Construction claims the hidden state with `swap(false)` and shows the
+/// cursor, keeping the exit/panic paths from double-restoring during the
+/// prompt. Drop re-hides and returns the hidden state to the command-wide
+/// guard. If the cursor was already visible, this reveal stays inert.
 pub(crate) struct CursorReveal {
-    /// True iff this reveal performed the show and therefore owes a re-hide.
+    state: CursorState,
+    /// True only when this reveal performed the show and owes a re-hide.
     revealed: bool,
 }
-
 impl CursorReveal {
-    /// Reveal the cursor for the lifetime of this value, if it is hidden.
-    pub(crate) fn new() -> Self {
-        // Claiming the hidden state and emitting show is exactly
-        // `restore_cursor_once`: it `swap(false)`s the flag and, iff it won
-        // that transition, writes `CURSOR_SHOW` via buffered stderr. Reusing
-        // it keeps the claim-once protocol in one place; the inverse half
-        // (re-hide + re-arm) has no equivalent and lives in `Drop`.
-        let revealed = restore_cursor_once();
-        Self { revealed }
+    /// Reveal for this value's lifetime, reusing the claim-once restore path.
+    pub(crate) fn new(state: &CursorState) -> Self {
+        Self {
+            state: state.clone(),
+            revealed: state.restore_once(),
+        }
     }
 }
-
 impl Drop for CursorReveal {
     fn drop(&mut self) {
-        if !self.revealed {
-            return;
+        if self.revealed {
+            // This reveal is the sole mutator while its synchronous,
+            // single-threaded prompt runs: it claimed the flag in `new`, and
+            // a signal-driven exit terminates before this drop can run.
+            // Unconditional `store(true)` is safe only under that invariant;
+            // it hands the hidden state back to the command guard/restore net.
+            use std::io::Write;
+            let mut out = std::io::stderr();
+            let _ = out.write_all(CURSOR_HIDE);
+            let _ = out.flush();
+            self.state.0.store(true, Ordering::SeqCst);
         }
-        // Re-hide and hand the flag back to the command-wide guard / net.
-        // Unconditional `store(true)` (not a `swap`) is the one place the
-        // strict "only the swap-winner mutates" discipline is relaxed: this
-        // reveal claimed the flag in `new`, the prompt is synchronous and
-        // single-threaded, and a SIGINT during it terminates the process
-        // before this drop runs — so nothing else can have touched the flag
-        // between `new` and here. Safe only under that sole-mutator invariant.
-        use std::io::Write;
-        let mut out = std::io::stderr();
-        let _ = out.write_all(CURSOR_HIDE);
-        let _ = out.flush();
-        CURSOR_HIDDEN.store(true, Ordering::SeqCst);
     }
-}
-
-/// Install the panic hook that restores the cursor on the panic exit path
-/// `Drop` cannot reach. Idempotent-safe to call once at startup; a no-op
-/// when stderr is not a terminal (nothing ever hides the cursor in that case,
-/// so nothing needs restoring).
-pub fn install_panic_restore_hook() {
-    if !progress_mode().is_tty() {
-        return;
-    }
-
-    install_panic_restore_hook_inner();
-}
-
-fn install_panic_restore_hook_inner() {
-    // Panic path: `panic = "abort"` does not unwind, so the guard's `Drop`
-    // never runs. Restore the cursor (if hidden) then delegate to the
-    // previous hook so the normal panic message / abort still happens.
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_cursor_once();
-        prev(info);
-    }));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // These tests mutate the process-global `CURSOR_HIDDEN`. They must not
-    // run concurrently with each other; nextest's process-per-test model
-    // isolates them, and within a process they are ordered by this mutex.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn reset_cursor_hidden_for_test(hidden: bool) {
-        CURSOR_HIDDEN.store(hidden, Ordering::SeqCst);
-    }
-
-    fn install_panic_restore_hook_for_test() {
-        install_panic_restore_hook_inner();
-    }
-
-    fn is_cursor_hidden_for_test() -> bool {
-        CURSOR_HIDDEN.load(Ordering::SeqCst)
+    #[test]
+    fn independent_cursor_states_keep_other_invocations_hidden() {
+        let a = CursorState::new();
+        let b = CursorState::new();
+        let mut a_output = Vec::new();
+        let mut b_output = Vec::new();
+        let a_guard = CursorGuard::new(a.clone(), &mut a_output, true);
+        let b_guard = CursorGuard::new(b.clone(), &mut b_output, true);
+        std::thread::spawn(move || a.restore()).join().unwrap();
+        assert!(b.0.load(Ordering::SeqCst));
+        drop(a_guard);
+        drop(b_guard);
+        assert_eq!(a_output, CURSOR_HIDE);
+        assert_eq!(b_output, [CURSOR_HIDE, CURSOR_SHOW].concat());
     }
 
     #[test]
     fn guard_hides_on_construct_and_shows_on_drop_when_enabled() {
-        let _l = TEST_LOCK.lock().unwrap();
-        reset_cursor_hidden_for_test(false);
+        let state = CursorState::new();
         let mut buf: Vec<u8> = Vec::new();
         // The guard borrows `buf`, so the hide-then-show ordering can only
         // be asserted after the scope ends.
         {
-            let _guard = CursorGuard::new(&mut buf, true);
-            assert!(is_cursor_hidden_for_test(), "flag armed on hide");
+            let _guard = CursorGuard::new(state.clone(), &mut buf, true);
+            assert!(state.0.load(Ordering::SeqCst), "flag armed on hide");
         }
         assert_eq!(buf, b"\x1b[?25l\x1b[?25h");
-        assert!(!is_cursor_hidden_for_test(), "flag cleared once restored");
+        assert!(
+            !state.0.load(Ordering::SeqCst),
+            "flag cleared once restored"
+        );
     }
 
     #[test]
     fn guard_writes_nothing_when_disabled() {
-        let _l = TEST_LOCK.lock().unwrap();
-        reset_cursor_hidden_for_test(false);
+        let state = CursorState::new();
         let mut buf: Vec<u8> = Vec::new();
         {
-            let _guard = CursorGuard::new(&mut buf, false);
+            let _guard = CursorGuard::new(state.clone(), &mut buf, false);
         }
         assert!(
             buf.is_empty(),
@@ -294,13 +219,11 @@ mod tests {
 
     #[test]
     fn guard_restores_cursor_on_early_error_unwind() {
-        let _l = TEST_LOCK.lock().unwrap();
-        reset_cursor_hidden_for_test(false);
         // Simulate a `?`-style early return: the guard is dropped while the
         // surrounding fallible operation bails out. The show sequence must
         // still be emitted so the terminal is left usable.
         fn refresh_phase(buf: &mut Vec<u8>) -> Result<(), &'static str> {
-            let _guard = CursorGuard::new(buf, true);
+            let _guard = CursorGuard::new(CursorState::new(), buf, true);
             Err("provider read failed")?;
             unreachable!()
         }
@@ -315,26 +238,28 @@ mod tests {
 
     #[test]
     fn restore_is_claimed_exactly_once() {
-        let _l = TEST_LOCK.lock().unwrap();
         // Simulate an explicit exit path firing first: the flag is armed,
         // that path claims the restore, and the guard's later drop must stay
         // silent so the sequence is not emitted twice.
-        reset_cursor_hidden_for_test(true);
-        assert!(restore_cursor_once(), "first claimant performs the restore");
+        let state = CursorState::new();
+        state.0.store(true, Ordering::SeqCst);
+        assert!(state.restore_once(), "first claimant performs the restore");
         assert!(
-            !restore_cursor_once(),
+            !state.restore_once(),
             "second claimant must observe the cleared flag and do nothing"
         );
 
         // And a guard dropping after an explicit exit path already restored:
         // no write.
-        reset_cursor_hidden_for_test(true);
-        assert!(restore_cursor_once());
+        let state = CursorState::new();
+        state.0.store(true, Ordering::SeqCst);
+        assert!(state.restore_once());
         let mut buf: Vec<u8> = Vec::new();
         {
             // should_hide=true but the flag was already cleared by the
             // explicit exit path above → Drop's `swap` sees false → no write.
             let g = CursorGuard {
+                state: state.clone(),
                 writer: &mut buf,
                 should_hide: true,
             };
@@ -348,73 +273,68 @@ mod tests {
 
     #[test]
     fn restore_path_claims_once_and_is_idempotent() {
-        let _l = TEST_LOCK.lock().unwrap();
-        reset_cursor_hidden_for_test(true);
+        let state = CursorState::new();
+        state.0.store(true, Ordering::SeqCst);
         assert!(
-            restore_cursor_once(),
+            state.restore_once(),
             "armed: the path claims and performs the restore"
         );
         assert!(
-            !is_cursor_hidden_for_test(),
+            !state.0.load(Ordering::SeqCst),
             "flag cleared after the restore"
         );
         assert!(
-            !restore_cursor_once(),
+            !state.restore_once(),
             "not armed: a second restore call must be a no-op"
         );
     }
 
     #[test]
-    fn install_panic_restore_hook_restores_hidden_cursor_once() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        reset_cursor_hidden_for_test(true);
-        install_panic_restore_hook_for_test();
-
-        let result = std::panic::catch_unwind(|| {
-            panic!("cursor restore hook test");
-        });
-
-        assert!(result.is_err());
-        assert!(!is_cursor_hidden_for_test());
+    fn panic_restoration_callback_restores_hidden_cursor_once() {
+        let state = CursorState::new();
+        state.0.store(true, Ordering::SeqCst);
+        // Exercise the callback used by the binary hook without installing a
+        // process-wide handler in the test runner.
+        state.restore();
+        assert!(!state.0.load(Ordering::SeqCst));
     }
 
     #[test]
     fn reveal_shows_then_rehides_when_cursor_was_hidden() {
-        let _l = TEST_LOCK.lock().unwrap();
         // Command-wide guard has hidden the cursor (flag armed).
-        reset_cursor_hidden_for_test(true);
+        let state = CursorState::new();
+        state.0.store(true, Ordering::SeqCst);
         {
-            let r = CursorReveal::new();
+            let r = CursorReveal::new(&state);
             assert!(r.revealed, "reveal claims the hidden state and shows");
             assert!(
-                !is_cursor_hidden_for_test(),
+                !state.0.load(Ordering::SeqCst),
                 "flag taken from the exit/panic net for the prompt's duration"
             );
             // A restore path arriving during the prompt finds the flag already
             // false and must not double-restore.
             assert!(
-                !restore_cursor_once(),
+                !state.restore_once(),
                 "restore during prompt is a no-op (reveal owns the state)"
             );
             drop(r);
         }
         assert!(
-            is_cursor_hidden_for_test(),
+            state.0.load(Ordering::SeqCst),
             "after the prompt the hidden state is handed back to the guard"
         );
     }
 
     #[test]
     fn reveal_is_inert_when_cursor_not_hidden() {
-        let _l = TEST_LOCK.lock().unwrap();
         // Non-TTY / inert command-wide guard: nothing was hidden.
-        reset_cursor_hidden_for_test(false);
+        let state = CursorState::new();
         {
-            let r = CursorReveal::new();
+            let r = CursorReveal::new(&state);
             assert!(!r.revealed, "nothing to reveal when not hidden");
         }
         assert!(
-            !is_cursor_hidden_for_test(),
+            !state.0.load(Ordering::SeqCst),
             "an inert reveal must not arm the flag on drop"
         );
     }

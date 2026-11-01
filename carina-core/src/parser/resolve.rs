@@ -505,6 +505,7 @@ trait PreApplyResourceMut {
     fn attributes(&self) -> &IndexMap<String, Value>;
     fn dependency_bindings(&self) -> &BTreeSet<RelativeBindingName>;
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
+    fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives;
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName>;
 }
 
@@ -516,13 +517,16 @@ impl PreApplyResourceMut for Resource {
         &self.attributes
     }
     fn dependency_bindings(&self) -> &BTreeSet<RelativeBindingName> {
-        &self.dependency_bindings
+        &self.dependencies.value_bindings
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
+    fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives {
+        &mut self.directives
+    }
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName> {
-        &mut self.dependency_bindings
+        &mut self.dependencies.value_bindings
     }
 }
 
@@ -534,13 +538,16 @@ impl PreApplyResourceMut for DataSource {
         &self.attributes
     }
     fn dependency_bindings(&self) -> &BTreeSet<RelativeBindingName> {
-        &self.dependency_bindings
+        &self.dependencies.value_bindings
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
     }
+    fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives {
+        &mut self.directives
+    }
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName> {
-        &mut self.dependency_bindings
+        &mut self.dependencies.value_bindings
     }
 }
 
@@ -824,6 +831,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         }
 
         *resource.attributes_mut() = resolved_attrs;
+        resolve_directive_function_calls(
+            resource.directives_mut(),
+            &binding_map,
+            fn_ctx.config,
+            session,
+            defer_unknown_functions,
+            preserve_failed_user_calls,
+        )?;
     }
 
     // Residual `for` bodies are not part of `iter_pre_apply_resources_mut`:
@@ -836,6 +851,25 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
+        match &mut deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => resolve_directive_function_calls(
+                resource.directives_mut(),
+                &binding_map,
+                fn_ctx.config,
+                session,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?,
+            crate::parser::DeferredForBody::Read(source) => resolve_directive_function_calls(
+                &mut source.directives,
+                &binding_map,
+                fn_ctx.config,
+                session,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?,
+            crate::parser::DeferredForBody::ModuleCall(_) => {}
+        }
         let Some(attributes) = deferred.template_attributes_mut() else {
             continue;
         };
@@ -848,6 +882,34 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 defer_unknown_functions,
                 preserve_failed_user_calls,
             )?;
+        }
+    }
+
+    for conditional in &mut parsed.deferred_module_ifs {
+        for body in conditional.branches_mut() {
+            match body {
+                crate::parser::DeferredIfBody::Resource(resource) => {
+                    resolve_directive_function_calls(
+                        &mut resource.directives,
+                        &binding_map,
+                        fn_ctx.config,
+                        session,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?
+                }
+                crate::parser::DeferredIfBody::DataSource(source) => {
+                    resolve_directive_function_calls(
+                        &mut source.directives,
+                        &binding_map,
+                        fn_ctx.config,
+                        session,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?
+                }
+                crate::parser::DeferredIfBody::ModuleCall(_) => {}
+            }
         }
     }
 
@@ -910,7 +972,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // reducing an `Any` builtin such as `lookup()` would incorrectly make
         // an otherwise-uninferrable output look like a concrete String.
         if attribute.static_type.is_some()
-            && let Some(value) = &mut attribute.value
+            && let Some(crate::parser::BoundaryExpression::Value(value)) = &mut attribute.value
         {
             *value = resolve_function_calls_only(
                 value,
@@ -927,21 +989,16 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         // need their concrete values for boundary checking; unannotated
         // exports must retain the expression for return-type inference.
         let has_static_type = export.type_expr_opt().is_some();
-        if has_static_type {
-            let resolved = export
-                .value()
-                .map(|value| {
-                    resolve_function_calls_only(
-                        value,
-                        &binding_map,
-                        fn_ctx.config,
-                        session,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
-                    )
-                })
-                .transpose()?;
-            export.set_value(resolved);
+        if has_static_type && let Some(value) = export.value() {
+            let resolved = resolve_function_calls_only(
+                value,
+                &binding_map,
+                fn_ctx.config,
+                session,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+            export.replace_value(resolved);
         }
     }
 
@@ -983,10 +1040,10 @@ pub fn collect_known_bindings_merged<E>(parsed: &File<E>) -> std::collections::H
 #[cfg(test)]
 pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSeed<'_>> {
     let structural = parsed.structural_binding_names();
-    let module_parameters: HashSet<&str> = parsed
+    let module_parameters: HashMap<&str, &super::TypeExpr> = parsed
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
 
     collect_seed_bindings_from_parts(
@@ -999,7 +1056,7 @@ pub(crate) fn collect_seed_bindings_merged(parsed: &ParsedFile) -> Vec<BindingSe
 
 pub(crate) fn collect_seed_bindings_from_parts<'a>(
     structural: &HashSet<&'a str>,
-    module_parameters: &HashSet<&'a str>,
+    module_parameters: &HashMap<&'a str, &'a super::TypeExpr>,
     variables: &'a IndexMap<String, Value>,
     metadata: &'a impl super::ast::BindingSeedMetadata,
 ) -> Vec<BindingSeed<'a>> {
@@ -1017,10 +1074,10 @@ pub(crate) fn collect_seed_bindings_from_parts<'a>(
     names
         .into_iter()
         .map(|name| {
-            if module_parameters.contains(name) {
+            if let Some(declared_type) = module_parameters.get(name) {
                 match metadata.structural_handles().get(name) {
                     Some(handle) => BindingSeed::typed_structural(name, handle),
-                    None => BindingSeed::module_parameter(name),
+                    None => BindingSeed::module_parameter(name, declared_type),
                 }
             } else if let Some(handle) = metadata.structural_aliases().get(name) {
                 BindingSeed::structural_alias(name, handle)
@@ -1368,7 +1425,7 @@ fn accumulate_undefined_reference_errors(
         }
     }
     for attr in &parsed.attribute_params {
-        if let Some(value) = &attr.value {
+        if let Some(crate::parser::BoundaryExpression::Value(value)) = &attr.value {
             check(value);
         }
     }
@@ -1778,6 +1835,31 @@ fn reject_required_interpolation_unavailable<B: BindingAddress>(
     Ok(())
 }
 
+fn resolve_directive_function_calls(
+    directives: &mut crate::resource::AuthoredDirectives,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    defer_unknown_functions: bool,
+    preserve_failed_user_calls: bool,
+) -> Result<(), ParseError> {
+    directives.try_update_expressions(|_, expression| {
+        expression.value = resolve_function_calls_only(
+            &expression.value,
+            binding_map,
+            config,
+            session,
+            defer_unknown_functions,
+            preserve_failed_user_calls,
+        )
+        .map_err(|error| match expression.source().authored_location() {
+            Some((source_file, _)) => error.in_file(source_file),
+            None => error,
+        })?;
+        Ok(())
+    })
+}
+
 /// Walk a value tree and finalize any `Value::Deferred(DeferredValue::FunctionCall)` placeholder
 /// that the per-file parse deferred (typically because the user-fn
 /// lives in a sibling `.crn` — #2444). Recurses through `List` / `Map`
@@ -2006,7 +2088,9 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                     .signature
                     .attributes
                     .iter()
-                    .map(|(name, attribute)| (name.clone(), attribute.to_value()))
+                    .filter_map(|(name, attribute)| {
+                        attribute.value().map(|value| (name.clone(), value))
+                    })
                     .collect(),
             };
             bindings.set_with_completeness(
@@ -2326,7 +2410,7 @@ mod seed_precedence_tests {
             SeedKind::TypedStructural(_)
             | SeedKind::Provisional
             | SeedKind::StructuralAlias(_)
-            | SeedKind::ModuleParameter => {}
+            | SeedKind::ModuleParameter(_) => {}
             SeedKind::Value { value, .. } => {
                 panic!("structural binding `cluster` must seed as Structural, not Value({value:?})")
             }
@@ -2360,7 +2444,7 @@ mod seed_precedence_tests {
             SeedKind::TypedStructural(_)
             | SeedKind::Provisional
             | SeedKind::StructuralAlias(_)
-            | SeedKind::ModuleParameter => {
+            | SeedKind::ModuleParameter(_) => {
                 panic!("plain value let must seed as Value, not a non-value seed")
             }
         }

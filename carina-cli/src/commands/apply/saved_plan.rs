@@ -13,7 +13,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     Current, DataSource, ResolvedResourceId, Resource, ResourceId, SavedComposition,
-    SavedDataSource, SavedResource, State, Value,
+    SavedDataSource, SavedModuleSource, SavedResource, State, Value,
 };
 use carina_state::{ResourceState, StateFile};
 
@@ -21,7 +21,7 @@ use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
     MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
     RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
-    UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
+    SavedPlanResource, UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
 };
 use crate::error::{
     AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
@@ -50,7 +50,14 @@ fn verify_saved_plan_provider_scopes(
     })
 }
 
-fn planned_secret_hashes(resources: &[SavedResource]) -> PlannedSecretHashes {
+fn planned_secret_hashes<D>(
+    resources: &[Resource<
+        SavedModuleSource,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+        D,
+    >],
+) -> PlannedSecretHashes {
     resources
         .iter()
         .filter(|resource| {
@@ -310,6 +317,19 @@ pub(super) enum ReloadedProviderBoundPlanFile {
     },
 }
 
+impl ReloadedProviderBoundPlanFile {
+    pub(super) fn legacy_dependency_classification(
+        &self,
+    ) -> Option<&carina_state::LegacyDependencyClassification> {
+        match self {
+            Self::Verified { plan, .. } => plan.plan_file.legacy_dependency_classification(),
+            Self::NeedsSecretVerification { plan, .. } => {
+                plan.plan_file.legacy_dependency_classification()
+            }
+        }
+    }
+}
+
 /// Placeholder-free saved plan awaiting provider-schema verification.
 pub(super) struct ReloadedVerifiedPlanFile {
     plan_file: UnresolvedReloadedPlanFile,
@@ -473,19 +493,19 @@ pub(super) struct ExpansionPriorStates {
 fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
     match current {
         Current::Absent(state) => {
-            Orphan::absent(state, row.binding.clone(), row.directives.clone().into())
+            Orphan::absent(state, row.binding.clone(), row.directives.clone())
         }
         Current::Present(present) => {
-            Orphan::present(present, row.binding.clone(), row.directives.clone().into())
+            Orphan::present(present, row.binding.clone(), row.directives.clone())
         }
         Current::CreateInFlight(pending) => {
-            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone().into())
+            Orphan::create_in_flight(pending, row.binding.clone(), row.directives.clone())
         }
         Current::CreateOutcomeUnknown(unknown) => {
-            Orphan::create_outcome_unknown(unknown, row.binding.clone(), (&row.directives).into())
+            Orphan::create_outcome_unknown(unknown, row.binding.clone(), row.directives.clone())
         }
         Current::MissingIdentifier(state) => {
-            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone().into())
+            Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
         }
     }
 }
@@ -727,7 +747,7 @@ impl ValidatedDesiredPlan {
         self.plan.provider_configs()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedPlanResource] {
         self.plan.sorted_resources()
     }
 
@@ -789,7 +809,7 @@ impl ScopeCheckedDesiredPlan {
         self.plan.context()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedPlanResource] {
         self.plan.sorted_resources()
     }
 
@@ -874,7 +894,7 @@ impl DesiredPlanFile {
         }
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedPlanResource] {
         match self {
             Self::Verified(plan) => plan.sorted_resources(),
             Self::NeedsHistoricalVerification(plan) => plan.sorted_resources(),
@@ -939,7 +959,7 @@ impl DesiredVerifiedPlanFile {
         self.plan_file.provider_configs()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedPlanResource] {
         self.plan_file.sorted_resources()
     }
 
@@ -1059,7 +1079,7 @@ impl RehydratedPlanFile {
         self.plan_file.provider_configs()
     }
 
-    fn sorted_resources(&self) -> &[SavedResource] {
+    fn sorted_resources(&self) -> &[SavedPlanResource] {
         self.plan_file.sorted_resources()
     }
 
@@ -1120,7 +1140,7 @@ impl ExecutablePlanFile {
         self.plan.plan()
     }
 
-    pub(super) fn sorted_resources(&self) -> &[SavedResource] {
+    pub(super) fn sorted_resources(&self) -> &[SavedPlanResource] {
         self.plan.sorted_resources()
     }
 
@@ -1223,10 +1243,6 @@ mod tests {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -1234,8 +1250,17 @@ mod tests {
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(carina_core::provider::InitializeOutcome::unavailable()
-                    .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
+                Ok(
+                    carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                        Box::new(
+                            carina_provider_mock::ConfiguredBuiltinMock::new(
+                                carina_provider_mock::MockBehavior::default(),
+                                carina_provider_mock::MockScope::memory(),
+                            )
+                            .create_provider(),
+                        ),
+                    ),
+                )
             })
         }
 
@@ -1278,6 +1303,7 @@ mod tests {
 
     fn wasm_context(name: &'static str, bytes: &[u8]) -> ValidatedConfig<()> {
         ValidatedConfig::for_test(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![LoadedProviderFactory::for_test_with_bytes(
                 Box::new(ArtifactFactory { name }),
@@ -1289,6 +1315,7 @@ mod tests {
 
     fn wasm_load(name: &'static str, bytes: &[u8]) -> ProviderLoad {
         ProviderLoad::for_test(
+            &crate::test_support::TestCommandRuntime::new(),
             vec![LoadedProviderFactory::for_test_with_bytes(
                 Box::new(ArtifactFactory { name }),
                 bytes,
@@ -1298,14 +1325,23 @@ mod tests {
     }
 
     fn builtin_context() -> ValidatedConfig<()> {
-        ValidatedConfig::from_factories_for_test((), Vec::new(), &[])
+        ValidatedConfig::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            (),
+            Vec::new(),
+            &[],
+        )
     }
 
     fn builtin_load() -> ProviderLoad {
         ProviderLoad::for_test_with_provider_phase::<
             carina_core::resource::NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
-        >(Vec::new(), &[])
+        >(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &[],
+        )
     }
 
     fn saved_provider_configs(
@@ -1339,6 +1375,9 @@ mod tests {
             backend_config: None,
             plan: Plan::new(),
             sorted_resources: Vec::new(),
+            sorted_value_destroy_dependencies: Vec::new(),
+            sorted_explicit_destroy_dependencies: Vec::new(),
+            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -1377,7 +1416,13 @@ mod tests {
             provider.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
                 InitializedProvider::for_test(
-                    Box::new(carina_provider_mock::MockProvider::new()),
+                    Box::new(
+                        carina_provider_mock::ConfiguredBuiltinMock::new(
+                            carina_provider_mock::MockBehavior::default(),
+                            carina_provider_mock::MockScope::memory(),
+                        )
+                        .create_provider(),
+                    ),
                     scope,
                 ),
             );
@@ -1821,9 +1866,12 @@ mod tests {
             backend_config: None,
             plan: plan.clone(),
             sorted_resources: Vec::new(),
+            sorted_value_destroy_dependencies: Vec::new(),
+            sorted_explicit_destroy_dependencies: Vec::new(),
+            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
-            data_sources: vec![data_source.clone()],
+            data_sources: vec![data_source.clone().into_value_snapshot()],
             data_source_origins: Vec::new(),
             data_source_values: vec![SavedDataSourceValue {
                 id: data_source.id.clone(),
@@ -1849,7 +1897,11 @@ mod tests {
 
         let rehydrated = pending
             .verify_historical(
-                &carina_provider_mock::MockProvider::new(),
+                &carina_provider_mock::ConfiguredBuiltinMock::new(
+                    carina_provider_mock::MockBehavior::default(),
+                    carina_provider_mock::MockScope::memory(),
+                )
+                .create_provider(),
                 &mut actual_states,
                 &mut verified_planned_states,
                 &HistoricalResourceAddresses::from_plan(&plan),

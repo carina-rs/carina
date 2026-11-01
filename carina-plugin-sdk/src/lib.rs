@@ -8,6 +8,13 @@ pub use carina_provider_protocol::types;
 
 pub mod aws_credentials;
 
+mod desired;
+pub use desired::{
+    DeferredLeaf, DesiredEditError, DesiredInputs, DesiredList, DesiredMap, DesiredNormalization,
+    DesiredNormalizationError, DesiredResource, DesiredScalar, DesiredValue, DesiredValueMut,
+    DesiredView, NativeDesiredNormalization, NormalizedResource,
+};
+
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub mod __private;
@@ -80,7 +87,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-16 JSON.
+/// Failure while projecting validated SDK schemas onto version-19 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -183,7 +190,7 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-16
+/// The validated provider schemas determine the scalar kind. The version-19
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -232,31 +239,151 @@ pub enum BindingPattern {
 /// dispatched work but its identifier-less token cannot cross the WASM
 /// boundary, the guest traps so the host can classify the attempt from its
 /// per-call egress record instead of erasing it as untracked.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// The phase comes only from the token; callers cannot supply a second phase:
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{Pending, PendingPhase, PhasedToken};
+///
+/// fn disagree<T: PhasedToken>(token: T) -> Pending<T> {
+///     Pending { token, poll_after_secs: 1, phase: PendingPhase::Operation }
+/// }
+/// ```
+#[derive(Debug, Clone)]
 pub struct Pending<T> {
     pub token: T,
     pub poll_after_secs: u32,
-    pub phase: carina_provider_protocol::PendingPhase,
 }
 
 pub use carina_provider_protocol::types::{CreateProgress, PendingDelete, PendingToken, Sent};
 pub use carina_provider_protocol::{PendingPhase, PollFinality, PollRequest};
 
-impl<T> Pending<T> {
-    pub fn operation(token: T, poll_after_secs: u32) -> Self {
+/// A provider-owned continuation with a distinct operation-phase payload.
+///
+/// `from_operation` and `into_operation` must be inverses. `operation` returns
+/// `Some` for exactly the variants accepted by `into_operation`; all other
+/// variants are read-back continuations and require an identifier. The default
+/// phase is derived from that borrowed view, so implementations need no
+/// separate phase match.
+///
+/// Identifier-less create handles take the operation payload directly:
+///
+/// ```
+/// use carina_plugin_sdk::{CreateAttempt, CreateStep, PhasedToken, Sent};
+///
+/// #[derive(Debug)]
+/// enum Token {
+///     Operating(String),
+///     ReadBack,
+/// }
+///
+/// impl PhasedToken for Token {
+///     type Operation = String;
+///
+///     fn from_operation(operation: String) -> Self {
+///         Self::Operating(operation)
+///     }
+///
+///     fn into_operation(self) -> Result<String, Self> {
+///         match self {
+///             Self::Operating(operation) => Ok(operation),
+///             Self::ReadBack => Err(self),
+///         }
+///     }
+///
+///     fn operation(&self) -> Option<&String> {
+///         match self {
+///             Self::Operating(operation) => Some(operation),
+///             Self::ReadBack => None,
+///         }
+///     }
+/// }
+///
+/// fn defer(attempt: CreateAttempt, operation_id: String) -> CreateStep<Token> {
+///     attempt.pending(operation_id, Sent::AllRequestAttributes, 1)
+/// }
+/// ```
+///
+/// A full token, which could contain a read-back continuation, cannot be passed:
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{CreateAttempt, CreateStep, PhasedToken, Sent};
+/// fn pending<T: PhasedToken>(attempt: CreateAttempt, token: T) -> CreateStep<T> {
+///     attempt.pending::<T>(token, Sent::AllRequestAttributes, 1)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{CreateAttempt, CreateVerdict, PhasedToken, Sent, types::ProviderError};
+/// fn preserve<T: PhasedToken>(attempt: CreateAttempt, token: T, error: ProviderError)
+///     -> CreateVerdict<T>
+/// {
+///     attempt.preserve::<T>(token, Sent::AllRequestAttributes, 1, error)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PhasedToken, PollAttempt, CreateStep};
+/// fn pending<T: PhasedToken>(attempt: PollAttempt, token: T) -> CreateStep<T> {
+///     attempt.pending::<T>(token, 1)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PhasedToken, PollAttempt, PollVerdict, types::ProviderError};
+/// fn preserve<T: PhasedToken>(attempt: PollAttempt, token: T, error: ProviderError)
+///     -> PollVerdict<T>
+/// {
+///     attempt.preserve::<T>(token, 1, error)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PhasedToken, ResumeAttempt, ResumeStep};
+/// fn pending<T: PhasedToken>(attempt: ResumeAttempt, token: T) -> ResumeStep<T> {
+///     attempt.pending::<T>(token, 1)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PhasedToken, ResumeAttempt, ResumeVerdict, types::ProviderError};
+/// fn preserve<T: PhasedToken>(attempt: ResumeAttempt, token: T, error: ProviderError)
+///     -> ResumeVerdict<T>
+/// {
+///     attempt.preserve::<T>(token, 1, error)
+/// }
+/// ```
+pub trait PhasedToken: Sized {
+    /// The payload that can be carried without an identifier.
+    type Operation;
+
+    /// Wrap an operation payload without a runtime phase check.
+    fn from_operation(operation: Self::Operation) -> Self;
+    /// Narrow a host token, returning a read-back token unchanged.
+    fn into_operation(self) -> Result<Self::Operation, Self>;
+    /// Borrow the operation payload, or return `None` for read-back.
+    fn operation(&self) -> Option<&Self::Operation>;
+
+    /// Derive the continuation phase from its operation payload.
+    fn phase(&self) -> PendingPhase {
+        if self.operation().is_some() {
+            PendingPhase::Operation
+        } else {
+            PendingPhase::ReadBack
+        }
+    }
+}
+
+impl<T: PhasedToken> Pending<T> {
+    pub fn new(token: T, poll_after_secs: u32) -> Self {
         Self {
             token,
             poll_after_secs,
-            phase: PendingPhase::Operation,
         }
     }
 
-    pub fn read_back(token: T, poll_after_secs: u32) -> Self {
-        Self {
-            token,
-            poll_after_secs,
-            phase: PendingPhase::ReadBack,
-        }
+    pub fn phase(&self) -> PendingPhase {
+        self.token.phase()
     }
 }
 
@@ -295,10 +422,15 @@ impl CreateAttempt {
         IssuedCreate { identifier, sent }
     }
 
-    pub fn pending<T>(self, token: T, sent: Sent, poll_after_secs: u32) -> CreateStep<T> {
+    pub fn pending<T: PhasedToken>(
+        self,
+        token: T::Operation,
+        sent: Sent,
+        poll_after_secs: u32,
+    ) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
-                token,
+                token: T::from_operation(token),
                 progress: CreateProgress::Operating { identifier: None },
                 sent,
                 poll_after_secs,
@@ -306,9 +438,9 @@ impl CreateAttempt {
         ))
     }
 
-    pub fn preserve<T>(
+    pub fn preserve<T: PhasedToken>(
         self,
-        token: T,
+        token: T::Operation,
         sent: Sent,
         poll_after_secs: u32,
         error: ProviderError,
@@ -316,7 +448,7 @@ impl CreateAttempt {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
-                    token,
+                    token: T::from_operation(token),
                     progress: CreateProgress::Operating { identifier: None },
                     sent,
                     poll_after_secs,
@@ -368,10 +500,14 @@ impl PollAttempt {
         }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+    pub fn pending<T: PhasedToken>(
+        self,
+        token: T::Operation,
+        poll_after_secs: u32,
+    ) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
-                token,
+                token: T::from_operation(token),
                 progress: CreateProgress::Operating { identifier: None },
                 sent: self.sent,
                 poll_after_secs,
@@ -379,16 +515,16 @@ impl PollAttempt {
         ))
     }
 
-    pub fn preserve<T>(
+    pub fn preserve<T: PhasedToken>(
         self,
-        token: T,
+        token: T::Operation,
         poll_after_secs: u32,
         error: ProviderError,
     ) -> PollVerdict<T> {
         PollVerdict(carina_provider_protocol::types::PollVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
-                    token,
+                    token: T::from_operation(token),
                     progress: CreateProgress::Operating { identifier: None },
                     sent: self.sent,
                     poll_after_secs,
@@ -422,39 +558,33 @@ impl IssuedCreate {
         }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
-    }
-
-    /// Continue polling the post-create read after the identifier is known.
-    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
-    }
-
-    fn pending_in_phase<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        phase: PendingPhase,
-    ) -> CreateStep<T> {
+    pub fn pending<T: PhasedToken>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
-            carina_provider_protocol::types::PendingCreate {
-                token,
-                progress: match phase {
-                    PendingPhase::Operation => CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
-                        identifier: self.identifier,
-                    },
-                },
-                sent: self.sent,
-                poll_after_secs,
-            },
+            self.into_pending(token, poll_after_secs),
         ))
     }
 
-    pub fn preserve<T>(
+    fn into_pending<T: PhasedToken>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+    ) -> carina_provider_protocol::types::PendingCreate<T> {
+        carina_provider_protocol::types::PendingCreate {
+            progress: match token.phase() {
+                PendingPhase::Operation => CreateProgress::Operating {
+                    identifier: Some(self.identifier),
+                },
+                PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                    identifier: self.identifier,
+                },
+            },
+            token,
+            sent: self.sent,
+            poll_after_secs,
+        }
+    }
+
+    pub fn preserve<T: PhasedToken>(
         self,
         token: T,
         poll_after_secs: u32,
@@ -462,14 +592,7 @@ impl IssuedCreate {
     ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
-                pending: carina_provider_protocol::types::PendingCreate {
-                    token,
-                    progress: CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    sent: self.sent,
-                    poll_after_secs,
-                },
+                pending: self.into_pending(token, poll_after_secs),
                 error,
             },
         ))
@@ -595,26 +718,30 @@ impl ResumeAttempt {
         ResumedCreate { identifier }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+    pub fn pending<T: PhasedToken>(
+        self,
+        token: T::Operation,
+        poll_after_secs: u32,
+    ) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
             carina_provider_protocol::types::ResumePending {
-                token,
+                token: T::from_operation(token),
                 progress: CreateProgress::Operating { identifier: None },
                 poll_after_secs,
             },
         ))
     }
 
-    pub fn preserve<T>(
+    pub fn preserve<T: PhasedToken>(
         self,
-        token: T,
+        token: T::Operation,
         poll_after_secs: u32,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
-                    token,
+                    token: T::from_operation(token),
                     progress: CreateProgress::Operating { identifier: None },
                     poll_after_secs,
                 },
@@ -681,37 +808,32 @@ impl ResumedCreate {
         FinishingResume { identifier }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
-    }
-
-    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
-    }
-
-    fn pending_in_phase<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        phase: PendingPhase,
-    ) -> ResumeStep<T> {
+    pub fn pending<T: PhasedToken>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
-            carina_provider_protocol::types::ResumePending {
-                token,
-                progress: match phase {
-                    PendingPhase::Operation => CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
-                        identifier: self.identifier,
-                    },
-                },
-                poll_after_secs,
-            },
+            self.into_pending(token, poll_after_secs),
         ))
     }
 
-    pub fn preserve<T>(
+    fn into_pending<T: PhasedToken>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+    ) -> carina_provider_protocol::types::ResumePending<T> {
+        carina_provider_protocol::types::ResumePending {
+            progress: match token.phase() {
+                PendingPhase::Operation => CreateProgress::Operating {
+                    identifier: Some(self.identifier),
+                },
+                PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                    identifier: self.identifier,
+                },
+            },
+            token,
+            poll_after_secs,
+        }
+    }
+
+    pub fn preserve<T: PhasedToken>(
         self,
         token: T,
         poll_after_secs: u32,
@@ -719,13 +841,7 @@ impl ResumedCreate {
     ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
-                pending: carina_provider_protocol::types::ResumePending {
-                    token,
-                    progress: CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    poll_after_secs,
-                },
+                pending: self.into_pending(token, poll_after_secs),
                 error,
             },
         ))
@@ -824,15 +940,15 @@ impl FinishingResume {
 
 /// Typestate and provider-owned token passed to a create poll.
 #[derive(Debug)]
-pub enum Poll<T> {
-    Unissued(PollAttempt, T),
+pub enum Poll<T: PhasedToken> {
+    Unissued(PollAttempt, T::Operation),
     Issued(IssuedCreate, T),
 }
 
 /// Typestate and provider-owned token passed to a persisted create resume.
 #[derive(Debug)]
-pub enum Resume<T> {
-    Unissued(ResumeAttempt, T),
+pub enum Resume<T: PhasedToken> {
+    Unissued(ResumeAttempt, T::Operation),
     Issued(ResumedCreate, T),
 }
 
@@ -1010,6 +1126,22 @@ pub enum DeleteOutcome<T> {
 #[derive(Debug)]
 pub enum Never {}
 
+impl PhasedToken for Never {
+    type Operation = Self;
+
+    fn from_operation(operation: Self::Operation) -> Self {
+        match operation {}
+    }
+
+    fn into_operation(self) -> Result<Self::Operation, Self> {
+        match self {}
+    }
+
+    fn operation(&self) -> Option<&Self::Operation> {
+        match *self {}
+    }
+}
+
 impl serde::Serialize for Never {
     fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1030,220 +1162,11 @@ impl<'de> serde::Deserialize<'de> for Never {
     }
 }
 
-/// The state of one top-level desired resource attribute at normalization time.
-///
-/// The host holds unresolved attributes back from the WASM value boundary. A
-/// provider must therefore distinguish an attribute the user omitted from one
-/// whose value exists but cannot be observed until its dependency resolves.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DesiredAttribute<T> {
-    Known(T),
-    Absent,
-    Deferred,
-}
-
-/// A desired resource decoded from the WASM normalization boundary.
-///
-/// Attribute storage and the host's deferred-name set stay private so callers
-/// cannot accidentally interpret a missing map entry as user-authored
-/// absence. Use [`DesiredResource::attribute`] or
-/// [`DesiredResource::attribute_mut`] for one attribute, or
-/// [`DesiredResource::attributes`] to walk every known and deferred attribute.
-#[derive(Debug)]
-pub struct DesiredResource {
-    resource: Resource,
-    deferred: std::collections::BTreeSet<String>,
-}
-
-/// A desired resource whose normalization is complete.
-///
-/// This type is intentionally opaque. Provider implementations can create it
-/// only by calling [`DesiredResource::finish`]; the SDK's guest glue is solely
-/// responsible for encoding it onto the WASM boundary.
-///
-/// ```compile_fail
-/// use carina_plugin_sdk::{NormalizedResource, types::Resource};
-///
-/// fn expose_raw(normalized: NormalizedResource) -> Resource {
-///     let NormalizedResource { resource } = normalized;
-///     resource
-/// }
-/// ```
-#[derive(Debug)]
-pub struct NormalizedResource {
-    // Guest encoding exists only for WASM builds; host-only SDK builds still
-    // need this opaque return type in the public trait signature.
-    #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
-    resource: Resource,
-}
-
-/// An attempted insertion targeted an attribute that was not absent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DesiredAttributeError {
-    /// The name already has a known value.
-    Known { name: String },
-    /// The host is withholding the name's unresolved value.
-    Deferred { name: String },
-}
-
-impl std::fmt::Display for DesiredAttributeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Known { name } => write!(
-                formatter,
-                "attribute '{name}' is known; insert_absent requires an absent attribute"
-            ),
-            Self::Deferred { name } => write!(
-                formatter,
-                "attribute '{name}' is deferred; insert_absent requires an absent attribute"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DesiredAttributeError {}
-
-/// Invalid `desired-resource` input received from the WASM host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DesiredResourceDecodeError {
-    DuplicateDeferredAttribute { name: String },
-    DeferredAttributePresent { name: String },
-}
-
-impl std::fmt::Display for DesiredResourceDecodeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DuplicateDeferredAttribute { name } => {
-                write!(
-                    formatter,
-                    "deferred attribute name '{name}' appears more than once"
-                )
-            }
-            Self::DeferredAttributePresent { name } => write!(
-                formatter,
-                "attribute '{name}' is both present in the resource and marked deferred"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DesiredResourceDecodeError {}
-
-impl DesiredResource {
-    #[cfg(any(target_arch = "wasm32", test))]
-    fn decode(
-        resource: Resource,
-        deferred: Vec<String>,
-    ) -> Result<Self, DesiredResourceDecodeError> {
-        let mut deferred_names = std::collections::BTreeSet::new();
-        for name in deferred {
-            if !deferred_names.insert(name.clone()) {
-                return Err(DesiredResourceDecodeError::DuplicateDeferredAttribute { name });
-            }
-        }
-        if let Some(name) = deferred_names
-            .iter()
-            .find(|name| resource.attributes.contains_key(name.as_str()))
-        {
-            return Err(DesiredResourceDecodeError::DeferredAttributePresent {
-                name: name.clone(),
-            });
-        }
-        Ok(Self {
-            resource,
-            deferred: deferred_names,
-        })
-    }
-
-    /// Resource identity used for provider dispatch and diagnostics.
-    pub fn id(&self) -> &ResourceId {
-        &self.resource.id
-    }
-
-    /// Query one top-level attribute without conflating absence and deferral.
-    pub fn attribute(&self, name: &str) -> DesiredAttribute<&Value> {
-        if self.deferred.contains(name) {
-            DesiredAttribute::Deferred
-        } else {
-            self.resource
-                .attributes
-                .get(name)
-                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
-        }
-    }
-
-    /// Mutably query one known top-level attribute.
-    ///
-    /// Deferred and absent attributes cannot be synthesized through this
-    /// method; both remain explicit enum variants.
-    pub fn attribute_mut(&mut self, name: &str) -> DesiredAttribute<&mut Value> {
-        if self.deferred.contains(name) {
-            DesiredAttribute::Deferred
-        } else {
-            self.resource
-                .attributes
-                .get_mut(name)
-                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
-        }
-    }
-
-    /// Iterate over every known and deferred top-level attribute.
-    ///
-    /// Absent attributes have no name to yield. Each deferred name is emitted
-    /// explicitly as [`DesiredAttribute::Deferred`].
-    pub fn attributes(&self) -> impl Iterator<Item = (&str, DesiredAttribute<&Value>)> {
-        let known = self
-            .resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.as_str(), DesiredAttribute::Known(value)));
-        let deferred = self
-            .deferred
-            .iter()
-            .map(|name| (name.as_str(), DesiredAttribute::Deferred));
-        known.chain(deferred)
-    }
-
-    /// Insert a top-level attribute only when it is truly absent.
-    ///
-    /// Known and deferred names produce distinct typed errors. In particular,
-    /// a deferred name cannot be replaced while its value is withheld by the
-    /// host.
-    pub fn insert_absent(
-        &mut self,
-        name: impl Into<String>,
-        value: Value,
-    ) -> Result<(), DesiredAttributeError> {
-        use std::collections::btree_map::Entry;
-
-        let name = name.into();
-        if self.deferred.contains(&name) {
-            return Err(DesiredAttributeError::Deferred { name });
-        }
-        match self.resource.attributes.entry(name) {
-            Entry::Vacant(entry) => {
-                entry.insert(value);
-                Ok(())
-            }
-            Entry::Occupied(entry) => Err(DesiredAttributeError::Known {
-                name: entry.key().clone(),
-            }),
-        }
-    }
-
-    /// Finish normalization and seal the resource for the SDK's guest glue.
-    pub fn finish(self) -> NormalizedResource {
-        NormalizedResource {
-            resource: self.resource,
-        }
-    }
-}
-
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
-    type CreateToken: serde::Serialize + serde::de::DeserializeOwned;
-    type UpdateToken: serde::Serialize + serde::de::DeserializeOwned;
+    type CreateToken: PhasedToken + serde::Serialize + serde::de::DeserializeOwned;
+    type UpdateToken: PhasedToken + serde::Serialize + serde::de::DeserializeOwned;
     type DeleteToken: serde::Serialize + serde::de::DeserializeOwned;
 
     /// Return provider name and display name.
@@ -1263,6 +1186,42 @@ pub trait CarinaProvider {
     /// Resource schemas, config, and this table are admitted together before
     /// any schema metadata is emitted.
     fn reference_forms(&self) -> ReferenceForms;
+
+    /// Resolve comparison-only leaves in this initialized provider instance.
+    /// Results are positional. Unsupported identities fail individually.
+    fn resolve_references(
+        &self,
+        requests: Vec<types::ReferenceRequest>,
+    ) -> Result<Vec<Result<types::ReferenceOutcome, types::ReferenceError>>, ProviderError> {
+        Ok(requests
+            .into_iter()
+            .map(|request| {
+                let types::TypeIdentity {
+                    provider,
+                    segments,
+                    kind,
+                } = request.ty;
+                let identity = std::iter::once(provider)
+                    .chain(segments)
+                    .chain(std::iter::once(kind))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Err(types::ReferenceError::InvalidReference(Box::new(
+                    ProviderError {
+                        kind: types::ProviderErrorKind::InvalidInput,
+                        message: format!("unsupported reference identity {identity}"),
+                        resource_id: None,
+                        cause: None,
+                        provider_name: None,
+                        operation: Some("resolve_references".into()),
+                        status: None,
+                        code: None,
+                        request_id: None,
+                    },
+                )))
+            })
+            .collect())
+    }
 
     /// Return the types of the provider block's configuration attributes
     /// (e.g., `region`). The host uses these to validate attributes
@@ -1335,11 +1294,11 @@ pub trait CarinaProvider {
 
     /// Continue a create operation loaded from state. `poll_request` has the
     /// same host-owned finality and monotonic read-back semantics as
-    /// [`CarinaProvider::poll_create`]. On the first call after loading state,
-    /// the WIT transport's inbound phase and delay are non-authoritative because
-    /// state retains only the token and optional identifier; the SDK does not
-    /// expose those scheduling fields here. Recover the actual phase from the
-    /// token or cloud operation and set it on any pending result returned.
+    /// [`CarinaProvider::poll_create`]. SDK dispatch rejects a token that would
+    /// regress the host's read-back progress to operation. The first call uses
+    /// operation progress because state retains no scheduling metadata. A saved
+    /// read-back token with an identifier can resume through an issued handle;
+    /// its next pending or preserved result reports read-back progress.
     fn resume_create(
         &self,
         id: &ResourceId,
@@ -1437,20 +1396,50 @@ pub trait CarinaProvider {
         vec![]
     }
 
-    /// Normalize desired resources (optional).
+    /// Normalize desired resources through a structural [`DesiredView`].
     ///
-    /// Every attribute lookup is a three-way query: [`DesiredAttribute::Known`],
-    /// [`DesiredAttribute::Absent`], or [`DesiredAttribute::Deferred`], because
-    /// the host temporarily withholds unresolved values from WASM. Use
-    /// [`DesiredResource::attributes`] for a generic walk,
-    /// [`DesiredResource::attribute_mut`] to edit known values, and
-    /// [`DesiredResource::insert_absent`] to add a value only when it is truly
-    /// absent. Return each resource by calling [`DesiredResource::finish`].
+    /// Consume each [`DesiredResource`] with [`DesiredResource::into_normalization`],
+    /// edit known leaves through [`DesiredNormalization::view`], and return its
+    /// checked [`DesiredNormalization::finish`]. Lists/maps remain visible beside
+    /// opaque secret/reference/unknown leaves. Every deferred leaf must survive
+    /// exactly once within its original resource and top-level attribute.
+    /// Validate cross-field inputs with [`DesiredView::inputs`] here, or
+    /// [`DesiredInputs::from_core`] during native create/update validation.
+    /// That projection keeps secrets/references deferred; CRUD bodies still get
+    /// real secret values. Move nodes with [`DesiredMap::remove`] followed by
+    /// [`DesiredMap::insert_absent`], or reorder with [`DesiredList::move_within`].
+    /// Each deferred leaf must remain in its original top-level attribute.
+    ///
+    /// Both routes call the same function and propagate errors with `?`. Native
+    /// builders/finish return core provider errors with the original resource id
+    /// and provider instance; the typed normalization error remains accessible
+    /// through `detail().cause()`. Guest errors use the protocol error type.
+    ///
+    /// ```
+    /// use carina_plugin_sdk::{DesiredResource, DesiredView, NativeDesiredNormalization,
+    ///     NormalizedResource, types::ProviderError};
+    /// use carina_plugin_sdk::core::{provider::ProviderResult, resource::ProviderResource};
+    /// # fn shared(_: &mut DesiredView<'_>) {}
+    /// fn native(resource: &mut ProviderResource) -> ProviderResult<()> {
+    ///     let mut desired = NativeDesiredNormalization::from_core(resource)?;
+    ///     shared(&mut desired.view());
+    ///     desired.finish()?;
+    ///     Ok(())
+    /// }
+    /// fn wasm(resource: DesiredResource) -> Result<NormalizedResource, ProviderError> {
+    ///     let mut desired = resource.into_normalization()?;
+    ///     shared(&mut desired.view());
+    ///     Ok(desired.finish()?)
+    /// }
+    /// ```
     fn normalize_desired(
         &self,
         resources: Vec<DesiredResource>,
     ) -> Result<Vec<NormalizedResource>, ProviderError> {
-        Ok(resources.into_iter().map(DesiredResource::finish).collect())
+        resources
+            .into_iter()
+            .map(|resource| resource.finish().map_err(Into::into))
+            .collect()
     }
 
     /// Normalize read-back state (optional).
@@ -1485,19 +1474,49 @@ pub fn dispatch_create<P: CarinaProvider + ?Sized>(
         .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
 
+/// Whether a token would move the host's continuation backward in phase.
+/// Operation progress may advance to a read-back token, including on the first
+/// resume call when persisted state has no phase metadata.
+#[doc(hidden)]
+pub const fn continuation_phase_regresses(
+    host_phase: PendingPhase,
+    token_phase: PendingPhase,
+) -> bool {
+    matches!(
+        (host_phase, token_phase),
+        (PendingPhase::ReadBack, PendingPhase::Operation)
+    )
+}
+
 /// Fixed guest-transport seam for polling a host-owned continuation.
+///
+/// A backward phase transition preserves the previous continuation via `Undetermined`.
+/// An identifier-bearing operation continuation may advance to a read-back token.
+/// A read-back token without an identifier ends polling via `Untracked`.
 pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
     provider: &P,
     id: &ResourceId,
     request: CreateRequest,
-    identifier: Option<AppliedIdentifier>,
+    progress: CreateProgress,
     sent: Sent,
     token: P::CreateToken,
     poll_request: PollRequest,
 ) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict<P::CreateToken>>> {
-    let poll = match identifier {
+    if continuation_phase_regresses(progress.phase(), token.phase()) {
+        return Err(Box::new(types::PollVerdict::Undetermined(
+            create_phase_mismatch(id),
+        )));
+    }
+    let poll = match progress.into_identifier() {
         Some(identifier) => Poll::Issued(IssuedCreate::from_parts(identifier, sent), token),
-        None => Poll::Unissued(PollAttempt::from_sent(sent), token),
+        None => Poll::Unissued(
+            PollAttempt::from_sent(sent),
+            token.into_operation().map_err(|_token| {
+                Box::new(types::PollVerdict::Untracked(read_back_without_identifier(
+                    id,
+                )))
+            })?,
+        ),
     };
     provider
         .poll_create(id, request, poll, poll_request)
@@ -1506,17 +1525,31 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
 }
 
 /// Fixed guest-transport seam for resuming a state-owned continuation.
+///
+/// Applies the same phase and identifier checks as [`dispatch_poll_create`].
 pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
     provider: &P,
     id: &ResourceId,
     request: CreateRequest,
-    identifier: Option<AppliedIdentifier>,
+    progress: CreateProgress,
     token: P::CreateToken,
     poll_request: PollRequest,
 ) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict<P::CreateToken>>> {
-    let resume = match identifier {
+    if continuation_phase_regresses(progress.phase(), token.phase()) {
+        return Err(Box::new(types::ResumeVerdict::Undetermined(
+            create_phase_mismatch(id),
+        )));
+    }
+    let resume = match progress.into_identifier() {
         Some(identifier) => Resume::Issued(ResumedCreate::new(identifier), token),
-        None => Resume::Unissued(ResumeAttempt::new(), token),
+        None => Resume::Unissued(
+            ResumeAttempt::new(),
+            token.into_operation().map_err(|_token| {
+                Box::new(types::ResumeVerdict::Untracked(
+                    read_back_without_identifier(id),
+                ))
+            })?,
+        ),
     };
     provider
         .resume_create(id, request, resume, poll_request)
@@ -1524,19 +1557,74 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
         .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
 
+fn create_phase_mismatch(id: &ResourceId) -> ProviderError {
+    ProviderError {
+        kind: types::ProviderErrorKind::Internal,
+        message: "create continuation phase does not match its token".to_string(),
+        resource_id: Some(id.clone()),
+        cause: None,
+        provider_name: None,
+        operation: None,
+        status: None,
+        code: Some("CREATE_CONTINUATION_PHASE_MISMATCH".to_string()),
+        request_id: None,
+    }
+}
+
+fn read_back_without_identifier(id: &ResourceId) -> ProviderError {
+    ProviderError {
+        kind: types::ProviderErrorKind::InvalidInput,
+        message: "read-back continuation requires an identifier".to_string(),
+        resource_id: Some(id.clone()),
+        cause: None,
+        provider_name: None,
+        operation: None,
+        status: None,
+        code: Some("READ_BACK_WITHOUT_IDENTIFIER".to_string()),
+        request_id: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
 
-    struct SchemaOnlyProvider {
+    #[test]
+    fn default_reference_resolver_rejects_every_unsupported_identity() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: BTreeMap::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let requests = ["First", "Second"]
+            .into_iter()
+            .map(|kind| types::ReferenceRequest {
+                ty: TypeIdentity {
+                    provider: "test".into(),
+                    segments: vec!["keys".into()],
+                    kind: kind.into(),
+                },
+                value: "alias/example".into(),
+            })
+            .collect();
+        let results = provider.resolve_references(requests).unwrap();
+        assert_eq!(results.len(), 2);
+        for (result, name) in results.into_iter().zip(["First", "Second"]) {
+            assert!(
+                matches!(result, Err(types::ReferenceError::InvalidReference(error)) if error.message.contains(&format!("test.keys.{name}")))
+            );
+        }
+    }
+
+    struct TestProvider {
         resources: Vec<ValidatedResourceSchema>,
         forms: carina_core::schema::ReferenceForms,
         reference_form_calls: Cell<usize>,
     }
 
-    impl CarinaProvider for SchemaOnlyProvider {
-        type CreateToken = Never;
+    impl CarinaProvider for TestProvider {
+        type CreateToken = TestToken;
         type UpdateToken = Never;
         type DeleteToken = Never;
 
@@ -1600,20 +1688,32 @@ mod tests {
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-            _poll: Poll<Self::CreateToken>,
+            poll: Poll<Self::CreateToken>,
             _poll_request: PollRequest,
         ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
-            unimplemented!("schema-only provider")
+            Err(match poll {
+                Poll::Unissued(attempt, operation) => {
+                    attempt.preserve(operation, 7, continuation_error())
+                }
+                Poll::Issued(issued, token) => {
+                    issued.preserve(token, 7, continuation_error()).into()
+                }
+            })
         }
 
         fn resume_create(
             &self,
             _id: &ResourceId,
             _request: CreateRequest,
-            _resume: Resume<Self::CreateToken>,
+            resume: Resume<Self::CreateToken>,
             _poll_request: PollRequest,
         ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
-            unimplemented!("schema-only provider")
+            Err(match resume {
+                Resume::Unissued(attempt, operation) => {
+                    attempt.preserve(operation, 9, continuation_error())
+                }
+                Resume::Issued(resumed, token) => resumed.preserve(token, 9, continuation_error()),
+            })
         }
 
         fn update(
@@ -1680,7 +1780,7 @@ mod tests {
     #[test]
     fn provider_schema_cache_rejects_a_form_for_an_undeclared_identity() {
         let identity = reference_identity();
-        let provider = SchemaOnlyProvider {
+        let provider = TestProvider {
             resources: Vec::new(),
             forms: BTreeMap::from([(identity.clone(), reference_form())]),
             reference_form_calls: Cell::new(0),
@@ -1716,7 +1816,7 @@ mod tests {
             )
             .validate()
             .unwrap();
-        let provider = SchemaOnlyProvider {
+        let provider = TestProvider {
             resources: vec![schema],
             forms: BTreeMap::from([(identity, reference_form())]),
             reference_form_calls: Cell::new(0),
@@ -1801,17 +1901,165 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v16");
+            .expect_err("a validated schema must always be projectable to the current protocol");
 
-        assert!(error.to_string().contains("protocol v16"), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "protocol v{}",
+                carina_provider_protocol::PROTOCOL_VERSION
+            )),
+            "{error}"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    enum TestToken {
+        Operation,
+        ReadBack,
+    }
+
+    impl PhasedToken for TestToken {
+        type Operation = ();
+
+        fn from_operation((): ()) -> Self {
+            Self::Operation
+        }
+
+        fn into_operation(self) -> Result<(), Self> {
+            match self {
+                Self::Operation => Ok(()),
+                Self::ReadBack => Err(self),
+            }
+        }
+
+        fn operation(&self) -> Option<&()> {
+            match self {
+                Self::Operation => Some(&()),
+                Self::ReadBack => None,
+            }
+        }
+    }
+
+    fn crud_resource(attributes: BTreeMap<String, Value>) -> types::Resource {
+        types::Resource {
+            id: types::ResourceId {
+                provider: "test".into(),
+                resource_type: "test.Widget".into(),
+                identity: "example".into(),
+            },
+            attributes,
+            directives: types::Directives::default(),
+        }
+    }
+
+    fn continuation_error() -> ProviderError {
+        ProviderError {
+            kind: types::ProviderErrorKind::Internal,
+            message: "transient continuation error".to_string(),
+            resource_id: None,
+            cause: None,
+            provider_name: None,
+            operation: None,
+            status: None,
+            code: None,
+            request_id: None,
+        }
     }
 
     #[test]
-    fn read_back_create_and_resume_progress_keep_the_issued_identifier() {
+    fn issued_create_preserve_follows_read_back_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let error = continuation_error();
+        let verdict = CreateAttempt::new()
+            .issued(identifier.clone(), Sent::only(["name"]))
+            .preserve(TestToken::ReadBack, 7, error.clone())
+            .into_protocol();
+        let types::CreateVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::ReadingBack { identifier }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::ReadBack);
+        assert_eq!(in_flight.pending.sent, Sent::only(["name"]));
+        assert_eq!(in_flight.pending.poll_after_secs, 7);
+        assert_eq!(
+            serde_json::to_value(in_flight.error).unwrap(),
+            serde_json::to_value(error).unwrap()
+        );
+    }
+
+    #[test]
+    fn issued_create_preserve_follows_operation_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let verdict = CreateAttempt::new()
+            .issued(identifier.clone(), Sent::AllRequestAttributes)
+            .preserve(TestToken::Operation, 3, continuation_error())
+            .into_protocol();
+        let types::CreateVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::Operating {
+                identifier: Some(identifier)
+            }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::Operation);
+        assert_eq!(in_flight.pending.sent, Sent::AllRequestAttributes);
+        assert_eq!(in_flight.pending.poll_after_secs, 3);
+    }
+
+    #[test]
+    fn resumed_create_preserve_follows_read_back_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let error = continuation_error();
+        let verdict = ResumeAttempt::new()
+            .issued(identifier.clone())
+            .preserve(TestToken::ReadBack, 9, error.clone())
+            .into_protocol();
+        let types::ResumeVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::ReadingBack { identifier }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::ReadBack);
+        assert_eq!(in_flight.pending.poll_after_secs, 9);
+        assert_eq!(
+            serde_json::to_value(in_flight.error).unwrap(),
+            serde_json::to_value(error).unwrap()
+        );
+    }
+
+    #[test]
+    fn resumed_create_preserve_follows_operation_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let verdict = ResumeAttempt::new()
+            .issued(identifier.clone())
+            .preserve(TestToken::Operation, 5, continuation_error())
+            .into_protocol();
+        let types::ResumeVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::Operating {
+                identifier: Some(identifier)
+            }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::Operation);
+        assert_eq!(in_flight.pending.poll_after_secs, 5);
+    }
+
+    #[test]
+    fn pending_create_and_resume_follow_read_back_token_phase() {
         let identifier = AppliedIdentifier::new("created-id").unwrap();
         let create = CreateAttempt::new()
             .issued(identifier.clone(), Sent::only(["name"]))
-            .pending_read_back("create-token", 7)
+            .pending(TestToken::ReadBack, 7)
             .into_protocol();
         let carina_provider_protocol::types::CreateStep::Pending(create) = create else {
             panic!("issued create must remain pending")
@@ -1825,7 +2073,7 @@ mod tests {
         assert_eq!(create.sent, Sent::only(["name"]));
         let resume = ResumeAttempt::new()
             .issued(identifier.clone())
-            .pending_read_back("resume-token", 9)
+            .pending(TestToken::ReadBack, 9)
             .into_protocol();
         let carina_provider_protocol::types::ResumeStep::Pending(resume) = resume else {
             panic!("issued resume must remain pending")
@@ -1834,158 +2082,347 @@ mod tests {
     }
 
     #[test]
+    fn pending_update_follows_token_phase() {
+        for (token, phase) in [
+            (TestToken::Operation, PendingPhase::Operation),
+            (TestToken::ReadBack, PendingPhase::ReadBack),
+        ] {
+            let pending = Pending::new(token, 4);
+            assert_eq!(pending.phase(), phase);
+            assert_eq!(pending.token, token);
+            assert_eq!(pending.poll_after_secs, 4);
+        }
+    }
+
+    #[test]
+    fn operation_payload_round_trips_without_accepting_read_back() {
+        assert_eq!(
+            TestToken::ReadBack.into_operation().unwrap_err(),
+            TestToken::ReadBack
+        );
+        TestToken::Operation.into_operation().unwrap();
+        assert_eq!(TestToken::from_operation(()), TestToken::Operation);
+    }
+
+    #[test]
+    fn identifierless_dispatch_ends_invalid_read_back_before_calling_provider() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = crud_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        let request = CreateRequest { resource };
+        let poll_request = PollRequest {
+            finality: PollFinality::Continue,
+        };
+        let verdict = dispatch_poll_create(
+            &provider,
+            &id,
+            request.clone(),
+            CreateProgress::Operating { identifier: None },
+            Sent::AllRequestAttributes,
+            TestToken::ReadBack,
+            poll_request,
+        )
+        .unwrap_err();
+        let types::PollVerdict::Untracked(error) = *verdict else {
+            panic!("invalid read-back must end polling, got {verdict:?}");
+        };
+        assert!(error.message.contains("requires an identifier"));
+        assert_eq!(error.code.as_deref(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
+        assert_eq!(error.kind, types::ProviderErrorKind::InvalidInput);
+        assert_eq!(error.resource_id, Some(id.clone()));
+
+        let verdict = dispatch_resume_create(
+            &provider,
+            &id,
+            request,
+            CreateProgress::Operating { identifier: None },
+            TestToken::ReadBack,
+            poll_request,
+        )
+        .unwrap_err();
+        let types::ResumeVerdict::Untracked(error) = *verdict else {
+            panic!("invalid resumed read-back must end polling, got {verdict:?}");
+        };
+        assert!(error.message.contains("requires an identifier"));
+        assert_eq!(error.code.as_deref(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
+        assert_eq!(error.kind, types::ProviderErrorKind::InvalidInput);
+        assert_eq!(error.resource_id, Some(id));
+    }
+
+    #[test]
+    fn poll_dispatch_rejects_backward_phase_transition() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = crud_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        let verdict = dispatch_poll_create(
+            &provider,
+            &id,
+            CreateRequest {
+                resource: resource.clone(),
+            },
+            CreateProgress::ReadingBack {
+                identifier: AppliedIdentifier::new("created-id").unwrap(),
+            },
+            Sent::AllRequestAttributes,
+            TestToken::Operation,
+            PollRequest {
+                finality: PollFinality::Continue,
+            },
+        )
+        .unwrap_err();
+        let types::PollVerdict::Undetermined(error) = *verdict else {
+            panic!("a regression must keep the previous continuation, got {verdict:?}");
+        };
+        assert!(error.message.contains("phase does not match its token"));
+        assert_eq!(
+            error.code.as_deref(),
+            Some("CREATE_CONTINUATION_PHASE_MISMATCH")
+        );
+        assert_eq!(error.resource_id, Some(id.clone()));
+    }
+
+    #[test]
+    fn resume_dispatch_rejects_backward_phase_transition() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = crud_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        let verdict = dispatch_resume_create(
+            &provider,
+            &id,
+            CreateRequest {
+                resource: resource.clone(),
+            },
+            CreateProgress::ReadingBack {
+                identifier: AppliedIdentifier::new("created-id").unwrap(),
+            },
+            TestToken::Operation,
+            PollRequest {
+                finality: PollFinality::Continue,
+            },
+        )
+        .unwrap_err();
+        let types::ResumeVerdict::Undetermined(error) = *verdict else {
+            panic!("a regression must keep the previous continuation, got {verdict:?}");
+        };
+        assert!(error.message.contains("phase does not match its token"));
+        assert_eq!(
+            error.code.as_deref(),
+            Some("CREATE_CONTINUATION_PHASE_MISMATCH")
+        );
+        assert_eq!(error.resource_id, Some(id.clone()));
+    }
+
+    #[test]
+    fn poll_dispatch_accepts_forward_read_back_transition() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = crud_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let sent = Sent::only(["name"]);
+        let verdict = dispatch_poll_create(
+            &provider,
+            &id,
+            CreateRequest { resource },
+            CreateProgress::Operating {
+                identifier: Some(identifier.clone()),
+            },
+            sent.clone(),
+            TestToken::ReadBack,
+            PollRequest {
+                finality: PollFinality::Continue,
+            },
+        )
+        .unwrap_err();
+        let types::PollVerdict::InFlight(in_flight) = *verdict else {
+            panic!("a forward transition must reach the provider, got {verdict:?}");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::ReadingBack { identifier }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::ReadBack);
+        assert_eq!(in_flight.pending.sent, sent);
+        assert_eq!(in_flight.pending.poll_after_secs, 7);
+        assert_eq!(in_flight.error.message, continuation_error().message);
+    }
+
+    #[test]
+    fn resume_dispatch_accepts_forward_read_back_transition() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = crud_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let verdict = dispatch_resume_create(
+            &provider,
+            &id,
+            CreateRequest { resource },
+            CreateProgress::Operating {
+                identifier: Some(identifier.clone()),
+            },
+            TestToken::ReadBack,
+            PollRequest {
+                finality: PollFinality::Continue,
+            },
+        )
+        .unwrap_err();
+        let types::ResumeVerdict::InFlight(in_flight) = *verdict else {
+            panic!("a forward transition must reach the provider, got {verdict:?}");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::ReadingBack { identifier }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::ReadBack);
+        assert_eq!(in_flight.pending.poll_after_secs, 9);
+        assert_eq!(in_flight.error.message, continuation_error().message);
+    }
+
+    #[test]
+    fn update_dispatch_rejects_backward_phase_transition() {
+        let token = serde_json::to_string(&TestToken::Operation).unwrap();
+        let error =
+            wasm_guest::decode_pending_update::<TestToken>(&token, 4, PendingPhase::ReadBack)
+                .unwrap_err();
+        assert!(error.to_string().contains("phase does not match its token"));
+    }
+
+    #[test]
+    fn update_dispatch_accepts_forward_read_back_transition() {
+        let token = serde_json::to_string(&TestToken::ReadBack).unwrap();
+        let pending =
+            wasm_guest::decode_pending_update::<TestToken>(&token, 4, PendingPhase::Operation)
+                .expect("a read-back token may advance operation progress");
+        assert_eq!(pending.token, TestToken::ReadBack);
+        assert_eq!(pending.phase(), PendingPhase::ReadBack);
+        assert_eq!(pending.poll_after_secs, 4);
+    }
+
+    #[test]
+    fn update_dispatch_accepts_matching_phases() {
+        for token in [TestToken::Operation, TestToken::ReadBack] {
+            let encoded = serde_json::to_string(&token).unwrap();
+            let pending =
+                wasm_guest::decode_pending_update::<TestToken>(&encoded, 4, token.phase()).unwrap();
+            assert_eq!(pending.token, token);
+            assert_eq!(pending.phase(), token.phase());
+            assert_eq!(pending.poll_after_secs, 4);
+        }
+    }
+
+    fn matching_create_continuations() -> [(CreateProgress, TestToken); 3] {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        [
+            (
+                CreateProgress::Operating { identifier: None },
+                TestToken::Operation,
+            ),
+            (
+                CreateProgress::Operating {
+                    identifier: Some(identifier.clone()),
+                },
+                TestToken::Operation,
+            ),
+            (
+                CreateProgress::ReadingBack { identifier },
+                TestToken::ReadBack,
+            ),
+        ]
+    }
+
+    #[test]
+    fn poll_dispatch_preserves_matching_continuations_in_both_phases() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = crud_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        let sent = Sent::only(["name"]);
+        for (progress, token) in matching_create_continuations() {
+            let verdict = dispatch_poll_create(
+                &provider,
+                &id,
+                CreateRequest {
+                    resource: resource.clone(),
+                },
+                progress.clone(),
+                sent.clone(),
+                token,
+                PollRequest {
+                    finality: PollFinality::Continue,
+                },
+            )
+            .unwrap_err();
+            let types::PollVerdict::InFlight(in_flight) = *verdict else {
+                panic!("a matching continuation must reach the provider, got {verdict:?}");
+            };
+            assert_eq!(in_flight.pending.progress, progress);
+            assert_eq!(in_flight.pending.token, token);
+            assert_eq!(in_flight.pending.sent, sent);
+            assert_eq!(in_flight.pending.poll_after_secs, 7);
+            assert_eq!(in_flight.error.message, continuation_error().message);
+        }
+    }
+
+    #[test]
+    fn resume_dispatch_preserves_matching_continuations_in_both_phases() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = crud_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        for (progress, token) in matching_create_continuations() {
+            let verdict = dispatch_resume_create(
+                &provider,
+                &id,
+                CreateRequest {
+                    resource: resource.clone(),
+                },
+                progress.clone(),
+                token,
+                PollRequest {
+                    finality: PollFinality::Continue,
+                },
+            )
+            .unwrap_err();
+            let types::ResumeVerdict::InFlight(in_flight) = *verdict else {
+                panic!("a matching continuation must reach the provider, got {verdict:?}");
+            };
+            assert_eq!(in_flight.pending.progress, progress);
+            assert_eq!(in_flight.pending.token, token);
+            assert_eq!(in_flight.pending.poll_after_secs, 9);
+            assert_eq!(in_flight.error.message, continuation_error().message);
+        }
+    }
+
+    #[test]
     fn never_token_decode_always_fails() {
         for encoded in ["null", "{}", "0", "\"token\""] {
             assert!(serde_json::from_str::<Never>(encoded).is_err());
         }
-        assert!(
-            serde_json::from_str::<Pending<Never>>(r#"{"token":null,"poll_after_secs":1}"#,)
-                .is_err()
-        );
-    }
-
-    fn desired_resource(attributes: BTreeMap<String, Value>) -> Resource {
-        Resource {
-            id: ResourceId {
-                provider: "test".to_string(),
-                resource_type: "test.Widget".to_string(),
-                identity: "example".to_string(),
-            },
-            attributes,
-            directives: types::Directives::default(),
-        }
-    }
-
-    #[test]
-    fn desired_resource_exposes_known_absent_and_deferred_attributes() {
-        let mut desired = DesiredResource::decode(
-            desired_resource(BTreeMap::from([(
-                "known".to_string(),
-                Value::String("before".to_string()),
-            )])),
-            vec!["deferred".to_string()],
-        )
-        .expect("valid desired resource");
-
-        assert!(matches!(
-            desired.attribute("known"),
-            DesiredAttribute::Known(Value::String(value)) if value == "before"
-        ));
-        assert!(matches!(
-            desired.attribute("absent"),
-            DesiredAttribute::Absent
-        ));
-        assert!(matches!(
-            desired.attribute("deferred"),
-            DesiredAttribute::Deferred
-        ));
-
-        match desired.attribute_mut("known") {
-            DesiredAttribute::Known(value) => *value = Value::String("after".to_string()),
-            DesiredAttribute::Absent | DesiredAttribute::Deferred => {
-                panic!("known attribute must remain mutable")
-            }
-        }
-        assert!(matches!(
-            desired.attribute_mut("deferred"),
-            DesiredAttribute::Deferred
-        ));
-
-        let normalized = desired.finish();
-        assert_eq!(
-            normalized.resource.attributes.get("known"),
-            Some(&Value::String("after".to_string()))
-        );
-        assert!(!normalized.resource.attributes.contains_key("deferred"));
-    }
-
-    #[test]
-    fn desired_resource_iteration_and_absent_insertion_preserve_three_way_state() {
-        let mut desired = DesiredResource::decode(
-            desired_resource(BTreeMap::from([(
-                "known".to_string(),
-                Value::String("configured".to_string()),
-            )])),
-            vec!["deferred".to_string()],
-        )
-        .expect("valid desired resource");
-
-        let states = desired
-            .attributes()
-            .map(|(name, attribute)| {
-                let state = match attribute {
-                    DesiredAttribute::Known(_) => "known",
-                    DesiredAttribute::Deferred => "deferred",
-                    DesiredAttribute::Absent => unreachable!("absent names are not iterable"),
-                };
-                (name, state)
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            states,
-            BTreeMap::from([("deferred", "deferred"), ("known", "known")])
-        );
-
-        let deferred_error = desired
-            .insert_absent("deferred", Value::String("replacement".to_string()))
-            .expect_err("a deferred attribute is not absent");
-        assert_eq!(
-            deferred_error,
-            DesiredAttributeError::Deferred {
-                name: "deferred".to_string()
-            }
-        );
-
-        let known_error = desired
-            .insert_absent("known", Value::String("replacement".to_string()))
-            .expect_err("a known attribute is not absent");
-        assert_eq!(
-            known_error,
-            DesiredAttributeError::Known {
-                name: "known".to_string()
-            }
-        );
-
-        desired
-            .insert_absent("absent", Value::String("default".to_string()))
-            .expect("an absent attribute accepts a default");
-        assert!(matches!(
-            desired.attribute("absent"),
-            DesiredAttribute::Known(Value::String(value)) if value == "default"
-        ));
-    }
-
-    #[test]
-    fn desired_resource_rejects_duplicate_deferred_names() {
-        let error = DesiredResource::decode(
-            desired_resource(BTreeMap::new()),
-            vec!["pending".to_string(), "pending".to_string()],
-        )
-        .expect_err("duplicate deferred names must be rejected");
-
-        assert!(matches!(
-            error,
-            DesiredResourceDecodeError::DuplicateDeferredAttribute { name }
-                if name == "pending"
-        ));
-    }
-
-    #[test]
-    fn desired_resource_rejects_present_deferred_attribute() {
-        let error = DesiredResource::decode(
-            desired_resource(BTreeMap::from([(
-                "pending".to_string(),
-                Value::String("guest-visible".to_string()),
-            )])),
-            vec!["pending".to_string()],
-        )
-        .expect_err("an attribute cannot be both present and deferred");
-
-        assert!(matches!(
-            error,
-            DesiredResourceDecodeError::DeferredAttributePresent { name }
-                if name == "pending"
-        ));
     }
 
     #[test]

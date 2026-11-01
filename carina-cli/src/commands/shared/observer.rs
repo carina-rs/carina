@@ -3,13 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::output_style::Colorize;
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::plan::Plan;
 use carina_core::provider::PartialReadDiagnostic;
 use carina_core::resource::ModuleSource;
 use carina_core::value::format_value_user_facing;
 use carina_core::wait::WaitObservation;
-use colored::Colorize;
 
 use crate::commands::shared::progress::{
     EffectProgressKey, FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressSink,
@@ -36,28 +36,36 @@ pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [
 pub(crate) struct CliObserver<S = ModuleSource> {
     progress: ProgressBackend<EffectProgressKey<S>>,
     project_dir: PathBuf,
+    color_mode: crate::output_style::ColorMode,
 }
 
 impl<S> CliObserver<S> {
     /// Create a new observer using stderr's terminal state.
-    pub(crate) fn new(_plan: &Plan<S>, project_dir: &Path) -> Self
+    pub(crate) fn new(
+        color_mode: crate::output_style::ColorMode,
+        _plan: &Plan<S>,
+        project_dir: &Path,
+    ) -> Self
     where
         S: 'static,
     {
         Self {
-            progress: ProgressBackend::new(ProgressSink::Human),
+            progress: ProgressBackend::new(color_mode, ProgressSink::Human),
             project_dir: project_dir.to_path_buf(),
+            color_mode,
         }
     }
 }
 
 impl<S> ExecutionObserver<S> for CliObserver<S> {
     fn on_event(&self, event: &ExecutionEvent<S>) {
-        handle_event(&self.progress, event, &self.project_dir);
+        let color_mode = self.color_mode;
+        handle_event(color_mode, &self.progress, event, &self.project_dir);
     }
 }
 
 fn handle_event<S>(
+    color_mode: crate::output_style::ColorMode,
     progress_backend: &ProgressBackend<EffectProgressKey<S>>,
     event: &ExecutionEvent<S>,
     project_dir: &Path,
@@ -72,7 +80,7 @@ fn handle_event<S>(
         }
         ExecutionEvent::EffectInterrupted { effect, progress } => {
             let key = EffectProgressKey::new(effect);
-            let counter = format_progress(progress).dimmed();
+            let counter = format_progress(progress).dimmed(color_mode);
             let outcome = NonFailureOutcome::unknown(format!(
                 "{} - interrupted (outcome unknown) {}",
                 format_effect(effect),
@@ -87,8 +95,8 @@ fn handle_event<S>(
             ..
         } => {
             let key = EffectProgressKey::new(effect);
-            let timing = format!("took {}", format_duration(*duration)).dimmed();
-            let counter = format_progress(progress).dimmed();
+            let timing = format!("took {}", format_duration(*duration)).dimmed(color_mode);
+            let counter = format_progress(progress).dimmed(color_mode);
             let outcome = NonFailureOutcome::success(format!(
                 "{} {} {}",
                 format_effect(effect),
@@ -105,8 +113,8 @@ fn handle_event<S>(
             ..
         } => {
             let key = EffectProgressKey::new(effect);
-            let timing = format!("took {}", format_duration(*duration)).dimmed();
-            let counter = format_progress(progress).dimmed();
+            let timing = format!("took {}", format_duration(*duration)).dimmed(color_mode);
+            let counter = format_progress(progress).dimmed(color_mode);
             let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
             let outcome = NonFailureOutcome::partial(
                 format!("{} (partial) {} {}", format_effect(effect), timing, counter),
@@ -122,8 +130,8 @@ fn handle_event<S>(
             progress,
         } => {
             let key = EffectProgressKey::new(effect);
-            let timing = format!("took {}", format_duration(*duration)).dimmed();
-            let counter = format_progress(progress).dimmed();
+            let timing = format!("took {}", format_duration(*duration)).dimmed(color_mode);
+            let counter = format_progress(progress).dimmed(color_mode);
             let mut details = vec![failure.to_string()];
             if let Some(recovery) = recovery {
                 details.push(recovery.display_with_project_dir(project_dir).to_string());
@@ -140,7 +148,7 @@ fn handle_event<S>(
             progress,
         } => {
             let key = EffectProgressKey::new(effect);
-            let counter = format_progress(progress).dimmed();
+            let counter = format_progress(progress).dimmed(color_mode);
             let outcome = NonFailureOutcome::skipped(format!(
                 "{} - {} {}",
                 format_effect(effect),
@@ -182,7 +190,7 @@ fn handle_event<S>(
         ExecutionEvent::RefreshStarted => {
             progress_backend.section_header(format!(
                 "{}",
-                "Refreshing uncertain resource states...".cyan()
+                "Refreshing uncertain resource states...".cyan(color_mode)
             ));
         }
         ExecutionEvent::RefreshSucceeded { id } => {
@@ -191,7 +199,7 @@ fn handle_event<S>(
         ExecutionEvent::RefreshFailed { id, error } => {
             progress_backend.info_line(format!(
                 "{} Refresh {} - {}",
-                "!".yellow(),
+                "!".yellow(color_mode),
                 id,
                 carina_core::executor::render_error_chain(*error)
             ));
@@ -231,7 +239,7 @@ fn format_wait_observed_attr(observation: &WaitObservation) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
@@ -263,14 +271,18 @@ mod tests {
         }
     }
 
-    fn plain_output(event: &ExecutionEvent) -> String {
-        plain_output_at(event, Path::new("test-project"))
+    fn plain_output(color_mode: crate::output_style::ColorMode, event: &ExecutionEvent) -> String {
+        plain_output_at(color_mode, event, Path::new("test-project"))
     }
 
-    fn plain_output_at(event: &ExecutionEvent, project_dir: &Path) -> String {
+    fn plain_output_at(
+        color_mode: crate::output_style::ColorMode,
+        event: &ExecutionEvent,
+        project_dir: &Path,
+    ) -> String {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::plain(output.clone());
-        handle_event(&backend, event, project_dir);
+        let backend = ProgressBackend::plain(color_mode, output.clone());
+        handle_event(color_mode, &backend, event, project_dir);
         strip_ansi(&String::from_utf8(output.0.lock().unwrap().clone()).unwrap())
     }
 
@@ -280,18 +292,20 @@ mod tests {
         context: carina_core::executor::FailureEventContext<'_>,
         project_dir: &Path,
     ) -> String {
+        let color_mode = crate::output_style::ColorMode::Plain;
         struct Renderer<'a> {
             backend: ProgressBackend<EffectProgressKey>,
             project_dir: &'a Path,
         }
         impl ExecutionObserver for Renderer<'_> {
             fn on_event(&self, event: &ExecutionEvent<'_>) {
-                handle_event(&self.backend, event, self.project_dir);
+                let color_mode = crate::output_style::ColorMode::Plain;
+                handle_event(color_mode, &self.backend, event, self.project_dir);
             }
         }
         let output = SharedWriter::default();
         let observer = Renderer {
-            backend: ProgressBackend::plain(output.clone()),
+            backend: ProgressBackend::plain(color_mode, output.clone()),
             project_dir,
         };
         carina_core::executor::FailureSink::default().record(
@@ -323,7 +337,7 @@ mod tests {
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new((resource).into_value_snapshot())
     }
 
     fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
@@ -337,13 +351,13 @@ mod tests {
     fn dummy_wait_effect() -> Effect {
         let target = resolved(Resource::new("aws.acm.Certificate", "demo"));
         Effect::Wait {
-            identity: absolute_binding("demo_ready"),
+            id: carina_core::resource::ResolvedResourceId::with_identity("__wait", "demo_ready"),
             target_id: carina_core::wait::ManagedWaitTarget::for_test(&target),
             until: equals_predicate(AttrPath::single("status"), "issued"),
             until_surface: "demo.status == issued".to_string(),
             timeout: Duration::from_secs(300),
             interval: Duration::from_secs(5),
-            explicit_dependencies: HashSet::new(),
+            explicit_dependencies: Default::default(),
         }
     }
 
@@ -354,9 +368,9 @@ mod tests {
             generation,
             directives: Default::default(),
             binding: Some(absolute_binding("same")),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         }
     }
 
@@ -495,26 +509,41 @@ mod tests {
 
     #[test]
     fn plain_started_and_waiting_write_nothing_immediately() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let effect = dummy_create_effect();
-        assert!(plain_output(&ExecutionEvent::effect_started_for_test(&effect)).is_empty());
         assert!(
-            plain_output(&ExecutionEvent::Waiting {
-                effect: &effect,
-                pending_dependencies: vec!["x".into()],
-            })
+            plain_output(
+                color_mode,
+                &ExecutionEvent::effect_started_for_test(&effect)
+            )
+            .is_empty()
+        );
+        assert!(
+            plain_output(
+                color_mode,
+                &ExecutionEvent::Waiting {
+                    effect: &effect,
+                    pending_dependencies: vec!["x".into()],
+                }
+            )
             .is_empty()
         );
     }
 
     #[test]
     fn plain_observer_heartbeat_precedes_success_outcome() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let output = SharedWriter::default();
-        let backend =
-            ProgressBackend::plain_with_interval(output.clone(), Duration::from_millis(10));
+        let backend = ProgressBackend::plain_with_interval(
+            color_mode,
+            output.clone(),
+            Duration::from_millis(10),
+        );
         let effect = dummy_create_effect();
         let label = format_effect(&effect);
 
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::effect_started_for_test(&effect),
             Path::new("test-project"),
@@ -522,6 +551,7 @@ mod tests {
         wait_for_output_contains(&output.0, &format!("Still running: {label}"));
 
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::EffectSucceeded {
                 effect: &effect,
@@ -547,16 +577,19 @@ mod tests {
 
     #[test]
     fn plain_interrupted_finishes_effect_and_stops_heartbeats() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let output = SharedWriter::default();
-        let backend = ProgressBackend::plain(output.clone());
+        let backend = ProgressBackend::plain(color_mode, output.clone());
         let effect = dummy_create_effect();
 
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::effect_started_for_test(&effect),
             Path::new("test-project"),
         );
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::EffectInterrupted {
                 effect: &effect,
@@ -581,9 +614,10 @@ mod tests {
 
     #[test]
     fn wait_polling_resets_plain_generic_heartbeat_schedule() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let output = SharedWriter::default();
         let interval = Duration::from_secs(30);
-        let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
+        let backend = ProgressBackend::plain_with_interval(color_mode, output.clone(), interval);
         let effect = dummy_wait_effect();
         let key = EffectProgressKey::new(&effect);
         let target_id = ResourceId::with_identity("aws.acm.Certificate", "demo");
@@ -595,11 +629,13 @@ mod tests {
         let observation = wait_observation(&target_id, &predicate, &attrs);
 
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::effect_started_for_test(&effect),
             Path::new("test-project"),
         );
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::WaitPolling {
                 effect: &effect,
@@ -623,16 +659,20 @@ mod tests {
 
     #[test]
     fn plain_emits_one_line_per_succeeded() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let effect = dummy_create_effect();
-        let output = plain_output(&ExecutionEvent::EffectSucceeded {
-            effect: &effect,
-            state: None,
-            duration: Duration::from_millis(123),
-            progress: ProgressInfo {
-                completed: 1,
-                total: 3,
+        let output = plain_output(
+            color_mode,
+            &ExecutionEvent::EffectSucceeded {
+                effect: &effect,
+                state: None,
+                duration: Duration::from_millis(123),
+                progress: ProgressInfo {
+                    completed: 1,
+                    total: 3,
+                },
             },
-        });
+        );
         let lines: Vec<_> = output.lines().collect();
         assert_eq!(lines.len(), 1);
         let line = lines[0];
@@ -645,6 +685,7 @@ mod tests {
 
     #[test]
     fn plain_partial_success_detail_lines_are_stable() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let effect = dummy_create_effect();
         let state = carina_core::resource::State::not_found(ResourceId::with_identity(
             "aws.s3.Bucket",
@@ -656,16 +697,19 @@ mod tests {
         )
         .expect("fixture has missing attributes");
 
-        let output = plain_output(&ExecutionEvent::EffectPartiallySucceeded {
-            effect: &effect,
-            state: &state,
-            diagnostic: &diagnostic,
-            duration: Duration::from_millis(123),
-            progress: ProgressInfo {
-                completed: 1,
-                total: 3,
+        let output = plain_output(
+            color_mode,
+            &ExecutionEvent::EffectPartiallySucceeded {
+                effect: &effect,
+                state: &state,
+                diagnostic: &diagnostic,
+                duration: Duration::from_millis(123),
+                progress: ProgressInfo {
+                    completed: 1,
+                    total: 3,
+                },
             },
-        });
+        );
         let lines: Vec<_> = output.lines().collect();
 
         assert_eq!(
@@ -699,6 +743,7 @@ mod tests {
 
     #[test]
     fn cycle_members_and_provider_chains_are_rendered_once_across_progress_and_summary() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::executor::{
             EffectFailureKind, FailureEventContext, FailureReport, FailureSink,
         };
@@ -707,12 +752,17 @@ mod tests {
         struct Renderer(ProgressBackend<EffectProgressKey>);
         impl ExecutionObserver for Renderer {
             fn on_event(&self, event: &ExecutionEvent<'_>) {
-                handle_event(&self.0, event, Path::new("project"));
+                let color_mode = crate::output_style::ColorMode::Plain;
+                handle_event(color_mode, &self.0, event, Path::new("project"));
             }
         }
         let effects: Vec<Effect> = ["blocked", "a", "b", "c", "provider"]
             .into_iter()
-            .map(|name| Effect::Create(ResolvedResource::new(Resource::new("test.resource", name))))
+            .map(|name| {
+                Effect::Create(ResolvedResource::new(
+                    (Resource::new("test.resource", name)).into_value_snapshot(),
+                ))
+            })
             .collect();
         let deps = HashMap::from([
             (0, HashSet::from([3])),
@@ -721,7 +771,7 @@ mod tests {
             (3, HashSet::from([1])),
         ]);
         let output = SharedWriter::default();
-        let observer = Renderer(ProgressBackend::plain(output.clone()));
+        let observer = Renderer(ProgressBackend::plain(color_mode, output.clone()));
         let mut sink = FailureSink::default();
         let mut classified = carina_core::executor::classify_stalled_effects(
             &effects,
@@ -836,14 +886,16 @@ mod tests {
 
     #[test]
     fn refresh_started_uses_an_empty_line_and_column_zero_header() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         assert_eq!(
-            plain_output(&ExecutionEvent::RefreshStarted),
+            plain_output(color_mode, &ExecutionEvent::RefreshStarted),
             "\nRefreshing uncertain resource states...\n",
         );
     }
 
     #[test]
     fn identical_effect_labels_keep_distinct_live_spinners() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let first = dummy_delete_effect(EffectGeneration::Deposed(
             carina_state::DeposedKey::new_unique(),
         ));
@@ -853,16 +905,19 @@ mod tests {
         assert_eq!(format_effect(&first), format_effect(&second));
 
         let backend = ProgressBackend::tty(
+            color_mode,
             ProgressDrawTarget::hidden(),
             std::io::sink(),
             std::io::sink(),
         );
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::effect_started_for_test(&first),
             Path::new("test-project"),
         );
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::effect_started_for_test(&second),
             Path::new("test-project"),
@@ -875,6 +930,7 @@ mod tests {
         );
 
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::EffectSucceeded {
                 effect: &first,
@@ -894,6 +950,7 @@ mod tests {
         );
 
         handle_event(
+            color_mode,
             &backend,
             &ExecutionEvent::EffectSucceeded {
                 effect: &second,
@@ -911,15 +968,19 @@ mod tests {
 
     #[test]
     fn plain_skipped_includes_reason() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let effect = dummy_create_effect();
-        let output = plain_output(&ExecutionEvent::EffectSkipped {
-            effect: &effect,
-            reason: "dependency 'x' failed",
-            progress: ProgressInfo {
-                completed: 3,
-                total: 3,
+        let output = plain_output(
+            color_mode,
+            &ExecutionEvent::EffectSkipped {
+                effect: &effect,
+                reason: "dependency 'x' failed",
+                progress: ProgressInfo {
+                    completed: 3,
+                    total: 3,
+                },
             },
-        });
+        );
         let lines: Vec<_> = output.lines().collect();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("dependency 'x' failed"));

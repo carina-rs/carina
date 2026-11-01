@@ -19,6 +19,7 @@ use crate::parser::{
     DeferredForExpression, DeferredIfCondition, DeferredValueIf, LoadedProviderContext,
     ModuleArgument, ModuleCall, ModuleResolvedParsedFile, ParsedDeferredForExpression,
     ParsedDeferredForPhase, ParsedFile, ProviderContext, ResourceTypePath, SourceSpan, TypeExpr,
+    UnexpandedDependencies, UnexpandedDependencyOperand,
 };
 use crate::resource::{
     AbsoluteBindingAddress, CanonicalEnumValue, LoopSlot, ModuleSource, ParserPlaceholder,
@@ -31,7 +32,7 @@ type ConcreteValue<P = ParserPlaceholder, B = RelativeBindingName> =
     crate::resource::ConcreteValue<P, B>;
 type DeferredValue<P = ParserPlaceholder, B = RelativeBindingName> =
     crate::resource::DeferredValue<P, B>;
-type Directives<B = RelativeBindingName> = crate::resource::Directives<B>;
+type Directives<B = RelativeBindingName> = crate::resource::AuthoredDirectives<B>;
 type Resource<S = ModuleSource, P = ParserPlaceholder, B = RelativeBindingName> =
     crate::resource::Resource<S, P, B>;
 type ExpandedValue = Value<ParserPlaceholder, AbsoluteBindingAddress>;
@@ -165,6 +166,217 @@ impl ModuleResolutionFixture {
             caller_file.parent().expect("caller file has a directory"),
         )
     }
+
+    fn resolve_upstream_caller(
+        &self,
+        caller_relative: impl AsRef<Path>,
+    ) -> Result<ModuleResolvedParsedFile, ModuleError> {
+        let caller_file = self.root.join(caller_relative);
+        let caller = fs::read_to_string(&caller_file).expect("read fixture caller");
+        let config = ProviderContext::default();
+        let parsed = crate::parser::parse_file(&caller, &caller_file, &config)
+            .expect("fixture caller parses");
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            resolve_upstream_modules_with_providerless_config(
+                parsed,
+                caller_file.parent().expect("caller file has a directory"),
+                session,
+                &crate::schema::SchemaRegistry::new(),
+            )
+        })
+    }
+}
+
+#[test]
+fn module_argument_force_delete_reaches_provider_directives() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("module/main.crn", "arguments { force: Bool }\nlet r = mock.test.resource { name = 'r' directives { force_delete = force } }\n");
+    fixture.write(
+        "main.crn",
+        "let m = use { source = './module' }\nlet instance = m { force = true }\n",
+    );
+    let expanded = fixture
+        .resolve_caller("main.crn")
+        .unwrap()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .unwrap();
+    let directives = crate::provider::ProviderDirectives::resolve(
+        &expanded.resources[0].directives,
+        crate::resource::ProviderDirectiveSchema::Unavailable,
+    );
+    assert!(
+        directives.force_delete(),
+        "the module argument must reach the provider request"
+    );
+}
+
+#[test]
+fn nested_module_directive_expressions_resolve_both_boolean_values() {
+    for flag in [false, true] {
+        let fixture = ModuleResolutionFixture::new();
+        fixture.write("inner/main.crn", "arguments { flag: Bool }\nlet r = mock.test.resource { name = 'r' directives { prevent_destroy = flag create_before_destroy = flag force_delete = if flag { true } else { false } } }\n");
+        fixture.write("outer/main.crn", "arguments { flag: Bool }\nlet inner = use { source = '../inner' }\nlet nested = inner { flag = flag }\n");
+        fixture.write("main.crn", &format!("let outer = use {{ source = './outer' }}\nlet instance = outer {{ flag = {flag} }}\n"));
+        let expanded = fixture
+            .resolve_caller("main.crn")
+            .unwrap()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .unwrap();
+        let directives = crate::provider::ProviderDirectives::resolve(
+            &expanded.resources[0].directives,
+            crate::resource::ProviderDirectiveSchema::Unavailable,
+        );
+        assert_eq!(directives.prevent_destroy(), flag);
+        assert_eq!(directives.create_before_destroy(), flag);
+        assert_eq!(directives.force_delete(), flag);
+    }
+}
+
+#[test]
+fn module_directives_resolve_before_deferred_loop_is_saved() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("module/main.crn", "arguments { flag: Bool }\nlet source = mock.test.resource { name = 'source' }\nlet resources = for name in source.items { mock.test.resource { name = name directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } } }\n");
+    fixture.write(
+        "main.crn",
+        "let m = use { source = './module' }\nlet instance = m { flag = true }\n",
+    );
+    let expanded = fixture
+        .resolve_caller("main.crn")
+        .unwrap()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .unwrap();
+    assert_eq!(expanded.deferred_for_expressions().len(), 1);
+    let deferred = expanded.deferred_for_expressions()[0].clone();
+    let graph = crate::resolved_graph::resolve_expanded_graph(expanded.into()).unwrap();
+    let (compiled, _dependencies) = graph.compile_deferred_for(deferred).unwrap();
+    let saved = crate::parser::SavedDeferredForExpression::from(compiled);
+    let json = serde_json::to_value(&saved)
+        .expect("resolved template directives keep the saved-plan format");
+    assert_eq!(
+        json["template_resource"]["directives"],
+        serde_json::json!({
+            "force_delete": true,
+            "create_before_destroy": true,
+            "prevent_destroy": {"kind": "explicit", "value": true},
+        })
+    );
+    let restored: crate::parser::SavedDeferredForExpression = serde_json::from_value(json).unwrap();
+    let children = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::ProviderContext::default(),
+        |session| {
+            crate::parser::expand_deferred_children(
+                &restored,
+                &crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                        "child".into(),
+                    )),
+                ])),
+                crate::resource::AccessMissPolicy::Error,
+                session,
+            )
+        },
+    )
+    .unwrap();
+    assert!(children[0].directives.explicitly_prevents_destroy());
+    assert!(children[0].directives.force_delete);
+    assert!(children[0].directives.create_before_destroy);
+}
+
+#[test]
+fn module_argument_resource_output_cannot_become_a_directive_default() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        let fixture = ModuleResolutionFixture::new();
+        fixture.write("module/main.crn", &format!("arguments {{ flag: Bool }}\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{ {directive} = flag }}\n}}\n"));
+        fixture.write("main.crn", "let source = mock.test.resource { name = 'source' }\nlet m = use { source = './module' }\nlet instance = m { flag = source.flag }\n");
+        let error = fixture
+            .resolve_caller("main.crn")
+            .unwrap()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .expect_err("resource output must stay deferred");
+        let message = error.to_string();
+        assert!(
+            message.contains(directive) && message.contains("module/main.crn:4:"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn module_loop_directives_are_strictly_resolved_for_each_child() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("module/main.crn", "arguments { flags: list(Bool) }\nlet children = for flag in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
+    fixture.write("main.crn", "let source = mock.test.resource { name = 'source' }\nlet m = use { source = './module' }\nlet instance = m { flags = source.flags }\n");
+    let expanded = fixture
+        .resolve_caller("main.crn")
+        .unwrap()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .unwrap();
+    let deferred = &expanded.deferred_for_expressions()[0];
+    for flag in [true, false] {
+        let children = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::parser::expand_deferred_children(
+                    deferred,
+                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::Bool(flag),
+                    )])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
+        )
+        .unwrap();
+        let directives = crate::provider::ProviderDirectives::resolve(
+            &children[0].directives,
+            crate::resource::ProviderDirectiveSchema::Unavailable,
+        );
+        assert_eq!(directives.prevent_destroy(), flag);
+        assert_eq!(directives.force_delete(), flag);
+        assert_eq!(directives.create_before_destroy(), flag);
+    }
+    for (value, kind) in [
+        (
+            Value::Concrete(ConcreteValue::String("not-a-bool".into())),
+            "got String",
+        ),
+        (
+            Value::root_resource_ref("source", "flag", Vec::new()),
+            "a resource reference",
+        ),
+        (
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: crate::resource::RootScope::new()
+                        .resolve(RelativeBindingName::new("upstream")),
+                },
+            )),
+            "unknown until apply",
+        ),
+    ] {
+        let error = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::parser::expand_deferred_children(
+                    deferred,
+                    &Value::Concrete(ConcreteValue::List(vec![value])),
+                    crate::resource::AccessMissPolicy::Error,
+                    session,
+                )
+            },
+        )
+        .expect_err("unresolved child directives must never become defaults");
+        let text = error.to_string();
+        assert!(
+            text.contains("module/main.crn:3:") && text.contains("prevent_destroy"),
+            "{text}"
+        );
+        assert!(
+            text.contains(kind) && text.contains("mock.test.resource"),
+            "{text}"
+        );
+        assert!(text.contains("main.crn:3:"), "{text}");
+    }
 }
 
 fn assert_secret_resource_reference_is_module_qualified(call: &str) -> AbsoluteBindingAddress {
@@ -265,7 +477,7 @@ let disabled = choice { flag = false }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get("value"))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.value`"))
     };
     assert_eq!(
@@ -312,7 +524,7 @@ let decremented = choice { flag = false  n = 10 }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get(attribute))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.{attribute}`"))
     };
 
@@ -577,7 +789,7 @@ let disabled = choice { flag = false }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get(name))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.{name}`"))
     };
     assert_eq!(
@@ -682,7 +894,7 @@ let disabled = outer { flag = false }
                 composition.binding.as_ref().map(|binding| binding.as_str()) == Some(binding)
             })
             .and_then(|composition| composition.signature.attributes.get("value"))
-            .map(crate::resource::LiveCompositionAttribute::to_value)
+            .and_then(crate::resource::LiveCompositionAttribute::value)
             .unwrap_or_else(|| panic!("missing `{binding}.value`"))
     };
     assert_eq!(
@@ -1247,7 +1459,7 @@ let on = choice { flag = true }
             composition.binding.as_ref().map(|binding| binding.as_str()) == Some("off")
         })
         .and_then(|composition| composition.signature.attributes.get("n"))
-        .map(crate::resource::LiveCompositionAttribute::to_value)
+        .and_then(crate::resource::LiveCompositionAttribute::value)
         .expect("false instance output");
     assert_eq!(
         off_output,
@@ -1407,7 +1619,7 @@ fn resolve_anonymous_loop_module_fixture(
         .expect("root fixture parses");
     let parsed = resolve_modules(parsed, root.path()).expect("module fixture expands");
     parsed
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders")
 }
 
@@ -1611,7 +1823,7 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
         .expect("root fixture parses");
     let parsed = resolve_modules(parsed, root.path()).expect("nested loop module expands");
     let mut parsed = parsed
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders");
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
@@ -1788,7 +2000,7 @@ fn create_test_module() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2023,7 +2235,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: None,
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2231,7 +2443,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2341,7 +2553,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         resolved_ignore_changes: Default::default(),
         prefixes: HashMap::new(),
         binding: Some(format!("{}.role", current_prefix).into()),
-        dependency_bindings: BTreeSet::new(),
+        dependencies: Default::default(),
         module_source: Some(crate::resource::ModuleSource::expanded_module(
             "thing",
             current_prefix.clone(),
@@ -2407,7 +2619,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".into()),
-                dependency_bindings: BTreeSet::new(),
+                dependencies: Default::default(),
                 module_source: None,
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
@@ -2427,7 +2639,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
                 resolved_ignore_changes: Default::default(),
                 prefixes: HashMap::new(),
                 binding: Some("subnet".into()),
-                dependency_bindings: BTreeSet::new(),
+                dependencies: Default::default(),
                 module_source: None,
                 default_tag_keys: Default::default(),
                 loop_provenance: Default::default(),
@@ -2590,7 +2802,7 @@ fn create_module_with_attributes() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("sg".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -2679,7 +2891,7 @@ fn test_expand_module_call_creates_composition() {
                     .signature
                     .attributes
                     .get("security_group")
-                    .map(|a| a.to_value()),
+                    .map(|a| a.value().expect("fixture output is a value")),
                 Some(expanded_resource_ref(
                     "web.sg".to_string(),
                     "id".to_string(),
@@ -3051,7 +3263,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
                     .signature
                     .attributes
                     .get("endpoint")
-                    .map(|a| a.to_value()),
+                    .map(|a| a.value().expect("fixture output is a value")),
                 Some(ExpandedValue::Concrete(ExpandedConcreteValue::String(
                     "fixed-endpoint".into()
                 ))),
@@ -3249,41 +3461,40 @@ thing { name = 'beta'  }
 
 #[test]
 fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
-    let mut origin = Resource::with_provider("mock", "test.resource", "origin", None);
-    origin.binding = Some("origin".into());
-
-    // Model the parsed `upper(origin)` call directly: ordinary parsing rejects
-    // a bare handle in strict mode, while the permissive directory pass keeps
-    // the failed call as Unavailable for diagnostics and identity material.
-    let handle = crate::eval_value::StructuralHandle::new(
-        crate::eval_value::StructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
-            "mock",
-            "test.resource",
-        )),
-        "origin",
-    );
-    let mut dependent = Resource::pending_with_provider("mock", "test.resource", None);
-    dependent.set_attr(
-        "replacement_key".to_string(),
-        Value::Deferred(DeferredValue::FunctionCall {
-            name: crate::builtins::BuiltinFunction::upper,
-            args: vec![crate::resource::FunctionArgument::from_handle(handle)],
-            source_line: (7).into(),
-        }),
-    );
-    let mut module = ParsedFile {
-        resources: vec![origin, dependent],
-        ..ParsedFile::default()
-    };
-    crate::parser::resolve_resource_refs_defer_unknown_functions(
-        &mut module,
-        &ProviderContext::default(),
-    )
-    .expect("permissive resolution must retain the failed built-in");
-
     crate::validation::deferred_types::with_session_for_test(
-        &crate::parser::ProviderContext::default(),
+        &crate::parser::LoadedProviderContext::empty_for_test(),
         |session| {
+            let mut origin = Resource::with_provider("mock", "test.resource", "origin", None);
+            origin.binding = Some("origin".into());
+
+            // Model the parsed `upper(origin)` call directly: ordinary parsing rejects
+            // a bare handle in strict mode, while the permissive directory pass keeps
+            // the failed call as Unavailable for diagnostics and identity material.
+            let handle = crate::eval_value::UnexpandedStructuralHandle::new(
+                crate::eval_value::UnexpandedStructuralHandleKind::Resource(
+                    crate::parser::ResourceTypePath::new("mock", "test.resource"),
+                ),
+                "origin",
+            );
+            let mut dependent = Resource::pending_with_provider("mock", "test.resource", None);
+            dependent.set_attr(
+                "replacement_key".to_string(),
+                Value::Deferred(DeferredValue::FunctionCall {
+                    name: crate::builtins::BuiltinFunction::upper,
+                    args: vec![crate::resource::FunctionArgument::from_handle(handle)],
+                    source_line: (7).into(),
+                }),
+            );
+            let mut module = ParsedFile {
+                resources: vec![origin, dependent],
+                ..ParsedFile::default()
+            };
+            crate::parser::resolve_resource_refs_defer_unknown_functions(
+                &mut module,
+                &ProviderContext::default(),
+            )
+            .expect("permissive resolution must retain the failed built-in");
+
             let resolver = {
                 let mut resolver = ModuleResolver::new(".", session);
                 resolver.imported_modules.insert("m".to_string(), module);
@@ -3337,7 +3548,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
             );
             let mut resources = resources
                 .into_iter()
-                .map(crate::resource::Resource::into_expanded)
+                .map(|resource| resource.into_expanded(&crate::schema::SchemaRegistry::new()))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("expanded module resources contain no parser placeholders");
 
@@ -3391,7 +3602,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
                 "instance-prefixed unavailable arguments must produce distinct identity hashes: {identities:?}",
             );
         },
-    )
+    );
 }
 
 #[test]
@@ -4063,7 +4274,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("distribution".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -4079,7 +4290,12 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
                 rhs: Value::Concrete(ConcreteValue::String("available".into())),
             },
             timeout_secs: Some(300),
-            depends_on: vec!["subnet".into()],
+            depends_on: UnexpandedDependencies::new(vec![UnexpandedDependencyOperand::Handle(
+                crate::eval_value::UnexpandedResourceHandle::new(
+                    "subnet",
+                    ResourceTypePath::new("", "ec2.Subnet"),
+                ),
+            )]),
             line: 1,
         });
         m
@@ -4115,6 +4331,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             assert_eq!(wb.until_predicate.attribute_segments, ["state"]);
             assert_eq!(
                 wb.depends_on
+                    .binding_references()
                     .iter()
                     .map(|binding| binding.as_str())
                     .collect::<Vec<_>>(),
@@ -4182,7 +4399,7 @@ fn test_module_composition_dot_path_refs() {
                     .signature
                     .attributes
                     .get("security_group")
-                    .map(|a| a.to_value()),
+                    .map(|a| a.value().expect("fixture output is a value")),
                 Some(expanded_resource_ref(
                     "web.sg".to_string(),
                     "id".to_string(),
@@ -4384,7 +4601,7 @@ fn create_module_with_interpolation() -> ParsedFile {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("vpc".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -6763,8 +6980,9 @@ let child = imported { peer = source }
         .expect("expanded consumer");
     assert_eq!(
         consumer
-            .directives
+            .dependencies
             .depends_on
+            .binding_references()
             .iter()
             .map(|binding| binding.as_str())
             .collect::<Vec<_>>(),
@@ -6828,13 +7046,15 @@ let child = imported {
     let message = error.to_string();
     assert!(message.contains("at line 5"), "unexpected error: {message}");
     assert!(
-        message.contains("depends_on parameter 'peer' received a value"),
+        message.contains(
+            "module argument 'peer': expected resource handle mock.test.Thing; got resource attribute value"
+        ),
         "unexpected error: {message}",
     );
 }
 
 #[test]
-fn module_value_argument_binding_collision_is_not_treated_as_a_handle() {
+fn module_value_argument_binding_collision_is_not_promoted_to_a_handle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let module_dir = tmp.path().join("modules/consumer");
     fs::create_dir_all(&module_dir).unwrap();
@@ -6861,30 +7081,21 @@ let child = imported { peer = peer.identifier }
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
     let parsed = crate::parser::parse(root_body, &context).unwrap();
-    let parsed = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        resolve_modules_with_config(
-            parsed,
-            &root_dir,
-            session.catalog(),
-            &crate::schema::SchemaRegistry::new(),
-        )
-        .expect("the typed Value variant must survive a binding-name collision")
-    });
-
-    let consumer = parsed
-        .resources
-        .iter()
-        .find(|resource| {
-            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.consumer")
-        })
-        .expect("expanded consumer");
-    assert_eq!(
-        consumer.get_attr("parent"),
-        Some(&expanded_resource_ref(
-            "peer",
-            "identifier",
-            vec!["name".to_string()],
-        )),
+    let error = resolve_modules_with_config(
+        parsed,
+        &root_dir,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("an attribute value cannot satisfy a handle parameter");
+    let message = error.to_string();
+    assert!(
+        message.contains("peer") && message.contains("mock.test.Thing"),
+        "{message}"
+    );
+    assert!(
+        message.contains("resource reference") || message.contains("resource attribute value"),
+        "the argument must remain a value: {message}"
     );
 }
 
@@ -7715,8 +7926,7 @@ outer {
     Ok(())
 }
 
-/// A declared resource reference is a typed handle for boundary checking even
-/// though its runtime transport remains the resource id string (#3803).
+/// A declared resource reference is a typed handle for boundary checking.
 #[test]
 fn ref_argument_forwarded_to_scalar_is_rejected_before_expansion() {
     let error = resolve_ref_forwarding_fixture("Int")
@@ -7731,11 +7941,13 @@ fn ref_argument_forwarded_to_scalar_is_rejected_before_expansion() {
 }
 
 #[test]
-fn ref_argument_forwarded_to_string_is_rejected_as_a_bare_handle() {
+fn ref_argument_forwarded_to_string_is_rejected_by_the_typed_boundary() {
     let error = resolve_ref_forwarding_fixture("String")
         .expect_err("a bare handle cannot cross into a String parameter");
     assert!(
-        error.to_string().contains("'a' is a resource, not a value"),
+        error
+            .to_string()
+            .contains("cannot assign mock.test.resource to 'x': expected String"),
         "{error}",
     );
 }
@@ -7803,50 +8015,67 @@ let instance = child { source = source }
 
 #[test]
 fn ref_typed_module_argument_used_bare_is_rejected_in_module_context() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let module_dir = tmp.path().join("child");
-    fs::create_dir_all(&module_dir).expect("module directory");
-    fs::write(
-        module_dir.join("main.crn"),
-        r#"arguments {
-  source: mock.test.resource
-}
-let consumer = mock.test.consumer {
-  parent = source
-}
-"#,
-    )
-    .expect("module source");
-    let root_source = r#"let source = mock.test.resource { name = 'root' }
-let child = use { source = './child' }
-let instance = child { source = source }
-"#;
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let module_dir = tmp.path().join("child");
+            fs::create_dir_all(&module_dir).expect("module directory");
+            fs::write(
+                module_dir.join("main.crn"),
+                r#"arguments {
+          source: mock.test.resource
+        }
+        let consumer = mock.test.consumer {
+          parent = source
+        }
+        "#,
+            )
+            .expect("module source");
+            let root_source = r#"let source = mock.test.resource { name = 'root' }
+        let child = use { source = './child' }
+        let instance = child { source = source }
+        "#;
 
-    let mut config = ProviderContext::default();
-    config
-        .resource_types
-        .insert(("mock".to_string(), "test.resource".to_string()));
-    let parsed = crate::parser::parse(root_source, &config).expect("root parse");
-    let error = crate::validation::deferred_types::with_session_for_test(&config, |session| {
-        resolve_modules_with_config(
-            parsed,
-            tmp.path(),
-            session.catalog(),
-            &crate::schema::SchemaRegistry::new(),
-        )
-        .expect_err("bare module handle use must fail")
-    });
-    let message = error.to_string();
-    assert!(
-        message.contains("'source' is a resource handle, not a value")
-            && message.contains("line 5"),
-        "unexpected error: {message}",
+            let mut config = ProviderContext::default();
+            config
+                .resource_types
+                .insert(("mock".to_string(), "test.resource".to_string()));
+            let parsed = crate::parser::parse(root_source, &config).expect("root parse");
+            let parsed = resolve_modules_with_config(
+                parsed,
+                tmp.path(),
+                &config,
+                &crate::schema::SchemaRegistry::new(),
+            )
+            .expect("module expansion retains the typed pending use for validation");
+            let schemas = crate::schema::SchemaRegistry::new();
+            let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
+            let context = crate::validation::ValidationTypeContext::in_session(
+                &parsed,
+                &schemas,
+                session,
+                &signatures,
+            );
+            let report = crate::validation::check_expanded_bare_binding_uses(&parsed, &context);
+            let finding = report
+                .findings()
+                .iter()
+                .find(|finding| {
+                    finding.use_site.name == "source"
+                        && matches!(finding.use_site.owner, BindingUseOwner::Resource(_))
+                })
+                .expect("bare handle use remains owned by the validation seam");
+            let message = finding.error.to_string();
+            assert!(
+                message.contains("'source' is a resource handle, not a value")
+                    && finding.use_site.span.start_line() == 5,
+                "unexpected finding: {finding:?}",
+            );
+        },
     );
 }
 
-/// Three-deep pass-through: outer → middle → inner all forwarding the
-/// same `list(String)` arg. Each enclosing scope contributes its own
-/// arg signature; the chain must hold across both module-call hops.
 #[test]
 fn test_list_passthrough_three_levels_deep() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -8248,7 +8477,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some("cert".into()),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -8285,7 +8514,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     resolved_ignore_changes: Default::default(),
                     prefixes: HashMap::new(),
                     binding: None,
-                    dependency_bindings: BTreeSet::new(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -8493,7 +8722,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                     resolved_ignore_changes: Default::default(),
                     prefixes: HashMap::new(),
                     binding: None,
-                    dependency_bindings: BTreeSet::new(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -8868,19 +9097,21 @@ let registry_publish = registry {
         .expect("expanded module consumer must exist");
     assert!(
         consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .any(|binding| binding.as_str() == "registry_publish.target"),
         "module resource dependency must be populated and prefixed: {:?}",
-        consumer.dependency_bindings,
+        consumer.dependencies.value_bindings,
     );
     assert!(
         consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .all(|binding| binding.as_str() != "registry_publish.label"),
         "module arguments must not be mistaken for intra-module resources: {:?}",
-        consumer.dependency_bindings,
+        consumer.dependencies.value_bindings,
     );
     assert_eq!(
         consumer.attributes.get("description"),
@@ -8900,7 +9131,8 @@ let registry_publish = registry {
         .expect("expanded module data source must exist");
     assert_eq!(
         roles
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>(),
@@ -9040,7 +9272,8 @@ let outer = outer_module {}
         .expect("twice-expanded consumer must exist");
     assert_eq!(
         consumer
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>(),
@@ -9057,7 +9290,8 @@ let outer = outer_module {}
         .expect("twice-expanded data source must exist");
     assert_eq!(
         roles
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .iter()
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>(),
@@ -9794,5 +10028,887 @@ fn resolved_module_signature_preserves_unresolvable_attribute_type_for_best_effo
                     )
         ),
         "best-effort module signature must retain the typed unchecked reason: {static_type:?}",
+    );
+}
+
+fn handle_output_provider_context() -> ProviderContext {
+    let mut context = ProviderContext::default();
+    for resource_type in ["test.Record", "test.Consumer", "test.Target"] {
+        context
+            .resource_types
+            .insert(("mock".to_string(), resource_type.to_string()));
+    }
+    context
+}
+
+#[test]
+fn anonymous_module_handle_output_resolves_after_instance_reconciliation() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("producer/arguments.crn", "arguments { name: String }\n");
+    fixture.write(
+        "producer/resources.crn",
+        "let record = mock.test.Record { name = name }\n",
+    );
+    fixture.write("producer/attributes.crn", "attributes { r = record }\n");
+    fixture.write("providers.crn", "provider mock {}\n");
+    fixture.write("backend.crn", "backend local { path = './state.json' }\n");
+    fixture.write("exports.crn", "exports { message: String = message }\n");
+    let context = handle_output_provider_context();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let resolve = |name: &str| {
+        let caller = fixture.write(
+            "main.crn",
+            &format!(
+                "let message = 'directory export'\nlet producer = use {{ source = './producer' }}\nproducer {{ name = '{name}' }}\n"
+            ),
+        );
+        let loaded = crate::config_loader::load_configuration_with_config(
+            caller.parent().unwrap(),
+            &context,
+            &schemas,
+        )
+        .expect("multi-file project directory loads");
+        assert_eq!(loaded.parsed.providers.len(), 1);
+        assert!(loaded.parsed.backend.is_some());
+        assert_eq!(loaded.parsed.export_params.len(), 1);
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            super::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                &fixture.root,
+                session,
+                &schemas,
+            )
+            .map_err(Box::new)
+        })
+        .map_err(|error| *error)
+        .expect("anonymous module expands")
+    };
+    let previous = resolve("before-edit");
+    let mut edited = resolve("after-edit");
+    let prior_instance = &previous.compositions[0].instance;
+    let new_instance = &edited.compositions[0].instance;
+    assert!(edited.compositions[0].binding.is_none());
+    let (_, prior_hash) = parse_synthetic_instance_prefix(prior_instance).unwrap();
+    let (_, new_hash) = parse_synthetic_instance_prefix(new_instance).unwrap();
+    assert_ne!(prior_hash, new_hash, "argument edit must move the SimHash");
+    assert!(prior_hash.distance(new_hash) < crate::identifier::SIMHASH_HAMMING_THRESHOLD);
+    let prior_record = &previous.resources[0].id;
+    let prior_state = crate::resource::State::existing(
+        prior_record.clone(),
+        HashMap::from([(
+            "name".to_string(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "before-edit".into(),
+            )),
+        )]),
+    );
+    let state_lookup = |provider: &str, resource_type: &str| {
+        assert_eq!(provider, prior_state.id.provider);
+        assert_eq!(resource_type, prior_state.id.resource_type);
+        vec![prior_state.id.identity_str().unwrap().to_string()]
+    };
+    crate::module_resolver::reconcile_anonymous_module_instances(
+        &mut edited,
+        &state_lookup,
+        &crate::identifier::StateBlockClaims::empty(),
+    );
+    assert_eq!(edited.compositions[0].instance, *prior_instance);
+    assert_eq!(edited.resources[0].id, *prior_record);
+
+    let expanded = edited.into_expanded(&schemas).unwrap();
+    let graph = crate::resolved_graph::resolve_expanded_graph(expanded.into())
+        .expect("anonymous handle output must resolve through the remapped composition");
+    let composition = &graph.configuration().compositions[0];
+    assert_eq!(composition.instance, *prior_instance);
+    assert_eq!(
+        composition.signature.attributes["r"]
+            .handle()
+            .map(AsRef::as_ref),
+        Some(prior_record),
+        "the reconciled composition must expose its remapped resource handle",
+    );
+}
+
+#[test]
+fn unannotated_local_and_argument_handle_outputs_forward_across_modules() {
+    let tmp = tempfile::tempdir().expect("temporary handle-output fixture");
+    let producer = tmp.path().join("producer");
+    let relay = tmp.path().join("relay");
+    let root = tmp.path().join("root");
+    for directory in [&producer, &relay, &root] {
+        fs::create_dir_all(directory).expect("create fixture directory");
+    }
+
+    fs::write(
+        producer.join("resources.crn"),
+        "let record = mock.test.Record { name = 'record' }\n",
+    )
+    .expect("write producer resource");
+    fs::write(
+        producer.join("attributes.crn"),
+        "attributes {\n  r = record\n}\n",
+    )
+    .expect("write producer attributes");
+    fs::write(
+        relay.join("arguments.crn"),
+        "arguments {\n  x: mock.test.Record\n}\n",
+    )
+    .expect("write relay arguments");
+    fs::write(relay.join("attributes.crn"), "attributes {\n  r = x\n}\n")
+        .expect("write relay attributes");
+
+    let root_source = r#"
+let producer_module = use { source = "../producer" }
+let relay_module = use { source = "../relay" }
+let produced = producer_module {}
+let relayed = relay_module { x = produced.r }
+
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [relayed.r] }
+}
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("unannotated local and argument handles must forward transitively");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer")
+        })
+        .expect("consumer resource")
+        .clone();
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        ["relayed.r"]
+    );
+
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("produced.record")
+        })
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("producer record has a resolved instance-qualified identity");
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("transitive handle outputs resolve at the expanded graph seam");
+    let expected_type = TypeExpr::Ref(ResourceTypePath::new("mock", "test.Record"));
+    for instance in ["produced", "relayed"] {
+        let output = index
+            .configuration()
+            .compositions
+            .iter()
+            .find(|composition| composition.instance == instance)
+            .and_then(|composition| composition.signature.attributes.get("r"))
+            .unwrap_or_else(|| panic!("{instance}.r output"));
+        assert_eq!(
+            output
+                .declared_type()
+                .and_then(crate::static_type::ConsumerStaticType::known),
+            Some(&expected_type),
+            "unannotated {instance}.r must infer a known resource-handle type",
+        );
+        assert_eq!(
+            output.handle(),
+            Some(&expected),
+            "transitive forwarding must preserve the producer's resolved id",
+        );
+    }
+    let consumer = index
+        .resolve_resource(consumer, &crate::schema::SchemaRegistry::new())
+        .expect("consumer dependency resolves through both module outputs");
+    assert_eq!(
+        consumer.explicit_dependencies().iter().collect::<Vec<_>>(),
+        [&expected],
+    );
+}
+
+#[test]
+fn directives_resolve_local_and_module_output_handles_through_one_typed_path() {
+    let tmp = tempfile::tempdir().expect("temporary mixed dependency fixture");
+    let producer = tmp.path().join("producer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&producer).expect("create producer module");
+    fs::create_dir_all(&root).expect("create root directory");
+    fs::write(
+        producer.join("resources.crn"),
+        "let record = mock.test.Record { name = 'module' }\n",
+    )
+    .expect("write module resource");
+    fs::write(
+        producer.join("attributes.crn"),
+        "attributes {\n  r = record\n}\n",
+    )
+    .expect("write module handle output");
+
+    let root_source = r#"let local = mock.test.Record { name = "local" }
+let producer_module = use { source = "../producer" }
+let child = producer_module {}
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [local, child.r] }
+}
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root fixture");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("mixed local/output handle dependencies expand");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer")
+        })
+        .cloned()
+        .expect("consumer resource");
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        ["local", "child.r"],
+    );
+    let expected = parsed
+        .resources
+        .iter()
+        .filter(|resource| {
+            matches!(
+                resource.binding.as_ref().map(|binding| binding.as_str()),
+                Some("local" | "child.record")
+            )
+        })
+        .map(|resource| {
+            crate::resource::ResolvedResourceId::try_new(resource.id.clone())
+                .expect("dependency has a resolved id")
+        })
+        .collect::<crate::resource::ResolvedDependencies>();
+    assert_eq!(expected.len(), 2);
+
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("expanded dependency graph resolves both operands");
+    let consumer = index
+        .resolve_resource(consumer, &crate::schema::SchemaRegistry::new())
+        .expect("consumer dependencies resolve");
+    assert_eq!(consumer.explicit_dependencies(), &expected);
+}
+
+#[test]
+fn module_wait_handle_argument_resolves_to_the_callers_resource() {
+    let tmp = tempfile::tempdir().expect("temporary wait-handle fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: mock.test.Record\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("target.crn"),
+        r#"let target = mock.test.Target { name = "target" }
+"#,
+    )
+    .expect("write wait target");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait target {
+  until      = target.status == "ready"
+  depends_on = [peer]
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let source = mock.test.Record { name = "source" }
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = source }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module wait expands");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "child.ready")
+        .expect("expanded wait")
+        .clone();
+    assert_eq!(wait.depends_on.diagnostic_references(), ["source"]);
+    assert!(
+        wait.depends_on
+            .diagnostic_references()
+            .iter()
+            .all(|dependency| dependency != "child.peer"),
+        "a module parameter spelling is not a resource address: {wait:?}",
+    );
+
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("source")
+        })
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("caller source has a resolved identity");
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("expanded graph resolves the caller-supplied wait dependency");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("module-internal wait resolves structurally");
+    assert_eq!(
+        resolved_wait
+            .explicit_dependencies
+            .iter()
+            .collect::<Vec<_>>(),
+        [&expected],
+        "the wait must depend on the caller resource, never child.peer",
+    );
+}
+
+#[test]
+fn module_wait_target_and_predicate_root_resolve_handle_argument_to_caller_resource() {
+    let tmp = tempfile::tempdir().expect("temporary wait-target handle fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: mock.test.Record\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait peer {
+  until = peer.name == "source"
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let source = mock.test.Record { name = "source" }
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = source }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module wait expands");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+    let expected = parsed
+        .iter_all_resources()
+        .find(|resource| resource.binding() == Some("source"))
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id().clone()))
+        .expect("caller source has a resolved identity");
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "child.ready")
+        .cloned()
+        .expect("expanded wait");
+    let index = crate::resolved_graph::resolve_expanded_graph(parsed.into())
+        .expect("expanded graph resolves the caller-supplied wait target");
+    let resolved = index
+        .resolve_wait_binding(&wait)
+        .expect("wait target and predicate root resolve through the module argument");
+
+    assert_eq!(resolved.target_id.id(), &expected);
+    assert_eq!(
+        resolved.until_predicate.root.as_str(),
+        "source",
+        "the predicate root must use the same caller resource as the wait target",
+    );
+}
+
+#[test]
+fn module_wait_on_value_argument_is_rejected() {
+    let tmp = tempfile::tempdir().expect("temporary wait-value fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  peer: String\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait peer {
+  until = peer.name == "source"
+}
+"#,
+    )
+    .expect("write module wait");
+
+    let root_source = r#"
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { peer = "source" }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let error = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("a value argument cannot be used as a wait target");
+
+    assert!(
+        error
+            .to_string()
+            .contains("wait 'peer': expected resource handle"),
+        "unexpected diagnostic: {error}",
+    );
+}
+
+#[test]
+fn dotted_unresolved_module_argument_in_depends_on_resolves_to_caller_resource() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write(
+        "consumer/main.crn",
+        r#"arguments { peer: mock.test.Thing }
+let consumer = mock.test.Consumer {
+  name = "consumer"
+  directives { depends_on = [peer] }
+}
+"#,
+    );
+    let caller = r#"let source = mock.test.Thing { name = "source" }
+let imported = use { source = "../consumer" }
+let child = imported { peer = source }
+"#;
+    fixture.write("root/main.crn", caller);
+
+    let parsed = fixture
+        .resolve_upstream_caller("root/main.crn")
+        .expect("providerless module resolution retains the provisional handle argument");
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.consumer")
+        })
+        .expect("expanded consumer");
+
+    assert_eq!(
+        consumer.dependencies.depends_on.diagnostic_references(),
+        ["source"],
+        "a DottedUnresolved argument must substitute the caller handle before prefixing",
+    );
+}
+
+#[test]
+fn module_wait_dependency_on_for_group_prefixes_and_resolves_every_member() {
+    let tmp = tempfile::tempdir().expect("temporary wait-for-group fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+
+    fs::write(
+        module.join("resources.crn"),
+        r#"let target = mock.test.Target { name = "target" }
+let records = for record_name in ["one", "two"] {
+  mock.test.Record { name = record_name }
+}
+"#,
+    )
+    .expect("write module resources");
+    fs::write(
+        module.join("wait.crn"),
+        r#"let ready = wait target {
+  until      = target.status == "ready"
+  depends_on = [records]
+}
+"#,
+    )
+    .expect("write module wait");
+    fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  target_name: String = ready.name\n}\n",
+    )
+    .expect("write module output");
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  marker: String = \"fixture\"\n}\n",
+    )
+    .expect("write module argument");
+
+    let root_source = r#"let consumer_module = use { source = "../consumer" }
+let child = consumer_module {}
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse_file(root_source, &root.join("main.crn"), &context)
+        .expect("root parses with its source path");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("module with a wait over a for group expands");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "child.ready")
+        .expect("expanded wait")
+        .clone();
+    assert_eq!(wait.depends_on.diagnostic_references(), ["child.records"]);
+
+    let expected = parsed
+        .resources
+        .iter()
+        .filter(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .map(|binding| binding.as_str())
+                .is_some_and(|binding| binding.starts_with("child.records["))
+        })
+        .filter_map(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .collect::<crate::resource::ResolvedDependencies>();
+    assert_eq!(expected.len(), 2, "both loop members must be materialized");
+
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("expanded graph registers the prefixed loop group");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("wait dependency resolves to the complete managed group");
+    assert_eq!(resolved_wait.explicit_dependencies, expected);
+
+    let live_projection = index
+        .project_legacy_dependency("child.records", "legacy loop-group fixture")
+        .expect("the v20 collection spelling projects through the live graph")
+        .into_dependencies();
+    assert_eq!(live_projection.to_resolved_dependencies(), expected);
+}
+
+#[test]
+fn p3_unannotated_handle_output_orders_the_consumer_wait_after_the_producer() {
+    let tmp = tempfile::tempdir().expect("temporary P3 handle-output fixture");
+    let producer = tmp.path().join("producer");
+    let consumer = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    for directory in [&producer, &consumer, &root] {
+        fs::create_dir_all(directory).expect("create fixture directory");
+    }
+
+    fs::write(
+        producer.join("record.crn"),
+        "let validation_record = mock.test.Record { name = 'validation-record' }\n",
+    )
+    .expect("write producer resource");
+    fs::write(
+        producer.join("attributes.crn"),
+        "attributes {\n  validation_record = validation_record\n}\n",
+    )
+    .expect("write unannotated producer output");
+    fs::write(
+        consumer.join("arguments.crn"),
+        "arguments {\n  validation_record: mock.test.Record\n}\n",
+    )
+    .expect("write consumer handle argument");
+    fs::write(
+        consumer.join("target.crn"),
+        "let target = mock.test.Target { name = 'target' }\n",
+    )
+    .expect("write consumer wait target");
+    fs::write(
+        consumer.join("wait.crn"),
+        r#"let ready = wait target {
+  until      = target.status == "ready"
+  depends_on = [validation_record]
+}
+"#,
+    )
+    .expect("write consumer wait");
+    fs::write(
+        consumer.join("attributes.crn"),
+        "attributes {\n  observed_name: String = ready.name\n}\n",
+    )
+    .expect("write consumer wait output");
+
+    let root_source = r#"
+let producer_module = use { source = "../producer" }
+let consumer_module = use { source = "../consumer" }
+let producer = producer_module {}
+let consumer = consumer_module {
+  validation_record = producer.validation_record
+}
+let reader = mock.test.Consumer { name = consumer.observed_name }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let parsed = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("P3 modules expand");
+    let parsed = parsed
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("root fixture has no remaining parser placeholders");
+
+    let expected = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("producer.validation_record")
+        })
+        .and_then(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
+        .expect("producer record has an instance-qualified resolved id");
+    let target = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("consumer.target")
+        })
+        .cloned()
+        .expect("consumer wait target");
+    let producer_resource = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str())
+                == Some("producer.validation_record")
+        })
+        .cloned()
+        .expect("producer resource");
+    let reader = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("reader")
+        })
+        .cloned()
+        .expect("wait output consumer");
+    let wait = parsed
+        .wait_bindings
+        .iter()
+        .find(|wait| wait.binding.as_str() == "consumer.ready")
+        .cloned()
+        .expect("expanded consumer wait");
+
+    let resources = parsed.resources.clone(); // allow: direct — fixture test inspection
+    let data_sources = parsed.data_sources.clone();
+    let index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("P3 graph addresses resolve");
+    let resolved_wait = index
+        .resolve_wait_binding(&wait)
+        .expect("consumer wait dependency resolves");
+    assert_eq!(
+        resolved_wait
+            .explicit_dependencies
+            .iter()
+            .collect::<Vec<_>>(),
+        [&expected],
+        "the wait must retain the producer instance's resource id",
+    );
+    assert!(
+        resolved_wait
+            .explicit_dependencies
+            .iter()
+            .all(|dependency| dependency.identity_str() != "consumer.validation_record"),
+        "the consumer parameter spelling must never become a graph address",
+    );
+    let resolved_reader = index
+        .resolve_resource(reader, &crate::schema::SchemaRegistry::new())
+        .expect("reader dependency resolves through the consumer composition");
+    assert_eq!(
+        resolved_reader
+            .value_dependencies()
+            .iter()
+            .collect::<Vec<_>>(),
+        [&resolved_wait.id],
+        "a concrete wait output must retain the wait scheduler edge",
+    );
+
+    let producer_effect = crate::effect::Effect::Create(
+        index
+            .resolve_resource(producer_resource, &crate::schema::SchemaRegistry::new())
+            .expect("resolve producer resource"),
+    );
+    let target_effect = crate::effect::Effect::Create(
+        index
+            .resolve_resource(target, &crate::schema::SchemaRegistry::new())
+            .expect("resolve consumer target"),
+    );
+    let wait_effect = crate::effect::Effect::Wait {
+        id: resolved_wait.id,
+        target_id: resolved_wait.target_id,
+        until: crate::wait::predicate::WaitPredicate::equals(
+            crate::wait::predicate::AttrPath::single("status"),
+            Value::Concrete(ConcreteValue::String("ready".to_string().into())),
+        )
+        .expect("valid wait predicate"),
+        until_surface: resolved_wait.until_raw,
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_secs(5),
+        explicit_dependencies: resolved_wait.explicit_dependencies,
+    };
+
+    let mut plan = crate::plan::Plan::new();
+    plan.add(producer_effect.clone());
+    plan.add(target_effect.clone());
+    plan.add(wait_effect.clone());
+    let analysis = crate::effect::deps::build_effect_dependency_analysis(
+        plan.effects(),
+        std::iter::empty(),
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .expect("the complete P3 plan has a valid dependency graph");
+    assert!(
+        analysis
+            .deps_of(2)
+            .expect("wait dependency set")
+            .contains(&0),
+        "the wait effect must order after the producer effect",
+    );
+
+    let mut incomplete = crate::plan::Plan::new();
+    incomplete.add(target_effect);
+    incomplete.add(wait_effect);
+    let failure = crate::effect::deps::build_effect_dependency_analysis(
+        incomplete.effects(),
+        std::iter::empty(),
+        crate::effect::deps::ScheduleInputs::Apply,
+    )
+    .expect_err("a missing producer effect must not silently drop the wait edge");
+    assert_eq!(failure.unresolved().len(), 1);
+    assert_eq!(failure.unresolved()[0].id(), &expected);
+}
+
+#[test]
+fn ref_typed_module_argument_rejects_a_string_value() {
+    let tmp = tempfile::tempdir().expect("temporary Ref boundary fixture");
+    let module = tmp.path().join("consumer");
+    let root = tmp.path().join("root");
+    fs::create_dir_all(&module).expect("create consumer module");
+    fs::create_dir_all(&root).expect("create root directory");
+    fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  record: mock.test.Record\n}\n",
+    )
+    .expect("write module arguments");
+    fs::write(
+        module.join("resource.crn"),
+        "let target = mock.test.Target { name = 'target' }\n",
+    )
+    .expect("write module resource");
+
+    let root_source = r#"
+let consumer_module = use { source = "../consumer" }
+let child = consumer_module { record = "record-id" }
+"#;
+    fs::write(root.join("main.crn"), root_source).expect("write root source");
+
+    let context = handle_output_provider_context();
+    let parsed = crate::parser::parse(root_source, &context).expect("root parses");
+    let error = resolve_modules_with_config(
+        parsed,
+        &root,
+        &context,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect_err("a String value must not satisfy a resource-handle parameter");
+    assert!(
+        error.to_string().contains(
+            "module argument 'record': expected resource handle mock.test.Record; got String"
+        ),
+        "unexpected diagnostic: {error}",
     );
 }

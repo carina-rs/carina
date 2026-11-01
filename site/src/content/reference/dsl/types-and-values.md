@@ -265,8 +265,10 @@ let label = "network-${vpc}"
 ```
 
 Use an attribute such as `vpc.vpc_id`. The same rule applies to bindings
-created by `for`, `if`, `use`, module calls, and `wait`. For a module call,
-select an output such as `network.vpc_id`.
+created by `for`, `if`, `use`, module calls, and `wait`. A module output may
+itself be a handle: if a module declares `attributes { vpc = vpc }`, then
+`network.vpc` is the handle and `network.vpc.vpc_id` is a value selected from
+the underlying resource.
 
 A handle may be given another name with `let`. The alias is itself a handle,
 so attribute access works through it, but using the alias bare in a value
@@ -283,12 +285,13 @@ let subnet = awscc.ec2.Subnet {
 ```
 
 Only syntax that explicitly transports a handle accepts one directly. Examples
-are `directives.depends_on`, `directives.provider`, and function or module
-arguments. The argument itself decides what is transported: passing `vpc`
-binds the parameter as a handle, while passing `vpc.vpc_id` binds it as a
-value. A resource type annotation checks that a passed handle has the expected
-resource type; it does not turn values into handles. An untyped function
-parameter can also receive a handle:
+are a module `attributes` entry, `directives.depends_on`,
+`wait.depends_on`, `directives.provider`, and function or module arguments.
+The argument itself decides what is transported: passing `vpc` binds the
+parameter as a handle, while passing `vpc.vpc_id` binds it as a value. A
+resource type annotation accepts only a matching handle; it does not turn a
+string or identity value into a handle. An untyped function parameter can also
+receive a handle:
 
 ```crn
 fn id_of(resource) {
@@ -406,14 +409,32 @@ arguments {
 
 ### Resource Type References
 
-Resource types can be used as type expressions to indicate a reference:
+Resource types used as type expressions mean resource handles. They are not
+aliases for the resource's ID or another string attribute:
+
+```crn
+arguments {
+  network: awscc.ec2.Vpc
+}
+
+attributes {
+  network = network
+}
+```
+
+A matching bare resource or module handle can satisfy `awscc.ec2.Vpc`. A
+`String`, `vpc.vpc_id`, or even the typed identity value
+`aws.ec2.Vpc.Id` cannot. When the boundary should carry the ID value, annotate
+it with the identity type instead:
 
 ```crn
 attributes {
-  vpc_id   : awscc.ec2.Vpc = vpc.vpc_id
-  subnet_id: awscc.ec2.Subnet = subnet.subnet_id
+  vpc_id: aws.ec2.Vpc.Id = vpc.vpc_id
 }
 ```
+
+Resource handles may cross module boundaries in the same expanded graph, but
+they cannot be stored in `exports` or read through `upstream_state`.
 
 ## Null
 

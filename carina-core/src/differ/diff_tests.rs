@@ -4,9 +4,8 @@ use crate::schema::{
 };
 
 use crate::resource::{
-    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
-    ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
-    RelativeBindingName, RootScope,
+    AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue, ExpandedResource as Resource,
+    ExpandedValue as Value, RelativeBindingName, RootScope,
 };
 use indexmap::IndexMap;
 
@@ -27,7 +26,7 @@ fn diff_test(
         saved,
         prev_explicit,
         schema,
-        &super::exact_comparison_context_for_tests(),
+        &super::exact_comparison_schema_for_tests(),
     )
 }
 
@@ -530,7 +529,7 @@ fn create_plan_detects_typed_orphan_for_deletion() {
     let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id, orphan_attrs),
         None,
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -996,9 +995,19 @@ fn update_when_optional_nested_create_only_field_is_omitted_but_present_in_state
 fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_state() {
     let (desired, current, schemas) = omitted_optional_nested_create_only_fixture();
     let id = desired.id.clone();
-    let managed =
-        ResolvedResource::collect_resolved_with_schemas(std::iter::once(desired.clone()), &schemas)
-            .expect("budget fixture must resolve");
+    let graph = crate::resolved_graph::resolve_expanded_graph(
+        crate::parser::ExpandedParsedFile {
+            resources: vec![desired.clone()],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .expect("budget fixture graph must resolve");
+    let managed = vec![
+        graph
+            .resolve_resource(desired.clone(), &schemas)
+            .expect("budget fixture must resolve"),
+    ];
     let (schemas, provider) = crate::provider::comparison_fixture_for_test(
         &schemas,
         managed.iter().map(|resource| &resource.id),
@@ -1016,8 +1025,22 @@ fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_st
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &provider,
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("comparison fixture must resolve");
+
+    let pre_graph_stability = pre_graph_managed_binding_stability(
+        std::slice::from_ref(&desired),
+        &current_states,
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &provider,
+        &crate::references::prepare_empty_for_tests(),
+    )
+    .expect("pre-graph lifecycle paths must resolve")
+    .expect("pre-graph comparison fixture must resolve");
+    assert_eq!(pre_graph_stability, stability);
 
     assert!(matches!(
         stability.get(&id),
@@ -1749,12 +1772,13 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
     let desired = vec![];
 
     let orphan_id = ResourceId::with_identity("subnet", "my-subnet");
+    let dependency_id = crate::resource::ResolvedResourceId::with_identity("vpc", "my-vpc");
     let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
-        .with_root_dependency_bindings(std::collections::BTreeSet::from(["my_vpc".to_string()]));
+        .with_dependency_bindings(crate::test_support::persisted([dependency_id.clone()]));
     let orphans = crate::differ::Orphans::from([Orphan::from_state(
         orphan_state,
         Some(absolute_binding("my_subnet")),
-        crate::resource::Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -1793,7 +1817,7 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
                 "Orphan Delete should preserve the typed binding"
             );
             assert!(
-                dependencies.contains(&absolute_binding("my_vpc")),
+                dependencies.contains(&dependency_id),
                 "Orphan Delete should preserve typed dependency bindings"
             );
         }

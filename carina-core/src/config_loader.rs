@@ -534,7 +534,7 @@ fn collect_file_declarations(
         .filter(|name| !argument_names.contains(name) && !function_names.contains(name))
         .collect();
     for name in local_variable_names {
-        if parsed.variables.contains_key(name)
+        if parsed.variables.contains_key(name.as_str())
             && !binding_names.contains(name.as_str())
             && !argument_names.contains(name.as_str())
         {
@@ -1185,7 +1185,12 @@ pub(crate) fn parse_directory_files_located_from_root(
     provisional_seeds.extend(
         directory_module_parameters
             .iter()
-            .map(|name| parser::BindingSeed::module_parameter(name)),
+            // The syntax-classification pass does not know an argument's
+            // declared type when parsing a sibling file. Preserve the bare
+            // name as a provisional reference here; the fixed-point union
+            // replaces it with either a typed structural handle (`Ref`) or a
+            // value-shaped module-argument placeholder before the final pass.
+            .map(|name| parser::BindingSeed::provisional(name)),
     );
 
     // Pass 1.a: classify declarations with the complete syntactic scope.
@@ -1208,14 +1213,16 @@ pub(crate) fn parse_directory_files_located_from_root(
         merge_parsed_file(&mut pass1_union, parsed);
     }
     let structural = pass1_union.structural_binding_names();
-    let module_parameters: HashSet<&str> = pass1_union
+    let module_parameters: HashMap<&str, &parser::TypeExpr> = pass1_union
         .arguments
         .iter()
-        .map(|argument| argument.name.as_str())
+        .map(|argument| (argument.name.as_str(), &argument.static_type))
         .collect();
     parser::reject_cyclic_let_bindings_in_variables(&pass1_union.variables, &structural)
         .map_err(LocatedParseError::directory_wide)?;
     let seed_metadata = pass1_union.parser_binding_metadata.binding_seed_snapshot();
+    let mut stable_structural_metadata = seed_metadata.clone();
+    stable_structural_metadata.retain(|name| !pass1_union.variables.contains_key(name.as_str()));
     let mut bindings_current = DirectorySeedState {
         variables: pass1_union.variables.clone(),
         metadata: seed_metadata,
@@ -1230,13 +1237,21 @@ pub(crate) fn parse_directory_files_located_from_root(
             &bindings_current.variables,
             &bindings_current.metadata,
         );
-        let bindings_next = parse_local_variable_union(
+        let mut bindings_next = parse_local_variable_union(
             files,
             config,
             &seeds,
             &pass_1a_local_variables,
             &directory_functions,
         )?;
+        // The fixed point recomputes value-shaped `let` bindings only.
+        // Resource handles, Ref-typed module arguments, and structural aliases
+        // are declarations rather than values, so carry their exact metadata
+        // across every iteration instead of degrading them to provisional or
+        // unknown seeds after the first pass.
+        let mut still_structural = stable_structural_metadata.clone();
+        still_structural.retain(|name| !bindings_next.variables.contains_key(name.as_str()));
+        bindings_next.metadata.extend(still_structural);
         parser::reject_cyclic_let_bindings_in_variables(&bindings_next.variables, &structural)
             .map_err(LocatedParseError::directory_wide)?;
 
@@ -1529,6 +1544,33 @@ mod tests {
     use crate::parser::ModuleCall;
     use crate::resource::{DeferredValue, Value};
     use std::fs;
+
+    #[test]
+    fn directory_load_preserves_resource_handle_export_type_for_boundary_validation() {
+        let directory = tempfile::tempdir().expect("temporary export fixture");
+        fs::write(
+            directory.path().join("main.crn"),
+            "let instance = mock.compute.Instance { name = \"instance\" }\nexports {\n  inferred = instance\n}\n",
+        )
+        .expect("write fixture");
+
+        let loaded = load_configuration_with_config(
+            directory.path(),
+            &ProviderContext::default(),
+            &SchemaRegistry::new(),
+        )
+        .expect("load handle export fixture");
+        assert!(
+            matches!(
+                loaded.parsed.export_params[0].static_type,
+                crate::static_type::ExportStaticType::Inferred(
+                    crate::static_type::StaticType::Known(crate::parser::TypeExpr::Ref(_))
+                )
+            ),
+            "directory inference lost the handle export: {:?}",
+            loaded.parsed.export_params[0].static_type,
+        );
+    }
 
     /// Helper to create a temporary directory for tests
     fn create_temp_dir(name: &str) -> PathBuf {
@@ -2287,11 +2329,13 @@ for account_id in orgs.accounts {
                 )]),
             )]));
         let mut parsed = parsed
-            .into_expanded()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
             .expect("directory fixture must contain no parser placeholders");
-        parsed
-            .expand_deferred_for_expressions(&bindings)
-            .expect("resolved upstream iterable expands");
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| parsed.expand_deferred_for_expressions(&bindings, session),
+        )
+        .expect("resolved upstream iterable expands");
 
         assert!(parsed.deferred_for_expressions().is_empty());
         assert!(
@@ -3136,7 +3180,7 @@ awscc.ec2.SecurityGroup {
                     rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
                 },
                 timeout_secs: None,
-                depends_on: Vec::new(),
+                depends_on: Default::default(),
                 line: 1,
             }],
             ..ParsedFile::default()

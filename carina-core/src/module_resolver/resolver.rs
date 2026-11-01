@@ -187,6 +187,9 @@ impl ResidualModuleResolutionError {
                     error,
                 })
             }
+            ModuleError::TypeResolution(_diagnostic) => {
+                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
+            }
             ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::CircularImport(_module) => None,
             ModuleError::Io(_error) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
@@ -390,6 +393,9 @@ impl ResidualModuleResolutionError {
                     crate::validation::TypeResolutionParserError::new(path, error),
                 )
             }
+            ModuleError::TypeResolution(diagnostic) => findings.iter().any(|finding| {
+                finding.message().type_resolution_diagnostic() == Some(diagnostic.as_ref())
+            }),
             ModuleError::UnknownModule(_) => false,
             ModuleError::ProviderInModule => false,
             ModuleError::StateBlockInModule => false,
@@ -489,6 +495,7 @@ fn without_covered_reference_type_members(
         | ModuleError::Io(_)
         | ModuleError::Parse(_)
         | ModuleError::ParseInFile { path: _, error: _ }
+        | ModuleError::TypeResolution(_)
         | ModuleError::UnknownArgument {
             module: _,
             argument: _,
@@ -756,12 +763,7 @@ impl TypeResolutionPolicy for StrictTypeResolution {
     ) -> Result<(), ModuleError> {
         let type_errors = crate::validation::resolve_file_type_exprs(parsed, config);
         if let Some(first) = type_errors.into_iter().next() {
-            return Err(ModuleError::Parse(ParseError::InvalidExpression {
-                line: first
-                    .source_location()
-                    .map_or(0, |source| source.span().start_line()),
-                message: first.to_string(),
-            }));
+            return Err(ModuleError::TypeResolution(Box::new(first)));
         }
         Ok(())
     }
@@ -957,9 +959,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
         &self,
-        parsed: &crate::parser::File<E>,
+        parsed: &mut crate::parser::File<E>,
     ) -> Result<RefCheckWitness, ModuleError> {
         let imported_modules = self.resolved_module_signatures();
+        lift_module_attribute_handles(parsed, &imported_modules);
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
             parsed, self.schemas, None, &imported_modules, self.session,
         );
@@ -1263,6 +1266,180 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     }
 }
 
+fn lift_module_attribute_handles<E>(
+    parsed: &mut crate::parser::File<E>,
+    signatures: &super::ResolvedModuleSignatures,
+) {
+    let calls = parsed
+        .module_calls
+        .iter()
+        .filter_map(|call| {
+            call.binding_name
+                .as_ref()
+                .map(|binding| (binding.clone(), call.module_name.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let local_resources = parsed
+        .iter_all_resources()
+        .filter_map(|resource| match resource {
+            crate::parser::ResourceRef::Resource(resource) => {
+                resource.binding.as_ref().map(|binding| {
+                    (
+                        binding.clone(),
+                        crate::parser::ResourceTypePath::new(
+                            resource.id.provider.clone(),
+                            resource.id.resource_type.clone(),
+                        ),
+                    )
+                })
+            }
+            crate::parser::ResourceRef::Deferred {
+                resource,
+                deferred: _deferred,
+            } => resource.binding_address().map(|binding| {
+                (
+                    binding.clone(),
+                    crate::parser::ResourceTypePath::new(
+                        resource.id().provider.clone(),
+                        resource.id().resource_type.clone(),
+                    ),
+                )
+            }),
+            crate::parser::ResourceRef::LiveComposition(_composition) => None,
+            crate::parser::ResourceRef::DataSource(_data_source) => None,
+        })
+        .collect::<HashMap<_, _>>();
+
+    let lift = |value: &crate::parser::ParsedValue| {
+        let crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }) =
+            value
+        else {
+            return None;
+        };
+        if !path.segments().is_empty() {
+            return None;
+        }
+        let module_name = calls.get(path.binding())?;
+        let static_type = signatures
+            .get(module_name)?
+            .attributes
+            .get(path.attribute())?
+            .as_ref()?
+            .known()?;
+        let crate::parser::TypeExpr::Ref(resource_type) = static_type else {
+            return None;
+        };
+        Some(
+            crate::eval_value::UnexpandedStructuralHandle::module_attribute(
+                path.binding(),
+                path.attribute(),
+                resource_type.clone(),
+            )
+            .resource_handle()
+            .expect("a typed module attribute constructs a resource handle"),
+        )
+    };
+
+    for attribute in &mut parsed.attribute_params {
+        let handle = match attribute.value.as_ref() {
+            Some(crate::parser::BoundaryExpression::Value(value)) => lift(value),
+            Some(crate::parser::BoundaryExpression::Handle(_)) | None => None,
+        };
+        if let Some(handle) = handle {
+            attribute.value = Some(crate::parser::BoundaryExpression::Handle(handle));
+        }
+    }
+
+    for call in &mut parsed.module_calls {
+        for argument in call.arguments_mut() {
+            let handle = argument.value().and_then(lift);
+            if let Some(handle) = handle {
+                argument.replace_with_resource_handle(handle);
+            }
+        }
+    }
+
+    let lift_dependency = |operand: &mut crate::parser::UnexpandedDependencyOperand| {
+        let handle = match operand {
+            crate::parser::UnexpandedDependencyOperand::Handle(_handle) => None,
+            crate::parser::UnexpandedDependencyOperand::BareBinding(binding) => {
+                local_resources.get(binding.as_str()).map(|resource_type| {
+                    crate::eval_value::UnexpandedResourceHandle::new(
+                        binding.as_str(),
+                        resource_type.clone(),
+                    )
+                })
+            }
+            crate::parser::UnexpandedDependencyOperand::AttributeSelection {
+                binding,
+                attribute,
+            } => calls
+                .get(binding.as_str())
+                .and_then(|module_name| signatures.get(module_name))
+                .and_then(|signature| signature.attributes.get(attribute))
+                .and_then(Option::as_ref)
+                .and_then(|static_type| static_type.known())
+                .and_then(|resolved| match resolved {
+                    crate::parser::TypeExpr::Ref(resource_type) => Some(
+                        crate::eval_value::UnexpandedStructuralHandle::module_attribute(
+                            binding.as_str(),
+                            attribute,
+                            resource_type.clone(),
+                        )
+                        .resource_handle()
+                        .expect("a typed module output constructs a resource handle"),
+                    ),
+                    crate::parser::TypeExpr::String
+                    | crate::parser::TypeExpr::Bool
+                    | crate::parser::TypeExpr::Int
+                    | crate::parser::TypeExpr::Float
+                    | crate::parser::TypeExpr::Duration
+                    | crate::parser::TypeExpr::Simple(_)
+                    | crate::parser::TypeExpr::UnloadedSchemaType(_)
+                    | crate::parser::TypeExpr::List(_)
+                    | crate::parser::TypeExpr::Map(_)
+                    | crate::parser::TypeExpr::DottedUnresolved(_)
+                    | crate::parser::TypeExpr::SchemaType { .. }
+                    | crate::parser::TypeExpr::Struct { .. }
+                    | crate::parser::TypeExpr::StringLiteral(_)
+                    | crate::parser::TypeExpr::Union(_) => None,
+                }),
+        };
+        if let Some(handle) = handle {
+            *operand = crate::parser::UnexpandedDependencyOperand::Handle(handle);
+        }
+    };
+
+    for resource in parsed.iter_all_resources_mut() {
+        match resource {
+            crate::parser::ResourceMut::Resource(resource) => {
+                for operand in resource.dependencies.depends_on.iter_mut() {
+                    lift_dependency(operand);
+                }
+            }
+            crate::parser::ResourceMut::DataSource(data_source) => {
+                for operand in data_source.dependencies.depends_on.iter_mut() {
+                    lift_dependency(operand);
+                }
+            }
+            crate::parser::ResourceMut::Deferred { .. } => {}
+            crate::parser::ResourceMut::LiveComposition(_composition) => {}
+        }
+    }
+    for deferred in &mut parsed.deferred_for_phase.expressions {
+        if let crate::parser::DeferredForBody::Resource(resource) = &mut deferred.body {
+            for operand in resource.dependencies_mut().depends_on.iter_mut() {
+                lift_dependency(operand);
+            }
+        }
+    }
+    for wait in &mut parsed.wait_bindings {
+        for operand in wait.depends_on.iter_mut() {
+            lift_dependency(operand);
+        }
+    }
+}
+
 impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>>
     RefCheckedModuleGraph<'parsed, 'cfg, E>
 {
@@ -1463,10 +1640,14 @@ pub fn prepare_root_export_validation(
 /// ```compile_fail,E0308
 /// use std::path::Path;
 /// use carina_core::module_resolver::resolve_modules_providerless;
-/// use carina_core::parser::ParsedFile;
+/// use carina_core::parser::{ParsedFile, ProviderContext};
+/// use carina_core::validation::deferred_types::TypeCheckSession;
 ///
 /// let parsed = ParsedFile::default();
-/// let _ = resolve_modules_providerless(parsed, Path::new("."));
+/// let checks = TypeCheckSession::run(&ProviderContext::default(), |session| {
+///     resolve_modules_providerless(parsed, Path::new("."), session)
+/// });
+/// checks.publish(&mut Vec::new());
 /// ```
 pub fn resolve_modules_providerless(
     parsed: ParsedRootDirectory,
@@ -1632,7 +1813,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
     let mut contributions = Vec::new();
-    match resolver.validate_reference_types(&graph) {
+    match resolver.validate_reference_types(&mut graph) {
         Ok(root_witness) => {
             let (expanded, expansion_errors) = resolve_modules_with_resolver_collecting(
                 &graph,
@@ -1725,7 +1906,9 @@ where
             argument.try_visit_values(&mut |value| audit(value, "composition argument"))?;
         }
         for attribute in composition.signature.attributes.values() {
-            audit(&attribute.to_value(), "composition attribute")?;
+            if let Some(value) = attribute.value() {
+                audit(&value, "composition attribute")?;
+            }
         }
         for constraint in &composition.signature.pending_constraints {
             audit_validate_expr(

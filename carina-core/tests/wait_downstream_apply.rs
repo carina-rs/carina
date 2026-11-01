@@ -45,7 +45,8 @@ use carina_core::provider::{
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
-    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, Resource, ResourceId, State, Value,
+    ConcreteValue, Current, PlanInputCurrent, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, ValidatedConfigSchema,
@@ -101,6 +102,37 @@ fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
             result.skip_count
         ),
     }
+}
+
+fn resolve_plan_graph(
+    parsed: carina_core::parser::ExpandedParsedFile,
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+) -> (
+    Vec<ResolvedResource>,
+    Vec<carina_core::wait::ResolvedWaitBinding>,
+) {
+    let index = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (resources).to_vec();
+        configuration.data_sources = Vec::new();
+        configuration.into()
+    })
+    .expect("expanded test graph must resolve");
+    let managed = resources
+        .iter()
+        .cloned()
+        .map(|resource| index.resolve_resource(resource, registry))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("managed test dependencies must resolve");
+    let waits = index
+        .configuration()
+        .wait_bindings
+        .iter()
+        .map(|wait| index.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("wait test dependencies must resolve");
+    (managed, waits)
 }
 
 /// cert read returns ISSUED (+ certificate_arn) immediately; other
@@ -309,7 +341,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
     });
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders");
 
     // ---- Root-cause assertion #1: the module's wait binding survived
@@ -345,7 +377,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     assert!(
         wb.depends_on
             .iter()
-            .any(|dependency| dependency.as_str() == "r.validation_record"),
+            .any(|dependency| dependency.binding_reference().as_str() == "r.validation_record"),
         "depends_on entries must be instance-prefixed; got {:?}",
         wb.depends_on
     );
@@ -414,8 +446,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     .expect("resolve_refs should succeed");
 
     let provider = fixture_provider(&resources_for_plan);
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(parsed.clone(), &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -432,23 +464,24 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
 
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the prefixed wait binding"
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })
@@ -522,7 +555,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         resolve_modules(parsed, &root, session).expect("nested module resolution should succeed")
     });
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("expanded nested module fixture contains no parser placeholders");
 
     // The two-level-deep wait binding survived, doubly instance-prefixed
@@ -607,8 +640,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     .expect("resolve_refs should succeed");
 
     let provider = fixture_provider(&resources_for_plan);
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(parsed.clone(), &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -625,22 +658,23 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "o.c.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "o.c.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the doubly-prefixed binding"
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })
@@ -716,7 +750,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         resolve_modules(parsed, &caller, session).expect("module resolution should succeed")
     });
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders");
 
     let sorted_resources =
@@ -805,8 +839,8 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
     let provider = fixture_provider(&resources_for_plan);
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let (resolved_resources_for_plan, resolved_waits) =
+        resolve_plan_graph(parsed, &resources_for_plan, &registry);
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
@@ -823,13 +857,14 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &registry,
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &parsed.wait_bindings,
+        &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
+            carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued"
         )),
         "the value-layer alias fix must NOT remove the Effect::Wait \
          dependency edge — both halves of the wait binding must hold"

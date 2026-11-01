@@ -168,6 +168,23 @@ impl<'de> serde::Deserialize<'de> for OwnedTypeIdentity {
 }
 
 impl OwnedTypeIdentity {
+    /// Reference annotations retain string shape and owner identity, while
+    /// their declaration remains offline-only in the factory's schema index.
+    pub(crate) fn from_schema_declaration(
+        owner: impl Into<String>,
+        declaration: &AttributeType,
+    ) -> Option<Self> {
+        if let crate::schema::RawShape::Reference { identity, .. } = declaration.raw_shape() {
+            return Some(Self {
+                owners: NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider(
+                    owner.into(),
+                )),
+                declaration: IdentifiedScalarDeclaration::String(identity.clone()),
+            });
+        }
+        IdentifiedCustomTypeDeclaration::new(declaration)
+            .map(|declaration| Self::from_declaration(owner, declaration))
+    }
     pub(crate) fn from_declaration(
         owner: impl Into<String>,
         declaration: IdentifiedCustomTypeDeclaration<'_>,

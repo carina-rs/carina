@@ -121,6 +121,14 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let text = doc.text();
 
+        // A module resource-handle output preserves the underlying resource
+        // schema for postfix access. Detect the depth-2 shape before the
+        // generic value-position dispatcher, which otherwise sees only the
+        // module-call binding and falls back to in-scope names.
+        if let Some(completions) = self.module_handle_dot_completions(&text, position, base_path) {
+            return completions;
+        }
+
         // `<binding>.<key>.<partial>` (depth-2) is checked first because
         // its prefix shape also matches the depth-1 walker's tail (which
         // would treat `<key>` as the binding and decline). #2041.
@@ -782,6 +790,18 @@ impl CompletionProvider {
                 .is_some();
                 completions
                     .extend(self.completions_for_type(field.field_type(), Some(resource_type)));
+                completions.extend(
+                    self.resource_ref_completions_for_type(
+                        field.field_type().in_schema(schema.as_schema().defs()),
+                        text,
+                        base_path,
+                    )
+                    .into_iter()
+                    .filter(|item| {
+                        !current_binding
+                            .is_some_and(|binding| item.label.starts_with(&format!("{binding}.")))
+                    }),
+                );
             }
         }
         let mut in_scope = self.in_scope_binding_completions(

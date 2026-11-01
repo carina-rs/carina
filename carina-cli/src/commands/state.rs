@@ -1,9 +1,10 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::wiring::AddressedDataSourceReadInputs;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::output_style::Colorize;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
-use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -32,8 +33,8 @@ use carina_core::shutdown::{
 use carina_core::value::format_value;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedInstance,
-    DeposedKey, LoadedOrphans, LockInfo, ResourceState, RowBasis, StateBackend, StateFile,
-    StateUrl, load_state_from_url,
+    DeposedKey, LoadedOrphans, LocalStateFile, LockInfo, ResourceState, RowBasis, StateBackend,
+    StateFile, StateUrl, load_local_state_file, load_state_from_url,
 };
 
 use super::{
@@ -54,7 +55,7 @@ use crate::commands::state_output::{StateShowCurrentKind, StateShowDocument, Sta
 use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
+    MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
     prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
@@ -98,7 +99,13 @@ fn format_deferred_state_refresh_warning(
         })
         .collect::<Vec<_>>();
     if refs.is_empty() {
-        refs.extend(resource.dependency_bindings.iter().map(ToString::to_string));
+        refs.extend(
+            resource
+                .dependencies
+                .value_bindings
+                .iter()
+                .map(ToString::to_string),
+        );
     }
     let refs = if refs.is_empty() {
         "unknown input dependency".to_string()
@@ -223,6 +230,20 @@ pub enum StateCommands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
     },
+    /// Check a legacy state's dependency migration without provider I/O or writes
+    Migrate {
+        /// Directory containing the current .crn configuration
+        #[arg(long, value_name = "DIR")]
+        check: PathBuf,
+
+        /// Copied local state file (file:///<absolute-path> or a bare path; no remote URLs)
+        #[arg(long, value_parser = LocalStateFile::parse)]
+        state_url: LocalStateFile,
+
+        /// Trusted local provider schema artifact (repeatable KIND=PATH)
+        #[arg(long = "provider-schema", value_name = "KIND=PATH")]
+        provider_schemas: Vec<String>,
+    },
     /// Forget a create-outcome-unknown row after confirming the resource is absent
     Forget {
         /// Namespaced resource type, for example awscc.ec2.Vpc
@@ -299,6 +320,7 @@ impl StateCommands {
             Self::BucketDelete { path, .. }
             | Self::Refresh { path, .. }
             | Self::Forget { path, .. } => Some(path),
+            Self::Migrate { check, .. } => Some(check),
             Self::List { path, state_url }
             | Self::Lookup {
                 path, state_url, ..
@@ -318,7 +340,7 @@ impl StateCommands {
 
 /// Run state subcommands
 pub async fn run_state_command(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     command: StateCommands,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
@@ -328,10 +350,15 @@ pub async fn run_state_command(
             bucket_name,
             force,
             path,
-        } => run_state_bucket_delete(user_dirs, &bucket_name, force, &path, provider_context).await,
+        } => run_state_bucket_delete(runtime, &bucket_name, force, &path, provider_context).await,
         StateCommands::Refresh { path, lock } => {
-            run_state_refresh(user_dirs, &path, lock, provider_context, cancel).await
+            run_state_refresh(runtime, &path, lock, provider_context, cancel).await
         }
+        StateCommands::Migrate {
+            check,
+            state_url,
+            provider_schemas,
+        } => run_state_migration_check(runtime, &check, &state_url, &provider_schemas).await,
         StateCommands::Forget {
             resource_type,
             identity,
@@ -339,6 +366,7 @@ pub async fn run_state_command(
             path,
         } => {
             run_state_forget(
+                runtime,
                 &resource_type,
                 &identity,
                 auto_approve,
@@ -349,7 +377,13 @@ pub async fn run_state_command(
             .await
         }
         StateCommands::List { path, state_url } => {
-            run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
+            run_state_list(
+                runtime,
+                path.as_deref(),
+                state_url.as_deref(),
+                provider_context,
+            )
+            .await
         }
         StateCommands::Lookup {
             query,
@@ -358,6 +392,7 @@ pub async fn run_state_command(
             json,
         } => {
             run_state_lookup(
+                runtime,
                 &query,
                 path.as_deref(),
                 state_url.as_deref(),
@@ -373,6 +408,7 @@ pub async fn run_state_command(
             json,
         } => {
             run_state_show(
+                runtime,
                 path.as_deref(),
                 state_url.as_deref(),
                 tui,
@@ -382,6 +418,91 @@ pub async fn run_state_command(
             .await
         }
     }
+}
+
+/// Classify a copied pre-v21 state against the current expanded graph without
+/// initializing a provider, reading upstream state, or writing any state.
+async fn run_state_migration_check(
+    runtime: &crate::runtime::CommandRuntime,
+    config_dir: &Path,
+    state_file: &LocalStateFile,
+    provider_schema_args: &[String],
+) -> Result<(), AppError> {
+    let mut provider_schema_overrides = HashMap::new();
+    for argument in provider_schema_args {
+        let (name, path) = argument.split_once('=').ok_or_else(|| {
+            AppError::Config(format!(
+                "invalid --provider-schema {argument:?}: expected KIND=PATH"
+            ))
+        })?;
+        if name.is_empty() || path.is_empty() {
+            return Err(AppError::Config(format!(
+                "invalid --provider-schema {argument:?}: expected non-empty KIND and PATH"
+            )));
+        }
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(AppError::Config(format!(
+                "invalid --provider-schema {argument:?}: PATH must be absolute"
+            )));
+        }
+        if provider_schema_overrides
+            .insert(name.to_string(), path)
+            .is_some()
+        {
+            return Err(AppError::Config(format!(
+                "provider schema override for {name:?} was supplied more than once"
+            )));
+        }
+    }
+
+    // A migration check must never acquire a KMS client through the command's
+    // ordinary parser context. Provider-owned custom types are loaded below;
+    // decrypt() remains unavailable on this read-only/offline path.
+    let loaded = load_configuration_with_config(
+        config_dir,
+        &ProviderContext::default(),
+        &carina_core::schema::SchemaRegistry::new(),
+    )?;
+    let duplicate_declarations = loaded.duplicate_declarations;
+    let parsed = loaded.parsed;
+    let state = load_local_state_file(state_file).await?;
+    if !state.requires_legacy_dependency_migration() {
+        println!(
+            "State dependency migration check passed: state is already version {}.",
+            StateFile::CURRENT_VERSION
+        );
+        return Ok(());
+    }
+    let base_dir = get_base_dir(config_dir);
+    let providers = MigrationCheckProviderLoad::load(
+        runtime,
+        &parsed.providers,
+        base_dir,
+        &provider_schema_overrides,
+    )?;
+    let validated =
+        providers.validate_evaluated_config(parsed, base_dir, &duplicate_declarations)?;
+
+    // The owner performs parser-aware cleanup, late identity preparation,
+    // moved-address projection, and graph construction as one transition.
+    // Historical identifier-less read rows are removed only from this copy.
+    let migration = match validated.migrate_legacy_dependencies_from_copied_state(state)? {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            return Err(AppError::Validation(format!(
+                "{rows}: cannot classify offline: rows owned by a deferred loop over upstream_state or unread data sources; run plan/apply (which reads) to migrate"
+            )));
+        }
+    };
+    let migrated_rows = migration.migrated_rows();
+    let warning_count = migration.warning_count();
+    let _validated = migration.report_and_validate(runtime.color_mode())?;
+    println!(
+        "State dependency migration check passed: {} row(s) classified, {} orphan/deposed warning(s); no state was written.",
+        migrated_rows, warning_count
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +565,7 @@ fn format_state_forget_target(
 }
 
 async fn confirm_state_forget<R>(
+    runtime: &crate::runtime::CommandRuntime,
     reader: R,
     cancel: ShutdownToken,
     auto_approve: bool,
@@ -451,6 +573,7 @@ async fn confirm_state_forget<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    let color_mode = runtime.color_mode();
     if auto_approve {
         return Ok(StateForgetConfirmation::Confirmed);
     }
@@ -458,16 +581,16 @@ where
     println!(
         "{}",
         "Forget this create-outcome-unknown state row?"
-            .yellow()
-            .bold()
+            .yellow(color_mode)
+            .bold(color_mode)
     );
     println!(
         "  {}",
         "Only continue after confirming that the resource does not exist. Type 'yes' to confirm."
-            .yellow()
+            .yellow(color_mode)
     );
     let input = {
-        let _reveal = CursorReveal::new();
+        let _reveal = CursorReveal::new(runtime.cursor());
         print!("\n  Enter a value: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|error| error.to_string())?;
         let result = crate::signal::read_line_until_cancelled(reader, cancel).await;
@@ -480,13 +603,14 @@ where
         Ok(StateForgetConfirmation::Confirmed)
     } else {
         println!();
-        println!("{}", "State forget cancelled.".yellow());
+        println!("{}", "State forget cancelled.".yellow(color_mode));
         Ok(StateForgetConfirmation::Cancelled)
     }
 }
 
 /// Remove the recovery row for a create whose outcome is unknown.
 pub async fn run_state_forget(
+    runtime: &crate::runtime::CommandRuntime,
     namespaced_type: &str,
     identity: &str,
     auto_approve: bool,
@@ -494,6 +618,7 @@ pub async fn run_state_forget(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let address = state_forget_address(namespaced_type, identity)?;
     let loaded = load_configuration_with_config(
         path,
@@ -512,15 +637,16 @@ pub async fn run_state_forget(
         .await
         .map_err(AppError::Backend)?;
 
-    println!("{}", "Acquiring state lock...".cyan());
+    println!("{}", "Acquiring state lock...".cyan(color_mode));
     let lock = backend
         .acquire_lock("state forget")
         .await
         .map_err(|error| map_lock_error(error, path))?;
-    println!("  {} Lock acquired", "✓".green());
+    println!("  {} Lock acquired", "✓".green(color_mode));
 
     let reader = tokio::io::BufReader::new(tokio::io::stdin());
     let operation = run_state_forget_locked(
+        runtime,
         backend.as_ref(),
         &lock,
         &address,
@@ -533,13 +659,50 @@ pub async fn run_state_forget(
     let release =
         release_lock_after_execute(backend.as_ref(), StateLockRef::Held(&lock), &cancel).await;
     if release.is_ok() {
-        println!("  {} Lock released", "✓".green());
+        println!("  {} Lock released", "✓".green(color_mode));
     }
     operation?;
     release
 }
 
+struct StateForgetWriteState(StateFile);
+
+impl StateForgetWriteState {
+    fn from_loaded(state: StateFile, project_dir: &Path) -> Result<Self, AppError> {
+        if state.requires_legacy_dependency_migration() {
+            let forget = ProjectCommand::new("state forget", project_dir);
+            let refresh = ProjectCommand::new("state refresh", project_dir);
+            return Err(AppError::Config(format!(
+                "Cannot run `{forget}` while state contains unmigrated pre-v21 dependency names. Run `{refresh}` first; state refresh classifies those names without discarding create-outcome-unknown recovery rows."
+            )));
+        }
+        Ok(Self(state))
+    }
+}
+
+impl std::ops::Deref for StateForgetWriteState {
+    type Target = StateFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StateForgetWriteState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AsMut<StateFile> for StateForgetWriteState {
+    fn as_mut(&mut self) -> &mut StateFile {
+        &mut self.0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_state_forget_locked<R>(
+    runtime: &crate::runtime::CommandRuntime,
     backend: &dyn StateBackend,
     lock: &LockInfo,
     address: &StateBlockAddress,
@@ -551,16 +714,18 @@ async fn run_state_forget_locked<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    let mut state =
+    let color_mode = runtime.color_mode();
+    let state =
         crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
             .await?
             .unwrap_or_default();
+    let mut state = StateForgetWriteState::from_loaded(state, project_dir)?;
     let row = state
         .find_outcome_unknown(address)
         .map_err(|source| AppError::from_state_forget(source, project_dir))?;
 
     println!("{}", format_state_forget_target(address, row.resource()));
-    if confirm_state_forget(reader, cancel, auto_approve).await?
+    if confirm_state_forget(runtime, reader, cancel, auto_approve).await?
         == StateForgetConfirmation::Cancelled
     {
         return Ok(());
@@ -571,12 +736,12 @@ where
             StateFile::forget(row);
         }
     }
-    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    crate::commands::apply::save_state_locked(backend, lock, state.as_mut()).await?;
     println!(
         "{} {}",
         "Forgot create-outcome-unknown current instance:"
-            .green()
-            .bold(),
+            .green(color_mode)
+            .bold(color_mode),
         display_state_forget_address(address)
     );
     Ok(())
@@ -584,6 +749,7 @@ where
 
 /// Run force-unlock command
 pub async fn run_force_unlock(
+    color_mode: crate::output_style::ColorMode,
     lock_id: &str,
     path: &Path,
     provider_context: &ProviderContext,
@@ -603,12 +769,22 @@ pub async fn run_force_unlock(
 
     // Administrative lock recovery uses the shared old-backend-on-drift
     // selector without emitting the read-command warning.
-    println!("{}", "Force unlocking state...".yellow().bold());
+    println!(
+        "{}",
+        "Force unlocking state..."
+            .yellow(color_mode)
+            .bold(color_mode)
+    );
     println!("Lock ID: {}", lock_id);
 
     match BackendSelection::force_unlock(base_dir, backend_config.as_ref(), lock_id).await {
         Ok(()) => {
-            println!("{}", "State has been successfully unlocked.".green().bold());
+            println!(
+                "{}",
+                "State has been successfully unlocked."
+                    .green(color_mode)
+                    .bold(color_mode)
+            );
             Ok(())
         }
         Err(BackendError::LockNotFound(_)) => Err(AppError::Config(format!(
@@ -631,10 +807,12 @@ pub async fn run_force_unlock(
 /// is `Some`. When both are `None`, the existing behavior applies and
 /// the path defaults to `.`.
 async fn load_state_file(
+    runtime: &crate::runtime::CommandRuntime,
     path: Option<&Path>,
     state_url: Option<&str>,
     provider_context: &ProviderContext,
 ) -> Result<Option<StateFile>, AppError> {
+    let color_mode = runtime.color_mode();
     if let Some(raw) = state_url {
         let url = StateUrl::parse(raw).map_err(AppError::Backend)?;
         return load_state_from_url(&url)
@@ -660,6 +838,7 @@ async fn load_state_file(
 
     let base_dir = get_base_dir(path);
     let backend = resolve_backend_for_read(
+        color_mode,
         base_dir,
         path,
         backend_config.as_ref(),
@@ -761,6 +940,15 @@ fn create_outcome_unknown_status(unknown: &UnknownCreateOutcome) -> String {
     )
 }
 
+fn pending_legacy_dependencies_text(state: &StateFile, row: &ResourceState) -> Option<String> {
+    state.legacy_dependency_names_for(row).map(|legacy| {
+        format!(
+            "dependencies not yet migrated (legacy: {})",
+            legacy.iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
 /// Format state list output. Returns each line as a string.
 fn format_state_list(state: &StateFile) -> Vec<String> {
     let mut lines = Vec::new();
@@ -805,6 +993,9 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
                 deposed_state_marker(&deposed.key, &deposed.identifier)
             ));
         }
+        if let Some(pending) = pending_legacy_dependencies_text(state, rs) {
+            lines.push(format!("{row_prefix}  ({pending})"));
+        }
     }
     lines
 }
@@ -815,11 +1006,13 @@ fn deposed_state_marker(key: &DeposedKey, identifier: &str) -> String {
 
 /// Run state list command
 async fn run_state_list(
+    runtime: &crate::runtime::CommandRuntime,
     path: Option<&Path>,
     state_url: Option<&str>,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = require_state_file(load_state_file(path, state_url, provider_context).await?)?;
+    let state =
+        require_state_file(load_state_file(runtime, path, state_url, provider_context).await?)?;
 
     if state.resources().is_empty() {
         println!("No resources in state.");
@@ -859,7 +1052,13 @@ fn format_state_lookup(
             return format_state_lookup_json(state, rs, attribute);
         }
         let current = current_for_state_command(state, rs);
-        return format_resource_value(rs, &current, attribute, false);
+        let value = format_resource_value(rs, &current, attribute, false)?;
+        if attribute.is_none()
+            && let Some(pending) = pending_legacy_dependencies_text(state, rs)
+        {
+            return Ok(format!("{pending}\n{value}"));
+        }
+        return Ok(value);
     }
 
     // (2) Nothing matched — report the full query so the operator
@@ -921,7 +1120,7 @@ fn format_state_lookup_json(
     row: &ResourceState,
     attribute: Option<&str>,
 ) -> Result<String, AppError> {
-    let resource = StateShowResource::from_row(row)
+    let resource = StateShowResource::from_row(row, state.legacy_dependency_names_for(row))
         .map_err(|error| AppError::Config(format!("Failed to render state JSON: {error}")))?;
 
     let value = match attribute {
@@ -1082,13 +1281,15 @@ fn missing_attribute_error<T>(rs: &ResourceState, attr: &str) -> Result<T, AppEr
 
 /// Run state lookup command
 async fn run_state_lookup(
+    runtime: &crate::runtime::CommandRuntime,
     query: &str,
     path: Option<&Path>,
     state_url: Option<&str>,
     json_output: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = require_state_file(load_state_file(path, state_url, provider_context).await?)?;
+    let state =
+        require_state_file(load_state_file(runtime, path, state_url, provider_context).await?)?;
     let output = format_state_lookup(&state, query, json_output)?;
     println!("{}", output);
     Ok(())
@@ -1101,31 +1302,28 @@ async fn run_state_lookup(
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in state.resources() {
-        let identity = rs.identity.clone();
-        // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
-        let mut resource = carina_core::resource::DataSource::with_provider(
+        let id = ResolvedResourceId::with_provider_identity(
             &rs.provider,
             &rs.resource_type,
-            identity,
+            rs.identity.clone(),
             rs.directives.provider_instance.clone(),
         );
-        resource.directives = rs.directives.clone().into();
-
-        // Set typed metadata fields from state
-        resource.binding = rs.binding.clone();
-        resource.dependency_bindings = rs.dependency_bindings.clone();
-
-        // Convert persisted JSON attributes through the state-only decoder.
-        for (key, value) in rs
+        let attributes = rs
             .persisted_attributes()
             .map(PersistedAttributes::to_values)
             .unwrap_or_default()
-        {
-            resource.set_attr(key, value);
-        }
+            .into_iter()
+            .collect();
 
         plan.add(Effect::Read {
-            resource: ResolvedDataSource::new(resource),
+            resource: ResolvedDataSource::from_persisted_parts(
+                id,
+                attributes,
+                rs.directives.clone().into(),
+                rs.binding.clone(),
+                rs.dependency_bindings.to_resolved_dependencies(),
+                rs.directives.depends_on.to_resolved_dependencies(),
+            ),
         });
     }
     plan
@@ -1149,6 +1347,9 @@ fn format_state_show(state: &StateFile) -> String {
             "# {}.{} ({})\n",
             rs.provider, rs.resource_type, display_name
         ));
+        if let Some(pending) = pending_legacy_dependencies_text(state, rs) {
+            output.push_str(&format!("  {pending}\n"));
+        }
 
         let current = current_for_state_command(state, rs);
         match StateCommandCurrent::from(&current) {
@@ -1199,13 +1400,14 @@ fn format_attributes_for_show(
 
 /// Run state show command
 async fn run_state_show(
+    runtime: &crate::runtime::CommandRuntime,
     path: Option<&Path>,
     state_url: Option<&str>,
     tui: bool,
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = load_state_file(path, state_url, provider_context).await?;
+    let state = load_state_file(runtime, path, state_url, provider_context).await?;
 
     let Some(state) = state else {
         if json {
@@ -1233,14 +1435,30 @@ async fn run_state_show(
     }
 
     if tui {
+        for row in state.resources() {
+            if let Some(legacy) = state.legacy_dependency_names_for(row) {
+                let display_name = row
+                    .binding
+                    .as_ref()
+                    .map(AbsoluteBindingAddress::as_str)
+                    .unwrap_or(row.identity.as_str());
+                println!(
+                    "Warning: {display_name}: dependencies not yet migrated (legacy: {})",
+                    legacy.iter().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
         let plan = build_plan_from_state(&state);
         let historical_display =
             carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
         let prev_explicit = state.build_explicit();
         carina_tui::run(
-            &plan,
+            carina_core::detail_rows::PlanDisplay::unprepared(
+                &plan,
+                &historical_display,
+                carina_core::detail_rows::DetailComparisons::RecordedEffects,
+            ),
             &carina_core::schema::SchemaRegistry::new(),
-            &historical_display,
             Some(&prev_explicit),
             &carina_core::provider::ProviderRouter::new(),
         )?;
@@ -1254,12 +1472,13 @@ async fn run_state_show(
 
 /// Run state bucket delete command
 async fn run_state_bucket_delete(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     bucket_name: &str,
     force: bool,
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -1289,21 +1508,24 @@ async fn run_state_bucket_delete(
     // that command wiring before asking the operator to confirm deletion; the
     // resolved provider values needed for construction can wait until after
     // confirmation.
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     println!(
         "{}",
         "WARNING: This will delete the state bucket and all state history."
-            .red()
-            .bold()
+            .red(color_mode)
+            .bold(color_mode)
     );
-    println!("Bucket: {}", bucket_name.yellow());
+    println!("Bucket: {}", bucket_name.yellow(color_mode));
 
     if !force {
         println!();
-        println!("{}", "Type the bucket name to confirm deletion:".yellow());
+        println!(
+            "{}",
+            "Type the bucket name to confirm deletion:".yellow(color_mode)
+        );
         print!("  Enter bucket name: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
@@ -1314,7 +1536,7 @@ async fn run_state_bucket_delete(
 
         if input.trim() != bucket_name {
             println!();
-            println!("{}", "Deletion cancelled.".yellow());
+            println!("{}", "Deletion cancelled.".yellow(color_mode));
             return Ok(());
         }
     }
@@ -1322,6 +1544,7 @@ async fn run_state_bucket_delete(
     let provider_name = selection.provider_name();
     let resource_type = selection.resource_type();
     let provider_inputs = load_state_bucket_delete_provider_inputs(
+        runtime,
         validated_config.resources(),
         base_dir,
         provider_context,
@@ -1336,7 +1559,7 @@ async fn run_state_bucket_delete(
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
-    println!("{}", "Emptying bucket...".cyan());
+    println!("{}", "Emptying bucket...".cyan(color_mode));
 
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
@@ -1366,8 +1589,8 @@ async fn run_state_bucket_delete(
             println!(
                 "{}",
                 format!("Deleted state bucket: {}", bucket_name)
-                    .green()
-                    .bold()
+                    .green(color_mode)
+                    .bold(color_mode)
             );
             Ok(())
         }
@@ -1399,11 +1622,13 @@ fn state_bucket_delete_request(
 }
 
 async fn load_state_bucket_delete_provider_inputs<E>(
+    runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
+        runtime,
         parsed,
         base_dir,
         provider_context,
@@ -1430,12 +1655,13 @@ async fn create_state_bucket_delete_provider<R>(
 
 /// Run state refresh command
 pub async fn run_state_refresh(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     lock: bool,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -1445,7 +1671,7 @@ pub async fn run_state_refresh(
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
@@ -1463,19 +1689,19 @@ pub async fn run_state_refresh(
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
-        println!("{}", "Acquiring state lock...".cyan());
+        println!("{}", "Acquiring state lock...".cyan(color_mode));
         let li = backend
             .acquire_lock("refresh")
             .await
             .map_err(|error| map_lock_error(error, path))?;
-        println!("  {} Lock acquired", "✓".green());
+        println!("  {} Lock acquired", "✓".green(color_mode));
         StateLock::held(li)
     } else {
         println!(
             "{}",
             "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         StateLock::disabled_by_cli_flag()
     };
@@ -1496,7 +1722,7 @@ pub async fn run_state_refresh(
         && release_result.is_ok()
         && matches!(op_result, Err(AppError::Interrupted))
     {
-        println!("  {} Lock released", "✓".green());
+        println!("  {} Lock released", "✓".green(color_mode));
     }
     op_result?;
     release_result
@@ -1510,6 +1736,7 @@ pub(crate) async fn run_state_refresh_locked(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = validated_config.context().runtime().color_mode();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the refresh lock before the "no
     // resources" short-circuit returns — see
@@ -1531,7 +1758,7 @@ pub(crate) async fn run_state_refresh_locked(
         } else {
             "No resources in state. Nothing to refresh."
         };
-        println!("{}", msg.yellow());
+        println!("{}", msg.yellow(color_mode));
         return Ok(());
     }
 
@@ -1539,6 +1766,7 @@ pub(crate) async fn run_state_refresh_locked(
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
+        validated_config.context().runtime(),
         parsed,
         base_dir,
         provider_context,
@@ -1559,7 +1787,7 @@ pub(crate) async fn run_state_refresh_locked(
         get_provider_with_ctx(ctx, provider_inputs.configs(), ProgressSink::Human).await?;
 
     println!();
-    let progress = ProgressBackend::new(ProgressSink::Human);
+    let progress = ProgressBackend::new(color_mode, ProgressSink::Human);
     let refresh_phase = RefreshPhase::start(&progress);
 
     // Read states for all resources using identifier from state.
@@ -1575,7 +1803,7 @@ pub(crate) async fn run_state_refresh_locked(
                     managed_reads.push((resource.id.clone(), present.identifier().clone()));
                 }
                 Current::MissingIdentifier(state) => {
-                    warn_missing_provider_identifier(&resource.id);
+                    warn_missing_provider_identifier(color_mode, &resource.id);
                     missing_provider_identifier_ids.insert(resource.id.clone());
                     managed_current.insert(resource.id.clone(), Current::MissingIdentifier(state));
                 }
@@ -1590,8 +1818,14 @@ pub(crate) async fn run_state_refresh_locked(
             }
         }
     }
-    let (managed_states, mut already_refreshed) =
-        refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
+    let (managed_states, mut already_refreshed) = refresh_existing_resources_until_cancelled(
+        #[cfg(test)]
+        ctx.runtime(),
+        &provider,
+        managed_reads,
+        &cancel,
+    )
+    .await?;
     managed_current.extend(managed_states);
     match cancel.phase() {
         ShutdownPhase::Running => {}
@@ -1611,6 +1845,8 @@ pub(crate) async fn run_state_refresh_locked(
         .map(|sf| sf.build_orphans(&pre_expansion_desired_ids))
         .unwrap_or_default();
     let (refreshed_orphans, refreshed_orphan_ids) = refresh_orphans_until_cancelled(
+        #[cfg(test)]
+        ctx.runtime(),
         &provider,
         loaded_orphans,
         state_file.as_ref(),
@@ -1625,7 +1861,7 @@ pub(crate) async fn run_state_refresh_locked(
             Current::CreateInFlight(_pending) => {}
             Current::CreateOutcomeUnknown(_unknown) => {}
             Current::MissingIdentifier(_state) => {
-                warn_missing_provider_identifier(id);
+                warn_missing_provider_identifier(color_mode, id);
                 missing_provider_identifier_ids.insert(id.clone());
             }
         }
@@ -1659,7 +1895,10 @@ pub(crate) async fn run_state_refresh_locked(
         state_file.as_ref(),
     )
     .await?;
-    let saved_dep_bindings: HashMap<ResourceId, BTreeSet<AbsoluteBindingAddress>> = state_file
+    let saved_dep_bindings: HashMap<
+        ResourceId,
+        carina_core::resource::PersistedDestroyDependencies,
+    > = state_file
         .as_ref()
         .map(|sf| {
             sorted_resources
@@ -1705,9 +1944,7 @@ pub(crate) async fn run_state_refresh_locked(
         }
     }
     let mut prepared_expansion = addressed_expansion.seal(data_source_values);
-    let crate::wiring::ExpandedRefreshState {
-        sorted_resources: resorted,
-    } = validated_config
+    let materialization = validated_config
         .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
             provider: &provider,
             comparison_provider: &provider,
@@ -1719,6 +1956,7 @@ pub(crate) async fn run_state_refresh_locked(
             refresh_phase: &refresh_phase,
         })
         .await?;
+    let (validated_config, resorted) = validated_config.finish_legacy_expansion(materialization);
     let (ctx, parsed) = validated_config.context_and_resources();
     let sorted_resources = resorted;
     let crate::wiring::PreparedDeferredForExpansionParts {
@@ -1758,7 +1996,7 @@ pub(crate) async fn run_state_refresh_locked(
         if let DataSourceValue::DeferredToApply(unresolved) = value {
             eprintln!(
                 "{}",
-                format_deferred_state_refresh_warning(resource, unresolved).yellow()
+                format_deferred_state_refresh_warning(resource, unresolved).yellow(color_mode)
             );
         }
     }
@@ -1811,10 +2049,45 @@ pub(crate) async fn run_state_refresh_locked(
         ctx.schemas(),
     );
 
-    let resolved_resources = ResolvedResource::collect_resolved_with_schemas(
-        sorted_resources.iter().cloned(),
-        ctx.schemas(),
+    // State refresh does not build a plan, but every consumer below still
+    // requires the same post-expansion dependency phase as planning. Resolve
+    // the refreshed resource set through the one graph-address transition;
+    // converting each raw resource independently would either reject its
+    // authored snapshots or silently discard ordering metadata.
+    let moved_pairs = crate::wiring::resolve_moved_pairs(
+        ctx,
+        parsed,
+        &sorted_resources,
+        &parsed.data_sources,
+        &state_file,
     )?;
+    let validated = match validated_config
+        .resolve_legacy_graph(&moved_pairs, state_file.as_ref())?
+    {
+        carina_state::LegacyClassificationOutcome::Classified(validated) => validated,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            return Err(AppError::Validation(format!(
+                "{rows}: legacy dependency migration requires reads; run plan/apply (which reads upstream_state) to migrate"
+            )));
+        }
+    };
+    let (ctx, expanded_graph) = validated.config.context_and_resources();
+    let parsed = expanded_graph.configuration();
+    if let Some(migrated) = validated.migrated_state {
+        state_file = Some(migrated);
+        if let Some(state) = state_file.as_ref() {
+            for (id, current) in &mut managed_current {
+                if let Some(row) = state.find_resource_for_id(id) {
+                    current.set_dependency_bindings(row.dependency_bindings.clone());
+                }
+            }
+        }
+    }
+    let resolved_resources = sorted_resources
+        .iter()
+        .cloned()
+        .map(|resource| expanded_graph.resolve_resource(resource, ctx.schemas()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut state = state_file.take().unwrap();
 
@@ -1831,6 +2104,7 @@ pub(crate) async fn run_state_refresh_locked(
             None => continue, // Not in state, skip
         };
         diff_display_update_resource_with_provider(
+            color_mode,
             &resource.resolved_id(),
             fresh_current,
             &mut state,
@@ -1852,6 +2126,7 @@ pub(crate) async fn run_state_refresh_locked(
             None => continue,
         };
         diff_display_update_resource_with_provider(
+            color_mode,
             orphan_id,
             fresh_current,
             &mut state,
@@ -1864,6 +2139,7 @@ pub(crate) async fn run_state_refresh_locked(
     }
 
     let deposed_summary = refresh_deposed_generations_until_cancelled(
+        color_mode,
         &provider,
         &mut state,
         &resolved_resources,
@@ -1937,7 +2213,7 @@ pub(crate) async fn run_state_refresh_locked(
             },
         )?;
         let resolution = crate::commands::shared::state_writeback::materialize_exports(&values)?;
-        resolution.write_into(&mut state)
+        resolution.write_into(color_mode, &mut state)
     } else {
         SkippedExports::default()
     };
@@ -1961,10 +2237,18 @@ pub(crate) async fn run_state_refresh_locked(
             &deposed_summary,
         )
     );
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} State saved (serial: {})",
+        "✓".green(color_mode),
+        state.serial
+    );
 
     if !skipped_exports.is_empty() {
-        println!("  {} {}", "!".yellow(), skipped_exports.count_description());
+        println!(
+            "  {} {}",
+            "!".yellow(color_mode),
+            skipped_exports.count_description()
+        );
         return Err(AppError::Config(skipped_exports.failure_message()));
     }
 
@@ -2005,6 +2289,7 @@ fn format_state_refresh_summary(
 }
 
 async fn refresh_existing_resources_until_cancelled(
+    #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
     provider: &dyn Provider,
     reads: Vec<(ResourceId, AppliedIdentifier)>,
     cancel: &ShutdownToken,
@@ -2052,7 +2337,7 @@ async fn refresh_existing_resources_until_cancelled(
         let next_in_flight = async {
             if draining {
                 crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
-                    cancel,
+                    runtime, cancel,
                 )
                 .await;
             }
@@ -2105,6 +2390,7 @@ async fn refresh_existing_resources_until_cancelled(
 }
 
 async fn refresh_orphans_until_cancelled(
+    #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
     provider: &dyn Provider,
     loaded: LoadedOrphans,
     state_file: Option<&StateFile>,
@@ -2160,7 +2446,7 @@ async fn refresh_orphans_until_cancelled(
         let next_in_flight = async {
             if draining {
                 crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
-                    cancel,
+                    runtime, cancel,
                 )
                 .await;
             }
@@ -2209,13 +2495,13 @@ async fn refresh_orphans_until_cancelled(
     Ok((refreshed_orphans, refreshed))
 }
 
-fn warn_missing_provider_identifier(id: &ResourceId) {
+fn warn_missing_provider_identifier(color_mode: crate::output_style::ColorMode, id: &ResourceId) {
     eprintln!(
         "{}",
         format!(
             "Warning: {id}: saved state has no provider identifier and was not refreshed; the row was preserved. Add a `removed` block and apply it, then add an `import` block with the real provider identifier to restore management."
         )
-        .yellow()
+        .yellow(color_mode)
     );
 }
 
@@ -2238,6 +2524,7 @@ struct DeposedRefreshSummary {
 }
 
 async fn refresh_deposed_generations_until_cancelled<P>(
+    color_mode: crate::output_style::ColorMode,
     provider: &P,
     state: &mut carina_state::StateFile,
     desired_resources: &[ResolvedResource],
@@ -2277,7 +2564,7 @@ where
                         deposed_state_marker(&target.generation.key, &target.generation.identifier),
                         target.generation.key,
                     )
-                    .yellow()
+                    .yellow(color_mode)
                 );
                 summary.failed_generations += 1;
                 continue;
@@ -2315,7 +2602,7 @@ where
                         deposed_state_marker(&target.generation.key, &target.generation.identifier),
                         err
                     )
-                    .yellow()
+                    .yellow(color_mode)
                 );
                 summary.failed_generations += 1;
                 continue;
@@ -2332,11 +2619,11 @@ where
             summary.removed_generations += 1;
             println!(
                 "  {} \"{}\" {}:",
-                target.id.display_type().cyan(),
+                target.id.display_type().cyan(color_mode),
                 target.id.identity_display(),
                 deposed_state_marker(&target.generation.key, &target.generation.identifier)
             );
-            println!("    {} resource no longer exists", "-".red());
+            println!("    {} resource no longer exists", "-".red(color_mode));
             println!();
             continue;
         }
@@ -2389,11 +2676,11 @@ where
         )?;
         println!(
             "  {} \"{}\" {}:",
-            target.id.display_type().cyan(),
+            target.id.display_type().cyan(color_mode),
             target.id.identity_display(),
             deposed_state_marker(&target.generation.key, &target.generation.identifier)
         );
-        println!("    {} attributes refreshed", "~".yellow());
+        println!("    {} attributes refreshed", "~".yellow(color_mode));
         println!();
     }
 
@@ -2505,6 +2792,7 @@ struct StateRefreshCounts {
 
 #[allow(clippy::too_many_arguments)]
 fn diff_display_update_resource_with_provider(
+    color_mode: crate::output_style::ColorMode,
     id: &ResolvedResourceId,
     fresh_current: &Current,
     state: &mut carina_state::StateFile,
@@ -2532,7 +2820,7 @@ fn diff_display_update_resource_with_provider(
             counts.unchanged += 1;
             println!(
                 "  {} \"{}\"{}:",
-                id.display_type().cyan(),
+                id.display_type().cyan(color_mode),
                 identity,
                 label_suffix,
             );
@@ -2544,7 +2832,7 @@ fn diff_display_update_resource_with_provider(
             counts.unchanged += 1;
             println!(
                 "  {} \"{}\"{}:",
-                id.display_type().cyan(),
+                id.display_type().cyan(color_mode),
                 identity,
                 label_suffix,
             );
@@ -2556,7 +2844,7 @@ fn diff_display_update_resource_with_provider(
 
     let resolved_comparison = provider.comparison_for(schemas, id.as_inner())?;
     let owner_schema = resolved_comparison.owner_schema();
-    let comparison = resolved_comparison.context();
+    let comparison = &resolved_comparison.context().observation();
     let resource_schema = Some(owner_schema.schema().as_schema());
 
     let refreshed_resource_state = if exists {
@@ -2618,7 +2906,10 @@ fn diff_display_update_resource_with_provider(
     if !exists {
         // Resource was deleted externally
         has_changes = true;
-        changes.push(format!("    {} resource no longer exists", "-".red()));
+        changes.push(format!(
+            "    {} resource no longer exists",
+            "-".red(color_mode)
+        ));
     } else {
         // Check for modified, added, and removed attributes
         let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
@@ -2644,29 +2935,29 @@ fn diff_display_update_resource_with_provider(
                     has_changes = true;
                     changes.push(format!(
                         "    {} {}: {} {} {}",
-                        "~".yellow(),
+                        "~".yellow(color_mode),
                         key,
-                        format_value(old).red(),
-                        "\u{2192}".dimmed(),
-                        format_value(new).green(),
+                        format_value(old).red(color_mode),
+                        "\u{2192}".dimmed(color_mode),
+                        format_value(new).green(color_mode),
                     ));
                 }
                 (Some(old), None) => {
                     has_changes = true;
                     changes.push(format!(
                         "    {} {}: {}",
-                        "-".red(),
+                        "-".red(color_mode),
                         key,
-                        format_value(old).red(),
+                        format_value(old).red(color_mode),
                     ));
                 }
                 (None, Some(new)) => {
                     has_changes = true;
                     changes.push(format!(
                         "    {} {}: {}",
-                        "+".green(),
+                        "+".green(color_mode),
                         key,
-                        format_value(new).green(),
+                        format_value(new).green(color_mode),
                     ));
                 }
                 _ => {}
@@ -2678,7 +2969,7 @@ fn diff_display_update_resource_with_provider(
         counts.updated += 1;
         println!(
             "  {} \"{}\"{}:",
-            id.display_type().cyan(),
+            id.display_type().cyan(color_mode),
             identity,
             label_suffix,
         );
@@ -2701,7 +2992,9 @@ fn diff_display_update_resource_with_provider(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn diff_display_update_resource(
+    color_mode: crate::output_style::ColorMode,
     id: &ResolvedResourceId,
     fresh_current: &Current,
     state: &mut carina_state::StateFile,
@@ -2713,6 +3006,7 @@ fn diff_display_update_resource(
     let (schemas, provider) =
         carina_core::provider::comparison_fixture_for_test(schemas, std::iter::once(id.as_inner()));
     diff_display_update_resource_with_provider(
+        color_mode,
         id,
         fresh_current,
         state,
@@ -2728,7 +3022,7 @@ fn diff_display_update_resource(
 mod tests {
     use super::*;
     use crate::commands::shared::cancellation_test_support::{
-        CancellationFixtureBase, MOCK_PROVIDER_ENV_LOCK, ScopedEnv, install_refresh_drain_barrier,
+        CancellationFixtureBase, install_refresh_drain_barrier,
     };
     use crate::provider_upstream_test_support::{
         ProviderConfigCaptureFactory, provider_default_tags_local_resource_fixture,
@@ -2752,11 +3046,16 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::Context,
+    };
 
     const LEGACY_SECRET_PREFIX: &str = "_secret:argon2:";
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new((resource).into_value_snapshot())
     }
 
     fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
@@ -2796,7 +3095,7 @@ mod tests {
                 .expect("test fixture crosses module resolution")
             },
         )
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test fixture contains no leftover parser placeholders")
     }
 
@@ -2829,6 +3128,7 @@ mod tests {
 
     #[test]
     fn state_refresh_counts_reference_form_equivalent_value_as_unchanged() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
         use carina_core::schema::{
             ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
@@ -2894,7 +3194,13 @@ mod tests {
         provider.add_provider(
             "aws".to_string(),
             InitializedProvider::for_test(
-                Box::new(carina_provider_mock::MockProvider::new()),
+                Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                ),
                 ReferenceScope::available("aws", "us-east-1", "123456789012")
                     .expect("fixture scope is valid"),
             ),
@@ -2902,6 +3208,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource_with_provider(
+            color_mode,
             &ResolvedResourceId::new(desired.id.clone()),
             &fresh,
             &mut state,
@@ -3005,6 +3312,7 @@ mod tests {
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3052,6 +3360,7 @@ mod tests {
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3084,6 +3393,7 @@ mod tests {
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3123,7 +3433,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_without_downstream_state_ignores_missing_provider_upstream() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
@@ -3135,7 +3445,7 @@ mod tests {
         .unwrap();
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
+        let providers = ProviderLoad::load(&runtime, &parsed.providers, &downstream).unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -3159,10 +3469,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(&runtime, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -3186,10 +3496,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(&runtime, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -3216,6 +3526,7 @@ mod tests {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let inputs = load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
             &ProviderContext::default(),
@@ -3224,6 +3535,7 @@ mod tests {
         .expect("state bucket delete provider inputs must resolve");
         let received_role_arn = Arc::new(Mutex::new(None));
         let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3274,6 +3586,7 @@ mod tests {
         let parsed = resolve_authored_file_for_test(parsed, &downstream);
 
         let error = match load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
             &ProviderContext::default(),
@@ -3298,6 +3611,7 @@ mod tests {
         parsed.providers[0].name = "test".to_string();
         let parsed = resolve_authored_file_for_test(parsed, &base_dir);
         let inputs = load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &base_dir,
             &ProviderContext::default(),
@@ -3306,6 +3620,7 @@ mod tests {
         .expect("bucket delete must not load tag-only upstream state");
         let received_role_arn = Arc::new(Mutex::new(None));
         let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3354,6 +3669,7 @@ mod tests {
         let parsed = resolve_authored_file_for_test(parsed, temp.path());
 
         let inputs = load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             temp.path(),
             &ProviderContext::default(),
@@ -3362,6 +3678,7 @@ mod tests {
         .expect("deferred default tags must not block bucket provider construction");
         let received_role_arn = Arc::new(Mutex::new(None));
         let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3411,10 +3728,6 @@ mod tests {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
         }
 
         fn create_provider(
@@ -3549,10 +3862,6 @@ mod tests {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
         }
 
         fn create_provider(
@@ -3702,6 +4011,7 @@ mod tests {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
@@ -3755,7 +4065,7 @@ mod tests {
                 }],
             },
             binding: Some(absolute_binding("checked")),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
@@ -3793,6 +4103,7 @@ mod tests {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
@@ -3840,7 +4151,7 @@ mod tests {
                 }],
             },
             binding: Some(absolute_binding("checked")),
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             module_name: "checked_module".to_string(),
             instance: "root.checked".to_string(),
             call_path: crate::test_composition_call_path(),
@@ -3871,6 +4182,7 @@ mod tests {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
             &provider_configs,
@@ -3930,6 +4242,74 @@ mod tests {
         )
         .expect("outcome-unknown fixture must decode")
         .into_state()
+    }
+
+    fn legacy_outcome_unknown_state_fixture() -> StateFile {
+        carina_state::check_and_migrate(
+            &serde_json::json!({
+                "version": 20,
+                "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
+                "serial": 4,
+                "lineage": "legacy-state-forget-test",
+                "carina_version": "test",
+                "resources": [{
+                    "resource_type": "test.Resource",
+                    "identity": "unknown",
+                    "provider": "mock",
+                    "current": {
+                        "kind": "create_outcome_unknown",
+                        "started_at": "2026-10-30T03:00:00Z"
+                    },
+                    "dependency_bindings": ["removed_dependency"]
+                }],
+                "exports": {}
+            })
+            .to_string(),
+        )
+        .expect("legacy outcome-unknown fixture must decode")
+        .into_state()
+    }
+
+    struct ReadProbe(Arc<AtomicBool>);
+
+    impl tokio::io::AsyncRead for ReadProbe {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.0.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn state_forget_rejects_legacy_dependencies_before_prompting() {
+        let state = legacy_outcome_unknown_state_fixture();
+        assert!(state.requires_legacy_dependency_migration());
+        let backend = ModuleConstraintRefreshBackend { state };
+        let read = Arc::new(AtomicBool::new(false));
+
+        let error = run_state_forget_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            &backend,
+            &LockInfo::for_test("state forget"),
+            &StateBlockAddress::new("mock", "test.Resource", "unknown"),
+            Path::new("infra/project"),
+            false,
+            tokio::io::BufReader::new(ReadProbe(Arc::clone(&read))),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect_err("legacy dependency names must be rejected before confirmation");
+
+        assert!(!read.load(Ordering::SeqCst), "confirmation input was read");
+        assert!(
+            error
+                .to_string()
+                .contains("carina state refresh infra/project"),
+            "the recovery must name the graph-aware migration command: {error}"
+        );
     }
 
     fn outcome_unknown_state_with_deposed_fixture() -> StateFile {
@@ -3994,6 +4374,7 @@ mod tests {
         let fixture = state_forget_fixture(&outcome_unknown_state_fixture());
 
         run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "unknown",
             true,
@@ -4014,6 +4395,7 @@ mod tests {
         let fixture = state_forget_fixture(&outcome_unknown_state_with_deposed_fixture());
 
         run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "unknown",
             true,
@@ -4056,6 +4438,7 @@ mod tests {
         let fixture = state_forget_fixture(&state);
 
         let error = run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "normal",
             true,
@@ -4085,6 +4468,7 @@ mod tests {
             .expect("hold fixture lock");
 
         let error = run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "unknown",
             true,
@@ -4108,6 +4492,7 @@ mod tests {
     #[tokio::test]
     async fn state_forget_confirmation_requires_yes_and_auto_approve_skips_input() {
         let cancelled = confirm_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             tokio::io::BufReader::new("no\n".as_bytes()),
             ShutdownToken::running(),
             false,
@@ -4117,6 +4502,7 @@ mod tests {
         assert_eq!(cancelled, StateForgetConfirmation::Cancelled);
 
         let confirmed = confirm_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             tokio::io::BufReader::new(tokio::io::empty()),
             ShutdownToken::running(),
             true,
@@ -4298,7 +4684,7 @@ mod tests {
             identifier.to_string(),
             provider_instance.map(str::to_string),
             attributes,
-            BTreeSet::new(),
+            Default::default(),
         )
     }
 
@@ -4312,7 +4698,6 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_loads_providers_once() {
-        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = CancellationFixtureBase::new();
         let state_path = fixture.state_path().display();
         fixture.write_crn(format!(
@@ -4320,9 +4705,9 @@ mod tests {
         ));
         fixture.write_backend_lock();
 
-        let load_count = crate::wiring::track_provider_loads_for_test();
+        let loads_before = fixture.runtime().provider_load_count();
         run_state_refresh(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             false,
             &ProviderContext::default(),
@@ -4332,7 +4717,7 @@ mod tests {
         .expect("empty state refresh must succeed");
 
         assert_eq!(
-            load_count.count(),
+            fixture.runtime().provider_load_count() - loads_before,
             1,
             "validation and locked refresh must share one provider load"
         );
@@ -4340,9 +4725,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-        let fixture = CancellationFixtureBase::new();
+        let mut fixture = CancellationFixtureBase::new();
         let state_path = fixture.state_path().display();
         fixture.write_crn(format!(
             "backend local {{ path = \"{state_path}\" }}\n\
@@ -4375,18 +4758,28 @@ mod tests {
         .expect("write mock provider state");
         let read_ready_path = fixture.readiness_path("mock-read-ready");
         let read_outcome_path = fixture.readiness_path("mock-read-outcome");
-        let _provider_env = [
-            ScopedEnv::set("CARINA_MOCK_STATE_FILE", &provider_state_path),
-            ScopedEnv::set("CARINA_MOCK_READ_DELAY_MS_FOR", "test.resource.managed"),
-            ScopedEnv::set("CARINA_MOCK_READ_DELAY_MS", "60000"),
-            ScopedEnv::set("CARINA_MOCK_READ_READY_PATH", &read_ready_path),
-            ScopedEnv::set("CARINA_MOCK_READ_OUTCOME_PATH", &read_outcome_path),
-        ];
-        let drain_barrier = install_refresh_drain_barrier(fixture.shutdown_token());
+        fixture.configure_mock(
+            carina_provider_mock::MockBehavior {
+                read_delay: Some(carina_provider_mock::SelectedDelay {
+                    address: "test.resource.managed".to_string(),
+                    duration: std::time::Duration::from_millis(60000),
+                }),
+                observations: carina_provider_mock::MockObservations {
+                    read_ready: Some(std::path::PathBuf::from(&read_ready_path)),
+                    read_outcome: Some(std::path::PathBuf::from(&read_outcome_path)),
+                    ..carina_provider_mock::MockObservations::default()
+                },
+                ..carina_provider_mock::MockBehavior::default()
+            },
+            carina_provider_mock::MockScope::file(std::path::PathBuf::from(&provider_state_path))
+                .unwrap(),
+        );
+        let drain_barrier =
+            install_refresh_drain_barrier(fixture.runtime(), fixture.shutdown_token());
 
         let provider_context = ProviderContext::default();
         let refresh = run_state_refresh(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             &provider_context,
@@ -4442,7 +4835,10 @@ mod tests {
         assert!(!fixture.lock_path().exists(), "lock must be released");
     }
 
-    async fn assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(loop_target: &str) {
+    async fn assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(
+        color_mode: crate::output_style::ColorMode,
+        loop_target: &str,
+    ) {
         let source = r#"
                 let source = aws.service.Source {
                     name = "source"
@@ -4584,6 +4980,7 @@ mod tests {
             .with_saved_attr_hydration()
             .with_read_state(&child.id, "widget-1", refreshed);
         let (orphans, already_refreshed) = refresh_orphans_until_cancelled(
+            &crate::test_support::TestCommandRuntime::new(),
             &provider,
             state_file.build_orphans(&desired_ids),
             Some(&state_file),
@@ -4607,12 +5004,13 @@ mod tests {
                 already_refreshed,
             })
             .seal(carina_core::data_source_value::DataSourceValues::empty());
-        let progress = ProgressBackend::plain(std::io::sink());
+        let progress = ProgressBackend::plain(color_mode, std::io::sink());
         let refresh_phase = RefreshPhase::start(&progress);
         let mut validated_config = ValidatedConfig::from_factories_with_additional_schemas_for_test::<
             carina_core::resource::NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
         >(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             Vec::new(),
             &[],
@@ -4668,12 +5066,18 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_expansion_hydrates_lifted_saved_enum_attrs() {
-        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs("let widgets = ").await;
+        let color_mode = crate::output_style::ColorMode::Plain;
+        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(
+            color_mode,
+            "let widgets = ",
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn state_refresh_unbound_expansion_hydrates_lifted_saved_enum_attrs() {
-        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs("").await;
+        let color_mode = crate::output_style::ColorMode::Plain;
+        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(color_mode, "").await;
     }
 
     fn deposed_format_state() -> StateFile {
@@ -4991,7 +5395,7 @@ mod tests {
     fn lookup_json_in_flight_resource_returns_public_row_and_rejects_attributes() {
         let id =
             ResourceId::with_provider_identity("mock", "test.resource", "pending-resource", None);
-        let resource = ResolvedResource::new(Resource::from_id(id.clone()));
+        let resource = resolved(Resource::from_id(id.clone()));
         let pending = crate::fixture_in_flight_create(
             &id,
             "resume-token",
@@ -5107,7 +5511,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_migrates_v8_state_before_producing_candidates() {
+    fn completion_loads_v8_state_as_pending_v20_before_producing_candidates() {
         let contents = json!({
             "version": 8,
             "serial": 3,
@@ -5126,7 +5530,8 @@ mod tests {
 
         let state = parse_local_state_for_completion(&contents)
             .expect("older state should migrate for completion");
-        assert_eq!(state.version, StateFile::CURRENT_VERSION);
+        assert_eq!(state.version, 20);
+        assert!(state.requires_legacy_dependency_migration());
         assert_eq!(
             candidate_values(&complete_state_lookup_from(&state, "v")),
             vec!["vpc"]
@@ -5277,6 +5682,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generations_drops_gone_updates_alive_and_preserves_current() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let gone_key = deposed_key("gone-key");
         let alive_key = deposed_key("alive-key");
         let mut state = StateFile::new();
@@ -5324,6 +5730,7 @@ mod tests {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5369,6 +5776,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_removes_shell_row_when_gone() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5389,6 +5797,7 @@ mod tests {
         );
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5412,6 +5821,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_carries_previous_write_only_value_when_read_omits_it() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5454,6 +5864,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5480,6 +5891,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_ignores_provider_echo_for_write_only_value() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5520,6 +5932,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5542,6 +5955,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_masks_plaintext_secret_from_provider_read() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5572,6 +5986,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5597,6 +6012,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_deposed_generation_carries_schema_write_only_plaintext_without_desired_secret()
     {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5637,6 +6053,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5664,6 +6081,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_rehashes_existing_hash_without_desired_secret() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
@@ -5675,7 +6093,7 @@ mod tests {
                 "password".to_string(),
                 structural_legacy_secret(&"ab".repeat(32)),
             )]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         state
             .upsert_resource(row)
@@ -5692,6 +6110,7 @@ mod tests {
         );
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5727,6 +6146,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_merges_nested_secret_hash_per_leaf_and_converges() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
@@ -5739,7 +6159,7 @@ mod tests {
             "vpc-old".to_string(),
             None,
             HashMap::from([("tags".to_string(), previous_tags.clone())]),
-            BTreeSet::new(),
+            Default::default(),
         ));
         state
             .upsert_resource(row)
@@ -5762,6 +6182,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5784,6 +6205,7 @@ mod tests {
         assert!(!secret.contains("plain-secret"));
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5806,6 +6228,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_preserves_all_host_metadata_and_prevent_destroy() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.Subnet",
@@ -5815,13 +6238,19 @@ mod tests {
         let mut row = ResourceState::try_applied("ec2.Subnet", "main", "awscc", "subnet-current")
             .expect("fixture identifier is non-empty")
             .with_attribute("token", json!("old-token"));
-        row.directives = carina_core::resource::Directives::default()
-            .with_force_delete(true)
-            .with_create_before_destroy(true)
-            .with_depends_on(vec![absolute_binding("security_group")])
-            .with_provider_instance("west")
-            .with_prevent_destroy(true)
-            .into();
+        row.directives = carina_core::resource::PersistedDirectives::from_resolved(
+            &carina_core::resource::Directives::default()
+                .with_force_delete(true)
+                .with_create_before_destroy(true)
+                .with_provider_instance("west")
+                .with_prevent_destroy(true),
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.SecurityGroup",
+                "security_group",
+                None,
+            )]),
+        );
         row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
@@ -5832,7 +6261,10 @@ mod tests {
             },
         );
         row.binding = Some(absolute_binding("subnet"));
-        row.dependency_bindings = BTreeSet::from([absolute_binding("vpc")]);
+        row.dependency_bindings =
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "vpc", None,
+            )]);
         row.explicit = carina_core::explicit::ExplicitFields::Struct {
             children: HashMap::from([(
                 "cidr_block".to_string(),
@@ -5874,6 +6306,7 @@ mod tests {
         );
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -5893,16 +6326,25 @@ mod tests {
         );
         assert_eq!(
             refreshed.dependency_bindings,
-            BTreeSet::from([absolute_binding("vpc")])
+            crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                "awscc", "ec2.Vpc", "vpc", None
+            )])
         );
         assert_eq!(
             refreshed.directives,
-            carina_core::resource::Directives::default()
-                .with_force_delete(true)
-                .with_create_before_destroy(true)
-                .with_depends_on(vec![absolute_binding("security_group")])
-                .with_provider_instance("west")
-                .with_prevent_destroy(true)
+            carina_core::resource::PersistedDirectives::from_resolved(
+                &carina_core::resource::Directives::default()
+                    .with_force_delete(true)
+                    .with_create_before_destroy(true)
+                    .with_provider_instance("west")
+                    .with_prevent_destroy(true),
+                crate::test_support::persisted([ResolvedResourceId::with_provider_identity(
+                    "awscc",
+                    "ec2.SecurityGroup",
+                    "security_group",
+                    None
+                )])
+            )
         );
         assert_eq!(
             refreshed.prefixes,
@@ -5958,7 +6400,10 @@ mod tests {
         ));
     }
 
-    fn refresh_reordered_list(list_type: AttributeType) -> StateRefreshCounts {
+    fn refresh_reordered_list(
+        color_mode: crate::output_style::ColorMode,
+        list_type: AttributeType,
+    ) -> StateRefreshCounts {
         let id = ResourceId::with_provider_identity("test", "example.Lists", "main", None);
         let desired = Resource::with_provider("test", "example.Lists", "main", None);
         let mut state = StateFile::new();
@@ -5991,6 +6436,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id),
             &Current::from_state(fresh),
             &mut state,
@@ -6006,6 +6452,7 @@ mod tests {
 
     #[test]
     fn current_refresh_treats_empty_non_marker_struct_and_absent_as_unchanged() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("test", "example.Settings", "main", None);
         let desired = resolved(Resource::with_provider(
             "test",
@@ -6041,6 +6488,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id),
             &Current::from_state(fresh),
             &mut state,
@@ -6057,7 +6505,8 @@ mod tests {
 
     #[test]
     fn current_refresh_seeds_unrecorded_from_empty_desired_without_promoting_tags() {
-        use carina_core::differ::{Diff, diff};
+        let color_mode = crate::output_style::ColorMode::Plain;
+        use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::explicit::ExplicitFields;
 
         let id = ResourceId::with_provider_identity("mock", "ec2.InternetGateway", "igw", None);
@@ -6096,6 +6545,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6126,15 +6576,18 @@ mod tests {
                 schemas
                     .get_for(&desired)
                     .map(|schema| schema.schema().as_schema()),
-                &carina_core::differ::exact_comparison_context_for_tests(),
-            ),
+                &carina_core::differ::exact_comparison_schema_for_tests(),
+                &carina_core::references::prepare_empty_for_tests(),
+            )
+            .unwrap(),
             Diff::NoChange(_)
         ));
     }
 
     #[test]
     fn current_refresh_keeps_prior_authored_tags_when_desired_has_removed_them() {
-        use carina_core::differ::{Diff, diff};
+        let color_mode = crate::output_style::ColorMode::Plain;
+        use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::explicit::ExplicitFields;
 
         let id = ResourceId::with_provider_identity("mock", "ec2.InternetGateway", "igw", None);
@@ -6195,6 +6648,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6223,8 +6677,10 @@ mod tests {
             schemas
                 .get_for(&desired)
                 .map(|schema| schema.schema().as_schema()),
-            &carina_core::differ::exact_comparison_context_for_tests(),
+            &carina_core::differ::exact_comparison_schema_for_tests(),
+            &carina_core::references::prepare_empty_for_tests(),
         )
+        .unwrap()
         else {
             panic!("refresh must preserve the pending tags removal");
         };
@@ -6232,6 +6688,7 @@ mod tests {
     }
 
     fn diff_after_failed_update_and_state_refresh(
+        color_mode: crate::output_style::ColorMode,
         applied: Resource,
         desired: Resource,
         provider_attributes: HashMap<String, Value>,
@@ -6240,7 +6697,7 @@ mod tests {
         carina_core::differ::Diff,
         carina_core::explicit::ExplicitFields,
     ) {
-        use carina_core::differ::{Diff, diff};
+        use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::executor::AcceptedRequest;
 
         let id = desired.id.clone();
@@ -6272,8 +6729,10 @@ mod tests {
             &prior_saved,
             Some(&prior.explicit),
             None,
-            &carina_core::differ::exact_comparison_context_for_tests(),
+            &carina_core::differ::exact_comparison_schema_for_tests(),
+            &carina_core::references::prepare_empty_for_tests(),
         )
+        .unwrap()
         else {
             panic!("the Applied row must initially plan the nested removal");
         };
@@ -6300,6 +6759,7 @@ mod tests {
         // the next plan. The provider still reports the pre-update value.
         let mut counts = StateRefreshCounts::default();
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(provider_state.clone()),
             &mut refreshed_state,
@@ -6324,14 +6784,17 @@ mod tests {
                 &saved,
                 Some(&explicit),
                 None,
-                &carina_core::differ::exact_comparison_context_for_tests(),
-            ),
+                &carina_core::differ::exact_comparison_schema_for_tests(),
+                &carina_core::references::prepare_empty_for_tests(),
+            )
+            .unwrap(),
             explicit,
         )
     }
 
     #[test]
     fn state_refresh_nested_struct_pending_removal_after_failed_update_is_replanned() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::differ::Diff;
 
         let settings = |description: Option<&str>| {
@@ -6354,6 +6817,7 @@ mod tests {
             .with_attribute("settings", settings(None));
 
         let (result, explicit) = diff_after_failed_update_and_state_refresh(
+            color_mode,
             applied,
             desired,
             HashMap::from([("settings".to_string(), applied_settings)]),
@@ -6373,6 +6837,7 @@ mod tests {
 
     #[test]
     fn state_refresh_list_element_nested_pending_removal_after_failed_update_is_replanned() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::differ::Diff;
 
         let rule = |port, description: Option<&str>| {
@@ -6400,6 +6865,7 @@ mod tests {
             .with_attribute("rules", desired_rules);
 
         let (result, explicit) = diff_after_failed_update_and_state_refresh(
+            color_mode,
             applied,
             desired,
             HashMap::from([("rules".to_string(), applied_rules)]),
@@ -6419,7 +6885,11 @@ mod tests {
 
     #[test]
     fn current_refresh_ignores_reordered_unordered_list() {
-        let counts = refresh_reordered_list(AttributeType::unordered_list(AttributeType::string()));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts = refresh_reordered_list(
+            color_mode,
+            AttributeType::unordered_list(AttributeType::string()),
+        );
 
         assert_eq!(counts.updated, 0);
         assert_eq!(counts.unchanged, 1);
@@ -6427,7 +6897,9 @@ mod tests {
 
     #[test]
     fn current_refresh_reports_reordered_ordered_list() {
-        let counts = refresh_reordered_list(AttributeType::list(AttributeType::string()));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts =
+            refresh_reordered_list(color_mode, AttributeType::list(AttributeType::string()));
 
         assert_eq!(counts.updated, 1);
         assert_eq!(counts.unchanged, 0);
@@ -6435,10 +6907,14 @@ mod tests {
 
     #[test]
     fn current_refresh_ignores_reordered_unordered_string_or_list_union() {
-        let counts = refresh_reordered_list(AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::unordered_list(AttributeType::string()),
-        ]));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts = refresh_reordered_list(
+            color_mode,
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::unordered_list(AttributeType::string()),
+            ]),
+        );
 
         assert_eq!(counts.updated, 0);
         assert_eq!(counts.unchanged, 1);
@@ -6446,10 +6922,14 @@ mod tests {
 
     #[test]
     fn current_refresh_reports_reordered_ordered_string_or_list_union() {
-        let counts = refresh_reordered_list(AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::list(AttributeType::string()),
-        ]));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts = refresh_reordered_list(
+            color_mode,
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::list(AttributeType::string()),
+            ]),
+        );
 
         assert_eq!(counts.updated, 1);
         assert_eq!(counts.unchanged, 0);
@@ -6457,6 +6937,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_rehashes_existing_hash_without_desired_secret() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
         state
@@ -6474,6 +6955,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6504,6 +6986,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_merges_nested_secret_hash_per_leaf_and_converges() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
@@ -6531,6 +7014,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6557,6 +7041,7 @@ mod tests {
         assert_eq!(counts.unchanged, 0);
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6584,6 +7069,7 @@ mod tests {
 
     #[test]
     fn current_refresh_drops_schema_write_only_plaintext_absent_from_desired() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
@@ -6612,6 +7098,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6635,6 +7122,7 @@ mod tests {
 
     #[test]
     fn current_refresh_carries_previous_write_only_value_instead_of_desired() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
             .with_attribute("password", string_value("new"));
@@ -6664,6 +7152,7 @@ mod tests {
         );
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id),
             &Current::from_state(fresh),
             &mut state,
@@ -6686,6 +7175,7 @@ mod tests {
 
     #[test]
     fn current_refresh_carries_plain_raw_legacy_marker_in_write_only_attribute() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
@@ -6716,6 +7206,7 @@ mod tests {
         );
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6739,6 +7230,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_hydrates_unreturned_attributes() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -6768,6 +7260,7 @@ mod tests {
             );
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -6803,6 +7296,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_lifts_enum_state_and_is_stable() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -6848,6 +7342,7 @@ mod tests {
         let desired = Resource::with_provider("awscc", "service.Widget", "main", None);
 
         let first = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             std::slice::from_ref(&resolved(desired.clone())),
@@ -6878,6 +7373,7 @@ mod tests {
         );
 
         let second = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             std::slice::from_ref(&resolved(desired.clone())),
@@ -6907,6 +7403,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_matches_masking_authority_by_provider_instance() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -6946,6 +7443,7 @@ mod tests {
             Resource::with_provider("awscc", "db.Instance", "main", Some("west".to_string()));
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(wrong_instance), resolved(right_instance)],
@@ -6970,6 +7468,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_read_error_leaves_entry_untouched() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let key = deposed_key("error-key");
         let mut state = StateFile::new();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
@@ -6988,6 +7487,7 @@ mod tests {
             DeposedRefreshTestProvider::default().with_read_error(&id, "vpc-old", "read failed");
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -7017,6 +7517,7 @@ mod tests {
 
     #[test]
     fn current_instance_refresh_preserves_deposed_entries() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let key = deposed_key("old-key");
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let mut state = StateFile::new();
@@ -7041,6 +7542,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -7061,6 +7563,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_unlock_without_backend_uses_local_backend() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         // When no backend block is configured, run_force_unlock should
         // fall back to the anchored default local backend instead of erroring with
         // "No backend configuration found. force-unlock requires a backend."
@@ -7072,7 +7575,7 @@ mod tests {
         // Call force-unlock with a dummy lock ID.
         // The local backend will return LockNotFound because there is no lock file,
         // but crucially it should NOT return "No backend configuration found".
-        let result = run_force_unlock("dummy-lock-id", &path, &provider_context).await;
+        let result = run_force_unlock(color_mode, "dummy-lock-id", &path, &provider_context).await;
 
         // Should get LockNotFound (the local backend works), not a config error
         match &result {
@@ -7116,6 +7619,7 @@ mod tests {
         assert_eq!(
             vpc_effect
                 .binding_address()
+                .as_deref()
                 .map(carina_core::resource::BindingAddress::as_str),
             Some("vpc"),
         );
@@ -7126,9 +7630,14 @@ mod tests {
         let state = load_fixture_state();
         let plan = build_plan_from_state(&state);
 
-        let vpc_resource = plan.effects()[0].as_resource_ref().unwrap();
-        assert!(vpc_resource.attributes().contains_key("cidr_block"));
-        assert!(vpc_resource.attributes().contains_key("vpc_id"));
+        let Effect::Read {
+            resource: vpc_resource,
+        } = &plan.effects()[0]
+        else {
+            panic!("refresh read")
+        };
+        assert!(vpc_resource.attributes.contains_key("cidr_block"));
+        assert!(vpc_resource.attributes.contains_key("vpc_id"));
     }
 
     #[test]
@@ -7144,10 +7653,17 @@ mod tests {
         let plan = build_plan_from_state(&state);
 
         // subnet depends on vpc
-        let subnet_resource = plan.effects()[1].as_resource_ref().unwrap();
+        let Effect::Read {
+            resource: subnet_resource,
+        } = &plan.effects()[1]
+        else {
+            panic!("refresh read")
+        };
         assert_eq!(
-            subnet_resource.dependency_bindings(),
-            &std::collections::BTreeSet::from([absolute_binding("vpc")])
+            subnet_resource.value_dependencies(),
+            &state.resources()[1]
+                .dependency_bindings
+                .to_resolved_dependencies()
         );
     }
 
@@ -7177,7 +7693,8 @@ mod tests {
         let mut resource: DataSource =
             DataSource::with_provider("mock", "iam.Roles", "roles", None);
         resource
-            .dependency_bindings
+            .dependencies
+            .value_bindings
             .insert(absolute_binding("registry_publish.target"));
 
         let warning = format_deferred_state_refresh_warning(&resource, &[]);

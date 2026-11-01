@@ -7,6 +7,22 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Decode and validate a host-owned update continuation before dispatch.
+#[doc(hidden)]
+pub fn decode_pending_update<T: serde::de::DeserializeOwned + crate::PhasedToken>(
+    token: &str,
+    poll_after_secs: u32,
+    host_phase: crate::PendingPhase,
+) -> Result<crate::Pending<T>, serde_json::Error> {
+    let pending = crate::Pending::new(serde_json::from_str::<T>(token)?, poll_after_secs);
+    if crate::continuation_phase_regresses(host_phase, pending.phase()) {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "update continuation phase does not match its token",
+        ));
+    }
+    Ok(pending)
+}
+
 /// Structural failures that can be diagnosed in a provider's const context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressPatternStructureError {
@@ -163,36 +179,16 @@ pub const fn egress_json_bytes<const N: usize>(json: &str) -> [u8; N] {
     output
 }
 
-/// Decode the version-16 `desired-resource` record into the SDK's typed view.
-///
-/// This is public only because [`crate::export_provider!`] expands in the
-/// provider crate. Provider implementations receive [`crate::DesiredResource`]
-/// and never the raw deferred-name list.
-#[doc(hidden)]
-pub fn decode_desired_resource(
-    resource: proto::Resource,
-    deferred: Vec<String>,
-) -> Result<crate::DesiredResource, crate::DesiredResourceDecodeError> {
-    crate::DesiredResource::decode(resource, deferred)
-}
-
-/// Visit an opaque normalized resource for guest-boundary encoding.
-///
-/// This is public only because [`crate::export_provider!`] expands in the
-/// provider crate. It deliberately exposes neither the raw resource nor its
-/// attribute map.
+/// Visit checked normalization output; ordinary protocol values cannot carry slots.
 #[doc(hidden)]
 pub fn visit_normalized_resource<T>(
     resource: &crate::NormalizedResource,
-    visitor: impl FnOnce(
-        &proto::ResourceId,
-        std::collections::btree_map::Iter<'_, String, proto::Value>,
-    ) -> T,
+    visitor: impl FnOnce(&carina_provider_protocol::normalization::NormalizationResource) -> T,
 ) -> T {
-    visitor(&resource.resource.id, resource.resource.attributes.iter())
+    visitor(&resource.resource)
 }
 
-/// Render one error chain for protocol-v16 metadata's string-only failure
+/// Render one error chain for protocol-v19 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -220,14 +216,15 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-16 WIT resource records.
+/// Return the honest directive default for protocol-19 WIT resource records.
 ///
-/// Protocol 16 does not transport directives on create, poll-create,
-/// resume-create, read-data-source, or normalize-desired requests. Providers
+/// Protocol 19 does not transport directives on create, poll-create,
+/// resume-create, or read-data-source requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
+/// Desired normalization uses a separate record without directive fields.
 /// Delete-request directives are transported separately after host resolution.
 #[doc(hidden)]
-pub fn protocol_16_default_resource_directives() -> proto::Directives {
+pub fn protocol_19_default_resource_directives() -> proto::Directives {
     proto::Directives::default()
 }
 
@@ -806,7 +803,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v16 metadata exports return a bare string rather
+                // Protocol v19 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure
@@ -859,7 +856,7 @@ macro_rules! export_provider {
                     wit_types::Value::ListVal(json) => helpers::decode_list_val(json),
                     wit_types::Value::MapVal(json) => helpers::decode_map_val(json),
                     // Desired-state `normalize_desired` round trips are
-                    // host-sealed and never carry `SecretVal` (carina#3800).
+                    // structural and use the separate DesiredValue type.
                     // CRUD inputs decode the inner JSON into an ordinary
                     // provider value because
                     // `proto::Value` has no `Secret` arm. Malformed or null
@@ -1121,7 +1118,7 @@ macro_rules! export_provider {
                 })
             }
 
-            fn sdk_to_wit_pending<T: serde::Serialize>(
+            fn sdk_to_wit_pending<T: serde::Serialize + $crate::PhasedToken>(
                 pending: &$crate::Pending<T>,
             ) -> Result<wit_types::PendingUpdate, serde_json::Error> {
                 Ok(wit_types::PendingUpdate {
@@ -1129,18 +1126,18 @@ macro_rules! export_provider {
                         token: serde_json::to_string(&pending.token)?,
                         poll_after_secs: pending.poll_after_secs,
                     },
-                    phase: proto_to_wit_pending_phase(pending.phase),
+                    phase: proto_to_wit_pending_phase(pending.phase()),
                 })
             }
 
-            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned>(
+            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned + $crate::PhasedToken>(
                 pending: wit_types::PendingUpdate,
             ) -> Result<$crate::Pending<T>, serde_json::Error> {
-                Ok($crate::Pending {
-                    token: serde_json::from_str(&pending.operation.token)?,
-                    poll_after_secs: pending.operation.poll_after_secs,
-                    phase: wit_to_proto_pending_phase(pending.phase),
-                })
+                helpers::decode_pending_update(
+                    &pending.operation.token,
+                    pending.operation.poll_after_secs,
+                    wit_to_proto_pending_phase(pending.phase),
+                )
             }
 
             fn sdk_to_wit_pending_delete<T: serde::Serialize>(
@@ -1751,22 +1748,33 @@ macro_rules! export_provider {
                 }
             }
 
-            fn decode_create_identifier(
+            fn decode_create_progress(
                 operation: &'static str,
-                identifier: Option<String>,
-            ) -> Result<Option<proto::AppliedIdentifier>, wit_types::ProviderError> {
-                identifier
-                    .map(proto::AppliedIdentifier::new)
-                    .transpose()
-                    .map_err(|error| {
+                progress: wit_types::CreateProgress,
+            ) -> Result<proto::CreateProgress, wit_types::ProviderError> {
+                let decode_identifier = |identifier| {
+                    proto::AppliedIdentifier::new(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error(operation, error)
                     })
+                };
+                Ok(match progress {
+                    wit_types::CreateProgress::Operating(identifier) => {
+                        proto::CreateProgress::Operating {
+                            identifier: identifier.map(decode_identifier).transpose()?,
+                        }
+                    }
+                    wit_types::CreateProgress::ReadingBack(identifier) => {
+                        proto::CreateProgress::ReadingBack {
+                            identifier: decode_identifier(identifier)?,
+                        }
+                    }
+                })
             }
 
             fn wit_to_sdk_poll<T: serde::de::DeserializeOwned>(
                 pending: wit_types::PendingCreate,
                 request: &proto::CreateRequest,
-            ) -> Result<(Option<proto::AppliedIdentifier>, proto::Sent, T), wit_types::ProviderError> {
+            ) -> Result<(proto::CreateProgress, proto::Sent, T), wit_types::ProviderError> {
                 let wit_types::PendingCreate {
                     operation,
                     progress,
@@ -1798,13 +1806,13 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("poll_create", error)
                 })?;
-                let identifier = decode_create_identifier("poll_create", wit_create_identifier(progress))?;
-                Ok((identifier, sent, token))
+                let progress = decode_create_progress("poll_create", progress)?;
+                Ok((progress, sent, token))
             }
 
             fn wit_to_sdk_resume<T: serde::de::DeserializeOwned>(
                 pending: wit_types::ResumePending,
-            ) -> Result<(Option<proto::AppliedIdentifier>, T), wit_types::ProviderError> {
+            ) -> Result<(proto::CreateProgress, T), wit_types::ProviderError> {
                 let wit_types::ResumePending {
                     operation,
                     progress,
@@ -1816,11 +1824,11 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("resume_create", error)
                 })?;
-                let identifier = decode_create_identifier("resume_create", wit_create_identifier(progress))?;
-                Ok((identifier, token))
+                let progress = decode_create_progress("resume_create", progress)?;
+                Ok((progress, token))
             }
 
-            fn sdk_to_wit_update_outcome<T: serde::Serialize>(
+            fn sdk_to_wit_update_outcome<T: serde::Serialize + $crate::PhasedToken>(
                 outcome: &$crate::UpdateOutcome<T>,
                 operation: &'static str,
             ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
@@ -1863,33 +1871,41 @@ macro_rules! export_provider {
                 })
             }
 
-            fn normalized_to_wit_resource(
-                res: &$crate::NormalizedResource,
-            ) -> Result<wit_types::ResourceDef, helpers::WasmValueEncodeError> {
-                helpers::visit_normalized_resource(res, |id, attributes| {
-                    let attributes = attributes
-                        .map(|(key, value)| {
-                            proto_to_wit_value(value)
-                                .map(|value| (key.clone(), value))
-                                .map_err(|error| error.prepend_attribute(key))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    Ok(wit_types::ResourceDef {
-                        id: proto_to_wit_resource_id(id),
-                        attributes,
-                    })
+            fn desired_from_wit_value(value: &wit_types::DesiredValue, id: &proto::ResourceId, attribute: &str) -> Result<$crate::protocol::normalization::NormalizationValue, $crate::DesiredNormalizationError> {
+                use $crate::protocol::normalization::NormalizationValue as V;
+                Ok(match value {
+                    wit_types::DesiredValue::BoolVal(value) => V::Bool(*value),
+                    wit_types::DesiredValue::IntVal(value) => V::Int(*value),
+                    wit_types::DesiredValue::FloatVal(value) => V::Float(*value),
+                    wit_types::DesiredValue::StrVal(value) => V::String(value.clone()),
+                    wit_types::DesiredValue::DeferredVal(slot) => V::Deferred(*slot),
+                    wit_types::DesiredValue::ListVal(json) => V::from_json_list(json, id, attribute)?,
+                    wit_types::DesiredValue::MapVal(json) => V::from_json_map(json, id, attribute)?,
+                    wit_types::DesiredValue::StringListVal(json) => V::from_json_string_list(json, id, attribute)?,
                 })
             }
 
-            // -- Guest trait implementation --
+            fn desired_to_wit_value(value: &$crate::protocol::normalization::NormalizationValue, id: &proto::ResourceId, attribute: &str) -> Result<wit_types::DesiredValue, $crate::DesiredNormalizationError> {
+                use $crate::protocol::normalization::NormalizationValue as V;
+                Ok(match value {
+                    V::Bool(value) => wit_types::DesiredValue::BoolVal(*value),
+                    V::Int(value) => wit_types::DesiredValue::IntVal(*value),
+                    V::Float(value) => wit_types::DesiredValue::FloatVal(*value),
+                    V::String(value) => wit_types::DesiredValue::StrVal(value.clone()),
+                    V::Deferred(slot) => wit_types::DesiredValue::DeferredVal(*slot),
+                    V::StringList(_) => wit_types::DesiredValue::StringListVal(value.to_json(id, attribute)?),
+                    V::List(_) => wit_types::DesiredValue::ListVal(value.to_json(id, attribute)?),
+                    V::Map(_) => wit_types::DesiredValue::MapVal(value.to_json(id, attribute)?),
+                })
+            }
 
-            /// Trust-boundary encoder for a complete protocol error record.
-            ///
-            /// A core provider produces this exact record with
-            /// `ProviderError::to_wire`; guest implementations may also build
-            /// it directly. Its runtime message and flattened cause are
-            /// untrusted data and are passed through unchanged for the host's
-            /// sole sanctioned `ProviderError::from_wire` decode path.
+            fn normalized_to_wit_resource(res: &$crate::NormalizedResource) -> Result<wit_types::DesiredResource, $crate::DesiredNormalizationError> {
+                helpers::visit_normalized_resource(res, |resource| {
+                    let attributes = resource.attributes.iter().map(|(name, value)| desired_to_wit_value(value, &resource.id, name).map(|value| (name.clone(),value))).collect::<Result<Vec<_>,_>>()?;
+                    Ok(wit_types::DesiredResource { id: proto_to_wit_resource_id(&resource.id), attributes })
+                })
+            }
+
             fn proto_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
                 let detail = wit_types::ErrorDetail {
                     message: err.message,
@@ -1957,21 +1973,18 @@ macro_rules! export_provider {
                 })
             }
 
-            fn desired_resource_decode_to_provider_error(
-                error: $crate::DesiredResourceDecodeError,
-            ) -> wit_types::ProviderError {
-                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!(
-                        "WASM boundary decode error in normalize_desired: {error}"
-                    ),
-                    resource_id: None,
-                    cause: None,
-                    provider_name: None,
-                    operation: Some("normalize_desired".to_string()),
-                    status: None,
-                    code: None,
-                    request_id: None,
-                })
+            fn desired_resource_decode_to_provider_error(error: $crate::DesiredNormalizationError) -> wit_types::ProviderError {
+                desired_resource_boundary_to_provider_error("decode", error)
+            }
+
+            fn desired_resource_encode_to_provider_error(error: $crate::DesiredNormalizationError) -> wit_types::ProviderError {
+                desired_resource_boundary_to_provider_error("encode", error)
+            }
+
+            fn desired_resource_boundary_to_provider_error(direction: &str, error: $crate::DesiredNormalizationError) -> wit_types::ProviderError {
+                let mut error: proto::ProviderError = error.into();
+                error.message = format!("WASM boundary {direction} error in normalize_desired: {}", error.message);
+                proto_to_wit_provider_error(error)
             }
 
             fn boundary_applied_identifier_decode_to_provider_error(
@@ -2260,7 +2273,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let directives = helpers::protocol_16_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
@@ -2278,7 +2291,7 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let directives = helpers::protocol_16_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2310,7 +2323,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_16_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2319,7 +2332,7 @@ macro_rules! export_provider {
                             ));
                         }
                     };
-                    let (identifier, sent, token) = match wit_to_sdk_poll::<
+                    let (progress, sent, token) = match wit_to_sdk_poll::<
                         <$provider_type as $crate::CarinaProvider>::CreateToken,
                     >(pending, &proto_request) {
                         Ok(poll) => poll,
@@ -2333,7 +2346,7 @@ macro_rules! export_provider {
                         &*provider,
                         &proto_id,
                         proto_request,
-                        identifier,
+                        progress,
                         sent,
                         token,
                         poll_request,
@@ -2358,7 +2371,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_16_default_resource_directives();
+                    let directives = helpers::protocol_19_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2367,7 +2380,7 @@ macro_rules! export_provider {
                             ));
                         }
                     };
-                    let (identifier, token) = match wit_to_sdk_resume::<
+                    let (progress, token) = match wit_to_sdk_resume::<
                         <$provider_type as $crate::CarinaProvider>::CreateToken,
                     >(pending) {
                         Ok(resume) => resume,
@@ -2381,7 +2394,7 @@ macro_rules! export_provider {
                         &*provider,
                         &proto_id,
                         proto_request,
-                        identifier,
+                        progress,
                         token,
                         poll_request,
                     ) {
@@ -2569,28 +2582,41 @@ macro_rules! export_provider {
                     .map_err(validate_string_to_provider_error)
                 }
 
+                fn resolve_references(
+                    requests: Vec<wit_types::ReferenceRequest>,
+                ) -> Result<Vec<Result<wit_types::ReferenceOutcome, wit_types::ReferenceError>>, wit_types::ProviderError> {
+                    let requests = requests.into_iter().map(|request| {
+                        let wit_types::ReferenceRequest { ty, value } = request;
+                        proto::ReferenceRequest { ty: wit_to_proto_type_identity(&ty), value }
+                    }).collect();
+                    let results = {
+                        let provider = get_provider().lock().unwrap();
+                        $crate::CarinaProvider::resolve_references(&*provider, requests)
+                    }.map_err(proto_to_wit_provider_error)?;
+                    Ok(results.into_iter().map(|result| match result {
+                        Ok(proto::ReferenceOutcome::Resolved(value)) => Ok(wit_types::ReferenceOutcome::Resolved(value)),
+                        Ok(proto::ReferenceOutcome::NotFound(error)) => Ok(wit_types::ReferenceOutcome::NotFound(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::AccessDenied(error)) => Err(wit_types::ReferenceError::AccessDenied(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::Transient(error)) => Err(wit_types::ReferenceError::Transient(proto_to_wit_provider_error(*error))),
+                        Err(proto::ReferenceError::InvalidReference(error)) => Err(wit_types::ReferenceError::InvalidReference(proto_to_wit_provider_error(*error))),
+                    }).collect())
+                }
+
                 fn normalize_desired(
                     resources: Vec<wit_types::DesiredResource>,
-                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
-                    let proto_resources = resources
-                        .into_iter()
-                        .map(|desired| {
-                            let wit_types::DesiredResource {
-                                resource,
-                                deferred,
-                            } = desired;
-                            let directives = helpers::protocol_16_default_resource_directives();
-                            let resource = wit_to_proto_resource(&resource, directives).map_err(|error| {
-                                boundary_decode_to_provider_error(
-                                    "normalize_desired",
-                                    None,
-                                    error,
-                                )
-                            })?;
-                            helpers::decode_desired_resource(resource, deferred)
-                                .map_err(desired_resource_decode_to_provider_error)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                ) -> Result<Vec<wit_types::DesiredResource>, wit_types::ProviderError> {
+                    let proto_resources = resources.into_iter().map(|resource| {
+                        let id = wit_to_proto_resource_id(&resource.id);
+                        let mut attributes = std::collections::BTreeMap::new();
+                        for (name, value) in resource.attributes {
+                            if attributes.contains_key(&name) {
+                                return Err(desired_resource_decode_to_provider_error($crate::DesiredNormalizationError::new(id.clone(), &name, $crate::protocol::normalization::NormalizationErrorKind::DuplicateKey { key: name.clone() })));
+                            }
+                            let value = desired_from_wit_value(&value, &id, &name).map_err(desired_resource_decode_to_provider_error)?;
+                            attributes.insert(name,value);
+                        }
+                        Ok($crate::__private::decode_desired_resource($crate::protocol::normalization::NormalizationResource { id, attributes }))
+                    }).collect::<Result<Vec<_>,wit_types::ProviderError>>()?;
                     // Keep the mutex guard's lexical scope limited to the
                     // provider call; bridge result and encoding work does not
                     // require access to the shared provider.
@@ -2603,9 +2629,7 @@ macro_rules! export_provider {
                         .iter()
                         .map(normalized_to_wit_resource)
                         .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error("normalize_desired", None, error)
-                        })
+                        .map_err(desired_resource_encode_to_provider_error)
                 }
 
                 fn normalize_state(
@@ -2801,7 +2825,7 @@ mod tests {
 
     #[test]
     fn wit_resource_protocol_directives_are_all_false_without_transport() {
-        let directives = protocol_16_default_resource_directives();
+        let directives = protocol_19_default_resource_directives();
 
         assert!(!directives.force_delete);
         assert!(!directives.create_before_destroy);

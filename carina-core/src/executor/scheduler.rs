@@ -2,16 +2,15 @@ use std::collections::{HashMap, HashSet};
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::{Effect, SchedulerKey};
-use crate::parser::DeferredForExpression;
-use crate::resource::ResourceId;
+use crate::parser::CompiledDeferredForExpression as DeferredForExpression;
+use crate::resource::ResolvedResourceId;
 
 use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
 use super::parallel::apply_deferred_replace_delete_deps;
 use crate::effect::deps::{
     DependencyAnalysis, DependencyAnalysisFailure, ScheduleInputs, UnresolvedRequiredDependency,
-    build_effect_dependency_analysis, build_effect_dependency_analysis_from_resources,
-    relax_update_update_edges,
+    build_effect_dependency_analysis, relax_update_update_edges,
 };
 
 pub(super) struct SchedulerDeps {
@@ -22,6 +21,7 @@ pub(super) struct SchedulerDeps {
 pub(super) struct PureMetaStep<'a, S> {
     effect: &'a Effect<S>,
     template: &'a DeferredForExpression<S>,
+    dependencies: &'a crate::resource::DeferredDependencyTemplate,
 }
 
 impl<'a, S> PureMetaStep<'a, S> {
@@ -30,10 +30,12 @@ impl<'a, S> PureMetaStep<'a, S> {
             Effect::DeferredCreate(payload) => Some(Self {
                 effect,
                 template: payload.template.as_ref(),
+                dependencies: &payload.dependency_template,
             }),
             Effect::DeferredReplace(payload) => Some(Self {
                 effect,
                 template: payload.template.as_ref(),
+                dependencies: &payload.dependency_template,
             }),
             Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -64,7 +66,7 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
         return PureMetaOutcome::NotPureMeta;
     };
 
-    match dispatch_deferred_create(step.effect, step.template, bindings, ctx) {
+    match dispatch_deferred_create(step.effect, step.template, step.dependencies, bindings, ctx) {
         DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
         DeferredDispatchResult::MaterializeFailed(failure) => PureMetaOutcome::Failed(failure),
     }
@@ -91,40 +93,20 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
         | Effect::Import { .. }
         | Effect::Remove { .. }
         | Effect::Move { .. }
-        | Effect::Wait { .. } => effect.binding_address().map(ToString::to_string),
+        | Effect::Wait { .. } => effect.binding_address().map(|binding| binding.to_string()),
     }
 }
 
 pub(super) fn build_scheduler_deps<S>(
     effects: &[Effect<S>],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     finish_scheduler_deps(
         effects,
         build_effect_dependency_analysis(
             effects,
-            unresolved_resources,
-            compositions,
-            ScheduleInputs::Apply,
-        ),
-        deferred_replace_delete_deps,
-    )
-}
-
-pub(super) fn build_saved_scheduler_deps<S>(
-    effects: &[Effect<S>],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource<S>>,
-    compositions: &[crate::resource::SavedComposition],
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> SchedulerDeps {
-    finish_scheduler_deps(
-        effects,
-        crate::effect::deps::build_saved_effect_dependency_analysis(
-            effects,
-            unresolved_resources,
-            compositions,
+            unresolved_resources.keys(),
             ScheduleInputs::Apply,
         ),
         deferred_replace_delete_deps,
@@ -133,17 +115,15 @@ pub(super) fn build_saved_scheduler_deps<S>(
 
 pub(super) fn build_scheduler_deps_from_resources(
     effects: &[Effect],
-    unresolved_resources: &HashMap<ResourceId, &UnresolvedResource>,
-    compositions: &[crate::resource::LiveComposition],
+    unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     let effect_refs: Vec<_> = effects.iter().collect();
     finish_scheduler_deps(
         effects,
-        build_effect_dependency_analysis_from_resources(
+        build_effect_dependency_analysis(
             &effect_refs,
-            unresolved_resources,
-            compositions,
+            unresolved_resources.keys(),
             ScheduleInputs::Apply,
         ),
         deferred_replace_delete_deps,
@@ -278,7 +258,8 @@ impl<'a, S> FailureView<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::{DeferredCreatePayload, EffectGeneration};
+    use crate::effect::EffectGeneration;
+    use crate::resource::ResourceId;
 
     #[test]
     fn resource_identity_does_not_collide_with_binding_failure_key() {
@@ -303,12 +284,13 @@ mod tests {
                 generation: EffectGeneration::Current,
                 directives: crate::resource::Directives::default(),
                 binding: Some(shared),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             },
             Effect::Wait {
-                identity: crate::resource::absolute_binding_address_for_test(
+                id: crate::resource::ResolvedResourceId::with_identity(
+                    "__wait",
                     "wait_for_shared_resource",
                 ),
                 target_id: ManagedWaitTarget::for_test(&target),
@@ -320,7 +302,7 @@ mod tests {
                 until_surface: "shared.status == ready".to_string(),
                 timeout: Duration::from_secs(60),
                 interval: Duration::from_secs(1),
-                explicit_dependencies: HashSet::new(),
+                explicit_dependencies: Default::default(),
             },
         ];
         let deps_of = HashMap::new();
@@ -356,14 +338,26 @@ mod tests {
                 .expect("deferred fixture crosses the module-resolution seam")
             },
         )
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions()[0].clone();
         let scheduler_key = template.target().scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));
+        let _deferred_id = crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "failed_unbound_loop",
+        ));
 
+        let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into())
+            .expect("upstream fixture graph");
+        let (template, descriptor) = graph
+            .compile_deferred_for(template)
+            .expect("compiled fixture loop");
         let effects = vec![
-            Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(template))),
+            Effect::DeferredCreate(crate::effect::DeferredCreatePayload::new(
+                Box::new(template),
+                descriptor,
+            )),
             Effect::Delete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test.Child",
@@ -373,11 +367,13 @@ mod tests {
                 generation: EffectGeneration::Current,
                 directives: crate::resource::Directives::default(),
                 binding: Some(crate::resource::RootScope::new().resolve("dependent".into())),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::from([
-                    crate::resource::RootScope::new().resolve(scheduler_key.into())
-                ]),
-                blocked_by_updates: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: std::iter::once(ResolvedResourceId::with_identity(
+                    "test.Resource",
+                    crate::resource::ResourceIdentity::new(scheduler_key),
+                ))
+                .collect(),
+                blocked_by_updates: Default::default(),
             },
         ];
         let failed_indices = HashSet::from([0]);
@@ -393,6 +389,72 @@ mod tests {
         let failed = FailureView::new(&effects, &deps_of, &failed_indices)
             .find_failed_dependency(1)
             .expect("the explicit graph dependency must be recognized");
+
+        assert!(matches!(failed, FailedDependency::Labeled(label) if label == "main.crn:2"));
+    }
+    #[test]
+    fn cross_phase_unbound_failure_uses_source_location_not_scheduler_key() {
+        let parsed = crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
+             for value in upstream.values {\n\
+               mock.test.Child { identity_input = value }\n\
+             }\n",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("unbound deferred loop parses");
+        let parsed = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .map_err(Box::new)
+            },
+        )
+        .map_err(|error| *error)
+        .expect("module resolution")
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .expect("expanded loop");
+        let template = parsed.deferred_for_expressions()[0].clone();
+        let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into())
+            .expect("upstream fixture graph");
+        let (template, dependency_template) = graph
+            .compile_deferred_for(template)
+            .expect("loop compilation");
+        let scheduler_key = template.target().scheduler_key().to_string();
+        assert!(scheduler_key.starts_with("_loop_"));
+        let deferred_id = template.deferred_effect_id().clone();
+
+        let effects = vec![
+            Effect::DeferredCreate(crate::effect::DeferredCreatePayload::new(
+                Box::new(template),
+                dependency_template,
+            )),
+            Effect::Delete {
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "test.Child",
+                    "dependent",
+                )),
+                identifier: crate::effect::fixture_applied_identifier("dependent"),
+                generation: EffectGeneration::Current,
+                directives: crate::resource::Directives::default(),
+                binding: Some(crate::resource::absolute_binding_address_for_test(
+                    "dependent",
+                )),
+                dependencies: Default::default(),
+                explicit_dependencies: std::iter::once(deferred_id).collect(),
+                blocked_by_updates: Default::default(),
+            },
+        ];
+        let deps_of = HashMap::new();
+        let failed_indices = HashSet::from([0]);
+
+        let failed = FailureView::new(&effects, &deps_of, &failed_indices)
+            .find_failed_dependency(1)
+            .expect("the cross-phase dependency must be recognized");
 
         assert!(matches!(failed, FailedDependency::Labeled(label) if label == "main.crn:2"));
     }

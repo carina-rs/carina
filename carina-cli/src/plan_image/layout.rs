@@ -1760,11 +1760,11 @@ mod tests {
         carina_core::resource::absolute_binding_address_for_test(name)
     }
 
-    fn resource(binding: &str, dependencies: &[&str]) -> Resource {
-        let identity = carina_core::resource::ResourceIdentity::try_from(binding.to_string())
-            .expect("fixture identity");
-        let mut resource = Resource::new("test.Widget", identity);
-        resource.binding = Some(absolute_binding(binding));
+    fn resource(binding: &str, dependencies: &[&str]) -> ResolvedResource {
+        let identity =
+            carina_core::resource::ResourceIdentity::try_from(binding.to_owned()).unwrap();
+        let mut resource =
+            Resource::new("test.Widget", identity).with_absolute_binding(absolute_binding(binding));
         for dependency in dependencies {
             resource.set_attr(
                 format!("ref_{dependency}"),
@@ -1775,12 +1775,28 @@ mod tests {
                 .resolve_root_for_test(),
             );
         }
-        resource
+        ResolvedResource::from_resolved_parts(
+            resource.into_value_snapshot(),
+            dependencies
+                .iter()
+                .map(|dependency| {
+                    ResolvedResourceId::with_identity(
+                        "test.Widget",
+                        carina_core::resource::ResourceIdentity::try_from((*dependency).to_owned())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+            Default::default(),
+        )
     }
 
-    fn model_for(plan: &Plan, desired: &[Resource], trace: Option<&ExpansionTrace>) -> GraphModel {
-        let desired = ResolvedResource::collect_resolved(desired.iter().cloned())
-            .expect("layout fixtures have resolved identities");
+    fn model_for(
+        plan: &Plan,
+        desired: &[ResolvedResource],
+        trace: Option<&ExpansionTrace>,
+    ) -> GraphModel {
+        let desired = desired.to_vec();
         let unresolved: Vec<_> = desired
             .iter()
             .map(|resource| UnresolvedResource::from_pre_resolve(resource.as_inner().clone()))
@@ -1802,8 +1818,10 @@ mod tests {
         })
     }
 
-    fn fixture_model(name: &str) -> GraphModel {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name(name);
+    fn fixture_model(color_mode: crate::output_style::ColorMode, name: &str) -> GraphModel {
+        let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(&runtime, name)
+            .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         build_model(PlanImageInput {
             plan: &fixture.plan,
@@ -1891,7 +1909,7 @@ mod tests {
         (expanded, vertices, band_bounds)
     }
 
-    fn update(resource: Resource) -> Effect {
+    fn update(resource: ResolvedResource) -> Effect {
         Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
             identifier: AppliedIdentifier::new(format!(
@@ -1903,7 +1921,7 @@ mod tests {
                     .as_str()
             ))
             .unwrap(),
-            to: ResolvedResource::new(resource),
+            to: resource,
             changed_attributes: vec!["description".to_string()],
         }
     }
@@ -1921,8 +1939,13 @@ mod tests {
         )
     }
 
-    fn assert_ordering_edges_match_executor(fixture_name: &str) {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name(fixture_name);
+    fn assert_ordering_edges_match_executor(
+        color_mode: crate::output_style::ColorMode,
+        fixture_name: &str,
+    ) {
+        let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(&runtime, fixture_name)
+            .expect("fixture mock inputs must be valid");
         if fixture_name == "deferred_for_with_paired_destroy" {
             assert!(
                 fixture
@@ -1944,9 +1967,10 @@ mod tests {
             summary: &summary,
         });
         let unresolved: HashMap<_, _> = fixture
-            .unresolved_resources
+            .desired_resources
             .iter()
-            .map(|resource| (resource.as_resource().id.clone(), resource))
+            .zip(&fixture.unresolved_resources)
+            .map(|(resolved, unresolved)| (resolved.resolved_id(), unresolved))
             .collect();
         let replacement_delete_indices: HashSet<_> = fixture
             .plan
@@ -1956,7 +1980,6 @@ mod tests {
         let scheduler_edges = carina_core::executor::build_plan_scheduler_dependency_edges(
             fixture.plan.effects(),
             &unresolved,
-            &fixture.compositions,
         );
         if fixture_name == "deferred_for_with_paired_destroy" {
             assert!(scheduler_edges.iter().any(|(from, to)| {
@@ -2033,8 +2056,8 @@ mod tests {
         let dependency = resource("database", &[]);
         let dependent = resource("service", &["database"]);
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(dependency.clone())));
-        plan.add(Effect::Create(ResolvedResource::new(dependent.clone())));
+        plan.add(Effect::Create(dependency.clone()));
+        plan.add(Effect::Create(dependent.clone()));
         let desired = vec![dependency, dependent];
         let layout = layout_graph(&model_for(&plan, &desired, None));
 
@@ -2060,7 +2083,7 @@ mod tests {
         ];
         let mut plan = Plan::new();
         for resource in [source, upper, middle, lower, sink] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
 
         let layout = layout_graph(&model_for(&plan, &desired, None));
@@ -2199,7 +2222,8 @@ mod tests {
 
     #[test]
     fn reference_layout_draws_changed_to_changed_reference_without_ordering_edge() {
-        let model = fixture_model("plan_image_reference_layout");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let subnet = model
             .nodes
             .iter()
@@ -2235,7 +2259,8 @@ mod tests {
 
     #[test]
     fn reference_layout_drawn_edges_never_point_left_except_reversed_delete_ordering() {
-        let model = fixture_model("plan_image_reference_layout");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let layout = layout_graph(&model);
         let ordering_pairs: HashSet<_> = model
             .ordering_edges
@@ -2316,10 +2341,11 @@ mod tests {
 
     #[test]
     fn reference_layout_haloed_module_cards_keep_four_pixel_border_margin() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         const HALO_OUTSET: f32 = 5.0 + 8.0 / 2.0;
         const REQUIRED_MARGIN: f32 = 4.0;
 
-        let model = fixture_model("plan_image_reference_layout");
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let layout = layout_graph(&model);
         for band in &layout.modules {
             for card in &layout.nodes {
@@ -2346,7 +2372,8 @@ mod tests {
 
     #[test]
     fn reference_layout_module_band_hugs_members_without_overlapping_non_members() {
-        let model = fixture_model("plan_image_reference_layout");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let layout = layout_graph(&model);
         let overlaps = |left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)| {
             left.0 < right.0 + right.2
@@ -2409,13 +2436,14 @@ mod tests {
 
     #[test]
     fn image_ordering_edges_equal_executor_edges_for_representative_plans() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         for fixture in [
             "mixed_operations",
             "plan_image_module_cascade",
             "deferred_for_with_paired_destroy",
             "replace_create_only",
         ] {
-            assert_ordering_edges_match_executor(fixture);
+            assert_ordering_edges_match_executor(color_mode, fixture);
         }
     }
 
@@ -2483,8 +2511,8 @@ mod tests {
         let u_id = GraphNodeId::Unchanged(ResolvedResourceId::new(u.id.clone()));
         let desired = vec![a.clone(), b.clone(), u];
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(a)));
-        plan.add(Effect::Create(ResolvedResource::new(b)));
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(b));
 
         let model = model_for(&plan, &desired, None);
         let layout = layout_graph(&model);
@@ -2522,7 +2550,7 @@ mod tests {
         let desired = vec![b.clone(), c.clone(), d.clone(), a.clone(), u];
         let mut plan = Plan::new();
         for resource in [b, c, d, a] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
 
         let model = model_for(&plan, &desired, None);
@@ -2585,7 +2613,7 @@ mod tests {
         let m2 = resource("module.m2", &["module.m1"]);
         let desired = vec![a.clone(), m1.clone(), m2.clone()];
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(a)));
+        plan.add(Effect::Create(a));
 
         let site = CallSite::new(
             carina_core::resource::EphemeralId::new(ResolvedResourceId::new(
@@ -2594,8 +2622,8 @@ mod tests {
             "./modules/cycle",
         );
         let mut trace = ExpansionTrace::new();
-        trace.record(PersistentId::new(m1.id), vec![site.clone()]);
-        trace.record(PersistentId::new(m2.id), vec![site.clone()]);
+        trace.record(PersistentId::new(m1.id.clone()), vec![site.clone()]);
+        trace.record(PersistentId::new(m2.id.clone()), vec![site.clone()]);
 
         let model = model_for(&plan, &desired, Some(&trace));
         let layout = layout_graph(&model);
@@ -2627,9 +2655,17 @@ mod tests {
                 generation: EffectGeneration::Current,
                 directives: Default::default(),
                 binding: Some(absolute_binding(binding)),
-                dependencies: dependencies.into_iter().map(absolute_binding).collect(),
-                explicit_dependencies: HashSet::new(),
-                blocked_by_updates: HashSet::new(),
+                dependencies: crate::test_support::persisted(dependencies.into_iter().map(
+                    |binding| {
+                        ResolvedResourceId::with_identity(
+                            "test.Widget",
+                            carina_core::resource::ResourceIdentity::try_from(binding.to_owned())
+                                .unwrap(),
+                        )
+                    },
+                )),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
             });
         }
         let layout = layout_graph(&model_for(&plan, &[], None));
@@ -2646,8 +2682,8 @@ mod tests {
         let first = resource("first/leaf", &[]);
         let second = resource("second/leaf", &[]);
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(first.clone())));
-        plan.add(Effect::Create(ResolvedResource::new(second.clone())));
+        plan.add(Effect::Create(first.clone()));
+        plan.add(Effect::Create(second.clone()));
         let desired = vec![first.clone(), second.clone()];
         let first_site = CallSite::new(
             carina_core::resource::EphemeralId::new(ResolvedResourceId::new(
@@ -2662,8 +2698,8 @@ mod tests {
             "./modules/second",
         );
         let mut trace = ExpansionTrace::new();
-        trace.record(PersistentId::new(first.id), vec![first_site]);
-        trace.record(PersistentId::new(second.id), vec![second_site]);
+        trace.record(PersistentId::new(first.id.clone()), vec![first_site]);
+        trace.record(PersistentId::new(second.id.clone()), vec![second_site]);
 
         let layout = layout_graph(&model_for(&plan, &desired, Some(&trace)));
         assert_eq!(layout.modules.len(), 2);
@@ -2681,7 +2717,7 @@ mod tests {
         let desired = vec![a.clone(), b.clone(), c.clone(), d.clone()];
         let mut plan = Plan::new();
         for resource in [d, c, b, a] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
         let model = model_for(&plan, &desired, None);
 
@@ -2694,8 +2730,8 @@ mod tests {
         let long = resource("a_genuinely_long_resource_binding", &[]);
         let desired = vec![short.clone(), long.clone()];
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(short)));
-        plan.add(Effect::Create(ResolvedResource::new(long)));
+        plan.add(Effect::Create(short));
+        plan.add(Effect::Create(long));
 
         let layout = layout_graph(&model_for(&plan, &desired, None));
         let short = layout.node(&GraphNodeId::Effect(0)).unwrap();
@@ -2714,7 +2750,7 @@ mod tests {
     fn graph_is_left_aligned_with_the_header_margin() {
         let widget = resource("widget", &[]);
         let mut plan = Plan::new();
-        plan.add(Effect::Create(ResolvedResource::new(widget.clone())));
+        plan.add(Effect::Create(widget.clone()));
 
         let layout = layout_graph(&model_for(&plan, &[widget], None));
 
@@ -2730,7 +2766,7 @@ mod tests {
         let desired = vec![a.clone(), b.clone(), c.clone(), d.clone()];
         let mut plan = Plan::new();
         for resource in [a, b, c, d] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
         let model = model_for(&plan, &desired, None);
         let layout = layout_graph(&model);
@@ -2764,7 +2800,7 @@ mod tests {
         let desired = vec![a.clone(), b.clone(), c.clone(), connector, d.clone()];
         let mut plan = Plan::new();
         for resource in [a, b, c, d] {
-            plan.add(Effect::Create(ResolvedResource::new(resource)));
+            plan.add(Effect::Create(resource));
         }
         let model = model_for(&plan, &desired, None);
         let layout = layout_graph(&model);
@@ -2797,7 +2833,7 @@ mod tests {
         ];
         let mut plan = Plan::new();
         for resource in &resources {
-            plan.add(Effect::Create(ResolvedResource::new(resource.clone())));
+            plan.add(Effect::Create(resource.clone()));
         }
         let model = model_for(&plan, &resources, None);
 
@@ -2877,8 +2913,13 @@ mod tests {
 
     #[test]
     fn coordinate_relaxation_preserves_order_gaps_and_band_bounds() {
-        let fixture =
-            crate::fixture_plan::build_plan_from_fixture_name("plan_image_module_cascade");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(
+            &runtime,
+            "plan_image_module_cascade",
+        )
+        .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
             plan: &fixture.plan,
@@ -2924,13 +2965,13 @@ mod tests {
         let mut plan = Plan::new();
         for index in 0..HALF {
             let source = resource(&format!("source_{index:04}"), &[]);
-            plan.add(Effect::Create(ResolvedResource::new(source.clone())));
+            plan.add(Effect::Create(source.clone()));
             desired.push(source);
         }
         for index in 0..HALF {
             let dependency = format!("source_{:04}", HALF - index - 1);
             let target = resource(&format!("target_{index:04}"), &[&dependency]);
-            plan.add(Effect::Create(ResolvedResource::new(target.clone())));
+            plan.add(Effect::Create(target.clone()));
             desired.push(target);
         }
         let model = model_for(&plan, &desired, None);

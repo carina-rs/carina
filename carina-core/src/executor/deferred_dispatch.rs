@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::{
-    DeferredForExpansionError, DeferredForExpression, DeferredForTarget, ShapeMismatch,
-    expand_deferred_children,
+    CompiledDeferredForExpression as DeferredForExpression, DeferredForExpansionError,
+    DeferredForTarget, ShapeMismatch, expand_deferred_children,
 };
-use crate::resource::{ResolvedResource, ResolvedResourceError, ResourceId};
+use crate::resource::{ResolvedResourceError, ResourceId};
 #[cfg(test)]
 use crate::schema::SchemaRegistry;
 
@@ -55,6 +55,9 @@ pub enum DeferredCreateFailure {
     },
     ValueAccess {
         error: DeferredForExpansionError,
+    },
+    Directives {
+        error: crate::resource::DirectiveResolutionErrors,
     },
     ResolveResource {
         error: ResolvedResourceError,
@@ -196,6 +199,9 @@ impl std::fmt::Display for DeferredCreateFailure {
             DeferredCreateFailure::ValueAccess { error: _error } => {
                 formatter.write_str("deferred-for value resolution failed")
             }
+            DeferredCreateFailure::Directives { error: _error } => {
+                formatter.write_str("deferred-for directive resolution failed")
+            }
             DeferredCreateFailure::ResolveResource { error: _error } => {
                 formatter.write_str("deferred-for resource resolution failed")
             }
@@ -239,6 +245,7 @@ impl std::error::Error for DeferredCreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ValueAccess { error } => Some(error),
+            Self::Directives { error } => Some(error),
             Self::ResolveResource { error } => Some(error),
             Self::ProviderConfig { error } => Some(error),
             Self::EnumCanonicalization { error } => Some(error),
@@ -279,6 +286,7 @@ pub(super) fn materialize_deferred_create<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
     template: &DeferredForExpression<S>,
+    dependencies: &crate::resource::DeferredDependencyTemplate,
     bindings: &ResolvedBindings,
     identity_inputs: &DeferredIdentityInputs<'_>,
 ) -> Result<Vec<Effect<S>>, DeferredCreateFailure> {
@@ -321,26 +329,31 @@ pub(super) fn materialize_deferred_create<
     };
     let miss_policy = bindings.access_miss_policy_for_value(&template.iterable);
 
-    let mut resources = expand_deferred_children(template, &iterable, miss_policy).map_err(
-        |error| match error {
-            DeferredForExpansionError::ShapeMismatch(mismatch) => {
-                DeferredCreateFailure::ShapeMismatch {
-                    file: template.file().map(str::to_owned),
-                    line: template.line(),
-                    binding: Box::new(template.target().clone()),
-                    expression: crate::value::format_value(&template.iterable),
-                    candidates: template.reference_candidates().into_iter().collect(),
-                    mismatch: Box::new(mismatch),
-                }
+    let mut resources = expand_deferred_children(
+        template,
+        &iterable,
+        miss_policy,
+        identity_inputs.type_checks,
+    )
+    .map_err(|error| match error {
+        DeferredForExpansionError::ShapeMismatch(mismatch) => {
+            DeferredCreateFailure::ShapeMismatch {
+                file: template.file().map(str::to_owned),
+                line: template.line(),
+                binding: Box::new(template.target().clone()),
+                expression: crate::value::format_value(&template.iterable),
+                candidates: template.reference_candidates().into_iter().collect(),
+                mismatch: Box::new(mismatch),
             }
-            error @ DeferredForExpansionError::ValueAccess { .. } => {
-                DeferredCreateFailure::ValueAccess { error }
-            }
-            error @ DeferredForExpansionError::Resolution { .. } => {
-                DeferredCreateFailure::ValueAccess { error }
-            }
-        },
-    )?;
+        }
+        error @ DeferredForExpansionError::ValueAccess { .. } => {
+            DeferredCreateFailure::ValueAccess { error }
+        }
+        error @ DeferredForExpansionError::Resolution { .. } => {
+            DeferredCreateFailure::ValueAccess { error }
+        }
+        DeferredForExpansionError::Directives(error) => DeferredCreateFailure::Directives { error },
+    })?;
     if matches!(
         template.target(),
         crate::parser::DeferredForTarget::Unbound {
@@ -372,17 +385,12 @@ pub(super) fn materialize_deferred_create<
     resources
         .into_iter()
         .map(|resource| {
-            debug_assert!(
-                template
-                    .root_bindings()
-                    .is_subset(&resource.dependency_bindings),
-                "apply-time deferred-for child must retain iterable dependencies"
-            );
-            ResolvedResource::resolve_with_schemas(resource, identity_inputs.schemas)
+            dependencies
+                .materialize(resource, identity_inputs.schemas)
                 .map(Effect::Create)
                 .map_err(|error| DeferredCreateFailure::ResolveResource { error })
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect()
 }
 
 /// Result of synchronously dispatching a deferred scheduler-meta effect.
@@ -406,10 +414,11 @@ pub(super) fn dispatch_deferred_create<
 >(
     _effect: &Effect<S>,
     template: &DeferredForExpression<S>,
+    dependencies: &crate::resource::DeferredDependencyTemplate,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_>,
 ) -> DeferredDispatchResult<S> {
-    match materialize_deferred_create(template, bindings, &ctx.identity_inputs) {
+    match materialize_deferred_create(template, dependencies, bindings, &ctx.identity_inputs) {
         Ok(children) => DeferredDispatchResult::Materialized(children),
         Err(err) => DeferredDispatchResult::MaterializeFailed(err),
     }
@@ -430,6 +439,29 @@ mod tests {
         ParsedIgnorePath, ParsedIgnorePathSegment, Resource, RootScope,
     };
 
+    fn materialize_compiled_fixture(
+        template: &ExpandedDeferredForExpression,
+        bindings: &ResolvedBindings,
+        identity: &DeferredIdentityInputs<'_>,
+    ) -> Result<Vec<Effect>, DeferredCreateFailure> {
+        let configuration = crate::parser::ExpandedParsedFile {
+            upstream_states: ["up", "parent", "upstream", "primary", "fallback"]
+                .into_iter()
+                .map(|binding| crate::parser::UpstreamState {
+                    binding: RootScope::new().resolve(binding.into()),
+                    source: std::path::PathBuf::from("upstream"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into())
+            .expect("fixture upstream declarations");
+        let (template, descriptor) = graph
+            .compile_deferred_for(template.clone())
+            .expect("fixture loop dependencies");
+        materialize_deferred_create(&template, &descriptor, bindings, identity)
+    }
+
     fn coalesced_template() -> ExpandedDeferredForExpression {
         let scope = RootScope::new();
         let mut template_resource: Resource<ModuleSource, LoopSlot, AbsoluteBindingAddress> =
@@ -441,7 +473,7 @@ mod tests {
                 LoopSlot::Value,
             )),
         );
-        DeferredForExpression::new(
+        crate::parser::DeferredForExpression::new(
             None,
             1,
             "for account in (up.accounts ?? [])".to_string(),
@@ -466,7 +498,7 @@ mod tests {
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| {
                 let schemas = crate::schema::SchemaRegistry::new();
-                materialize_deferred_create(
+                materialize_compiled_fixture(
                     template,
                     bindings,
                     &DeferredIdentityInputs {
@@ -478,6 +510,57 @@ mod tests {
                 )
             },
         )
+    }
+
+    #[test]
+    fn deferred_directive_failures_keep_their_label_and_typed_source() {
+        let parsed = crate::parser::parse(
+            "let up = upstream_state { source = '../upstream' }\nlet children = for flag in up.flags { mock.test.Child { name = 'child' directives { force_delete = flag } } }\n",
+            &crate::parser::ProviderContext::default(),
+        ).unwrap();
+        let expanded = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::default(),
+            |session| {
+                crate::module_resolver::resolve_modules_providerless(
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    std::path::Path::new("."),
+                    session,
+                )
+                .map_err(Box::new)
+            },
+        )
+        .map_err(|error| *error)
+        .unwrap()
+        .into_expanded(&SchemaRegistry::new())
+        .unwrap();
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "up",
+            HashMap::from([(
+                "flags".to_owned(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("invalid".into()),
+                )])),
+            )]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let error =
+            materialize_for_test(&expanded.deferred_for_expressions()[0], &bindings).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "deferred-for directive resolution failed"
+        );
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(
+            source
+                .downcast_ref::<crate::resource::DirectiveResolutionErrors>()
+                .is_some()
+        );
+        assert!(
+            source.to_string().contains("force_delete")
+                && source.to_string().contains("got String")
+        );
     }
 
     #[test]
@@ -551,7 +634,7 @@ mod tests {
                     factories: &[],
                     schemas: &schemas,
                 };
-                let children = materialize_deferred_create(&template, &bindings, &identity_inputs)
+                let children = materialize_compiled_fixture(&template, &bindings, &identity_inputs)
                     .expect("deferred children must resolve authored ignore paths");
 
                 let Effect::Create(child) = &children[0] else {
@@ -559,7 +642,7 @@ mod tests {
                 };
                 assert_eq!(child.ignore_changes().iter().len(), 1);
             },
-        )
+        );
     }
 
     #[test]
@@ -569,9 +652,9 @@ mod tests {
             |session| {
                 let parsed = crate::parser::parse(
                     "let upstream = upstream_state { source = '../upstream' }\n\
-             for value in upstream.values {\n\
-               mock.test.Child { identity_input = value }\n\
-             }\n",
+                     for value in upstream.values {\n\
+                       mock.test.Child { identity_input = value }\n\
+                     }\n",
                     &crate::parser::ProviderContext::default(),
                 )
                 .expect("deferred unbound loop parses");
@@ -583,10 +666,12 @@ mod tests {
                             std::path::Path::new("."),
                             session,
                         )
-                        .expect("deferred fixture crosses the module-resolution seam")
+                        .map_err(Box::new)
                     },
                 )
-                .into_expanded()
+                .map_err(|error| *error)
+                .expect("deferred fixture crosses the module-resolution seam")
+                .into_expanded(&crate::schema::SchemaRegistry::new())
                 .expect("deferred-loop fixture contains no parser placeholders");
                 let template = &parsed.deferred_for_expressions()[0];
                 let mut bindings = ResolvedBindings::default();
@@ -621,7 +706,7 @@ mod tests {
                     schemas: &schemas,
                 };
 
-                let children = materialize_deferred_create(template, &bindings, &identity_inputs)
+                let children = materialize_compiled_fixture(template, &bindings, &identity_inputs)
                     .expect("apply-time anonymous child materializes");
 
                 let [Effect::Create(child)] = children.as_slice() else {
@@ -636,7 +721,7 @@ mod tests {
                 assert!(child.binding.is_none());
                 assert!(child.loop_provenance.direct_origin().is_some());
             },
-        )
+        );
     }
 
     #[test]
@@ -646,9 +731,9 @@ mod tests {
             |session| {
                 let parsed = crate::parser::parse_file(
                     "let upstream = upstream_state { source = '../upstream' }\n\
-             for value in upstream.values {\n\
-               mock.test.Child { mode = value }\n\
-             }\n",
+                     for value in upstream.values {\n\
+                       mock.test.Child { mode = value }\n\
+                     }\n",
                     std::path::Path::new("main.crn"),
                     &crate::parser::ProviderContext::default(),
                 )
@@ -661,10 +746,12 @@ mod tests {
                             std::path::Path::new("."),
                             session,
                         )
-                        .expect("deferred fixture crosses the module-resolution seam")
+                        .map_err(Box::new)
                     },
                 )
-                .into_expanded()
+                .map_err(|error| *error)
+                .expect("deferred fixture crosses the module-resolution seam")
+                .into_expanded(&crate::schema::SchemaRegistry::new())
                 .expect("deferred-loop fixture contains no parser placeholders");
                 let template = &parsed.deferred_for_expressions()[0];
                 let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -702,18 +789,25 @@ mod tests {
                 };
 
                 let runtime_children =
-                    materialize_deferred_create(template, &bindings, &identity_inputs)
+                    materialize_compiled_fixture(template, &bindings, &identity_inputs)
                         .expect("apply-time enum child materializes");
                 let [Effect::Create(runtime_child)] = runtime_children.as_slice() else {
                     panic!("one runtime child expected");
                 };
 
-                let mut plan_time_resources = crate::parser::expand_deferred_children(
-                    template,
-                    &iterable,
-                    crate::resource::AccessMissPolicy::Error,
-                )
-                .expect("plan-time child expands");
+                let mut plan_time_resources =
+                    crate::validation::deferred_types::with_session_for_test(
+                        &crate::parser::ProviderContext::default(),
+                        |session| {
+                            crate::parser::expand_deferred_children(
+                                template,
+                                &iterable,
+                                crate::resource::AccessMissPolicy::Error,
+                                session,
+                            )
+                        },
+                    )
+                    .expect("plan-time child expands");
                 let canonical = crate::value::canonicalize_resources_with_schemas(
                     &mut plan_time_resources,
                     &schemas,
@@ -738,7 +832,7 @@ mod tests {
                     "apply-time hashing must consume the same canonical enum representation as planning"
                 );
             },
-        )
+        );
     }
 
     #[test]
@@ -748,9 +842,9 @@ mod tests {
             |session| {
                 let parsed = crate::parser::parse(
                     "let upstream = upstream_state { source = '../upstream' }\n\
-             for value in upstream.values {\n\
-               mock.test.Child { identity_input = value }\n\
-             }\n",
+                     for value in upstream.values {\n\
+                       mock.test.Child { identity_input = value }\n\
+                     }\n",
                     &crate::parser::ProviderContext::default(),
                 )
                 .expect("deferred unbound loop parses");
@@ -762,10 +856,12 @@ mod tests {
                             std::path::Path::new("."),
                             session,
                         )
-                        .expect("deferred fixture crosses the module-resolution seam")
+                        .map_err(Box::new)
                     },
                 )
-                .into_expanded()
+                .map_err(|error| *error)
+                .expect("deferred fixture crosses the module-resolution seam")
+                .into_expanded(&crate::schema::SchemaRegistry::new())
                 .expect("deferred-loop fixture contains no parser placeholders");
                 let template = &parsed.deferred_for_expressions()[0];
                 let mut bindings = ResolvedBindings::default();
@@ -801,7 +897,7 @@ mod tests {
                     schemas: &schemas,
                 };
 
-                let error = materialize_deferred_create(template, &bindings, &identity_inputs)
+                let error = materialize_compiled_fixture(template, &bindings, &identity_inputs)
                     .expect_err("identical apply-time children must fail identity assignment");
                 let source = std::error::Error::source(&error)
                     .expect("deferred failure must retain its typed identity source");
@@ -813,7 +909,7 @@ mod tests {
                     "unexpected source type: {source:?}",
                 );
             },
-        )
+        );
     }
 
     #[test]

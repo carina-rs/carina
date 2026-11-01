@@ -220,12 +220,7 @@ pub fn resolve_upstream_exports_with_schemas<B: BindingAddress>(
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
-    resolve_upstream_exports_with_context(
-        base_dir,
-        upstream_states,
-        crate::validation::typecheck::TypecheckProviderContext::for_session(config),
-        schemas,
-    )
+    resolve_upstream_exports_with_context(base_dir, upstream_states, config, schemas)
 }
 
 /// Bootstrap/discovery variant of
@@ -236,23 +231,17 @@ pub fn resolve_upstream_exports_providerless_with_schemas<B: BindingAddress>(
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
-    resolve_upstream_exports_with_context(
-        base_dir,
-        upstream_states,
-        crate::validation::typecheck::TypecheckProviderContext::for_session(config),
-        schemas,
-    )
+    resolve_upstream_exports_with_context(base_dir, upstream_states, config, schemas)
 }
 
 fn resolve_upstream_exports_with_context<B: BindingAddress>(
     base_dir: &Path,
     upstream_states: &[UpstreamState<B>],
-    provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
-    let config = provider_context
-        .session()
-        .expect("upstream producers borrow the run session");
+    let provider_context =
+        crate::validation::typecheck::TypecheckProviderContext::for_session(config);
     let mut out: UpstreamExports<B> = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
     for us in upstream_states {
@@ -318,9 +307,47 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                 // compares canonical identities. Resolve once more afterward
                 // to classify newly inferred names that the consumer cannot
                 // name, preserving that distinction from inference failure.
+                if schemas.is_none() {
+                    // Even the providerless discovery API is a state-boundary
+                    // loader. Handle RHSs and declared Ref types are
+                    // inferable without schemas and must never be advertised
+                    // as value-shaped upstream exports.
+                    let inferred =
+                        crate::validation::inference::infer_export_params(&parsed, &empty_schemas);
+                    if let Err(boundary_errors) =
+                        crate::validation::validate_export_handle_boundaries(inferred.parameters())
+                    {
+                        errors.push(UpstreamResolveError {
+                            binding: us.binding.to_string(),
+                            source: us.source.clone(),
+                            reason: boundary_errors
+                                .into_iter()
+                                .map(|error| error.to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        });
+                        continue;
+                    }
+                }
                 let entries: UpstreamExportEntries = match schemas {
                     Some(s) => {
                         let inferred = crate::validation::inference::apply_inference(parsed, s);
+                        if let Err(boundary_errors) =
+                            crate::validation::validate_export_handle_boundaries(
+                                &inferred.export_params,
+                            )
+                        {
+                            errors.push(UpstreamResolveError {
+                                binding: us.binding.to_string(),
+                                source: us.source.clone(),
+                                reason: boundary_errors
+                                    .into_iter()
+                                    .map(|error| error.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            });
+                            continue;
+                        }
                         inferred
                             .export_params
                             .into_iter()
@@ -363,7 +390,12 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
                                 e.name,
                                 UpstreamExportEntry {
                                     static_type,
-                                    value: e.value,
+                                    value: e.value.and_then(|expression| match expression {
+                                        crate::parser::BoundaryExpression::Value(value) => {
+                                            Some(value)
+                                        }
+                                        crate::parser::BoundaryExpression::Handle(_handle) => None,
+                                    }),
                                 },
                             )
                         })
@@ -555,7 +587,7 @@ fn check_upstream_state_field_references_inner<
         if include_typed_consumers {
             for_each_project_value(parsed, |value, location| check(value, location));
             for attr in &parsed.attribute_params {
-                if let Some(value) = &attr.value {
+                if let Some(crate::parser::BoundaryExpression::Value(value)) = &attr.value {
                     check(value, &format!("attributes.{}", attr.name));
                 }
             }
@@ -1425,6 +1457,61 @@ mod tests {
                 )
             )))
         ));
+    }
+
+    #[test]
+    fn upstream_load_rejects_declared_and_inferred_resource_handle_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("upstream");
+        fs::create_dir(&source).unwrap();
+        write_crn(
+            &source,
+            "resource.crn",
+            "let record = mock.test.Record { name = 'record' }\n",
+        );
+        write_crn(
+            &source,
+            "exports.crn",
+            "exports {\n  inferred = record\n  declared: mock.test.Record = record\n}\n",
+        );
+        let context = LoadedProviderContext::for_test(crate::parser::ProviderContext {
+            resource_types: std::collections::HashSet::from([(
+                "mock".to_string(),
+                "test.Record".to_string(),
+            )]),
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::new(),
+                Box::new(|_target, _value| Ok(())),
+            ),
+            ..crate::parser::ProviderContext::default()
+        });
+
+        let schemas = SchemaRegistry::new();
+        for schemas in [None, Some(&schemas)] {
+            let (exports, errors) =
+                crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                    resolve_upstream_exports_with_context(
+                        root.path(),
+                        &[upstream("up", "upstream")],
+                        session,
+                        schemas,
+                    )
+                });
+            assert!(
+                !exports.contains_key("up"),
+                "handle exports leaked: {exports:?}"
+            );
+            assert_eq!(errors.len(), 1, "unexpected upstream errors: {errors:?}");
+            let rendered = errors[0].to_string();
+            assert!(
+                rendered.contains(
+                    "export 'inferred': inferred resource handle mock.test.Record cannot cross a state boundary"
+                ) && rendered.contains(
+                    "export 'declared': resource handle mock.test.Record cannot cross a state boundary"
+                ),
+                "upstream loading must reject both handle export forms: {rendered}",
+            );
+        }
     }
 
     fn mk_exports(pairs: &[(&str, &[&str])]) -> UpstreamExports {

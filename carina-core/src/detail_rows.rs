@@ -13,7 +13,8 @@ use crate::diff_helpers::{
     schema_aware_equal,
 };
 use crate::differ::{
-    AttrComparison, ComparisonContext, LeafProvenance, TypedAttr, key_should_enter_patch,
+    AttrComparison, ComparisonContext, LeafProvenance, ReferenceEquality, TypedAttr,
+    key_should_enter_patch,
 };
 use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::explicit::{ExplicitProjection, ProjectedAuthoring};
@@ -79,6 +80,46 @@ struct HistoricalDeleteAttributes {
 }
 
 impl HistoricalDisplayAttributes {
+    pub(crate) fn reference_records(
+        &self,
+    ) -> impl Iterator<Item = (&ResourceId, &NestedWriteOnlyRecord)> {
+        self.deletes
+            .iter()
+            .map(|(key, entry)| (key.id(), &entry.nested_write_only))
+    }
+
+    pub(crate) fn reference_values(
+        &self,
+    ) -> impl Iterator<Item = (&ResourceId, &HashMap<String, Value>)> {
+        self.updates
+            .iter()
+            .flat_map(|(id, entry)| {
+                std::iter::once((id, &entry.attributes))
+                    .chain(entry.stored_attributes.as_ref().map(|values| (id, values)))
+            })
+            .chain(self.deletes.iter().flat_map(|(key, entry)| {
+                std::iter::once((key.id(), &entry.attributes)).chain(
+                    entry
+                        .stored_attributes
+                        .as_ref()
+                        .map(|values| (key.id(), values)),
+                )
+            }))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn for_planning(plan: &Plan, saved: &crate::provider::LiftedSavedAttrs) -> Self {
+        let mut display = Self::for_plan(plan);
+        for (id, attributes) in &mut display.updates {
+            attributes.stored_attributes = saved.get(id).cloned();
+        }
+        for (key, attributes) in &mut display.deletes {
+            attributes.stored_attributes = saved.get(key.id()).cloned();
+            attributes.nested_write_only = saved.nested_write_only(key.id()).clone();
+        }
+        display
+    }
+
     /// Build the fail-safe display view available from a plan alone. Desired
     /// secret shapes mask their historical counterparts; callers with state
     /// provenance should then refine it through the persisted-shape methods.
@@ -644,6 +685,216 @@ pub enum ListOfMapsDiffField {
     },
 }
 
+/// A plan and its display rows, released together by a clean recording pass.
+/// The plan is immutable for the entire lifetime of its prepared rows.
+///
+/// ```compile_fail,E0616
+/// use carina_core::detail_rows::PreparedPlanDisplay;
+/// fn replace_plan(display: &mut PreparedPlanDisplay) {
+///     display.plan = Default::default();
+/// }
+/// ```
+///
+/// ```compile_fail,E0596
+/// use carina_core::{detail_rows::PreparedPlanDisplay, plan::PlanError};
+/// fn mutate_plan(display: &mut PreparedPlanDisplay, error: PlanError) {
+///     display.plan().add_error(error);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct PreparedPlanDisplay {
+    plan: std::sync::Arc<Plan>,
+    historical: HistoricalDisplayAttributes,
+    detail: DetailLevel,
+    rows: Vec<Vec<DetailRow>>,
+}
+
+impl PreparedPlanDisplay {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        plan: std::sync::Arc<Plan>,
+        historical: HistoricalDisplayAttributes,
+        detail: DetailLevel,
+        registry: &SchemaRegistry,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+        provider: &ProviderRouter,
+        references: &crate::references::ResolvedReferences,
+    ) -> ProviderResult<Self> {
+        let replacements = plan
+            .replace_display_info()
+            .map(|info| (info.create_idx, info))
+            .collect::<HashMap<_, _>>();
+        let rows = {
+            plan.effects()
+                .iter()
+                .enumerate()
+                .map(|(index, effect)| {
+                    if let (Effect::Create(to), Some(replacement)) =
+                        (effect, replacements.get(&index))
+                    {
+                        build_replace_detail_rows_from_display(
+                            &plan,
+                            to,
+                            *replacement,
+                            &historical,
+                            Some(registry),
+                            detail,
+                            explicit.get(&to.id),
+                            provider,
+                            DetailComparisons::Planning(references),
+                        )
+                    } else {
+                        build_detail_rows_by_instance(
+                            effect,
+                            Some(registry),
+                            detail,
+                            &historical,
+                            Some(explicit),
+                            provider,
+                            DetailComparisons::Planning(references),
+                        )
+                    }
+                })
+                .collect::<ProviderResult<Vec<_>>>()?
+        };
+        Ok(Self {
+            plan,
+            historical,
+            detail,
+            rows,
+        })
+    }
+
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    pub fn detail(&self) -> DetailLevel {
+        self.detail
+    }
+
+    pub fn view(&self) -> PlanDisplay<'_> {
+        PlanDisplay {
+            plan: &self.plan,
+            historical: &self.historical,
+            rows: DisplayRows::Prepared {
+                detail: self.detail,
+                rows: &self.rows,
+            },
+        }
+    }
+}
+
+/// Planning display requires the exact witness returned with the plan. Saved
+/// effects already record their decisions and never repeat reference equality.
+#[derive(Debug, Clone, Copy)]
+pub enum DetailComparisons<'a> {
+    Planning(&'a crate::references::ResolvedReferences),
+    RecordedEffects,
+}
+
+/// Read-only display input. Prepared rows can enter this view only through
+/// their owning [`PreparedPlanDisplay`], so they cannot be paired with another
+/// plan, even one with the same number of effects.
+pub struct PlanDisplay<'a, S = crate::resource::ModuleSource> {
+    plan: &'a Plan<S>,
+    historical: &'a HistoricalDisplayAttributes,
+    rows: DisplayRows<'a>,
+}
+
+enum DisplayRows<'a> {
+    Prepared {
+        detail: DetailLevel,
+        rows: &'a [Vec<DetailRow>],
+    },
+    Build(DetailComparisons<'a>),
+}
+
+impl<'a, S> PlanDisplay<'a, S> {
+    /// A saved plan or a test comparison that builds its rows on demand.
+    /// This constructor cannot accept prepared rows.
+    pub fn unprepared(
+        plan: &'a Plan<S>,
+        historical: &'a HistoricalDisplayAttributes,
+        comparisons: DetailComparisons<'a>,
+    ) -> Self {
+        Self {
+            plan,
+            historical,
+            rows: DisplayRows::Build(comparisons),
+        }
+    }
+
+    pub fn plan(&self) -> &'a Plan<S> {
+        self.plan
+    }
+
+    pub fn detail_rows(
+        &self,
+        index: usize,
+        detail: DetailLevel,
+        registry: Option<&SchemaRegistry>,
+        explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
+        provider: &ProviderRouter,
+    ) -> ProviderResult<std::borrow::Cow<'a, [DetailRow]>> {
+        if detail == DetailLevel::NamesOnly {
+            return Ok(std::borrow::Cow::Borrowed(&[]));
+        }
+        let comparisons = match &self.rows {
+            DisplayRows::Prepared {
+                detail: prepared_detail,
+                rows,
+            } => {
+                if detail != *prepared_detail {
+                    return Err(crate::provider::ProviderError::invalid_input(
+                        "display detail differs from the prepared request",
+                    ));
+                }
+                return rows
+                    .get(index)
+                    .map(|rows| std::borrow::Cow::Borrowed(rows.as_slice()))
+                    .ok_or_else(|| {
+                        crate::provider::ProviderError::invalid_input(
+                            "prepared display has no rows for this effect index",
+                        )
+                    });
+            }
+            DisplayRows::Build(comparisons) => *comparisons,
+        };
+        let effect = self.plan.effects().get(index).ok_or_else(|| {
+            crate::provider::ProviderError::invalid_input("plan has no effect at this index")
+        })?;
+        let replacement = self
+            .plan
+            .replace_display_info()
+            .find(|info| info.create_idx == index);
+        let rows = if let (Effect::Create(to), Some(replacement)) = (effect, replacement) {
+            build_replace_detail_rows_from_display(
+                self.plan,
+                to,
+                replacement,
+                self.historical,
+                registry,
+                detail,
+                explicit.and_then(|map| map.get(&to.id)),
+                provider,
+                comparisons,
+            )?
+        } else {
+            build_detail_rows_by_instance(
+                effect,
+                registry,
+                detail,
+                self.historical,
+                explicit,
+                provider,
+                comparisons,
+            )?
+        };
+        Ok(std::borrow::Cow::Owned(rows))
+    }
+}
+
 /// Build detail rows for an effect using delete attributes keyed by resource
 /// id plus generation.
 pub fn build_detail_rows_by_instance<S>(
@@ -653,16 +904,18 @@ pub fn build_detail_rows_by_instance<S>(
     historical_attributes: &HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
     provider: &ProviderRouter,
+    comparisons: DetailComparisons<'_>,
 ) -> ProviderResult<Vec<DetailRow>> {
     if detail == DetailLevel::NamesOnly {
         return Ok(Vec::new());
     }
 
+    let rendered_changes = std::cell::RefCell::new(crate::differ::RenderedChanges::new());
     // carina#3181: `Effect` payloads are typestate structs — the
     // managed variants carry `Resource`, `Read` carries a
     // `DataSource`. Schema lookup routes through the matching
     // `get_for` / `get_for_data_source` registry method.
-    Ok(match effect {
+    let mut rows = match effect {
         Effect::Create(r) | Effect::ResumeCreate { resource: r, .. } => {
             let schema = registry
                 .and_then(|registry| registry.get_for(r))
@@ -683,15 +936,38 @@ pub fn build_detail_rows_by_instance<S>(
                 ComparisonResolutionError::MissingResourceSchema { id: to.id.clone() }
             })?;
             let resolved = provider.comparison_for(registry, &to.id)?;
-            build_update_rows(
-                historical,
-                to,
-                changed_attributes,
-                Some(resolved.owner_schema().schema().as_schema()),
-                detail,
-                explicit,
-                *resolved.context(),
-            )
+            match comparisons {
+                DetailComparisons::Planning(references) => {
+                    resolved
+                        .context()
+                        .with_references(references, &to.id, |comparison| {
+                            build_update_rows(
+                                historical,
+                                to,
+                                changed_attributes,
+                                Some(resolved.owner_schema().schema().as_schema()),
+                                detail,
+                                explicit,
+                                comparison.tracking_rows(&rendered_changes),
+                                false,
+                            )
+                        })?
+                }
+                DetailComparisons::RecordedEffects => {
+                    resolved.context().with_recorded_effects(|comparison| {
+                        build_update_rows(
+                            historical,
+                            to,
+                            changed_attributes,
+                            Some(resolved.owner_schema().schema().as_schema()),
+                            detail,
+                            explicit,
+                            comparison,
+                            true,
+                        )
+                    })
+                }
+            }
         }
         Effect::Delete {
             id,
@@ -740,7 +1016,42 @@ pub fn build_detail_rows_by_instance<S>(
         | Effect::Wait { .. }
         | Effect::DeferredCreate(_)
         | Effect::DeferredReplace(_) => Vec::new(),
-    })
+    };
+    if let DetailComparisons::Planning(references) = comparisons
+        && matches!(effect, Effect::Update { .. })
+    {
+        append_dangling_reference_notes(
+            &mut rows,
+            references,
+            effect.resource_id(),
+            &rendered_changes.into_inner(),
+        );
+    }
+    Ok(rows)
+}
+
+fn append_dangling_reference_notes(
+    rows: &mut Vec<DetailRow>,
+    references: &crate::references::ResolvedReferences,
+    resource: &ResourceId,
+    changed: &crate::differ::RenderedChanges,
+) {
+    rows.extend(
+        references
+            .dangling_references(resource)
+            .filter(|reference| {
+                changed.contains(&(reference.side, reference.path.clone()))
+                    || (reference.side == crate::references::ReferenceSide::Saved
+                        && changed.iter().any(|(_, path)| path == &reference.path))
+            })
+            .map(|reference| DetailRow::Text {
+                text: format!(
+                    "{}: {} reference no longer resolves",
+                    reference.path,
+                    reference.side.label()
+                ),
+            }),
+    );
 }
 
 /// Build the TUI-only identifier fallback for a delete whose normal detail
@@ -880,14 +1191,21 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
         .then(|| "# default_tags".to_string())
 }
 
-fn build_update_rows<S>(
+#[allow(clippy::too_many_arguments)]
+fn build_update_rows<S, D, R: ReferenceEquality>(
     historical: &HistoricalUpdateAttributes,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
     explicit: Option<&crate::explicit::ExplicitFields>,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
+    recorded_effects: bool,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
     let from_attributes = match schema {
@@ -915,29 +1233,28 @@ fn build_update_rows<S>(
             crate::resource::UnschematizedComparisonAttributes::new(to.resolved_attributes()),
         ),
     };
-    let comparison_attributes = to.resolved_ignore_changes.mask_comparison_readable_leaves(
+    let masked = to.resolved_ignore_changes.mask_comparison_attributes(
         &comparison_attributes,
         &from_attributes,
+        stored_attributes.as_ref(),
         schema,
     );
+    let fully_masked_attributes =
+        masked.fully_masked_attribute_count(&comparison_attributes, &from_attributes);
+    let comparison_attributes = masked.desired();
+    let from_attributes = masked.current();
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let projected = project_from_attrs(
-        &from_attributes,
-        stored_attributes.as_ref(),
-        &comparison_attributes,
-        explicit,
-        schema,
-        comparison,
-    );
+    let projected = project_from_attrs(&masked, explicit, schema, comparison);
     let from_attrs_projected = projected.attributes();
+    let comparison = comparison.with_left_origins(&projected.origins);
 
     let attr_rows = build_attribute_diff_rows(
         to,
-        &comparison_attributes,
+        comparison_attributes,
         AttributeDiffContext::for_update(
-            &from_attributes,
+            from_attributes,
             from_attrs_projected,
             schema,
             defs,
@@ -945,7 +1262,8 @@ fn build_update_rows<S>(
             changed_attributes,
             comparison,
         )
-        .with_explicit(Some(&projected.authoring)),
+        .with_explicit(Some(&projected.authoring))
+        .with_recorded_effects(recorded_effects),
     );
     rows.extend(attr_rows.rows);
 
@@ -972,11 +1290,12 @@ fn build_update_rows<S>(
     if detail == DetailLevel::Full {
         let unchanged_count = compute_unchanged_count(
             from_attrs_projected,
-            &comparison_attributes,
+            comparison_attributes,
             None,
             schema,
             &comparison,
-        ) + attr_rows.effectively_unchanged;
+        ) + attr_rows.effectively_unchanged
+            + fully_masked_attributes;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -1053,7 +1372,7 @@ fn string_list_diff_row(
     }
 }
 
-struct AttributeDiffContext<'a> {
+struct AttributeDiffContext<'a, R: ReferenceEquality> {
     from_attrs_raw: &'a CanonicalComparisonAttributes,
     from_attrs_projected: &'a CanonicalComparisonAttributes,
     schema: Option<&'a ResourceSchema>,
@@ -1063,7 +1382,8 @@ struct AttributeDiffContext<'a> {
     forces_replacement_keys: Option<&'a HashSet<&'a str>>,
     cascade_ref_hints: &'a [(String, String)],
     explicit: Option<&'a ProjectedAuthoring>,
-    comparison: ComparisonContext<'a>,
+    comparison: ComparisonContext<'a, R>,
+    recorded_effects: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1078,7 +1398,7 @@ struct ReplacementDiffContext<'a> {
     cascade_ref_hints: &'a [(String, String)],
 }
 
-impl<'a> AttributeDiffContext<'a> {
+impl<'a, R: ReferenceEquality> AttributeDiffContext<'a, R> {
     fn for_update(
         from_attrs_raw: &'a CanonicalComparisonAttributes,
         from_attrs_projected: &'a CanonicalComparisonAttributes,
@@ -1086,7 +1406,7 @@ impl<'a> AttributeDiffContext<'a> {
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
         changed_attribute_keys: &'a [String],
-        comparison: ComparisonContext<'a>,
+        comparison: ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             from_attrs_raw,
@@ -1099,6 +1419,7 @@ impl<'a> AttributeDiffContext<'a> {
             cascade_ref_hints: &[],
             explicit: None,
             comparison,
+            recorded_effects: false,
         }
     }
 
@@ -1109,7 +1430,7 @@ impl<'a> AttributeDiffContext<'a> {
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
         replacement: ReplacementDiffContext<'a>,
-        comparison: ComparisonContext<'a>,
+        comparison: ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             from_attrs_raw,
@@ -1122,7 +1443,13 @@ impl<'a> AttributeDiffContext<'a> {
             cascade_ref_hints: replacement.cascade_ref_hints,
             explicit: None,
             comparison,
+            recorded_effects: false,
         }
+    }
+
+    fn with_recorded_effects(mut self, recorded_effects: bool) -> Self {
+        self.recorded_effects = recorded_effects;
+        self
     }
 
     fn with_explicit(mut self, explicit: Option<&'a ProjectedAuthoring>) -> Self {
@@ -1195,57 +1522,29 @@ fn is_whole_value(explicit: Option<&ProjectedAuthoring>) -> bool {
     matches!(explicit, Some(ProjectedAuthoring::WholeValue))
 }
 
-fn project_from_attrs(
-    from_attributes: &CanonicalComparisonAttributes,
-    stored_attributes: Option<&CanonicalComparisonAttributes>,
-    desired_attributes: &CanonicalComparisonAttributes,
+fn project_from_attrs<R: ReferenceEquality>(
+    masked: &crate::resource::MaskedComparisonAttributes,
     explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> crate::explicit::ProjectedAttributes {
-    // Project `from.attributes` through the user-authoring tree so
-    // server-side default fields the user never wrote don't inflate
-    // the unchanged-count summary (refs awscc#206). Stored values anchor
-    // per-element list records when present; otherwise the projection uses
-    // the legacy union fallback.
-    let empty_stored = CanonicalComparisonAttributes::default();
     match explicit {
-        Some(explicit) => ExplicitProjection::for_desired(
-            stored_attributes.unwrap_or(&empty_stored),
-            desired_attributes,
-            explicit,
-            schema,
-            &comparison,
-        )
-        .project_attributes(from_attributes.clone()),
-        None => crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None),
+        Some(explicit) => {
+            ExplicitProjection::for_desired(masked, explicit, schema, &comparison).current()
+        }
+        None => crate::explicit::ProjectedAttributes::unprojected(masked.current().clone(), None),
     }
 }
 
-fn project_previous_attrs(
-    previous_attributes: &CanonicalComparisonAttributes,
-    stored_attributes: Option<&CanonicalComparisonAttributes>,
-    desired_attributes: &CanonicalComparisonAttributes,
-    explicit: Option<&crate::explicit::ExplicitFields>,
-    schema: Option<&ResourceSchema>,
-    comparison: ComparisonContext<'_>,
-) -> crate::explicit::ProjectedAttributes {
-    // Same projection as `project_from_attrs`, but sourced from
-    // replacement-display metadata instead of a replace effect state.
-    project_from_attrs(
-        previous_attributes,
-        stored_attributes,
-        desired_attributes,
-        explicit,
-        schema,
-        comparison,
-    )
-}
-
-fn build_attribute_diff_rows<S>(
-    to: &crate::resource::Resource<S>,
+fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     to_attributes: &CanonicalComparisonAttributes,
-    ctx: AttributeDiffContext<'_>,
+    ctx: AttributeDiffContext<'_, R>,
 ) -> AttributeDiffRows {
     let mut rows = Vec::new();
 
@@ -1296,14 +1595,47 @@ fn build_attribute_diff_rows<S>(
                 None
             }
         });
+        if forces_replacement
+            && let Some((_, hint)) = ctx
+                .cascade_ref_hints
+                .iter()
+                .find(|(attribute, _)| attribute == &key)
+        {
+            rows.push(DetailRow::ReplaceCascade {
+                key: key.clone(),
+                old: old_value
+                    .map(render_value)
+                    .unwrap_or_else(|| render_other("(none)")),
+                new: render_other(hint.clone()),
+            });
+            continue;
+        }
         let attr_type = ctx
             .schema
             .and_then(|s| s.attributes.get(key.as_str()))
             .map(|a| &a.attr_type);
         // Keep the raw verdict only for the hidden-unchanged accounting below.
+        let comparison = ctx.comparison.at_path(&key);
+        let ctx = AttributeDiffContext { comparison, ..ctx };
         let raw_is_same = old_value
             .map(|old| schema_aware_equal(old, new_value, attr_type, ctx.defs, &ctx.comparison))
             .unwrap_or(false);
+        // Recorded effects own the change decision. Count retained but byte-different
+        // inputs as hidden unchanged values without inventing additional rows.
+        if ctx.recorded_effects
+            && let DetailLeafProvenance::DecidedByPlan(changed) = ctx.leaf_provenance
+            && !changed.contains(&key)
+        {
+            if !raw_is_same
+                && (old_value.is_some()
+                    || ctx
+                        .schema
+                        .is_some_and(|schema| schema.write_only_bearing(&key)))
+            {
+                effectively_unchanged += 1;
+            }
+            continue;
+        }
         let type_info = attr_type.map(|attr_type| TypedAttr {
             attr_type,
             defs: ctx.defs,
@@ -1345,6 +1677,8 @@ fn build_attribute_diff_rows<S>(
         }
 
         if payload_only {
+            ctx.comparison
+                .rendered_change(old_value, Some(new_value), attr_type, ctx.defs);
             let old = old_value
                 .map(render_value)
                 .unwrap_or_else(|| render_other("(none)"));
@@ -1363,6 +1697,8 @@ fn build_attribute_diff_rows<S>(
         // behind the same guessed identity the state record intentionally
         // refused to claim.
         if ctx.is_whole_value_authored(&key) && is_list_of_maps(new_value) {
+            ctx.comparison
+                .rendered_change(old_value, Some(new_value), attr_type, ctx.defs);
             let old = old_value
                 .map(render_value)
                 .unwrap_or_else(|| render_other("(none)"));
@@ -1412,6 +1748,7 @@ fn build_attribute_diff_rows<S>(
         } else if let Some(diff) =
             compute_string_list_change(old_value, new_value, attr_type, ctx.defs)
         {
+            diff.record_rows(old_value, new_value, attr_type, ctx.defs, &ctx.comparison);
             rows.push(string_list_diff_row(
                 key.to_string(),
                 diff.unchanged,
@@ -1446,6 +1783,8 @@ fn build_attribute_diff_rows<S>(
                 effectively_unchanged += 1;
                 continue;
             }
+            ctx.comparison
+                .rendered_change(old_value, Some(new_value), attr_type, ctx.defs);
             rows.push(changed_row(
                 key.to_string(),
                 old_str,
@@ -1467,15 +1806,21 @@ fn build_attribute_diff_rows<S>(
 /// effect. This helper owns the delete-index lookup so every renderer consumes
 /// the same masked historical view rather than reconstructing that lookup.
 #[allow(clippy::too_many_arguments)]
-pub fn build_replace_detail_rows_from_display<S>(
+pub fn build_replace_detail_rows_from_display<S, D>(
     plan: &Plan<S>,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     replacement: ReplaceDisplayInfo<'_>,
     historical_display: &HistoricalDisplayAttributes,
     registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
     explicit: Option<&crate::explicit::ExplicitFields>,
     provider: &ProviderRouter,
+    comparisons: DetailComparisons<'_>,
 ) -> ProviderResult<Vec<DetailRow>> {
     let Some(Effect::Delete {
         id,
@@ -1500,28 +1845,69 @@ pub fn build_replace_detail_rows_from_display<S>(
     let schema = resolved.owner_schema().schema().as_schema();
     let comparison_attributes =
         CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema);
-    Ok(build_replace_rows_from_attributes(
-        &historical_attributes.attributes,
-        historical_attributes.stored_attributes.as_ref(),
-        &historical_attributes.nested_write_only,
-        to,
-        &comparison_attributes,
-        replacement.changed_create_only,
-        replacement.temporary_name,
-        replacement.cascade_ref_hints,
-        Some(schema),
-        detail,
-        explicit,
-        *resolved.context(),
-    ))
+    let rendered_changes = std::cell::RefCell::new(crate::differ::RenderedChanges::new());
+    let mut rows = match comparisons {
+        DetailComparisons::Planning(references) => {
+            resolved
+                .context()
+                .with_references(references, &to.id, |comparison| {
+                    build_replace_rows_from_attributes(
+                        &historical_attributes.attributes,
+                        historical_attributes.stored_attributes.as_ref(),
+                        &historical_attributes.nested_write_only,
+                        to,
+                        &comparison_attributes,
+                        replacement.changed_create_only,
+                        replacement.temporary_name,
+                        replacement.cascade_ref_hints,
+                        Some(schema),
+                        detail,
+                        explicit,
+                        comparison.tracking_rows(&rendered_changes),
+                    )
+                })?
+        }
+        DetailComparisons::RecordedEffects => {
+            resolved.context().with_recorded_effects(|comparison| {
+                build_replace_rows_from_attributes(
+                    &historical_attributes.attributes,
+                    historical_attributes.stored_attributes.as_ref(),
+                    &historical_attributes.nested_write_only,
+                    to,
+                    &comparison_attributes,
+                    replacement.changed_create_only,
+                    replacement.temporary_name,
+                    replacement.cascade_ref_hints,
+                    Some(schema),
+                    detail,
+                    explicit,
+                    comparison,
+                )
+            })
+        }
+    };
+    if let DetailComparisons::Planning(references) = comparisons {
+        append_dangling_reference_notes(
+            &mut rows,
+            references,
+            &to.id,
+            &rendered_changes.into_inner(),
+        );
+    }
+    Ok(rows)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_replace_rows_from_attributes<S>(
+fn build_replace_rows_from_attributes<S, D, R: ReferenceEquality>(
     previous_attributes: &HashMap<String, Value>,
     stored_attributes: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
-    to: &crate::resource::Resource<S>,
+    to: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     comparison_attributes: &CanonicalComparisonAttributes,
     changed_create_only: &[String],
     temporary_name: Option<&crate::effect::TemporaryName>,
@@ -1529,7 +1915,7 @@ fn build_replace_rows_from_attributes<S>(
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
     explicit: Option<&crate::explicit::ExplicitFields>,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
     let defs = schema
@@ -1549,22 +1935,26 @@ fn build_replace_rows_from_attributes<S>(
             crate::resource::UnschematizedComparisonAttributes::new(attributes),
         ),
     });
-    let projected = project_previous_attrs(
+    let masked = to.resolved_ignore_changes.mask_comparison_attributes(
+        comparison_attributes,
         &previous_attributes,
         stored_attributes.as_ref(),
-        comparison_attributes,
-        explicit,
         schema,
-        comparison,
     );
+    let fully_masked_attributes =
+        masked.fully_masked_attribute_count(comparison_attributes, &previous_attributes);
+    let comparison_attributes = masked.desired();
+    let previous_attributes = masked.current();
+    let projected = project_from_attrs(&masked, explicit, schema, comparison);
     let from_attrs_projected = projected.attributes();
+    let comparison = comparison.with_left_origins(&projected.origins);
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
     let attr_rows = build_attribute_diff_rows(
         to,
         comparison_attributes,
         AttributeDiffContext::for_replace(
-            &previous_attributes,
+            previous_attributes,
             from_attrs_projected,
             schema,
             defs,
@@ -1632,7 +2022,8 @@ fn build_replace_rows_from_attributes<S>(
             Some(&force_keys),
             schema,
             &comparison,
-        ) + attr_rows.effectively_unchanged;
+        ) + attr_rows.effectively_unchanged
+            + fully_masked_attributes;
         if unchanged_count > 0 {
             rows.push(DetailRow::HiddenUnchanged {
                 count: unchanged_count,
@@ -1643,13 +2034,13 @@ fn build_replace_rows_from_attributes<S>(
     rows
 }
 
-fn build_replace_removed_row(
+fn build_replace_removed_row<R: ReferenceEquality>(
     key: &str,
     old_value: Option<&Value>,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> DetailRow {
     let Some(old_value) = old_value else {
         return DetailRow::ReplaceRemoved {
@@ -1691,13 +2082,13 @@ fn build_replace_removed_row(
     }
 }
 
-fn build_removed_attr_row(
+fn build_removed_attr_row<R: ReferenceEquality>(
     key: &str,
     old_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> DetailRow {
     if let Some(row) = build_map_removed_row(key, old_value) {
         return row;
@@ -1817,7 +2208,7 @@ fn build_map_removed_row(key: &str, old_value: &Value) -> Option<DetailRow> {
 /// whose key is in the set receive the `# default_tags` annotation; `Removed`
 /// and nested entries never do.
 #[allow(clippy::too_many_arguments)]
-fn build_map_diff_row(
+fn build_map_diff_row<R: ReferenceEquality>(
     key: &str,
     old_value: Option<&Value>,
     new_value: &Value,
@@ -1827,7 +2218,7 @@ fn build_map_diff_row(
     forces_replacement: bool,
     default_tag_keys: Option<&DefaultTagKeys>,
     explicit: Option<&ProjectedAuthoring>,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> Option<DetailRow> {
     let mut entries = compute_map_diff_entries_with_explicit(
         old_value, new_value, attr_type, defs, detail, explicit, comparison,
@@ -1855,27 +2246,27 @@ fn build_map_diff_row(
 }
 
 #[cfg(test)]
-fn compute_map_diff_entries(
+fn compute_map_diff_entries<R: ReferenceEquality>(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> Vec<MapDiffEntryIR> {
     compute_map_diff_entries_with_explicit(
         old_value, new_value, attr_type, defs, detail, None, comparison,
     )
 }
 
-fn compute_map_diff_entries_with_explicit(
+fn compute_map_diff_entries_with_explicit<R: ReferenceEquality>(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
     explicit: Option<&ProjectedAuthoring>,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> Vec<MapDiffEntryIR> {
     let new_map = match new_value {
         Value::Concrete(ConcreteValue::Map(m)) => m,
@@ -1904,6 +2295,8 @@ fn compute_map_diff_entries_with_explicit(
     for item in diff.iter_by_key() {
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
+                let paths = comparison.entry_paths(&e.key, attr_type, defs);
+                let comparison = comparison.at_paths(&paths);
                 let entry_type = map_entry_subtype(attr_type, &e.key, defs);
                 let entry_explicit = explicit_child(explicit, &e.key);
                 // Site 5 (carina#3073): `compute_map_diff` flagged this
@@ -1926,6 +2319,12 @@ fn compute_map_diff_entries_with_explicit(
                     continue;
                 }
                 if is_whole_value(entry_explicit) && is_list_of_maps(&e.new_value) {
+                    comparison.rendered_change(
+                        Some(&e.old_value),
+                        Some(&e.new_value),
+                        entry_type,
+                        defs,
+                    );
                     entries.push(MapDiffEntryIR::Changed {
                         key: RenderedKey::from_raw(&e.key),
                         old: render_value(&e.old_value),
@@ -1985,6 +2384,13 @@ fn compute_map_diff_entries_with_explicit(
                     compute_string_list_change(Some(&e.old_value), &e.new_value, entry_type, defs)
                 {
                     // #3234: see MapDiffEntryIR::StringListChanged docs.
+                    diff.record_rows(
+                        Some(&e.old_value),
+                        &e.new_value,
+                        entry_type,
+                        defs,
+                        &comparison,
+                    );
                     entries.push(MapDiffEntryIR::StringListChanged {
                         key: RenderedKey::from_raw(&e.key),
                         unchanged: diff.unchanged,
@@ -2006,6 +2412,12 @@ fn compute_map_diff_entries_with_explicit(
                     {
                         continue;
                     }
+                    comparison.rendered_change(
+                        Some(&e.old_value),
+                        Some(&e.new_value),
+                        entry_type,
+                        defs,
+                    );
                     entries.push(MapDiffEntryIR::Changed {
                         key: RenderedKey::from_raw(&e.key),
                         old: old_s,
@@ -2015,6 +2427,13 @@ fn compute_map_diff_entries_with_explicit(
                 }
             }
             crate::diff_helpers::MapDiffItem::Added(e) => {
+                let paths = comparison.entry_paths(&e.key, attr_type, defs);
+                comparison.at_paths(&paths).rendered_change(
+                    None,
+                    Some(&e.value),
+                    map_entry_subtype(attr_type, &e.key, defs),
+                    defs,
+                );
                 entries.push(MapDiffEntryIR::Added {
                     key: RenderedKey::from_raw(&e.key),
                     value: render_value(&e.value),
@@ -2022,6 +2441,13 @@ fn compute_map_diff_entries_with_explicit(
                 });
             }
             crate::diff_helpers::MapDiffItem::Removed(e) => {
+                let paths = comparison.entry_paths(&e.key, attr_type, defs);
+                comparison.at_paths(&paths).rendered_change(
+                    Some(&e.value),
+                    None,
+                    map_entry_subtype(attr_type, &e.key, defs),
+                    defs,
+                );
                 entries.push(MapDiffEntryIR::Removed {
                     key: RenderedKey::from_raw(&e.key),
                     value: render_value(&e.value),
@@ -2039,12 +2465,12 @@ fn compute_map_diff_entries_with_explicit(
 /// dropped (#2886) — semantically the attribute has no diff to show, so
 /// the caller should treat it as effectively unchanged and let it roll
 /// into the top-level `# (n unchanged attributes hidden)` summary.
-fn build_list_of_maps_diff_row(
+fn build_list_of_maps_diff_row<R: ReferenceEquality>(
     key: &str,
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
-    ctx: &AttributeDiffContext<'_>,
+    ctx: &AttributeDiffContext<'_, R>,
     forces_replacement: bool,
 ) -> Option<DetailRow> {
     let (unchanged, modified, added, removed) = compute_list_of_maps_diff_parts_with_explicit(
@@ -2064,13 +2490,13 @@ fn build_list_of_maps_diff_row(
     ))
 }
 
-fn compute_list_of_maps_diff_parts(
+fn compute_list_of_maps_diff_parts<R: ReferenceEquality>(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> (
     Vec<RenderedValue>,
     Vec<ListOfMapsDiffModified>,
@@ -2082,14 +2508,14 @@ fn compute_list_of_maps_diff_parts(
     )
 }
 
-fn compute_list_of_maps_diff_parts_with_explicit(
+fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
     explicit: Option<&ProjectedAuthoring>,
-    comparison: ComparisonContext<'_>,
+    comparison: ComparisonContext<'_, R>,
 ) -> (
     Vec<RenderedValue>,
     Vec<ListOfMapsDiffModified>,
@@ -2110,17 +2536,27 @@ fn compute_list_of_maps_diff_parts_with_explicit(
     // and already-at-element call sites cannot drift.
     let item_type = list_element_type(attr_type, defs);
 
-    let mut old_matched = vec![false; old_items.len()];
-    let mut new_matched = vec![false; new_items.len()];
+    let (exact, mut old_matched) =
+        crate::resource::match_equal_concrete_items(new_items, old_items);
+    let mut new_matched = exact.iter().map(Option::is_some).collect::<Vec<_>>();
 
     // Phase 1: Find exact matches. Site 3 (carina#3073): schema-aware
     // so two statements differing only by enum spelling
     // (`effect: allow` vs `Allow`) match as identical instead of
     // being reported as removed+added.
     for (ni, new_item) in new_items.iter().enumerate() {
+        if new_matched[ni] {
+            continue;
+        }
         for (oi, old_item) in old_items.iter().enumerate() {
             if !old_matched[oi]
-                && schema_aware_equal(old_item, new_item, item_type, defs, &comparison)
+                && schema_aware_equal(
+                    old_item,
+                    new_item,
+                    item_type,
+                    defs,
+                    &comparison.at_paths(&comparison.index_paths(oi, ni)),
+                )
             {
                 old_matched[oi] = true;
                 new_matched[ni] = true;
@@ -2161,7 +2597,9 @@ fn compute_list_of_maps_diff_parts_with_explicit(
         &unmatched_old_items,
         item_type,
         defs,
-        &comparison,
+        &comparison
+            .swapped()
+            .with_indices(&[unmatched_new.clone(), unmatched_old.clone()]),
     )
     .into_iter()
     .enumerate()
@@ -2201,12 +2639,16 @@ fn compute_list_of_maps_diff_parts_with_explicit(
             Value::Concrete(ConcreteValue::Map(new_map)),
         ) = (&old_items[oi], &new_items[ni])
         {
+            let paths = comparison.index_paths(oi, ni);
+            let comparison = comparison.at_paths(&paths);
             let element_explicit = explicit_list_element(explicit, oi);
             let mut keys: Vec<_> = new_map.keys().collect();
             keys.sort();
             let mut fields: Vec<ListOfMapsDiffField> = Vec::new();
             let mut unchanged_count: usize = 0;
             for k in keys {
+                let paths = comparison.entry_paths(k, item_type, defs);
+                let comparison = comparison.at_paths(&paths);
                 let field_explicit = explicit_child(element_explicit, k);
                 // Site 4 (carina#3073): resolve the struct field's
                 // type so an enum-equal field (`effect: allow` vs
@@ -2256,6 +2698,7 @@ fn compute_list_of_maps_diff_parts_with_explicit(
                         entries: nested,
                     });
                 } else if is_whole_value(field_explicit) && is_list_of_maps(&new_map[k]) {
+                    comparison.rendered_change(old_val, Some(&new_map[k]), field_type, defs);
                     fields.push(ListOfMapsDiffField::Changed {
                         key: RenderedKey::from_raw(k),
                         old: old_val
@@ -2266,6 +2709,7 @@ fn compute_list_of_maps_diff_parts_with_explicit(
                 } else if let Some(diff) =
                     compute_string_list_change(old_val, &new_map[k], field_type, defs)
                 {
+                    diff.record_rows(old_val, &new_map[k], field_type, defs, &comparison);
                     fields.push(ListOfMapsDiffField::StringListChanged {
                         key: RenderedKey::from_raw(k),
                         unchanged: diff.unchanged,
@@ -2290,6 +2734,7 @@ fn compute_list_of_maps_diff_parts_with_explicit(
                         unchanged_count += 1;
                         continue;
                     }
+                    comparison.rendered_change(old_val, Some(&new_map[k]), field_type, defs);
                     fields.push(ListOfMapsDiffField::Changed {
                         key: RenderedKey::from_raw(k),
                         old: old_v,
@@ -2321,6 +2766,16 @@ fn compute_list_of_maps_diff_parts_with_explicit(
         }
     }
 
+    for &index in &added_indices {
+        comparison
+            .at_paths(&comparison.index_paths(index, index))
+            .rendered_change(None, Some(&new_items[index]), item_type, defs);
+    }
+    for &index in &removed_indices {
+        comparison
+            .at_paths(&comparison.index_paths(index, index))
+            .rendered_change(Some(&old_items[index]), None, item_type, defs);
+    }
     let added = collect_added_removed_items(&added_indices, new_items);
     let removed = collect_added_removed_items(&removed_indices, old_items);
 
@@ -2404,7 +2859,7 @@ fn compute_string_list_change(
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> Option<crate::diff_helpers::StringListDiff<RenderedValue>> {
+) -> Option<StringListChange> {
     let enum_context = attr_type
         .and_then(|attr_type| string_list_inner_type(attr_type, defs))
         .and_then(AttributeType::enum_parts)
@@ -2413,11 +2868,17 @@ fn compute_string_list_change(
             dsl_map,
         });
 
-    let new_list = project_string_list_diff_elements(new_value, enum_context.as_ref())?;
+    let new_list = project_string_list_diff_elements(new_value, enum_context.as_ref())?
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
     let old_list = match old_value {
         Some(old_value) => project_string_list_diff_elements(old_value, enum_context.as_ref())?,
         None => Vec::new(),
-    };
+    }
+    .into_iter()
+    .enumerate()
+    .collect::<Vec<_>>();
     // carina#3075: when the element type is a `Enum`, the set-diff
     // must compare enum *values*, not raw spellings — otherwise a
     // DSL-alias element (`allow`) vs its API-canonical form (`Allow`) is
@@ -2430,19 +2891,62 @@ fn compute_string_list_change(
     let diff = crate::diff_helpers::compute_string_list_diff_by(
         &old_list,
         &new_list,
-        |left, right| {
+        |(_, left), (_, right)| {
             if enum_typed {
                 crate::resource::enum_values_equal(&left.comparison_key, &right.comparison_key)
             } else {
                 left.comparison_key == right.comparison_key
             }
         },
-        |element| element.display.clone(),
+        |(index, element)| (*index, element.display.clone()),
     );
     if diff.added.is_empty() && diff.removed.is_empty() {
         return None;
     }
-    Some(diff)
+    let (added_indices, added) = diff.added.into_iter().unzip();
+    let (removed_indices, removed) = diff.removed.into_iter().unzip();
+    Some(StringListChange {
+        unchanged: diff.unchanged.into_iter().map(|(_, value)| value).collect(),
+        added,
+        removed,
+        added_indices,
+        removed_indices,
+    })
+}
+
+struct StringListChange {
+    unchanged: Vec<RenderedValue>,
+    added: Vec<RenderedValue>,
+    removed: Vec<RenderedValue>,
+    added_indices: Vec<usize>,
+    removed_indices: Vec<usize>,
+}
+
+impl StringListChange {
+    fn record_rows<R: ReferenceEquality>(
+        &self,
+        old: Option<&Value>,
+        new: &Value,
+        ty: Option<&AttributeType>,
+        defs: &std::collections::BTreeMap<String, AttributeType>,
+        context: &ComparisonContext<'_, R>,
+    ) {
+        let element = list_element_type(ty, defs);
+        if let Some(items) = crate::resource::comparison_list_items(new) {
+            for &index in &self.added_indices {
+                context
+                    .at_paths(&context.index_paths(index, index))
+                    .rendered_change(None, Some(&items[index]), element, defs);
+            }
+        }
+        if let Some(items) = old.and_then(crate::resource::comparison_list_items) {
+            for &index in &self.removed_indices {
+                context
+                    .at_paths(&context.index_paths(index, index))
+                    .rendered_change(Some(&items[index]), None, element, defs);
+            }
+        }
+    }
 }
 
 struct StringListDiffElement {
@@ -2540,7 +3044,8 @@ fn string_list_inner_type<'a>(
                 .iter()
                 .flatten()
                 .find_map(|member| on_path(member.as_attr(), defs, visited)),
-            crate::schema::Shape::String { .. }
+            crate::schema::Shape::Reference { .. }
+            | crate::schema::Shape::String { .. }
             | crate::schema::Shape::Int { .. }
             | crate::schema::Shape::Float { .. }
             | crate::schema::Shape::Bool
@@ -2571,16 +3076,22 @@ mod tests {
         ExpandedConcreteValue as ConcreteValue, ExpandedResource as Resource,
         ExpandedValue as Value, ResolvedResource, ResourceId, State,
     };
-    use std::collections::HashSet;
 
-    fn build_replace_detail_rows_from_display<S>(
+    #[allow(clippy::too_many_arguments)]
+    fn build_replace_detail_rows_from_display<S, D>(
         plan: &Plan<S>,
-        to: &crate::resource::Resource<S>,
+        to: &crate::resource::Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
         replacement: ReplaceDisplayInfo<'_>,
         historical_display: &HistoricalDisplayAttributes,
         registry: Option<&SchemaRegistry>,
         detail: DetailLevel,
         explicit: Option<&ExplicitFields>,
+        comparisons: DetailComparisons<'_>,
     ) -> Vec<DetailRow> {
         let base_registry = registry.cloned().unwrap_or_default();
         let (registry, provider) =
@@ -2594,6 +3105,7 @@ mod tests {
             detail,
             explicit,
             &provider,
+            comparisons,
         )
         .expect("test replacement display must resolve its comparison")
     }
@@ -2605,14 +3117,22 @@ mod tests {
         defs: &std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
     ) -> Vec<MapDiffEntryIR> {
-        super::compute_map_diff_entries(
-            old_value,
-            new_value,
-            attr_type,
-            defs,
-            detail,
-            crate::differ::exact_comparison_context_for_tests(),
-        )
+        crate::differ::exact_comparison_schema_for_tests()
+            .with_references(
+                &crate::references::prepare_empty_for_tests(),
+                &ResourceId::with_identity("test.Resource", "example"),
+                |comparison| {
+                    super::compute_map_diff_entries(
+                        old_value,
+                        new_value,
+                        attr_type,
+                        defs,
+                        detail,
+                        *comparison,
+                    )
+                },
+            )
+            .unwrap()
     }
 
     fn compute_list_of_maps_diff_parts(
@@ -2627,18 +3147,26 @@ mod tests {
         Vec<ListOfMapsDiffItem>,
         Vec<ListOfMapsDiffItem>,
     ) {
-        super::compute_list_of_maps_diff_parts(
-            old_value,
-            new_value,
-            attr_type,
-            defs,
-            detail,
-            crate::differ::exact_comparison_context_for_tests(),
-        )
+        crate::differ::exact_comparison_schema_for_tests()
+            .with_references(
+                &crate::references::prepare_empty_for_tests(),
+                &ResourceId::with_identity("test.Resource", "example"),
+                |comparison| {
+                    super::compute_list_of_maps_diff_parts(
+                        old_value,
+                        new_value,
+                        attr_type,
+                        defs,
+                        detail,
+                        *comparison,
+                    )
+                },
+            )
+            .unwrap()
     }
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::new(resource.with_dependency_phase(()))
     }
 
     fn rendered_key(key: &str) -> RenderedKey {
@@ -2689,8 +3217,263 @@ mod tests {
             &historical_attributes,
             prev_explicit,
             &provider,
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         )
         .expect("test detail display must resolve its comparison")
+    }
+
+    #[test]
+    fn round2_saved_plan_update_preserves_nested_explicit_aware_rows() {
+        let text = |s: &str| Value::Concrete(ConcreteValue::String(s.into()));
+        let map = |items: &[(&str, &str)]| {
+            Value::Concrete(ConcreteValue::Map(
+                items
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), text(v)))
+                    .collect(),
+            ))
+        };
+        let schema = PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "config",
+                    PatternAttributeType::struct_(
+                        "Settings",
+                        vec![
+                            PatternStructField::optional("mode", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::optional(
+                                "server_default",
+                                PatternAttributeType::string(),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut registry = SchemaRegistry::new();
+        registry.insert("test", schema);
+        let to = Resource::with_provider("test", "test.Widget", "example", None)
+            .with_attribute("tags", map(&[("env", "prod"), ("stable", "same")]))
+            .with_attribute("config", map(&[("mode", "new")]));
+        let from = State::existing(
+            to.id.clone(),
+            HashMap::from([
+                ("tags".into(), map(&[("env", "dev"), ("stable", "same")])),
+                (
+                    "config".into(),
+                    map(&[("mode", "old"), ("server_default", "hidden")]),
+                ),
+            ]),
+        );
+        let explicit = ExplicitFields::Struct {
+            children: HashMap::from([
+                (
+                    "tags".into(),
+                    ExplicitFields::Struct {
+                        children: HashMap::from([
+                            ("env".into(), ExplicitFields::Leaf),
+                            ("stable".into(), ExplicitFields::Leaf),
+                        ]),
+                    },
+                ),
+                (
+                    "config".into(),
+                    ExplicitFields::Struct {
+                        children: HashMap::from([("mode".into(), ExplicitFields::Leaf)]),
+                    },
+                ),
+            ]),
+        };
+        let explicit = HashMap::from([(to.id.clone(), explicit)]);
+        let effect = Effect::Update {
+            from: Box::new(from),
+            identifier: crate::effect::fixture_applied_identifier("example"),
+            to: resolved(to.clone()),
+            changed_attributes: vec!["config".into(), "tags".into()],
+        };
+        let expected = build_detail_rows(
+            &effect,
+            Some(&registry),
+            DetailLevel::Full,
+            None,
+            Some(&explicit),
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|row| matches!(row, DetailRow::MapDiff { .. }))
+        );
+        let mut plan = Plan::new();
+        plan.add(effect);
+        let wire = serde_json::to_vec(&SavedPlan::from(plan)).unwrap();
+        let saved: UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
+        let saved = saved.resolve_with_schemas(&registry).unwrap();
+        let mut historical = HistoricalDisplayAttributes::for_plan(&saved);
+        let update = historical.updates.get_mut(&to.id).unwrap();
+        update.stored_attributes = Some(update.attributes.clone());
+        let (schemas, provider) = crate::provider::comparison_fixture_for_test(&registry, [&to.id]);
+        let actual = build_detail_rows_by_instance(
+            &saved.effects()[0],
+            Some(&schemas),
+            DetailLevel::Full,
+            &historical,
+            Some(&explicit),
+            &provider,
+            DetailComparisons::RecordedEffects,
+        )
+        .unwrap();
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        assert!(!format!("{actual:?}").contains("server_default"));
+    }
+
+    #[test]
+    fn saved_plan_reference_update_uses_recorded_changed_attributes_without_witness() {
+        let string = |s: &str| Value::Concrete(ConcreteValue::String(s.into()));
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "test",
+            crate::schema::ResourceSchema::new("keys.Resource")
+                .attribute(
+                    crate::schema::AttributeSchema::optional(
+                        "key",
+                        PatternAttributeType::reference(
+                            crate::schema::TypeIdentity::new(
+                                Some("test"),
+                                ["keys", "Key"],
+                                "Reference",
+                            ),
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    crate::schema::AttributeSchema::optional(
+                        "name",
+                        PatternAttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let to = Resource::with_provider("test", "keys.Resource", "example", None)
+            .with_attribute("key", string("alias/new"))
+            .with_attribute("name", string("new"));
+        let from = State {
+            id: to.id.clone(),
+            identifier: Some("resource-123".into()),
+            attributes: HashMap::from([
+                ("key".into(), string("canonical/old")),
+                ("name".into(), string("old")),
+            ]),
+            exists: true,
+            dependency_bindings: Default::default(),
+            partial_read: None,
+        };
+        for changed in [vec!["name".to_string()], vec!["key".to_string()]] {
+            let effect = Effect::Update {
+                identifier: crate::provider::AppliedIdentifier::new("resource-123").unwrap(),
+                from: Box::new(from.clone()),
+                to: resolved(to.clone()),
+                changed_attributes: changed.clone(),
+            };
+            let mut plan = Plan::new();
+            plan.add(effect.clone());
+            let wire = serde_json::to_vec(&SavedPlan::from(plan)).unwrap();
+            let unresolved: UnresolvedSavedPlan = serde_json::from_slice(&wire).unwrap();
+            let saved_plan = unresolved.resolve_with_schemas(&registry).unwrap();
+            let historical = HistoricalDisplayAttributes::for_plan(&saved_plan);
+            let (schemas, provider) =
+                crate::provider::comparison_fixture_for_test(&registry, [&to.id]);
+            let rows = build_detail_rows_by_instance(
+                &saved_plan.effects()[0],
+                Some(&schemas),
+                DetailLevel::Explicit,
+                &historical,
+                None,
+                &provider,
+                DetailComparisons::RecordedEffects,
+            )
+            .unwrap();
+            let rendered = format!("{rows:?}");
+            assert_eq!(
+                rendered.contains("alias/new"),
+                changed.contains(&"key".to_string()),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_replacement_retains_cascade_hints_payload_and_temporary_name() {
+        let to = Resource::new("test.Widget", "example")
+            .with_attribute(
+                "key",
+                Value::Concrete(ConcreteValue::String("alias/live".into())),
+            )
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("example-temp".into())),
+            );
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(to.clone())));
+        plan.add(Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(to.id.clone()),
+            identifier: crate::effect::fixture_applied_identifier("old-widget"),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        });
+        plan.replace_display_mut().push(ReplaceDisplayMetadata {
+            create_idx: 0,
+            delete_idx: 1,
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::try_from(vec!["key".to_string()]).unwrap(),
+            cascade_ref_hints: vec![("key".into(), "(known after apply)".into())],
+            temporary_name: Some(crate::effect::TemporaryName {
+                attribute: "name".into(),
+                original_value: "example".into(),
+                temporary_value: "example-temp".into(),
+                can_rename: true,
+            }),
+            previous_attributes: HashMap::from([(
+                "key".into(),
+                Value::Concrete(ConcreteValue::String("key/old".into())),
+            )]),
+        });
+        let rows = build_replace_detail_rows_from_display(
+            &plan,
+            &to,
+            plan.replace_display_info().next().unwrap(),
+            &HistoricalDisplayAttributes::for_plan(&plan),
+            None,
+            DetailLevel::Full,
+            None,
+            DetailComparisons::RecordedEffects,
+        );
+        assert!(rows.iter().any(|row| matches!(row, DetailRow::TemporaryNameNote { attribute, .. } if attribute == "name")), "{rows:?}");
+        assert!(rows.iter().any(|row| matches!(row, DetailRow::ReplaceCascade { key, new, .. } if key == "key" && new.plain() == "(known after apply)")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, DetailRow::Changed { key, new, .. } if key == "name" && new.plain() == "'example-temp'")),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -2714,7 +3497,7 @@ mod tests {
         let desired = Resource::new("test.Widget", "example")
             .with_attribute("password", secret("new-secret"));
         let id = desired.id.clone();
-        let to = ResolvedResource::resolve_with_schemas(desired.clone(), &registry)
+        let to = ResolvedResource::resolve_raw_fixture(desired.clone(), &registry)
             .expect("desired fixture resolves with its schema");
         let from = State::existing(
             id.clone(),
@@ -2769,6 +3552,7 @@ mod tests {
             &historical,
             None,
             &provider,
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         )
         .expect("rehydrated update rows render");
         assert!(rows.iter().any(|row| matches!(
@@ -2793,20 +3577,28 @@ mod tests {
         let comparison_attributes = CanonicalComparisonAttributes::from_unschematized(
             crate::resource::UnschematizedComparisonAttributes::new(to.resolved_attributes()),
         );
-        build_replace_rows_from_attributes(
-            &from.attributes,
-            Some(&from.attributes),
-            &NestedWriteOnlyRecord::new(),
-            &to,
-            &comparison_attributes,
-            &changed_create_only,
-            None,
-            &cascade_ref_hints,
-            None,
-            detail,
-            prev_explicit.and_then(|map| map.get(&id)),
-            crate::differ::exact_comparison_context_for_tests(),
-        )
+        crate::differ::exact_comparison_schema_for_tests()
+            .with_references(
+                &crate::references::prepare_empty_for_tests(),
+                &id,
+                |comparison| {
+                    build_replace_rows_from_attributes(
+                        &from.attributes,
+                        Some(&from.attributes),
+                        &NestedWriteOnlyRecord::new(),
+                        &to,
+                        &comparison_attributes,
+                        &changed_create_only,
+                        None,
+                        &cascade_ref_hints,
+                        None,
+                        detail,
+                        prev_explicit.and_then(|map| map.get(&id)),
+                        *comparison,
+                    )
+                },
+            )
+            .unwrap()
     }
 
     fn empty_struct_comparison_registry() -> SchemaRegistry {
@@ -2976,7 +3768,7 @@ mod tests {
             crate::resource::ParsedIgnorePathSegment::Attribute("config".to_string()),
             crate::resource::ParsedIgnorePathSegment::Attribute("label".to_string()),
         ])];
-        let to = ResolvedResource::resolve_with_schemas(to, &registry)
+        let to = ResolvedResource::resolve_raw_fixture(to, &registry)
             .expect("ignore_changes path must resolve");
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier("widget-id"),
@@ -3122,6 +3914,7 @@ mod tests {
             &historical,
             Some(&explicit),
             &provider,
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         )
         .expect("detail display must resolve its comparison");
 
@@ -3548,9 +4341,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -3581,6 +4374,7 @@ mod tests {
             None,
             DetailLevel::Explicit,
             None,
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         );
         let entries = rows
             .iter()
@@ -3763,9 +4557,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
@@ -3791,9 +4585,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
 
         let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
@@ -3865,9 +4659,9 @@ mod tests {
             generation: EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -3890,6 +4684,7 @@ mod tests {
             None,
             DetailLevel::Explicit,
             None,
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         );
 
         assert_eq!(
@@ -3919,9 +4714,9 @@ mod tests {
             generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
             directives: Default::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
@@ -3970,6 +4765,7 @@ mod tests {
             None,
             DetailLevel::Explicit,
             None,
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         );
         let rendered = format!("{rows:?}");
         assert!(
@@ -4518,9 +5314,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut tags = IndexMap::new();
         tags.insert(
@@ -4566,9 +5362,9 @@ mod tests {
             generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
-            dependencies: HashSet::new(),
-            explicit_dependencies: std::collections::HashSet::new(),
-            blocked_by_updates: HashSet::new(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         };
         let mut entry = IndexMap::new();
         entry.insert(
@@ -5509,6 +6305,7 @@ mod tests {
             &historical,
             None,
             &provider,
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         )
         .expect("reference-form display must resolve through the provider router");
 
@@ -5547,6 +6344,7 @@ mod tests {
             &historical,
             None,
             &ProviderRouter::new(),
+            DetailComparisons::Planning(&crate::references::prepare_empty_for_tests()),
         )
         .expect_err("an update without a schema/comparison must fail");
 

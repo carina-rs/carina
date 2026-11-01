@@ -54,7 +54,7 @@
 //! let _ = AttributeSchema::provider_populated("value", AttributeType::string()).create_only();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use carina_core::schema::{AttributeSchema, AttributeType};
 //! let _ = AttributeSchema::optional("value", AttributeType::string()).identity();
 //! ```
@@ -124,12 +124,12 @@
 //! let _ = StructField::optional("value", AttributeType::string()).identity();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use carina_core::schema::{AttributeType, StructField};
 //! let _ = StructField::provider_populated("value", AttributeType::string()).create_only();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use carina_core::schema::{AttributeType, StructField};
 //! let _ = StructField::provider_populated("value", AttributeType::string()).identity();
 //! ```
@@ -225,8 +225,38 @@ mod type_identity;
 
 pub use assignability::{TypeAssignability, TypeAssignmentDeferral};
 pub use carina_provider_protocol::types::{
-    DslTransform, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
+    DslTransform, ListElements, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
+
+/// Count and element policies enforced together when walking a list.
+///
+/// Elements containing secrets or diagnostic-sensitive strings are skipped for
+/// uniqueness, like unresolved elements, to avoid revealing equality. The
+/// same applies when a secret encloses the list. Provider output and persisted
+/// state skip uniqueness as well; length constraints always apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListConstraints {
+    length: Option<(Option<u64>, Option<u64>)>,
+    elements: ListElements,
+}
+
+impl ListConstraints {
+    pub(crate) const fn new(
+        length: Option<(Option<u64>, Option<u64>)>,
+        elements: ListElements,
+    ) -> Self {
+        Self { length, elements }
+    }
+
+    pub const fn length(self) -> Option<(Option<u64>, Option<u64>)> {
+        self.length
+    }
+
+    pub const fn elements(self) -> ListElements {
+        self.elements
+    }
+}
+
 /// Per-resource operational configuration for provider timeouts and retries.
 pub use carina_provider_protocol::{OperationConfig, ReadBackBudget, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
@@ -560,6 +590,13 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
         AttrTypeKind::UnloadedSchemaType(_) => errors.push(TypeError::from(
             crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
         )),
+        // Reference leaves have portable offline constraints and no custom
+        // validator callback. Their identity selects only the plan resolver.
+        AttrTypeKind::Reference {
+            identity: _,
+            pattern: _,
+            length: _,
+        } => {}
         AttrTypeKind::String { binding, .. }
         | AttrTypeKind::Int { binding, .. }
         | AttrTypeKind::Float { binding, .. } => {
@@ -913,7 +950,7 @@ impl IdentityMode {
 ///
 /// Only an optional create-only field exposes when-present identity:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::schema::{AttributeType, StructField};
 /// let _ = StructField::required("value", AttributeType::string())
 ///     .create_only()
@@ -1108,20 +1145,23 @@ impl<R: PatternForm> PatternStructField<R> {
     }
 }
 
-/// An internal cursor describing the mode inherited by fields of the current
-/// type. Keeping ancestry in a type forces every schema/value walker to choose
-/// a concrete reference path before consulting field mode or block aliases.
+/// An internal cursor describing inherited field mode and secret sensitivity.
+/// Keeping ancestry in a type forces every schema/value walker to choose a
+/// concrete reference path before consulting field mode or block aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FieldAncestry {
     provider_populated: bool,
+    in_secret: bool,
 }
 
 impl FieldAncestry {
     pub(crate) const WRITABLE: Self = Self {
         provider_populated: false,
+        in_secret: false,
     };
     pub(crate) const PROVIDER_POPULATED: Self = Self {
         provider_populated: true,
+        in_secret: false,
     };
 
     pub(crate) fn from_input_mode(mode: InputMode) -> Self {
@@ -1147,7 +1187,17 @@ impl FieldAncestry {
     }
 
     pub(crate) fn descend(self, field: &CompiledStructField) -> Self {
-        Self::from_input_mode(self.effective_input_mode(field))
+        Self {
+            in_secret: self.in_secret,
+            ..Self::from_input_mode(self.effective_input_mode(field))
+        }
+    }
+
+    fn inside_secret(self) -> Self {
+        Self {
+            in_secret: true,
+            ..self
+        }
     }
 }
 
@@ -1375,7 +1425,7 @@ pub struct PatternAttributeType<R: PatternForm = Draft> {
 ///
 /// Drafts cannot enter a value-validation API:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::resource::EnumValueResolver;
 /// use carina_core::schema::{AttributeType, ResourceSchema, TypeIdentity};
 /// let draft = AttributeType::enum_(
@@ -1438,6 +1488,12 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     /// Directional identity checks remain decidable; scalar-dependent checks
     /// explicitly defer with `ProvidersNotLoaded`.
     UnloadedSchemaType(crate::parser::UnloadedSchemaType),
+    /// A string-valued reference resolved only for comparison by its schema owner.
+    Reference {
+        identity: TypeIdentity,
+        pattern: Option<R::Pattern>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    },
     /// String
     String {
         binding: RefinementBinding,
@@ -1447,9 +1503,9 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     },
     /// A resource handle used only by the schema-level boundary relation.
     ///
-    /// Handles are string-backed until #3803's transport work lands, but they
-    /// retain the declared resource path so assignability can reject a handle
-    /// flowing into a scalar or a different resource type.
+    /// This is a structural capability, not a provider value. It is
+    /// assignable only to the same resource-handle type and cannot validate a
+    /// concrete scalar.
     ResourceHandle {
         provider: String,
         resource_type: String,
@@ -1501,7 +1557,7 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     List {
         element_type: Box<PatternAttributeType<R>>,
         ordered: bool,
-        length: Option<(Option<u64>, Option<u64>)>,
+        constraints: ListConstraints,
     },
     /// Map with typed keys and values.
     /// `key`: type constraint for map keys (e.g., `String` for unconstrained,
@@ -1555,6 +1611,12 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
 pub enum Shape<'a, R: PatternForm = Draft> {
     /// Nominal evidence whose scalar kind requires provider schemas.
     UnloadedSchemaType(&'a crate::parser::UnloadedSchemaType),
+    /// String-valued reference with mandatory resolver identity.
+    Reference {
+        identity: &'a TypeIdentity,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1592,7 +1654,7 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     List {
         element_type: &'a PatternAttributeType<R>,
         ordered: bool,
-        length: Option<(Option<u64>, Option<u64>)>,
+        constraints: ListConstraints,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -1641,6 +1703,16 @@ impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
             Shape::UnloadedSchemaType(unloaded) => f
                 .debug_tuple("Shape::UnloadedSchemaType")
                 .field(unloaded)
+                .finish(),
+            Shape::Reference {
+                identity,
+                pattern,
+                length,
+            } => f
+                .debug_struct("Shape::Reference")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
                 .finish(),
             Shape::String {
                 identity,
@@ -1691,12 +1763,12 @@ impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
             Shape::List {
                 element_type,
                 ordered,
-                length,
+                constraints,
             } => f
                 .debug_struct("Shape::List")
                 .field("element_type", element_type)
                 .field("ordered", ordered)
-                .field("length", length)
+                .field("constraints", constraints)
                 .finish_non_exhaustive(),
             Shape::Map { key, value } => f
                 .debug_struct("Shape::Map")
@@ -1733,6 +1805,12 @@ impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
 pub enum RawShape<'a, R: PatternForm = Draft> {
     /// Boundary-only nominal evidence without a loaded scalar declaration.
     UnloadedSchemaType(&'a crate::parser::UnloadedSchemaType),
+    /// String-valued reference with mandatory resolver identity.
+    Reference {
+        identity: &'a TypeIdentity,
+        pattern: Option<&'a str>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1770,7 +1848,7 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     List {
         element_type: &'a PatternAttributeType<R>,
         ordered: bool,
-        length: Option<(Option<u64>, Option<u64>)>,
+        constraints: ListConstraints,
     },
     /// Map with typed key/value — see [`AttrTypeKind::Map`].
     Map {
@@ -1797,6 +1875,16 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
             RawShape::UnloadedSchemaType(unloaded) => f
                 .debug_tuple("RawShape::UnloadedSchemaType")
                 .field(unloaded)
+                .finish(),
+            RawShape::Reference {
+                identity,
+                pattern,
+                length,
+            } => f
+                .debug_struct("RawShape::Reference")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
                 .finish(),
             RawShape::String {
                 identity,
@@ -1847,12 +1935,12 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
             RawShape::List {
                 element_type,
                 ordered,
-                length,
+                constraints,
             } => f
                 .debug_struct("RawShape::List")
                 .field("element_type", element_type)
                 .field("ordered", ordered)
-                .field("length", length)
+                .field("constraints", constraints)
                 .finish_non_exhaustive(),
             RawShape::Map { key, value } => f
                 .debug_struct("RawShape::Map")
@@ -2271,7 +2359,7 @@ impl Schema {
                 defs,
                 path,
                 inner,
-                ancestry,
+                ancestry.inside_secret(),
                 &mut secret_errors,
                 visited_refs,
             );
@@ -2406,11 +2494,17 @@ impl Schema {
             }
             AttrTypeKind::List {
                 element_type: inner,
-                length,
-                ..
+                constraints,
+                ordered: _ordered,
             } => {
                 let Some(items) = (match concrete {
-                    ConcreteValueRef::List(items) => Some(items),
+                    ConcreteValueRef::List(items) => Some(Cow::Borrowed(items)),
+                    ConcreteValueRef::StringList(items) => Some(Cow::Owned(
+                        items
+                            .iter()
+                            .map(|item| Value::Concrete(ConcreteValue::String(item.clone())))
+                            .collect::<Vec<_>>(),
+                    )),
                     _ => None,
                 }) else {
                     out.push((
@@ -2422,9 +2516,26 @@ impl Schema {
                     ));
                     return;
                 };
-                if let Err(error) = validate_list_length(*length, items.len()) {
-                    out.push((path.clone(), error));
-                    return;
+                for result in constraints.check(
+                    items.iter(),
+                    defs,
+                    ancestry,
+                    CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                    |item| {
+                        fit_value_to_type_on_path(
+                            inner,
+                            item,
+                            defs,
+                            ancestry,
+                            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                            &mut Vec::new(),
+                        )
+                    },
+                ) {
+                    if let Err(ListConstraintError { index, error }) = result {
+                        let error_path = index.map_or_else(|| path.clone(), |i| path.push_index(i));
+                        out.push((error_path, *error));
+                    }
                 }
                 for (i, item) in items.iter().enumerate() {
                     let next_path = path.push_index(i);
@@ -2616,8 +2727,14 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return validation_error_with_defs_on_path(attr, inner, defs, ancestry, visited_refs)
-            .map_err(TypeError::masked_for_secret);
+        return validation_error_with_defs_on_path(
+            attr,
+            inner,
+            defs,
+            ancestry.inside_secret(),
+            visited_refs,
+        )
+        .map_err(TypeError::masked_for_secret);
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
         validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)?;
@@ -2642,38 +2759,67 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
         }
         AttrTypeKind::List {
             element_type: inner,
-            length,
-            ordered: _,
+            constraints,
+            ordered: _ordered,
         } => {
-            if let Some(ConcreteValueRef::List(items)) = value.as_concrete() {
-                validate_list_length(*length, items.len())?;
-                for (i, item) in items.iter().enumerate() {
-                    if let Err(inner_err) =
-                        validate_attr_with_defs_and_ancestry(inner, item, defs, ancestry)
-                    {
-                        return Err(inner_err.at_list_index(i));
-                    }
+            let items: Cow<'_, [Value<P, B>]> = match value.as_concrete() {
+                Some(ConcreteValueRef::List(items)) => Cow::Borrowed(items),
+                Some(ConcreteValueRef::StringList(items)) => Cow::Owned(
+                    items
+                        .iter()
+                        .map(|item| Value::Concrete(ConcreteValue::String(item.clone())))
+                        .collect(),
+                ),
+                None => return Ok(()),
+                Some(_) => {
+                    return Err(TypeError::TypeMismatch {
+                        expected: attr.type_name(),
+                        got: value.type_name(),
+                    });
                 }
-                Ok(())
-            } else if let Some(ConcreteValueRef::StringList(items)) = value.as_concrete() {
-                validate_list_length(*length, items.len())?;
-                for (i, item) in items.iter().enumerate() {
-                    let item: Value<P, B> = Value::Concrete(ConcreteValue::String(item.clone()));
-                    if let Err(inner_err) =
-                        validate_attr_with_defs_and_ancestry(inner, &item, defs, ancestry)
-                    {
-                        return Err(inner_err.at_list_index(i));
+            };
+            for result in constraints.check(
+                items.iter(),
+                defs,
+                ancestry,
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                |item| {
+                    fit_value_to_type_on_path(
+                        inner,
+                        item,
+                        defs,
+                        ancestry,
+                        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                        &mut Vec::new(),
+                    )
+                },
+            ) {
+                let (i, fit) = result.map_err(|failure| {
+                    let error = *failure.error;
+                    match failure.index {
+                        Some(_)
+                            if matches!(
+                                error,
+                                TypeError::DuplicateListElement {
+                                    value: _,
+                                    index: _,
+                                    first_index: _,
+                                    attribute: _
+                                }
+                            ) =>
+                        {
+                            error
+                        }
+                        Some(index) => error.at_list_index(index),
+                        None => error,
                     }
+                })?;
+                if fit.is_none() {
+                    validate_attr_with_defs_and_ancestry(inner, &items[i], defs, ancestry)
+                        .map_err(|error| error.at_list_index(i))?;
                 }
-                Ok(())
-            } else if value.as_concrete().is_none() {
-                Ok(())
-            } else {
-                Err(TypeError::TypeMismatch {
-                    expected: attr.type_name(),
-                    got: value.type_name(),
-                })
             }
+            Ok(())
         }
         AttrTypeKind::Map { key, value: val_ty } => {
             if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
@@ -2790,6 +2936,16 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
             AttrTypeKind::UnloadedSchemaType(unloaded) => {
                 f.debug_tuple("UnloadedSchemaType").field(unloaded).finish()
             }
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => f
+                .debug_struct("Reference")
+                .field("identity", identity)
+                .field("pattern", pattern)
+                .field("length", length)
+                .finish(),
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -2847,12 +3003,12 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
+                constraints,
             } => f
                 .debug_struct("List")
                 .field("element_type", element_type)
                 .field("ordered", ordered)
-                .field("length", length)
+                .field("constraints", constraints)
                 .finish(),
             AttrTypeKind::Map { key, value } => f
                 .debug_struct("Map")
@@ -3180,6 +3336,15 @@ impl<R: PatternForm> PatternAttributeType<R> {
     fn shape_from_resolved(resolved: &PatternAttributeType<R>) -> Shape<'_, R> {
         match &resolved.kind {
             AttrTypeKind::UnloadedSchemaType(unloaded) => Shape::UnloadedSchemaType(unloaded),
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => Shape::Reference {
+                identity,
+                pattern: pattern.as_deref(),
+                length: *length,
+            },
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -3231,11 +3396,11 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
+                constraints,
             } => Shape::List {
                 element_type: element_type.as_ref(),
                 ordered: *ordered,
-                length: *length,
+                constraints: *constraints,
             },
             AttrTypeKind::Map { key, value } => Shape::Map {
                 key: key.as_ref(),
@@ -3272,6 +3437,15 @@ impl<R: PatternForm> PatternAttributeType<R> {
     pub fn raw_shape<'a>(&'a self) -> RawShape<'a, R> {
         match &self.kind {
             AttrTypeKind::UnloadedSchemaType(unloaded) => RawShape::UnloadedSchemaType(unloaded),
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => RawShape::Reference {
+                identity,
+                pattern: pattern.as_deref(),
+                length: *length,
+            },
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -3323,11 +3497,11 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
+                constraints,
             } => RawShape::List {
                 element_type: element_type.as_ref(),
                 ordered: *ordered,
-                length: *length,
+                constraints: *constraints,
             },
             AttrTypeKind::Map { key, value } => RawShape::Map {
                 key: key.as_ref(),
@@ -3388,6 +3562,22 @@ impl<R: PatternForm> PatternAttributeType<R> {
     pub(crate) fn string_literal_set(values: Vec<String>) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::StringLiteralSet { values },
+        }
+    }
+
+    /// Create a reference leaf. Resolution changes comparison keys only; its
+    /// authored and persisted values remain strings. Validation is offline.
+    pub fn reference(
+        identity: TypeIdentity,
+        pattern: Option<R::Pattern>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    ) -> Self {
+        Self {
+            kind: AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            },
         }
     }
 
@@ -3653,7 +3843,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
 
     /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
     pub fn list(inner: PatternAttributeType<R>) -> Self {
-        Self::refined_list(inner, true, None)
+        Self::refined_list(inner, true, None, ListElements::AllowDuplicates)
     }
 
     /// Create a List type with protocol-carried refinement metadata.
@@ -3661,19 +3851,20 @@ impl<R: PatternForm> PatternAttributeType<R> {
         element_type: PatternAttributeType<R>,
         ordered: bool,
         length: Option<(Option<u64>, Option<u64>)>,
+        elements: ListElements,
     ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::List {
                 element_type: Box::new(element_type),
                 ordered,
-                length,
+                constraints: ListConstraints::new(length, elements),
             },
         }
     }
 
     /// Create an unordered List type (insertionOrder=false).
     pub fn unordered_list(inner: PatternAttributeType<R>) -> Self {
-        Self::refined_list(inner, false, None)
+        Self::refined_list(inner, false, None, ListElements::AllowDuplicates)
     }
 
     /// Create a Map type with unconstrained string keys.
@@ -3732,6 +3923,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
     pub fn type_name(&self) -> String {
         match &self.kind {
             AttrTypeKind::UnloadedSchemaType(unloaded) => unloaded.identity().to_string(),
+            AttrTypeKind::Reference { identity, .. } => identity.to_string(),
             AttrTypeKind::Bool => "Bool".to_string(),
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
@@ -3780,6 +3972,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
     pub fn is_string_based_custom(&self) -> bool {
         match &self.kind {
             AttrTypeKind::UnloadedSchemaType(_) => false,
+            AttrTypeKind::Reference { .. } => true,
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -3868,7 +4061,8 @@ impl PatternAttributeType<Compiled> {
                 to_dsl.as_ref(),
                 concrete,
             ),
-            AttrTypeKind::String { .. }
+            AttrTypeKind::Reference { .. }
+            | AttrTypeKind::String { .. }
             | AttrTypeKind::ResourceHandle { .. }
             | AttrTypeKind::StringLiteralSet { .. }
             | AttrTypeKind::Int { .. }
@@ -3893,7 +4087,8 @@ impl PatternAttributeType<Compiled> {
     ) -> Result<(), TypeError> {
         debug_assert!(matches!(
             self.kind,
-            AttrTypeKind::String { .. }
+            AttrTypeKind::Reference { .. }
+                | AttrTypeKind::String { .. }
                 | AttrTypeKind::Int { .. }
                 | AttrTypeKind::Float { .. }
                 | AttrTypeKind::Enum { .. }
@@ -3932,7 +4127,14 @@ impl PatternAttributeType<Compiled> {
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
-            (AttrTypeKind::ResourceHandle { .. }, ConcreteValueRef::String(_)) => Ok(()),
+            (
+                AttrTypeKind::Reference {
+                    identity,
+                    pattern,
+                    length,
+                },
+                ConcreteValueRef::String(s),
+            ) => validate_string_refinement(Some(identity), pattern.as_ref(), *length, s),
             (AttrTypeKind::StringLiteralSet { values }, ConcreteValueRef::String(value))
                 if values.iter().any(|candidate| candidate == value) =>
             {
@@ -4338,6 +4540,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         }
         match (&self.attr.kind, &sink.attr.kind) {
             (UnloadedSchemaType(_), _) | (_, UnloadedSchemaType(_)) => false,
+            // A resolver identity selects comparison behavior, not a different
+            // wire scalar. Reference inputs accept string outputs; constraints
+            // are checked on the materialized value before planning.
+            (String { .. } | Reference { .. }, Reference { .. }) => true,
+            (Reference { .. }, String { .. }) => true,
+
             (
                 ResourceHandle {
                     provider: source_provider,
@@ -4350,12 +4558,6 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ..
                 },
             ) => source_provider == sink_provider && source_resource == sink_resource,
-            // #3803 transport is not implemented yet, so resource handles are
-            // represented by id strings at runtime. Preserve main's
-            // compatibility with every open string-shaped sink while keeping
-            // closed literal sets closed.
-            (ResourceHandle { .. }, String { .. }) => true,
-            (ResourceHandle { .. }, StringLiteralSet { .. }) => false,
             (ResourceHandle { .. }, _) => false,
             // Literal declarations carry string evidence but not the identity
             // evidence required by a provider custom type (#2648).
@@ -4372,13 +4574,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (StringLiteralSet { values: source, .. }, StringLiteralSet { values: sink, .. }) => {
                 source.iter().all(|value| sink.contains(value))
             }
-            // String-backed values and attributes may still flow into a Ref
-            // sink until resource-handle transport is implemented. Numeric and
-            // structural sources never reach this arm.
-            (String { .. } | Enum { .. } | StringLiteralSet { .. }, ResourceHandle { .. }) => true,
             // Preserve the pre-existing declared String -> literal-union
-            // behavior while ensuring ResourceHandle took the rejecting arm
-            // above.
+            // behavior.
             (String { .. }, StringLiteralSet { .. }) => true,
             (_, ResourceHandle { .. } | StringLiteralSet { .. }) => false,
             (
@@ -4725,26 +4922,6 @@ fn validate_string_refinement(
     Ok(())
 }
 
-fn validate_list_length(
-    length: Option<(Option<u64>, Option<u64>)>,
-    count: usize,
-) -> Result<(), TypeError> {
-    if let Some((min, max)) = length {
-        let count_u64 = count as u64;
-        if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
-            return Err(TypeError::LengthOutOfRange {
-                value: format!("{count} items").into(),
-                length: count,
-                min,
-                max,
-                attribute: None,
-                type_name: Some("List".to_string()),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn validate_int_range(
     range: Option<(Option<i64>, Option<i64>)>,
     value: i64,
@@ -4879,6 +5056,111 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
     }
 }
 
+/// Compare the ordinary JSON of a value canonicalized with its successful fit
+/// for the active purpose. Unresolved elements and elements containing secrets
+/// or diagnostic-sensitive strings are not comparable: even a masked duplicate
+/// would reveal equality. The provider remains the final authority for them.
+/// Canonicalization preserves integer/float spellings and struct block aliases,
+/// so those spellings remain distinct keys: uniqueness can miss duplicates but
+/// must never invent them (including by rounding large integers to floats).
+/// Wait-condition right-hand sides are not checked for uniqueness.
+/// Nested unordered lists compare in order, another possible missed duplicate.
+#[derive(PartialEq, Eq, Hash)]
+struct KnownListElement(serde_json::Value);
+
+impl KnownListElement {
+    fn from_fit<P: PlaceholderKind, B: BindingAddress>(
+        value: &Value<P, B>,
+        fit: &Fit<'_>,
+        defs: &BTreeMap<String, CompiledAttributeType>,
+        purpose: CanonicalizationPurpose<'_>,
+    ) -> Option<Self> {
+        if crate::value::contains_secret(value) || value.contains_diagnostic_sensitive_string() {
+            return None;
+        }
+        crate::value::canonical_json_with_fit(value.clone(), fit, defs, purpose).map(Self)
+    }
+}
+
+/// A count failure belongs to the list; a duplicate belongs to its later item.
+struct ListConstraintError {
+    index: Option<usize>,
+    error: Box<TypeError>,
+}
+
+impl ListConstraints {
+    /// Check count and canonical element equality through one traversal. The
+    /// caller controls early exit by consuming the first error or every result.
+    fn check<'schema, P, B, I>(
+        self,
+        items: I,
+        defs: &BTreeMap<String, CompiledAttributeType>,
+        ancestry: FieldAncestry,
+        purpose: CanonicalizationPurpose<'_>,
+        mut fit_item: impl FnMut(&Value<P, B>) -> Option<Fit<'schema>>,
+    ) -> impl Iterator<Item = Result<(usize, Option<Fit<'schema>>), ListConstraintError>>
+    where
+        P: PlaceholderKind,
+        B: BindingAddress,
+        I: ExactSizeIterator,
+        I::Item: std::borrow::Borrow<Value<P, B>>,
+    {
+        let count = items.len();
+        let length_error = self.length.and_then(|(min, max)| {
+            let count_u64 = count as u64;
+            (min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max)).then(
+                || ListConstraintError {
+                    index: None,
+                    error: Box::new(TypeError::LengthOutOfRange {
+                        value: format!("{count} items").into(),
+                        length: count,
+                        min,
+                        max,
+                        attribute: None,
+                        type_name: Some("List".to_string()),
+                    }),
+                },
+            )
+        });
+        let mut seen: HashMap<KnownListElement, usize> = HashMap::new();
+        let authored = match purpose {
+            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl)
+            | CanonicalizationPurpose::ProviderConfig { provider_name: _ } => true,
+            // A wait RHS compares against observed state; it is not provider input.
+            CanonicalizationPurpose::WaitRhs
+            | CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput)
+            | CanonicalizationPurpose::State => false,
+        };
+        length_error
+            .into_iter()
+            .map(Err)
+            .chain(items.enumerate().map(move |(index, item)| {
+                let value = std::borrow::Borrow::borrow(&item);
+                let fit = fit_item(value);
+                if authored
+                    && !ancestry.in_secret
+                    && self.elements == ListElements::Unique
+                    && let Some(fit) = &fit
+                    && let Some(key) = KnownListElement::from_fit(value, fit, defs, purpose)
+                {
+                    if let Some(first_index) = seen.get(&key) {
+                        return Err(ListConstraintError {
+                            index: Some(index),
+                            error: Box::new(TypeError::DuplicateListElement {
+                                value: crate::value::format_value(value).into(),
+                                index,
+                                first_index: *first_index,
+                                attribute: None,
+                            }),
+                        });
+                    }
+                    seen.insert(key, index);
+                }
+                Ok((index, fit))
+            }))
+    }
+}
+
 impl Fit<'_> {
     fn with_kind<'a>(
         exactness: FitExactness,
@@ -4951,7 +5233,8 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
 
     match &attr.kind {
         AT::UnloadedSchemaType(_) => return None,
-        AT::String { .. }
+        AT::Reference { .. }
+        | AT::String { .. }
         | AT::ResourceHandle { .. }
         | AT::StringLiteralSet { .. }
         | AT::Int { .. }
@@ -4966,8 +5249,14 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         | AT::Ref(_) => {}
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let inner =
-            fit_value_to_resolved_type_on_path(attr, inner, defs, ancestry, purpose, visited_refs)?;
+        let inner = fit_value_to_resolved_type_on_path(
+            attr,
+            inner,
+            defs,
+            ancestry.inside_secret(),
+            purpose,
+            visited_refs,
+        )?;
         let exactness = inner.exactness;
         return Some(Fit::with_kind(
             exactness,
@@ -5022,7 +5311,8 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
                 ))
             }
             AT::Ref(_) => unreachable!("fit dispatch received an unresolved Ref"),
-            AT::String { .. }
+            AT::Reference { .. }
+            | AT::String { .. }
             | AT::ResourceHandle { .. }
             | AT::StringLiteralSet { .. }
             | AT::Bool
@@ -5093,23 +5383,25 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         (
             AT::List {
                 element_type,
-                length,
-                ..
+                constraints,
+                ordered: _ordered,
             },
             ConcreteValueRef::List(items),
         ) => {
-            validate_list_length(*length, items.len()).ok()?;
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
-            for item in items {
-                let child = fit_value_to_type_on_path(
+            for result in constraints.check(items.iter(), defs, ancestry, purpose, |item| {
+                fit_value_to_type_on_path(
                     element_type,
                     item,
                     defs,
                     ancestry,
                     purpose,
                     &mut Vec::new(),
-                )?;
+                )
+            }) {
+                let (_, child) = result.ok()?;
+                let child = child?;
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
@@ -5118,24 +5410,30 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         (
             AT::List {
                 element_type,
-                length,
-                ..
+                constraints,
+                ordered: _ordered,
             },
             ConcreteValueRef::StringList(items),
         ) => {
-            validate_list_length(*length, items.len()).ok()?;
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
-            for item in items {
-                let item: Value<P, B> = Value::Concrete(ConcreteValue::String(item.clone()));
-                let child = fit_value_to_type_on_path(
-                    element_type,
-                    &item,
-                    defs,
-                    ancestry,
-                    purpose,
-                    &mut Vec::new(),
-                )?;
+            let values = items
+                .iter()
+                .map(|item| Value::Concrete(ConcreteValue::String(item.clone())));
+            for result in
+                constraints.check(values, defs, ancestry, purpose, |item: &Value<P, B>| {
+                    fit_value_to_type_on_path(
+                        element_type,
+                        item,
+                        defs,
+                        ancestry,
+                        purpose,
+                        &mut Vec::new(),
+                    )
+                })
+            {
+                let (_, child) = result.ok()?;
+                let child = child?;
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
@@ -5248,7 +5546,8 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: Bind
         }
         (AT::Ref(_), _) => unreachable!("fit dispatch received an unresolved Ref"),
         (
-            AT::String { .. }
+            AT::Reference { .. }
+            | AT::String { .. }
             | AT::ResourceHandle { .. }
             | AT::StringLiteralSet { .. }
             | AT::Int { .. }
@@ -5426,7 +5725,6 @@ fn union_member_judgement_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
         // Same-constructor match — second tier.
         (AT::Map { .. }, ConcreteValueRef::Map(_))
         | (AT::String { .. }, ConcreteValueRef::String(_))
-        | (AT::ResourceHandle { .. }, ConcreteValueRef::String(_))
         | (AT::StringLiteralSet { .. }, ConcreteValueRef::String(_))
         | (AT::Int { .. }, ConcreteValueRef::Int(_))
         | (AT::Float { .. }, ConcreteValueRef::Float(_))
@@ -6803,6 +7101,12 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::InvalidEnumVariant { .. }
         | TypeError::PatternMismatch { .. }
         | TypeError::LengthOutOfRange { .. }
+        | TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _,
+        }
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
         | TypeError::CustomTypeValidation { .. }
@@ -6895,6 +7199,18 @@ pub enum TypeError {
         max: Option<u64>,
         attribute: Option<String>,
         type_name: Option<String>,
+    },
+
+    #[error(
+        "Duplicate list element {} at index {index} (first at index {first_index}){}",
+        value.render_enum_value(InvalidEnumValueKind::Identifier),
+        attribute.as_ref().map(|name| format!(" for '{name}'")).unwrap_or_default()
+    )]
+    DuplicateListElement {
+        value: DiagnosticValue,
+        index: usize,
+        first_index: usize,
+        attribute: Option<String>,
     },
 
     /// The value was written in the source as a quoted string literal
@@ -7078,6 +7394,12 @@ impl TypeError {
             TypeError::InvalidEnumVariant { attribute, .. }
             | TypeError::PatternMismatch { attribute, .. }
             | TypeError::LengthOutOfRange { attribute, .. }
+            | TypeError::DuplicateListElement {
+                attribute,
+                value: _,
+                index: _,
+                first_index: _,
+            }
             | TypeError::StringLiteralExpectedEnum { attribute, .. }
             | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
             TypeError::ReadOnlyAttribute { name }
@@ -7155,6 +7477,17 @@ impl TypeError {
                 max,
                 attribute,
                 type_name,
+            },
+            TypeError::DuplicateListElement {
+                index,
+                first_index,
+                attribute,
+                value: _,
+            } => TypeError::DuplicateListElement {
+                value: DiagnosticValue::Masked,
+                index,
+                first_index,
+                attribute,
             },
             TypeError::StringLiteralExpectedEnum {
                 attribute,
@@ -7318,6 +7651,12 @@ impl TypeError {
                     | TypeError::LengthOutOfRange {
                         attribute: attr_slot,
                         ..
+                    }
+                    | TypeError::DuplicateListElement {
+                        attribute: attr_slot,
+                        value: _,
+                        index: _,
+                        first_index: _,
                     }
                     | TypeError::StringLiteralExpectedEnum {
                         attribute: attr_slot,
@@ -7573,7 +7912,7 @@ impl CompletionValue {
 ///
 /// Only an optional create-only attribute exposes when-present identity:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::schema::{AttributeSchema, AttributeType};
 /// let _ = AttributeSchema::required("name", AttributeType::string())
 ///     .create_only()
@@ -8585,6 +8924,19 @@ pub struct EffectiveType<'a> {
 }
 
 impl<'a> EffectiveType<'a> {
+    /// A structural value walk without an enclosing attribute's mode context.
+    pub(crate) fn for_value_walk(
+        attr_type: &'a PatternAttributeType<Compiled>,
+        defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ) -> Self {
+        Self {
+            attr_type,
+            defs,
+            path: Vec::new(),
+            field_ancestry: FieldAncestry::WRITABLE,
+        }
+    }
+
     pub fn as_type(&self) -> &'a PatternAttributeType<Compiled> {
         self.attr_type
     }
@@ -8652,6 +9004,24 @@ impl<'a> EffectiveType<'a> {
             path: self.path.clone(),
             field_ancestry: self.field_ancestry,
         })
+    }
+
+    pub(crate) fn union_members(&self) -> Vec<Self> {
+        union_members_with_defs(self.attr_type, self.defs)
+            .into_iter()
+            .flat_map(|members| {
+                members
+                    .iter()
+                    .flatten()
+                    .map(|member| Self {
+                        attr_type: member.as_attr(),
+                        defs: self.defs,
+                        path: self.path.clone(),
+                        field_ancestry: self.field_ancestry,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     pub fn map_value(&self) -> Option<Self> {
@@ -8739,7 +9109,8 @@ fn type_contains_struct(
             .as_raw_slice()
             .iter()
             .any(|member| type_contains_struct(member, defs, budget)),
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::Int { .. }
         | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool
@@ -8802,7 +9173,8 @@ fn collect_effective_field_candidates<'a>(
                 );
             }
         }
-        Shape::String { .. }
+        Shape::Reference { .. }
+        | Shape::String { .. }
         | Shape::Int { .. }
         | Shape::Float { .. }
         | Shape::Bool
@@ -9451,6 +9823,11 @@ fn identified_declaration_kind(
 ) -> Option<IdentifiedDeclarationKind> {
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => None,
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(IdentifiedDeclarationKind::String),
         RawShape::String {
             identity: Some(_identity),
             pattern: _pattern,
@@ -9497,7 +9874,7 @@ fn identified_declaration_kind(
         RawShape::List {
             element_type: _element_type,
             ordered: _ordered,
-            length: _length,
+            constraints: _constraints,
         } => None,
         RawShape::Map {
             key: _key,
@@ -9518,6 +9895,11 @@ fn identified_declaration_scalar_kind(
 ) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => None,
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(RefinedScalarKind::String),
         RawShape::String {
             identity: Some(_identity),
             pattern: _pattern,
@@ -9564,7 +9946,7 @@ fn identified_declaration_scalar_kind(
         RawShape::List {
             element_type: _element_type,
             ordered: _ordered,
-            length: _length,
+            constraints: _constraints,
         } => None,
         RawShape::Map {
             key: _key,
@@ -9586,6 +9968,11 @@ fn visit_identified_declarations(
 ) {
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => {}
+        RawShape::Reference {
+            identity,
+            pattern: _pattern,
+            length: _length,
+        } => visitor(identity, attribute_type),
         RawShape::String {
             identity: Some(identity),
             pattern: _,
@@ -9614,7 +10001,7 @@ fn visit_identified_declarations(
         RawShape::List {
             element_type,
             ordered: _,
-            length: _,
+            constraints: _constraints,
         } => visit_identified_declarations(element_type, visitor),
         RawShape::Map { key, value } => {
             visit_identified_declarations(key, visitor);
@@ -9713,6 +10100,11 @@ fn validate_identified_scalar_kind_consistency(
 ) {
     let identified = match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => None,
+        RawShape::Reference {
+            identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some((identity, RefinedScalarKind::String)),
         RawShape::String {
             identity: Some(identity),
             ..
@@ -9749,7 +10141,8 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has a DSL transform that protocol v16 cannot represent"
+                                "closed enum `{identity}` has a DSL transform that protocol v{} cannot represent",
+                                carina_provider_protocol::PROTOCOL_VERSION
                             ),
                         );
                     }
@@ -9767,7 +10160,8 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has base metadata that protocol v16 cannot represent"
+                                "closed enum `{identity}` has base metadata that protocol v{} cannot represent",
+                                carina_provider_protocol::PROTOCOL_VERSION
                             ),
                         );
                     }
@@ -9778,7 +10172,8 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "open enum `{identity}` has DSL aliases that protocol v16 cannot represent"
+                                "open enum `{identity}` has DSL aliases that protocol v{} cannot represent",
+                                carina_provider_protocol::PROTOCOL_VERSION
                             ),
                         );
                     }
@@ -9786,7 +10181,10 @@ fn validate_identified_scalar_kind_consistency(
                         push_schema_issue(
                             issues,
                             &location,
-                            format!("open enum `{identity}` has no namespace for protocol v16"),
+                            format!(
+                                "open enum `{identity}` has no namespace for protocol v{}",
+                                carina_provider_protocol::PROTOCOL_VERSION
+                            ),
                         );
                     }
                 }
@@ -9863,7 +10261,8 @@ fn validate_identified_scalar_kind_consistency(
                 );
             }
         }
-        RawShape::String { .. }
+        RawShape::Reference { .. }
+        | RawShape::String { .. }
         | RawShape::Int { .. }
         | RawShape::Float { .. }
         | RawShape::Bool
@@ -9878,7 +10277,7 @@ fn scalar_kind_for_schema_base<R: PatternForm>(
 ) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(_) => None,
-        RawShape::String { .. } => Some(RefinedScalarKind::String),
+        RawShape::Reference { .. } | RawShape::String { .. } => Some(RefinedScalarKind::String),
         RawShape::Int { .. } => Some(RefinedScalarKind::Int),
         RawShape::Float { .. } => Some(RefinedScalarKind::Float),
         RawShape::Enum { base, .. } => scalar_kind_for_schema_base(base),
@@ -10249,7 +10648,7 @@ fn validate_type_definition(
                     fields.iter().find(|field| field.name == name).map(|field| {
                         FieldGroupMemberAdmission {
                             input_mode: field.declared_input_mode,
-                            // StructField has no default in the core or v16
+                            // StructField has no default in the core or current
                             // protocol grammar. Keeping this explicit makes a
                             // future addition inherit the shared rejection.
                             has_default: false,
@@ -10271,7 +10670,8 @@ fn validate_type_definition(
                 );
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -10372,7 +10772,8 @@ fn collect_identity_paths_in_type(
                 );
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -10400,7 +10801,8 @@ pub(crate) fn identity_leaf_is_scalar_or_enum(
             ref_chain.pop();
             result
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -10577,7 +10979,8 @@ fn type_write_only_analysis<'schema, R: PatternForm>(
                 ..nested
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -10709,7 +11112,8 @@ fn type_create_only_analysis<'schema, R: PatternForm>(
                 ..nested
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -10731,8 +11135,11 @@ fn validate_keyed_partial_update(
     };
 
     let list = resolve_refs_on_path(&attribute.attr_type, defs, &mut Vec::new());
-    let Some(AttrTypeKind::List { element_type, .. }) =
-        list.ok().map(|resolved| &resolved.attr.kind)
+    let Some(AttrTypeKind::List {
+        element_type,
+        ordered: _ordered,
+        constraints: _constraints,
+    }) = list.ok().map(|resolved| &resolved.attr.kind)
     else {
         push_schema_issue(
             issues,
@@ -10890,6 +11297,7 @@ fn project_write_only_leaves<'schema, R: PatternForm>(
             }
         }
         AttrTypeKind::Union(_)
+        | AttrTypeKind::Reference { .. }
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -10995,6 +11403,7 @@ fn strip_write_only_leaves_from_value<'schema>(
             ))
         }
         AttrTypeKind::Union(_)
+        | AttrTypeKind::Reference { .. }
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -11404,7 +11813,8 @@ fn collect_block_names_from_type(
                 collect_block_names_from_type(t, defs, ancestry, visited_definitions, result);
             }
         }
-        AttrTypeKind::String { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
@@ -11842,8 +12252,8 @@ fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
 /// This uses the same field matcher as the rename pass, including the narrow
 /// ambiguous-name rule for parser-produced lists. Union values are left to
 /// normal schema validation.
-pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAddress>(
-    resource: &Resource<S, P, B>,
+pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAddress, D>(
+    resource: &Resource<S, P, B, D>,
     schema: &CompiledResourceSchema,
 ) -> Option<BlockNameConflict> {
     find_block_name_alias_in_map(
@@ -13348,7 +13758,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// witness, so callers cannot pair one provider's lookup with another
 /// provider's schema:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use std::collections::HashMap;
 /// use carina_core::schema::{ResourceSchema, no_lookup};
 ///
@@ -13362,7 +13772,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 ///
 /// An unbound witness also has no public structural-only validation shortcut:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use std::collections::HashMap;
 /// use carina_core::schema::ResourceSchema;
 ///
@@ -13372,7 +13782,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 ///
 /// Nor can external callers install an approve-all lookup for provider config:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// use carina_core::schema::no_lookup;
 ///
 /// let _ = no_lookup();
@@ -13380,7 +13790,7 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 ///
 /// A rootless config type likewise cannot accept an arbitrary lookup:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use std::collections::BTreeMap;
 /// use carina_core::resource::{ConcreteValue, Value};
 /// use carina_core::schema::{AttributeType, ValidatedConfigSchema};
@@ -13546,11 +13956,13 @@ impl SchemaRegistry {
         for (owner, _, _, schema) in self.iter() {
             let mut collect = |candidate: &TypeIdentity, declaration: &CompiledAttributeType| {
                 if candidate == identity {
-                    declarations.insert(crate::parser::OwnedTypeIdentity::from_declaration(
-                        owner,
-                        crate::parser::IdentifiedCustomTypeDeclaration::new(declaration)
-                            .expect("admitted identified declarations carry scalar kinds"),
-                    ));
+                    declarations.insert(
+                        crate::parser::OwnedTypeIdentity::from_schema_declaration(
+                            owner,
+                            declaration,
+                        )
+                        .expect("admitted identified declarations carry scalar kinds"),
+                    );
                 }
             };
             for attribute in schema.effective_attributes() {
@@ -13680,9 +14092,14 @@ impl SchemaRegistry {
     }
 
     /// Look up the `Managed` schema for a given [`Resource`].
-    pub fn get_for<S, P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(
+    pub fn get_for<
+        S,
+        P: crate::resource::PlaceholderKind,
+        B: crate::resource::BindingAddress,
+        D,
+    >(
         &self,
-        resource: &crate::resource::Resource<S, P, B>,
+        resource: &crate::resource::Resource<S, P, B, D>,
     ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,
@@ -13727,9 +14144,10 @@ impl SchemaRegistry {
         S,
         P: crate::resource::PlaceholderKind,
         B: crate::resource::BindingAddress,
+        D,
     >(
         &self,
-        resource: &crate::resource::DataSource<S, P, B>,
+        resource: &crate::resource::DataSource<S, P, B, D>,
     ) -> Option<OwnerBoundResourceSchema<'_>> {
         self.get(
             &resource.id.provider,
@@ -14078,7 +14496,8 @@ impl<R: PatternForm> PatternResourceSchema<R> {
                     }
                 }
             }
-            Shape::String { .. }
+            Shape::Reference { .. }
+            | Shape::String { .. }
             | Shape::Int { .. }
             | Shape::Float { .. }
             | Shape::Bool
@@ -14351,7 +14770,12 @@ impl PatternResourceSchema<Compiled> {
                     &mut errors,
                 );
             } else if mode == ValueEntryValidation::FullInput {
-                let suggestion = suggest_similar_name(name, &known);
+                let id_attribute = format!("{name}_id");
+                let suggestion = if known.contains(&id_attribute.as_str()) {
+                    Some(id_attribute)
+                } else {
+                    suggest_similar_name(name, &known)
+                };
                 errors.push(TypeError::UnknownAttribute {
                     name: name.clone(),
                     suggestion,

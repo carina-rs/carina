@@ -33,10 +33,6 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -45,8 +41,15 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         *self.received_role_arn.lock().unwrap() = config.attributes().get("role_arn").cloned();
         Box::pin(async {
-            Ok(carina_core::provider::InitializeOutcome::unavailable()
-                .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
+            )
         })
     }
 

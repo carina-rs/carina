@@ -34,6 +34,7 @@ use ratatui::prelude::*;
 
 use carina_core::explicit::ExplicitFields;
 use carina_core::module::FileSignature;
+#[cfg(test)]
 use carina_core::plan::Plan;
 use carina_core::provider::{ProviderError, ProviderRouter};
 use carina_core::resource::ResourceId;
@@ -230,25 +231,34 @@ impl std::error::Error for TuiError {
 /// When prior authoring records are provided, ambiguous pending list removals
 /// use the same whole-value display as the CLI.
 pub fn run(
-    plan: &Plan,
+    display: carina_core::detail_rows::PlanDisplay<'_>,
     schemas: &SchemaRegistry,
-    historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
 ) -> Result<(), TuiError> {
-    let mut app = app_for_run(plan, schemas, historical_display, prev_explicit, provider)?;
+    let mut app = App::from_display(display, schemas, prev_explicit, provider)
+        .map_err(TuiError::PlanDisplay)?;
     run_tui(ui::draw, handle_key, &mut app).map_err(TuiError::Io)
 }
 
+#[cfg(test)]
 fn app_for_run(
     plan: &Plan,
     schemas: &SchemaRegistry,
     historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
+    comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> Result<App, TuiError> {
-    App::new(plan, schemas, historical_display, prev_explicit, provider)
-        .map_err(TuiError::PlanDisplay)
+    App::new(
+        plan,
+        schemas,
+        historical_display,
+        prev_explicit,
+        provider,
+        comparisons,
+    )
+    .map_err(TuiError::PlanDisplay)
 }
 
 fn run_tui<A>(
@@ -283,6 +293,48 @@ fn run_tui<A>(
 }
 
 #[cfg(test)]
+fn compiled_loop_fixture(
+    template: Box<carina_core::parser::ExpandedDeferredForExpression>,
+) -> carina_core::effect::DeferredCreatePayload {
+    let producer =
+        carina_core::resource::Resource::with_provider("aws", "acm.Certificate", "cert", None)
+            .with_absolute_binding(carina_core::resource::absolute_binding_address_for_test(
+                "cert",
+            ));
+    let graph = carina_core::resolved_graph::ExpandedBindingIndex::for_test_resources(&[producer])
+        .expect("fixture graph");
+    let (template, dependencies) = graph
+        .compile_deferred_for(*template)
+        .expect("fixture loop compilation");
+    carina_core::effect::DeferredCreatePayload::new(Box::new(template), dependencies)
+}
+#[cfg(test)]
+fn compiled_replace_fixture(
+    deletes: carina_core::effect::NonEmptyDeletes,
+    template: Box<carina_core::parser::ExpandedDeferredForExpression>,
+) -> carina_core::effect::DeferredReplacePayload {
+    let payload = compiled_loop_fixture(template);
+    carina_core::effect::DeferredReplacePayload {
+        deletes,
+        template: payload.template,
+        dependency_template: payload.dependency_template,
+    }
+}
+
+#[cfg(test)]
+fn create_plan_fixture(
+    resources: impl IntoIterator<Item = carina_core::resource::ExpandedResource>,
+) -> Plan {
+    let resources = carina_core::resource::ResolvedResource::collect_resolved(resources)
+        .expect("TUI fixture graph resolves");
+    let mut plan = Plan::new();
+    for resource in resources {
+        plan.add(carina_core::effect::Effect::Create(resource));
+    }
+    plan
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carina_core::effect::Effect;
@@ -293,7 +345,7 @@ mod tests {
     };
 
     fn create(resource: Resource) -> Effect {
-        Effect::Create(ResolvedResource::new(resource))
+        Effect::Create(ResolvedResource::new((resource).into_value_snapshot()))
     }
 
     fn absolute(binding: &str) -> AbsoluteBindingAddress {
@@ -368,8 +420,9 @@ mod tests {
                 .with_identifier("widget-id"),
             ),
             to: ResolvedResource::new(
-                Resource::new("test.Widget", "example")
-                    .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into()))),
+                (Resource::new("test.Widget", "example")
+                    .with_attribute("name", Value::Concrete(ConcreteValue::String("new".into()))))
+                .into_value_snapshot(),
             ),
             changed_attributes: vec!["name".to_string()],
         });
@@ -382,6 +435,9 @@ mod tests {
             &historical_display,
             None,
             &ProviderRouter::new(),
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
         ) {
             Ok(_) => panic!("the missing comparison schema must reach the TUI boundary"),
             Err(error) => error,

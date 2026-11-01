@@ -3450,12 +3450,7 @@ fn completion_uses_the_directory_partial_catalog_instead_of_the_document_catalog
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
-        fn extract_region(
-            &self,
-            _: &indexmap::IndexMap<String, carina_core::resource::Value>,
-        ) -> String {
-            String::new()
-        }
+
         fn create_provider(
             &self,
             _: Option<&str>,
@@ -5173,5 +5168,113 @@ attributes {
         labels.contains(&"oidc_provider_arn"),
         "sibling-file `arguments` must reach an attributes-block value position. Got: {:?}",
         labels
+    );
+}
+
+#[test]
+fn reference_input_completion_accepts_compatible_key_output_from_a_sibling_file() {
+    use carina_core::schema::TypeIdentity;
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("keys.Key")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "arn",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::new(Some("test"), ["keys", "Key"], "Arn")),
+                        Some("^key/.+$".into()),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "test",
+        ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::reference(
+                        TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "test",
+        ResourceSchema::new("keys.Nested")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional(
+                                "key",
+                                AttributeType::reference(
+                                    TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+                                    None,
+                                    None,
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".into()], vec![], vec![]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("keys.crn"),
+        "let source = test.keys.Key {}\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider test {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    let main = "let target = test.keys.Resource {\n  key = \n}\n";
+    std::fs::write(directory.path().join("main.crn"), main).unwrap();
+    let completions = provider.complete_for_test(
+        &create_document(main),
+        Position {
+            line: 1,
+            character: "  key = ".len() as u32,
+        },
+        Some(directory.path()),
+    );
+    assert!(
+        completions.iter().any(|item| item.label == "source.arn"),
+        "{completions:?}"
+    );
+    let nested = "let target = test.keys.Nested {\n  settings {\n    key = \n  }\n}\n";
+    std::fs::write(directory.path().join("main.crn"), nested).unwrap();
+    let completions = provider.complete_for_test(
+        &create_document(nested),
+        Position {
+            line: 2,
+            character: "    key = ".len() as u32,
+        },
+        Some(directory.path()),
+    );
+    assert!(
+        completions.iter().any(|item| item.label == "source.arn"),
+        "{completions:?}"
     );
 }

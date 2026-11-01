@@ -24,6 +24,7 @@ use carina_cli::fixture_plan::{
     build_fixture_plan_change_summary, build_plan_from_fixture_name_using,
     delete_instance_attributes_from_plan, provider_router_for_plan,
 };
+use carina_cli::output_style::ColorMode;
 use carina_cli::plan_image::{
     ImageTheme, PlanImageInput, PlanImageTarget, StateMetadata, parse_output_target,
     render_plan_outputs, resolve_plan_image_options, write_inline_image, write_plan_image,
@@ -46,6 +47,13 @@ fn parse_detail(s: &str) -> Option<DetailLevel> {
 }
 
 fn main() -> ExitCode {
+    let color_mode = ColorMode::resolve(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::env::var_os("CLICOLOR").as_deref(),
+        std::env::var_os("CLICOLOR_FORCE").as_deref(),
+    );
+    let runtime = carina_cli::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         print_usage();
@@ -148,7 +156,20 @@ fn main() -> ExitCode {
         }
     };
 
-    let fp = build_plan_from_fixture_name_using(&fixture, LoadedProviderFactory::for_test);
+    let fp = match build_plan_from_fixture_name_using(
+        &runtime,
+        &fixture,
+        LoadedProviderFactory::for_test,
+    ) {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                carina_cli::error::format_error_with_source_chain(&error)
+            );
+            return ExitCode::from(1);
+        }
+    };
     let historical_display =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     let summary = build_fixture_plan_change_summary(&fp);
@@ -196,24 +217,37 @@ fn main() -> ExitCode {
         );
     }
 
-    let provider = provider_router_for_plan(&fp.plan);
+    let provider = match provider_router_for_plan(&runtime, &fp.plan) {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                carina_cli::error::format_error_with_source_chain(&error)
+            );
+            return ExitCode::from(1);
+        }
+    };
     if tui {
         if let Err(e) = carina_tui::run(
-            &fp.plan,
+            carina_core::detail_rows::PlanDisplay::unprepared(
+                &fp.plan,
+                &historical_display,
+                fp.references.for_display(),
+            ),
             &fp.schemas,
-            &historical_display,
             Some(&fp.prev_explicit),
             &provider,
         ) {
             eprintln!("{}", carina_cli::error::format_error_with_source_chain(&e));
             return ExitCode::from(1);
         }
-        fp.moved_hints.eprint();
+        fp.moved_hints.eprint(color_mode);
         return ExitCode::SUCCESS;
     }
 
     if destroy {
         let output = match format_destroy_plan_with_delete_instances(
+            color_mode,
             &fp.plan,
             detail,
             &historical_display,
@@ -228,6 +262,7 @@ fn main() -> ExitCode {
         print!("{output}");
     } else {
         if let Err(error) = print_plan(
+            color_mode,
             &fp.plan,
             &summary,
             detail,
@@ -237,12 +272,13 @@ fn main() -> ExitCode {
             Some(&fp.prev_explicit),
             None,
             &provider,
+            fp.references.for_display(),
         ) {
             eprintln!("error: {error}");
             return ExitCode::from(1);
         }
     }
-    fp.moved_hints.eprint();
+    fp.moved_hints.eprint(color_mode);
 
     if let Some(rendered_inline_image) = rendered_inline_image
         && let Err(error) = write_inline_image(rendered_inline_image, std::io::stdout().lock())

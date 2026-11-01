@@ -28,7 +28,7 @@ use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{
     AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
-    GuestCallBudget, WasmProviderFactory, WasmProviderLoadError,
+    GuestCallBudget, SchemaOnlyWasmProviderFactory, WasmProviderFactory, WasmProviderLoadError,
 };
 use carina_provider_resolver::{
     LockFile, ProviderLoadIdentity, ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
@@ -1030,6 +1030,37 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_schema_preserves_unique_list_refinement() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let schemas = factory.schemas();
+    let schema = schemas
+        .iter()
+        .find(|schema| schema.parts().resource_type == "actions.OidcSubject")
+        .unwrap();
+    let claims = schema.effective_attribute("claim_keys").unwrap();
+    let value: Value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::enum_identifier("repo")),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "mock.actions.OidcSubject.ClaimKey.repo",
+        )),
+    ]));
+    let error = claims.validate(&value).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            carina_core::schema::TypeError::DuplicateListElement {
+                index: 1,
+                first_index: 0,
+                value: _,
+                attribute: _
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn schema_only_loads_an_aws_world_without_a_credential_source() {
     let path = skip_if_no_aws_http_wasm!();
     let cache = tempfile::tempdir().expect("create schema-only cache tempdir");
@@ -1048,6 +1079,32 @@ async fn schema_only_loads_an_aws_world_without_a_credential_source() {
             .schemas()
             .iter()
             .any(|schema| schema.parts().resource_type == "test.aws_credentials")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_only_metadata_factory_links_aws_credentials_without_a_credential_source() {
+    let path = skip_if_no_aws_http_wasm!();
+    let user_dirs = carina_core::TestUserDirs::new();
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+
+    let factory = SchemaOnlyWasmProviderFactory::from_bytes(
+        mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
+        &user_dirs,
+    )
+    .await
+    .expect("metadata-only loading must link the AWS credential import without a source");
+
+    assert_eq!(factory.name(), "aws");
+    assert!(
+        factory
+            .schemas()
+            .iter()
+            .any(|schema| schema.parts().resource_type == "test.aws_credentials")
+    );
+    assert!(
+        !user_dirs.compiled_wasm_cache_dir().exists(),
+        "metadata-only loading must not write a precompile cache"
     );
 }
 
@@ -2225,6 +2282,192 @@ async fn test_wasm_create_read_back_completes_within_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_preserve_error_keeps_phase_and_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "__mock_read_back_preserve_error__";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        identity,
+        "create_read_back_pending_polls",
+        100,
+    );
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("a transient read error must retain the read-back continuation")
+        .into_kind();
+    let CreateFailureKind::InFlight { pending, error } = failure else {
+        panic!("read-back must remain in flight");
+    };
+    let pending = pending
+        .into_fresh()
+        .expect("the provider returned a fresh continuation");
+    assert_eq!(
+        pending.phase(),
+        carina_provider_protocol::PendingPhase::ReadBack
+    );
+    assert_minted_mock_identifier(pending.identifier().unwrap().as_str());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(pending.token().expose_for_provider_call())
+            .unwrap(),
+        serde_json::json!({"phase": "read_back"})
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("read-back temporarily unavailable"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("polling protocol"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_resumed_create_read_back_preserve_error_keeps_token_and_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "__mock_read_back_preserve_error__";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let token = serde_json::json!({"phase": "operation", "remaining": 0, "polls_served": 0, "mode": "normal"}).to_string();
+    let pending = persisted_create_for_resume(&id, &token, Some("mock-id"));
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        identity,
+        "create_read_back_pending_polls",
+        100,
+    );
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+    let failure = provider
+        .provider()
+        .resume_create(request)
+        .await
+        .expect_err("a transient resumed read error must retain the read-back continuation")
+        .into_kind();
+    let ResumeFailureKind::InFlight { pending, error } = failure else {
+        panic!("resumed read-back must remain in flight");
+    };
+    assert_eq!(pending.identifier().unwrap().as_str(), "mock-id");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(pending.token().expose_for_provider_call())
+            .unwrap(),
+        serde_json::json!({"phase": "read_back"}),
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("read-back temporarily unavailable"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("polling protocol"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_resumed_saved_read_back_from_fresh_instance_reads_by_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "resumed-saved-read-back";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        identity,
+        "create_read_back_pending_polls",
+        1,
+    );
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("create a resource with identifier-based read-back"),
+    );
+    let identifier = created
+        .identifier
+        .expect("a created resource has an identifier");
+    drop(provider);
+    let (factory, _fresh_cache) = load_factory(&path).await;
+    let fresh = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("fresh provider should init");
+    let token = serde_json::json!({"phase": "read_back"}).to_string();
+    let pending = persisted_create_for_resume(&id, &token, Some(&identifier));
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+
+    // State has no phase. The first host call supplies Operating, and the saved
+    // read-back token must still reach a read by identifier in the fresh guest.
+    let outcome = fresh
+        .provider()
+        .resume_create(request)
+        .await
+        .expect("a saved read-back must complete from a fresh instance")
+        .into_kind();
+    let ResumeOutcomeKind::Resumed(resumed) = outcome else {
+        panic!("the resumed read-back must return a complete read, got {outcome:?}");
+    };
+    assert_eq!(resumed.identifier().as_str(), identifier);
+    let state = resumed.observed_state();
+    assert_eq!(
+        state.attributes.get("read_identifier"),
+        Some(&Value::Concrete(ConcreteValue::String(identifier.into()))),
+    );
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into()))),
+    );
+    assert!(state.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "invalid-resumed-read-back";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let token = serde_json::json!({"phase": "read_back"}).to_string();
+    let pending = persisted_create_for_resume(&id, &token, None);
+    let resource = resource_with_string_attribute("test.resource", identity, "name", identity);
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+    let failure = provider
+        .provider()
+        .resume_create(request)
+        .await
+        .expect_err("identifier-less read-back is permanently invalid")
+        .into_kind();
+    let ResumeFailureKind::Ended(error) = failure else {
+        panic!("invalid read-back must end polling, got {failure:?}");
+    };
+    assert!(
+        error.to_string().contains("requires an identifier"),
+        "{error}"
+    );
+    assert_eq!(
+        error.detail().code.as_deref(),
+        Some("READ_BACK_WITHOUT_IDENTIFIER")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_create_read_back_budget_returns_partial_then_refresh_completes() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -2378,7 +2621,7 @@ async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_succes
         "resumed-read-back-partial",
         None,
     );
-    let token = serde_json::json!({ "phase": "read_back" }).to_string();
+    let token = serde_json::json!({"phase": "read_back"}).to_string();
     let pending = persisted_create_for_resume(&id, &token, Some("mock-id"));
     let resource = resource_with_int_attribute(
         "test.short_budget",
@@ -4950,6 +5193,107 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string("private-leaf"))));
+    let reference = root_resource_ref("peer", "identifier");
+    let resource = Resource::with_provider("mock", "test.normalize_leaf", "mixed", None)
+        .with_attribute("domain_name", string("example.com"))
+        .with_attribute(
+            "subject_alternative_names",
+            Value::Concrete(ConcreteValue::List(vec![
+                string("EXAMPLE.COM."),
+                string("WWW.EXAMPLE.COM."),
+                secret.clone(),
+                reference.clone(),
+            ])),
+        )
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([
+                    ("id".into(), secret.clone()),
+                    ("destination".into(), reference.clone()),
+                ])),
+            )])),
+        )
+        .with_attribute(
+            "alias_target",
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                ("dns_name".into(), string("target.example.com.")),
+                ("secret".into(), secret),
+                ("reference".into(), reference),
+                (
+                    "$carina_deferred".into(),
+                    Value::Concrete(ConcreteValue::Int(42)),
+                ),
+            ]))),
+        );
+    let mut resources = provider_resources(vec![resource]);
+    normalizer.normalize_desired(&mut resources).await.unwrap();
+    let Some(Value::Concrete(ConcreteValue::List(names))) =
+        resources[0].get_attr("subject_alternative_names")
+    else {
+        panic!()
+    };
+    assert_eq!(
+        names.len(),
+        3,
+        "known apex must be removed beside deferred leaves"
+    );
+    assert_eq!(names[0], string("www.example.com"));
+    assert!(
+        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.as_ref() == &string("private-leaf"))
+    );
+    assert!(matches!(
+        &names[2],
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+    ));
+    let Some(Value::Concrete(ConcreteValue::List(rules))) = resources[0].get_attr("rules") else {
+        panic!()
+    };
+    let Value::Concrete(ConcreteValue::Map(rule)) = &rules[0] else {
+        panic!()
+    };
+    let Some(Value::Concrete(ConcreteValue::Map(default))) = rule.get("delete_marker_replication")
+    else {
+        panic!("known rule must receive its default")
+    };
+    assert_eq!(default.get("status"), Some(&string("Disabled")));
+    assert!(matches!(
+        rule.get("id"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    assert!(matches!(
+        rule.get("destination"),
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+    ));
+    let Some(Value::Concrete(ConcreteValue::Map(alias))) = resources[0].get_attr("alias_target")
+    else {
+        panic!()
+    };
+    assert_eq!(alias.get("dns_name"), Some(&string("target.example.com")));
+    assert_eq!(
+        alias.get("$carina_deferred"),
+        Some(&Value::Concrete(ConcreteValue::Int(42)))
+    );
+    assert!(matches!(
+        alias.get("secret"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    assert!(matches!(
+        alias.get("reference"),
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wasm_normalize_desired_rejects_absent_required_together_attribute() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -4978,6 +5322,59 @@ async fn wasm_normalize_desired_rejects_absent_required_together_attribute() {
     assert_eq!(
         error.detail().context(),
         "test.normalize_required_together companion is required when primary is present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_wasm_normalize_desired_preserves_leaf_handles() {
+    let path = skip_if_no_http_wasm!();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("http-private".into()),
+    ))));
+    let reference = root_resource_ref("peer", "identifier");
+    let resource = Resource::with_provider("mock_http", "test.resource", "http-leaves", None)
+        .with_attribute("secret", secret.clone())
+        .with_attribute(
+            "items",
+            Value::Concrete(ConcreteValue::List(vec![reference.clone(), secret])),
+        )
+        .with_attribute(
+            "literal",
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "$carina_deferred".into(),
+                Value::Concrete(ConcreteValue::Int(0)),
+            )]))),
+        );
+    let mut resources = provider_resources(vec![resource]);
+    normalizer.normalize_desired(&mut resources).await.unwrap();
+    let Some(Value::Deferred(DeferredValue::Secret(inner))) = resources[0].get_attr("secret")
+    else {
+        panic!()
+    };
+    assert_eq!(
+        inner.as_ref(),
+        &Value::Concrete(ConcreteValue::String("http-private".into()))
+    );
+    let Some(Value::Concrete(ConcreteValue::List(items))) = resources[0].get_attr("items") else {
+        panic!()
+    };
+    assert_eq!(items[0], reference);
+    assert!(matches!(
+        &items[1],
+        Value::Deferred(DeferredValue::Secret(_))
+    ));
+    let Some(Value::Concrete(ConcreteValue::Map(literal))) = resources[0].get_attr("literal")
+    else {
+        panic!()
+    };
+    assert_eq!(
+        literal.get("$carina_deferred"),
+        Some(&Value::Concrete(ConcreteValue::Int(0)))
     );
 }
 
@@ -5540,14 +5937,16 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
             ConcreteValue::String(plaintext.into()),
         )))),
     );
-    let diff = carina_core::differ::diff(
-        &ResolvedResource::new(desired),
+    let diff = carina_core::differ::diff_for_test(
+        &ResolvedResource::new(desired.into_value_snapshot()),
         &states[&id],
         &saved_attrs,
         None,
         None,
-        &carina_core::differ::exact_comparison_context_for_tests(),
-    );
+        &carina_core::differ::exact_comparison_schema_for_tests(),
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
     assert!(
         !diff.is_change(),
         "refresh hydration of an unchanged write-only legacy secret must not plan an update: {diff:?}",
@@ -6208,4 +6607,66 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
         error.to_string().contains("satisfier_hint"),
         "the error must name the malformed export: {error}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_reference_batches_preserve_order_and_all_typed_outcomes() {
+    use carina_core::references::{ReferenceError, ReferenceOutcome, ReferenceRequest};
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let error = serde_json::json!({"kind":"api_error","message":"mock lookup diagnostic","code":"MockDenied","request_id":"request-123"});
+    let table = serde_json::json!({
+        "alias/live":{"Ok":{"Resolved":"key/a"}},
+        "gone":{"Ok":{"NotFound":error.clone()}},
+        "denied":{"Err":{"AccessDenied":error.clone()}},
+        "retry":{"Err":{"Transient":error.clone()}},
+        "invalid":{"Err":{"InvalidReference":error}},
+        "empty":{"Ok":{"Resolved":""}}
+    });
+    let attributes = indexmap::IndexMap::from([(
+        "reference_table".into(),
+        Value::Concrete(ConcreteValue::String(table.to_string().into())),
+    )]);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &attributes))
+        .await
+        .unwrap();
+    let requests = ["alias/live", "gone", "denied", "retry", "invalid", "empty"]
+        .into_iter()
+        .map(|value| ReferenceRequest {
+            ty: TypeIdentity::new(Some("mock"), ["keys", "Key"], "Reference"),
+            value: value.into(),
+        })
+        .collect::<Vec<_>>();
+    let results = provider
+        .provider()
+        .resolve_references(&requests)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), requests.len());
+    let mut results = results.into_iter();
+    assert!(matches!(
+        results.next().unwrap(),
+        Ok(ReferenceOutcome::Resolved(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Ok(ReferenceOutcome::NotFound(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::AccessDenied(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::Transient(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::InvalidReference(_))
+    ));
+    assert!(matches!(
+        results.next().unwrap(),
+        Err(ReferenceError::InvalidReference(_))
+    ));
 }

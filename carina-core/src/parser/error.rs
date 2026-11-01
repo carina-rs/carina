@@ -7,7 +7,6 @@ use crate::eval_value::EvalValueError;
 use std::path::{Path, PathBuf};
 
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
-pub const NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE: &str = "prevent_destroy uses a non-literal expression; only a literal `false` opts out of schema-default protection";
 
 /// A body kind that cannot be expanded after a deferred `for` iterable
 /// becomes known.
@@ -315,7 +314,6 @@ fn format_undefined_identifier(
 pub enum WarningKind {
     ProviderSchemasNotLoaded,
     DeferredFor,
-    NonLiteralPreventDestroy,
     SingleQuotedInterpolation,
     UnusedForBinding,
 }

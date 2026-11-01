@@ -81,10 +81,16 @@ A partition the instance cannot reach is `InvalidReference`, not a guess.
 Extend the [comparison projection](../../carina-core/src/resource/mod.rs)
 with exactly these rules:
 
-- Both sides concrete and byte-equal: equal, no lookup.
+- Both sides concrete and byte-equal: equal; the comparison needs no evidence.
 - Otherwise canonicalize each side: key ARN as-is; any other form through
-  `DescribeKey` to a key ARN. Compare ARNs.
+  its `DescribeKey` outcome to a key ARN. Compare ARNs.
 - Unknown/deferred on either side: existing unknown handling, no lookup.
+
+The comparator never calls the resolver itself; it reads outcomes prepared
+under D5. Preparation is not limited to the pairs the differ compares: after
+a first-pass miss it resolves every concrete reference value in the
+computation's inputs, then replays once. Only outcomes a comparison uses
+are judged under D6, including saved-side pairing of lists.
 
 SQS, SNS and S3 retain echoed aliases; KMS resolves them on every encrypt
 call, so the resource follows the alias. Identical raw aliases compare
@@ -96,23 +102,43 @@ Apply the same rules to saved/write-only fallbacks, preserving omission and
 ownership rules. Comparison ARNs never enter payloads, bindings/exports or
 state attributes.
 
-### D5. Prepare references before the differ; preserve deferred values
+### D5. Record comparison demands; preserve deferred values
 
-Core provides one async prepare step before the differ. The CLI invokes it
-after refresh, hydration, reference evaluation and normalization at the
-plan-input seam in [wiring](../../carina-cli/src/wiring/mod.rs). Resolve only
-leaves needing a lookup under D4. Batch by initialized provider instance;
-cache per run by `(provider instance, reference type identity, raw value)`.
+After refresh, hydration, reference evaluation and normalization, run the real
+planning computation in a recording session. This includes binding-stability
+passes, cascade planning and both detail-row rendering modes. When a concrete,
+non-byte-equal reference pair lacks evidence, the comparator records its operands
+at their resource paths and provisionally returns unequal.
+There is no separate walker enumerating pairs.
 
-Preparation returns a `ResolvedReferences` witness required by the
-differ/plan entry point. Every reference comparison caller, including
-binding-stability comparisons, uses this witness. Missing preparation for
-a needed pair is a typed error; no caller can compare a reference leaf as
-a plain string.
+If pass 1 records any miss, discard its provisional result and enumerate every
+concrete reference value in that computation's inputs: desired, current/read
+and saved leaves, including lists, binding-stability and cascade inputs,
+historical display operands and write-only fallbacks. Walk the masked, canonical
+comparison and display values by schema, not pairs.
+Resolve uncached values in one concurrent batch per initialized provider instance,
+checking positional lengths and nonempty successes. Replay that computation once.
+The limit is per computation: binding-stability, plan-with-cascades, display and
+apply augmentation each run at most one replay.
 
-Unknown/deferred leaves are never resolved and retain existing dependency
-and scheduling behavior. Apply executes effects; it does not re-diff
-materialized leaves or prepare them for comparison.
+Cache `Resolved`, `NotFound` or `Failed` by `(provider instance, reference type
+identity, raw value)`, including a failure for every value of a failed batch.
+Reuse cached outcomes, including `Failed`, for the rest of the invocation
+without retry. Only comparisons judge these outcomes under D6; unused outcomes
+produce no error or note. A miss after the replay is a typed internal `UnpreparedAfterReplay`
+error naming the resource, attribute path and redacted-safe raw value.
+
+The recording session returns only an opaque provisional result. Only a pass
+that records nothing releases its result and a `ResolvedReferences` witness.
+Provisional plans, rendering results and errors cannot escape that boundary.
+A clean first pass makes no resolver call and needs no replay. Secret values
+are never requested; a comparison that uses one returns the typed secret error.
+The typed traversal-depth check finishes before any guest call.
+
+Unknown/deferred leaves retain existing dependency and scheduling behavior.
+Apply-time augmentation uses the same rule in its own invocation, with a fresh
+cache for keys that become concrete or change after planning. Unchanged planned
+leaves keep their recorded decision.
 
 ### D6. Resolution failures are typed; only a dangling current value is a diff
 
@@ -120,13 +146,16 @@ The resolver's per-request outcome is a closed enum, and the comparison
 side decides what each case means:
 
 ```rust
-enum ReferenceOutcome { Resolved(KmsKeyArn), NotFound(ProviderError) }
+enum ReferenceOutcome { Resolved(CanonicalReference), NotFound(ProviderError) }
 enum ReferenceError {
     AccessDenied(ProviderError),   // AccessDeniedException, key policy denial
     Transient(ProviderError),      // throttling after retries, transport, 5xx, credentials
     InvalidReference(ProviderError), // malformed value, unreachable partition, non-ARN success
 }
 ```
+
+Core holds a provider-agnostic `CanonicalReference`; the guest validates `KmsKeyArn`.
+Cached states are `Resolved`, `NotFound` and `Failed`.
 
 | Case | Desired side | Current (read/state) side |
 |---|---|---|
@@ -137,18 +166,16 @@ enum ReferenceError {
 `NotFound` on the current side means the resource points at nothing; an
 error there would block the very update that repairs it, so it becomes a
 diff whose plan detail says the current reference no longer resolves.
-Every other failure aborts planning (exit 1): it says nothing about
-equality, and treating it as a difference would silently plan an update
+Every other failure aborts planning (exit 1) when a comparison uses it: it says
+nothing about equality, and treating it as a difference would silently plan an update
 or replacement, and treating it as equality would silently hide one.
-Denials and transient failures therefore never reach the differ.
+Unused lookup failures have no effect on planning.
 
-The types enforce this. `ResolvedReferences` stores
-`DesiredSide::Arn(KmsKeyArn)` and `CurrentSide::{Arn(KmsKeyArn), Dangling}`;
-the prepare step is the only constructor and returns `ReferenceError`
-(or `NotFound` for a desired value) as a typed plan error with its
-`#[source]` chain. The differ has no error case to fall back from, so a
-raw string comparison cannot be reached. Report provider instance,
-resource/path, reference and AWS code/request ID; no executable saved plan
+The types enforce this. Preparation stores per-value outcomes in
+`ResolvedReferences`; the comparator returns a typed plan error with its
+`#[source]` chain for a used failure or desired-side `NotFound`. Current/saved-only
+`NotFound` becomes dangling. No failed lookup falls back to raw equality.
+Report provider instance, resource/path, reference and AWS code/request ID; no executable saved plan
 on failure.
 
 Resolve `alias/aws/<svc>` with plain `DescribeKey`, including first-use
@@ -166,7 +193,8 @@ this permission is independent of advisory `--check-iam`.
 Normal `apply` re-plans with fresh resolution. Saved plans carry effects
 with raw payloads: a KMS target moving between plan and apply is ordinary
 cloud-side drift, like any other attribute, under the existing saved-plan
-contract. No saved-plan format change is needed.
+contract. Apply-time augmentation follows D5, including fresh preparation
+for newly concrete or changed leaves. No saved-plan format change is needed.
 
 ## Protocol
 
@@ -189,16 +217,17 @@ resolve-references: func(requests: list<reference-request>)
 ```
 
 Results are positional; the host retains resource/path fan-out and never
-sends unknown/deferred leaves. Reject length mismatches and `resolved`
-values that are not valid key ARNs (as `invalid-reference`). The outer
-error covers whole-call failure and aborts planning. The variants map
+sends unknown/deferred leaves. Core rejects length mismatches and empty
+`resolved` values (as `invalid-reference`). The shared guest resolver
+validates the canonical key ARN shape through its `KmsKeyArn` output type;
+core remains provider-agnostic. The outer error covers whole-call failure,
+cached per request as `Failed` and judged on use under D6. The variants map
 one-to-one onto D6's Rust enums; the guest classifies AWS error codes, so
 the host never parses error strings. The SDK default fails every request
 with `invalid-reference` naming the unsupported type identity.
 
-Use main's protocol version plus one at merge, advancing
-`MIN_SUPPORTED_PROTOCOL_VERSION` to match, with no shim. Main is 15 now;
-#4162 plans 16. Do not reserve a version.
+Use protocol v18 after merging main's v17 list uniqueness change (#4196),
+advancing `MIN_SUPPORTED_PROTOCOL_VERSION` to match, with no shim.
 
 ## Migration
 
@@ -224,12 +253,15 @@ requirement together.
 - **Core:** all three D4 rules, alias/ID/ARN equivalence, account/region
   distinctions, ARN-returning repoints, echoed-alias equality, saved/write-only
   fallbacks and unchanged raw values. Require the witness for differ and
-  binding-stability callers; missing needed entries are typed errors.
-  Every D6 table cell: desired `NotFound` and every `ReferenceError` abort
+  binding-stability callers. A first-pass miss resolves every concrete
+  reference value and replays exactly once; a miss after the replay is
+  `UnpreparedAfterReplay`. Failed batches are cached and not retried, and a
+  failure for a value no comparison uses does not fail planning.
+  Every D6 table cell: compared desired `NotFound` and `ReferenceError` abort
   planning with the source chain; current `NotFound` becomes a diff.
   Instance region/account scope for bare forms; ARN forms keep their own
   region/account and are never rewritten to the instance's.
-- **WASM/host:** positional batches, length mismatch, non-ARN success,
+- **WASM/host:** positional batches, length mismatch, empty success,
   unsupported defaults, error/timeout transport and cache isolation by
   instance/type/value. Unknowns and schema-only loading make no KMS calls;
   schema-only loading makes no credential requests.

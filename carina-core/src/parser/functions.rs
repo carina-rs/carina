@@ -8,7 +8,7 @@ use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
 use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
-use crate::eval_value::{BareStructuralHandle, EvalValue, StructuralHandleKind};
+use crate::eval_value::{BareStructuralHandle, EvalValue, UnexpandedStructuralHandleKind};
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind,
     Value as GenericValue,
@@ -418,9 +418,12 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
 
 fn function_argument_awaits_module_substitution(argument: &FunctionArgument) -> bool {
     argument.pending_parameter().is_some()
-        || argument
-            .handle()
-            .is_some_and(|handle| matches!(handle.kind(), StructuralHandleKind::ModuleParameter))
+        || argument.handle().is_some_and(|handle| {
+            matches!(
+                handle.kind(),
+                UnexpandedStructuralHandleKind::ModuleParameter
+            )
+        })
         || argument.value().is_some_and(contains_module_argument)
 }
 
@@ -485,7 +488,7 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
                     .value()
                     .is_some_and(|value| contains_module_argument_matching(value, predicate))
                 || argument.handle().is_some_and(|handle| {
-                    matches!(handle.kind(), StructuralHandleKind::ModuleParameter)
+                    matches!(handle.kind(), UnexpandedStructuralHandleKind::ModuleParameter)
                         && predicate(handle.canonical_binding().as_str())
                 })
         }),
@@ -895,7 +898,9 @@ pub(crate) fn lower_function_arguments(
 ) -> Result<Vec<FunctionArgument>, ParseError> {
     args.into_iter()
         .map(|argument| match argument {
-            EvalValue::StructuralHandle(handle) => Ok(FunctionArgument::from_handle(handle)),
+            EvalValue::UnexpandedStructuralHandle(handle) => {
+                Ok(FunctionArgument::from_handle(handle))
+            }
             argument => argument
                 .into_value()
                 .map(FunctionArgument::from_value)
@@ -1241,7 +1246,7 @@ fn substituted_function_argument<B: BindingAddress>(
         FunctionSubstitutionPosition::Value => Err(ParseError::from_eval_value(
             crate::eval_value::EvalValueError::BareStructuralHandle(BareStructuralHandle {
                 binding: name.to_string(),
-                kind: StructuralHandleKind::FunctionParameter,
+                kind: UnexpandedStructuralHandleKind::FunctionParameter,
             }),
             source_line,
         )),

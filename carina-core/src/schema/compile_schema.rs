@@ -23,6 +23,29 @@ impl PatternAttributeType<Draft> {
             AttrTypeKind::UnloadedSchemaType(unloaded) => {
                 AttrTypeKind::UnloadedSchemaType(unloaded)
             }
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => AttrTypeKind::Reference {
+                identity,
+                pattern: match pattern {
+                    Some(pattern) => match CompiledPattern::try_new(&pattern) {
+                        Ok(pattern) => Some(pattern),
+                        Err(error) => {
+                            issues.push(SchemaDefinitionIssue {
+                                path: location.to_string(),
+                                location,
+                                message: error.to_string(),
+                                pattern_error: Some(error),
+                            });
+                            return None;
+                        }
+                    },
+                    None => None,
+                },
+                length,
+            },
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -78,13 +101,13 @@ impl PatternAttributeType<Draft> {
             AttrTypeKind::List {
                 element_type,
                 ordered,
-                length,
+                constraints,
             } => AttrTypeKind::List {
                 element_type: Box::new(
                     element_type.compile_patterns(location.with_suffix("[]"), issues)?,
                 ),
                 ordered,
-                length,
+                constraints,
             },
             AttrTypeKind::Map { key, value } => {
                 let key = key.compile_patterns(location.with_suffix(".<key>"), issues);

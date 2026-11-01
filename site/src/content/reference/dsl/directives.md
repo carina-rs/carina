@@ -4,7 +4,7 @@ description: Carina-side lifecycle, ordering, routing, and change-ownership cont
 ---
 
 A `directives` block controls how Carina manages a resource. Directives are not
-resource attributes. In provider protocol 16, only delete requests carry the
+resource attributes. In provider protocol 19, only delete requests carry the
 resolved provider-visible directives; other request resource records do not
 transport authored directives.
 
@@ -23,15 +23,51 @@ cloud.storage.Bucket {
 | `force_delete` | `false` | Ask the provider to delete a resource even when it contains dependent data |
 | `create_before_destroy` | `false` | Create a replacement before destroying the existing resource |
 | `prevent_destroy` | resource schema (normally `false`) | Reject a plan that would destroy the resource |
-| `depends_on` | `[]` | Add ordering dependencies on sibling `let` bindings |
+| `depends_on` | `[]` | Add ordering dependencies on managed-resource handles |
 | `provider` | provider-kind default | Route the resource to a [named provider instance](/reference/dsl/syntax/#named-provider-instances) |
 | `ignore_changes` | `[]` | Leave selected, authored attribute paths under another system's control after creation |
+
+## `depends_on`
+
+Use `depends_on` when a provider attribute reference does not express all of
+the ordering a resource needs. Each list item must be a managed-resource
+handle, either a local binding or a resource-handle output from a module:
+
+```crn
+let record = aws.route53.RecordSet {
+  # ...
+}
+
+let records = use { source = './modules/records' }
+let producer = records {}
+
+aws.acm.CertificateValidation {
+  # ...
+
+  directives {
+    depends_on = [record, producer.validation_record]
+  }
+}
+```
+
+Carina resolves every operand to the target resource's complete,
+instance-qualified address before planning. A literal, resource attribute,
+value output, data source, provider, wait binding, or module call is not a
+valid dependency handle. Missing or wrong-kind targets are errors; Carina does
+not silently drop an edge.
+
+Dependencies are resource-specific and affect ordering only. Depending on a
+module call as a whole is not supported: that would wait for unrelated module
+resources, reduce parallelism, and create false cycles. If the selected
+resource is unchanged, the dependent resource remains unchanged and its
+values do not become “known after apply.” When the selected resource changes,
+the dependent effect is ordered after it.
 
 ## `prevent_destroy`
 
 A provider can mark a dangerous resource type as protected by default. When it
-does, omitting `prevent_destroy` keeps the protection enabled. To opt out, write
-the literal value explicitly:
+does, omitting `prevent_destroy` keeps the protection enabled. To opt out, set
+`prevent_destroy` to a value that resolves to `false`:
 
 ```crn
 directives {
@@ -53,11 +89,64 @@ protection for a removed resource also requires that resource's provider
 schema to be available. If the schema is unavailable, an unspecified removed
 resource is not protected by the schema default.
 
-A non-literal expression that resolves to `true` enables protection. Any other
-non-literal value is treated as unspecified and produces a warning, so it keeps
-any schema-default protection enabled. Only the literal `false` opts out of a
-schema default. An explicit `true` always enables protection, even for resource
-types whose schema default is false.
+The three boolean directives (`prevent_destroy`, `create_before_destroy`, and
+`force_delete`) accept expressions that resolve to a boolean,
+including local `let` values, `Bool` module arguments, and loop variables.
+Carina resolves module arguments after substitution and loop variables for
+each element when the loop expands:
+
+```crn
+arguments { flags: list(Bool) }
+
+for index, flag in flags {
+  mock.test.resource {
+    name = 'resource-${index}'
+    directives { prevent_destroy = flag }
+  }
+}
+```
+
+A resolved `false` explicitly disables
+`prevent_destroy`, including schema-default protection; an absent setting
+continues to use the schema default. A resolved `true` enables protection.
+
+For a type protected by its schema, a module argument's default cannot opt out
+of that protection. If `protect: Bool = false` supplies `prevent_destroy` and
+the caller omits `protect`, validation fails. The caller must pass the value
+explicitly, for example `module { protect = false }`.
+
+A value remains defaulted if **any** argument default contributes to it.
+Carina combines contributors through nested calls, conditional value expressions,
+coalescing, and user functions. A defaulted loop iterable contributes only to
+values that reference a loop variable, including arguments passed to another
+module. An explicit contributor does not erase another contributor's default
+origin. Diagnostics list every contributing default argument and point to the
+calls that omitted those arguments.
+
+A literal `prevent_destroy = false` stays explicit inside a loop, even when the
+iterable comes from a default. By contrast, `prevent_destroy = flag` over a
+defaulted list containing `false` requires an explicit caller value. A condition
+that selects whether a resource or module call exists does not contribute its
+origin to values inside that body; a literal opt-out there also stays explicit.
+
+An argument whose default refers to another argument still uses its own default.
+For example, with `first: Bool = false` and `protect: Bool = first`, passing only
+`first = false` leaves `protect` defaulted. Passing `protect = false` replaces
+that default expression explicitly. A literal `false` passed to an inner module
+is explicit when no other default contributes to the value.
+
+This restriction applies only to `prevent_destroy` on schema-protected types.
+
+Standalone module validation accepts a bare `Bool` argument or a bare loop
+variable over a `list(Bool)` or `map(Bool)` argument. Computed expressions that
+merely mention a Bool argument do not qualify for that exemption. Loop directive
+expressions must depend only on the current element and local values; resource,
+binding, upstream, unknown, coalesce, and value-level `if` dependencies are validation errors.
+
+Non-boolean values and expressions that remain deferred or unknown, such as
+resource output references, are validation errors. The error names the
+directive and its source location; Carina never substitutes a default for an
+unresolved expression.
 
 ## `ignore_changes`
 

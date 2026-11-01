@@ -52,6 +52,15 @@ impl MidRunStateWriter {
             }
         }
     }
+
+    /// Persist a graph-classified schema migration while the heartbeat owns
+    /// the same lock used by later incremental writes.
+    pub(crate) async fn write_schema_migration(
+        &self,
+        state: &mut StateFile,
+    ) -> Result<(), AppError> {
+        self.write_state(state).await
+    }
 }
 
 /// Proof that the background saver has stopped before final state is built.

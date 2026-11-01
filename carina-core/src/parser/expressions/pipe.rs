@@ -178,11 +178,11 @@ pub(crate) fn combine_coalesce_operands(
                 },
             )))
         }
-        EvalValue::ComputedWithStructuralHandles { value, metadata } => {
+        EvalValue::ComputedWithUnexpandedStructuralHandles { value, metadata } => {
             let default = default
                 .into_value()
                 .map_err(|error| ParseError::from_eval_value(error, line))?;
-            Ok(EvalValue::ComputedWithStructuralHandles {
+            Ok(EvalValue::ComputedWithUnexpandedStructuralHandles {
                 value: Value::Deferred(DeferredValue::Coalesce {
                     value: Box::new(value),
                     default: Box::new(default),

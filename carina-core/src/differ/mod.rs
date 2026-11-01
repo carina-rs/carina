@@ -6,19 +6,19 @@
 mod comparison;
 mod plan;
 
+use crate::resource::PersistedDirectives;
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 
 use crate::binding_index::ManagedBindingStability;
 use crate::effect::{MoveAuthority, ReleasedListKey, ReleasedListKeys};
 use crate::provider::{
-    LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, ProviderResult, ProviderRouter,
-    StateTransformMap,
+    LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, ProviderRouter, StateTransformMap,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, CanonicalComparisonAttributes, Current, Directives, PlanInputCurrent,
-    PlanInputDesired, PresentResourceState, ResolvedResource, Resource, ResourceId, State,
-    UnidentifiedState, Value, into_plan_input_current_map,
+    AbsoluteBindingAddress, CanonicalComparisonAttributes, Current, MaskedComparisonAttributes,
+    PlanInputCurrent, PlanInputDesired, PresentResourceState, ResolvedResource, Resource,
+    ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaRegistry, ValidatedResourceSchema,
@@ -29,8 +29,28 @@ use crate::schema::{
 pub use plan::create_plan_for_test;
 pub use plan::{
     CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice, PendingCascadePlan,
-    block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades,
+    ResolvedDeferredCreateTargets, block_deletes_on_prior_consumer_updates, create_plan,
+    create_plan_with_cascades,
 };
+
+/// Typed failures before a plan can become executable.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanComparisonError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Reference(#[from] Box<crate::references::ReferencePlanError>),
+    #[error(transparent)]
+    Resource(#[from] crate::resource::ResolvedResourceError),
+}
+
+impl From<crate::provider::ComparisonResolutionError> for PlanComparisonError {
+    fn from(error: crate::provider::ComparisonResolutionError) -> Self {
+        Self::Provider(error.into())
+    }
+}
+
+pub type PlanComparisonResult<T> = Result<T, PlanComparisonError>;
 
 struct PlanInputSavedAttributes {
     attributes: HashMap<ResourceId, CanonicalComparisonAttributes>,
@@ -81,7 +101,102 @@ pub fn managed_binding_stability(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     provider: &ProviderRouter,
-) -> ProviderResult<HashMap<ResourceId, ManagedBindingStability>> {
+    references: &crate::references::ResolvedReferences,
+) -> PlanComparisonResult<HashMap<ResourceId, ManagedBindingStability>> {
+    managed_binding_stability_for_resources(
+        managed.iter().map(ResolvedResource::as_resource),
+        current_states,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        provider,
+        references,
+    )
+}
+
+/// Compute the early binding-stability projection without pretending that
+/// authored dependency operands have crossed the expanded-graph boundary.
+///
+/// This pass runs before late anonymous identities exist. It resolves only
+/// schema-owned `ignore_changes` metadata; dependency operands stay in their
+/// unexpanded representation until [`crate::resolved_graph`] performs the one
+/// real address transition later in planning.
+///
+/// The outer result preserves lifecycle-path resolution errors while the inner
+/// provider result preserves comparison-capability errors.
+pub fn pre_graph_managed_binding_stability(
+    managed: &[Resource],
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    provider: &ProviderRouter,
+    references: &crate::references::ResolvedReferences,
+) -> Result<
+    PlanComparisonResult<HashMap<ResourceId, ManagedBindingStability>>,
+    crate::resource::ResolvedResourceError,
+> {
+    let PreGraphStabilityResources { resources, pending } =
+        prepare_pre_graph_stability_resources(managed, registry)?;
+    let stability = managed_binding_stability_for_resources(
+        resources.iter(),
+        current_states,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        provider,
+        references,
+    );
+    Ok(stability.map(|mut stability| {
+        stability.extend(pending);
+        stability
+    }))
+}
+
+pub(crate) struct PreGraphStabilityResources {
+    pub(crate) resources: Vec<Resource>,
+    pub(crate) pending: HashMap<ResourceId, ManagedBindingStability>,
+}
+
+/// Resolve only lifecycle paths for reference-aware pre-graph comparisons.
+/// Authored dependency operands retain their parser phase throughout replay.
+pub(crate) fn prepare_pre_graph_stability_resources(
+    managed: &[Resource],
+    registry: &SchemaRegistry,
+) -> Result<PreGraphStabilityResources, crate::resource::ResolvedResourceError> {
+    let mut pending = HashMap::new();
+    let mut schema_resolved = Vec::new();
+    for resource in managed {
+        if resource.id.identity_str().is_none() {
+            pending.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
+            continue;
+        }
+        let mut resource = resource.clone();
+        crate::resource::resolve_resource_ignore_changes(&mut resource, registry)?;
+        schema_resolved.push(resource);
+    }
+    Ok(PreGraphStabilityResources {
+        resources: schema_resolved,
+        pending,
+    })
+}
+
+pub(crate) fn managed_binding_stability_for_resources<'a, D: 'a + Clone>(
+    managed: impl IntoIterator<
+        Item = &'a Resource<
+            crate::resource::ModuleSource,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    >,
+    current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    provider: &ProviderRouter,
+    references: &crate::references::ResolvedReferences,
+) -> PlanComparisonResult<HashMap<ResourceId, ManagedBindingStability>> {
     let mut result = HashMap::new();
     let comparison_saved = PlanInputSavedAttributes::new(saved_attrs, registry);
     for resource in managed {
@@ -98,22 +213,36 @@ pub fn managed_binding_stability(
         let owner_schema = resolved_comparison.owner_schema();
         let context = resolved_comparison.context();
         let schema = owner_schema.schema();
-        let desired = PlanInputDesired::with_resource_schema(resource, Some(schema.as_schema()));
-        let changed_attributes = match diff_present_with_releases(
-            &desired,
-            present,
-            ExistingComparisonInputs {
-                current_attributes,
-                saved: comparison_saved.get(&resource.id),
-                nested_write_only: saved_attrs.nested_write_only(&resource.id),
-                prev_explicit: prev_explicit.get(&resource.id),
-                schema: Some(schema.as_schema()),
-                context,
-            },
-            schema,
-        )
-        .diff
-        {
+        let desired_attributes = CanonicalComparisonAttributes::canonicalize(
+            resource.resolved_attributes(),
+            schema.as_schema(),
+        );
+        let masked = resource.resolved_ignore_changes.mask_comparison_attributes(
+            &desired_attributes,
+            current_attributes,
+            comparison_saved.get(&resource.id),
+            Some(schema.as_schema()),
+        );
+        let diff = context.with_references(references, &resource.id, |context| {
+            diff_present_resource_with_releases(
+                resource,
+                &desired_attributes,
+                present,
+                ExistingComparisonInputs {
+                    masked: &masked,
+                    current_attributes,
+                    saved: comparison_saved.get(&resource.id),
+                    nested_write_only: saved_attrs.nested_write_only(&resource.id),
+                    prev_explicit: prev_explicit.get(&resource.id),
+                    schema: Some(schema.as_schema()),
+                    context,
+                    observations: &resolved_comparison.context().observation(),
+                },
+                schema,
+            )
+            .diff
+        })?;
+        let changed_attributes = match diff {
             PresentDiff::NoChange { .. } => {
                 result.insert(
                     resource.id.clone(),
@@ -128,7 +257,7 @@ pub fn managed_binding_stability(
         let changed_attributes = plan::filter_non_removable_removals(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.as_resource(),
+            resource,
             changed_attributes,
             registry,
         );
@@ -139,24 +268,22 @@ pub fn managed_binding_stability(
             );
             continue;
         }
-        let authored_views = comparison::project_authored_attribute_views(
-            desired.comparison_attributes(),
-            current_attributes,
-            comparison_saved.get(&resource.id),
-            prev_explicit.get(&resource.id),
-            Some(schema.as_schema()),
-            context,
-        );
-        if !plan::find_changed_create_only(
-            &changed_attributes,
-            authored_views.current(),
-            authored_views.removal_evidence(),
-            &desired,
-            schema.as_schema(),
-            context,
-        )
-        .is_empty()
-        {
+        if context.with_references(references, &resource.id, |context| {
+            let authored_views = comparison::project_authored_attribute_views(
+                &masked,
+                prev_explicit.get(&resource.id),
+                Some(schema.as_schema()),
+                context,
+            );
+            !plan::find_changed_create_only_for_resource(
+                &changed_attributes,
+                resource,
+                &authored_views,
+                schema.as_schema(),
+                context,
+            )
+            .is_empty()
+        })? {
             result.insert(resource.id.clone(), ManagedBindingStability::Unavailable);
             continue;
         }
@@ -184,14 +311,14 @@ pub fn managed_binding_stability(
 pub struct Orphan {
     current: Current,
     binding: Option<AbsoluteBindingAddress>,
-    directives: Directives,
+    directives: PersistedDirectives,
 }
 
 impl Orphan {
     pub fn absent(
         state: crate::resource::AbsentState,
         binding: Option<AbsoluteBindingAddress>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::Absent(state),
@@ -204,7 +331,7 @@ impl Orphan {
     pub(crate) fn from_state(
         state: State,
         binding: Option<AbsoluteBindingAddress>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::from_state(state),
@@ -216,7 +343,7 @@ impl Orphan {
     pub fn present(
         present: PresentResourceState,
         binding: Option<AbsoluteBindingAddress>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::Present(present),
@@ -228,7 +355,7 @@ impl Orphan {
     pub fn missing_identifier(
         state: UnidentifiedState,
         binding: Option<AbsoluteBindingAddress>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::MissingIdentifier(state),
@@ -240,7 +367,7 @@ impl Orphan {
     pub fn create_in_flight(
         pending: crate::provider::InFlightCreate,
         binding: Option<AbsoluteBindingAddress>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::CreateInFlight(pending),
@@ -252,7 +379,7 @@ impl Orphan {
     pub fn create_outcome_unknown(
         unknown: crate::provider::UnknownCreateOutcome,
         binding: Option<AbsoluteBindingAddress>,
-        directives: Directives,
+        directives: PersistedDirectives,
     ) -> Self {
         Self {
             current: Current::CreateOutcomeUnknown(unknown),
@@ -277,8 +404,19 @@ impl Orphan {
         self.binding.as_ref()
     }
 
-    pub fn directives(&self) -> &Directives {
+    pub fn directives(&self) -> &PersistedDirectives {
         &self.directives
+    }
+
+    /// Refresh graph-classified destroy metadata after a legacy state file
+    /// crosses the configuration-aware migration seam.
+    pub fn set_destroy_metadata(
+        &mut self,
+        dependencies: crate::resource::PersistedDestroyDependencies,
+        directives: PersistedDirectives,
+    ) {
+        self.current.set_dependency_bindings(dependencies);
+        self.directives = directives;
     }
 
     /// Project this persisted-only resource into the minimal desired-resource
@@ -286,24 +424,18 @@ impl Orphan {
     /// for its values; the projection exists only so a data-source input can
     /// resolve a binding that is no longer present in the configuration.
     pub fn binding_resource(&self) -> Resource {
-        let (attributes, dependency_bindings) = match &self.current {
-            Current::Absent(state) => (
-                &state.state().attributes,
-                &state.state().dependency_bindings,
-            ),
-            Current::Present(present) => (
-                &present.state().attributes,
-                &present.state().dependency_bindings,
-            ),
+        let attributes = match &self.current {
+            Current::Absent(state) => &state.state().attributes,
+            Current::Present(present) => &present.state().attributes,
             Current::CreateInFlight(_pending) => {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: self.directives.clone(),
+                    directives: self.directives.clone().into(),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
-                    dependency_bindings: Default::default(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
@@ -314,21 +446,18 @@ impl Orphan {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: self.directives.clone(),
+                    directives: (&self.directives).into(),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
-                    dependency_bindings: Default::default(),
+                    dependencies: Default::default(),
                     module_source: None,
                     default_tag_keys: Default::default(),
                     loop_provenance: Default::default(),
                     quoted_string_attrs: Default::default(),
                 };
             }
-            Current::MissingIdentifier(state) => (
-                &state.state().attributes,
-                &state.state().dependency_bindings,
-            ),
+            Current::MissingIdentifier(state) => &state.state().attributes,
         };
         Resource {
             id: self.current.id().clone(),
@@ -336,11 +465,11 @@ impl Orphan {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-            directives: self.directives.clone(),
+            directives: (&self.directives).into(),
             resolved_ignore_changes: Default::default(),
             prefixes: Default::default(),
             binding: self.binding.clone(),
-            dependency_bindings: dependency_bindings.clone(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -496,6 +625,19 @@ impl Orphans {
         self.by_id.get(id)
     }
 
+    pub fn set_destroy_metadata(
+        &mut self,
+        id: &ResourceId,
+        dependencies: crate::resource::PersistedDestroyDependencies,
+        directives: PersistedDirectives,
+    ) -> bool {
+        let Some(orphan) = self.by_id.get_mut(id) else {
+            return false;
+        };
+        orphan.set_destroy_metadata(dependencies, directives);
+        true
+    }
+
     pub(crate) fn get_mut(&mut self, id: &ResourceId) -> Option<&mut Orphan> {
         self.by_id.get_mut(id)
     }
@@ -600,12 +742,19 @@ impl<'a> PlanPriorStates<'a> {
         }
     }
 
-    fn materialize_current_states(
+    pub(crate) fn materialize_current_states(
         self,
         managed: &[ResolvedResource],
         registry: &crate::schema::SchemaRegistry,
     ) -> HashMap<ResourceId, PlanInputCurrent> {
-        let resources: Vec<Resource> = managed
+        let resources: Vec<
+            Resource<
+                crate::resource::ModuleSource,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                (),
+            >,
+        > = managed
             .iter()
             .map(|resource| resource.as_resource().clone())
             .collect();
@@ -624,9 +773,14 @@ impl<'a> PlanPriorStates<'a> {
     }
 }
 
-fn managed_orphan_provider_states(
+fn managed_orphan_provider_states<D>(
     orphans: &Orphans,
-    managed: &[Resource],
+    managed: &[Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
 ) -> HashMap<ResourceId, Current> {
     managed
         .iter()
@@ -851,26 +1005,64 @@ fn create_plan_for_tests(
     data_sources: &[crate::resource::DataSource],
     provider: &dyn crate::provider::Provider,
     current_states: &HashMap<ResourceId, crate::resource::PlanInputCurrent>,
-    directives_map: &HashMap<ResourceId, crate::resource::Directives>,
+    directives_map: &HashMap<ResourceId, crate::resource::PersistedDirectives>,
     registry: &crate::schema::SchemaRegistry,
     saved_attrs: &crate::provider::LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphans: &Orphans,
     wait_bindings: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
 ) -> crate::plan::Plan {
-    let managed =
-        ResolvedResource::collect_resolved_with_schemas(managed.iter().cloned(), registry)
-            .expect("differ test resources must have resolved identities and valid ignore paths");
+    let parsed = crate::parser::File::<
+        crate::parser::InferredExportParam<
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+        >,
+        crate::resource::NoPlaceholder,
+        crate::resource::LoopSlot,
+        crate::parser::ResolvedDeferredForPhase<
+            crate::resource::NoPlaceholder,
+            crate::resource::LoopSlot,
+            crate::resource::AbsoluteBindingAddress,
+        >,
+        crate::resource::AbsoluteBindingAddress,
+    > {
+        wait_bindings: wait_bindings.to_vec(),
+        ..Default::default()
+    };
+    let binding_index = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = managed.to_vec();
+        configuration.data_sources = data_sources.to_vec();
+        configuration.into()
+    })
+    .expect("differ test graph must resolve");
+    let managed = managed
+        .iter()
+        .cloned()
+        .map(|resource| binding_index.resolve_resource(resource, registry))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("differ test resources must have resolved dependencies");
+    let data_sources = data_sources
+        .iter()
+        .cloned()
+        .map(|data_source| binding_index.resolve_data_source(data_source))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("differ test data sources must have resolved dependencies");
+    let wait_bindings = wait_bindings
+        .iter()
+        .map(|wait| binding_index.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("differ test waits must have resolved dependencies");
     plan::create_plan_for_test(
         &managed,
-        data_sources,
+        &data_sources,
         provider,
         PlanPriorStates::new(current_states, orphans),
         directives_map,
         registry,
         saved_attrs,
         prev_explicit,
-        wait_bindings,
+        &wait_bindings,
     )
     .expect("differ test provider hints should succeed")
 }
@@ -882,16 +1074,24 @@ use crate::effect::Effect;
 use crate::plan::Plan;
 #[cfg(test)]
 use crate::schema::CompiledAttributeType as AttributeType;
-pub use comparison::ComparisonContext;
+pub use comparison::{
+    AuthoringComparison, AuthoringEquality, ComparisonContext, ComparisonSchema,
+    ObservationComparison, ObservationEquality, PlanningComparison, PlanningEquality,
+    ReferenceEquality,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub fn exact_comparison_context_for_tests() -> ComparisonContext<'static> {
-    use std::sync::LazyLock;
+pub fn exact_comparison_context_for_tests() -> ObservationComparison<'static> {
+    exact_comparison_schema_for_tests().observation()
+}
 
+#[cfg(any(test, feature = "test-utils"))]
+pub fn exact_comparison_schema_for_tests() -> ComparisonSchema<'static> {
+    use std::sync::LazyLock;
     static SCOPE: crate::provider::ReferenceScope = crate::provider::ReferenceScope::Unavailable;
     static FORMS: LazyLock<crate::schema::ReferenceForms> =
         LazyLock::new(crate::schema::ReferenceForms::new);
-    ComparisonContext::for_test(&SCOPE, &FORMS)
+    ComparisonSchema::for_test(&SCOPE, &FORMS)
 }
 
 #[cfg(test)]
@@ -899,12 +1099,16 @@ fn empty_lifted_saved_attrs() -> crate::provider::LiftedSavedAttrs {
     crate::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
 }
 
+#[cfg(test)]
+pub(crate) use comparison::ApplyTimeCreateOnlyChange;
+
 // Re-export comparison primitives for consumers that must agree with
 // `find_changed_attributes`: detail rows render with the same equality,
 // and executor patch construction uses the same key/value gate.
 pub(crate) use comparison::{
-    AttrComparison, LeafProvenance, TypedAttr, key_should_enter_patch,
-    key_should_enter_patch_with_ignores, secret_grafted_comparison_view, type_aware_equal,
+    ApplyTimeComparisonError, AttrComparison, LeafProvenance, OperandOrigins, RenderedChanges,
+    TypedAttr, find_apply_time_changed_attributes, key_should_enter_patch,
+    secret_grafted_comparison_view, type_aware_equal,
 };
 
 /// Returns true when `binding` is one direct child emitted by the deferred-for
@@ -939,12 +1143,24 @@ pub fn binding_matches_deferred_template<B: crate::resource::BindingAddress>(
 #[derive(Debug, Clone, PartialEq)]
 pub enum Diff {
     /// Resource does not exist -> needs creation
-    Create(Resource),
+    Create(
+        Resource<
+            crate::resource::ModuleSource,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >,
+    ),
     /// Resource exists with differences -> needs update
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: Resource,
+        to: Resource<
+            crate::resource::ModuleSource,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            (),
+        >,
         changed_attributes: Vec<String>,
     },
     /// Resource exists with no differences -> no action needed
@@ -960,11 +1176,18 @@ impl Diff {
     }
 }
 
-enum PresentDiff {
+enum PresentDiff<D = ()> {
     Update {
         id: ResourceId,
         from: Box<State>,
-        to: Box<Resource>,
+        to: Box<
+            Resource<
+                crate::resource::ModuleSource,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                D,
+            >,
+        >,
         changed_attributes: Vec<String>,
         ignored_readable_differences: usize,
     },
@@ -980,8 +1203,8 @@ pub(super) struct PlannedListKeyRelease {
     pub(super) keys: ReleasedListKeys,
 }
 
-struct PresentDiffResult {
-    diff: PresentDiff,
+struct PresentDiffResult<D = ()> {
+    diff: PresentDiff<D>,
     releases: Vec<PlannedListKeyRelease>,
 }
 
@@ -1180,12 +1403,14 @@ fn filter_explicit_list_elements(
 
 #[derive(Clone, Copy)]
 struct ExistingComparisonInputs<'a, 'context> {
+    masked: &'a MaskedComparisonAttributes,
     current_attributes: &'a CanonicalComparisonAttributes,
     saved: Option<&'a CanonicalComparisonAttributes>,
     nested_write_only: &'a NestedWriteOnlyRecord,
     prev_explicit: Option<&'a crate::explicit::ExplicitFields>,
     schema: Option<&'a ResourceSchema>,
-    context: &'a ComparisonContext<'context>,
+    context: &'a PlanningComparison<'context>,
+    observations: &'a ObservationComparison<'a>,
 }
 
 fn diff_present_with_releases(
@@ -1194,16 +1419,37 @@ fn diff_present_with_releases(
     inputs: ExistingComparisonInputs<'_, '_>,
     schema: &ValidatedResourceSchema,
 ) -> PresentDiffResult {
-    let releases = find_keyed_partial_update_releases(
+    diff_present_resource_with_releases(
+        desired.authored().as_resource(),
         desired.comparison_attributes(),
-        inputs.current_attributes,
-        inputs.saved,
+        current,
+        inputs,
+        schema,
+    )
+}
+
+fn diff_present_resource_with_releases<D: Clone>(
+    desired: &Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    desired_attributes: &CanonicalComparisonAttributes,
+    current: &PresentResourceState,
+    inputs: ExistingComparisonInputs<'_, '_>,
+    schema: &ValidatedResourceSchema,
+) -> PresentDiffResult<D> {
+    let releases = find_keyed_partial_update_releases(
+        inputs.masked.desired(),
+        inputs.masked.current(),
+        inputs.masked.saved(),
         inputs.prev_explicit,
         schema,
     );
     if releases.is_empty() {
         return PresentDiffResult {
-            diff: diff_present(desired, current, inputs),
+            diff: diff_existing_resource(desired, desired_attributes, current.state(), inputs),
             releases,
         };
     }
@@ -1211,6 +1457,7 @@ fn diff_present_with_releases(
     let mut filtered_current = inputs.current_attributes.clone();
     let mut filtered_saved = inputs.saved.cloned();
     let mut filtered_explicit = inputs.prev_explicit.cloned();
+    let mut filtered_masked = inputs.masked.clone();
     for release in &releases {
         let attribute = schema
             .effective_attribute(&release.attribute)
@@ -1222,6 +1469,9 @@ fn diff_present_with_releases(
             .iter()
             .map(ReleasedListKey::key)
             .collect::<HashSet<_>>();
+        filtered_masked.retain_observed_list_elements(&release.attribute, |element| {
+            keyed_element_key(element, key_field).is_none_or(|key| !released.contains(key))
+        });
         if let Some(value) = filtered_current.get_mut(&release.attribute) {
             remove_keys_from_list(value, key_field, &released);
         }
@@ -1242,10 +1492,12 @@ fn diff_present_with_releases(
         }
     }
 
-    let mut diff = diff_existing_state(
+    let mut diff = diff_existing_resource(
         desired,
+        desired_attributes,
         current.state(),
         ExistingComparisonInputs {
+            masked: &filtered_masked,
             current_attributes: &filtered_current,
             saved: filtered_saved.as_ref(),
             prev_explicit: filtered_explicit.as_ref(),
@@ -1261,31 +1513,42 @@ fn diff_present_with_releases(
     PresentDiffResult { diff, releases }
 }
 
-fn diff_present(
-    desired: &PlanInputDesired<'_>,
-    current: &PresentResourceState,
-    inputs: ExistingComparisonInputs<'_, '_>,
-) -> PresentDiff {
-    diff_existing_state(desired, current.state(), inputs)
-}
-
 fn diff_existing_state(
     desired: &PlanInputDesired<'_>,
     current: &State,
     inputs: ExistingComparisonInputs<'_, '_>,
 ) -> PresentDiff {
-    let authored = desired.authored();
+    diff_existing_resource(
+        desired.authored().as_resource(),
+        desired.comparison_attributes(),
+        current,
+        inputs,
+    )
+}
+
+fn diff_existing_resource<D: Clone>(
+    authored: &Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    desired_attributes: &CanonicalComparisonAttributes,
+    current: &State,
+    inputs: ExistingComparisonInputs<'_, '_>,
+) -> PresentDiff<D> {
     let changes = comparison::find_changed_attributes_with_ignores(
         comparison::AttributeValueViews::new(
-            desired.comparison_attributes(),
+            inputs.masked,
+            desired_attributes,
             inputs.current_attributes,
-            inputs.saved,
             inputs.nested_write_only,
         ),
         inputs.prev_explicit,
         inputs.schema,
-        authored.ignore_changes(),
+        &authored.resolved_ignore_changes,
         inputs.context,
+        inputs.observations,
     );
 
     if changes.changed.is_empty() {
@@ -1296,7 +1559,7 @@ fn diff_existing_state(
         PresentDiff::Update {
             id: authored.id.clone(),
             from: Box::new(current.clone()),
-            to: Box::new(authored.as_resource().clone()),
+            to: Box::new(authored.clone()),
             changed_attributes: changes.changed,
             ignored_readable_differences: changes.ignored_readable_differences,
         }
@@ -1316,41 +1579,129 @@ fn diff_existing_state(
 /// records when present; otherwise projection uses their legacy union. The
 /// authoring tree also drives explicit-removal detection for attributes the
 /// user previously wrote but no longer mentions.
-/// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
-/// case-insensitive enum matching).
+/// The owner-bound schema and reference witness are required, so every leaf
+/// uses its declared comparison semantics.
 ///
 /// Pending resources cannot enter the differ:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::differ::diff;
-/// use carina_core::provider::RawSavedAttrs;
+/// use carina_core::provider::{LiftedSavedAttrs, ResolvedComparison};
+/// use carina_core::differ::PlanningComparison;
 /// use carina_core::resource::{Resource, State};
-/// use carina_core::schema::SchemaRegistry;
 ///
-/// let resource = Resource::pending("test.Resource");
-/// let state = State::not_found(resource.id.clone());
-/// let saved = RawSavedAttrs::default().lift(&SchemaRegistry::new());
-/// let _ = diff(&resource, &state, &saved, None, None);
+/// fn pending(comparison: ResolvedComparison<'_>, context: &PlanningComparison<'_>,
+///     saved: &LiftedSavedAttrs) {
+///     let resource = Resource::pending("test.Resource");
+///     let state = State::not_found(resource.id.clone());
+///     let _ = diff(&resource, &state, saved, None, comparison, context);
+/// }
 /// ```
 ///
 /// Nested write-only provenance is a required planning input:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::differ::diff;
+/// use carina_core::provider::ResolvedComparison;
+/// use carina_core::differ::PlanningComparison;
 /// use carina_core::resource::{ResolvedResource, Resource, ResourceId, State};
 ///
-/// let resource = ResolvedResource::new(Resource::new("test.Resource", "example"));
-/// let state = State::not_found(ResourceId::with_identity("test.Resource", "example"));
-/// let _ = diff(&resource, &state, None, None, None);
+/// fn missing_provenance(comparison: ResolvedComparison<'_>, context: &PlanningComparison<'_>) {
+///     let resource = ResolvedResource::new(Resource::new("test.Resource", "example"));
+///     let state = State::not_found(ResourceId::with_identity("test.Resource", "example"));
+///     let _ = diff(&resource, &state, None, None, comparison, context);
+/// }
+/// ```
+/// An observation context cannot enter the planning differ:
+///
+/// ```compile_fail,E0308
+/// use carina_core::differ::{diff, ObservationComparison};
+/// use carina_core::provider::{LiftedSavedAttrs, ResolvedComparison};
+/// use carina_core::resource::{ResolvedResource, State};
+/// fn observation_cannot_plan(
+///     desired: &ResolvedResource, current: &State, saved: &LiftedSavedAttrs,
+///     schema: ResolvedComparison<'_>, observation: &ObservationComparison<'_>,
+/// ) {
+///     let _ = diff(desired, current, saved, None, schema, observation);
+/// }
 /// ```
 pub fn diff(
     desired: &ResolvedResource,
     current: &State,
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    comparison: crate::provider::ResolvedComparison<'_>,
+    context: &PlanningComparison<'_>,
+) -> PlanComparisonResult<Diff> {
+    let schema = comparison.owner_schema().schema();
+    diff_with_schema(
+        desired,
+        current,
+        saved_attrs,
+        prev_explicit,
+        schema,
+        context,
+        &comparison.context().observation(),
+    )
+}
+
+/// Explicit unschematized comparison support for focused fixtures only.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn diff_for_test(
+    desired: &ResolvedResource,
+    current: &State,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
-) -> Diff {
+    context_schema: &ComparisonSchema<'_>,
+    references: &crate::references::ResolvedReferences,
+) -> PlanComparisonResult<Diff> {
+    context_schema.with_references(references, &desired.id, |context| {
+        diff_with_comparison_schema(
+            desired,
+            current,
+            saved_attrs,
+            prev_explicit,
+            schema,
+            context,
+            &context_schema.observation(),
+        )
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_with_schema(
+    desired: &ResolvedResource,
+    current: &State,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: &ValidatedResourceSchema,
+    context: &PlanningComparison<'_>,
+    observations: &ObservationComparison<'_>,
+) -> PlanComparisonResult<Diff> {
+    diff_with_comparison_schema(
+        desired,
+        current,
+        saved_attrs,
+        prev_explicit,
+        Some(schema.as_schema()),
+        context,
+        observations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_with_comparison_schema(
+    desired: &ResolvedResource,
+    current: &State,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+    context: &PlanningComparison<'_>,
+    observations: &ObservationComparison<'_>,
+) -> PlanComparisonResult<Diff> {
     let current_attributes = match schema {
         Some(schema) => {
             CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)
@@ -1368,18 +1719,22 @@ pub fn diff(
                 crate::resource::UnschematizedComparisonAttributes::new(saved),
             ),
         });
-    diff_with_saved_parts(
+    let comparison_desired = PlanInputDesired::with_resource_schema(desired, schema);
+    let masked = comparison_desired.masked_comparison(&current_attributes, saved.as_ref(), schema);
+    Ok(diff_with_saved_parts(
         desired,
         current,
         ExistingComparisonInputs {
+            masked: &masked,
             current_attributes: &current_attributes,
             saved: saved.as_ref(),
             nested_write_only: saved_attrs.nested_write_only(&desired.id),
             prev_explicit,
             schema,
             context,
+            observations,
         },
-    )
+    ))
 }
 
 fn diff_with_saved_parts(
@@ -1415,7 +1770,7 @@ pub(crate) fn diff_test(
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    context: &ComparisonContext<'_>,
+    context_schema: &ComparisonSchema<'_>,
 ) -> Diff {
     let current_attributes = match schema {
         Some(schema) => {
@@ -1431,18 +1786,38 @@ pub(crate) fn diff_test(
             crate::resource::UnschematizedComparisonAttributes::new(saved),
         ),
     });
-    diff_with_saved_parts(
-        &ResolvedResource::new(desired.clone()),
-        current,
-        ExistingComparisonInputs {
-            current_attributes: &current_attributes,
-            saved: saved.as_ref(),
-            nested_write_only: &NestedWriteOnlyRecord::new(),
-            prev_explicit,
+    let resolved_desired = ResolvedResource::new(desired.clone().into_value_snapshot());
+    let comparison_desired = PlanInputDesired::with_resource_schema(&resolved_desired, schema);
+    let masked = resolved_desired
+        .ignore_changes()
+        .mask_comparison_attributes(
+            comparison_desired.comparison_attributes(),
+            &current_attributes,
+            saved.as_ref(),
             schema,
-            context,
-        },
-    )
+        );
+    context_schema
+        .with_references(
+            &crate::references::prepare_empty_for_tests(),
+            &desired.id,
+            |context| {
+                diff_with_saved_parts(
+                    &ResolvedResource::new(desired.clone().into_value_snapshot()),
+                    current,
+                    ExistingComparisonInputs {
+                        masked: &masked,
+                        current_attributes: &current_attributes,
+                        saved: saved.as_ref(),
+                        nested_write_only: &NestedWriteOnlyRecord::new(),
+                        prev_explicit,
+                        schema,
+                        context,
+                        observations: &context_schema.observation(),
+                    },
+                )
+            },
+        )
+        .expect("test differ requires prepared reference pairs")
 }
 
 #[cfg(test)]

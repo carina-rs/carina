@@ -3,8 +3,9 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
+use crate::resource::PersistedDirectives;
 use indexmap::IndexMap;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use crate::explicit::{ExplicitFields, PendingPaths};
 use crate::plan::{
@@ -14,7 +15,7 @@ use crate::plan::{
 use crate::resource::{
     AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
     ExpandedDirectives as Directives, ExpandedResource as Resource, ExpandedValue as Value,
-    RelativeBindingName, ResolvedResourceId, ResourceIdentity, RootScope,
+    RelativeBindingName, ResolvedResourceId, RootScope,
 };
 
 fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
@@ -34,7 +35,7 @@ fn diff_test(
         saved,
         prev_explicit,
         schema,
-        &super::exact_comparison_context_for_tests(),
+        &super::exact_comparison_schema_for_tests(),
     )
 }
 
@@ -44,6 +45,10 @@ fn existing_state(id: ResourceId, attributes: HashMap<String, Value>) -> State {
         .expect("fixture resource identity must be resolved")
         .to_string();
     State::existing(id, attributes).with_identifier(identifier)
+}
+
+fn resolved_id(id: &ResourceId) -> ResolvedResourceId {
+    ResolvedResourceId::try_new(id.clone()).expect("test resource identity must be resolved")
 }
 
 fn string_wait_schemas(provider: &str) -> SchemaRegistry {
@@ -382,7 +387,7 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
     let orphans = Orphans::from([Orphan::create_in_flight(
         pending,
         Some(absolute_binding("orphan")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
     let plan = create_plan(
         &[],
@@ -439,7 +444,7 @@ fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
     let orphans = Orphans::from([Orphan::create_outcome_unknown(
         unknown_create_outcome(orphan_id.clone()),
         Some(absolute_binding("orphan")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
     let orphan_plan = create_plan(
         &[],
@@ -485,7 +490,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
     let orphans = Orphans::from([Orphan::create_outcome_unknown(
         unknown_create_outcome(other_id.clone()),
         Some(absolute_binding("shared")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
     let managed = ResolvedResource::collect_resolved([imported]).unwrap();
     let (_import_effect, replacement) = Effect::import_replacing_outcome_unknown(
@@ -499,11 +504,13 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &desired,
         CascadeDependents::new(
             &managed,
-            DeferredCreateTargets::partition_for_expansion(
-                crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
-                |_| DeferredForExpansionChoice::Retain,
-            )
-            .1,
+            crate::test_support::resolved_targets(
+                DeferredCreateTargets::partition_for_expansion(
+                    crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
+                    |_| DeferredForExpansionChoice::Retain,
+                )
+                .1,
+            ),
         ),
         &[],
         &ProviderRouter::new(),
@@ -514,6 +521,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &HashMap::new(),
         &[],
         &HashSet::from([replacement]),
+        &crate::references::prepare_empty_for_tests(),
     )
     .unwrap()
     .finish(|_| {});
@@ -585,7 +593,14 @@ fn changed_provider_instance_rejects_resume() {
     );
 }
 
-fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
+fn provider_ready<S: Clone, D: Clone + Default>(
+    resource: crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = crate::schema::SchemaRegistry::new();
@@ -703,6 +718,7 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
         &saved,
         &HashMap::new(),
         &[],
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("plan comparison succeeds");
 
@@ -2340,7 +2356,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     ])));
     let distribution_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
     let distribution_state = existing_state(distribution_id.clone(), distribution_attrs.clone())
-        .with_root_dependency_bindings(BTreeSet::from(["web_acl".to_string()]));
+        .with_dependency_bindings(crate::test_support::persisted([resolved_id(&web_acl_id)]));
     let web_acl_state = existing_state(web_acl_id.clone(), HashMap::new())
         .with_identifier("arn:aws:wafv2:acl/test");
     let current_states = HashMap::from([(distribution_id.clone(), distribution_state)]);
@@ -2349,7 +2365,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     ))
     .lift(&SchemaRegistry::new());
     let prev_explicit = HashMap::from([(
-        distribution_id,
+        distribution_id.clone(),
         ExplicitFields::Struct {
             children: HashMap::from([(
                 "distribution_config".to_string(),
@@ -2365,7 +2381,7 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     let orphans = Orphans::from([Orphan::from_state(
         web_acl_state,
         Some(absolute_binding("web_acl")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -2426,13 +2442,14 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
     };
     assert_eq!(
         blocked_by_updates,
-        &HashSet::from([ResourceIdentity::new("distribution")])
+        &std::iter::once(resolved_id(&distribution_id)).collect()
     );
 }
 
 #[test]
 fn orphan_delete_uses_typed_binding_without_state_attribute() {
     let orphan_id = ResourceId::with_identity("example.Service", "removed-service");
+    let network_id = ResolvedResourceId::with_identity("example.Network", "network-id");
     let orphan_state = existing_state(
         orphan_id.clone(),
         HashMap::from([(
@@ -2441,7 +2458,7 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
         )]),
     )
     .with_identifier("service-123")
-    .with_root_dependency_bindings(BTreeSet::from(["network".to_string()]));
+    .with_dependency_bindings(crate::test_support::persisted([network_id.clone()]));
     assert!(
         orphan_state
             .attributes
@@ -2453,7 +2470,7 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
     let orphans = Orphans::from([Orphan::from_state(
         orphan_state,
         Some(absolute_binding("service")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -2490,7 +2507,7 @@ fn orphan_delete_uses_typed_binding_without_state_attribute() {
         binding.as_ref().map(AbsoluteBindingAddress::as_str),
         Some("service")
     );
-    assert_eq!(dependencies, &HashSet::from([absolute_binding("network")]));
+    assert_eq!(dependencies, &crate::test_support::persisted([network_id]));
 }
 
 #[test]
@@ -2508,7 +2525,7 @@ fn desired_resource_uses_same_id_orphan_as_its_current_state_without_explicit_pr
         )
         .with_identifier("service-123"),
         Some(absolute_binding("service")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     );
 
     let plan = create_plan(
@@ -2548,7 +2565,7 @@ fn orphan_collection_rekeys_index_and_provider_state_together() {
     let orphan = Orphan::from_state(
         existing_state(old_id.clone(), HashMap::new()),
         Some(absolute_binding("service")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     );
     let mut orphans: Orphans = [orphan].into_iter().collect();
 
@@ -2730,7 +2747,11 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
     let orphan_id = ResourceId::with_identity("example.Service", "removed-service");
     let orphan_state =
         existing_state(orphan_id.clone(), HashMap::new()).with_identifier("service-123");
-    let directives = Directives::default().with_depends_on(vec![absolute_binding("x")]);
+    let x = ResolvedResourceId::with_provider_identity("mock", "example.Dependency", "x", None);
+    let directives = PersistedDirectives::from_resolved(
+        &Directives::default(),
+        crate::test_support::persisted([x.clone()]),
+    );
     let orphans = Orphans::from([Orphan::from_state(
         orphan_state,
         Some(absolute_binding("service")),
@@ -2767,11 +2788,8 @@ fn orphan_delete_keeps_persisted_explicit_dependencies_without_binding_dependenc
     else {
         panic!("expected orphan Delete, got {delete:?}");
     };
-    assert_eq!(dependencies, &HashSet::from([absolute_binding("x")]));
-    assert_eq!(
-        explicit_dependencies,
-        &HashSet::from([absolute_binding("x")]),
-    );
+    assert_eq!(dependencies, &crate::test_support::persisted([x.clone()]));
+    assert_eq!(explicit_dependencies, &std::iter::once(x.clone()).collect(),);
 }
 
 #[test]
@@ -2800,12 +2818,13 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
             Value::Concrete(ConcreteValue::String("producer-old".into())),
         )]),
     )
-    .with_root_dependency_bindings(BTreeSet::from(["producer".to_string()]));
+    .with_dependency_bindings(crate::test_support::persisted([resolved_id(&producer_id)]));
     let current_states = HashMap::from([
         (producer_id.clone(), producer_state),
         (consumer_id.clone(), consumer_state),
     ]);
-    let prev_explicit = HashMap::from([(consumer_id, explicit_top_level(&["producer_id"]))]);
+    let prev_explicit =
+        HashMap::from([(consumer_id.clone(), explicit_top_level(&["producer_id"]))]);
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
@@ -2858,7 +2877,7 @@ fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
     };
     assert_eq!(
         blocked_by_updates,
-        &HashSet::from([ResourceIdentity::new("consumer-id")])
+        &std::iter::once(resolved_id(&consumer_id)).collect()
     );
 }
 
@@ -2868,7 +2887,6 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
     let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
     let consumer = Resource::new("example.Consumer", "consumer-id")
         .with_root_binding("consumer")
-        .with_root_dependency_bindings(BTreeSet::from(["dependency".to_string()]))
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let consumer_state = existing_state(
         consumer_id.clone(),
@@ -2877,32 +2895,40 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
             Value::Concrete(ConcreteValue::Int(1)),
         )]),
     )
-    .with_root_dependency_bindings(BTreeSet::from(["dependency".to_string()]));
+    .with_dependency_bindings(crate::test_support::persisted([resolved_id(
+        &dependency_id,
+    )]));
     let dependency_state =
         existing_state(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
     let current_states = HashMap::from([(consumer_id, consumer_state)]);
     let orphans = Orphans::from([Orphan::from_state(
         dependency_state,
         Some(absolute_binding("dependency")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
-    let plan = create_plan(
+    let consumer = crate::resource::ResolvedResource::from_resolved_parts(
+        consumer.into_value_snapshot(),
+        std::iter::once(resolved_id(&dependency_id)).collect(),
+        Default::default(),
+    );
+    let plan_input_current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &SchemaRegistry::new(),
+        &[],
+    );
+    let plan = super::plan::create_plan_for_test(
         &[consumer],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            current_states,
-            &crate::schema::SchemaRegistry::new(),
-            &[],
-        ),
+        crate::differ::PlanPriorStates::new(&plan_input_current, &orphans),
         &HashMap::new(),
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &orphans,
         &[],
-    );
+    )
+    .expect("resolved inverse-edge fixture plans");
 
     let delete = plan
         .effects()
@@ -2939,13 +2965,16 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
         existing_state(dependency_id.clone(), HashMap::new()).with_identifier("dependency-old");
     let current_states = HashMap::from([(consumer_id.clone(), consumer_state)]);
     let directives_map = HashMap::from([(
-        consumer_id,
-        Directives::default().with_depends_on(vec![absolute_binding("dependency")]),
+        consumer_id.clone(),
+        PersistedDirectives::from_resolved(
+            &Directives::default(),
+            crate::test_support::persisted([resolved_id(&dependency_id)]),
+        ),
     )]);
     let orphans = Orphans::from([Orphan::from_state(
         dependency_state,
         Some(absolute_binding("dependency")),
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -2978,7 +3007,7 @@ fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
     };
     assert_eq!(
         blocked_by_updates,
-        &HashSet::from([ResourceIdentity::new("consumer-id")])
+        &std::iter::once(resolved_id(&consumer_id)).collect()
     );
 }
 
@@ -4169,7 +4198,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id.clone(), attrs),
         None,
-        Directives::default().with_prevent_destroy(true),
+        crate::resource::PersistedDirectives::default().with_prevent_destroy(true),
     )]);
 
     let plan = create_plan(
@@ -4218,7 +4247,7 @@ fn schema_default_prevent_destroy_blocks_orphan_delete_when_schema_is_available(
     let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id.clone(), HashMap::new()),
         None,
-        Directives::default(),
+        PersistedDirectives::default(),
     )]);
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -4262,7 +4291,7 @@ fn unspecified_orphan_without_a_registered_schema_keeps_existing_delete_behavior
     let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id, HashMap::new()),
         None,
-        Directives::default(),
+        PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -4630,7 +4659,7 @@ fn without_prevent_destroy_delete_works_normally() {
     let orphans = Orphans::from([Orphan::from_state(
         existing_state(orphan_id, attrs),
         None,
-        Directives::default(),
+        crate::resource::PersistedDirectives::default(),
     )]);
 
     let plan = create_plan(
@@ -4677,7 +4706,8 @@ fn prevent_destroy_collects_multiple_errors() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
     );
-    let prevent_destroy = Directives::default().with_prevent_destroy(true);
+    let prevent_destroy =
+        crate::resource::PersistedDirectives::default().with_prevent_destroy(true);
     let orphans = Orphans::from([
         Orphan::from_state(
             existing_state(first_id, attrs1),
@@ -4730,7 +4760,8 @@ fn wait_binding_lowers_to_wait_effect() {
     // emitted only when it gates a real downstream change.
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, consumer];
 
@@ -4744,7 +4775,7 @@ fn wait_binding_lowers_to_wait_effect() {
             rhs: Value::Concrete(ConcreteValue::String("ready".into())),
         },
         timeout_secs: Some(75 * 60),
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
@@ -4776,7 +4807,7 @@ fn wait_binding_lowers_to_wait_effect() {
         .find(|e| e.is_wait())
         .expect("expected Wait effect");
     let Effect::Wait {
-        identity,
+        id,
         target_id,
         until,
         until_surface,
@@ -4786,7 +4817,7 @@ fn wait_binding_lowers_to_wait_effect() {
     else {
         unreachable!();
     };
-    assert_eq!(identity.as_str(), "cert_issued");
+    assert_eq!(id.identity_str(), "cert_issued");
     assert_eq!(target_id.id().identity_str(), "cert");
     assert_eq!(target_id.id().resource_type(), "acm.Certificate");
     assert_eq!(
@@ -4808,7 +4839,8 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
     let job = Resource::new("job.Job", "job").with_root_binding("job");
     let mut consumer = Resource::new("job.Consumer", "consumer").with_root_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("job_ready"));
     let wait = WaitBinding {
         binding: absolute_binding("job_ready"),
@@ -4820,7 +4852,7 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
             rhs: Value::Concrete(ConcreteValue::enum_identifier("ready")),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
@@ -4866,7 +4898,8 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
     let mut consumer = Resource::with_provider("aws", "consumer.Thing", "consumer", None)
         .with_root_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("cert_renewed"));
     let wait = WaitBinding {
         binding: absolute_binding("cert_renewed"),
@@ -4882,7 +4915,7 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
             )),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
     let renewal_status = PatternAttributeType::enum_(
@@ -4955,7 +4988,8 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
         .with_root_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("job_ready"));
     let wait = WaitBinding {
         binding: absolute_binding("job_ready"),
@@ -4967,7 +5001,7 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
             rhs: Value::Concrete(ConcreteValue::String("ready".into())),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
     let mut schemas = SchemaRegistry::new();
@@ -5029,7 +5063,8 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
         .with_root_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("job_ready"));
     let wait = WaitBinding {
         binding: absolute_binding("job_ready"),
@@ -5041,7 +5076,7 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
             rhs: Value::Concrete(ConcreteValue::enum_identifier("test.job.Job.Status.ready")),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
     let status = PatternAttributeType::enum_(
@@ -5142,7 +5177,8 @@ let renewed = wait cert {
     let mut consumer = Resource::with_provider("aws", "consumer.Thing", "consumer", None)
         .with_root_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("renewed"));
     let wait = WaitBinding {
         binding: absolute_binding("renewed"),
@@ -5157,7 +5193,7 @@ let renewed = wait cert {
             )),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
     let plan = create_plan(
@@ -5192,7 +5228,7 @@ let renewed = wait cert {
 }
 
 #[test]
-fn data_source_wait_is_a_plan_error_and_emits_no_wait_effect() {
+fn data_source_wait_is_rejected_at_the_expanded_graph_boundary() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
     use crate::resource::ExpandedDataSource as DataSource;
 
@@ -5203,7 +5239,8 @@ fn data_source_wait_is_a_plan_error_and_emits_no_wait_effect() {
     let mut consumer = Resource::with_provider("test", "consumer.Thing", "consumer", None)
         .with_root_binding("consumer");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("lookup_found"));
     let wait = WaitBinding {
         binding: absolute_binding("lookup_found"),
@@ -5217,36 +5254,31 @@ fn data_source_wait_is_a_plan_error_and_emits_no_wait_effect() {
             )),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
-    let plan = create_plan(
-        &[identity_collision, consumer],
-        &[lookup],
-        &HintProvider { hints: Vec::new() },
-        &HashMap::new(),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &Orphans::new(),
-        &[wait],
-    );
-
-    assert_eq!(plan.errors().len(), 1);
+    let resources = vec![identity_collision, consumer];
+    let data_sources = vec![lookup];
+    let mut parsed: crate::parser::ExpandedParsedFile = Default::default();
+    parsed.wait_bindings.push(wait.clone());
+    let error = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect_err("a data source cannot be a wait target");
     assert!(
         matches!(
-            &plan.errors()[0].kind,
-            PlanErrorKind::WaitTargetIsDataSource {
-                wait_binding,
-                target,
-            } if wait_binding == "lookup_found" && target == "lookup"
+            &error,
+            crate::resolved_graph::ExpandedGraphResolutionError::DataSourceHandle {
+                owner,
+                reference,
+            } if owner == "wait 'lookup_found'" && reference == "lookup"
         ),
-        "expected a data-source target error, got: {:?}",
-        plan.errors()
+        "expected a data-source target error, got: {error:?}"
     );
-    assert!(!plan.effects().iter().any(Effect::is_wait));
 }
 
 #[test]
@@ -5258,7 +5290,8 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
     // create_plan legitimately skips emitting or lowering the wait.
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, consumer];
 
@@ -5272,7 +5305,7 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
@@ -5345,7 +5378,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
             .expect("plan fixture crosses the module-resolution seam")
         },
     )
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("plan fixture contains no parser placeholders");
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("validation_records".to_string())],
@@ -5377,7 +5410,18 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         unreachable!();
     };
     assert!(
-        explicit_dependencies.contains(&absolute_binding("validation_records")),
+        explicit_dependencies.contains(&ResolvedResourceId::new(
+            parsed
+                .resources
+                .iter()
+                .find(|r| r
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| b.as_str() == "validation_records"))
+                .expect("hint target row")
+                .id
+                .clone()
+        )),
         "provider satisfier hint should add validation_records; got {explicit_dependencies:?}"
     );
 }
@@ -5392,7 +5436,8 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
     let dependency = Resource::new("route53.RecordSet", "record").with_root_binding("something");
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dependency, consumer];
     let wait = WaitBinding {
@@ -5405,7 +5450,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: None,
-        depends_on: vec![absolute_binding("something")],
+        depends_on: vec![absolute_binding("something")].into(),
         line: 1,
     };
     let provider = HintProvider {
@@ -5438,7 +5483,19 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
         unreachable!();
     };
     assert_eq!(explicit_dependencies.len(), 1);
-    assert!(explicit_dependencies.contains(&absolute_binding("something")));
+    assert!(
+        explicit_dependencies.contains(&ResolvedResourceId::new(
+            resources
+                .iter()
+                .find(|r| r
+                    .binding
+                    .as_ref()
+                    .is_some_and(|b| b.as_str() == "something"))
+                .expect("hint target row")
+                .id
+                .clone()
+        ))
+    );
 }
 
 #[test]
@@ -5451,7 +5508,8 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     // something (carina#3101).
     let mut consumer = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
     consumer
-        .dependency_bindings
+        .dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, consumer];
 
@@ -5478,7 +5536,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
@@ -5509,7 +5567,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
 }
 
 #[test]
-fn wait_with_unknown_target_emits_plan_error() {
+fn wait_with_unknown_target_is_rejected_at_the_expanded_graph_boundary() {
     use crate::parser::{UntilPredicateAst, WaitBinding};
 
     let resources: Vec<Resource> = vec![];
@@ -5527,33 +5585,28 @@ fn wait_with_unknown_target_emits_plan_error() {
             rhs: Value::Concrete(ConcreteValue::enum_identifier("ISSUED")),
         },
         timeout_secs: None,
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
-    let plan = create_plan(
-        &resources,
-        &[],
-        &HintProvider { hints: Vec::new() },
-        &HashMap::new(),
-        &HashMap::new(),
-        &SchemaRegistry::new(),
-        &empty_lifted_saved_attrs(),
-        &HashMap::new(),
-        &Orphans::new(),
-        &[wait],
-    );
-    assert!(
-        !plan.errors().is_empty(),
-        "missing-target wait should surface a plan error"
-    );
+    let mut parsed: crate::parser::ExpandedParsedFile = Default::default();
+    parsed.wait_bindings.push(wait.clone());
+    let error = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources.clone();
+        configuration.data_sources = Vec::new();
+        configuration.into()
+    })
+    .expect_err("missing wait target must fail graph resolution");
     assert!(
         matches!(
-            &plan.errors()[0].kind,
-            PlanErrorKind::WaitTargetMissing { target, .. } if target == "nonexistent"
+            &error,
+            crate::resolved_graph::ExpandedGraphResolutionError::MissingDependency {
+                owner,
+                reference,
+            } if owner == "wait 'cert_issued'" && reference == "nonexistent"
         ),
-        "error should retain the missing target, got: {:?}",
-        plan.errors()[0]
+        "error message should mention the missing target, got: {error}"
     );
 }
 
@@ -5568,7 +5621,8 @@ fn wait_omitted_when_all_consumers_unchanged() {
 
     let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
-    dist.dependency_bindings
+    dist.dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
@@ -5600,7 +5654,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
@@ -5641,7 +5695,8 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     // `dist` is new (absent from managed current state) → Create → mutating.
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
-    dist.dependency_bindings
+    dist.dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
@@ -5655,7 +5710,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
     let schemas = string_wait_schemas("");
@@ -5674,9 +5729,9 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     );
 
     assert!(
-        plan.effects().iter().any(
-            |e| matches!(e, Effect::Wait { identity, .. } if identity.as_str() == "cert_issued")
-        ),
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { id, .. } if id.identity_str() == "cert_issued")),
         "carina#3101: the wait must still be emitted when a consumer \
          has a pending change (carina#3085/#3061 not regressed); \
          effects were {:?}",
@@ -5707,7 +5762,8 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     // dist is new (absent from managed current state) → Create → mutating.
     // It references the wait binding, so the wait "gates a pending change".
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
-    dist.dependency_bindings
+    dist.dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
@@ -5735,7 +5791,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
             )),
         },
         timeout_secs: Some(60),
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
 
@@ -5804,7 +5860,8 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     // post-apply.
     let cert = Resource::new("acm.Certificate", "cert").with_root_binding("cert");
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
-    dist.dependency_bindings
+    dist.dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
@@ -5818,7 +5875,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
     let schemas = string_wait_schemas("");
@@ -5837,9 +5894,9 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     );
 
     assert!(
-        plan.effects().iter().any(
-            |e| matches!(e, Effect::Wait { identity, .. } if identity.as_str() == "cert_issued")
-        ),
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { id, .. } if id.identity_str() == "cert_issued")),
         "carina#3358: the wait must still be emitted when its target is \
          changing in this plan (cached state is stale); effects were {:?}",
         plan.effects()
@@ -5868,7 +5925,8 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
             Value::Concrete(ConcreteValue::String("new.example.com".into())),
         );
     let mut dist = Resource::new("cloudfront.Distribution", "dist").with_root_binding("dist");
-    dist.dependency_bindings
+    dist.dependencies
+        .value_bindings
         .insert(absolute_binding("cert_issued"));
     let resources = vec![cert, dist];
 
@@ -5901,7 +5959,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
             rhs: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         timeout_secs: Some(60),
-        depends_on: vec![],
+        depends_on: Default::default(),
         line: 1,
     };
     let schemas = string_wait_schemas("");
@@ -5935,9 +5993,9 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         plan.effects()
     );
     assert!(
-        plan.effects().iter().any(
-            |e| matches!(e, Effect::Wait { identity, .. } if identity.as_str() == "cert_issued")
-        ),
+        plan.effects()
+            .iter()
+            .any(|e| matches!(e, Effect::Wait { id, .. } if id.identity_str() == "cert_issued")),
         "carina#3358: the wait must still be emitted when an existing \
          (Known) target has a pending Update, even though its cached \
          state satisfies the predicate; effects were {:?}",

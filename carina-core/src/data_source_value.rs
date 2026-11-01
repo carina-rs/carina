@@ -54,16 +54,28 @@ impl DataSourceValue {
 /// paired `(DataSource, DataSourceValue)` entries and cannot observe a query
 /// that is absent from both the read-state and deferred sets.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DataSourceValues<S = ModuleSource> {
-    data_sources: Vec<DataSource<S>>,
+pub struct DataSourceValues<S = ModuleSource, D = crate::resource::UnexpandedDependencyFields> {
+    data_sources: Vec<DataSource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, D>>,
     values: Vec<DataSourceValue>,
 }
 
-impl<S: Clone> DataSourceValues<S> {
+impl<S: Clone, D: Clone> DataSourceValues<S, D> {
     /// Build a total collection by classifying every configured data source.
     pub fn from_data_sources(
-        data_sources: &[DataSource<S>],
-        mut value_for: impl FnMut(&DataSource<S>) -> DataSourceValue,
+        data_sources: &[crate::resource::DataSource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >],
+        mut value_for: impl FnMut(
+            &crate::resource::DataSource<
+                S,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                D,
+            >,
+        ) -> DataSourceValue,
     ) -> Self {
         Self {
             data_sources: data_sources.to_vec(),
@@ -75,8 +87,20 @@ impl<S: Clone> DataSourceValues<S> {
     /// boundaries. An error aborts construction; it cannot produce a partial
     /// collection.
     pub fn try_from_data_sources<E>(
-        data_sources: &[DataSource<S>],
-        mut value_for: impl FnMut(&DataSource<S>) -> Result<DataSourceValue, E>,
+        data_sources: &[crate::resource::DataSource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >],
+        mut value_for: impl FnMut(
+            &crate::resource::DataSource<
+                S,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                D,
+            >,
+        ) -> Result<DataSourceValue, E>,
     ) -> Result<Self, E> {
         let values = data_sources
             .iter()
@@ -96,11 +120,20 @@ impl<S: Clone> DataSourceValues<S> {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&DataSource<S>, &DataSourceValue)> {
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &DataSource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, D>,
+            &DataSourceValue,
+        ),
+    > {
         self.data_sources.iter().zip(&self.values)
     }
 
-    pub fn data_sources(&self) -> &[DataSource<S>] {
+    pub fn data_sources(
+        &self,
+    ) -> &[DataSource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, D>] {
         &self.data_sources
     }
 
@@ -201,7 +234,11 @@ impl<S: Clone> DataSourceValues<S> {
             return Err(BlockedDataSourceValuesError { blocked });
         }
         Ok(ExecutableDataSourceValues {
-            data_sources: self.data_sources,
+            data_sources: self
+                .data_sources
+                .into_iter()
+                .map(DataSource::into_value_snapshot)
+                .collect(),
             values,
         })
     }
@@ -221,7 +258,7 @@ enum ExecutableDataSourceValue {
 /// accepted by the executor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutableDataSourceValues<S = ModuleSource> {
-    data_sources: Vec<DataSource<S>>,
+    data_sources: Vec<DataSource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, ()>>,
     values: Vec<ExecutableDataSourceValue>,
 }
 

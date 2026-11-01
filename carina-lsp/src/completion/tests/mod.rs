@@ -443,13 +443,6 @@ impl ProviderFactory for EnumShadowFactory {
         Ok(())
     }
 
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,

@@ -276,6 +276,97 @@ fn type_completion_item(label: String, detail: String, range: Range) -> Completi
 }
 
 impl CompletionProvider {
+    pub(super) fn module_handle_dot_completions(
+        &self,
+        text: &str,
+        position: Position,
+        base_path: Option<&Path>,
+    ) -> Option<Vec<CompletionItem>> {
+        let line = text.lines().nth(position.line as usize)?;
+        let prefix = line
+            .chars()
+            .take(position.character as usize)
+            .collect::<String>();
+        let token_start = prefix
+            .char_indices()
+            .rev()
+            .find_map(|(index, character)| {
+                (!character.is_alphanumeric() && character != '_' && character != '.')
+                    .then_some(index + character.len_utf8())
+            })
+            .unwrap_or(0);
+        let token = &prefix[token_start..];
+        let segments = token.split('.').collect::<Vec<_>>();
+        if segments.len() != 3
+            || segments[0].is_empty()
+            || segments[1].is_empty()
+            || !segments.iter().all(|segment| {
+                segment
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+            })
+        {
+            return None;
+        }
+        let call_binding = segments[0];
+        let output_name = segments[1];
+
+        let mut merged = String::new();
+        let source = DslSource::resolve_directory(text, base_path, &mut merged);
+        let (_, rhs) = Self::extract_let_bindings(source)
+            .into_iter()
+            .find(|(binding, _)| binding == call_binding)?;
+        if self.extract_resource_type(&rhs).is_some() {
+            return None;
+        }
+        let call_expression = rhs
+            .split(|character: char| character.is_whitespace() || character == '{')
+            .find(|segment| !segment.is_empty())?;
+        let header = format!("let {call_binding} = {call_expression} {{");
+        let module_name = crate::enclosing_block::named_module_call_name(header.trim())?;
+        let parsed = self.load_called_module(module_name, text, base_path)?;
+        let output = parsed
+            .attribute_params
+            .iter()
+            .find(|attribute| attribute.name == output_name)?;
+        let resource_type = output
+            .value
+            .as_ref()
+            .and_then(carina_core::parser::BoundaryExpression::handle)
+            .map(|handle| handle.resource_type().to_string())
+            .or_else(|| match output.static_type.as_ref() {
+                Some(TypeExpr::Ref(path)) => Some(path.to_string()),
+                Some(TypeExpr::DottedUnresolved(path))
+                    if self.lookup_schema(&path.to_string()).is_some() =>
+                {
+                    Some(path.to_string())
+                }
+                Some(TypeExpr::DottedUnresolved(_)) => None,
+                Some(
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::UnloadedSchemaType(_)
+                    | TypeExpr::List(_)
+                    | TypeExpr::Map(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_)
+                    | TypeExpr::Union(_),
+                )
+                | None => None,
+            })?;
+        let start_character = prefix[..token_start].chars().count() as u32;
+        Some(self.binding_attribute_completions(
+            &format!("{call_binding}.{output_name}"),
+            &resource_type,
+            Range::new(Position::new(position.line, start_character), position),
+        ))
+    }
+
     pub(super) fn attribute_completions_for_type(
         &self,
         resource_type: &str,
@@ -409,10 +500,8 @@ impl CompletionProvider {
         // schema lookup but using different matching strategies:
         //
         //   - Resource bindings: each binding's resource schema is queried
-        //     directly. A field is offered when its `Custom`-type name
-        //     equals the target attribute's `Custom`-type name. This is a
-        //     string compare — adequate because both ends sit inside the
-        //     compiled provider schema and share a closed type vocabulary.
+        //     directly. Directional schema assignability is shared with
+        //     validation, including string outputs flowing into references.
         //
         //   - `upstream_state` bindings (#2353): exports are declared by
         //     the user with a `TypeExpr` that lives in a different type
@@ -439,9 +528,12 @@ impl CompletionProvider {
                     }
                     if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
                         for binding_attr in binding_schema.as_schema().attributes().values() {
-                            if let Some(binding_type_name) =
-                                Self::extract_custom_type_name(binding_attr.attr_type())
-                                && binding_type_name == target_name
+                            if binding_schema
+                                .as_schema()
+                                .type_in_schema(binding_attr.attr_type())
+                                .is_assignable_to(
+                                    schema.as_schema().type_in_schema(attr_schema.attr_type()),
+                                )
                             {
                                 let full_ref = format!("{}.{}", binding_name, binding_attr.name());
                                 completions.push(CompletionItem {
@@ -791,7 +883,12 @@ impl CompletionProvider {
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
         match attr_type.shape_ref_free() {
             Ok(Shape::UnloadedSchemaType(unloaded)) => Some(&unloaded.identity().kind),
-            Ok(Shape::String {
+            Ok(Shape::Reference {
+                identity: id,
+                pattern: _,
+                length: _,
+            })
+            | Ok(Shape::String {
                 identity: Some(id), ..
             })
             | Ok(Shape::Int {
@@ -1085,6 +1182,7 @@ impl CompletionProvider {
                 // invalid traversal targets for v1 ignore paths.
                 Shape::Map { .. }
                 | Shape::Union
+                | Shape::Reference { .. }
                 | Shape::String { .. }
                 | Shape::Int { .. }
                 | Shape::Float { .. }
@@ -1825,7 +1923,7 @@ impl CompletionProvider {
     /// directory-scoped [`DslSource`] so exports in `exports.crn` can
     /// reference bindings declared in a sibling `main.crn`
     /// (see #2043 follow-up).
-    fn resource_ref_completions_for_type(
+    pub(super) fn resource_ref_completions_for_type(
         &self,
         target: TypeInSchema<'_, carina_core::schema::Compiled>,
         text: &str,
@@ -2471,7 +2569,7 @@ fn return_type_fits(
             to_dsl: None,
             ..
         } => matches!(ret, R::String | R::Any),
-        Shape::String { .. } => false,
+        Shape::Reference { .. } | Shape::String { .. } => false,
         Shape::Int { .. } => matches!(ret, R::Int | R::Any),
         // No built-in currently returns a Bool; leave as unfit.
         Shape::Bool => false,

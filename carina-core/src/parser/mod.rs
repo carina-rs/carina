@@ -8,6 +8,8 @@ mod blocks;
 mod config;
 mod context;
 mod deferred_if;
+mod dependencies;
+pub use dependencies::{UnexpandedDependencies, UnexpandedDependencyOperand};
 mod entry;
 mod error;
 mod expressions;
@@ -52,17 +54,17 @@ pub(crate) type ParserValidationBlock =
 pub(crate) type ParserRequireBlock =
     ast::RequireBlock<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
 
-pub use crate::eval_value::StructuralHandleKind;
+pub use crate::eval_value::{UnexpandedResourceHandle, UnexpandedStructuralHandleKind};
 pub use crate::resource::RelativeBindingName;
 pub use ast::{
     ArgumentOrigin, ArgumentParameter, AttributeParameter, AttributePath, AttributePathSegment,
     AuthoredArgumentRef, BackendConfig, BareBindingKind, BareBindingUse, BindingScopeId,
-    BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, CallExpansion,
-    ConsumerArgumentParameter, ConsumerAttributeParameter, DeferredForBody,
-    DeferredForExpansionError, DeferredForExpression, DeferredForPhaseTraversal, DeferredForSite,
-    DeferredForTarget, DeferredForTemplateAddress, DeferredForTemplateResource,
-    ExpandedBackendConfig, ExpandedDeferredForExpression, ExpandedFile,
-    ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedExportParam,
+    BindingUseOwner, BoundDeferredTarget, BoundDeferredTargetError, BoundaryExpression,
+    CallExpansion, CompiledDeferredForExpression, ConsumerArgumentParameter,
+    ConsumerAttributeParameter, DeferredForBody, DeferredForExpansionError, DeferredForExpression,
+    DeferredForPhaseTraversal, DeferredForSite, DeferredForTarget, DeferredForTemplateAddress,
+    DeferredForTemplateResource, ExpandedBackendConfig, ExpandedDeferredForExpression,
+    ExpandedFile, ExpandedInferredExportParam, ExpandedInferredFile, ExpandedParsedExportParam,
     ExpandedParsedFile, ExpandedProviderConfig, ExpandedStateBlock, ExpandedUpstreamState,
     ExpansionKey, ExportParamLike, ExportParameter, File, FnParam, InferredExportParam,
     InferredFile, IntoExpandedExportParam, ModuleArgument, ModuleCall, ModuleCallDiagnosticSource,
@@ -79,8 +81,8 @@ pub use ast::{
     ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub(crate) use ast::{
-    BareBindingSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
-    ParsedDeferredForIterableState, ParsedDeferredForParts,
+    BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
+    ParsedDeferredForIterableState, ParsedDeferredForParts, UnexpandedCompositionAttribute,
 };
 pub(crate) use config::ProviderCustomTypeSource;
 pub use config::{
@@ -93,9 +95,11 @@ pub use config::{
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
 pub use deferred_if::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, DeferredValueIf};
 pub use entry::{
-    AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse_file, parse_file_and_resolve,
-    parse_provider_factory_declarations, top_level_anonymous_resource_spans,
-    top_level_backend_block_spans, top_level_exports_block_spans, top_level_state_block_spans,
+    AnonymousResourceSourceSpan, AttributeValueSourceSpans, LetBindingSourceSpans, SourceSpanIndex,
+    TopLevelBlockSourceSpan, attribute_value_source_span, attribute_value_source_spans, parse_file,
+    parse_file_and_resolve, parse_provider_factory_declarations,
+    top_level_anonymous_resource_spans, top_level_backend_block_spans,
+    top_level_exports_block_spans, top_level_let_binding_spans, top_level_state_block_spans,
     top_level_upstream_state_spans,
 };
 pub(crate) use entry::{
@@ -110,8 +114,8 @@ pub(crate) use entry::{
 };
 pub use error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
-    NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE, ParseError, ParseWarning, ParseWarningSpan,
-    SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE, UnresolvedTypeToken, WarningKind,
+    ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
+    UnresolvedTypeToken, WarningKind,
 };
 pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,
@@ -168,5 +172,6 @@ pub(crate) use static_eval::{
 #[cfg(test)]
 mod tests;
 
+pub(crate) use ast::resolve_loop_directive_value;
 #[cfg(test)]
 pub(crate) use types::bare_type_for_test;

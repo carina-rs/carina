@@ -292,7 +292,6 @@ const LEGACY_ENUM_KEY: &str = "Enum";
 #[derive(Clone, Copy)]
 enum JsonEncoding {
     /// Provider/function JSON: preserve user keys and send enum API values.
-    #[cfg(any(test, feature = "test-utils"))]
     Ordinary,
     /// State/export JSON: reserve `$` keys and retain canonical enum identity.
     Persisted,
@@ -303,7 +302,6 @@ enum JsonEncoding {
 impl JsonEncoding {
     fn context(self) -> SerializationContext {
         match self {
-            #[cfg(any(test, feature = "test-utils"))]
             Self::Ordinary => SerializationContext::ValueToJson,
             Self::Persisted => SerializationContext::StateWriteback,
             Self::LegacySecretMaterial => SerializationContext::SecretRedaction,
@@ -702,7 +700,6 @@ fn value_to_json_inner(
             Ok(serde_json::Value::String(s.to_string()))
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => match encoding {
-            #[cfg(any(test, feature = "test-utils"))]
             JsonEncoding::Ordinary => Ok(serde_json::Value::String(c.api_value().to_string())),
             JsonEncoding::Persisted => Ok(canonical_enum_to_json(c, PERSISTED_ENUM_KEY)),
             JsonEncoding::LegacySecretMaterial => Ok(canonical_enum_to_json(c, LEGACY_ENUM_KEY)),
@@ -2732,8 +2729,14 @@ fn attributes_contain_redacted_secret<'a, P: PlaceholderKind + 'a, B: BindingAdd
     values.into_iter().any(contains_redacted_secret)
 }
 
-fn deferred_template_contains_redacted_secret<S, P, T>(
-    template: &crate::parser::DeferredForExpression<S, P, T>,
+fn deferred_template_contains_redacted_secret<S, P, T, D>(
+    template: &crate::parser::DeferredForExpression<
+        S,
+        P,
+        T,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> bool
 where
     P: PlaceholderKind,
@@ -2754,11 +2757,11 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
         }
         UnresolvedSavedEffect::Create(resource)
         | UnresolvedSavedEffect::ResumeCreate { resource, .. } => {
-            attributes_contain_redacted_secret(resource.attributes.values())
+            attributes_contain_redacted_secret(resource.as_resource().attributes.values())
         }
         UnresolvedSavedEffect::Update { from, to, .. } => {
             attributes_contain_redacted_secret(from.attributes.values())
-                || attributes_contain_redacted_secret(to.attributes.values())
+                || attributes_contain_redacted_secret(to.as_resource().attributes.values())
         }
         UnresolvedSavedEffect::Import { identifier, .. } => contains_redacted_secret(identifier),
         UnresolvedSavedEffect::ReleaseListKeys { keys, .. } => keys
@@ -2828,7 +2831,7 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             .iter()
             .any(|key| contains_redacted_secret(key.retained_value())),
         Effect::Wait {
-            identity: _identity,
+            id: _id,
             target_id: _target_id,
             until,
             until_surface: _until_surface,
@@ -2842,6 +2845,7 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
         Effect::DeferredReplace(payload) => {
             let crate::effect::DeferredReplacePayload {
                 deletes: _deletes,
+                dependency_template: _dependency_template,
                 template,
             } = payload.as_ref();
             deferred_template_contains_redacted_secret(template)
@@ -3770,9 +3774,22 @@ pub fn redact_secrets_in_attributes(
 }
 
 /// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
-pub fn redact_secrets_in_resource(
-    resource: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SerializationError> {
+pub fn redact_secrets_in_resource<S: Clone, D: Clone>(
+    resource: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> Result<
+    crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SerializationError,
+> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |_, value| {
         redact_secrets_in_value(value)
     })?;
@@ -3784,10 +3801,23 @@ pub fn redact_secrets_in_resource(
 
 /// Redact desired secrets while reusing matching persisted digests at the
 /// same nested paths.
-pub fn redact_secrets_in_resource_reusing_persisted_hashes(
-    resource: &crate::resource::Resource,
+pub fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
+    resource: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     persisted: &crate::provider::PersistedAttributes,
-) -> Result<crate::resource::Resource, SerializationError> {
+) -> Result<
+    crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SerializationError,
+> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| {
         match persisted.encoded_value(key) {
             Some(previous) => redact_with_guide(
@@ -3808,10 +3838,28 @@ pub fn redact_secrets_in_resource_reusing_persisted_hashes(
 /// stay exactly as they appear in the effect: replacement creates may carry a
 /// temporary name, and cascade updates may deliberately retain unresolved
 /// references for apply-time resolution.
-fn redact_resource_using_redacted_shape(
-    resource: &crate::resource::Resource,
-    guide: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SerializationError> {
+fn redact_resource_using_redacted_shape<S: Clone, D: Clone, T, E>(
+    resource: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    guide: &crate::resource::Resource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+) -> Result<
+    crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SerializationError,
+> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| match guide
         .attributes
         .get(key)
@@ -3828,10 +3876,28 @@ fn redact_resource_using_redacted_shape(
 /// Redact an authored resource by pairing it with the evaluator's resource at
 /// the same identity. Attribute names form the first path segment; nested
 /// paths are handled by [`redact_secrets_using_evaluated`].
-pub fn redact_secrets_in_resource_using_evaluated(
-    source: &crate::resource::Resource,
-    evaluated: &crate::resource::Resource,
-) -> Result<crate::resource::Resource, SerializationError> {
+pub fn redact_secrets_in_resource_using_evaluated<S: Clone, D: Clone, T, E>(
+    source: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    evaluated: &crate::resource::Resource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+) -> Result<
+    crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SerializationError,
+> {
     let attributes =
         redact_attrs_with_guide(source.attributes.iter(), |key, value| {
             match evaluated.attributes.get(key) {
@@ -3846,10 +3912,28 @@ pub fn redact_secrets_in_resource_using_evaluated(
 }
 
 /// Restore every placeholder in a resource from a freshly evaluated resource.
-pub fn rehydrate_resource_secrets<S: Clone, T>(
-    saved: &crate::resource::Resource<S>,
-    evaluated: &crate::resource::Resource<T>,
-) -> Result<crate::resource::Resource<S>, SecretRehydrationSiteError> {
+pub fn rehydrate_resource_secrets<S: Clone, D: Clone, T, E>(
+    saved: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    evaluated: &crate::resource::Resource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+) -> Result<
+    crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SecretRehydrationSiteError,
+> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3865,9 +3949,22 @@ pub fn rehydrate_resource_secrets<S: Clone, T>(
 }
 
 /// Redact all secrets in a [`DataSource`](crate::resource::DataSource).
-pub fn redact_secrets_in_data_source(
-    resource: &crate::resource::DataSource,
-) -> Result<crate::resource::DataSource, SerializationError> {
+pub fn redact_secrets_in_data_source<S: Clone, D: Clone>(
+    resource: &crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> Result<
+    crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SerializationError,
+> {
     let attributes = redact_attrs_with_guide(resource.attributes.iter(), |_, value| {
         redact_secrets_in_value(value)
     })?;
@@ -3877,10 +3974,28 @@ pub fn redact_secrets_in_data_source(
     })
 }
 
-pub fn redact_secrets_in_data_source_using_evaluated(
-    source: &crate::resource::DataSource,
-    evaluated: &crate::resource::DataSource,
-) -> Result<crate::resource::DataSource, SerializationError> {
+pub fn redact_secrets_in_data_source_using_evaluated<S: Clone, D: Clone, T, E>(
+    source: &crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    evaluated: &crate::resource::DataSource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+) -> Result<
+    crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SerializationError,
+> {
     let attributes =
         redact_attrs_with_guide(source.attributes.iter(), |key, value| {
             match evaluated.attributes.get(key) {
@@ -3894,10 +4009,28 @@ pub fn redact_secrets_in_data_source_using_evaluated(
     })
 }
 
-pub fn rehydrate_data_source_secrets<S: Clone, T>(
-    saved: &crate::resource::DataSource<S>,
-    evaluated: &crate::resource::DataSource<T>,
-) -> Result<crate::resource::DataSource<S>, SecretRehydrationSiteError> {
+pub fn rehydrate_data_source_secrets<S: Clone, D: Clone, T, E>(
+    saved: &crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    evaluated: &crate::resource::DataSource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+) -> Result<
+    crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SecretRehydrationSiteError,
+> {
     let mut resource = saved.clone();
     for (key, saved_value) in &saved.attributes {
         if let Some(value) = rehydrate_secret_entry(
@@ -3945,9 +4078,11 @@ pub fn redact_secrets_in_live_composition(
         .signature
         .attributes
         .iter()
-        .map(|(k, attr)| {
-            redact_secrets_in_value(&attr.to_value())
-                .map(|value| (k.clone(), attr.with_value(value)))
+        .map(|(k, attr)| match attr.value() {
+            Some(value) => {
+                redact_secrets_in_value(&value).map(|value| (k.clone(), attr.with_value(value)))
+            }
+            None => Ok((k.clone(), attr.clone())),
         })
         .collect();
     let mut out = resource.clone();
@@ -4017,7 +4152,7 @@ pub fn rehydrate_saved_composition_secrets(
             .signature
             .attributes
             .get(key)
-            .map(crate::resource::LiveCompositionAttribute::to_value);
+            .and_then(crate::resource::LiveCompositionAttribute::value);
         let value = rehydrate_secret_entry(
             &saved_value,
             evaluated_value.as_ref(),
@@ -4049,9 +4184,14 @@ pub fn redact_secrets_in_state(
 
 /// Redact provider plaintext in a state using the corresponding desired
 /// resource as the secret-shape authority.
-pub fn redact_secrets_in_state_using_resource(
+pub fn redact_secrets_in_state_using_resource<D>(
     state: &crate::resource::State,
-    desired: &crate::resource::Resource,
+    desired: &crate::resource::Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
 ) -> Result<crate::resource::State, SerializationError> {
     let attributes = redact_attrs_with_guide(state.attributes.iter(), |key, value| match desired
         .attributes
@@ -4174,8 +4314,8 @@ pub fn rehydrate_state_secrets_from_plaintext(
 }
 
 fn redact_deferred_template(
-    template: &crate::parser::DeferredForExpression,
-) -> Result<crate::parser::DeferredForExpression, SerializationError> {
+    template: &crate::parser::CompiledDeferredForExpression,
+) -> Result<crate::parser::CompiledDeferredForExpression, SerializationError> {
     let mut redacted = template.clone();
     redacted.iterable = redact_secrets_only(&template.iterable)?;
     *redacted.template_attributes_mut() = template
@@ -4193,18 +4333,16 @@ pub fn redact_secrets_in_effect(
     use crate::effect::{DeferredCreatePayload, DeferredReplacePayload, Effect};
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
-            resource: crate::resource::ResolvedDataSource::new(redact_secrets_in_data_source(
-                resource,
-            )?),
+            resource: resource.replace_inner(redact_secrets_in_data_source(resource)?),
         },
-        Effect::Create(resource) => Effect::Create(crate::resource::ResolvedResource::new(
-            redact_secrets_in_resource(resource)?,
-        )),
+        Effect::Create(resource) => {
+            Effect::Create(resource.replace_inner(redact_secrets_in_resource(resource)?))
+        }
         Effect::ResumeCreate {
             resource,
             started_at,
         } => Effect::ResumeCreate {
-            resource: crate::resource::ResolvedResource::new(redact_secrets_in_resource(resource)?),
+            resource: resource.replace_inner(redact_secrets_in_resource(resource)?),
             started_at: started_at.clone(),
         },
         Effect::Update {
@@ -4215,7 +4353,7 @@ pub fn redact_secrets_in_effect(
         } => Effect::Update {
             from: Box::new(redact_secrets_in_state(from)?),
             identifier: identifier.clone(),
-            to: crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?),
+            to: to.replace_inner(redact_secrets_in_resource(to)?),
             changed_attributes: changed_attributes.clone(),
         },
         Effect::Delete {
@@ -4273,10 +4411,12 @@ pub fn redact_secrets_in_effect(
         Effect::Wait { .. } => effect.clone(),
         Effect::DeferredCreate(payload) => Effect::DeferredCreate(DeferredCreatePayload::new(
             Box::new(redact_deferred_template(&payload.template)?),
+            payload.dependency_template.clone(),
         )),
         Effect::DeferredReplace(payload) => {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                 deletes: payload.deletes.clone(),
+                dependency_template: payload.dependency_template.clone(),
                 template: Box::new(redact_deferred_template(&payload.template)?),
             }))
         }
@@ -4287,7 +4427,8 @@ pub fn redact_secrets_in_effect(
 pub fn redact_secrets_in_plan(
     plan: &crate::plan::Plan,
 ) -> Result<crate::plan::Plan, SerializationError> {
-    redact_secrets_in_plan_with_desired_and_historical(plan, &HashMap::new(), &HashMap::new())
+    let planned_resources: HashMap<_, crate::resource::Resource> = HashMap::new();
+    redact_secrets_in_plan_with_desired_and_historical(plan, &planned_resources, &HashMap::new())
 }
 
 fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resource::ResourceId>> {
@@ -4310,9 +4451,17 @@ fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resour
         .collect()
 }
 
-pub fn redact_secrets_in_plan_with_desired_and_historical(
+pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
     plan: &crate::plan::Plan,
-    planned_resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
+    planned_resources: &HashMap<
+        crate::resource::ResourceId,
+        crate::resource::Resource<
+            crate::resource::ModuleSource,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    >,
     historical: &HashMap<crate::resource::ResourceId, crate::resource::State>,
 ) -> Result<crate::plan::Plan, SerializationError> {
     let reusable_resource = |id: &crate::resource::ResourceId| {
@@ -4326,14 +4475,14 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
         .iter()
         .map(|effect| {
             let mut effect = match effect {
-                crate::effect::Effect::Create(resource) => match reusable_resource(&resource.id) {
-                    Some(planned) => {
-                        crate::effect::Effect::Create(crate::resource::ResolvedResource::new(
+                crate::effect::Effect::Create(resource) => {
+                    match reusable_resource(&resource.id) {
+                        Some(planned) => crate::effect::Effect::Create(resource.replace_inner(
                             redact_resource_using_redacted_shape(resource, planned)?,
-                        ))
+                        )),
+                        None => redact_secrets_in_effect(effect)?,
                     }
-                    None => redact_secrets_in_effect(effect)?,
-                },
+                }
                 crate::effect::Effect::Update {
                     from,
                     identifier,
@@ -4343,12 +4492,10 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                     from: Box::new(redact_secrets_in_state(from)?),
                     identifier: identifier.clone(),
                     to: match reusable_resource(&to.id) {
-                        Some(planned) => crate::resource::ResolvedResource::new(
-                            redact_resource_using_redacted_shape(to, planned)?,
-                        ),
-                        None => {
-                            crate::resource::ResolvedResource::new(redact_secrets_in_resource(to)?)
+                        Some(planned) => {
+                            to.replace_inner(redact_resource_using_redacted_shape(to, planned)?)
                         }
+                        None => to.replace_inner(redact_secrets_in_resource(to)?),
                     },
                     changed_attributes: changed_attributes.clone(),
                 },
@@ -4446,9 +4593,8 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     )
                 })?;
                 Ok(Effect::Read {
-                    resource: crate::resource::ResolvedDataSource::new(
-                        rehydrate_data_source_secrets(resource, fresh)?,
-                    ),
+                    resource: resource
+                        .replace_inner(rehydrate_data_source_secrets(resource, fresh)?),
                 })
             }
             Effect::Create(resource) => {
@@ -4461,7 +4607,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                         SecretRehydrationError::ShapeMismatch,
                     )
                 })?;
-                Ok(Effect::Create(crate::resource::ResolvedResource::new(
+                Ok(Effect::Create(resource.replace_inner(
                     rehydrate_resource_secrets(resource, fresh)?,
                 )))
             }
@@ -4483,9 +4629,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                 Ok(Effect::Update {
                     from: from.clone(),
                     identifier: identifier.clone(),
-                    to: crate::resource::ResolvedResource::new(rehydrate_resource_secrets(
-                        to, fresh,
-                    )?),
+                    to: to.replace_inner(rehydrate_resource_secrets(to, fresh)?),
                     changed_attributes: changed_attributes.clone(),
                 })
             }
@@ -4505,12 +4649,14 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                 let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
                 Ok(Effect::DeferredCreate(DeferredCreatePayload::new(
                     Box::new(template),
+                    payload.dependency_template.clone(),
                 )))
             }
             Effect::DeferredReplace(payload) => {
                 let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
                 Ok(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes: payload.deletes.clone(),
+                    dependency_template: payload.dependency_template.clone(),
                     template: Box::new(template),
                 })))
             }
@@ -4528,9 +4674,9 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
 }
 
 fn rehydrate_deferred_template<S: Clone, T>(
-    saved: &crate::parser::DeferredForExpression<S>,
+    saved: &crate::parser::CompiledDeferredForExpression<S>,
     candidates: &[crate::parser::DeferredForExpression<T>],
-) -> Result<crate::parser::DeferredForExpression<S>, SecretRehydrationSiteError> {
+) -> Result<crate::parser::CompiledDeferredForExpression<S>, SecretRehydrationSiteError> {
     let has_placeholder = deferred_template_contains_redacted_secret(saved);
     if !has_placeholder {
         return Ok(saved.clone());
@@ -5597,7 +5743,7 @@ fn canonicalize_resolved_value_for_purpose<
         purpose,
         visited_refs,
     ) {
-        canonicalize_with_fit(value, fit, defs, purpose, error_policy)
+        canonicalize_with_fit(value, &fit, defs, purpose, error_policy)
     } else {
         canonicalize_without_fit(
             value,
@@ -5611,12 +5757,28 @@ fn canonicalize_resolved_value_for_purpose<
     }
 }
 
+/// Encode a successful fit through the same canonicalization used by values.
+/// Address-bearing or unresolved values cannot form an ordinary JSON key.
+pub(crate) fn canonical_json_with_fit<H: PlaceholderKind, B: BindingAddress>(
+    value: Value<H, B>,
+    fit: &crate::schema::Fit<'_>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+) -> Option<serde_json::Value> {
+    let canonical = canonicalize_with_fit(value, fit, defs, purpose, RejectEnumResolutionErrors)
+        .ok()?
+        .try_map_placeholder::<crate::resource::NoPlaceholder, ()>(&mut |_| Err(()))
+        .ok()?
+        .try_into_address_free_absolute()?;
+    value_to_json_inner(&canonical, None, false, JsonEncoding::Ordinary, false).ok()
+}
+
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
 fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
     value: Value<H, B>,
-    fit: crate::schema::Fit<'_>,
+    fit: &crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
@@ -5626,9 +5788,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
         return Ok(canonicalize_to_string_list(value));
     }
 
-    match (value, fit.kind) {
+    match (value, &fit.kind) {
         (Value::Deferred(DeferredValue::Secret(value)), crate::schema::FitKind::Secret(fit)) => {
-            canonicalize_with_fit(*value, *fit, defs, purpose, error_policy)
+            canonicalize_with_fit(*value, fit, defs, purpose, error_policy)
                 .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
                 .map_err(|error| error_policy.mask_secret(error))
         }
@@ -5639,9 +5801,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 default: default_fit,
             },
         ) => {
-            let value = canonicalize_with_fit(*value, *value_fit, defs, purpose, error_policy)?;
+            let value = canonicalize_with_fit(*value, value_fit, defs, purpose, error_policy)?;
             let default =
-                canonicalize_with_fit(*default, *default_fit, defs, purpose, error_policy)?;
+                canonicalize_with_fit(*default, default_fit, defs, purpose, error_policy)?;
             Ok(Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(value),
                 default: Box::new(default),
@@ -5653,7 +5815,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
             // consuming both here makes the single selection decision
             // explicit and prevents a second member lookup.
             let _chosen_member = member;
-            canonicalize_with_fit(value, *fit, defs, purpose, error_policy)
+            canonicalize_with_fit(value, fit, defs, purpose, error_policy)
         }
         (
             _,
@@ -5661,7 +5823,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 canonical,
                 rewrite: true,
             },
-        ) => Ok(Value::Concrete(ConcreteValue::CanonicalEnum(canonical))),
+        ) => Ok(Value::Concrete(ConcreteValue::CanonicalEnum(
+            canonical.clone(),
+        ))),
         (value, crate::schema::FitKind::Enum { rewrite: false, .. }) => Ok(value),
         (Value::Concrete(ConcreteValue::List(items)), crate::schema::FitKind::List(fits)) => {
             debug_assert_eq!(items.len(), fits.len());
@@ -5680,6 +5844,16 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
             Value::Concrete(ConcreteValue::StringList(items)),
             crate::schema::FitKind::StringList(fits),
         ) => {
+            // Reference elements require the recursive typed comparison path;
+            // StringList remains the canonical union-of-plain-strings form.
+            // This changes only the in-memory list representation, never raw
+            // string values or their JSON payload/state representation.
+            let reference_elements = fits.iter().any(|fit| {
+                matches!(
+                    fit.attr.as_attr().shape_with_defs(defs),
+                    crate::schema::Shape::Reference { .. }
+                )
+            });
             debug_assert_eq!(items.len(), fits.len());
             let canonicalized = items
                 .into_iter()
@@ -5698,6 +5872,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                     result.map_err(|error| error_policy.at_list_index(index, error))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if reference_elements {
+                return Ok(Value::Concrete(ConcreteValue::List(canonicalized)));
+            }
             let strings = canonicalized
                 .iter()
                 .map(|item| match item {
@@ -5718,7 +5895,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 .map(|((key, value), fit)| {
                     let canonical_key = fit.canonical_key.clone().unwrap_or_else(|| key.clone());
                     let value =
-                        canonicalize_with_fit(value, fit.value, defs, purpose, error_policy)
+                        canonicalize_with_fit(value, &fit.value, defs, purpose, error_policy)
                             .map_err(|error| error_policy.at_map_value(key.clone(), error))?;
                     Ok((key, canonical_key, value))
                 })
@@ -5853,7 +6030,8 @@ fn type_contains_enum(
                 .iter()
                 .flatten()
                 .any(|member| walk(member.as_attr(), defs, visited)),
-            AttrTypeKind::String { .. }
+            AttrTypeKind::Reference { .. }
+            | AttrTypeKind::String { .. }
             | AttrTypeKind::ResourceHandle { .. }
             | AttrTypeKind::StringLiteralSet { .. }
             | AttrTypeKind::Int { .. }
@@ -5878,7 +6056,9 @@ fn finish_no_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationError
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
 ) -> Result<Value<H, B>, P::Error> {
-    if purpose.rejects_unrecognized_enum_text() && type_contains_enum(expected, defs) {
+    if matches!(&expected.kind, AttrTypeKind::ResourceHandle { .. })
+        || (purpose.rejects_unrecognized_enum_text() && type_contains_enum(expected, defs))
+    {
         let source = crate::schema::TypeError::TypeMismatch {
             expected: expected.type_name(),
             got: value.type_name(),
@@ -6346,12 +6526,13 @@ pub struct CanonicalizedResources<
     S = crate::resource::ModuleSource,
     H: PlaceholderKind = crate::resource::NoPlaceholder,
     B: BindingAddress = crate::resource::AbsoluteBindingAddress,
+    D = crate::resource::UnexpandedDependencyFields<B>,
 > {
-    resources: &'a mut [crate::resource::Resource<S, H, B>],
+    resources: &'a mut [crate::resource::Resource<S, H, B, D>],
 }
 
-impl<'a, S, H: PlaceholderKind, B: BindingAddress> CanonicalizedResources<'a, S, H, B> {
-    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S, H, B>] {
+impl<'a, S, H: PlaceholderKind, B: BindingAddress, D> CanonicalizedResources<'a, S, H, B, D> {
+    pub(crate) fn into_mut_slice(self) -> &'a mut [crate::resource::Resource<S, H, B, D>] {
         self.resources
     }
 }
@@ -6522,10 +6703,10 @@ pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
 /// Call this once after `resolver::resolve_refs_*` and before the
 /// differ runs, so every `Resource` flowing into the plan / state /
 /// provider boundary carries the canonical shape. See #2481, #2511.
-pub fn canonicalize_resources_with_schemas<'a, S, H: PlaceholderKind, B: BindingAddress>(
-    resources: &'a mut [crate::resource::Resource<S, H, B>],
+pub fn canonicalize_resources_with_schemas<'a, S, H: PlaceholderKind, B: BindingAddress, D>(
+    resources: &'a mut [crate::resource::Resource<S, H, B, D>],
     registry: &crate::schema::SchemaRegistry,
-) -> Result<CanonicalizedResources<'a, S, H, B>, EnumCanonicalizationError> {
+) -> Result<CanonicalizedResources<'a, S, H, B, D>, EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
         if let Some(schema) = registry.get_for(resource) {
             canonicalize_desired_attribute_map_with_schema(
@@ -6550,8 +6731,13 @@ pub fn canonicalize_resources_with_schemas<'a, S, H: PlaceholderKind, B: Binding
 /// Guest output is provider/state text, so strings resolve only by literal API
 /// membership or a declared alias. Dotted strings are never reinterpreted as
 /// namespaced DSL identifiers.
-pub fn canonicalize_normalized_resources_with_schemas<S>(
-    resources: &mut [crate::resource::Resource<S>],
+pub fn canonicalize_normalized_resources_with_schemas<S, D>(
+    resources: &mut [crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for resource in resources.iter_mut() {
@@ -6719,8 +6905,8 @@ pub fn canonicalize_provider_configs_with_schemas<H: PlaceholderKind>(
 /// authored `read` inputs, so `EnumIdentifier` uses authored-DSL semantics. Unknown
 /// non-enum values pass through, while an identifier without a resolvable
 /// schema is rejected (carina#3181, carina#3740).
-pub fn canonicalize_data_sources_with_schemas<S, H: PlaceholderKind, B: BindingAddress>(
-    data_sources: &mut [crate::resource::DataSource<S, H, B>],
+pub fn canonicalize_data_sources_with_schemas<S, H: PlaceholderKind, B: BindingAddress, D>(
+    data_sources: &mut [crate::resource::DataSource<S, H, B, D>],
     registry: &crate::schema::SchemaRegistry,
 ) -> Result<(), EnumCanonicalizationError> {
     for data_source in data_sources.iter_mut() {
@@ -6825,6 +7011,29 @@ mod tests {
     impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {
         fn inference_type_authority(&self) -> crate::resource::PlaceholderTypeAuthority<'_> {
             crate::resource::PlaceholderTypeAuthority::AwaitingSubstitution
+        }
+        type DirectiveBool<B: crate::resource::BindingAddress> = bool;
+        type DirectivePreventDestroy<B: crate::resource::BindingAddress> =
+            crate::resource::PreventDestroy;
+        fn rebind_directives<
+            B: crate::resource::BindingAddress,
+            C: crate::resource::BindingAddress,
+        >(
+            directives: crate::resource::Directives<B, Self>,
+            resolve: &mut impl FnMut(B) -> C,
+        ) -> crate::resource::Directives<C, Self> {
+            crate::resource::directive_expr::rebind_resolved_directives(directives, resolve)
+        }
+
+        fn map_absolute_directive_values(
+            _directives: &mut crate::resource::Directives<
+                crate::resource::AbsoluteBindingAddress,
+                Self,
+            >,
+            _map: &mut impl FnMut(
+                &crate::resource::AbsoluteBindingAddress,
+            ) -> crate::resource::AbsoluteBindingAddress,
+        ) {
         }
     }
 
@@ -9246,25 +9455,28 @@ mod tests {
     }
 
     #[test]
-    fn resource_handle_validation_and_desired_canonicalization_agree_on_string_wire_value() {
+    fn resource_handle_validation_and_desired_canonicalization_reject_values() {
         let handle = AttributeType::resource_handle("test", "widget");
         let string_id = Value::Concrete(ConcreteValue::String("widget-123".into()));
         let identifier = Value::Concrete(ConcreteValue::enum_identifier("widget_binding"));
 
-        assert!(handle.validate(&string_id).is_ok());
+        assert!(matches!(
+            handle.validate(&string_id),
+            Err(crate::schema::TypeError::TypeMismatch { .. })
+        ));
         assert!(matches!(
             handle.validate(&identifier),
             Err(crate::schema::TypeError::TypeMismatch { .. })
         ));
-        assert_eq!(
+        assert!(
             canonicalize_desired_with_type(
-                string_id.clone(),
+                string_id,
                 &handle,
                 crate::schema::empty_defs_for_schema_walks(),
                 DesiredValueSource::AuthoredDsl,
             )
-            .unwrap(),
-            string_id,
+            .is_err(),
+            "a string value must not become a resource handle during canonicalization",
         );
         assert!(
             canonicalize_desired_with_type(
@@ -10917,7 +11129,7 @@ mod tests {
                 canonical_from.id.identity_display().to_string(),
             ),
             from: Box::new(canonical_from.clone()),
-            to: ResolvedResource::new(to.clone()),
+            to: ResolvedResource::new(to.clone().with_dependency_phase(())),
             changed_attributes: vec!["items".to_string()],
         });
 
@@ -11390,7 +11602,7 @@ mod tests {
                 .signature
                 .attributes
                 .get("non_secret")
-                .map(|a| a.to_value()),
+                .and_then(|a| a.value()),
             Some(Value::Concrete(ConcreteValue::String("kept".into()))),
         );
 
@@ -11400,7 +11612,7 @@ mod tests {
             .signature
             .attributes
             .get("secret_field")
-            .map(|a| a.to_value())
+            .and_then(|a| a.value())
             .as_ref()
         {
             Some(Value::Deferred(DeferredValue::RedactedSecret { hash })) => {
@@ -12601,6 +12813,44 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_float_preserves_integer_and_display() {
+        let attr = AttributeType::float();
+        let defs = crate::schema::empty_defs_for_schema_walks();
+        for n in [1, 9_007_199_254_740_993] {
+            for purpose in [
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+                CanonicalizationPurpose::ProviderConfig {
+                    provider_name: "mock",
+                },
+                CanonicalizationPurpose::State,
+                CanonicalizationPurpose::WaitRhs,
+            ] {
+                let value: Value = Value::Concrete(ConcreteValue::Int(n));
+                let fit = crate::schema::fit_value_to_resolved_type_on_path(
+                    &attr,
+                    &value,
+                    defs,
+                    crate::schema::FieldAncestry::WRITABLE,
+                    purpose,
+                    &mut Vec::new(),
+                )
+                .expect("integers fit Float attributes");
+                let canonical = canonicalize_with_fit(
+                    value.clone(),
+                    &fit,
+                    defs,
+                    purpose,
+                    RejectEnumResolutionErrors,
+                )
+                .unwrap();
+                assert_eq!(canonical, value);
+                assert_eq!(render_value(&canonical).plain(), n.to_string());
+            }
+        }
+    }
+
+    #[test]
     fn canonicalize_recurses_into_struct_via_block_name() {
         let t = AttributeType::struct_(
             "Statement".to_string(),
@@ -13233,7 +13483,7 @@ mod tests {
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
         use crate::resource::{ExpandedResource as Resource, ResourceId};
-        use std::collections::{BTreeSet, HashMap, HashSet};
+        use std::collections::{HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
@@ -13245,7 +13495,7 @@ mod tests {
             resolved_ignore_changes: Default::default(),
             prefixes: HashMap::new(),
             binding: Some(absolute_binding("p1")),
-            dependency_bindings: BTreeSet::new(),
+            dependencies: Default::default(),
             module_source: None,
             default_tag_keys: Default::default(),
             loop_provenance: Default::default(),
@@ -13402,7 +13652,7 @@ mod tests {
 
     fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
         use crate::resource::{ResourceId, State};
-        use std::collections::{BTreeSet, HashMap};
+        use std::collections::HashMap;
         let mut attributes = HashMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
@@ -13412,7 +13662,7 @@ mod tests {
             identifier: Some("arn:aws:iam::123:policy/p1".to_string()),
             attributes,
             exists: true,
-            dependency_bindings: BTreeSet::new(),
+            dependency_bindings: Default::default(),
             partial_read: None,
         }
     }
@@ -13648,7 +13898,7 @@ mod tests {
                     .unwrap()
                     .as_schema(),
             ),
-            &crate::differ::exact_comparison_context_for_tests(),
+            &crate::differ::exact_comparison_schema_for_tests(),
         );
         assert!(
             matches!(result, Diff::NoChange(_)),
@@ -13956,7 +14206,7 @@ mod tests {
 
     #[test]
     fn redact_secrets_in_deferred_create_redacts_and_rehydrates_template() {
-        use crate::effect::{DeferredCreatePayload, Effect};
+        use crate::effect::Effect;
         use crate::parser::{DeferredForExpression, ForBinding};
         use crate::plan::Plan;
         use crate::resource::PathSegment;
@@ -13988,7 +14238,7 @@ mod tests {
         > = crate::resource::Resource::new("aws.route53.RecordSet", "validation_records");
         template_resource.set_attr("name", placeholder.clone());
         template_resource.set_attr("comment", secret.clone());
-        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+        let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(
             DeferredForExpression::new(
                 None,
                 1,
@@ -14015,13 +14265,36 @@ mod tests {
             ))
         ));
 
+        assert!(matches!(
+            redacted_template
+                .template_resource()
+                .attributes()
+                .get("comment"),
+            Some(LoopValue::Deferred(
+                LoopDeferredValue::RedactedSecret { .. }
+            ))
+        ));
         let mut plan = Plan::new();
         plan.add(effect.clone());
         let redacted_plan = redact_secrets_in_plan(&plan).expect("redact deferred plan");
         let Effect::DeferredCreate(payload) = &effect else {
             unreachable!();
         };
-        let deferred_templates = resolved_deferred_templates([payload.template.as_ref().clone()]);
+        let deferred_templates =
+            resolved_deferred_templates([crate::parser::DeferredForExpression::new(
+                payload.template.file().map(str::to_owned),
+                payload.template.line(),
+                payload.template.header.clone(),
+                payload.template.target().clone(),
+                payload.template.iterable.clone(),
+                payload.template.binding.clone(),
+                payload
+                    .template
+                    .template_resource()
+                    .as_resource()
+                    .clone()
+                    .with_dependency_phase(Default::default()),
+            )]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &redacted_plan,
             &HashMap::new(),
@@ -14038,12 +14311,16 @@ mod tests {
             template.attributes().get("comment"),
             Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
         ));
+        assert!(matches!(
+            template.template_resource().attributes().get("comment"),
+            Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
+        ));
         assert!(!template.attributes().values().any(contains_redacted_secret));
     }
 
     #[test]
     fn deferred_template_redaction_uses_template_resource_as_single_projection() {
-        use crate::effect::{DeferredCreatePayload, Effect};
+        use crate::effect::Effect;
         use crate::parser::{DeferredForExpression, ForBinding};
 
         let secret = |plaintext: &str| {
@@ -14056,7 +14333,7 @@ mod tests {
             LoopSlot,
         > = crate::resource::Resource::new("aws.route53.RecordSet", "records");
         template_resource.set_attr("comment", secret("authoritative"));
-        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+        let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(
             DeferredForExpression::new(
                 None,
                 1,
@@ -14082,15 +14359,29 @@ mod tests {
             .expect("template resource comment");
 
         let LoopValue::Deferred(LoopDeferredValue::RedactedSecret {
-            hash: _canonical_hash,
+            hash: canonical_hash,
         }) = canonical
         else {
             panic!("expected canonical placeholder, got {canonical:?}");
         };
+        let LoopValue::Deferred(LoopDeferredValue::RedactedSecret {
+            hash: projected_hash,
+        }) = template
+            .template_resource()
+            .attributes()
+            .get("comment")
+            .expect("canonical comment")
+        else {
+            panic!("canonical template must retain the redacted secret");
+        };
+        assert_eq!(
+            canonical_hash, projected_hash,
+            "the display accessor must use the canonical template resource"
+        );
     }
 
     #[test]
-    fn deferred_template_redaction_noops_without_placeholders() {
+    fn deferred_template_preserves_display_only_projection_and_noops_without_placeholders() {
         use crate::effect::{DeferredCreatePayload, Effect};
         use crate::parser::{DeferredForExpression, ForBinding};
 
@@ -14117,18 +14408,24 @@ mod tests {
             ForBinding::Simple("child".to_string()),
             template_resource,
         );
-        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(template.clone())));
+        let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(
+            template.clone(),
+        )));
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact placeholder-free template");
         let Effect::DeferredCreate(redacted_payload) = redacted else {
             panic!("expected deferred create")
         };
         let redacted_template = redacted_payload.template;
-        assert_eq!(redacted_template.as_ref(), &template);
+        assert_eq!(
+            redacted_template.as_ref(),
+            &template.clone().into_compiled()
+        );
 
         let mut plan = crate::plan::Plan::new();
         plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
             redacted_template,
+            redacted_payload.dependency_template,
         )));
         let deferred_templates = resolved_deferred_templates([]);
         let rehydrated = rehydrate_plan_desired_secrets(
@@ -14143,7 +14440,7 @@ mod tests {
             panic!("expected deferred create")
         };
         let output = &payload.template;
-        assert_eq!(output.as_ref(), &template);
+        assert_eq!(output.as_ref(), &template.clone().into_compiled());
         assert_eq!(output.attributes().get("identifier"), Some(&display_only),);
     }
 
@@ -14157,22 +14454,20 @@ mod tests {
             ExpandedDirectives as Directives, ExpandedResource as Resource, ResolvedResource,
             ResolvedResourceId, ResourceId,
         };
-        use std::collections::HashSet;
-
         let id = ResourceId::with_identity("aws.s3.Bucket", "bucket");
         let mut create = Resource::new("aws.s3.Bucket", "bucket");
         create.binding = Some(absolute_binding("bucket"));
 
         let mut plan = crate::plan::Plan::new();
         plan.add_replacement(ReplacementGroup {
-            create: ResolvedResource::new(create),
+            create: ResolvedResource::new(create.with_dependency_phase(())),
             delete: ReplacementDelete {
                 id: ResolvedResourceId::new(id.clone()),
                 identifier: crate::effect::fixture_applied_identifier("bucket-old"),
                 directives: Directives::default(),
                 binding: Some(absolute_binding("bucket")),
-                dependencies: HashSet::new(),
-                explicit_dependencies: HashSet::new(),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
             },
             create_before_destroy: true,
             changed_create_only: ChangedCreateOnly::new(vec!["bucket_name".to_string()])
@@ -14180,7 +14475,7 @@ mod tests {
             cascade_ref_hints: vec![("vpc_id".to_string(), "vpc.id".to_string())],
             temporary_name: None,
             permanent_name_override,
-            consumer_updates: HashSet::new(),
+            consumer_updates: Default::default(),
             previous_attributes,
         });
         plan

@@ -5,7 +5,7 @@ description: "Build a minimal Carina provider with carina-plugin-sdk, compile it
 
 This page builds `hello`, a provider with one resource type, `hello.greeting`. It calls no API: a greeting's message is derived from its name. That keeps the example small enough to read in full while still going through every call the host makes, so you can run `plan`, `apply` and `destroy` against it.
 
-The SDK supplies the WIT bindings and their generator from the Carina revision you pin. Use a Carina revision that includes [carina-rs/carina#4191](https://github.com/carina-rs/carina/pull/4191) (SDK-owned provider bindings) or later. Your provider needs no WIT checkout or `wit-bindgen` dependency.
+The SDK supplies the WIT bindings and their generator from the Carina revision you pin. Use a Carina revision that includes [carina-rs/carina#4191](https://github.com/carina-rs/carina/pull/4191) (SDK-owned provider bindings) and the `PhasedToken` associated operation-payload API. Your provider needs no WIT checkout or `wit-bindgen` dependency.
 
 ## Prerequisites
 
@@ -56,7 +56,7 @@ serde = "1"
 serde_json = "1"
 ```
 
-The SDK is not on crates.io; depend on it from git. Replace `<carina-rev>` with the full commit SHA of a Carina revision that includes [carina-rs/carina#4191](https://github.com/carina-rs/carina/pull/4191) (SDK-owned provider bindings) or later. `serde` and `serde_json` are needed because the adapter that `export_provider!` generates uses them from your crate. The SDK chooses the binding generator and WIT revision for you.
+The SDK is not on crates.io; depend on it from git. Replace `<carina-rev>` with the full commit SHA of a Carina revision that includes SDK-owned provider bindings and the `PhasedToken` associated operation-payload API. `serde` and `serde_json` are needed because the adapter that `export_provider!` generates uses them from your crate. The SDK chooses the binding generator and WIT revision for you.
 
 ## The provider
 
@@ -204,7 +204,8 @@ impl CarinaProvider for HelloProvider {
         _poll_request: PollRequest,
     ) -> Result<CreateStep<Never>, PollVerdict<Never>> {
         match poll {
-            Poll::Unissued(_, token) | Poll::Issued(_, token) => match token {},
+            Poll::Unissued(_, token) => match token {},
+            Poll::Issued(_, token) => match token {},
         }
     }
 
@@ -216,7 +217,8 @@ impl CarinaProvider for HelloProvider {
         _poll_request: PollRequest,
     ) -> Result<ResumeStep<Never>, ResumeVerdict<Never>> {
         match resume {
-            Resume::Unissued(_, token) | Resume::Issued(_, token) => match token {},
+            Resume::Unissued(_, token) => match token {},
+            Resume::Issued(_, token) => match token {},
         }
     }
 

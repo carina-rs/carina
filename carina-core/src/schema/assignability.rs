@@ -117,7 +117,8 @@ fn identity<R: PatternForm>(kind: &AttrTypeKind<R>) -> Option<&TypeIdentity> {
         | AttrTypeKind::Int { binding, .. }
         | AttrTypeKind::Float { binding, .. } => binding.identity(),
         AttrTypeKind::Enum { identity, .. } => Some(identity),
-        AttrTypeKind::ResourceHandle { .. }
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration

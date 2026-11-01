@@ -113,7 +113,7 @@ fn resolve_refs_inner(
             AbsoluteBindingAddress,
         >::Resource(resource));
         if !deps.is_empty() {
-            resource.dependency_bindings = deps.into_iter().collect();
+            resource.dependencies.value_bindings = deps.into_iter().collect();
         }
     }
 
@@ -220,7 +220,7 @@ fn resolve_data_source_refs_inner(
                 AbsoluteBindingAddress,
             >::DataSource(data_source));
         if !deps.is_empty() {
-            data_source.dependency_bindings = deps.into_iter().collect();
+            data_source.dependencies.value_bindings = deps.into_iter().collect();
         }
     }
     let mark_unresolved_upstream = !unresolved_upstream_bindings.is_empty();
@@ -279,14 +279,14 @@ pub fn resolve_saved_composition_refs_post_apply(
     Ok(())
 }
 
-trait RuntimeCompositionAttribute: Sized {
-    fn runtime_value(&self) -> Value;
+trait RuntimeCompositionAttribute: Sized + Clone {
+    fn runtime_value(&self) -> Option<Value>;
     fn with_runtime_value(&self, value: Value) -> Self;
 }
 
 impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
-    fn runtime_value(&self) -> Value {
-        self.to_value()
+    fn runtime_value(&self) -> Option<Value> {
+        self.value()
     }
 
     fn with_runtime_value(&self, value: Value) -> Self {
@@ -295,8 +295,8 @@ impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
 }
 
 impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute {
-    fn runtime_value(&self) -> Value {
-        self.to_value()
+    fn runtime_value(&self) -> Option<Value> {
+        Some(self.to_value())
     }
 
     fn with_runtime_value(&self, value: Value) -> Self {
@@ -316,7 +316,10 @@ fn resolve_composition_attributes<A: RuntimeCompositionAttribute>(
             // reclassify it in the same lifecycle. A forwarded reference that
             // resolves to a literal becomes derived; one that remains a
             // reference stays forwarded.
-            let resolved = resolve_ref_value(&attribute.runtime_value(), bindings, config)?;
+            let Some(value) = attribute.runtime_value() else {
+                return Ok((key.clone(), attribute.clone()));
+            };
+            let resolved = resolve_ref_value(&value, bindings, config)?;
             Ok((key.clone(), attribute.with_runtime_value(resolved)))
         })
         .collect()
@@ -1832,14 +1835,17 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
             &resources,
         );
-        let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-            managed: &resources,
-            compositions: &[],
-            managed_current: &current,
-            data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
-            wait_aliases: &[],
-        });
+        let bindings =
+            ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs::<
+                crate::resource::UnexpandedDependencyFields,
+            > {
+                managed: &resources,
+                compositions: &[],
+                managed_current: &current,
+                data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            });
         let fallback = Value::Concrete(ConcreteValue::String("d".into()));
         let expression = coalesce(
             Value::root_resource_ref("producer", "comment", vec![]),
@@ -2851,7 +2857,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                dependency_bindings: std::collections::BTreeSet::new(),
+                dependency_bindings: Default::default(),
 
                 partial_read: None,
             },
@@ -4116,7 +4122,8 @@ mod tests {
 
         assert!(
             resources[0]
-                .dependency_bindings
+                .dependencies
+                .value_bindings
                 .contains(&absolute_binding("network")),
             "dependency_bindings must record the upstream binding even after stamping"
         );
@@ -4205,7 +4212,7 @@ mod tests {
     #[test]
     fn resolve_ref_value_wait_binding_absent_target_left_intact() {
         let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-            managed: &[],
+            managed: &[] as &[Resource],
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),

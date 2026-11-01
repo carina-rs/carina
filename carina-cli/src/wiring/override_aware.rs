@@ -1,5 +1,6 @@
 //! Canonical resource pairs and resolved resources with permanent name overrides applied.
 
+use carina_core::resource::{PendingResourceIdentityError, ResolvedResourceId};
 use std::collections::{HashMap, HashSet};
 
 use carina_core::binding_index::{LivePreApplyInputs, ManagedBindingStability, ResolvedBindings};
@@ -96,8 +97,7 @@ impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
 {
     pub(crate) fn into_expanded_for_test(
         self,
-    ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::LeftoverPlaceholders>
-    {
+    ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::ExpansionError> {
         let Self {
             parsed,
             unresolved,
@@ -105,16 +105,15 @@ impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
         } = self;
         let unresolved = unresolved
             .into_iter()
-            .map(Resource::into_expanded)
-            .collect::<Result<_, _>>()
-            .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
+            .map(|resource| resource.into_expanded(&carina_core::schema::SchemaRegistry::new()))
+            .collect::<Result<_, _>>()?;
         let prefix_fallbacks = prefix_fallbacks
             .into_iter()
             .map(|attributes| carina_core::resource::into_expanded_value_map(attributes, None))
             .collect::<Result<_, _>>()
             .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
         Ok(CanonicalResourcePair {
-            parsed: parsed.into_expanded()?,
+            parsed: parsed.into_expanded(&carina_core::schema::SchemaRegistry::new())?,
             unresolved,
             prefix_fallbacks,
         })
@@ -327,6 +326,7 @@ impl<E> CanonicalResourcePair<E> {
     pub fn expand_deferred_for_expressions<F>(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
+        type_checks: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
         classify: F,
     ) -> Result<
         (
@@ -350,7 +350,8 @@ impl<E> CanonicalResourcePair<E> {
                     .any(|deferred| deferred.location().matches_deferred_warning(warning))
         });
         self.parsed.replace_deferred_for_expressions(selected);
-        self.parsed.expand_deferred_for_expressions(bindings)?;
+        self.parsed
+            .expand_deferred_for_expressions(bindings, type_checks)?;
         let residual = self.parsed.deferred_for_expressions().clone();
         self.parsed
             .deferred_for_expressions_mut()
@@ -389,9 +390,11 @@ impl<E> CanonicalResourcePair<E> {
 
 /// Two paired resources resolved to the same identity before execution.
 #[derive(Debug, thiserror::Error)]
-#[error("override-aware resources contain duplicate resolved id {id}")]
-pub struct DuplicateResolvedResourceIdError {
-    id: ResourceId,
+pub enum ResolvedResourceOriginIndexError {
+    #[error(transparent)]
+    PendingIdentity(#[from] PendingResourceIdentityError),
+    #[error("override-aware resources contain duplicate resolved id {id}")]
+    Duplicate { id: ResolvedResourceId },
 }
 
 /// Reference-resolution mode for an evaluated/authored resource pair.
@@ -595,7 +598,8 @@ impl OverrideAwareResources {
 
     pub fn unresolved_by_resolved_id(
         &self,
-    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+    ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError>
+    {
         unresolved_map_from_paired(self.resources(), self.paired_unresolved_resources())
     }
 
@@ -650,7 +654,8 @@ impl OverrideAwareResources {
     pub fn unresolved_by_resolved_id_with_binding_sources(
         &self,
         binding_sources: &OverrideAwareResources,
-    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+    ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError>
+    {
         let paired_unresolved =
             self.paired_unresolved_resources_with_binding_sources(binding_sources);
         unresolved_map_from_paired(self.resources(), paired_unresolved)
@@ -747,7 +752,7 @@ fn can_pair_by_binding(resource: &Resource, source: &Resource) -> bool {
 fn unresolved_map_from_paired(
     resources: &[Resource],
     paired_unresolved: Vec<Resource>,
-) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
+) -> Result<HashMap<ResolvedResourceId, UnresolvedResource>, ResolvedResourceOriginIndexError> {
     assert_eq!(
         resources.len(),
         paired_unresolved.len(),
@@ -755,10 +760,11 @@ fn unresolved_map_from_paired(
     );
     let mut by_id = HashMap::with_capacity(paired_unresolved.len());
     for (resource, unresolved) in resources.iter().zip(paired_unresolved) {
-        let id = resource.id.clone();
+        let id = ResolvedResourceId::try_new(resource.id.clone())
+            .ok_or_else(|| PendingResourceIdentityError::new(resource.id.clone()))?;
         let previous = by_id.insert(id.clone(), UnresolvedResource::from_pre_resolve(unresolved));
         if previous.is_some() {
-            return Err(DuplicateResolvedResourceIdError { id });
+            return Err(ResolvedResourceOriginIndexError::Duplicate { id });
         }
     }
     Ok(by_id)

@@ -35,6 +35,7 @@ mod validation;
 
 pub use error::{ModuleError, ModuleErrorCallSource};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
+pub(crate) use loader::load_module_with_config;
 pub use loader::{
     LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
     load_module_from_directory, load_module_with_diagnostics,

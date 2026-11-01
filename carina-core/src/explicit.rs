@@ -8,11 +8,11 @@
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
 use crate::diff_helpers::{list_element_type, map_entry_subtype};
-use crate::differ::ComparisonContext;
+use crate::differ::{ComparisonContext, ReferenceEquality};
 use crate::provider::SentDesiredAttributes;
 use crate::resource::{
-    CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, Resource, Value,
-    pair_list_elements, pair_list_elements_with_uniqueness,
+    CanonicalComparisonAttributes, ConcreteValue, ListElementPairing, MaskedComparisonAttributes,
+    Resource, Value, pair_list_elements, pair_list_elements_with_uniqueness,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -129,7 +129,14 @@ pub enum ExplicitFields {
 /// writeback must use one of the evidence-specific stored-value builders
 /// instead.
 #[cfg(test)]
-pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
+pub(crate) fn build_from_resource<S, D>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> ExplicitFields {
     ExplicitFields::Struct {
         children: resource
             .attributes
@@ -145,11 +152,16 @@ pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
 /// not evidence that the provider added them. Use
 /// [`build_from_resource_for_stored_values_after_send`] only when typed send
 /// evidence is available.
-pub fn build_from_read_resource_for_stored_values<S>(
-    resource: &Resource<S>,
+pub fn build_from_read_resource_for_stored_values<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     build_for_stored_values(
         resource,
@@ -177,13 +189,18 @@ pub fn build_from_read_resource_for_stored_values<S>(
 /// lists without a concrete stored-list counterpart use the legacy union
 /// [`ExplicitFields::List`] representation rather than recording unjustified
 /// indices.
-pub fn build_from_resource_for_stored_values_after_send<S>(
-    resource: &Resource<S>,
+pub fn build_from_resource_for_stored_values_after_send<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     prior_stored_authoring: Option<(&HashMap<String, Value>, &ExplicitFields)>,
     stored_attributes: &HashMap<String, Value>,
     sent_desired: &SentDesiredAttributes<'_>,
     schema: Option<&ResourceSchema>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     let mut rebuilt = match prior_stored_authoring {
         Some((prior_stored_attributes, prior_explicit)) => {
@@ -252,12 +269,17 @@ impl StoredValueAuthoringBasis {
     }
 }
 
-fn build_for_stored_values<S>(
-    resource: &Resource<S>,
+fn build_for_stored_values<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
     basis: StoredValueAuthoringBasis,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     let defs = schema
         .map(|schema| &schema.defs)
@@ -294,13 +316,18 @@ fn build_for_stored_values<S>(
 /// removal crosses an ambiguous list identity, the list becomes
 /// [`ExplicitFields::WholeValue`]. That keeps the removal visible without assigning
 /// it to a guessed element.
-pub fn build_carried_from_resource_for_stored_values<S>(
-    resource: &Resource<S>,
+pub fn build_carried_from_resource_for_stored_values<S, D, R: ReferenceEquality>(
+    resource: &Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
     prior_stored_attributes: &HashMap<String, Value>,
     prior_explicit: &ExplicitFields,
     fresh_stored_attributes: &HashMap<String, Value>,
     schema: Option<&ResourceSchema>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     let defs = schema
         .map(|schema| &schema.defs)
@@ -357,17 +384,17 @@ enum CarryLocation<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct CarryContext<'a> {
+struct CarryContext<'a, R: ReferenceEquality> {
     location: CarryLocation<'a>,
     defs: &'a BTreeMap<String, AttributeType>,
-    comparison: ComparisonContext<'a>,
+    comparison: ComparisonContext<'a, R>,
 }
 
-impl<'a> CarryContext<'a> {
+impl<'a, R: ReferenceEquality> CarryContext<'a, R> {
     fn resource(
         schema: Option<&'a ResourceSchema>,
         defs: &'a BTreeMap<String, AttributeType>,
-        comparison: ComparisonContext<'a>,
+        comparison: ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             location: CarryLocation::Resource(schema),
@@ -379,7 +406,7 @@ impl<'a> CarryContext<'a> {
     fn value(
         attr_type: Option<&'a AttributeType>,
         defs: &'a BTreeMap<String, AttributeType>,
-        comparison: ComparisonContext<'a>,
+        comparison: ComparisonContext<'a, R>,
     ) -> Self {
         Self {
             location: CarryLocation::Value(attr_type),
@@ -414,13 +441,13 @@ impl<'a> CarryContext<'a> {
     }
 }
 
-fn carry_node(
+fn carry_node<R: ReferenceEquality>(
     prior_explicit: &ExplicitFields,
     rebuilt: ExplicitFields,
     prior_stored: Option<&Value>,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     match prior_explicit {
         ExplicitFields::Leaf | ExplicitFields::Unrecorded => CarriedNode {
@@ -442,12 +469,12 @@ fn carry_node(
     }
 }
 
-fn carry_legacy_list(
+fn carry_legacy_list<R: ReferenceEquality>(
     element: &ExplicitFields,
     rebuilt: ExplicitFields,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
     else {
@@ -476,12 +503,12 @@ fn carry_legacy_list(
     }
 }
 
-fn carry_whole_value(
+fn carry_whole_value<R: ReferenceEquality>(
     rebuilt: ExplicitFields,
     pending: &PendingPaths,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
     else {
@@ -527,13 +554,13 @@ fn carry_whole_value(
     }
 }
 
-fn carry_struct(
+fn carry_struct<R: ReferenceEquality>(
     prior_children: &HashMap<String, ExplicitFields>,
     rebuilt: ExplicitFields,
     prior_stored: Option<&Value>,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_fields), Some(fresh_fields)) = (concrete_map(desired), concrete_map(fresh))
     else {
@@ -552,13 +579,13 @@ fn carry_struct(
     )
 }
 
-fn carry_struct_fields(
+fn carry_struct_fields<R: ReferenceEquality>(
     prior_children: &HashMap<String, ExplicitFields>,
     rebuilt: ExplicitFields,
     prior_fields: Option<CarryMap<'_>>,
     desired_fields: CarryMap<'_>,
     fresh_fields: CarryMap<'_>,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let mut rebuilt_children = match rebuilt {
         ExplicitFields::Struct { children } => children,
@@ -608,13 +635,13 @@ fn carry_struct_fields(
     }
 }
 
-fn carry_list(
+fn carry_list<R: ReferenceEquality>(
     prior_elements: &[ExplicitFields],
     rebuilt: ExplicitFields,
     prior_stored: Option<&Value>,
     desired: &Value,
     fresh: &Value,
-    context: CarryContext<'_>,
+    context: CarryContext<'_, R>,
 ) -> CarriedNode {
     let (Some(desired_items), Some(fresh_items)) = (concrete_list(desired), concrete_list(fresh))
     else {
@@ -686,6 +713,25 @@ fn carry_list(
         context.defs,
         &context.comparison,
     );
+    if has_unmatched_fresh
+        && prior_to_fresh.iter().any(Option::is_none)
+        && item_type.is_some_and(|ty| type_contains_reference(ty, context.defs, 0))
+    {
+        // Saved plans and newly returned references may have no prepared
+        // identity evidence. Byte inequality cannot establish a new element
+        // or discard its prior field provenance. Keep the authored field union
+        // until identity can be established; never promote provider defaults
+        // to whole-element Leaf authoring merely because alias bytes changed.
+        let prior = ExplicitFields::List {
+            element: Box::new(union_elements(prior_elements.iter().cloned())),
+        };
+        return carried_list_without_alignment(
+            &candidate_paths,
+            merge(prior, build_legacy_list(desired_items)),
+            has_pending_paths,
+            has_unmatched_fresh,
+        );
+    }
     // The normal builder deliberately retains only the stable stored-index
     // authoring vector (including deterministic choices for duplicates). It
     // does not retain the desired index or uniqueness evidence, so transfer
@@ -762,6 +808,38 @@ fn carry_list(
     }
 }
 
+fn type_contains_reference(
+    ty: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    depth: usize,
+) -> bool {
+    if depth >= 64 {
+        return true;
+    }
+    use crate::schema::AttrTypeKind;
+    match &ty.kind {
+        AttrTypeKind::Reference { .. } => true,
+        AttrTypeKind::Ref(name) => defs
+            .get(name)
+            .is_some_and(|ty| type_contains_reference(ty, defs, depth + 1)),
+        AttrTypeKind::List { element_type, .. } => {
+            type_contains_reference(element_type, defs, depth + 1)
+        }
+        AttrTypeKind::Map { value, .. } => type_contains_reference(value, defs, depth + 1),
+        AttrTypeKind::Struct { fields, .. } => fields
+            .iter()
+            .any(|field| type_contains_reference(&field.field_type, defs, depth + 1)),
+        AttrTypeKind::Union(_) => {
+            crate::schema::union_members_with_defs(ty, defs).is_some_and(|members| {
+                members.any_on_path(&mut Vec::new(), |member, _| {
+                    type_contains_reference(member.as_attr(), defs, depth + 1)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
 fn carried_list_without_alignment(
     candidate_paths: &[BTreeSet<Vec<String>>],
     rebuilt: ExplicitFields,
@@ -795,12 +873,12 @@ fn carried_list_without_alignment(
     }
 }
 
-fn mutually_unique_pairs(
+fn mutually_unique_pairs<R: ReferenceEquality>(
     left: &[Value],
     right: &[Value],
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> Vec<Option<usize>> {
     let forward = pair_list_elements_with_uniqueness(left, right, attr_type, defs, comparison);
     let reverse = pair_list_elements_with_uniqueness(right, left, attr_type, defs, comparison);
@@ -822,11 +900,11 @@ fn mutually_unique_pairs(
         .collect()
 }
 
-fn pending_paths_by_element(
+fn pending_paths_by_element<R: ReferenceEquality>(
     elements: &[ExplicitFields],
     desired_items: &[Value],
     fresh_items: &[Value],
-    item_context: CarryContext<'_>,
+    item_context: CarryContext<'_, R>,
 ) -> (Vec<BTreeSet<Vec<String>>>, Vec<Option<usize>>) {
     let authored_by_element: Vec<_> = elements
         .iter()
@@ -852,11 +930,11 @@ fn pending_paths_by_element(
     )
 }
 
-fn pending_candidate_paths(
+fn pending_candidate_paths<R: ReferenceEquality>(
     prior_authored_counts: BTreeMap<Vec<String>, usize>,
     desired_items: &[Value],
     fresh_items: &[Value],
-    item_context: CarryContext<'_>,
+    item_context: CarryContext<'_, R>,
 ) -> (BTreeSet<Vec<String>>, Vec<Option<usize>>) {
     let broad_candidates: BTreeSet<_> = prior_authored_counts
         .into_iter()
@@ -1024,13 +1102,13 @@ pub fn build_from_value(value: &Value) -> ExplicitFields {
     }
 }
 
-fn build_from_value_for_stored_value(
+fn build_from_value_for_stored_value<R: ReferenceEquality>(
     desired: &Value,
     stored: Option<&Value>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     basis: StoredValueAuthoringBasis,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
     match desired {
         Value::Concrete(ConcreteValue::Map(desired_fields)) => {
@@ -1224,12 +1302,33 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// authored element as [`ExplicitFields::Unrecorded`]. Missing or mismatched
 /// stored lists use the legacy union projection. Schema-aware list pairing
 /// uses the same equality as state writeback.
-pub struct ExplicitProjection<'a> {
-    stored_attributes: &'a CanonicalComparisonAttributes,
+pub struct ExplicitProjection<'a, R: ReferenceEquality> {
+    stored_attributes: Option<&'a CanonicalComparisonAttributes>,
     desired: ProjectionDesired<'a>,
     explicit: &'a ExplicitFields,
     schema: Option<&'a ResourceSchema>,
-    comparison: ComparisonContext<'a>,
+    comparison: ComparisonContext<'a, R>,
+}
+
+/// The planning projection cannot accept independent, unmasked operands.
+pub(crate) struct MaskedExplicitProjection<'a, R: ReferenceEquality> {
+    projection: ExplicitProjection<'a, R>,
+    masked: &'a MaskedComparisonAttributes,
+}
+
+impl<R: ReferenceEquality> MaskedExplicitProjection<'_, R> {
+    pub(crate) fn current(&self) -> ProjectedAttributes {
+        self.projection
+            .project_attributes(self.masked.current().clone())
+    }
+    pub(crate) fn saved(&self) -> Option<ProjectedAttributes> {
+        self.masked.saved().map(|saved| {
+            self.projection.project_attributes_with_side(
+                saved.clone(),
+                crate::references::ReferenceSide::Saved,
+            )
+        })
+    }
 }
 
 enum ProjectionDesired<'a> {
@@ -1237,47 +1336,62 @@ enum ProjectionDesired<'a> {
     Conservative,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ProjectionDesiredValue<'a> {
-    Present(&'a Value),
+    Present(&'a Value, String),
     Absent,
     Conservative,
 }
 
 impl ProjectionDesiredValue<'_> {
-    fn child(self, key: &str) -> Self {
+    fn child(
+        &self,
+        key: &str,
+        ty: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Self {
         match self {
-            Self::Present(Value::Concrete(ConcreteValue::Map(fields))) => {
-                fields.get(key).map_or(Self::Absent, Self::Present)
+            Self::Present(Value::Concrete(ConcreteValue::Map(fields)), path) => {
+                let child_path = if crate::diff_helpers::map_entry_is_map(ty, defs) {
+                    format!("{path}[{}]", crate::parser::display_string_literal(key))
+                } else {
+                    format!("{path}.{key}")
+                };
+                fields
+                    .get(key)
+                    .map_or(Self::Absent, |value| Self::Present(value, child_path))
             }
-            Self::Present(value) if !value.is_fully_resolved() => Self::Conservative,
-            Self::Present(_) | Self::Absent => Self::Absent,
+            Self::Present(value, _) if !value.is_fully_resolved() => Self::Conservative,
+            Self::Present(_, _) | Self::Absent => Self::Absent,
             Self::Conservative => Self::Conservative,
         }
     }
 }
 
-impl<'a> ExplicitProjection<'a> {
+impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
     /// Build a projection whose server-added classification is checked against
     /// the resource's desired attributes.
-    pub fn for_desired(
-        stored_attributes: &'a CanonicalComparisonAttributes,
-        desired_attributes: &'a CanonicalComparisonAttributes,
+    pub(crate) fn for_desired(
+        masked: &'a MaskedComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
-        comparison: &ComparisonContext<'a>,
-    ) -> Self {
-        Self {
-            stored_attributes,
-            desired: ProjectionDesired::Attributes(
-                desired_attributes
-                    .into_iter()
-                    .map(|(key, value)| (key.as_str(), value))
-                    .collect(),
-            ),
-            explicit,
-            schema,
-            comparison: *comparison,
+        comparison: &ComparisonContext<'a, R>,
+    ) -> MaskedExplicitProjection<'a, R> {
+        MaskedExplicitProjection {
+            masked,
+            projection: Self {
+                stored_attributes: masked.saved(),
+                desired: ProjectionDesired::Attributes(
+                    masked
+                        .desired()
+                        .into_iter()
+                        .map(|(key, value)| (key.as_str(), value))
+                        .collect(),
+                ),
+                explicit,
+                schema,
+                comparison: *comparison,
+            },
         }
     }
 
@@ -1289,10 +1403,10 @@ impl<'a> ExplicitProjection<'a> {
         stored_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
-        comparison: &ComparisonContext<'a>,
+        comparison: &ComparisonContext<'a, R>,
     ) -> Self {
         Self {
-            stored_attributes,
+            stored_attributes: Some(stored_attributes),
             desired: ProjectionDesired::Conservative,
             explicit,
             schema,
@@ -1311,6 +1425,17 @@ impl<'a> ExplicitProjection<'a> {
         &self,
         attributes: CanonicalComparisonAttributes,
     ) -> ProjectedAttributes {
+        self.project_attributes_with_side(attributes, crate::references::ReferenceSide::Current)
+    }
+
+    fn project_attributes_with_side(
+        &self,
+        attributes: CanonicalComparisonAttributes,
+        side: crate::references::ReferenceSide,
+    ) -> ProjectedAttributes {
+        let comparison = self
+            .comparison
+            .with_sides(side, crate::references::ReferenceSide::Saved);
         let defs = self
             .schema
             .map(|schema| &schema.defs)
@@ -1321,6 +1446,7 @@ impl<'a> ExplicitProjection<'a> {
 
         let mut projected_attributes = HashMap::new();
         let mut projected_children = HashMap::new();
+        let mut origins = crate::differ::OperandOrigins::new();
         for (key, value) in attributes {
             let Some(explicit) = children.get(&key) else {
                 continue;
@@ -1330,38 +1456,43 @@ impl<'a> ExplicitProjection<'a> {
                 .and_then(|schema| schema.attributes.get(&key))
                 .map(|attribute| &attribute.attr_type);
             let desired = match &self.desired {
-                ProjectionDesired::Attributes(attributes) => {
-                    attributes.get(key.as_str()).copied().map_or(
-                        ProjectionDesiredValue::Absent,
-                        ProjectionDesiredValue::Present,
-                    )
-                }
+                ProjectionDesired::Attributes(attributes) => attributes
+                    .get(key.as_str())
+                    .copied()
+                    .map_or(ProjectionDesiredValue::Absent, |value| {
+                        ProjectionDesiredValue::Present(value, key.clone())
+                    }),
                 ProjectionDesired::Conservative => ProjectionDesiredValue::Conservative,
             };
             let projected = project_value(
                 value,
-                self.stored_attributes.get(&key),
+                self.stored_attributes
+                    .and_then(|attributes| attributes.get(&key)),
                 desired,
                 explicit,
                 attr_type,
                 defs,
-                &self.comparison,
+                &comparison.at_path(&key),
             );
+            origins.extend(projected.origins);
             projected_attributes.insert(key.clone(), projected.value);
             projected_children.insert(key, projected.authoring);
         }
-        ProjectedAttributes::canonicalized(
+        let mut projected = ProjectedAttributes::canonicalized(
             projected_attributes,
             ProjectedAuthoring::Struct {
                 children: projected_children,
             },
             self.schema,
-        )
+        );
+        projected.origins = origins;
+        projected
     }
 }
 
 /// Values produced by an [`ExplicitProjection`].
 pub struct ProjectedAttributes {
+    pub(crate) origins: crate::differ::OperandOrigins,
     attributes: CanonicalComparisonAttributes,
     pub(crate) authoring: ProjectedAuthoring,
 }
@@ -1379,6 +1510,7 @@ impl ProjectedAttributes {
             ),
         };
         Self {
+            origins: crate::differ::OperandOrigins::new(),
             attributes,
             authoring,
         }
@@ -1389,6 +1521,7 @@ impl ProjectedAttributes {
         explicit: Option<&ExplicitFields>,
     ) -> Self {
         Self {
+            origins: crate::differ::OperandOrigins::new(),
             attributes,
             authoring: explicit.map_or(ProjectedAuthoring::Opaque, |explicit| {
                 ProjectedAuthoring::from_unprojected(explicit)
@@ -1398,6 +1531,12 @@ impl ProjectedAttributes {
 
     pub fn attributes(&self) -> &CanonicalComparisonAttributes {
         &self.attributes
+    }
+
+    pub(crate) fn into_comparison_parts(
+        self,
+    ) -> (CanonicalComparisonAttributes, crate::differ::OperandOrigins) {
+        (self.attributes, self.origins)
     }
 
     pub fn into_attributes(self) -> CanonicalComparisonAttributes {
@@ -1445,29 +1584,52 @@ impl ProjectedAuthoring {
 struct ProjectedValue {
     value: Value,
     authoring: ProjectedAuthoring,
+    origins: crate::differ::OperandOrigins,
 }
 
-fn project_value(
+fn project_value<R: ReferenceEquality>(
     value: Value,
     stored: Option<&Value>,
     desired: ProjectionDesiredValue<'_>,
     explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    comparison: &ComparisonContext<'_>,
+    comparison: &ComparisonContext<'_, R>,
+) -> ProjectedValue {
+    let mut projected = project_value_inner(
+        value, stored, desired, explicit, attr_type, defs, comparison,
+    );
+    projected
+        .origins
+        .entry(comparison.left_path().into())
+        .or_insert_with(|| comparison.reference_operands()[0].clone());
+    projected
+}
+
+fn project_value_inner<R: ReferenceEquality>(
+    value: Value,
+    stored: Option<&Value>,
+    desired: ProjectionDesiredValue<'_>,
+    explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+    comparison: &ComparisonContext<'_, R>,
 ) -> ProjectedValue {
     match explicit {
         ExplicitFields::Leaf | ExplicitFields::Unrecorded => ProjectedValue {
+            origins: crate::differ::OperandOrigins::new(),
             value,
             authoring: ProjectedAuthoring::Opaque,
         },
         ExplicitFields::WholeValue { .. } => ProjectedValue {
+            origins: crate::differ::OperandOrigins::new(),
             value,
             authoring: ProjectedAuthoring::WholeValue,
         },
         ExplicitFields::Struct { children } => {
             let Value::Concrete(ConcreteValue::Map(fields)) = value else {
                 return ProjectedValue {
+                    origins: crate::differ::OperandOrigins::new(),
                     value,
                     authoring: ProjectedAuthoring::Opaque,
                 };
@@ -1478,6 +1640,7 @@ fn project_value(
             };
             let mut projected_fields = IndexMap::new();
             let mut projected_children = HashMap::new();
+            let mut origins = crate::differ::OperandOrigins::new();
             for (key, value) in fields {
                 let Some(child) = children.get(&key) else {
                     continue;
@@ -1485,16 +1648,18 @@ fn project_value(
                 let projected = project_value(
                     value,
                     stored_fields.and_then(|fields| fields.get(&key)),
-                    desired.child(&key),
+                    desired.child(&key, attr_type, defs),
                     child,
                     map_entry_subtype(attr_type, &key, defs),
                     defs,
-                    comparison,
+                    &comparison.at_paths(&comparison.entry_paths(&key, attr_type, defs)),
                 );
+                origins.extend(projected.origins);
                 projected_fields.insert(key.clone(), projected.value);
                 projected_children.insert(key, projected.authoring);
             }
             ProjectedValue {
+                origins,
                 value: Value::Concrete(ConcreteValue::Map(projected_fields)),
                 authoring: ProjectedAuthoring::Struct {
                     children: projected_children,
@@ -1506,6 +1671,7 @@ fn project_value(
                 project_legacy_list_items(items, element)
             }
             value => ProjectedValue {
+                origins: crate::differ::OperandOrigins::new(),
                 value,
                 authoring: ProjectedAuthoring::Opaque,
             },
@@ -1513,6 +1679,7 @@ fn project_value(
         ExplicitFields::ListElements { elements } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return ProjectedValue {
+                    origins: crate::differ::OperandOrigins::new(),
                     value,
                     authoring: ProjectedAuthoring::Opaque,
                 };
@@ -1534,22 +1701,31 @@ fn project_value(
                 comparison,
             );
             let desired_by_current = match desired {
-                ProjectionDesiredValue::Present(Value::Concrete(ConcreteValue::List(
-                    desired_items,
-                ))) if desired_items.iter().all(Value::is_fully_resolved) => {
+                ProjectionDesiredValue::Present(
+                    Value::Concrete(ConcreteValue::List(desired_items)),
+                    desired_path,
+                ) if desired_items.iter().all(Value::is_fully_resolved) => {
                     // Pair in the normal desired -> current direction so each
                     // desired element claims at most one current element. A
                     // lower-scoring current candidate left unclaimed by that
                     // assignment is not desired evidence; treating it as an
                     // ambiguous match would resurface provider-added siblings.
-                    let stable_pairs =
-                        pair_list_elements(desired_items, &items, item_type, defs, comparison);
+                    let desired_paths = [desired_path.clone(), comparison.left_path().into()];
+                    let desired_comparison = comparison.desired_pair();
+                    let desired_comparison = desired_comparison.at_paths(&desired_paths);
+                    let stable_pairs = pair_list_elements(
+                        desired_items,
+                        &items,
+                        item_type,
+                        defs,
+                        &desired_comparison,
+                    );
                     let pairings = pair_list_elements_with_uniqueness(
                         desired_items,
                         &items,
                         item_type,
                         defs,
-                        comparison,
+                        &desired_comparison,
                     );
                     let mut desired_by_current = vec![ProjectionDesiredValue::Absent; items.len()];
                     for (desired_index, (current_index, pairing)) in
@@ -1561,7 +1737,10 @@ fn project_value(
                         desired_by_current[current_index] = match pairing {
                             ListElementPairing::Unique(unique_current_index) => {
                                 debug_assert_eq!(current_index, unique_current_index);
-                                ProjectionDesiredValue::Present(&desired_items[desired_index])
+                                ProjectionDesiredValue::Present(
+                                    &desired_items[desired_index],
+                                    format!("{desired_path}[{desired_index}]"),
+                                )
                             }
                             ListElementPairing::Ambiguous => ProjectionDesiredValue::Conservative,
                             ListElementPairing::Unmatched => ProjectionDesiredValue::Absent,
@@ -1569,33 +1748,43 @@ fn project_value(
                     }
                     desired_by_current
                 }
-                ProjectionDesiredValue::Present(value) if !value.is_fully_resolved() => {
+                ProjectionDesiredValue::Present(value, _) if !value.is_fully_resolved() => {
                     vec![ProjectionDesiredValue::Conservative; items.len()]
                 }
                 ProjectionDesiredValue::Conservative => {
                     vec![ProjectionDesiredValue::Conservative; items.len()]
                 }
-                ProjectionDesiredValue::Present(_) | ProjectionDesiredValue::Absent => {
+                ProjectionDesiredValue::Present(_, _) | ProjectionDesiredValue::Absent => {
                     vec![ProjectionDesiredValue::Absent; items.len()]
                 }
             };
             let mut projected_items = Vec::with_capacity(items.len());
+            let mut origins = crate::differ::OperandOrigins::new();
             let mut projected_elements = Vec::with_capacity(items.len());
-            for ((item, stored_pairing), desired) in items
+            for (index, ((item, stored_pairing), desired)) in items
                 .into_iter()
                 .zip(stored_pairings)
                 .zip(desired_by_current)
+                .enumerate()
             {
+                let stored_index = match stored_pairing {
+                    ListElementPairing::Unique(index) => index,
+                    _ => index,
+                };
+                let paths = comparison.index_paths(index, stored_index);
+                let output =
+                    comparison.index_paths(projected_items.len(), projected_items.len())[0].clone();
+                let comparison = &comparison.at_paths(&paths);
                 let paired_stored = match stored_pairing {
                     ListElementPairing::Unique(stored_index) => Some(&stored_items[stored_index]),
                     ListElementPairing::Ambiguous | ListElementPairing::Unmatched => None,
                 };
 
                 let projected = match desired {
-                    ProjectionDesiredValue::Present(desired) => project_value(
+                    ProjectionDesiredValue::Present(desired, desired_path) => project_value(
                         item,
                         paired_stored,
-                        ProjectionDesiredValue::Present(desired),
+                        ProjectionDesiredValue::Present(desired, desired_path),
                         &union,
                         item_type,
                         defs,
@@ -1639,10 +1828,17 @@ fn project_value(
                         }
                     },
                 };
+                for (path, origin) in projected.origins {
+                    let suffix = path
+                        .strip_prefix(&paths[0])
+                        .expect("projected child path is below its input root");
+                    origins.insert(format!("{output}{suffix}"), origin);
+                }
                 projected_items.push(projected.value);
                 projected_elements.push(projected.authoring);
             }
             ProjectedValue {
+                origins,
                 value: Value::Concrete(ConcreteValue::List(projected_items)),
                 authoring: ProjectedAuthoring::AlignedList {
                     elements: projected_elements,
@@ -1654,6 +1850,7 @@ fn project_value(
 
 fn project_legacy_list_items(items: Vec<Value>, element: &ExplicitFields) -> ProjectedValue {
     ProjectedValue {
+        origins: crate::differ::OperandOrigins::new(),
         value: Value::Concrete(ConcreteValue::List(
             items
                 .into_iter()
@@ -1712,8 +1909,13 @@ mod tests {
         RootScope::new().resolve(RelativeBindingName::new(binding))
     }
 
-    fn build_carried_from_resource_for_stored_values<S>(
-        resource: &Resource<S>,
+    fn build_carried_from_resource_for_stored_values<S, D>(
+        resource: &Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
         prior_stored_attributes: &HashMap<String, Value>,
         prior_explicit: &ExplicitFields,
         fresh_stored_attributes: &HashMap<String, Value>,
@@ -1770,14 +1972,19 @@ mod tests {
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
-        ExplicitProjection::for_desired(
-            &stored_attributes,
+        let masked = crate::resource::ResolvedIgnoreChanges::default().mask_comparison_attributes(
             &desired_attributes,
+            &current_attributes,
+            Some(&stored_attributes),
+            None,
+        );
+        ExplicitProjection::for_desired(
+            &masked,
             &root,
             None,
             &crate::differ::exact_comparison_context_for_tests(),
         )
-        .project_attributes(current_attributes)
+        .current()
         .into_attributes()
         .into_iter()
         .collect::<HashMap<_, _>>()
@@ -1827,14 +2034,19 @@ mod tests {
         let attributes = CanonicalComparisonAttributes::from_unschematized(
             crate::resource::UnschematizedComparisonAttributes::new(attributes),
         );
+        let masked = crate::resource::ResolvedIgnoreChanges::default().mask_comparison_attributes(
+            &attributes,
+            &attributes,
+            Some(&attributes),
+            None,
+        );
         ExplicitProjection::for_desired(
-            &attributes,
-            &attributes,
+            &masked,
             explicit,
             None,
             &crate::differ::exact_comparison_context_for_tests(),
         )
-        .project_attributes(attributes.clone())
+        .current()
         .into_attributes()
         .into_iter()
         .collect()
