@@ -195,7 +195,7 @@ pub enum DependencyResolutionError {
     #[error("{owner}: duplicate persisted dependency binding '{binding}'")]
     DuplicatePersistedTarget { owner: String, binding: String },
     #[error(
-        "{owner}: persisted dependency binding '{binding}' is not a resolved managed target in this saved plan"
+        "{owner}: persisted dependency binding '{binding}' is not a resolved dependency target in this saved plan"
     )]
     PersistedTargetMissing { owner: String, binding: String },
     #[error(
@@ -411,6 +411,25 @@ impl ResolvedDependencyScope {
         owner: impl Into<String>,
         persisted: PersistedDependencies,
     ) -> Result<ResolvedDependencies, DependencyResolutionError> {
+        self.promote_persisted_targets(owner, persisted, false)
+    }
+
+    /// Wait evidence also includes provider satisfier hints, which may name
+    /// data sources. Authored resource dependencies still require managed targets.
+    pub(crate) fn promote_persisted_wait_dependencies(
+        &self,
+        owner: impl Into<String>,
+        persisted: PersistedDependencies,
+    ) -> Result<ResolvedDependencies, DependencyResolutionError> {
+        self.promote_persisted_targets(owner, persisted, true)
+    }
+
+    fn promote_persisted_targets(
+        &self,
+        owner: impl Into<String>,
+        persisted: PersistedDependencies,
+        allow_data_source_hints: bool,
+    ) -> Result<ResolvedDependencies, DependencyResolutionError> {
         let owner = owner.into();
         let mut resolved = HashMap::with_capacity(persisted.0.len());
         for target in persisted.0 {
@@ -418,7 +437,14 @@ impl ResolvedDependencyScope {
             if resolved.contains_key(&binding) {
                 return Err(DependencyResolutionError::DuplicatePersistedTarget { owner, binding });
             }
-            let Some(expected) = self.managed.get(&binding) else {
+            let expected = self.managed.get(&binding).or_else(|| {
+                if allow_data_source_hints {
+                    self.data_sources.get(&binding)
+                } else {
+                    None
+                }
+            });
+            let Some(expected) = expected else {
                 return Err(DependencyResolutionError::PersistedTargetMissing { owner, binding });
             };
             if target.identity != expected.identity {
@@ -655,5 +681,24 @@ mod tests {
 
         assert_eq!(resolved.as_str(), "gate");
         assert_eq!(Some(resolved.identity()), target.id.identity());
+    }
+
+    #[test]
+    fn persisted_resource_dependencies_reject_data_source_targets() {
+        let lookup: DataSource =
+            DataSource::new("mock.test.Lookup", "lookup").with_binding("lookup");
+        let scope = ResolvedDependencyScope::from_resources(
+            &[] as &[Resource],
+            &[lookup],
+            std::iter::empty(),
+        );
+
+        let error = scope
+            .decode_format_37_dependencies(
+                "resource dependencies",
+                serde_json::json!([{ "binding": "lookup", "identity": "lookup" }]),
+            )
+            .expect_err("only provider wait hints may carry data source targets");
+        assert!(error.contains("lookup") && error.contains("not a resolved dependency target"));
     }
 }

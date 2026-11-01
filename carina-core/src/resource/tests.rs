@@ -828,7 +828,12 @@ fn resolved_resource_collect_resolved_rejects_unresolved_depends_on() {
     let mut resource = Resource::new("s3.Bucket", "logs");
     resource.directives.depends_on.push("gate".to_string());
 
-    assert!(ResolvedResource::collect_resolved([resource]).is_err());
+    assert!(matches!(
+        ResolvedResource::collect_resolved([resource]),
+        Err(ResolvedResourceError::Dependency(
+            crate::dependency::DependencyResolutionError::MetadataMismatch { .. }
+        ))
+    ));
 }
 
 #[test]

@@ -47,6 +47,10 @@ fn state_show_tui_accepts_depends_on_module_call_in_multifile_directory() {
         "state show --tui must treat persisted depends_on as display metadata; output:\n{output}",
     );
     assert!(
+        output.contains("\x1b[?1049h") && output.contains("consumer"),
+        "state show --tui must render the persisted resource in the TUI: {output}",
+    );
+    assert!(
         !output.contains("not declared in this scope"),
         "display must not resolve module-call dependencies against state rows: {output}",
     );

@@ -1085,7 +1085,8 @@ impl PersistedUnresolvedSavedEffect {
                     until_surface,
                     timeout,
                     interval,
-                    explicit_dependencies: scope.promote_persisted(owner, explicit_dependencies)?,
+                    explicit_dependencies: scope
+                        .promote_persisted_wait_dependencies(owner, explicit_dependencies)?,
                 }
             }
             Self::DeferredCreate {
@@ -2494,8 +2495,11 @@ impl<S> EffectWithSource<S> {
                 edges
             }
             Effect::DeferredReplace(payload) => {
-                let mut edges = self
-                    .blocking_bindings()
+                // Failure propagation uses binding names; scheduling explicit
+                // dependencies must use their resolver-produced identities.
+                let mut dependencies = deferred_replace_delete_dependencies(&payload.deletes);
+                dependencies.extend(payload.template.root_bindings());
+                let mut edges = dependencies
                     .into_iter()
                     .map(ResourceIdentity::new)
                     .map(ScheduleEdge::DependsOn)

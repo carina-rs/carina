@@ -360,9 +360,8 @@ mod tests {
         assert!(matches!(failed, FailedDependency::Labeled(label) if label == "main.crn:2"));
     }
 
-    #[test]
-    fn failed_explicit_dependency_pre_skips_deferred_children() {
-        let gate = Resource::new("test.Gate", "gate").with_binding("gate");
+    fn deferred_dependency_effects() -> Vec<Effect> {
+        let gate = Resource::new("test.Gate", "gate-provider-identity").with_binding("gate");
         let parsed = crate::parser::parse_file(
             "let upstream = upstream_state { source = '../upstream' }\n\
              let children = for value in upstream.values {\n\
@@ -392,7 +391,7 @@ mod tests {
             "__deferred_for",
             "children",
         ));
-        let effects = vec![
+        vec![
             Effect::Create(ResolvedResource::new(gate)),
             Effect::DeferredCreate {
                 id: deferred_id.clone(),
@@ -417,18 +416,55 @@ mod tests {
                 template: Box::new(template),
                 explicit_dependencies,
             })),
-        ];
+        ]
+    }
+
+    #[test]
+    fn failed_explicit_dependency_pre_skips_deferred_children() {
+        let effects = deferred_dependency_effects();
         let deps_of = HashMap::new();
         let failed_indices = HashSet::from([0]);
         let view = FailureView::new(&effects, &deps_of, &failed_indices);
 
-        for deferred_idx in [1, 2] {
-            assert!(
+        let pre_skipped = [1, 2]
+            .into_iter()
+            .filter(|&idx| {
                 matches!(
-                    view.find_failed_dependency(deferred_idx),
+                    view.find_failed_dependency(idx),
                     Some(FailedDependency::Labeled(label)) if label == "gate"
-                ),
-                "deferred effect {deferred_idx} must be pre-skipped after gate fails",
+                ) && view.is_effectively_pre_skipped(idx)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pre_skipped,
+            [1, 2],
+            "both deferred create and replace must be pre-skipped after gate fails",
+        );
+    }
+
+    #[test]
+    fn deferred_explicit_dependencies_do_not_use_binding_names_as_identities() {
+        let fixture = deferred_dependency_effects();
+        let unrelated = Effect::Create(ResolvedResource::new(
+            Resource::new("test.Unrelated", "gate").with_binding("unrelated"),
+        ));
+
+        for deferred in &fixture[1..] {
+            let effects = vec![fixture[0].clone(), unrelated.clone(), deferred.clone()];
+            let dependencies = build_effect_dependency_analysis(
+                &effects,
+                &HashMap::new(),
+                &[],
+                ScheduleInputs::Apply,
+            )
+            .expect("deferred dependency graph is valid")
+            .into_deps_of();
+
+            assert_eq!(
+                dependencies.get(&2),
+                Some(&HashSet::from([0])),
+                "deferred {} must depend on gate's resolved identity without an edge to unrelated",
+                deferred.kind(),
             );
         }
     }

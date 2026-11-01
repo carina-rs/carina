@@ -89,6 +89,64 @@ mod dependency_boundary_tests {
             result.err(),
         );
     }
+
+    #[test]
+    fn create_plan_uses_pre_resolved_wait_dependencies_outside_differ_scope() {
+        let target = Resource::new("test.Target", "target").with_binding("target");
+        let mut consumer = Resource::new("test.Consumer", "consumer");
+        consumer.dependency_bindings.insert("ready".to_string());
+        let composition: Resource =
+            Resource::new("test.Composition", "module_call").with_binding("module_call");
+        let parsed = crate::parser::parse_file(
+            "let ready = wait target {\n\
+               until = target.status == \"ready\"\n\
+               depends_on = [module_call]\n\
+             }\n",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::default(),
+        )
+        .expect("wait fixture parses")
+        .into_expanded()
+        .expect("wait fixture has no parser placeholders");
+        let scope = ResolvedDependencyScope::from_resources(
+            std::slice::from_ref(&target),
+            &[] as &[DataSource],
+            std::iter::empty(),
+        )
+        .with_declared_targets(&[composition]);
+        let wait = scope.resolve_wait(parsed.wait_bindings[0].clone()).unwrap();
+        let current_states = HashMap::new();
+        let orphans = Orphans::new();
+        let registry = SchemaRegistry::new();
+        let saved_attrs = crate::provider::RawSavedAttrs::default().lift(&registry);
+        let (_, provider) =
+            crate::provider::comparison_fixture_for_test(&registry, [&target.id, &consumer.id]);
+
+        let plan = create_plan(
+            &[
+                ResolvedResource::new(target),
+                ResolvedResource::new(consumer),
+            ],
+            &[],
+            &provider,
+            PlanPriorStates::new(&current_states, &orphans),
+            &HashMap::new(),
+            &registry,
+            &saved_attrs,
+            &HashMap::new(),
+            &[wait],
+        )
+        .expect("create_plan must retain wait evidence from the complete caller scope");
+
+        let wait = plan.effects().iter().find_map(|effect| match effect {
+            Effect::Wait {
+                explicit_dependencies,
+                ..
+            } => Some(explicit_dependencies),
+            _ => None,
+        });
+        assert!(wait.is_some_and(|dependencies| dependencies.contains("module_call")));
+    }
 }
 
 pub(crate) struct PendingReplace {
@@ -392,7 +450,6 @@ fn resolve_raw_planning_dependencies(
 ///     &[],
 /// );
 /// ```
-
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
     managed: &[ResolvedResource],

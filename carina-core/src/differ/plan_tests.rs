@@ -4239,6 +4239,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
 #[test]
 fn wait_provider_satisfier_hint_accepts_data_source_binding() {
     use crate::effect::Effect;
+    use crate::plan::{SavedPlan, UnresolvedSavedPlan};
     use crate::wait::BindingPattern;
 
     let parsed = crate::parser::parse_and_resolve(
@@ -4288,6 +4289,33 @@ fn wait_provider_satisfier_hint_accepts_data_source_binding() {
         unreachable!()
     };
     assert!(explicit_dependencies.contains("validation"));
+
+    let scope = crate::dependency::ResolvedDependencyScope::from_resources(
+        &parsed.resources,
+        &parsed.data_sources,
+        std::iter::empty(),
+    );
+    let expected = SavedPlan::from(plan);
+    let mut wire = serde_json::to_value(UnresolvedSavedPlan::from(expected.clone())).unwrap();
+    let decoded = UnresolvedSavedPlan::decode_format_37(wire.clone(), &scope)
+        .expect("saved wait provider hints may depend on a data source")
+        .resolve_with_schemas(&string_wait_schemas("aws"))
+        .unwrap();
+    assert_eq!(
+        decoded.effects().iter().find(|effect| effect.is_wait()),
+        expected.effects().iter().find(|effect| effect.is_wait()),
+    );
+
+    let wait = wire["effects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|effect| effect.get_mut("Wait"))
+        .unwrap();
+    wait["explicit_dependencies"][0]["identity"] = serde_json::json!("forged-validation");
+    let error = UnresolvedSavedPlan::decode_format_37(wire, &scope)
+        .expect_err("saved wait hints must match the recorded data source identity");
+    assert!(error.contains("forged-validation") && error.contains("does not match"));
 }
 
 #[test]

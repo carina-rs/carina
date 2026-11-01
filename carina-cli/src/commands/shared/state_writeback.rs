@@ -5570,9 +5570,8 @@ mod apply_state_save_tests {
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
-        let mut plan_json =
-            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
-                .expect("plan should serialize");
+        let mut plan_json = serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
+            .expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
             {
                 "create_idx": 1,
@@ -5747,9 +5746,8 @@ mod apply_state_save_tests {
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
-        let mut plan_json =
-            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
-                .expect("plan should serialize");
+        let mut plan_json = serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
+            .expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
             {
                 "create_idx": 1,
@@ -5871,9 +5869,8 @@ mod apply_state_save_tests {
             "name".to_string(),
             Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
-        let mut plan_json =
-            serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
-                .expect("plan should serialize");
+        let mut plan_json = serde_json::to_value(UnresolvedSavedPlan::from(SavedPlan::from(plan)))
+            .expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
             {
                 "create_idx": 1,

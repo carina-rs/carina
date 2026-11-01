@@ -652,10 +652,7 @@ impl ResolvedResourceId {
         Self(id)
     }
 
-    /// Try to construct without schema or dependency resolution.
-    ///
-    /// Returns `None` when identity is pending, ignore metadata is unresolved,
-    /// or authored `depends_on` requires resolver evidence.
+    /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(id: ResourceId) -> Option<Self> {
         match id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
@@ -982,7 +979,10 @@ impl<S> ResolvedResource<S> {
         }
     }
 
-    /// Try to construct; returns `None` if identity is pending.
+    /// Try to construct without schema or dependency resolution.
+    ///
+    /// Returns `None` when identity is pending, ignore metadata is unresolved,
+    /// or authored `depends_on` requires resolver evidence.
     pub fn try_new(resource: Resource<S>) -> Option<Self> {
         if matches!(
             resource.id.identity_state(),
