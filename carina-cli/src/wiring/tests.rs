@@ -10649,7 +10649,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
     );
     let canonical_resources = canonical_pair(
         &parsed,
-        parsed.resources.clone(), // allow: direct — fixture plan input
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
         wiring.context().schemas(),
     );
     let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
