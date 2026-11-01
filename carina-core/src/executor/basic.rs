@@ -1175,22 +1175,6 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 .schemas()
                 .get_for(resolved_resource)
                 .expect("managed_update_schema proved that the owner-bound schema exists");
-            let comparison = match ctx
-                .comparison_provider
-                .comparison_context_for(id, owner_schema)
-            {
-                Ok(comparison) => comparison,
-                Err(error) => {
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure: EffectFailureKind::provider(error),
-                            refresh: None,
-                        },
-                    );
-                }
-            };
             let mut candidates = HashMap::new();
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.contains(key)
@@ -1225,35 +1209,32 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     None,
                     Some(schema),
                 );
-                let additional = async {
-                    let references = crate::references::ReferencePreparation::default()
-                        .prepare_masked_resource(
-                            id,
+                let additional = crate::references::ReferencePreparation::default()
+                    .run(ctx.comparison_provider, |session| {
+                        session.apply_time(
+                            &resolved_to,
                             &masked,
-                            owner_schema.schema(),
+                            owner_schema,
                             ctx.comparison_provider,
                         )
-                        .await?;
-                    let additional = comparison.with_references(&references, id, |context| {
-                        crate::differ::find_apply_time_changed_attributes(
-                            &masked,
-                            resolved_to.as_inner(),
-                            schema,
-                            resolved_to.ignore_changes(),
-                            context,
-                        )
-                    })??;
-                    Ok::<_, crate::differ::ApplyTimeComparisonError>(additional)
-                }
-                .await;
+                    })
+                    .await;
                 match additional {
-                    Ok(additional) => effective_changed.extend(additional),
+                    Ok(additional) => effective_changed.extend(additional.value),
                     Err(error) => {
+                        let failure = match error {
+                            crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
+                                EffectFailureKind::execution(error)
+                            }
+                            crate::differ::ApplyTimeComparisonError::Reference(error) => {
+                                EffectFailureKind::provider(error)
+                            }
+                        };
                         return StartedBasicEffectResult::new(
                             started_effect,
                             started,
                             BasicEffectResult::Failure {
-                                failure: EffectFailureKind::provider(error),
+                                failure,
                                 refresh: None,
                             },
                         );

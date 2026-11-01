@@ -86,6 +86,9 @@ with exactly these rules:
   `DescribeKey` to a key ARN. Compare ARNs.
 - Unknown/deferred on either side: existing unknown handling, no lookup.
 
+Lookups happen only for pairs the differ actually compares, which can include
+saved-side pairing of lists.
+
 SQS, SNS and S3 retain echoed aliases; KMS resolves them on every encrypt
 call, so the resource follows the alias. Identical raw aliases compare
 equal. ECR and DynamoDB return key ARNs fixed at write time; resolving the
@@ -96,25 +99,31 @@ Apply the same rules to saved/write-only fallbacks, preserving omission and
 ownership rules. Comparison ARNs never enter payloads, bindings/exports or
 state attributes.
 
-### D5. Prepare references before the differ; preserve deferred values
+### D5. Record comparison demands; preserve deferred values
 
-Core provides one async prepare step before the differ. The CLI invokes it
-after refresh, hydration, reference evaluation and normalization at the
-plan-input seam in [wiring](../../carina-cli/src/wiring/mod.rs). Resolve only
-leaves needing a lookup under D4. Batch by initialized provider instance;
-cache per run by `(provider instance, reference type identity, raw value)`.
+After refresh, hydration, reference evaluation and normalization, run the real
+planning computation in a recording session. This includes binding-stability
+passes, cascade planning and both detail-row rendering modes. When a concrete,
+non-byte-equal reference pair lacks evidence, the comparator records its operands
+with their desired/current/saved origins and provisionally returns unequal.
+There is no separate walker enumerating pairs.
 
-Preparation returns a `ResolvedReferences` witness required by the
-differ/plan entry point. Every reference comparison caller, including
-binding-stability comparisons, uses this witness. Missing preparation for
-a needed pair is a typed error; no caller can compare a reference leaf as
-a plain string.
+Discard a pass that records anything, resolve its new values in one batch per
+initialized provider instance, and rerun. Provider batches run concurrently and
+validate their positional result lengths. Cache by `(provider instance, reference
+type identity, raw value)` for this planning invocation. Each rerun strictly grows
+the witness; exceeding 64 recording passes is a typed error.
 
-Unknown/deferred leaves are never resolved and retain existing dependency
-and scheduling behavior. Apply re-prepares only leaves that become concrete
-or change after planning, for apply-time augmentation under D4 and D6's
-failure table. DescribeKey may therefore run at apply too; unchanged planned
-leaves keep the recorded decision.
+The recording session returns only an opaque provisional result. Only a pass
+that records nothing releases its result and a `ResolvedReferences` witness.
+Provisional plans, rendering results and errors cannot escape that boundary.
+Secret-reference validation and the typed traversal-depth check finish before
+any guest call.
+
+Unknown/deferred leaves retain existing dependency and scheduling behavior.
+Apply-time augmentation runs the same recording loop with a fresh cache for
+keys that become concrete or change after planning. Unchanged planned leaves
+keep their recorded decision.
 
 ### D6. Resolution failures are typed; only a dangling current value is a diff
 

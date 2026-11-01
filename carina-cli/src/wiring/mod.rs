@@ -93,7 +93,6 @@ use carina_core::deps::{
 pub use carina_core::differ::DeferredForExpansionChoice;
 use carina_core::differ::{
     CascadeDependents, DeferredCreateTargets, block_deletes_on_prior_consumer_updates,
-    create_plan_with_cascades,
 };
 use carina_core::differ::{
     Orphan, Orphans, PlanPriorStates, into_all_prior_states, lift_prior_state_enum_leaves,
@@ -5550,24 +5549,19 @@ pub async fn derive_managed_binding_stability<E>(
         }
     }
     let resolved = schema_resolved;
-    let references = reference_preparation
-        .prepare(
-            &resolved,
-            &plan_input_current,
-            schemas,
-            saved_attrs,
-            provider,
-        )
-        .await?;
-    let mut stability = carina_core::differ::managed_binding_stability(
-        &resolved,
-        &plan_input_current,
-        schemas,
-        saved_attrs,
-        prev_explicit,
-        provider,
-        &references,
-    )?;
+    let mut stability = reference_preparation
+        .run(provider, |session| {
+            session.stability(
+                &resolved,
+                &plan_input_current,
+                schemas,
+                saved_attrs,
+                prev_explicit,
+                provider,
+            )
+        })
+        .await?
+        .value;
     stability.extend(pending_stability);
     Ok(stability)
 }
@@ -6195,24 +6189,19 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         override_aware_resources.resources().iter().cloned(),
         context.schemas(),
     )?;
-    let references = reference_preparation
-        .prepare(
-            &stability_resources,
-            &reconciled_input_current,
-            context.schemas(),
-            &addressed.saved_attrs,
-            provider,
-        )
-        .await?;
-    let managed_stability = carina_core::differ::managed_binding_stability(
-        &stability_resources,
-        &reconciled_input_current,
-        context.schemas(),
-        &addressed.saved_attrs,
-        &addressed.prev_explicit,
-        provider,
-        &references,
-    )?;
+    let managed_stability = reference_preparation
+        .run(provider, |session| {
+            session.stability(
+                &stability_resources,
+                &reconciled_input_current,
+                context.schemas(),
+                &addressed.saved_attrs,
+                &addressed.prev_explicit,
+                provider,
+            )
+        })
+        .await?
+        .value;
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
@@ -6251,21 +6240,27 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     );
     let plan_input_desired =
         carina_core::resource::plan_input_desired_resources(&resolved_resources, context.schemas());
-    let plan = create_plan_with_cascades(
-        &plan_input_desired,
-        CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets),
-        &data_sources_for_plan,
-        provider,
-        PlanPriorStates::new(&plan_input_current, &addressed.orphans),
-        &directives_map,
-        context.schemas(),
-        &addressed.saved_attrs,
-        &addressed.prev_explicit,
-        &wait_bindings,
-        &outcome_unknown_import_replacements,
-        &references,
-    )?;
-    let plan = plan.finish(|plan| {
+    let dependents =
+        CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets);
+    let prepared = reference_preparation
+        .run(provider, |session| {
+            session.plan_with_cascades(
+                &plan_input_desired,
+                &dependents,
+                &data_sources_for_plan,
+                provider,
+                PlanPriorStates::new(&plan_input_current, &addressed.orphans),
+                &directives_map,
+                context.schemas(),
+                &addressed.saved_attrs,
+                &addressed.prev_explicit,
+                &wait_bindings,
+                &outcome_unknown_import_replacements,
+            )
+        })
+        .await?;
+    let references = prepared.references;
+    let plan = prepared.value.finish(|plan| {
         add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
         block_deletes_on_prior_consumer_updates(plan, &directives_map);
         override_aware_resources.apply_plan_stability(&plan_input_current, plan, context.schemas());

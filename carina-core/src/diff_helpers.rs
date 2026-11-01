@@ -101,30 +101,41 @@ pub(crate) fn map_entry_subtype<'a>(
     key: &str,
     defs: &'a BTreeMap<String, AttributeType>,
 ) -> Option<&'a AttributeType> {
-    let mut t = attr_type?;
+    let t = map_entry_type(attr_type?, defs)?;
+    match t.shape_ref_free().ok()? {
+        crate::schema::Shape::Map { value, .. } => Some(value),
+        crate::schema::Shape::Struct { .. } => crate::schema::struct_fields_with_defs(t, defs)?
+            .iter()
+            .find(|field| field.name() == key)
+            .map(|field| &field.field_type),
+        _ => None,
+    }
+}
+
+pub(crate) fn map_entry_is_map(
+    ty: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> bool {
+    ty.and_then(|ty| map_entry_type(ty, defs))
+        .is_some_and(|ty| matches!(ty.shape_ref_free(), Ok(crate::schema::Shape::Map { .. })))
+}
+
+fn map_entry_type<'a>(
+    mut t: &'a AttributeType,
+    defs: &'a BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
     let mut visited_refs = Vec::new();
     loop {
-        let resolved = t.resolve_refs_for_union_walk_on_path(defs, &mut visited_refs)?;
-        t = resolved.as_attr();
-        match t
-            .shape_ref_free()
-            .expect("resolve_refs_for_union_walk_on_path must peel every top-level Ref")
-        {
-            crate::schema::Shape::List {
-                element_type: inner,
-                ..
-            } => t = inner,
-            crate::schema::Shape::Map { value, .. } => return Some(value),
-            crate::schema::Shape::Struct { .. } => {
-                let fields = crate::schema::struct_fields_with_defs(t, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                return fields
-                    .iter()
-                    .find(|field| field.name() == key)
-                    .map(|field| &field.field_type);
+        t = t
+            .resolve_refs_for_union_walk_on_path(defs, &mut visited_refs)?
+            .as_attr();
+        match t.shape_ref_free().ok()? {
+            crate::schema::Shape::List { element_type, .. } => t = element_type,
+            crate::schema::Shape::Map { .. } | crate::schema::Shape::Struct { .. } => {
+                return Some(t);
             }
             crate::schema::Shape::Union => {
-                t = union_member_for_walk(t, defs, UnionWalkTarget::MapEntry, &mut visited_refs)?;
+                t = union_member_for_walk(t, defs, UnionWalkTarget::MapEntry, &mut visited_refs)?
             }
             _ => return None,
         }
@@ -262,7 +273,7 @@ pub fn compute_unchanged_count<R: ReferenceEquality>(
                         let attr_type = schema
                             .and_then(|s| s.attributes.get(k.as_str()))
                             .map(|a| &a.attr_type);
-                        schema_aware_equal(nv, v, attr_type, defs, context)
+                        schema_aware_equal(v, nv, attr_type, defs, &context.at_path(k))
                     })
                     .unwrap_or(false)
         })

@@ -126,6 +126,19 @@ impl<'a> CascadeDependents<'a> {
     pub fn new(managed: &'a [ResolvedResource], deferred: DeferredCreateTargets) -> Self {
         Self { managed, deferred }
     }
+
+    pub(crate) fn managed(&self) -> &'a [ResolvedResource] {
+        self.managed
+    }
+
+    // Replaying a provisional computation must not consume the caller's
+    // deferred target owner. Only the clean plan is released by preparation.
+    pub(crate) fn for_recording_run(&self) -> Self {
+        Self {
+            managed: self.managed,
+            deferred: DeferredCreateTargets(self.deferred.0.clone()),
+        }
+    }
 }
 
 /// Cascaded diff awaiting the remaining, caller-owned planning effects.
@@ -154,6 +167,13 @@ pub struct PendingCascadePlan {
 }
 
 impl PendingCascadePlan {
+    /// Comparisons are complete before ancillary effects and retained deferred
+    /// effects are emitted. Recording renders this same diff plan without
+    /// consuming the caller's finalization owner.
+    pub(crate) fn comparison_plan(&self) -> &Plan {
+        &self.plan
+    }
+
     /// Complete the remaining planning steps, then emit the very same deferred
     /// targets already consulted during CBD promotion. The callback sees only
     /// the diff plan, preserving the historical ancillary-effect ordering.
@@ -286,9 +306,11 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
                     &self.current_items[current_index],
                     self.desired_items[desired_index].1,
                     self.schema,
-                    &self
-                        .context
-                        .at_path(&self.context.index_path(self.desired_items[desired_index].0)),
+                    &self.context.at_paths(
+                        &self
+                            .context
+                            .index_paths(current_index, self.desired_items[desired_index].0),
+                    ),
                     self.removal_evidence,
                 )
             {
@@ -396,7 +418,7 @@ fn create_only_values_compatible_on_path<'schema>(
                         current_items.get(index),
                         desired,
                         schema,
-                        &context.at_path(&context.index_path(index)),
+                        &context.at_paths(&context.index_paths(index, index)),
                         removal_evidence,
                     )
                 })
@@ -440,7 +462,7 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_entries.get(key),
                     desired,
                     schema,
-                    &context.at_path(&context.map_key_path(key)),
+                    &context.at_paths(&context.map_key_paths(key)),
                     removal_evidence,
                 )
             })
@@ -475,7 +497,7 @@ fn create_only_values_compatible_on_path<'schema>(
                             desired,
                             Some(&field.field_type),
                             &schema.defs,
-                            &context.at_path(&context.field_path(&field.name)),
+                            &context.at_paths(&context.field_paths(&field.name)),
                         )
                     });
                 }
@@ -484,7 +506,7 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_fields.get(&field.name),
                     desired,
                     schema,
-                    &context.at_path(&context.field_path(&field.name)),
+                    &context.at_paths(&context.field_paths(&field.name)),
                     removal_evidence,
                 )
             })
@@ -509,6 +531,8 @@ pub(super) fn find_changed_create_only<S>(
     schema: &ResourceSchema,
     context: &PlanningComparison<'_>,
 ) -> Vec<String> {
+    let context = context.with_left_origins(&views.current_origins);
+    let context = &context;
     let current_attributes = views.current();
     let removal_evidence = views.removal_evidence();
     let top_level = schema.create_only_attributes();
@@ -1164,12 +1188,8 @@ fn create_plan_parts(
                 let context = resolved_comparison.context();
                 let validated_schema = owner_schema.schema();
                 let schema = validated_schema.as_schema();
-                let masked = comparison_desired.masked_comparison(
-                    current_attributes,
-                    saved,
-                    Some(schema),
-                    references,
-                );
+                let masked =
+                    comparison_desired.masked_comparison(current_attributes, saved, Some(schema));
                 let result = context.with_references(references, &resource.id, |context| {
                     diff_present_with_releases(
                         comparison_desired,
@@ -1946,12 +1966,8 @@ fn promote_pending_replaces_for_dependents(
             let owner_schema = resolved_comparison.owner_schema();
             let schema = owner_schema.schema().as_schema();
             let desired = PlanInputDesired::with_resource_schema(resource, Some(schema));
-            let masked = desired.masked_comparison(
-                current.comparison_attributes(),
-                None,
-                Some(schema),
-                references,
-            );
+            let masked =
+                desired.masked_comparison(current.comparison_attributes(), None, Some(schema));
             let create_only_refs = resolved_comparison.context().with_references(
                 references,
                 &resource.id,

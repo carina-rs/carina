@@ -7423,6 +7423,12 @@ fn merge_maps<R: ReferenceEquality>(
             desired.contains_key(key) || !was_authored
         });
     }
+    for key in merged.keys() {
+        if !desired.contains_key(key) {
+            let paths = context.entry_paths(key, attr_type, defs);
+            context.at_paths(&paths).copied_saved();
+        }
+    }
     for (key, desired_value) in desired {
         let merged_value = match projected_saved.get(key) {
             Some(projected_saved_value) => {
@@ -7440,7 +7446,7 @@ fn merge_maps<R: ReferenceEquality>(
                         .unwrap_or(&ExplicitFields::Unrecorded),
                     map_entry_subtype(attr_type, key, defs),
                     defs,
-                    &context.at_path(&context.entry_path(key, attr_type, defs)),
+                    &context.at_paths(&context.entry_paths(key, attr_type, defs)),
                 )
             }
             None => desired_value.clone(),
@@ -7503,7 +7509,7 @@ where
         &remaining_saved,
         attr_type,
         defs,
-        context,
+        &context.with_indices(&context.remap_indices(&desired_indices, &saved_indices)),
     );
     for (i, pair) in
         commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates)
@@ -7575,7 +7581,7 @@ where
         &remaining_saved,
         attr_type,
         defs,
-        context,
+        &context.with_indices(&context.remap_indices(&desired_indices, &saved_indices)),
     );
     let pairs =
         commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates);
@@ -7854,15 +7860,13 @@ where
     let mut desired_offsets = Vec::with_capacity(desired.len() + 1);
     desired_offsets.push(0);
     for (desired_index, desired_value) in desired.iter().enumerate() {
-        let path = context.index_path(desired_index);
-        let context = &context.at_path(&path);
         for (saved_index, saved_value) in saved.iter().enumerate() {
             let score = similarity_score(
                 desired_value.borrow(),
                 saved_value.borrow(),
                 attr_type,
                 defs,
-                context,
+                &context.at_paths(&context.index_paths(desired_index, saved_index)),
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -8012,8 +8016,6 @@ where
     desired_offsets.push(0);
     let mut possible_saved = Vec::new();
     for (desired_index, desired_value) in desired.iter().enumerate() {
-        let path = context.index_path(desired_index);
-        let context = &context.at_path(&path);
         possible_saved.clear();
         let mut implicit_score = 0;
         match desired_value.borrow() {
@@ -8083,7 +8085,7 @@ where
                 saved[saved_index].borrow(),
                 attr_type,
                 defs,
-                context,
+                &context.at_paths(&context.index_paths(desired_index, saved_index)),
             );
             if score > 0 {
                 entries.push((score, desired_index, saved_index));
@@ -8287,7 +8289,10 @@ fn merge_lists<R: ReferenceEquality>(
 
     let item_type = list_element_type(attr_type, defs);
     let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs, context);
-    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, context);
+    let raw_paths = context.raw_saved_paths();
+    let raw_context = context.raw_saved_pair();
+    let raw_context = raw_context.at_paths(&raw_paths);
+    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs, &raw_context);
     let projected_origins = if projected_saved.len() == raw_saved.len() {
         // Projection preserves order when it retains every stored element.
         // Keeping the direct index mapping also preserves the established
@@ -8296,7 +8301,15 @@ fn merge_lists<R: ReferenceEquality>(
             .map(ListElementPairing::Unique)
             .collect()
     } else {
-        pair_list_elements_with_uniqueness(projected_saved, raw_saved, item_type, defs, context)
+        let saved_paths = [context.right_path().into(), raw_paths[1].clone()];
+        let saved_context = context.saved_pair();
+        pair_list_elements_with_uniqueness(
+            projected_saved,
+            raw_saved,
+            item_type,
+            defs,
+            &saved_context.at_paths(&saved_paths),
+        )
     };
 
     projected_pairs
@@ -8337,7 +8350,7 @@ fn merge_lists<R: ReferenceEquality>(
                         authoring,
                         item_type,
                         defs,
-                        &context.at_path(&context.index_path(desired_index)),
+                        &context.at_paths(&context.index_paths(desired_index, projected_index)),
                     )
                 }
                 None => desired[desired_index].clone(),
@@ -8368,7 +8381,7 @@ fn similarity_score<R: ReferenceEquality>(
                             bv,
                             map_entry_subtype(attr_type, k, defs),
                             defs,
-                            &context.at_path(&context.entry_path(k, attr_type, defs)),
+                            &context.at_paths(&context.entry_paths(k, attr_type, defs)),
                         )
                     })
                     .unwrap_or(false)
@@ -11255,32 +11268,19 @@ impl IntoIterator for CanonicalComparisonAttributes {
 }
 
 impl<'a> PlanInputDesired<'a> {
-    /// Reuse preparation's mask verbatim. Focused callers without prepared
-    /// inputs still cross the same sole ignore-mask constructor.
-    pub(crate) fn masked_comparison<'r>(
+    /// All planning callers use this sole ignore-mask constructor.
+    pub(crate) fn masked_comparison(
         &self,
         current: &CanonicalComparisonAttributes,
         saved: Option<&CanonicalComparisonAttributes>,
         schema: Option<&crate::schema::CompiledResourceSchema>,
-        references: &'r crate::references::ResolvedReferences,
-    ) -> std::borrow::Cow<'r, MaskedComparisonAttributes> {
-        references
-            .comparison_attributes(
-                &self.authored.id,
-                &self.comparison_attributes,
-                current,
-                saved,
-                self.authored.ignore_changes(),
-            )
-            .map(std::borrow::Cow::Borrowed)
-            .unwrap_or_else(|| {
-                std::borrow::Cow::Owned(self.authored.ignore_changes().mask_comparison_attributes(
-                    &self.comparison_attributes,
-                    current,
-                    saved,
-                    schema,
-                ))
-            })
+    ) -> MaskedComparisonAttributes {
+        self.authored.ignore_changes().mask_comparison_attributes(
+            &self.comparison_attributes,
+            current,
+            saved,
+            schema,
+        )
     }
 
     pub fn authored(&self) -> &'a ResolvedResource {

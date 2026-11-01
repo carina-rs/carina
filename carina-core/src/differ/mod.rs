@@ -121,7 +121,6 @@ pub fn managed_binding_stability(
             current_attributes,
             comparison_saved.get(&resource.id),
             Some(schema.as_schema()),
-            references,
         );
         let diff = context.with_references(references, &resource.id, |context| {
             diff_present_with_releases(
@@ -626,7 +625,7 @@ impl<'a> PlanPriorStates<'a> {
         }
     }
 
-    fn materialize_current_states(
+    pub(crate) fn materialize_current_states(
         self,
         managed: &[ResolvedResource],
         registry: &crate::schema::SchemaRegistry,
@@ -940,9 +939,9 @@ pub(crate) use comparison::ApplyTimeCreateOnlyChange;
 // `find_changed_attributes`: detail rows render with the same equality,
 // and executor patch construction uses the same key/value gate.
 pub(crate) use comparison::{
-    ApplyTimeComparisonError, AttrComparison, LeafProvenance, TypedAttr,
-    find_apply_time_changed_attributes, key_should_enter_patch, secret_grafted_comparison_view,
-    type_aware_equal,
+    ApplyTimeComparisonError, AttrComparison, LeafProvenance, OperandOrigins, RenderedChanges,
+    TypedAttr, find_apply_time_changed_attributes, key_should_enter_patch,
+    secret_grafted_comparison_view, type_aware_equal,
 };
 
 /// Returns true when `binding` is one direct child emitted by the deferred-for
@@ -1503,12 +1502,7 @@ fn diff_with_comparison_schema(
             ),
         });
     let comparison_desired = PlanInputDesired::with_resource_schema(desired, schema);
-    let masked = comparison_desired.masked_comparison(
-        &current_attributes,
-        saved.as_ref(),
-        schema,
-        context.prepared_references(),
-    );
+    let masked = comparison_desired.masked_comparison(&current_attributes, saved.as_ref(), schema);
     Ok(diff_with_saved_parts(
         desired,
         current,

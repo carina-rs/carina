@@ -1295,9 +1295,12 @@ impl<R: ReferenceEquality> MaskedExplicitProjection<'_, R> {
             .project_attributes(self.masked.current().clone())
     }
     pub(crate) fn saved(&self) -> Option<ProjectedAttributes> {
-        self.masked
-            .saved()
-            .map(|saved| self.projection.project_attributes(saved.clone()))
+        self.masked.saved().map(|saved| {
+            self.projection.project_attributes_with_side(
+                saved.clone(),
+                crate::references::ReferenceSide::Saved,
+            )
+        })
     }
 }
 
@@ -1306,21 +1309,33 @@ enum ProjectionDesired<'a> {
     Conservative,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ProjectionDesiredValue<'a> {
-    Present(&'a Value),
+    Present(&'a Value, String),
     Absent,
     Conservative,
 }
 
 impl ProjectionDesiredValue<'_> {
-    fn child(self, key: &str) -> Self {
+    fn child(
+        &self,
+        key: &str,
+        ty: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> Self {
         match self {
-            Self::Present(Value::Concrete(ConcreteValue::Map(fields))) => {
-                fields.get(key).map_or(Self::Absent, Self::Present)
+            Self::Present(Value::Concrete(ConcreteValue::Map(fields)), path) => {
+                let child_path = if crate::diff_helpers::map_entry_is_map(ty, defs) {
+                    format!("{path}[{}]", crate::parser::display_string_literal(key))
+                } else {
+                    format!("{path}.{key}")
+                };
+                fields
+                    .get(key)
+                    .map_or(Self::Absent, |value| Self::Present(value, child_path))
             }
-            Self::Present(value) if !value.is_fully_resolved() => Self::Conservative,
-            Self::Present(_) | Self::Absent => Self::Absent,
+            Self::Present(value, _) if !value.is_fully_resolved() => Self::Conservative,
+            Self::Present(_, _) | Self::Absent => Self::Absent,
             Self::Conservative => Self::Conservative,
         }
     }
@@ -1383,6 +1398,17 @@ impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
         &self,
         attributes: CanonicalComparisonAttributes,
     ) -> ProjectedAttributes {
+        self.project_attributes_with_side(attributes, crate::references::ReferenceSide::Current)
+    }
+
+    fn project_attributes_with_side(
+        &self,
+        attributes: CanonicalComparisonAttributes,
+        side: crate::references::ReferenceSide,
+    ) -> ProjectedAttributes {
+        let comparison = self
+            .comparison
+            .with_sides(side, crate::references::ReferenceSide::Saved);
         let defs = self
             .schema
             .map(|schema| &schema.defs)
@@ -1393,6 +1419,7 @@ impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
 
         let mut projected_attributes = HashMap::new();
         let mut projected_children = HashMap::new();
+        let mut origins = crate::differ::OperandOrigins::new();
         for (key, value) in attributes {
             let Some(explicit) = children.get(&key) else {
                 continue;
@@ -1402,12 +1429,12 @@ impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
                 .and_then(|schema| schema.attributes.get(&key))
                 .map(|attribute| &attribute.attr_type);
             let desired = match &self.desired {
-                ProjectionDesired::Attributes(attributes) => {
-                    attributes.get(key.as_str()).copied().map_or(
-                        ProjectionDesiredValue::Absent,
-                        ProjectionDesiredValue::Present,
-                    )
-                }
+                ProjectionDesired::Attributes(attributes) => attributes
+                    .get(key.as_str())
+                    .copied()
+                    .map_or(ProjectionDesiredValue::Absent, |value| {
+                        ProjectionDesiredValue::Present(value, key.clone())
+                    }),
                 ProjectionDesired::Conservative => ProjectionDesiredValue::Conservative,
             };
             let projected = project_value(
@@ -1418,23 +1445,27 @@ impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
                 explicit,
                 attr_type,
                 defs,
-                &self.comparison.at_path(&key),
+                &comparison.at_path(&key),
             );
+            origins.extend(projected.origins);
             projected_attributes.insert(key.clone(), projected.value);
             projected_children.insert(key, projected.authoring);
         }
-        ProjectedAttributes::canonicalized(
+        let mut projected = ProjectedAttributes::canonicalized(
             projected_attributes,
             ProjectedAuthoring::Struct {
                 children: projected_children,
             },
             self.schema,
-        )
+        );
+        projected.origins = origins;
+        projected
     }
 }
 
 /// Values produced by an [`ExplicitProjection`].
 pub struct ProjectedAttributes {
+    pub(crate) origins: crate::differ::OperandOrigins,
     attributes: CanonicalComparisonAttributes,
     pub(crate) authoring: ProjectedAuthoring,
 }
@@ -1452,6 +1483,7 @@ impl ProjectedAttributes {
             ),
         };
         Self {
+            origins: crate::differ::OperandOrigins::new(),
             attributes,
             authoring,
         }
@@ -1462,6 +1494,7 @@ impl ProjectedAttributes {
         explicit: Option<&ExplicitFields>,
     ) -> Self {
         Self {
+            origins: crate::differ::OperandOrigins::new(),
             attributes,
             authoring: explicit.map_or(ProjectedAuthoring::Opaque, |explicit| {
                 ProjectedAuthoring::from_unprojected(explicit)
@@ -1471,6 +1504,12 @@ impl ProjectedAttributes {
 
     pub fn attributes(&self) -> &CanonicalComparisonAttributes {
         &self.attributes
+    }
+
+    pub(crate) fn into_comparison_parts(
+        self,
+    ) -> (CanonicalComparisonAttributes, crate::differ::OperandOrigins) {
+        (self.attributes, self.origins)
     }
 
     pub fn into_attributes(self) -> CanonicalComparisonAttributes {
@@ -1518,6 +1557,7 @@ impl ProjectedAuthoring {
 struct ProjectedValue {
     value: Value,
     authoring: ProjectedAuthoring,
+    origins: crate::differ::OperandOrigins,
 }
 
 fn project_value<R: ReferenceEquality>(
@@ -1529,18 +1569,40 @@ fn project_value<R: ReferenceEquality>(
     defs: &BTreeMap<String, AttributeType>,
     comparison: &ComparisonContext<'_, R>,
 ) -> ProjectedValue {
+    let mut projected = project_value_inner(
+        value, stored, desired, explicit, attr_type, defs, comparison,
+    );
+    projected
+        .origins
+        .entry(comparison.left_path().into())
+        .or_insert_with(|| comparison.reference_operands()[0].clone());
+    projected
+}
+
+fn project_value_inner<R: ReferenceEquality>(
+    value: Value,
+    stored: Option<&Value>,
+    desired: ProjectionDesiredValue<'_>,
+    explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+    comparison: &ComparisonContext<'_, R>,
+) -> ProjectedValue {
     match explicit {
         ExplicitFields::Leaf | ExplicitFields::Unrecorded => ProjectedValue {
+            origins: crate::differ::OperandOrigins::new(),
             value,
             authoring: ProjectedAuthoring::Opaque,
         },
         ExplicitFields::WholeValue { .. } => ProjectedValue {
+            origins: crate::differ::OperandOrigins::new(),
             value,
             authoring: ProjectedAuthoring::WholeValue,
         },
         ExplicitFields::Struct { children } => {
             let Value::Concrete(ConcreteValue::Map(fields)) = value else {
                 return ProjectedValue {
+                    origins: crate::differ::OperandOrigins::new(),
                     value,
                     authoring: ProjectedAuthoring::Opaque,
                 };
@@ -1551,6 +1613,7 @@ fn project_value<R: ReferenceEquality>(
             };
             let mut projected_fields = IndexMap::new();
             let mut projected_children = HashMap::new();
+            let mut origins = crate::differ::OperandOrigins::new();
             for (key, value) in fields {
                 let Some(child) = children.get(&key) else {
                     continue;
@@ -1558,16 +1621,18 @@ fn project_value<R: ReferenceEquality>(
                 let projected = project_value(
                     value,
                     stored_fields.and_then(|fields| fields.get(&key)),
-                    desired.child(&key),
+                    desired.child(&key, attr_type, defs),
                     child,
                     map_entry_subtype(attr_type, &key, defs),
                     defs,
-                    &comparison.at_path(&comparison.entry_path(&key, attr_type, defs)),
+                    &comparison.at_paths(&comparison.entry_paths(&key, attr_type, defs)),
                 );
+                origins.extend(projected.origins);
                 projected_fields.insert(key.clone(), projected.value);
                 projected_children.insert(key, projected.authoring);
             }
             ProjectedValue {
+                origins,
                 value: Value::Concrete(ConcreteValue::Map(projected_fields)),
                 authoring: ProjectedAuthoring::Struct {
                     children: projected_children,
@@ -1579,6 +1644,7 @@ fn project_value<R: ReferenceEquality>(
                 project_legacy_list_items(items, element)
             }
             value => ProjectedValue {
+                origins: crate::differ::OperandOrigins::new(),
                 value,
                 authoring: ProjectedAuthoring::Opaque,
             },
@@ -1586,6 +1652,7 @@ fn project_value<R: ReferenceEquality>(
         ExplicitFields::ListElements { elements } => {
             let Value::Concrete(ConcreteValue::List(items)) = value else {
                 return ProjectedValue {
+                    origins: crate::differ::OperandOrigins::new(),
                     value,
                     authoring: ProjectedAuthoring::Opaque,
                 };
@@ -1607,22 +1674,31 @@ fn project_value<R: ReferenceEquality>(
                 comparison,
             );
             let desired_by_current = match desired {
-                ProjectionDesiredValue::Present(Value::Concrete(ConcreteValue::List(
-                    desired_items,
-                ))) if desired_items.iter().all(Value::is_fully_resolved) => {
+                ProjectionDesiredValue::Present(
+                    Value::Concrete(ConcreteValue::List(desired_items)),
+                    desired_path,
+                ) if desired_items.iter().all(Value::is_fully_resolved) => {
                     // Pair in the normal desired -> current direction so each
                     // desired element claims at most one current element. A
                     // lower-scoring current candidate left unclaimed by that
                     // assignment is not desired evidence; treating it as an
                     // ambiguous match would resurface provider-added siblings.
-                    let stable_pairs =
-                        pair_list_elements(desired_items, &items, item_type, defs, comparison);
+                    let desired_paths = [desired_path.clone(), comparison.left_path().into()];
+                    let desired_comparison = comparison.desired_pair();
+                    let desired_comparison = desired_comparison.at_paths(&desired_paths);
+                    let stable_pairs = pair_list_elements(
+                        desired_items,
+                        &items,
+                        item_type,
+                        defs,
+                        &desired_comparison,
+                    );
                     let pairings = pair_list_elements_with_uniqueness(
                         desired_items,
                         &items,
                         item_type,
                         defs,
-                        comparison,
+                        &desired_comparison,
                     );
                     let mut desired_by_current = vec![ProjectionDesiredValue::Absent; items.len()];
                     for (desired_index, (current_index, pairing)) in
@@ -1634,7 +1710,10 @@ fn project_value<R: ReferenceEquality>(
                         desired_by_current[current_index] = match pairing {
                             ListElementPairing::Unique(unique_current_index) => {
                                 debug_assert_eq!(current_index, unique_current_index);
-                                ProjectionDesiredValue::Present(&desired_items[desired_index])
+                                ProjectionDesiredValue::Present(
+                                    &desired_items[desired_index],
+                                    format!("{desired_path}[{desired_index}]"),
+                                )
                             }
                             ListElementPairing::Ambiguous => ProjectionDesiredValue::Conservative,
                             ListElementPairing::Unmatched => ProjectionDesiredValue::Absent,
@@ -1642,17 +1721,18 @@ fn project_value<R: ReferenceEquality>(
                     }
                     desired_by_current
                 }
-                ProjectionDesiredValue::Present(value) if !value.is_fully_resolved() => {
+                ProjectionDesiredValue::Present(value, _) if !value.is_fully_resolved() => {
                     vec![ProjectionDesiredValue::Conservative; items.len()]
                 }
                 ProjectionDesiredValue::Conservative => {
                     vec![ProjectionDesiredValue::Conservative; items.len()]
                 }
-                ProjectionDesiredValue::Present(_) | ProjectionDesiredValue::Absent => {
+                ProjectionDesiredValue::Present(_, _) | ProjectionDesiredValue::Absent => {
                     vec![ProjectionDesiredValue::Absent; items.len()]
                 }
             };
             let mut projected_items = Vec::with_capacity(items.len());
+            let mut origins = crate::differ::OperandOrigins::new();
             let mut projected_elements = Vec::with_capacity(items.len());
             for (index, ((item, stored_pairing), desired)) in items
                 .into_iter()
@@ -1660,18 +1740,24 @@ fn project_value<R: ReferenceEquality>(
                 .zip(desired_by_current)
                 .enumerate()
             {
-                let path = comparison.index_path(index);
-                let comparison = &comparison.at_path(&path);
+                let stored_index = match stored_pairing {
+                    ListElementPairing::Unique(index) => index,
+                    _ => index,
+                };
+                let paths = comparison.index_paths(index, stored_index);
+                let output =
+                    comparison.index_paths(projected_items.len(), projected_items.len())[0].clone();
+                let comparison = &comparison.at_paths(&paths);
                 let paired_stored = match stored_pairing {
                     ListElementPairing::Unique(stored_index) => Some(&stored_items[stored_index]),
                     ListElementPairing::Ambiguous | ListElementPairing::Unmatched => None,
                 };
 
                 let projected = match desired {
-                    ProjectionDesiredValue::Present(desired) => project_value(
+                    ProjectionDesiredValue::Present(desired, desired_path) => project_value(
                         item,
                         paired_stored,
-                        ProjectionDesiredValue::Present(desired),
+                        ProjectionDesiredValue::Present(desired, desired_path),
                         &union,
                         item_type,
                         defs,
@@ -1715,10 +1801,17 @@ fn project_value<R: ReferenceEquality>(
                         }
                     },
                 };
+                for (path, origin) in projected.origins {
+                    let suffix = path
+                        .strip_prefix(&paths[0])
+                        .expect("projected child path is below its input root");
+                    origins.insert(format!("{output}{suffix}"), origin);
+                }
                 projected_items.push(projected.value);
                 projected_elements.push(projected.authoring);
             }
             ProjectedValue {
+                origins,
                 value: Value::Concrete(ConcreteValue::List(projected_items)),
                 authoring: ProjectedAuthoring::AlignedList {
                     elements: projected_elements,
@@ -1730,6 +1823,7 @@ fn project_value<R: ReferenceEquality>(
 
 fn project_legacy_list_items(items: Vec<Value>, element: &ExplicitFields) -> ProjectedValue {
     ProjectedValue {
+        origins: crate::differ::OperandOrigins::new(),
         value: Value::Concrete(ConcreteValue::List(
             items
                 .into_iter()

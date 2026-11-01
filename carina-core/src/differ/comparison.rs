@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 
 use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
+use crate::references::{ReferenceOperand, ReferenceSide};
 use crate::resource::{
     ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
     InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews, Value,
@@ -34,6 +35,13 @@ pub struct ComparisonContext<'a, R: ReferenceEquality> {
     schema: ComparisonSchema<'a>,
     references: R,
     path: &'a str,
+    paths: Option<&'a [String; 2]>,
+    indices: Option<&'a [Vec<usize>; 2]>,
+    reversed_paths: bool,
+    sides: [ReferenceSide; 2],
+    origins: [Option<&'a OperandOrigins>; 2],
+    merge_origins: Option<&'a std::cell::RefCell<OperandOrigins>>,
+    rendered: Option<&'a std::cell::RefCell<RenderedChanges>>,
 }
 
 pub type PlanningComparison<'a> = ComparisonContext<'a, PlanningEquality<'a>>;
@@ -48,7 +56,13 @@ mod sealed {
 /// A closed set of policies for shared structural comparison helpers.
 pub trait ReferenceEquality: sealed::Sealed + std::fmt::Debug + Copy {
     #[doc(hidden)]
-    fn equal(&self, path: &str, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool;
+    fn equal(
+        &self,
+        operands: &[ReferenceOperand; 2],
+        identity: &TypeIdentity,
+        a: &ValueString,
+        b: &ValueString,
+    ) -> bool;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,11 +92,17 @@ impl sealed::Sealed for AuthoringEquality<'_> {}
 impl sealed::Sealed for DisplayEquality {}
 
 impl ReferenceEquality for PlanningEquality<'_> {
-    fn equal(&self, path: &str, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+    fn equal(
+        &self,
+        operands: &[ReferenceOperand; 2],
+        identity: &TypeIdentity,
+        a: &ValueString,
+        b: &ValueString,
+    ) -> bool {
         match self
             .0
             .references
-            .equal(self.0.resource, path, identity, a, b)
+            .equal(self.0.resource, identity, a, b, operands)
         {
             Ok(equal) => equal,
             Err(error) => {
@@ -94,23 +114,41 @@ impl ReferenceEquality for PlanningEquality<'_> {
 }
 
 impl ReferenceEquality for ObservationEquality {
-    fn equal(&self, _: &str, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+    fn equal(
+        &self,
+        _: &[ReferenceOperand; 2],
+        _: &TypeIdentity,
+        a: &ValueString,
+        b: &ValueString,
+    ) -> bool {
         a == b
     }
 }
 
 impl ReferenceEquality for AuthoringEquality<'_> {
-    fn equal(&self, path: &str, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+    fn equal(
+        &self,
+        operands: &[ReferenceOperand; 2],
+        identity: &TypeIdentity,
+        a: &ValueString,
+        b: &ValueString,
+    ) -> bool {
         self.references.map_or(a == b, |references| {
             references
-                .equal(self.resource, path, identity, a, b)
+                .equal(self.resource, identity, a, b, operands)
                 .unwrap_or(false)
         })
     }
 }
 
 impl ReferenceEquality for DisplayEquality {
-    fn equal(&self, _: &str, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+    fn equal(
+        &self,
+        _: &[ReferenceOperand; 2],
+        _: &TypeIdentity,
+        a: &ValueString,
+        b: &ValueString,
+    ) -> bool {
         a == b
     }
 }
@@ -151,6 +189,13 @@ impl<'a> ComparisonSchema<'a> {
             schema: self,
             references: ObservationEquality,
             path: "",
+            paths: None,
+            indices: None,
+            reversed_paths: false,
+            sides: [ReferenceSide::Current, ReferenceSide::Desired],
+            origins: [None, None],
+            merge_origins: None,
+            rendered: None,
         }
     }
 
@@ -166,6 +211,13 @@ impl<'a> ComparisonSchema<'a> {
                 resource,
             },
             path: "",
+            paths: None,
+            indices: None,
+            reversed_paths: false,
+            sides: [ReferenceSide::Current, ReferenceSide::Desired],
+            origins: [None, None],
+            merge_origins: None,
+            rendered: None,
         }
     }
 
@@ -187,6 +239,13 @@ impl<'a> ComparisonSchema<'a> {
             schema: *self,
             references: PlanningEquality(&session),
             path: "",
+            paths: None,
+            indices: None,
+            reversed_paths: false,
+            sides: [ReferenceSide::Current, ReferenceSide::Desired],
+            origins: [None, None],
+            merge_origins: None,
+            rendered: None,
         };
         let result = compare(&context);
         match session.error.into_inner() {
@@ -203,6 +262,13 @@ impl<'a> ComparisonSchema<'a> {
             schema: *self,
             references: DisplayEquality,
             path: "",
+            paths: None,
+            indices: None,
+            reversed_paths: false,
+            sides: [ReferenceSide::Current, ReferenceSide::Desired],
+            origins: [None, None],
+            merge_origins: None,
+            rendered: None,
         })
     }
 }
@@ -214,11 +280,10 @@ impl<'a> ObservationComparison<'a> {
     }
 }
 
-impl PlanningComparison<'_> {
-    pub(crate) fn prepared_references(&self) -> &crate::references::ResolvedReferences {
-        self.references.0.references
-    }
-}
+/// Origin overrides for values introduced by saved merges or projections.
+/// These are created where values are copied, never by pairing a second time.
+pub(crate) type OperandOrigins = HashMap<String, ReferenceOperand>;
+pub(crate) type RenderedChanges = std::collections::BTreeSet<(ReferenceSide, String)>;
 
 impl<R: ReferenceEquality> ComparisonContext<'_, R> {
     pub(crate) fn at_path<'p>(&'p self, path: &'p str) -> ComparisonContext<'p, R> {
@@ -226,7 +291,302 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
             schema: self.schema,
             references: self.references,
             path,
+            paths: None,
+            indices: None,
+            reversed_paths: false,
+            ..*self
         }
+    }
+
+    pub(crate) fn tracking_rows<'p>(
+        &'p self,
+        rendered: &'p std::cell::RefCell<RenderedChanges>,
+    ) -> ComparisonContext<'p, R> {
+        ComparisonContext {
+            rendered: Some(rendered),
+            ..*self
+        }
+    }
+
+    /// Called only when a changed leaf/whole-value row is emitted. This tracks
+    /// row provenance, not equality, and never enumerates comparison pairs.
+    pub(crate) fn rendered_change(
+        &self,
+        old: Option<&Value>,
+        new: Option<&Value>,
+        ty: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) {
+        let Some(rendered) = self.rendered else {
+            return;
+        };
+        fn leaves<R: ReferenceEquality>(
+            value: &Value,
+            side: usize,
+            ty: Option<&AttributeType>,
+            defs: &BTreeMap<String, AttributeType>,
+            context: &ComparisonContext<'_, R>,
+            changes: &mut RenderedChanges,
+        ) {
+            match value {
+                Value::Concrete(ConcreteValue::Map(values)) => {
+                    for (key, value) in values {
+                        let paths = context.entry_paths(key, ty, defs);
+                        leaves(
+                            value,
+                            side,
+                            crate::diff_helpers::map_entry_subtype(ty, key, defs),
+                            defs,
+                            &context.at_paths(&paths),
+                            changes,
+                        );
+                    }
+                }
+                Value::Concrete(ConcreteValue::List(values)) => {
+                    for (index, value) in values.iter().enumerate() {
+                        let paths = context.index_paths(index, index);
+                        leaves(
+                            value,
+                            side,
+                            crate::diff_helpers::list_element_type(ty, defs),
+                            defs,
+                            &context.at_paths(&paths),
+                            changes,
+                        );
+                    }
+                }
+                Value::Concrete(ConcreteValue::StringList(values)) => {
+                    for index in 0..values.len() {
+                        let paths = context.index_paths(index, index);
+                        changes.insert((context.sides[side], paths[side].clone()));
+                    }
+                }
+                _ => {
+                    let origin = &context.reference_operands()[side];
+                    changes.insert((origin.side, origin.path.clone()));
+                }
+            }
+        }
+        if old == new {
+            return;
+        }
+        let mut changes = rendered.borrow_mut();
+        if let Some(old) = old {
+            leaves(old, 0, ty, defs, self, &mut changes);
+        }
+        if let Some(new) = new {
+            leaves(new, 1, ty, defs, self, &mut changes);
+        }
+    }
+
+    pub(crate) fn with_sides(&self, left: ReferenceSide, right: ReferenceSide) -> Self {
+        Self {
+            sides: [left, right],
+            origins: [
+                (left == self.sides[0]).then_some(self.origins[0]).flatten(),
+                (right == self.sides[1])
+                    .then_some(self.origins[1])
+                    .flatten(),
+            ],
+            ..*self
+        }
+    }
+
+    pub(crate) fn swapped(&self) -> Self {
+        Self {
+            sides: [self.sides[1], self.sides[0]],
+            origins: [self.origins[1], self.origins[0]],
+            reversed_paths: !self.reversed_paths,
+            ..*self
+        }
+    }
+
+    pub(crate) fn at_paths<'p>(&'p self, paths: &'p [String; 2]) -> ComparisonContext<'p, R> {
+        ComparisonContext {
+            path: &paths[0],
+            paths: Some(paths),
+            indices: None,
+            reversed_paths: false,
+            ..*self
+        }
+    }
+
+    fn operand_paths(&self) -> [&str; 2] {
+        let paths = self.paths.map_or([self.path, self.path], |paths| {
+            [paths[0].as_str(), paths[1].as_str()]
+        });
+        if self.reversed_paths {
+            [paths[1], paths[0]]
+        } else {
+            paths
+        }
+    }
+
+    pub(crate) fn reference_operands(&self) -> [ReferenceOperand; 2] {
+        let paths = self.operand_paths();
+        std::array::from_fn(|index| {
+            self.origins[index]
+                .and_then(|origins| {
+                    let exact = origins
+                        .get(paths[index])
+                        .map(|origin| (paths[index].len(), origin));
+                    exact
+                        .or_else(|| {
+                            paths[index]
+                                .rmatch_indices(['.', '['])
+                                .find_map(|(length, _)| {
+                                    origins
+                                        .get(&paths[index][..length])
+                                        .map(|origin| (length, origin))
+                                })
+                        })
+                        .map(|(length, origin)| ReferenceOperand {
+                            side: origin.side,
+                            path: format!("{}{}", origin.path, &paths[index][length..]),
+                        })
+                })
+                .unwrap_or_else(|| ReferenceOperand {
+                    path: paths[index].into(),
+                    side: self.sides[index],
+                })
+        })
+    }
+
+    pub(crate) fn index_paths(&self, left: usize, right: usize) -> [String; 2] {
+        let paths = self.operand_paths();
+        let left = self.indices.map_or(left, |indices| indices[0][left]);
+        let right = self.indices.map_or(right, |indices| indices[1][right]);
+        [
+            format!("{}[{left}]", paths[0]),
+            format!("{}[{right}]", paths[1]),
+        ]
+    }
+
+    pub(crate) fn remap_indices(&self, left: &[usize], right: &[usize]) -> [Vec<usize>; 2] {
+        let remap = |side: usize, indices: &[usize]| {
+            indices
+                .iter()
+                .map(|&index| self.indices.map_or(index, |outer| outer[side][index]))
+                .collect()
+        };
+        [remap(0, left), remap(1, right)]
+    }
+
+    pub(crate) fn with_indices<'p>(
+        &'p self,
+        indices: &'p [Vec<usize>; 2],
+    ) -> ComparisonContext<'p, R> {
+        ComparisonContext {
+            indices: Some(indices),
+            ..*self
+        }
+    }
+
+    pub(crate) fn desired_pair(&self) -> Self {
+        Self {
+            sides: [ReferenceSide::Desired, self.sides[0]],
+            origins: [None, self.origins[0]],
+            ..*self
+        }
+    }
+
+    pub(crate) fn raw_saved_paths(&self) -> [String; 2] {
+        [
+            self.operand_paths()[0].into(),
+            self.reference_operands()[1].path.clone(),
+        ]
+    }
+
+    pub(crate) fn raw_saved_pair(&self) -> Self {
+        Self {
+            origins: [self.origins[0], None],
+            ..*self
+        }
+    }
+
+    pub(crate) fn saved_pair(&self) -> Self {
+        Self {
+            sides: [ReferenceSide::Saved, ReferenceSide::Saved],
+            origins: [self.origins[1], None],
+            ..*self
+        }
+    }
+
+    pub(crate) fn right_path(&self) -> &str {
+        self.operand_paths()[1]
+    }
+
+    pub(crate) fn field_paths(&self, field: &str) -> [String; 2] {
+        self.operand_paths().map(|path| {
+            if path.is_empty() {
+                field.into()
+            } else {
+                format!("{path}.{field}")
+            }
+        })
+    }
+
+    pub(crate) fn map_key_paths(&self, key: &str) -> [String; 2] {
+        self.operand_paths()
+            .map(|path| format!("{path}[{}]", crate::parser::display_string_literal(key)))
+    }
+
+    pub(crate) fn entry_paths(
+        &self,
+        key: &str,
+        ty: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) -> [String; 2] {
+        if crate::diff_helpers::map_entry_is_map(ty, defs) {
+            self.map_key_paths(key)
+        } else {
+            self.field_paths(key)
+        }
+    }
+
+    pub(crate) fn with_left_origins<'p>(
+        &'p self,
+        origins: &'p OperandOrigins,
+    ) -> ComparisonContext<'p, R> {
+        ComparisonContext {
+            origins: [Some(origins), self.origins[1]],
+            ..*self
+        }
+    }
+
+    pub(crate) fn left_path(&self) -> &str {
+        self.operand_paths()[0]
+    }
+
+    fn with_right_origins<'p>(&'p self, origins: &'p OperandOrigins) -> ComparisonContext<'p, R> {
+        ComparisonContext {
+            origins: [self.origins[0], Some(origins)],
+            ..*self
+        }
+    }
+
+    fn merging<'p>(
+        &'p self,
+        origins: &'p std::cell::RefCell<OperandOrigins>,
+        saved: Option<&'p OperandOrigins>,
+    ) -> ComparisonContext<'p, R> {
+        ComparisonContext {
+            sides: [ReferenceSide::Desired, ReferenceSide::Saved],
+            origins: [None, saved],
+            merge_origins: Some(origins),
+            ..*self
+        }
+    }
+
+    /// A saved-only subtree is copied here by merge_maps. Record its origin as
+    /// part of that copy, so equal can distinguish it from an authored value.
+    pub(crate) fn copied_saved(&self) {
+        let Some(origins) = self.merge_origins else {
+            return;
+        };
+        let output = self.operand_paths()[0];
+        let source = self.reference_operands()[1].clone();
+        origins.borrow_mut().insert(output.into(), source);
     }
 
     pub(crate) fn field_path(&self, field: &str) -> String {
@@ -255,10 +615,7 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
         ty: Option<&AttributeType>,
         defs: &BTreeMap<String, AttributeType>,
     ) -> String {
-        if matches!(
-            ty.map(|ty| ty.shape_with_defs(defs)),
-            Some(crate::schema::Shape::Map { .. })
-        ) {
+        if crate::diff_helpers::map_entry_is_map(ty, defs) {
             self.map_key_path(key)
         } else {
             self.field_path(key)
@@ -457,7 +814,9 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                     pattern: _,
                     length: _,
                 },
-            ) => context.references.equal(context.path, identity, a, b),
+            ) => context
+                .references
+                .equal(&context.reference_operands(), identity, a, b),
 
             // Lists: ordered or multiset comparison with inner type awareness
             (
@@ -662,7 +1021,7 @@ fn type_aware_lists_equal<R: ReferenceEquality>(
                 vb,
                 inner,
                 defs,
-                &context.at_path(&context.index_path(index)),
+                &context.at_paths(&context.index_paths(index, index)),
             )
         })
     } else {
@@ -680,7 +1039,7 @@ fn type_aware_lists_equal<R: ReferenceEquality>(
                         item_b,
                         inner,
                         defs,
-                        &context.at_path(&context.index_path(i)),
+                        &context.at_paths(&context.index_paths(i, j)),
                     )
                 {
                     matched[j] = true;
@@ -718,7 +1077,7 @@ where
                     vb,
                     get_type(k),
                     defs,
-                    &context.at_path(&context.map_key_path(k)),
+                    &context.at_paths(&context.map_key_paths(k)),
                 )
             })
             .unwrap_or(false)
@@ -752,7 +1111,7 @@ fn type_aware_struct_equal<R: ReferenceEquality>(
                     vb,
                     field_types.get(k.as_str()).copied(),
                     defs,
-                    &context.at_path(&context.field_path(k)),
+                    &context.at_paths(&context.field_paths(k)),
                 ) {
                     return false;
                 }
@@ -883,6 +1242,7 @@ pub(crate) struct TypedAttr<'a> {
 pub(crate) struct SavedAttr<'a> {
     pub(crate) views: SavedValueViews<'a>,
     pub(crate) authoring: &'a ExplicitFields,
+    pub(crate) origins: Option<&'a OperandOrigins>,
 }
 
 pub(crate) struct AttrComparison<'a> {
@@ -975,17 +1335,29 @@ pub(crate) fn should_patch_attr<R: ReferenceEquality>(
         .map(|info| (Some(info.attr_type), info.defs))
         .unwrap_or((None, empty_defs_for_schema_walks()));
 
+    if from_value == cmp.to {
+        // A raw no-change needs no saved merge, but still crosses typed
+        // equality so sensitive Reference strings are rejected.
+        return !type_aware_equal(from_value, cmp.to, attr_type, defs, context);
+    }
     match cmp.saved {
         Some(saved) => {
+            let origins = std::cell::RefCell::new(OperandOrigins::new());
             let effective_to = merge_with_saved(
                 cmp.to,
                 saved.views,
                 saved.authoring,
                 attr_type,
                 defs,
-                context,
+                &context.merging(&origins, saved.origins),
             );
-            !type_aware_equal(from_value, &effective_to, attr_type, defs, context)
+            !type_aware_equal(
+                from_value,
+                &effective_to,
+                attr_type,
+                defs,
+                &context.with_right_origins(&origins.into_inner()),
+            )
         }
         None => !type_aware_equal(from_value, cmp.to, attr_type, defs, context),
     }
@@ -1029,6 +1401,16 @@ pub(crate) fn key_should_enter_patch_with_ignores<R: ReferenceEquality>(
     {
         return false;
     }
+    let from_saved = cmp.from.is_none()
+        && schema
+            .and_then(|schema| schema.attributes.get(key))
+            .is_some_and(|attribute| attribute.write_only);
+    let context = if from_saved {
+        context.with_sides(ReferenceSide::Saved, ReferenceSide::Desired)
+    } else {
+        *context
+    };
+    let context = &context;
     let cmp = if cmp.from.is_none()
         && schema
             .and_then(|schema| schema.attributes.get(key))
@@ -1069,6 +1451,7 @@ fn nested_write_only_should_enter_patch<R: ReferenceEquality>(
     }
     let attr_type = &schema.attributes[key].attr_type;
 
+    let origins = std::cell::RefCell::new(OperandOrigins::new());
     let effective_to = cmp.saved.map_or_else(
         || Cow::Borrowed(cmp.to),
         |saved| {
@@ -1078,7 +1461,7 @@ fn nested_write_only_should_enter_patch<R: ReferenceEquality>(
                 saved.authoring,
                 Some(attr_type),
                 &schema.defs,
-                context,
+                &context.merging(&origins, saved.origins),
             ))
         },
     );
@@ -1088,7 +1471,7 @@ fn nested_write_only_should_enter_patch<R: ReferenceEquality>(
         cmp.from,
         effective_to.as_ref(),
         attr_type,
-        context,
+        &context.with_right_origins(&origins.into_inner()),
     );
 
     let desired_leaves = schema
@@ -1121,7 +1504,10 @@ fn nested_write_only_should_enter_patch<R: ReferenceEquality>(
                                         &saved,
                                         Some(field_type),
                                         &schema.defs,
-                                        &context.at_path(&context.leaf_path(path)),
+                                        &context.at_path(&context.leaf_path(path)).with_sides(
+                                            ReferenceSide::Desired,
+                                            ReferenceSide::Saved,
+                                        ),
                                     )
                                 })
                         },
@@ -1287,6 +1673,8 @@ pub(super) struct AuthoredAttributeViews<'a> {
     masked: &'a MaskedComparisonAttributes,
     current: CanonicalComparisonAttributes,
     saved: Option<CanonicalComparisonAttributes>,
+    pub(super) current_origins: OperandOrigins,
+    saved_origins: OperandOrigins,
     removal_evidence: AuthoredRemovalEvidence,
     previously_authored_top_level_attributes: Vec<String>,
 }
@@ -1341,18 +1729,24 @@ pub(super) fn project_authored_attribute_views<'a, R: ReferenceEquality>(
     };
     let projection = prev_explicit
         .map(|explicit| ExplicitProjection::for_desired(masked, explicit, schema, context));
-    let current = projection.as_ref().map_or_else(
-        || current.clone(),
-        |projection| projection.current().into_attributes(),
+    let (current, current_origins) = projection.as_ref().map_or_else(
+        || (current.clone(), OperandOrigins::new()),
+        |projection| projection.current().into_comparison_parts(),
     );
-    let saved = projection.as_ref().map_or_else(
-        || saved.cloned(),
-        |projection| projection.saved().map(|saved| saved.into_attributes()),
-    );
+    let (saved, saved_origins) = projection
+        .as_ref()
+        .and_then(|projection| projection.saved())
+        .map(|saved| {
+            let (attributes, origins) = saved.into_comparison_parts();
+            (Some(attributes), origins)
+        })
+        .unwrap_or_else(|| (saved.cloned(), OperandOrigins::new()));
     AuthoredAttributeViews {
         masked,
         current,
         saved,
+        current_origins,
+        saved_origins,
         removal_evidence,
         previously_authored_top_level_attributes,
     }
@@ -1409,6 +1803,8 @@ pub(super) fn find_changed_attributes_with_ignores(
     // (refs awscc#206).
     let raw_saved = masked.saved();
     let projected = project_authored_attribute_views(masked, prev_explicit, schema, context);
+    let context = context.with_left_origins(&projected.current_origins);
+    let context = &context;
     let projected_current = &projected.current;
     let projected_saved = projected.saved.as_ref();
 
@@ -1480,6 +1876,7 @@ pub(super) fn find_changed_attributes_with_ignores(
                         .and_then(|raw_saved| raw_saved.get(key))
                         .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
                         .unwrap_or_else(|| SavedValueViews::same(projected_value)),
+                    origins: Some(&projected.saved_origins),
                     authoring: match prev_explicit {
                         Some(ExplicitFields::Struct { children }) => {
                             children.get(key).unwrap_or(&ExplicitFields::Unrecorded)

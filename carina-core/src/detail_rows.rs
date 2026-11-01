@@ -80,6 +80,18 @@ struct HistoricalDeleteAttributes {
 }
 
 impl HistoricalDisplayAttributes {
+    pub(crate) fn for_planning(plan: &Plan, saved: &crate::provider::LiftedSavedAttrs) -> Self {
+        let mut display = Self::for_plan(plan);
+        for (id, attributes) in &mut display.updates {
+            attributes.stored_attributes = saved.get(id).cloned();
+        }
+        for (key, attributes) in &mut display.deletes {
+            attributes.stored_attributes = saved.get(key.id()).cloned();
+            attributes.nested_write_only = saved.nested_write_only(key.id()).clone();
+        }
+        display
+    }
+
     /// Build the fail-safe display view available from a plan alone. Desired
     /// secret shapes mask their historical counterparts; callers with state
     /// provenance should then refine it through the persisted-shape methods.
@@ -668,6 +680,7 @@ pub fn build_detail_rows_by_instance<S>(
         return Ok(Vec::new());
     }
 
+    let rendered_changes = std::cell::RefCell::new(crate::differ::RenderedChanges::new());
     // carina#3181: `Effect` payloads are typestate structs — the
     // managed variants carry `Resource`, `Read` carries a
     // `DataSource`. Schema lookup routes through the matching
@@ -705,7 +718,7 @@ pub fn build_detail_rows_by_instance<S>(
                                 Some(resolved.owner_schema().schema().as_schema()),
                                 detail,
                                 explicit,
-                                *comparison,
+                                comparison.tracking_rows(&rendered_changes),
                                 false,
                             )
                         })?
@@ -775,9 +788,14 @@ pub fn build_detail_rows_by_instance<S>(
         | Effect::DeferredReplace(_) => Vec::new(),
     };
     if let DetailComparisons::Planning(references) = comparisons
-        && matches!(effect, Effect::Update { .. } | Effect::Create(_))
+        && matches!(effect, Effect::Update { .. })
     {
-        append_dangling_reference_notes(&mut rows, references, effect.resource_id());
+        append_dangling_reference_notes(
+            &mut rows,
+            references,
+            effect.resource_id(),
+            &rendered_changes.into_inner(),
+        );
     }
     Ok(rows)
 }
@@ -786,154 +804,24 @@ fn append_dangling_reference_notes(
     rows: &mut Vec<DetailRow>,
     references: &crate::references::ResolvedReferences,
     resource: &ResourceId,
+    changed: &crate::differ::RenderedChanges,
 ) {
-    let notes = references
-        .dangling_references(resource)
-        .filter(|reference| {
-            rows.iter()
-                .any(|row| reference_has_diff_row(row, reference))
-        })
-        .map(|reference| DetailRow::Text {
-            text: format!(
-                "{}: {} reference no longer resolves",
-                reference.path,
-                reference.side.label()
-            ),
-        })
-        .collect::<Vec<_>>();
-    rows.extend(notes);
-}
-
-/// Inspect only changed/added/removed values, excluding hidden fields and
-/// unchanged list items. Saved fallbacks may explain a changed path without
-/// appearing verbatim in the provider's old-side display.
-fn reference_diff_value(
-    path: &[String],
-    values: &[&RenderedValue],
-    reference: &crate::references::DanglingReference,
-) -> bool {
-    reference.fields.starts_with(path)
-        && (reference.side == crate::references::ReferenceSide::Saved
-            || values.iter().any(|value| {
-                value.spans().iter().any(|span| {
-                    span.kind() == crate::value::ValueSpanKind::StringLiteral
-                        && span.text() == crate::parser::display_string_literal(&reference.raw)
-                })
-            }))
-}
-
-fn reference_has_diff_row(
-    row: &DetailRow,
-    reference: &crate::references::DanglingReference,
-) -> bool {
-    match row {
-        DetailRow::Changed { key, old, new }
-        | DetailRow::ChangedForcesReplacement { key, old, new }
-        | DetailRow::ReplaceCascade { key, old, new } => {
-            reference_diff_value(std::slice::from_ref(key), &[old, new], reference)
-        }
-        DetailRow::Removed { key, old } | DetailRow::ReplaceRemoved { key, old } => {
-            reference_diff_value(std::slice::from_ref(key), &[old], reference)
-        }
-        DetailRow::MapDiff { key, entries }
-        | DetailRow::MapDiffForcesReplacement { key, entries } => {
-            reference_in_map_diff(entries.as_slice(), std::slice::from_ref(key), reference)
-        }
-        DetailRow::ListOfMapsDiff { key, block }
-        | DetailRow::ListOfMapsDiffForcesReplacement { key, block } => {
-            reference_in_list_diff(block, std::slice::from_ref(key), reference)
-        }
-        DetailRow::StringListDiff {
-            key,
-            added,
-            removed,
-            ..
-        }
-        | DetailRow::StringListDiffForcesReplacement {
-            key,
-            added,
-            removed,
-            ..
-        } => added
-            .iter()
-            .chain(removed)
-            .any(|value| reference_diff_value(std::slice::from_ref(key), &[value], reference)),
-        _ => false,
-    }
-}
-
-fn reference_in_map_diff(
-    entries: &[MapDiffEntryIR],
-    path: &[String],
-    reference: &crate::references::DanglingReference,
-) -> bool {
-    entries.iter().any(|entry| {
-        let key = match entry {
-            MapDiffEntryIR::Added { key, .. }
-            | MapDiffEntryIR::Removed { key, .. }
-            | MapDiffEntryIR::Changed { key, .. }
-            | MapDiffEntryIR::NestedMapDiff { key, .. }
-            | MapDiffEntryIR::NestedListOfMapsDiff { key, .. }
-            | MapDiffEntryIR::StringListChanged { key, .. } => key,
-        };
-        let mut path = path.to_vec();
-        path.push(key.raw().into());
-        match entry {
-            MapDiffEntryIR::Added { value, .. } | MapDiffEntryIR::Removed { value, .. } => {
-                reference_diff_value(&path, &[value], reference)
-            }
-            MapDiffEntryIR::Changed { old, new, .. } => {
-                reference_diff_value(&path, &[old, new], reference)
-            }
-            MapDiffEntryIR::NestedMapDiff { entries, .. } => {
-                reference_in_map_diff(entries.as_slice(), &path, reference)
-            }
-            MapDiffEntryIR::NestedListOfMapsDiff { block, .. } => {
-                reference_in_list_diff(block, &path, reference)
-            }
-            MapDiffEntryIR::StringListChanged { added, removed, .. } => added
-                .iter()
-                .chain(removed)
-                .any(|value| reference_diff_value(&path, &[value], reference)),
-        }
-    })
-}
-
-fn reference_in_list_diff(
-    block: &NonEmptyListOfMapsBlock,
-    path: &[String],
-    reference: &crate::references::DanglingReference,
-) -> bool {
-    block.modified().iter().any(|item| {
-        item.fields.iter().any(|field| {
-            let key = match field {
-                ListOfMapsDiffField::Changed { key, .. }
-                | ListOfMapsDiffField::NestedMapChanged { key, .. }
-                | ListOfMapsDiffField::StringListChanged { key, .. } => key,
-            };
-            let mut path = path.to_vec();
-            path.push(key.raw().into());
-            match field {
-                ListOfMapsDiffField::Changed { old, new, .. } => {
-                    reference_diff_value(&path, &[old, new], reference)
-                }
-                ListOfMapsDiffField::NestedMapChanged { entries, .. } => {
-                    reference_in_map_diff(entries, &path, reference)
-                }
-                ListOfMapsDiffField::StringListChanged { added, removed, .. } => added
-                    .iter()
-                    .chain(removed)
-                    .any(|value| reference_diff_value(&path, &[value], reference)),
-            }
-        })
-    }) || block.added().iter().chain(block.removed()).any(|item| {
-        item.fields.iter().any(|(key, value)| {
-            let mut path = path.to_vec();
-            path.push(key.raw().into());
-            let rendered = value.render(crate::value::PrettyLayout::for_map_key(0, key));
-            reference_diff_value(&path, &[&rendered], reference)
-        })
-    })
+    rows.extend(
+        references
+            .dangling_references(resource)
+            .filter(|reference| {
+                changed.contains(&(reference.side, reference.path.clone()))
+                    || (reference.side == crate::references::ReferenceSide::Saved
+                        && changed.iter().any(|(_, path)| path == &reference.path))
+            })
+            .map(|reference| DetailRow::Text {
+                text: format!(
+                    "{}: {} reference no longer resolves",
+                    reference.path,
+                    reference.side.label()
+                ),
+            }),
+    );
 }
 
 /// Build the TUI-only identifier fallback for a delete whose normal detail
@@ -1125,6 +1013,7 @@ fn build_update_rows<S, R: ReferenceEquality>(
         .unwrap_or(empty_defs_for_schema_walks());
     let projected = project_from_attrs(&masked, explicit, schema, comparison);
     let from_attrs_projected = projected.attributes();
+    let comparison = comparison.with_left_origins(&projected.origins);
 
     let attr_rows = build_attribute_diff_rows(
         to,
@@ -1486,6 +1375,8 @@ fn build_attribute_diff_rows<S, R: ReferenceEquality>(
             .and_then(|s| s.attributes.get(key.as_str()))
             .map(|a| &a.attr_type);
         // Keep the raw verdict only for the hidden-unchanged accounting below.
+        let comparison = ctx.comparison.at_path(&key);
+        let ctx = AttributeDiffContext { comparison, ..ctx };
         let raw_is_same = old_value
             .map(|old| schema_aware_equal(old, new_value, attr_type, ctx.defs, &ctx.comparison))
             .unwrap_or(false);
@@ -1546,6 +1437,8 @@ fn build_attribute_diff_rows<S, R: ReferenceEquality>(
         }
 
         if payload_only {
+            ctx.comparison
+                .rendered_change(old_value, Some(new_value), attr_type, ctx.defs);
             let old = old_value
                 .map(render_value)
                 .unwrap_or_else(|| render_other("(none)"));
@@ -1564,6 +1457,8 @@ fn build_attribute_diff_rows<S, R: ReferenceEquality>(
         // behind the same guessed identity the state record intentionally
         // refused to claim.
         if ctx.is_whole_value_authored(&key) && is_list_of_maps(new_value) {
+            ctx.comparison
+                .rendered_change(old_value, Some(new_value), attr_type, ctx.defs);
             let old = old_value
                 .map(render_value)
                 .unwrap_or_else(|| render_other("(none)"));
@@ -1613,6 +1508,7 @@ fn build_attribute_diff_rows<S, R: ReferenceEquality>(
         } else if let Some(diff) =
             compute_string_list_change(old_value, new_value, attr_type, ctx.defs)
         {
+            diff.record_rows(old_value, new_value, attr_type, ctx.defs, &ctx.comparison);
             rows.push(string_list_diff_row(
                 key.to_string(),
                 diff.unchanged,
@@ -1647,6 +1543,8 @@ fn build_attribute_diff_rows<S, R: ReferenceEquality>(
                 effectively_unchanged += 1;
                 continue;
             }
+            ctx.comparison
+                .rendered_change(old_value, Some(new_value), attr_type, ctx.defs);
             rows.push(changed_row(
                 key.to_string(),
                 old_str,
@@ -1702,6 +1600,7 @@ pub fn build_replace_detail_rows_from_display<S>(
     let schema = resolved.owner_schema().schema().as_schema();
     let comparison_attributes =
         CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema);
+    let rendered_changes = std::cell::RefCell::new(crate::differ::RenderedChanges::new());
     let mut rows = match comparisons {
         DetailComparisons::Planning(references) => {
             resolved
@@ -1719,7 +1618,7 @@ pub fn build_replace_detail_rows_from_display<S>(
                         Some(schema),
                         detail,
                         explicit,
-                        *comparison,
+                        comparison.tracking_rows(&rendered_changes),
                     )
                 })?
         }
@@ -1743,7 +1642,12 @@ pub fn build_replace_detail_rows_from_display<S>(
         }
     };
     if let DetailComparisons::Planning(references) = comparisons {
-        append_dangling_reference_notes(&mut rows, references, &to.id);
+        append_dangling_reference_notes(
+            &mut rows,
+            references,
+            &to.id,
+            &rendered_changes.into_inner(),
+        );
     }
     Ok(rows)
 }
@@ -1793,6 +1697,7 @@ fn build_replace_rows_from_attributes<S, R: ReferenceEquality>(
     let previous_attributes = masked.current();
     let projected = project_from_attrs(&masked, explicit, schema, comparison);
     let from_attrs_projected = projected.attributes();
+    let comparison = comparison.with_left_origins(&projected.origins);
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
     let attr_rows = build_attribute_diff_rows(
@@ -2140,6 +2045,8 @@ fn compute_map_diff_entries_with_explicit<R: ReferenceEquality>(
     for item in diff.iter_by_key() {
         match item {
             crate::diff_helpers::MapDiffItem::Changed(e) => {
+                let paths = comparison.entry_paths(&e.key, attr_type, defs);
+                let comparison = comparison.at_paths(&paths);
                 let entry_type = map_entry_subtype(attr_type, &e.key, defs);
                 let entry_explicit = explicit_child(explicit, &e.key);
                 // Site 5 (carina#3073): `compute_map_diff` flagged this
@@ -2162,6 +2069,12 @@ fn compute_map_diff_entries_with_explicit<R: ReferenceEquality>(
                     continue;
                 }
                 if is_whole_value(entry_explicit) && is_list_of_maps(&e.new_value) {
+                    comparison.rendered_change(
+                        Some(&e.old_value),
+                        Some(&e.new_value),
+                        entry_type,
+                        defs,
+                    );
                     entries.push(MapDiffEntryIR::Changed {
                         key: RenderedKey::from_raw(&e.key),
                         old: render_value(&e.old_value),
@@ -2221,6 +2134,13 @@ fn compute_map_diff_entries_with_explicit<R: ReferenceEquality>(
                     compute_string_list_change(Some(&e.old_value), &e.new_value, entry_type, defs)
                 {
                     // #3234: see MapDiffEntryIR::StringListChanged docs.
+                    diff.record_rows(
+                        Some(&e.old_value),
+                        &e.new_value,
+                        entry_type,
+                        defs,
+                        &comparison,
+                    );
                     entries.push(MapDiffEntryIR::StringListChanged {
                         key: RenderedKey::from_raw(&e.key),
                         unchanged: diff.unchanged,
@@ -2242,6 +2162,12 @@ fn compute_map_diff_entries_with_explicit<R: ReferenceEquality>(
                     {
                         continue;
                     }
+                    comparison.rendered_change(
+                        Some(&e.old_value),
+                        Some(&e.new_value),
+                        entry_type,
+                        defs,
+                    );
                     entries.push(MapDiffEntryIR::Changed {
                         key: RenderedKey::from_raw(&e.key),
                         old: old_s,
@@ -2251,6 +2177,13 @@ fn compute_map_diff_entries_with_explicit<R: ReferenceEquality>(
                 }
             }
             crate::diff_helpers::MapDiffItem::Added(e) => {
+                let paths = comparison.entry_paths(&e.key, attr_type, defs);
+                comparison.at_paths(&paths).rendered_change(
+                    None,
+                    Some(&e.value),
+                    map_entry_subtype(attr_type, &e.key, defs),
+                    defs,
+                );
                 entries.push(MapDiffEntryIR::Added {
                     key: RenderedKey::from_raw(&e.key),
                     value: render_value(&e.value),
@@ -2258,6 +2191,13 @@ fn compute_map_diff_entries_with_explicit<R: ReferenceEquality>(
                 });
             }
             crate::diff_helpers::MapDiffItem::Removed(e) => {
+                let paths = comparison.entry_paths(&e.key, attr_type, defs);
+                comparison.at_paths(&paths).rendered_change(
+                    Some(&e.value),
+                    None,
+                    map_entry_subtype(attr_type, &e.key, defs),
+                    defs,
+                );
                 entries.push(MapDiffEntryIR::Removed {
                     key: RenderedKey::from_raw(&e.key),
                     value: render_value(&e.value),
@@ -2360,7 +2300,13 @@ fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
         }
         for (oi, old_item) in old_items.iter().enumerate() {
             if !old_matched[oi]
-                && schema_aware_equal(old_item, new_item, item_type, defs, &comparison)
+                && schema_aware_equal(
+                    old_item,
+                    new_item,
+                    item_type,
+                    defs,
+                    &comparison.at_paths(&comparison.index_paths(oi, ni)),
+                )
             {
                 old_matched[oi] = true;
                 new_matched[ni] = true;
@@ -2401,7 +2347,9 @@ fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
         &unmatched_old_items,
         item_type,
         defs,
-        &comparison,
+        &comparison
+            .swapped()
+            .with_indices(&[unmatched_new.clone(), unmatched_old.clone()]),
     )
     .into_iter()
     .enumerate()
@@ -2441,12 +2389,16 @@ fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
             Value::Concrete(ConcreteValue::Map(new_map)),
         ) = (&old_items[oi], &new_items[ni])
         {
+            let paths = comparison.index_paths(oi, ni);
+            let comparison = comparison.at_paths(&paths);
             let element_explicit = explicit_list_element(explicit, oi);
             let mut keys: Vec<_> = new_map.keys().collect();
             keys.sort();
             let mut fields: Vec<ListOfMapsDiffField> = Vec::new();
             let mut unchanged_count: usize = 0;
             for k in keys {
+                let paths = comparison.entry_paths(k, item_type, defs);
+                let comparison = comparison.at_paths(&paths);
                 let field_explicit = explicit_child(element_explicit, k);
                 // Site 4 (carina#3073): resolve the struct field's
                 // type so an enum-equal field (`effect: allow` vs
@@ -2496,6 +2448,7 @@ fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
                         entries: nested,
                     });
                 } else if is_whole_value(field_explicit) && is_list_of_maps(&new_map[k]) {
+                    comparison.rendered_change(old_val, Some(&new_map[k]), field_type, defs);
                     fields.push(ListOfMapsDiffField::Changed {
                         key: RenderedKey::from_raw(k),
                         old: old_val
@@ -2506,6 +2459,7 @@ fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
                 } else if let Some(diff) =
                     compute_string_list_change(old_val, &new_map[k], field_type, defs)
                 {
+                    diff.record_rows(old_val, &new_map[k], field_type, defs, &comparison);
                     fields.push(ListOfMapsDiffField::StringListChanged {
                         key: RenderedKey::from_raw(k),
                         unchanged: diff.unchanged,
@@ -2530,6 +2484,7 @@ fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
                         unchanged_count += 1;
                         continue;
                     }
+                    comparison.rendered_change(old_val, Some(&new_map[k]), field_type, defs);
                     fields.push(ListOfMapsDiffField::Changed {
                         key: RenderedKey::from_raw(k),
                         old: old_v,
@@ -2561,6 +2516,16 @@ fn compute_list_of_maps_diff_parts_with_explicit<R: ReferenceEquality>(
         }
     }
 
+    for &index in &added_indices {
+        comparison
+            .at_paths(&comparison.index_paths(index, index))
+            .rendered_change(None, Some(&new_items[index]), item_type, defs);
+    }
+    for &index in &removed_indices {
+        comparison
+            .at_paths(&comparison.index_paths(index, index))
+            .rendered_change(Some(&old_items[index]), None, item_type, defs);
+    }
     let added = collect_added_removed_items(&added_indices, new_items);
     let removed = collect_added_removed_items(&removed_indices, old_items);
 
@@ -2644,7 +2609,7 @@ fn compute_string_list_change(
     new_value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> Option<crate::diff_helpers::StringListDiff<RenderedValue>> {
+) -> Option<StringListChange> {
     let enum_context = attr_type
         .and_then(|attr_type| string_list_inner_type(attr_type, defs))
         .and_then(AttributeType::enum_parts)
@@ -2653,11 +2618,17 @@ fn compute_string_list_change(
             dsl_map,
         });
 
-    let new_list = project_string_list_diff_elements(new_value, enum_context.as_ref())?;
+    let new_list = project_string_list_diff_elements(new_value, enum_context.as_ref())?
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
     let old_list = match old_value {
         Some(old_value) => project_string_list_diff_elements(old_value, enum_context.as_ref())?,
         None => Vec::new(),
-    };
+    }
+    .into_iter()
+    .enumerate()
+    .collect::<Vec<_>>();
     // carina#3075: when the element type is a `Enum`, the set-diff
     // must compare enum *values*, not raw spellings — otherwise a
     // DSL-alias element (`allow`) vs its API-canonical form (`Allow`) is
@@ -2670,19 +2641,62 @@ fn compute_string_list_change(
     let diff = crate::diff_helpers::compute_string_list_diff_by(
         &old_list,
         &new_list,
-        |left, right| {
+        |(_, left), (_, right)| {
             if enum_typed {
                 crate::resource::enum_values_equal(&left.comparison_key, &right.comparison_key)
             } else {
                 left.comparison_key == right.comparison_key
             }
         },
-        |element| element.display.clone(),
+        |(index, element)| (*index, element.display.clone()),
     );
     if diff.added.is_empty() && diff.removed.is_empty() {
         return None;
     }
-    Some(diff)
+    let (added_indices, added) = diff.added.into_iter().unzip();
+    let (removed_indices, removed) = diff.removed.into_iter().unzip();
+    Some(StringListChange {
+        unchanged: diff.unchanged.into_iter().map(|(_, value)| value).collect(),
+        added,
+        removed,
+        added_indices,
+        removed_indices,
+    })
+}
+
+struct StringListChange {
+    unchanged: Vec<RenderedValue>,
+    added: Vec<RenderedValue>,
+    removed: Vec<RenderedValue>,
+    added_indices: Vec<usize>,
+    removed_indices: Vec<usize>,
+}
+
+impl StringListChange {
+    fn record_rows<R: ReferenceEquality>(
+        &self,
+        old: Option<&Value>,
+        new: &Value,
+        ty: Option<&AttributeType>,
+        defs: &std::collections::BTreeMap<String, AttributeType>,
+        context: &ComparisonContext<'_, R>,
+    ) {
+        let element = list_element_type(ty, defs);
+        if let Some(items) = crate::resource::comparison_list_items(new) {
+            for &index in &self.added_indices {
+                context
+                    .at_paths(&context.index_paths(index, index))
+                    .rendered_change(None, Some(&items[index]), element, defs);
+            }
+        }
+        if let Some(items) = old.and_then(crate::resource::comparison_list_items) {
+            for &index in &self.removed_indices {
+                context
+                    .at_paths(&context.index_paths(index, index))
+                    .rendered_change(Some(&items[index]), None, element, defs);
+            }
+        }
+    }
 }
 
 struct StringListDiffElement {
