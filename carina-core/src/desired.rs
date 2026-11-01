@@ -3,7 +3,9 @@
 use crate::protocol_convert::{
     protocol_to_core_value, resource_id_to_protocol, try_core_to_protocol_value,
 };
-use crate::resource::{ConcreteValue, Resource, Value, is_deferred_desired_leaf};
+use crate::resource::{
+    AbsoluteBindingAddress, ConcreteValue, NoPlaceholder, Resource, Value, is_deferred_desired_leaf,
+};
 use carina_provider_protocol::normalization::{
     NormalizationError, NormalizationErrorKind as Kind, NormalizationPathSegment as Segment,
     NormalizationResource, NormalizationValue as Wire,
@@ -32,7 +34,9 @@ struct OriginalLeaf {
 }
 
 impl NormalizationBatch {
-    pub fn new<S>(resources: &[Resource<S>]) -> Result<Self, NormalizationError> {
+    pub fn new<S, D>(
+        resources: &[Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>],
+    ) -> Result<Self, NormalizationError> {
         let mut batch = Self {
             resources: Vec::with_capacity(resources.len()),
             originals: Vec::with_capacity(resources.len()),
@@ -113,7 +117,10 @@ impl NormalizationBatch {
                     carina_provider_protocol::types::Value::StringList(value) => {
                         Wire::StringList(value)
                     }
-                    _ => unreachable!("containers were projected structurally"),
+                    carina_provider_protocol::types::Value::List(_)
+                    | carina_provider_protocol::types::Value::Map(_) => {
+                        unreachable!("containers were projected structurally")
+                    }
                 })
             }
         }

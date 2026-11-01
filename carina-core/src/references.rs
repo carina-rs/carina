@@ -494,6 +494,48 @@ impl ReferencePreparation {
         .await
     }
 
+    /// Prepare early binding stability without crossing the dependency graph
+    /// boundary. The same recording/replay gate operates on schema-resolved
+    /// comparison operands while the resource dependency phase stays authored.
+    pub async fn pre_graph_stability(
+        &mut self,
+        desired: &[crate::resource::Resource],
+        current: &HashMap<ResourceId, PlanInputCurrent>,
+        registry: &SchemaRegistry,
+        saved: &LiftedSavedAttrs,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+        provider: &ProviderRouter,
+    ) -> crate::differ::PlanComparisonResult<
+        PreparedComparison<HashMap<ResourceId, crate::binding_index::ManagedBindingStability>>,
+    > {
+        let crate::differ::PreGraphStabilityResources { resources, pending } =
+            crate::differ::prepare_pre_graph_stability_resources(desired, registry)?;
+        let desired = resources.iter().collect::<Vec<_>>();
+        validate_resource_inputs(&desired, current, registry, saved)?;
+        self.run(
+            provider,
+            || collect_resource_inputs(&desired, current, registry, saved),
+            |session| {
+                session.result(
+                    crate::differ::managed_binding_stability_for_resources(
+                        resources.iter(),
+                        current,
+                        registry,
+                        saved,
+                        explicit,
+                        provider,
+                        session.references,
+                    )
+                    .map(|mut stability| {
+                        stability.extend(pending.clone());
+                        stability
+                    }),
+                )
+            },
+        )
+        .await
+    }
+
     /// Prepare the differ and cascade decisions. Finalize ancillary effects
     /// before calling `display` with the complete historical display view.
     #[allow(clippy::too_many_arguments)]
@@ -501,14 +543,14 @@ impl ReferencePreparation {
         &mut self,
         desired: &crate::resource::PlanInputDesiredResources<'_>,
         dependents: &crate::differ::CascadeDependents<'_>,
-        data_sources: &[crate::resource::DataSource],
+        data_sources: &[crate::resource::ResolvedDataSource],
         provider: &ProviderRouter,
         prior: crate::differ::PlanPriorStates<'_>,
-        directives: &HashMap<ResourceId, crate::resource::Directives>,
+        directives: &HashMap<ResourceId, crate::resource::PersistedDirectives>,
         registry: &SchemaRegistry,
         saved: &LiftedSavedAttrs,
         explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-        waits: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
+        waits: &[crate::wait::ResolvedWaitBinding],
         unknown_imports: &HashSet<crate::effect::OutcomeUnknownImportReplacement>,
     ) -> crate::differ::PlanComparisonResult<PreparedComparison<crate::differ::PendingCascadePlan>>
     {
@@ -641,14 +683,14 @@ impl ReferencePreparation {
     pub async fn plan(
         &mut self,
         desired: &[ResolvedResource],
-        data_sources: &[crate::resource::DataSource],
+        data_sources: &[crate::resource::ResolvedDataSource],
         provider: &ProviderRouter,
         prior: crate::differ::PlanPriorStates<'_>,
-        directives: &HashMap<ResourceId, crate::resource::Directives>,
+        directives: &HashMap<ResourceId, crate::resource::PersistedDirectives>,
         registry: &SchemaRegistry,
         saved: &LiftedSavedAttrs,
         explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-        waits: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
+        waits: &[crate::wait::ResolvedWaitBinding],
     ) -> crate::differ::PlanComparisonResult<PreparedComparison<crate::plan::Plan>> {
         validate_inputs(
             desired,
@@ -737,6 +779,21 @@ impl ReferencePreparation {
                     path: "<planning>".into(),
                     raw: "<planning>".into(),
                     source: ReferenceFailure::Call(error.into()),
+                }))
+            }
+            Err(crate::differ::PlanComparisonError::Resource(error)) => {
+                Err(Box::new(ReferencePlanError {
+                    instance: ProviderInstanceKey::from(&desired[0].id),
+                    resource: desired[0].id.clone(),
+                    path: "<planning>".into(),
+                    raw: "<planning>".into(),
+                    source: ReferenceFailure::Call(
+                        ProviderError::invalid_input_caused_by(
+                            "Failed to resolve comparison resource",
+                            error,
+                        )
+                        .into(),
+                    ),
                 }))
             }
         }
@@ -858,8 +915,30 @@ fn validate_inputs(
     registry: &SchemaRegistry,
     saved: &LiftedSavedAttrs,
 ) -> Result<(), Box<ReferencePlanError>> {
-    for resource in desired {
-        let Some(schema) = registry.get_for(resource.as_resource()) else {
+    validate_resource_inputs(
+        &desired
+            .iter()
+            .map(ResolvedResource::as_resource)
+            .collect::<Vec<_>>(),
+        current,
+        registry,
+        saved,
+    )
+}
+
+fn validate_resource_inputs<D>(
+    desired: &[&crate::resource::Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    current: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved: &LiftedSavedAttrs,
+) -> Result<(), Box<ReferencePlanError>> {
+    for &resource in desired {
+        let Some(schema) = registry.get_for(resource) else {
             continue;
         };
         let desired = crate::resource::CanonicalComparisonAttributes::canonicalize(
@@ -877,7 +956,7 @@ fn validate_inputs(
                 schema.schema().as_schema(),
             )
         });
-        let masked = resource.ignore_changes().mask_comparison_attributes(
+        let masked = resource.resolved_ignore_changes.mask_comparison_attributes(
             &desired,
             current,
             saved.as_ref(),
@@ -899,14 +978,36 @@ fn collect_inputs(
     registry: &SchemaRegistry,
     saved: &LiftedSavedAttrs,
 ) -> Result<Vec<Occurrence>, Box<ReferencePlanError>> {
+    collect_resource_inputs(
+        &desired
+            .iter()
+            .map(ResolvedResource::as_resource)
+            .collect::<Vec<_>>(),
+        current,
+        registry,
+        saved,
+    )
+}
+
+fn collect_resource_inputs<D>(
+    desired: &[&crate::resource::Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    current: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved: &LiftedSavedAttrs,
+) -> Result<Vec<Occurrence>, Box<ReferencePlanError>> {
     let mut values = Vec::new();
     let ignores = desired
         .iter()
-        .map(|resource| (&resource.id, resource.ignore_changes()))
+        .map(|resource| (&resource.id, &resource.resolved_ignore_changes))
         .collect::<HashMap<_, _>>();
     let no_ignores = ResolvedIgnoreChanges::default();
-    for resource in desired {
-        if let Some(schema) = registry.get_for(resource.as_resource()) {
+    for &resource in desired {
+        if let Some(schema) = registry.get_for(resource) {
             let attributes = CanonicalComparisonAttributes::canonicalize(
                 resource.resolved_attributes(),
                 schema.schema().as_schema(),
@@ -914,7 +1015,7 @@ fn collect_inputs(
             collect_masked_attributes(
                 &resource.id,
                 &attributes,
-                resource.ignore_changes(),
+                &resource.resolved_ignore_changes,
                 schema.schema(),
                 &mut values,
             )?;

@@ -7,8 +7,8 @@ use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect,
 use carina_core::plan::Plan;
 use carina_core::resource::{
     AccessMissPolicy, ConcreteValue, DeferredValue, Directives, InterpolationPart, LoopSlot,
-    ModuleSource, PathSegment, ResolvedResource, Resource, ResourceId, State, Value,
-    apply_postfix_access,
+    ModuleSource, PathSegment, ResolvedDependencies, ResolvedResource, ResolvedResourceId,
+    Resource, ResourceId, State, Value, apply_postfix_access,
 };
 use carina_core::value::{PrettyLayout, PrettyValue, render_value};
 
@@ -76,22 +76,59 @@ fn for_value_access(fields: &[&str]) -> Value<LoopSlot> {
     )
 }
 
-fn resolved(resource: Resource) -> ResolvedResource {
-    ResolvedResource::new(resource)
+trait IntoResolvedTestResource {
+    fn into_resolved_test_resource(self) -> ResolvedResource;
 }
-
+impl IntoResolvedTestResource for Resource {
+    fn into_resolved_test_resource(self) -> ResolvedResource {
+        ResolvedResource::new(self.into_value_snapshot())
+    }
+}
+impl IntoResolvedTestResource for ResolvedResource {
+    fn into_resolved_test_resource(self) -> ResolvedResource {
+        self
+    }
+}
+fn resolved(resource: impl IntoResolvedTestResource) -> ResolvedResource {
+    resource.into_resolved_test_resource()
+}
+fn test_resource_ref(
+    resource: &Resource,
+) -> carina_core::parser::ResourceRef<
+    '_,
+    ModuleSource,
+    carina_core::resource::NoPlaceholder,
+    LoopSlot,
+> {
+    carina_core::parser::ResourceRef::<
+        _,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+    >::Resource(resource)
+}
 fn make_resource(
     resource_type: &str,
     name: &'static str,
     binding: &str,
-    deps: &[&str],
-) -> Resource {
-    let mut r = Resource::new(resource_type, name);
-    r.binding = Some(absolute_binding(binding));
-    for dep in deps {
-        r.set_attr(format!("ref_{}", dep), root_resource_ref(dep, "id"));
+    deps: &[&ResolvedResource],
+) -> ResolvedResource {
+    let mut resource =
+        Resource::new(resource_type, name).with_absolute_binding(absolute_binding(binding));
+    for dependency in deps {
+        let binding = dependency
+            .binding
+            .as_ref()
+            .map(|binding| binding.as_str())
+            .unwrap_or_else(|| dependency.identity_str());
+        resource.set_attr(format!("ref_{binding}"), root_resource_ref(binding, "id"));
     }
-    r
+    ResolvedResource::from_resolved_parts(
+        resource.into_value_snapshot(),
+        deps.iter()
+            .map(|dependency| dependency.resolved_id())
+            .collect(),
+        Default::default(),
+    )
 }
 
 /// Test that print_plan does not panic when a resource has a dependency
@@ -103,7 +140,8 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     let color_mode = crate::output_style::ColorMode::Plain;
     // Resource "b" depends on "a", but "a" is NOT in the plan.
     // This simulates an external/unresolved dependency.
-    let b = make_resource("test.resource", "b", "b", &["a"]);
+    let a = make_resource("test.resource", "a", "a", &[]);
+    let b = make_resource("test.resource", "b", "b", &[&a]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(b)));
     let provider = crate::fixture_plan::provider_router_for_plan(
@@ -136,13 +174,60 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     .expect("display fixture must have an initialized provider route");
 }
 
+#[test]
+fn apply_plan_displays_missing_persisted_destroy_dependency_warning() {
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let id = ResolvedResourceId::new(ResourceId::with_identity("test.resource", "orphan"));
+    let missing = ResolvedResourceId::new(ResourceId::with_identity("test.resource", "vanished"));
+    let generation = carina_core::effect::EffectGeneration::Current;
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: id.clone(),
+        identifier: carina_core::provider::AppliedIdentifier::new("orphan-provider-id")
+            .expect("fixture provider identifier"),
+        generation: generation.clone(),
+        directives: Default::default(),
+        binding: Some(absolute_binding("orphan")),
+        dependencies: crate::test_support::persisted([missing.clone()]),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    plan.record_unresolvable_destroy_dependencies(
+        id,
+        generation,
+        std::iter::once(missing.clone()).collect(),
+    );
+
+    let output = strip_ansi(&format_plan_for_test(
+        color_mode,
+        &plan,
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
+        ),
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        None,
+        None,
+    ));
+
+    assert!(output.contains("destroy ordering for test.resource.orphan is partially unknown"));
+    assert!(output.contains(&format!(
+        "persisted dependency `{missing}` no longer resolves"
+    )));
+}
+
 /// Test that print_plan handles the dependency graph correctly when
 /// dependents map is accessed with valid indices.
 #[test]
 fn test_print_plan_with_internal_dependency_does_not_panic() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let a = make_resource("test.resource", "a", "a", &[]);
-    let b = make_resource("test.resource", "b", "b", &["a"]);
+    let b = make_resource("test.resource", "b", "b", &[&a]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(a)));
     plan.add(Effect::Create(resolved(b)));
@@ -252,10 +337,10 @@ fn test_siblings_sorted_by_resource_type_and_binding() {
     // VPC is root. Under it: 2 subnets and 2 route tables, added in
     // interleaved order to expose HashMap non-determinism.
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt_b = make_resource("ec2.RouteTable", "rt_b", "rt_b", &["vpc"]);
-    let subnet_b = make_resource("ec2.Subnet", "subnet_b", "subnet_b", &["vpc"]);
-    let rt_a = make_resource("ec2.RouteTable", "rt_a", "rt_a", &["vpc"]);
-    let subnet_a = make_resource("ec2.Subnet", "subnet_a", "subnet_a", &["vpc"]);
+    let rt_b = make_resource("ec2.RouteTable", "rt_b", "rt_b", &[&vpc]);
+    let subnet_b = make_resource("ec2.Subnet", "subnet_b", "subnet_b", &[&vpc]);
+    let rt_a = make_resource("ec2.RouteTable", "rt_a", "rt_a", &[&vpc]);
+    let subnet_a = make_resource("ec2.Subnet", "subnet_a", "subnet_a", &[&vpc]);
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
@@ -317,8 +402,8 @@ fn test_siblings_sorted_by_resource_type_and_binding() {
 #[test]
 fn test_parent_selection_prefers_most_ancestral_dependency() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let sg = make_resource("ec2.SecurityGroup", "sg", "sg", &["vpc"]);
-    let endpoint = make_resource("ec2.vpc_endpoint", "endpoint", "endpoint", &["vpc", "sg"]);
+    let sg = make_resource("ec2.SecurityGroup", "sg", "sg", &[&vpc]);
+    let endpoint = make_resource("ec2.vpc_endpoint", "endpoint", "endpoint", &[&vpc, &sg]);
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
@@ -392,14 +477,14 @@ fn test_parent_selection_prefers_most_ancestral_dependency() {
 #[test]
 fn test_referenced_resource_without_deps_should_not_be_root() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
+    let rt = make_resource("ec2.RouteTable", "rt", "rt", &[&vpc]);
     let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
-    let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
+    let route = make_resource("ec2.route", "route", "route", &[&rt, &igw]);
     let igw_attachment = make_resource(
         "ec2.vpc_gateway_attachment",
         "igw_attachment",
         "igw_attachment",
-        &["vpc", "igw"],
+        &[&vpc, &igw],
     );
 
     let mut plan = Plan::new();
@@ -437,14 +522,14 @@ fn test_referenced_resource_without_deps_should_not_be_root() {
 #[test]
 fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
+    let rt = make_resource("ec2.RouteTable", "rt", "rt", &[&vpc]);
     let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
-    let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
+    let route = make_resource("ec2.route", "route", "route", &[&rt, &igw]);
     let igw_attachment = make_resource(
         "ec2.vpc_gateway_attachment",
         "igw_attachment",
         "igw_attachment",
-        &["vpc", "igw"],
+        &[&vpc, &igw],
     );
 
     let mut plan = Plan::new();
@@ -502,7 +587,7 @@ fn test_extract_compact_hint_resource_ref() {
         root_resource_ref("public_subnet_1a", "id"),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     // Should return only the first ResourceRef alphabetically, with _id suffix stripped
     assert_eq!(hint, Some("route_table: public_rt".to_string()));
 }
@@ -521,10 +606,7 @@ fn test_extract_compact_hint_skips_parent_ref() {
     );
 
     // When parent is database_rt, should skip route_table_id and show only subnet_id
-    let hint = extract_compact_hint(
-        carina_core::parser::ResourceRef::Resource(&r),
-        Some("database_rt"),
-    );
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("database_rt"));
     assert_eq!(hint, Some("subnet: database_subnet_1a".to_string()));
 }
 
@@ -537,7 +619,7 @@ fn test_extract_compact_hint_string_fallback() {
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, Some("destination_cidr_block: 0.0.0.0/0".to_string()));
 }
 
@@ -545,7 +627,7 @@ fn test_extract_compact_hint_string_fallback() {
 #[test]
 fn test_extract_compact_hint_none() {
     let r: Resource = Resource::new("ec2.route", "hash789");
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, None);
 }
 
@@ -559,7 +641,7 @@ fn test_extract_compact_hint_prefers_string_over_resource_ref() {
     );
     r.set_attr("gateway_id".to_string(), root_resource_ref("igw", "id"));
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     // String takes priority over ResourceRef
     assert_eq!(hint, Some("destination: 10.0.0.0/8".to_string()));
 }
@@ -575,7 +657,7 @@ fn test_extract_compact_hint_service_name_shortening() {
         )),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 
     // Single service component
@@ -587,7 +669,7 @@ fn test_extract_compact_hint_service_name_shortening() {
         )),
     );
 
-    let hint2 = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r2), None);
+    let hint2 = extract_compact_hint(test_resource_ref(&r2), None);
     assert_eq!(hint2, Some("service: s3".to_string()));
 }
 
@@ -605,10 +687,7 @@ fn test_extract_compact_hint_all_refs_match_parent() {
     );
 
     // When parent is endpoint_sg, should skip group_id and use description
-    let hint = extract_compact_hint(
-        carina_core::parser::ResourceRef::Resource(&r),
-        Some("endpoint_sg"),
-    );
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("endpoint_sg"));
     assert_eq!(hint, Some("description: Allow HTTPS from VPC".to_string()));
 }
 
@@ -632,7 +711,7 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
     r.set_attr("vpc_id".to_string(), root_resource_ref("vpc", "id"));
 
     // String attribute (service_name) takes priority over ResourceRef
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), Some("vpc"));
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("vpc"));
     assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 }
 
@@ -641,14 +720,18 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
 fn test_has_binding() {
     let mut bound: Resource = Resource::new("ec2.Vpc", "vpc");
     bound.binding = Some(absolute_binding("vpc"));
-    assert!(has_binding(carina_core::parser::ResourceRef::Resource(
-        &bound
-    )));
+    assert!(has_binding(carina_core::parser::ResourceRef::<
+        _,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+    >::Resource(&bound)));
 
     let anonymous: Resource = Resource::new("ec2.Vpc", "hash123");
-    assert!(!has_binding(carina_core::parser::ResourceRef::Resource(
-        &anonymous
-    )));
+    assert!(!has_binding(carina_core::parser::ResourceRef::<
+        _,
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::LoopSlot,
+    >::Resource(&anonymous)));
 }
 
 /// Test that format_compact_name shows plain identifiers for bound resources and
@@ -658,7 +741,7 @@ fn test_format_compact_name_bound_resource() {
     let mut r: Resource = Resource::new("ec2.Vpc", "vpc");
     r.binding = Some(absolute_binding("vpc"));
     // For bound resources, should show name as plain identifier (no quotes)
-    let result = format_compact_name(carina_core::parser::ResourceRef::Resource(&r), "vpc", None);
+    let result = format_compact_name(test_resource_ref(&r), "vpc", None);
     assert!(
         !result.contains('"'),
         "Bound resource name should not be quoted"
@@ -673,11 +756,7 @@ fn test_format_compact_name_anonymous_with_hint() {
         "subnet_id".to_string(),
         root_resource_ref("database_subnet_1a", "id"),
     );
-    let result = format_compact_name(
-        carina_core::parser::ResourceRef::Resource(&r),
-        "hash123",
-        None,
-    );
+    let result = format_compact_name(test_resource_ref(&r), "hash123", None);
     assert!(
         result.contains('(') && result.contains(')'),
         "Anonymous resource should show hint in parentheses, got: {}",
@@ -696,7 +775,7 @@ fn test_format_compact_name_anonymous_with_hint() {
 fn test_print_plan_compact_does_not_panic() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
-    let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
+    let rt = make_resource("ec2.RouteTable", "rt", "rt", &[&vpc]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
     plan.add(Effect::Create(resolved(rt)));
@@ -789,7 +868,7 @@ fn test_extract_compact_hint_list_containing_resource_ref() {
         )])),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(
         hint,
         Some("security_group: endpoint_sg".to_string()),
@@ -809,10 +888,7 @@ fn test_extract_compact_hint_list_ref_skips_parent() {
         )])),
     );
 
-    let hint = extract_compact_hint(
-        carina_core::parser::ResourceRef::Resource(&r),
-        Some("endpoint_sg"),
-    );
+    let hint = extract_compact_hint(test_resource_ref(&r), Some("endpoint_sg"));
     assert_eq!(
         hint, None,
         "Should skip List<ResourceRef> when ref matches parent"
@@ -841,7 +917,7 @@ fn test_extract_compact_hint_preserves_namespaced_string() {
         )),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(
         hint,
         Some("availability_zone: awscc.AvailabilityZone.ap_northeast_1a".to_string()),
@@ -860,7 +936,7 @@ fn test_extract_compact_hint_considers_all_resource_attributes() {
         Value::Concrete(ConcreteValue::String("abc123".into())),
     );
 
-    let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
+    let hint = extract_compact_hint(test_resource_ref(&r), None);
     assert_eq!(hint, Some("_hash: abc123".to_string()));
 }
 
@@ -886,9 +962,9 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
     );
 
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate(
-        carina_core::effect::DeferredCreatePayload::new(Box::new(deferred)),
-    ));
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(deferred),
+    )));
 
     let output = strip_ansi(&format_plan_for_test(
         color_mode,
@@ -919,6 +995,10 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
     ");
 }
 
+fn certificate_resource() -> Resource {
+    Resource::new("acm.Certificate", "cert").with_absolute_binding(absolute_binding("cert"))
+}
+
 fn deferred_validation_records_effect() -> Effect {
     let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::with_provider("aws", "route53.Record", "validation_records", None);
@@ -938,9 +1018,17 @@ fn deferred_validation_records_effect() -> Effect {
         template_resource,
     );
 
-    Effect::DeferredCreate(carina_core::effect::DeferredCreatePayload::new(Box::new(
-        deferred,
-    )))
+    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
+    configuration.resources = vec![certificate_resource()];
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
+        .expect("certificate fixture graph resolves");
+    let (template, dependency_template) = graph
+        .compile_deferred_for(deferred)
+        .expect("deferred fixture references the certificate producer");
+    Effect::DeferredCreate(carina_core::effect::DeferredCreatePayload::new(
+        Box::new(template),
+        dependency_template,
+    ))
 }
 
 #[test]
@@ -980,9 +1068,7 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
             template: _template
         }
     ));
-    let effect = Effect::DeferredCreate(carina_core::effect::DeferredCreatePayload::new(Box::new(
-        deferred,
-    )));
+    let effect = Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(deferred)));
     assert_eq!(
         format_effect(&effect),
         "Expand deferred for mock.test.resource _loop_39ec86fd0e24c726 (waits on upstream)",
@@ -999,9 +1085,11 @@ fn delete_record_effect(binding: &'static str) -> Effect {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(absolute_binding(binding)),
-        dependencies: HashSet::from([absolute_binding("cert")]),
-        explicit_dependencies: HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: crate::test_support::persisted([ResolvedResourceId::new(
+            certificate_resource().id,
+        )]),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     }
 }
 
@@ -1035,6 +1123,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
         }])
         .expect("fixture has one delete"),
         template: payload.template,
+        dependency_template: payload.dependency_template,
     }))
 }
 
@@ -1084,8 +1173,14 @@ fn test_deferred_replace_renders_dependent_children() {
     );
 
     let mut plan = Plan::new();
-    plan.add(deferred_replace_validation_records_effect());
-    plan.add(Effect::Create(resolved(dependent)));
+    let gate = deferred_replace_validation_records_effect();
+    let gate_id = gate.scheduler_id();
+    plan.add(gate);
+    plan.add(Effect::Create(ResolvedResource::from_resolved_parts(
+        resolved(dependent).into_inner(),
+        ResolvedDependencies::from_iter([gate_id]),
+        ResolvedDependencies::default(),
+    )));
 
     let output = strip_ansi(&format_plan_for_test(
         color_mode,
@@ -1123,9 +1218,7 @@ fn test_deferred_replace_renders_dependent_children() {
 fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let mut plan = Plan::new();
-    let mut certificate = Resource::new("acm.Certificate", "cert");
-    certificate.binding = Some(absolute_binding("cert"));
-    plan.add(Effect::Create(resolved(certificate)));
+    plan.add(Effect::Create(resolved(certificate_resource())));
     plan.add(delete_record_effect("old_record"));
     plan.add(deferred_replace_validation_records_effect());
 
@@ -1204,8 +1297,13 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     );
     // _dependency_bindings is saved by resolve_refs_with_state() before
     // ResourceRef values are resolved to strings.
-    sg.dependency_bindings = std::collections::BTreeSet::from([absolute_binding("vpc")]);
+    sg.dependencies.value_bindings = std::collections::BTreeSet::from([absolute_binding("vpc")]);
 
+    let sg = ResolvedResource::from_resolved_parts(
+        sg.into_value_snapshot(),
+        std::iter::once(vpc_to.resolved_id()).collect(),
+        Default::default(),
+    );
     let mut plan = Plan::new();
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("vpc-id"),
@@ -1218,8 +1316,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
 
     // VPC (idx 0) should be the only root.
-    // SG has _dependency_bindings metadata that preserves the dependency
-    // on "vpc", so get_resource_dependencies() recovers it.
+    // SG has resolved graph metadata that preserves the dependency on VPC.
     assert_eq!(
         roots,
         vec![0],
@@ -1255,9 +1352,9 @@ fn format_effect_delete_uses_binding_name() {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(absolute_binding("my_vpc")),
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
     assert_eq!(format_effect(&effect), "Delete awscc.ec2.Vpc my_vpc");
 }
@@ -1275,9 +1372,9 @@ fn format_effect_delete_falls_back_to_id_name() {
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
-        dependencies: HashSet::new(),
-        explicit_dependencies: std::collections::HashSet::new(),
-        blocked_by_updates: HashSet::new(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
     assert_eq!(
         format_effect(&effect),
@@ -2194,7 +2291,12 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     use carina_core::schema::SchemaRegistry;
 
     let cluster = make_resource("aws.eks.Cluster", "cluster/inner", "inner", &[]);
-    let node_role = make_resource("aws.iam.Role", "cluster/node-role", "node_role", &["inner"]);
+    let node_role = make_resource(
+        "aws.iam.Role",
+        "cluster/node-role",
+        "node_role",
+        &[&cluster],
+    );
     let bucket = make_resource("aws.s3.Bucket", "cluster/logs", "logs", &[]);
     let cluster_id = cluster.id.clone();
     let bucket_id = bucket.id.clone();
@@ -2328,7 +2430,8 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
 #[test]
 fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     let color_mode = crate::output_style::ColorMode::Plain;
-    let parent = make_resource("aws.s3.Bucket", "parent", "parent", &[]).with_attribute(
+    let mut parent = make_resource("aws.s3.Bucket", "parent", "parent", &[]);
+    parent.set_attr(
         "bucket",
         Value::Concrete(ConcreteValue::String("parent".into())),
     );

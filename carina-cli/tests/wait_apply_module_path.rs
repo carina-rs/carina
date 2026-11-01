@@ -43,7 +43,7 @@ use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, NoopNormalizer, Provider, ProviderFactory,
     ProviderNormalizer, ProviderResult, ReadOutcome,
 };
-use carina_core::resource::{Current, ResolvedResource, ResourceId, Value};
+use carina_core::resource::{Current, ResolvedResourceId, ResourceId, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use std::sync::Mutex;
 
@@ -533,7 +533,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();
-    let parsed = wiring.evaluated_resources_for_test();
+    let parsed = wiring.evaluated_resources_for_test().clone();
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, Current> = HashMap::new();
@@ -613,13 +613,53 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .await
         .expect("plan preprocessing");
     let resources_for_plan = override_aware_resources.resources().to_vec();
-    let resolved_resources_for_plan =
-        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = resources_for_plan.clone();
+        configuration.data_sources = data_sources.clone();
+        configuration.into()
+    })
+    .expect("expanded graph resolution");
+    let parsed = expanded_graph.configuration();
+    let resolved_resources_for_plan = resources_for_plan
+        .iter()
+        .cloned()
+        .map(|resource| expanded_graph.resolve_resource(resource, ctx.schemas()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("managed dependency resolution");
+    let distribution = resolved_resources_for_plan
+        .iter()
+        .find(|resource| resource.id.resource_type == "cloudfront.Distribution")
+        .expect("expanded fixture contains the distribution");
+    let certificate = resolved_resources_for_plan
+        .iter()
+        .find(|resource| resource.id.resource_type == "acm.Certificate")
+        .expect("expanded fixture contains the certificate");
+    let certificate_id = certificate.resolved_id();
+    assert_eq!(
+        distribution
+            .persisted_destroy_dependencies()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![&certificate_id],
+        "state dependency projection must flatten r.cert_issued to the managed certificate row"
+    );
+    let resolved_data_sources = data_sources
+        .iter()
+        .cloned()
+        .map(|data_source| expanded_graph.resolve_data_source(data_source))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("data source dependency resolution");
+    let resolved_wait_bindings = wait_bindings
+        .iter()
+        .map(|wait| expanded_graph.resolve_wait_binding(wait))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("wait dependency resolution");
 
     let saved_attrs = carina_core::provider::RawSavedAttrs::default().lift(ctx.schemas());
     let plan = carina_core::differ::create_plan_for_test(
         &resolved_resources_for_plan,
-        &parsed.data_sources,
+        &resolved_data_sources,
         &provider,
         carina_core::differ::PlanPriorStates::new(
             &carina_core::resource::into_plan_input_current_map(
@@ -633,12 +673,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ctx.schemas(),
         &saved_attrs,
         &HashMap::new(),
-        &wait_bindings,
+        &resolved_wait_bindings,
     )
     .expect("test provider hints should succeed");
 
     let has_wait = plan.effects().iter().any(|e| {
-        matches!(e, carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued")
+        matches!(e, carina_core::effect::Effect::Wait { id, .. } if id.identity_str() == "r.cert_issued")
     });
     assert!(
         has_wait,
@@ -646,11 +686,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         plan.effects()
     );
 
-    let unresolved_resources: HashMap<ResourceId, _> = sorted_resources
+    let unresolved_resources: HashMap<ResolvedResourceId, _> = sorted_resources
         .iter()
         .map(|r| {
             (
-                r.id.clone(),
+                ResolvedResourceId::new(r.id.clone()),
                 UnresolvedResource::from_pre_resolve(r.clone()),
             )
         })
@@ -658,11 +698,17 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let observer = CollectingObserver {
         failures: Mutex::new(Vec::new()),
     };
+    let data_source_origins = parsed
+        .data_sources
+        .iter()
+        .cloned()
+        .map(|source| source.into_value_snapshot())
+        .collect::<Vec<_>>();
     let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
-            data_source_origins: &parsed.data_sources,
+            data_source_origins: &data_source_origins,
         },
         compositions: &parsed.compositions,
         bindings: ResolvedBindings::default(),

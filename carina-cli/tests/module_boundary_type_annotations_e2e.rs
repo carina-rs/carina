@@ -1502,25 +1502,48 @@ let instance = consumer {
 }
 
 #[test]
-fn ref_typed_module_argument_binds_value_arguments_as_values() {
-    let module = issue_module("aws.ec2.Vpc", "");
-    let module = borrowed(&module);
-    let fixture = Fixture::module(&module, &[("main.crn", root_with_two_calls())]);
+fn ref_typed_module_argument_rejects_typed_identity_values() {
+    let fixture = Fixture::module(
+        &[("arguments.crn", "arguments {\n  vpc_id: aws.ec2.Vpc\n}\n")],
+        &[(
+            "main.crn",
+            r#"let web_tier = use { source = '../web_tier' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let wrong = aws.ec2.SecurityGroup {
+  name   = "wrong"
+  vpc_id = main_vpc.vpc_id
+}
+
+let matching_identity = web_tier {
+  vpc_id = main_vpc.vpc_id
+}
+
+let different_identity = web_tier {
+  vpc_id = wrong.group_id
+}
+"#,
+        )],
+    );
 
     let diagnostics = fixture.validate();
 
     assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.contains("resource handle, not a value")),
-        "a value argument stays value-shaped even under a Ref annotation: {diagnostics:#?}",
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("argument 'vpc_id': expected resource handle aws.ec2.Vpc")
+                && diagnostic.contains("got aws.ec2.Vpc.Id")
+        }),
+        "a matching identity value is still not a resource handle: {diagnostics:#?}",
     );
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("expected aws.ec2.Vpc.Id")
+            diagnostic.contains("argument 'vpc_id': expected resource handle aws.ec2.Vpc")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
         }),
-        "the independent second-call identity mismatch must remain visible: {diagnostics:#?}",
+        "a different identity value must retain its named type: {diagnostics:#?}",
     );
 }
 
@@ -1671,11 +1694,13 @@ fn unannotated_vpc_id_forward_is_inferred_and_passes() {
 }
 
 #[test]
-fn ref_annotated_composition_attribute_infers_forwarded_identity() {
+fn ref_annotated_composition_attribute_rejects_forwarded_identity_value() {
     let diagnostics = vpc_output_fixture(": aws.ec2.Vpc").validate();
     assert!(
-        diagnostics.is_empty(),
-        "Ref is unchecked while its forwarded value remains inferable: {diagnostics:#?}",
+        diagnostics.iter().any(|diagnostic| diagnostic.contains(
+            "attribute 'vpc_id': expected resource handle aws.ec2.Vpc; got aws.ec2.Vpc.Id"
+        )),
+        "a resource identity value must not satisfy a handle annotation: {diagnostics:#?}",
     );
 }
 

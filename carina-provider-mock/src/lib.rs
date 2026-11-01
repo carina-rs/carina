@@ -1110,10 +1110,15 @@ impl MockProvider {
         })
     }
 
-    async fn create_resource<S>(
+    async fn create_resource<S, D>(
         &self,
         id: ResourceId,
-        resource: Resource<S>,
+        resource: Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
         attempt: CreateAttempt,
     ) -> Result<CreateOutcome, CreateFailure> {
         let mode = &self.behavior.create_mode;
@@ -1234,10 +1239,15 @@ impl MockProvider {
         Ok(issued.succeeded(state_attrs))
     }
 
-    fn persist_resumed_resource<S>(
+    fn persist_resumed_resource<S, D>(
         &self,
         id: &ResourceId,
-        resource: &Resource<S>,
+        resource: &Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            D,
+        >,
     ) -> ProviderResult<HashMap<String, Value>> {
         let state_guard = self.lock_state_file()?;
         let mut states = state_guard.load_states_for_operation()?;

@@ -779,11 +779,15 @@ mod tests {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn resolved(resource: Resource) -> ResolvedResource {
-        ResolvedResource::new(resource)
+        ResolvedResource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
-        ResolvedDataSource::new(resource)
+        ResolvedDataSource::collect_resolved([resource])
+            .expect("fixture identity resolves")
+            .remove(0)
     }
 
     struct PermissionProvider {
@@ -977,9 +981,9 @@ mod tests {
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
-        plan.add(Effect::DeferredCreate(
-            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
-        ));
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
 
         let entries = collect_required_actions(
             &plan,
@@ -1020,9 +1024,9 @@ mod tests {
             ForBinding::Simple("opt".to_string()),
             template_resource,
         );
-        plan.add(Effect::DeferredCreate(
-            carina_core::effect::DeferredCreatePayload::new(Box::new(template)),
-        ));
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
 
         let mut schemas = SchemaRegistry::new();
         schemas.insert(

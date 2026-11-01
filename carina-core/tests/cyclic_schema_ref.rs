@@ -34,6 +34,20 @@ use carina_core::schema::{
 };
 use carina_core::value::CanonicalState;
 
+fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedResource {
+    let parsed = carina_core::parser::ExpandedParsedFile::default();
+    let graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (std::slice::from_ref(&resource)).to_vec();
+        configuration.data_sources = Vec::new();
+        configuration.into()
+    })
+    .expect("cyclic-schema fixture graph must resolve");
+    graph
+        .resolve_resource(resource, registry)
+        .expect("cyclic-schema fixture resource must resolve")
+}
+
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
 ///
 /// Top-level attribute `rules` is `List<Struct{ statement: Ref(Statement) }>`.
@@ -207,8 +221,9 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         )
         .expect("comparison provider route is initialized");
 
+    let desired = resolve_resource(desired, &schemas);
     let d = diff(
-        &ResolvedResource::new(desired),
+        &desired,
         &current,
         &saved,
         None,
@@ -272,8 +287,9 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         )
         .expect("comparison provider route is initialized");
 
+    let desired = resolve_resource(desired, &schemas);
     let d = diff(
-        &ResolvedResource::new(desired),
+        &desired,
         &current,
         &saved,
         None,

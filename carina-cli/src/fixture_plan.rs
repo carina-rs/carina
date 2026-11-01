@@ -687,7 +687,12 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_classification: _,
+                migrated_legacy_state,
             } = artifacts;
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
@@ -736,7 +741,12 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
+                legacy_dependency_classification: _,
+                migrated_legacy_state,
             } = artifacts;
+            if let Some(migrated) = migrated_legacy_state {
+                state_file = Some(migrated);
+            }
             let (plan, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
                     (plan, FixtureReferences(references))
@@ -1564,7 +1574,8 @@ mod tests {
         );
         let mut plan: Plan = Plan::new();
         plan.add(carina_core::effect::Effect::Create(ResolvedResource::new(
-            carina_core::resource::Resource::with_provider("mock", "test.resource", "item", None),
+            carina_core::resource::Resource::with_provider("mock", "test.resource", "item", None)
+                .into_value_snapshot(),
         )));
 
         let router_error = provider_router_for_plan(&runtime, &plan).err().unwrap();

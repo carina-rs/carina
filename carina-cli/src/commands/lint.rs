@@ -62,6 +62,29 @@ enum LintFile {
 }
 
 impl LintFile {
+    fn resolve_type_exprs_best_effort(&mut self, context: &carina_core::parser::ProviderContext) {
+        match self {
+            Self::Blocked(parsed) => {
+                parsed.resolve_type_exprs_report(context);
+            }
+            Self::Resolved(parsed) => {
+                carina_core::validation::resolve_file_type_exprs_best_effort(parsed, context);
+            }
+        }
+    }
+    fn export_handle_errors(&self) -> Option<Vec<carina_core::validation::ExportBoundaryError>> {
+        match self {
+            Self::Blocked(parsed) => {
+                carina_core::validation::validate_export_handle_boundaries(&parsed.export_params)
+                    .err()
+            }
+            Self::Resolved(parsed) => {
+                carina_core::validation::validate_export_handle_boundaries(&parsed.export_params)
+                    .err()
+            }
+        }
+    }
+
     fn collect_list_struct_attrs(
         &self,
         schemas: &carina_core::schema::SchemaRegistry,
@@ -176,7 +199,7 @@ pub fn run_lint(
     // blocked; retaining these findings and the schema-independent text scans
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
-    let parsed = if module_boundary_findings.is_empty() {
+    let mut parsed = if module_boundary_findings.is_empty() {
         let resolution = if let Some(loaded_provider_context) = loaded_provider_context {
             module_resolver::resolve_module_template_with_config(
                 parsed,
@@ -201,6 +224,11 @@ pub fn run_lint(
     } else {
         LintFile::Blocked(parsed)
     };
+
+    if let Some(loaded_provider_context) = loaded_provider_context {
+        parsed.resolve_type_exprs_best_effort(loaded_provider_context);
+    }
+    let export_handle_errors = parsed.export_handle_errors();
 
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = {
@@ -239,6 +267,13 @@ pub fn run_lint(
             message: finding.to_string(),
         })
         .collect();
+    if let Some(boundary_errors) = export_handle_errors {
+        warnings.extend(boundary_errors.into_iter().map(|error| LintWarning {
+            file: error.source_file().to_path_buf(),
+            line: error.source_span().start_line(),
+            message: error.to_string(),
+        }));
+    }
     if let Some(message) = provider_factory_error {
         warnings.push(LintWarning {
             file: path.to_path_buf(),

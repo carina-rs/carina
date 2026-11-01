@@ -7,6 +7,7 @@ mod desired_normalization;
 pub use wasm_factory::GuestCallBudget;
 pub use wasm_factory::{
     AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
-    PrecompiledComponentDeserializationError, ProviderInstantiationError, WASI_HTTP_HOST_VERSION,
-    WasmProviderFactory, WasmProviderLoadError,
+    PrecompiledComponentDeserializationError, ProviderInstantiationError,
+    SchemaOnlyWasmProviderFactory, WASI_HTTP_HOST_VERSION, WasmProviderFactory,
+    WasmProviderLoadError,
 };

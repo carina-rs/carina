@@ -10,7 +10,10 @@ pub use predicate::{AttrPath, AttrPathError, WaitPredicate};
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{DataSource, ResolvedResource, ResolvedResourceId};
+use crate::parser::UntilPredicateAst;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::resource::ResolvedResource;
+use crate::resource::{ResolvedDependencies, ResolvedResourceId};
 
 /// A managed resource that can be polled by an [`crate::effect::Effect::Wait`].
 ///
@@ -34,8 +37,13 @@ pub struct ManagedWaitTarget(ResolvedResourceId);
 impl ManagedWaitTarget {
     /// Construct a wait target selected by the differ's managed-resource
     /// resolver.
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn new(resource: &ResolvedResource) -> Self {
         Self(resource.resolved_id())
+    }
+
+    pub(crate) fn from_resolved_id(id: ResolvedResourceId) -> Self {
+        Self(id)
     }
 
     /// Construct a managed wait target in tests that assemble effects without
@@ -52,45 +60,16 @@ impl ManagedWaitTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WaitTargetLookup {
-    Managed(ManagedWaitTarget),
-    DataSource,
-    Missing,
-}
-
-/// Resolve a wait target with binding matches before identity matches and
-/// managed resources before data sources within each match class.
-pub(crate) fn resolve_wait_target(
-    target: &str,
-    managed: &[ResolvedResource],
-    data_sources: &[DataSource],
-) -> WaitTargetLookup {
-    if let Some(resource) = managed
-        .iter()
-        .find(|resource| resource.binding.as_ref().map(|binding| binding.as_str()) == Some(target))
-    {
-        return WaitTargetLookup::Managed(ManagedWaitTarget::new(resource));
-    }
-    if data_sources
-        .iter()
-        .any(|resource| resource.binding.as_ref().map(|binding| binding.as_str()) == Some(target))
-    {
-        return WaitTargetLookup::DataSource;
-    }
-    if let Some(resource) = managed
-        .iter()
-        .find(|resource| resource.identity_str() == target)
-    {
-        return WaitTargetLookup::Managed(ManagedWaitTarget::new(resource));
-    }
-    if data_sources
-        .iter()
-        .any(|resource| resource.id.identity_str() == Some(target))
-    {
-        return WaitTargetLookup::DataSource;
-    }
-    WaitTargetLookup::Missing
+/// A wait whose target and explicit ordering operands have crossed graph resolution.
+#[derive(Debug, Clone)]
+pub struct ResolvedWaitBinding {
+    pub id: ResolvedResourceId,
+    pub target_id: ManagedWaitTarget,
+    pub until_raw: String,
+    pub until_predicate: UntilPredicateAst<crate::resource::AbsoluteBindingAddress>,
+    pub timeout_secs: Option<u64>,
+    pub explicit_dependencies: ResolvedDependencies,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

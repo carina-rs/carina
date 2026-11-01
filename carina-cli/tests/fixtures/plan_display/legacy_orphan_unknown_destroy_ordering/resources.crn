@@ -1,0 +1,11 @@
+# The subnet was removed from configuration. Its v20 state snapshot retains
+# one known dependency on this VPC and one name from the removed module.
+awscc.ec2.Vpc {
+  cidr_block           = '10.0.0.0/16'
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = 'test-vpc'
+  }
+}

@@ -1,28 +1,29 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::provider::{Provider, ProviderResult};
-use crate::resource::{BindingAddress, ResourceId};
+use crate::resource::ResourceId;
+use crate::resource::{ResolvedDependencies, ResolvedResourceId};
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
 /// Resolve satisfier hints from the provider against the plan's known bindings,
 /// and return additional explicit dependencies for a wait on `target_id.attr_path`.
-pub fn satisfier_augmentation<B: BindingAddress>(
+pub fn satisfier_augmentation(
     provider: &dyn Provider,
     target_id: &ResourceId,
     attr_path: &AttrPath,
-    known_bindings: &HashSet<B>,
-) -> ProviderResult<HashSet<B>> {
-    let mut additional = HashSet::new();
+    known_bindings: &HashMap<crate::resource::AbsoluteBindingAddress, ResolvedResourceId>,
+) -> ProviderResult<ResolvedDependencies> {
+    let mut additional = ResolvedDependencies::default();
 
     for hint in provider.satisfier_hint(target_id, attr_path)? {
         match hint {
             BindingPattern::Exact(name) => {
-                if let Some(binding) = known_bindings
+                if let Some((_, id)) = known_bindings
                     .iter()
-                    .find(|binding| binding.as_str() == name)
+                    .find(|(binding, _)| binding.as_str() == name)
                 {
-                    additional.insert(binding.clone());
+                    additional.insert(id.clone());
                 }
             }
             BindingPattern::ForLoopChildren { base } => {
@@ -30,8 +31,8 @@ pub fn satisfier_augmentation<B: BindingAddress>(
                 additional.extend(
                     known_bindings
                         .iter()
-                        .filter(|binding| binding.as_str().starts_with(&prefix))
-                        .cloned(),
+                        .filter(|(name, _id)| name.as_str().starts_with(&prefix))
+                        .map(|(_name, id)| id.clone()),
                 );
             }
             BindingPattern::AttributeMatch {
@@ -150,14 +151,28 @@ mod tests {
         }
     }
 
-    fn augment(hints: Vec<BindingPattern>, known: &[&str]) -> HashSet<String> {
+    fn hint_id(name: &str) -> ResolvedResourceId {
+        ResolvedResourceId::with_identity(
+            "test.Hint",
+            crate::resource::ResourceIdentity::try_from(name.to_string())
+                .expect("test identity must be non-empty"),
+        )
+    }
+
+    fn augment(hints: Vec<BindingPattern>, known: &[&str]) -> ResolvedDependencies {
         let provider = HintProvider {
             hints,
             failure: None,
         };
         let known_bindings = known
             .iter()
-            .map(|name| crate::resource::RelativeBindingName::new(*name))
+            .map(|name| {
+                (
+                    crate::resource::RootScope::new()
+                        .resolve(crate::resource::RelativeBindingName::new(*name)),
+                    hint_id(name),
+                )
+            })
             .collect();
         satisfier_augmentation(
             &provider,
@@ -166,16 +181,13 @@ mod tests {
             &known_bindings,
         )
         .expect("test provider hints should succeed")
-        .into_iter()
-        .map(crate::resource::RelativeBindingName::into_string)
-        .collect()
     }
 
     #[test]
     fn exact_hint_included_when_known() {
         assert_eq!(
             augment(vec![BindingPattern::Exact("alb".to_string())], &["alb"]),
-            HashSet::from(["alb".to_string()])
+            [hint_id("alb")].into_iter().collect()
         );
     }
 
@@ -197,10 +209,12 @@ mod tests {
                     "unrelated_binding",
                 ],
             ),
-            HashSet::from([
-                "validation_records[0]".to_string(),
-                "validation_records[1]".to_string(),
-            ])
+            [
+                hint_id("validation_records[0]"),
+                hint_id("validation_records[1]"),
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -230,7 +244,7 @@ mod tests {
             &provider,
             &ResourceId::with_identity("acm.Certificate", "cert"),
             &AttrPath::single("status"),
-            &HashSet::<crate::resource::RelativeBindingName>::new(),
+            &Default::default(),
         )
         .expect_err("provider hint failures must abort augmentation");
 

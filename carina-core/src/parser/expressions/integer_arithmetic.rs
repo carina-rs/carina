@@ -1,6 +1,6 @@
 //! Binary integer-arithmetic expression parsing and constant folding.
 
-use crate::eval_value::{EvalValue, StructuralHandleMetadata};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandleMetadata};
 use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, evaluate_integer_values};
 use crate::parser::context::ExpressionMode;
 use crate::parser::expressions::primary::parse_postfix_eval_with_mode;
@@ -123,21 +123,23 @@ pub(crate) fn combine_integer_operands(
         .map_err(|error| arithmetic_error(op, span, error.to_string()))?;
     Ok(EvalValue::computed(
         value,
-        StructuralHandleMetadata::from_expression_operands([lhs_metadata, rhs_metadata]),
+        UnexpandedStructuralHandleMetadata::from_expression_operands([lhs_metadata, rhs_metadata]),
     ))
 }
 
 fn lower_integer_operand(
     value: EvalValue,
     span: IntegerOperatorSpan,
-) -> Result<(Value, Option<StructuralHandleMetadata>), ParseError> {
+) -> Result<(Value, Option<UnexpandedStructuralHandleMetadata>), ParseError> {
     match value {
-        EvalValue::ComputedWithStructuralHandles { value, metadata } => Ok((value, Some(metadata))),
+        EvalValue::ComputedWithUnexpandedStructuralHandles { value, metadata } => {
+            Ok((value, Some(metadata)))
+        }
         EvalValue::ProvisionalReference { binding } => {
             let value = Value::Deferred(DeferredValue::BindingRef { binding });
             Ok((
                 value.clone(),
-                Some(StructuralHandleMetadata::Handle {
+                Some(UnexpandedStructuralHandleMetadata::Handle {
                     access_base: Some(value),
                 }),
             ))

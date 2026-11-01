@@ -14,7 +14,7 @@ use super::ast::{
 use super::error::{ParseError, ParseWarning};
 use super::{ParserProviderConfig as ProviderConfig, ParserWaitBinding as WaitBinding};
 use super::{ProviderContext, Rule};
-use crate::eval_value::{EvalValue, StructuralHandle, StructuralHandleKind};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandle, UnexpandedStructuralHandleKind};
 use crate::resource::{
     DiagnosticSourceSpan, ModuleSource, ParserPlaceholder, RelativeBindingName,
     Resource as GenericResource, ResourceId, Value as GenericValue,
@@ -54,7 +54,7 @@ pub(super) enum ParseBinding {
         scope: BindingScopeId,
     },
     Structural {
-        handle: StructuralHandle,
+        handle: UnexpandedStructuralHandle,
         scope: BindingScopeId,
     },
 }
@@ -66,7 +66,7 @@ pub(super) enum ParseBindingRef<'a> {
         declaration: crate::schema::BindingKind,
         declared_type: Option<&'a Arc<TypeExpr>>,
     },
-    Structural(&'a StructuralHandle),
+    Structural(&'a UnexpandedStructuralHandle),
     Unbound,
 }
 
@@ -437,7 +437,11 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
         );
     }
 
-    pub(super) fn set_structural_binding(&mut self, name: String, handle: StructuralHandle) {
+    pub(super) fn set_structural_binding(
+        &mut self,
+        name: String,
+        handle: UnexpandedStructuralHandle,
+    ) {
         self.bindings.insert(
             name,
             ParseBinding::Structural {
@@ -447,7 +451,11 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
         );
     }
 
-    pub(super) fn set_structural_alias(&mut self, name: String, handle: StructuralHandle) {
+    pub(super) fn set_structural_alias(
+        &mut self,
+        name: String,
+        handle: UnexpandedStructuralHandle,
+    ) {
         self.bindings.insert(
             name.clone(),
             ParseBinding::Structural {
@@ -518,8 +526,8 @@ impl<'cfg, Source: Clone> ParseContext<'cfg, Source> {
         ) {
             self.set_structural_binding(
                 name.clone(),
-                StructuralHandle::new(
-                    StructuralHandleKind::Resource(super::ast::ResourceTypePath::new(
+                UnexpandedStructuralHandle::new(
+                    UnexpandedStructuralHandleKind::Resource(super::ast::ResourceTypePath::new(
                         resource.id.provider.clone(),
                         resource.id.resource_type.clone(),
                     )),
@@ -747,16 +755,18 @@ impl<'a> ExpressionMode<'a> {
             ),
             ParseBindingRef::Structural(handle) => {
                 let resource_type = match handle.kind() {
-                    StructuralHandleKind::Resource(resource_type) => Some(resource_type.clone()),
-                    StructuralHandleKind::For
-                    | StructuralHandleKind::If
-                    | StructuralHandleKind::Use
-                    | StructuralHandleKind::Module
-                    | StructuralHandleKind::Wait
-                    | StructuralHandleKind::UpstreamState
-                    | StructuralHandleKind::Provider
-                    | StructuralHandleKind::ModuleParameter
-                    | StructuralHandleKind::FunctionParameter => None,
+                    UnexpandedStructuralHandleKind::Resource(resource_type) => {
+                        Some(resource_type.clone())
+                    }
+                    UnexpandedStructuralHandleKind::For
+                    | UnexpandedStructuralHandleKind::If
+                    | UnexpandedStructuralHandleKind::Use
+                    | UnexpandedStructuralHandleKind::Module
+                    | UnexpandedStructuralHandleKind::Wait
+                    | UnexpandedStructuralHandleKind::UpstreamState
+                    | UnexpandedStructuralHandleKind::Provider
+                    | UnexpandedStructuralHandleKind::ModuleParameter
+                    | UnexpandedStructuralHandleKind::FunctionParameter => None,
                 };
                 (
                     BareBindingKind::Structural {

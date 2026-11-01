@@ -2,7 +2,7 @@
 
 use crate::wasm_factory::version_checked_bindings::{WitDesiredResource, wit_types as wit};
 use carina_core::desired::NormalizationBatch;
-use carina_core::resource::Resource;
+use carina_core::resource::{AbsoluteBindingAddress, NoPlaceholder, Resource};
 use carina_provider_protocol::normalization::{
     NormalizationError, NormalizationErrorKind as Kind, NormalizationResource,
     NormalizationValue as Wire,
@@ -76,8 +76,8 @@ fn from_wit(
     })
 }
 
-pub(crate) fn apply<S>(
-    resources: &mut [Resource<S>],
+pub(crate) fn apply<S, D>(
+    resources: &mut [Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>],
     batch: NormalizationBatch,
     returned: Vec<WitDesiredResource>,
 ) -> Result<(), NormalizationError> {
@@ -141,6 +141,70 @@ mod tests {
                     ])),
                 ),
         ]
+    }
+
+    #[test]
+    fn native_and_wasm_normalization_preserve_both_dependency_phases() {
+        fn normalize<D>(
+            resource: &mut Resource<
+                carina_core::resource::ModuleSource,
+                NoPlaceholder,
+                AbsoluteBindingAddress,
+                D,
+            >,
+        ) {
+            let original_id = resource.id.clone();
+            let original_binding = resource.binding.clone();
+            let original_secret = resource.attributes["secret"].clone();
+            let batch = NormalizationBatch::new(std::slice::from_ref(resource)).unwrap();
+            let mut returned = encode(&batch).unwrap();
+            returned[0]
+                .attributes
+                .iter_mut()
+                .find(|(name, _)| name == "known")
+                .unwrap()
+                .1 = wit::DesiredValue::StrVal("wasm".into());
+            apply(std::slice::from_mut(resource), batch, returned).unwrap();
+            assert_eq!(resource.attributes["known"], string("wasm"));
+            assert!(matches!(
+                DesiredInputs::from_core(resource)
+                    .unwrap()
+                    .attribute("secret"),
+                Some(DesiredValue::Deferred(_)),
+            ));
+
+            let mut native =
+                carina_plugin_sdk::NativeDesiredNormalization::from_core(resource).unwrap();
+            {
+                let mut view = native.view();
+                let Some(carina_plugin_sdk::DesiredValueMut::Known(value)) =
+                    view.attribute_mut("known")
+                else {
+                    panic!("known sibling stays editable beside the opaque secret");
+                };
+                *value = carina_plugin_sdk::DesiredScalar::String("native".into());
+            }
+            native.finish().unwrap();
+            assert_eq!(resource.attributes["known"], string("native"));
+            assert_eq!(resource.attributes["secret"], original_secret);
+            assert_eq!(resource.id, original_id);
+            assert_eq!(resource.binding, original_binding);
+        }
+
+        let binding = |name| carina_core::resource::absolute_binding_address_for_test(name);
+        let mut resource =
+            Resource::with_provider("test", "test.Widget", "example", Some("named".into()))
+                .with_absolute_binding(binding("example"))
+                .with_absolute_dependency_bindings([binding("upstream")].into_iter().collect())
+                .with_attribute("known", string("before"))
+                .with_attribute(
+                    "secret",
+                    Value::Deferred(DeferredValue::Secret(Box::new(string("private")))),
+                );
+        let dependencies = resource.dependencies.clone();
+        normalize(&mut resource);
+        assert_eq!(resource.dependencies, dependencies);
+        normalize(&mut resource.into_value_snapshot());
     }
 
     #[test]
