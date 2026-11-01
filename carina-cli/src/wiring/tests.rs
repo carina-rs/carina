@@ -13778,3 +13778,80 @@ exports { team_prefix: String = "x" }"#,
         assert!(!rendered.contains("Secret("), "{rendered}");
     }
 }
+
+#[tokio::test]
+async fn round2_binding_stability_reuses_normalized_inputs() {
+    struct AlreadyNormalized;
+    impl ProviderNormalizer for AlreadyNormalized {
+        fn normalize_desired<'a>(
+            &'a self,
+            _: &'a mut [carina_core::resource::ProviderResource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "desired values must not be normalized again",
+                ))
+            })
+        }
+        fn normalize_state<'a>(
+            &'a self,
+            _: &'a mut carina_core::provider::StateTransformMap,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "read values must not be normalized again",
+                ))
+            })
+        }
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _: &'a mut carina_core::provider::StateTransformMap,
+            _: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            carina_core::provider::ready_noop()
+        }
+    }
+    let parsed = parse("", &carina_core::parser::ProviderContext::default())
+        .unwrap()
+        .into_expanded()
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let resource = Resource::with_provider("test", "test.Widget", "example", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("normalized".into())),
+    );
+    let state =
+        State::existing(resource.id.clone(), resource.resolved_attributes()).with_identifier("id");
+    let current = HashMap::from([(resource.id.clone(), Current::from_state(state))]);
+    let mut provider = comparison_provider_for_resources(&schemas, std::slice::from_ref(&resource));
+    provider.add_normalizer("test", Box::new(AlreadyNormalized));
+    let saved = carina_core::provider::RawSavedAttrs::default().lift(&schemas);
+    let stability = derive_managed_binding_stability(
+        &parsed,
+        std::slice::from_ref(&resource),
+        &current,
+        &DataSourceValues::empty(),
+        &schemas,
+        &saved,
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &provider,
+        &mut carina_core::references::ReferencePreparation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stability[&resource.id],
+        carina_core::binding_index::ManagedBindingStability::NoPlannedEffect
+    );
+}

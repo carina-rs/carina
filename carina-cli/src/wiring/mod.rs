@@ -5511,41 +5511,13 @@ pub async fn derive_managed_binding_stability<E>(
     provider: &ProviderRouter,
     reference_preparation: &mut carina_core::references::ReferencePreparation,
 ) -> Result<HashMap<ResourceId, carina_core::binding_index::ManagedBindingStability>, AppError> {
-    // Binding stability is a planning comparison too. Normalize cloned
-    // observations and resolved desired values before preparing its witness.
-    let mut normalized_current = managed_current.clone();
-    // Optimistic binding snapshots may carry unknown output attributes. The
-    // persisted-state normalizer cannot encode these; withhold them just as
-    // desired normalization withholds deferred attributes, then restore them.
-    let mut deferred_attributes = HashMap::new();
-    for (id, current) in &mut normalized_current {
-        if let Some(attributes) = current.attributes_mut() {
-            let deferred = attributes
-                .extract_if(|_, value| carina_core::resource::value_contains_unknown(value))
-                .collect::<HashMap<_, _>>();
-            if !deferred.is_empty() {
-                deferred_attributes.insert(id.clone(), deferred);
-            }
-        }
-    }
-
-    normalize_prior_states(
-        &mut normalized_current,
-        &mut HashMap::new(),
-        &mut Orphans::new(),
-        provider,
-    )
-    .await?;
-    for (id, deferred) in deferred_attributes {
-        normalized_current
-            .get_mut(&id)
-            .and_then(Current::attributes_mut)
-            .expect("normalization preserves state-bearing resource routes")
-            .extend(deferred);
-    }
-
-    let plan_input_current =
-        carina_core::resource::into_plan_input_current_map(normalized_current, schemas, resources);
+    // These inputs already crossed the plan normalization seam. Re-running
+    // provider normalization here can change non-idempotent provider values.
+    let plan_input_current = carina_core::resource::into_plan_input_current_map(
+        managed_current.clone(),
+        schemas,
+        resources,
+    );
     let optimistic_bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
         managed: resources,
         compositions: &parsed.compositions,
@@ -5561,7 +5533,6 @@ pub async fn derive_managed_binding_stability<E>(
         &parsed.upstream_binding_names(),
     )
     .map_err(AppError::Validation)?;
-    apply_desired_normalization_slice(&mut resolved, &parsed.providers, provider, schemas).await?;
     // Identity derivation runs later in the plan pipeline. Pending resources
     // cannot have a refreshed row addressed to them yet, so they are
     // conservatively unavailable; resolved resources can be diffed normally.

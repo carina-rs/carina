@@ -730,7 +730,7 @@ pub fn generate_temporary_name(
 /// let states = HashMap::<ResourceId, Current>::new();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let orphans = Orphans::new();
-/// let references = futures::executor::block_on(carina_core::references::prepare_references(
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
 ///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
 ///     &carina_core::provider::ProviderRouter::new(),
 /// )).unwrap();
@@ -763,7 +763,7 @@ pub fn generate_temporary_name(
 /// let states: HashMap<ResourceId, State> = HashMap::new();
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
-/// let references = futures::executor::block_on(carina_core::references::prepare_references(
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
 ///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
 ///     &carina_core::provider::ProviderRouter::new(),
 /// )).unwrap();
@@ -797,7 +797,7 @@ pub fn generate_temporary_name(
 /// let registry = SchemaRegistry::default();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let raw_saved_attrs = RawSavedAttrs::default();
-/// let references = futures::executor::block_on(carina_core::references::prepare_references(
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
 ///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
 ///     &carina_core::provider::ProviderRouter::new(),
 /// )).unwrap();
@@ -876,13 +876,14 @@ pub fn create_plan_for_test(
         managed.iter().map(|resource| &resource.id),
     );
     let current = prior_states.materialize_current_states(managed, &registry);
-    let references = futures::executor::block_on(crate::references::prepare_references(
-        managed,
-        &current,
-        &registry,
-        saved_attrs,
-        &comparison_provider,
-    ))?;
+    let references =
+        futures::executor::block_on(crate::references::ReferencePreparation::default().prepare(
+            managed,
+            &current,
+            &registry,
+            saved_attrs,
+            &comparison_provider,
+        ))?;
     create_plan_with_provider(
         managed,
         data_sources,
@@ -1101,7 +1102,6 @@ fn create_plan_parts(
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
     references: &crate::references::ResolvedReferences,
 ) -> super::PlanComparisonResult<PlanBuild> {
-    references.validate_for(managed.authored(), current_states, registry, saved_attrs)?;
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let authored_managed = managed.authored();
@@ -1755,6 +1755,7 @@ fn known_binding_names(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cascade_dependent_updates(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
@@ -1893,6 +1894,7 @@ fn mark_pending_create_before_destroy(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,

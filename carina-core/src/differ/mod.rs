@@ -99,7 +99,6 @@ pub fn managed_binding_stability(
     provider: &ProviderRouter,
     references: &crate::references::ResolvedReferences,
 ) -> PlanComparisonResult<HashMap<ResourceId, ManagedBindingStability>> {
-    references.validate_for(managed, current_states, registry, saved_attrs)?;
     let mut result = HashMap::new();
     let comparison_saved = PlanInputSavedAttributes::new(saved_attrs, registry);
     for resource in managed {
@@ -904,10 +903,9 @@ use crate::effect::Effect;
 use crate::plan::Plan;
 #[cfg(test)]
 use crate::schema::CompiledAttributeType as AttributeType;
-pub(crate) use comparison::SavedPlanComparison;
 pub use comparison::{
     ComparisonContext, ComparisonSchema, ObservationComparison, ObservationEquality,
-    PlanningComparison, PlanningEquality, ReferenceEquality, SavedPlanReferenceComparisonError,
+    PlanningComparison, PlanningEquality, ReferenceEquality,
 };
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1408,7 +1406,7 @@ pub fn diff(
         current,
         saved_attrs,
         prev_explicit,
-        Some(schema.as_schema()),
+        schema,
         context,
         &comparison.context().observation(),
     )
@@ -1428,7 +1426,7 @@ pub fn diff_for_test(
     references: &crate::references::ResolvedReferences,
 ) -> PlanComparisonResult<Diff> {
     context_schema.with_references(references, &desired.id, |context| {
-        diff_with_schema(
+        diff_with_comparison_schema(
             desired,
             current,
             saved_attrs,
@@ -1442,6 +1440,27 @@ pub fn diff_for_test(
 
 #[allow(clippy::too_many_arguments)]
 fn diff_with_schema(
+    desired: &ResolvedResource,
+    current: &State,
+    saved_attrs: &LiftedSavedAttrs,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: &ValidatedResourceSchema,
+    context: &PlanningComparison<'_>,
+    observations: &ObservationComparison<'_>,
+) -> PlanComparisonResult<Diff> {
+    diff_with_comparison_schema(
+        desired,
+        current,
+        saved_attrs,
+        prev_explicit,
+        Some(schema.as_schema()),
+        context,
+        observations,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_with_comparison_schema(
     desired: &ResolvedResource,
     current: &State,
     saved_attrs: &LiftedSavedAttrs,

@@ -9808,7 +9808,8 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has a DSL transform that protocol v16 cannot represent"
+                                "closed enum `{identity}` has a DSL transform that protocol v{} cannot represent",
+                                carina_provider_protocol::PROTOCOL_VERSION
                             ),
                         );
                     }
@@ -9826,7 +9827,8 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "closed enum `{identity}` has base metadata that protocol v16 cannot represent"
+                                "closed enum `{identity}` has base metadata that protocol v{} cannot represent",
+                                carina_provider_protocol::PROTOCOL_VERSION
                             ),
                         );
                     }
@@ -9837,7 +9839,8 @@ fn validate_identified_scalar_kind_consistency(
                             issues,
                             &location,
                             format!(
-                                "open enum `{identity}` has DSL aliases that protocol v16 cannot represent"
+                                "open enum `{identity}` has DSL aliases that protocol v{} cannot represent",
+                                carina_provider_protocol::PROTOCOL_VERSION
                             ),
                         );
                     }
@@ -9845,7 +9848,10 @@ fn validate_identified_scalar_kind_consistency(
                         push_schema_issue(
                             issues,
                             &location,
-                            format!("open enum `{identity}` has no namespace for protocol v16"),
+                            format!(
+                                "open enum `{identity}` has no namespace for protocol v{}",
+                                carina_provider_protocol::PROTOCOL_VERSION
+                            ),
                         );
                     }
                 }

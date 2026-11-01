@@ -11,6 +11,7 @@ type TableResult = Result<wire::ReferenceOutcome, wire::ReferenceError>;
 struct TableProvider {
     table: HashMap<String, TableResult>,
     calls: Arc<Mutex<Vec<Vec<ReferenceRequest>>>>,
+    barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 impl Provider for TableProvider {
     fn name(&self) -> &str {
@@ -22,6 +23,9 @@ impl Provider for TableProvider {
     ) -> BoxFuture<'a, ProviderResult<Vec<Result<ReferenceOutcome, ReferenceError>>>> {
         self.calls.lock().unwrap().push(requests.to_vec());
         Box::pin(async move {
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
             Ok(requests
                 .iter()
                 .map(|request| {
@@ -156,6 +160,7 @@ impl Fixture {
             InitializedProvider::unavailable(Box::new(TableProvider {
                 table,
                 calls: calls.clone(),
+                barrier: None,
             })),
         );
         let mut registry = SchemaRegistry::new();
@@ -189,14 +194,15 @@ impl Fixture {
         }
     }
     async fn prepare(&self) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
-        prepare_references(
-            &self.desired,
-            &self.current,
-            &self.registry,
-            &self.saved,
-            &self.router,
-        )
-        .await
+        ReferencePreparation::default()
+            .prepare(
+                &self.desired,
+                &self.current,
+                &self.registry,
+                &self.saved,
+                &self.router,
+            )
+            .await
     }
     fn plan(
         &self,
@@ -415,7 +421,7 @@ async fn every_d6_table_cell_is_enforced_with_typed_sources() {
                             )
                     ));
                     assert_eq!(error.path, "key");
-                    assert_eq!(error.raw, raw);
+                    assert_eq!(error.raw.expose_plaintext(), raw);
                     assert_eq!(error.instance, ProviderInstanceKey::new("test", None));
                     let mut chain: Option<&(dyn std::error::Error + 'static)> = Some(&error);
                     let mut text = String::new();
@@ -448,7 +454,7 @@ async fn missing_needed_witness_entry_is_typed_error_in_plan_and_binding_stabili
         panic!("expected typed reference error")
     };
     assert!(matches!(source.source, ReferenceFailure::MissingWitness));
-    assert_eq!(source.path, "key");
+    assert_eq!(source.path, identity().to_string());
     let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
         panic!("present fixture")
     };
@@ -524,6 +530,7 @@ async fn resolution_cache_is_per_run_and_includes_type_and_provider_instance() {
         InitializedProvider::unavailable(Box::new(TableProvider {
             table: HashMap::from([("alias/live".into(), resolved("key/b"))]),
             calls: fixture.calls.clone(),
+            barrier: None,
         })),
     );
     let mut other = fixture.desired[0].as_resource().clone();
@@ -552,7 +559,12 @@ async fn resolution_cache_is_per_run_and_includes_type_and_provider_instance() {
         .unwrap();
     assert!(
         !witness
-            .equal(&other[0].id, &identity(), "alias/live", "key/a")
+            .equal(
+                &other[0].id,
+                &identity(),
+                &"alias/live".into(),
+                &"key/a".into()
+            )
             .unwrap()
     );
     assert_eq!(
@@ -812,7 +824,7 @@ async fn repeated_leaves_are_deduplicated_per_type_in_a_positional_batch() {
 }
 
 #[tokio::test]
-async fn unordered_reference_lists_match_identical_raw_items_without_lookup() {
+async fn unordered_reference_list_elements_share_one_resolution_path() {
     use crate::schema::AttributeType;
     let list = |items: &[&str]| {
         Value::Concrete(ConcreteValue::List(
@@ -823,14 +835,8 @@ async fn unordered_reference_lists_match_identical_raw_items_without_lookup() {
         list(&["alias/a", "alias/b"]),
         list(&["alias/b", "alias/a"]),
         HashMap::from([
-            (
-                "alias/a".into(),
-                Err(wire::ReferenceError::AccessDenied(error())),
-            ),
-            (
-                "alias/b".into(),
-                Err(wire::ReferenceError::AccessDenied(error())),
-            ),
+            ("alias/a".into(), resolved("key/same")),
+            ("alias/b".into(), resolved("key/same")),
         ]),
         false,
     );
@@ -866,5 +872,361 @@ async fn unordered_reference_lists_match_identical_raw_items_without_lookup() {
     );
     let witness = fixture.prepare().await.unwrap();
     assert!(fixture.plan(&witness).unwrap().effects().is_empty());
-    assert!(fixture.calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.calls.lock().unwrap()[0].len(), 2);
+}
+
+fn reset_values(fixture: &mut Fixture, desired: Value, current: Value, saved: Value) {
+    let mut resource = fixture.desired[0].as_resource().clone();
+    resource.attributes.insert("key".into(), desired);
+    fixture.desired =
+        ResolvedResource::collect_resolved_with_schemas([resource.clone()], &fixture.registry)
+            .unwrap();
+    let mut state = State::existing(
+        resource.id.clone(),
+        HashMap::from([("key".into(), current)]),
+    );
+    state.identifier = Some("resource-123".into());
+    fixture.current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(resource.id.clone(), Current::from_state(state))]),
+        &fixture.registry,
+        &[resource.clone()],
+    );
+    fixture.saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        resource.id,
+        HashMap::from([("key".into(), saved)]),
+    )]))
+    .lift(&fixture.registry);
+}
+
+#[tokio::test]
+async fn round2_s3_lists_collect_desired_read_and_saved_references() {
+    use crate::schema::{AttributeType, StructField};
+    for ordered in [true, false] {
+        let mut fixture = Fixture::new(
+            string("alias/b"),
+            string("alias/c"),
+            HashMap::from([
+                ("alias/a".into(), resolved("key/a")),
+                ("alias/b".into(), resolved("key/a")),
+                ("alias/c".into(), resolved("key/a")),
+            ]),
+            false,
+        );
+        let element = AttributeType::struct_(
+            "EncryptionRule",
+            vec![
+                StructField::optional(
+                    "kms_master_key_id",
+                    AttributeType::reference(identity(), None, None),
+                )
+                .build(),
+            ],
+        );
+        let list_type = if ordered {
+            AttributeType::list(element)
+        } else {
+            AttributeType::unordered_list(element)
+        };
+        fixture.registry.insert(
+            "test",
+            crate::schema::ResourceSchema::new("keys.Resource")
+                .attribute(AttributeSchema::optional("key", list_type).build())
+                .validate()
+                .unwrap(),
+        );
+        let list = |raw: &str| {
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "kms_master_key_id".into(),
+                    string(raw),
+                )])),
+            )]))
+        };
+        reset_values(
+            &mut fixture,
+            list("alias/b"),
+            list("alias/c"),
+            list("alias/a"),
+        );
+        let witness = fixture.prepare().await.unwrap();
+        assert!(fixture.plan(&witness).unwrap().effects().is_empty());
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]
+                .iter()
+                .map(|r| r.value.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["alias/a", "alias/b", "alias/c"])
+        );
+    }
+}
+
+#[tokio::test]
+async fn round2_ecr_saved_only_reference_is_collected_against_read_arn() {
+    use crate::schema::{AttributeType, StructField};
+    for not_found in [false, true] {
+        let mut fixture = Fixture::new(
+            string("unused"),
+            string("unused"),
+            HashMap::from([(
+                "alias/a".into(),
+                if not_found {
+                    Ok(wire::ReferenceOutcome::NotFound(error()))
+                } else {
+                    resolved("key/a")
+                },
+            )]),
+            false,
+        );
+        fixture.registry.insert(
+            "test",
+            crate::schema::ResourceSchema::new("keys.Resource")
+                .attribute(
+                    AttributeSchema::optional(
+                        "key",
+                        AttributeType::struct_(
+                            "EncryptionConfiguration",
+                            vec![
+                                StructField::optional("encryption_type", AttributeType::string())
+                                    .build(),
+                                StructField::optional(
+                                    "kms_key",
+                                    AttributeType::reference(identity(), None, None),
+                                )
+                                .build(),
+                            ],
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let config = |raw: Option<&str>| {
+            let mut fields = indexmap::IndexMap::from([("encryption_type".into(), string("KMS"))]);
+            if let Some(raw) = raw {
+                fields.insert("kms_key".into(), string(raw));
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        reset_values(
+            &mut fixture,
+            config(None),
+            config(Some("key/a")),
+            config(Some("alias/a")),
+        );
+        let witness = fixture.prepare().await.unwrap();
+        fixture.plan(&witness).unwrap();
+        assert_eq!(fixture.calls.lock().unwrap()[0].len(), 2);
+        assert_eq!(
+            witness.dangling_paths(&fixture.desired[0].id).count(),
+            usize::from(not_found)
+        );
+    }
+}
+
+#[tokio::test]
+async fn round2_secret_reference_is_rejected_before_any_guest_call() {
+    const SECRET: &str = "alias/private-secret";
+    for desired_side in [true, false] {
+        for equal in [true, false] {
+            for wrapped in [true, false] {
+                let secret = if wrapped {
+                    Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET))))
+                } else {
+                    Value::Concrete(ConcreteValue::String(
+                        crate::resource::ValueString::diagnostic_sensitive(SECRET),
+                    ))
+                };
+                let ordinary = string(if equal { SECRET } else { "key/a" });
+                let (desired, current) = if desired_side {
+                    (secret, ordinary)
+                } else {
+                    (ordinary, secret)
+                };
+                let fixture = Fixture::new(desired, current, HashMap::new(), false);
+                let error = fixture
+                    .prepare()
+                    .await
+                    .expect_err("secret references cannot cross the guest boundary");
+                assert!(matches!(
+                    error.source,
+                    ReferenceFailure::Resolution(ReferenceError::InvalidReference(_))
+                ));
+                assert!(fixture.calls.lock().unwrap().is_empty());
+                assert!(!error.to_string().contains(SECRET));
+                assert!(!format!("{error:?}").contains(SECRET));
+            }
+        }
+    }
+}
+
+struct ReferenceValidationFactory {
+    calls: Arc<Mutex<usize>>,
+}
+impl ProviderFactory for ReferenceValidationFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+    fn display_name(&self) -> &str {
+        "Reference validation fixture"
+    }
+    fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
+        Default::default()
+    }
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        vec![
+            crate::schema::ResourceSchema::new("keys.Resource")
+                .attribute(
+                    AttributeSchema::optional(
+                        "key",
+                        crate::schema::AttributeType::reference(
+                            identity(),
+                            Some("^alias/[a-z]+$".into()),
+                            Some((Some(7), Some(20))),
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        ]
+    }
+    fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+        crate::schema::ValidatedProviderSchemaWitness::new(
+            self.schemas(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+        )
+        .unwrap()
+    }
+    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+        Ok(())
+    }
+    fn extract_region(&self, _: &indexmap::IndexMap<String, Value>) -> String {
+        "test".into()
+    }
+    fn create_provider(
+        &self,
+        _: Option<&str>,
+        _: &crate::executor::ProviderReadyConfig,
+        _: InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+        unimplemented!()
+    }
+    fn validate_custom_type(
+        &self,
+        _: &TypeIdentity,
+        _: &CanonicalCustomTypeValue,
+    ) -> ProviderResult<()> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
+    use crate::parser::{
+        CustomTypeResolver, CustomTypeValidationTarget, IdentifiedCustomTypeDeclaration,
+        OwnedTypeIdentity,
+    };
+    let calls = Arc::new(Mutex::new(0));
+    let factory = ReferenceValidationFactory {
+        calls: calls.clone(),
+    };
+    let schemas = factory.schemas();
+    let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(vec![Box::new(factory)]);
+    let custom_types = provider_custom_types_from_factories(factories);
+    let owned = OwnedTypeIdentity::provider("test", identity());
+    custom_types
+        .validate(
+            CustomTypeValidationTarget::Annotation(&owned),
+            &string("alias/valid"),
+        )
+        .unwrap();
+    assert_eq!(
+        *calls.lock().unwrap(),
+        0,
+        "reference annotations only run local string constraints"
+    );
+    assert!(
+        custom_types
+            .validate(
+                CustomTypeValidationTarget::Annotation(&owned),
+                &string("bad")
+            )
+            .is_err()
+    );
+    assert_eq!(*calls.lock().unwrap(), 0);
+    let attribute = schemas[0].effective_attribute("key").unwrap();
+    assert!(
+        IdentifiedCustomTypeDeclaration::new(attribute.field_type()).is_none(),
+        "resolver identity must not request guest custom-type validation"
+    );
+    assert!(
+        attribute
+            .value_type()
+            .validate(&string("alias/valid"))
+            .is_ok()
+    );
+    assert!(attribute.value_type().validate(&string("bad")).is_err());
+}
+
+#[tokio::test]
+async fn round2_provider_instance_batches_run_concurrently() {
+    let mut fixture = Fixture::new(string("alias/live"), string("key/a"), HashMap::new(), false);
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    for instance in [None, Some("other".to_string())] {
+        fixture.router.add_provider_instance(
+            ProviderInstanceKey::new("test", instance.clone()),
+            InitializedProvider::unavailable(Box::new(TableProvider {
+                table: HashMap::from([("alias/live".into(), resolved("key/a"))]),
+                calls: fixture.calls.clone(),
+                barrier: Some(barrier.clone()),
+            })),
+        );
+    }
+    let mut other = fixture.desired[0].as_resource().clone();
+    other.id.provider_instance = Some("other".into());
+    let mut state = State::existing(
+        other.id.clone(),
+        HashMap::from([("key".into(), string("key/a"))]),
+    );
+    state.identifier = Some("other-id".into());
+    fixture
+        .current
+        .extend(crate::resource::into_plan_input_current_map(
+            HashMap::from([(other.id.clone(), Current::from_state(state))]),
+            &fixture.registry,
+            &[other.clone()],
+        ));
+    fixture.desired.extend(
+        ResolvedResource::collect_resolved_with_schemas([other], &fixture.registry).unwrap(),
+    );
+    let witness = tokio::time::timeout(std::time::Duration::from_secs(1), fixture.prepare())
+        .await
+        .expect("both instance batches must reach the barrier concurrently")
+        .unwrap();
+    assert!(fixture.plan(&witness).unwrap().effects().is_empty());
+    assert_eq!(fixture.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn reference_plan_errors_preserve_secret_redaction_without_preparation() {
+    let value = crate::resource::ValueString::diagnostic_sensitive("alias/private-secret");
+    let error = prepare_empty_for_tests()
+        .equal(
+            &ResourceId::with_identity("keys.Resource", "example"),
+            &identity(),
+            &value,
+            &"key/a".into(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.source,
+        ReferenceFailure::Resolution(ReferenceError::InvalidReference(_))
+    ));
+    assert!(!error.to_string().contains("alias/private-secret"));
+    assert!(!format!("{error:?}").contains("alias/private-secret"));
 }

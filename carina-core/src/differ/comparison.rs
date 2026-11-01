@@ -9,8 +9,8 @@ use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::resource::{
     ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
-    InterpolationPart, ResolvedIgnoreChanges, SavedValueViews, Value, merge_with_saved,
-    value_at_leaf,
+    InterpolationPart, ResolvedIgnoreChanges, SavedValueViews, Value, ValueString,
+    merge_with_saved, value_at_leaf,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, DslTransform,
@@ -37,7 +37,7 @@ pub struct ComparisonContext<'a, R: ReferenceEquality> {
 
 pub type PlanningComparison<'a> = ComparisonContext<'a, PlanningEquality<'a>>;
 pub type ObservationComparison<'a> = ComparisonContext<'a, ObservationEquality>;
-pub(crate) type SavedPlanComparison<'a> = ComparisonContext<'a, SavedPlanEquality<'a>>;
+pub(crate) type SavedPlanComparison<'a> = ComparisonContext<'a, DisplayEquality>;
 
 mod sealed {
     pub trait Sealed {}
@@ -46,7 +46,7 @@ mod sealed {
 /// A closed set of policies for shared structural comparison helpers.
 pub trait ReferenceEquality: sealed::Sealed + std::fmt::Debug + Copy {
     #[doc(hidden)]
-    fn equal(&self, identity: &TypeIdentity, a: &str, b: &str) -> bool;
+    fn equal(&self, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,25 +56,17 @@ pub struct PlanningEquality<'a>(&'a ReferenceComparisonSession<'a>);
 #[derive(Debug, Clone, Copy)]
 pub struct ObservationEquality;
 
+/// Byte equality for rendering recorded effects. This policy cannot enter a
+/// planning API and never resolves references or changes recorded effects.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SavedPlanEquality<'a>(
-    &'a std::cell::RefCell<Option<SavedPlanReferenceComparisonError>>,
-);
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "saved-plan rendering attempted reference equality for `{identity}`; use the effect's recorded changed attributes"
-)]
-pub struct SavedPlanReferenceComparisonError {
-    pub identity: TypeIdentity,
-}
+pub(crate) struct DisplayEquality;
 
 impl sealed::Sealed for PlanningEquality<'_> {}
 impl sealed::Sealed for ObservationEquality {}
-impl sealed::Sealed for SavedPlanEquality<'_> {}
+impl sealed::Sealed for DisplayEquality {}
 
 impl ReferenceEquality for PlanningEquality<'_> {
-    fn equal(&self, identity: &TypeIdentity, a: &str, b: &str) -> bool {
+    fn equal(&self, identity: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
         match self.0.references.equal(self.0.resource, identity, a, b) {
             Ok(equal) => equal,
             Err(error) => {
@@ -86,19 +78,14 @@ impl ReferenceEquality for PlanningEquality<'_> {
 }
 
 impl ReferenceEquality for ObservationEquality {
-    fn equal(&self, _: &TypeIdentity, a: &str, b: &str) -> bool {
+    fn equal(&self, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
         a == b
     }
 }
 
-impl ReferenceEquality for SavedPlanEquality<'_> {
-    fn equal(&self, identity: &TypeIdentity, _: &str, _: &str) -> bool {
-        self.0
-            .borrow_mut()
-            .get_or_insert_with(|| SavedPlanReferenceComparisonError {
-                identity: identity.clone(),
-            });
-        false
+impl ReferenceEquality for DisplayEquality {
+    fn equal(&self, _: &TypeIdentity, a: &ValueString, b: &ValueString) -> bool {
+        a == b
     }
 }
 
@@ -167,17 +154,12 @@ impl<'a> ComparisonSchema<'a> {
 
     pub(crate) fn with_recorded_effects<T>(
         &self,
-        compare: impl for<'session> FnOnce(SavedPlanComparison<'session>) -> T,
-    ) -> Result<T, SavedPlanReferenceComparisonError> {
-        let error = std::cell::RefCell::new(None);
-        let result = compare(ComparisonContext {
+        compare: impl FnOnce(SavedPlanComparison<'_>) -> T,
+    ) -> T {
+        compare(ComparisonContext {
             schema: *self,
-            references: SavedPlanEquality(&error),
-        });
-        match error.into_inner() {
-            Some(error) => Err(error),
-            None => Ok(result),
-        }
+            references: DisplayEquality,
+        })
     }
 }
 
@@ -185,12 +167,6 @@ impl<'a> ObservationComparison<'a> {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(scope: &'a ReferenceScope, reference_forms: &'a ReferenceForms) -> Self {
         ComparisonSchema::for_test(scope, reference_forms).observation()
-    }
-}
-
-impl PlanningComparison<'_> {
-    pub(crate) fn resolved_references(&self) -> &crate::references::ResolvedReferences {
-        self.references.0.references
     }
 }
 
@@ -373,11 +349,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                     pattern: _,
                     length: _,
                 },
-            ) => {
-                let a = a.expose_plaintext();
-                let b = b.expose_plaintext();
-                context.references.equal(identity, a, b)
-            }
+            ) => context.references.equal(identity, a, b),
 
             // Lists: ordered or multiset comparison with inner type awareness
             (
@@ -1510,22 +1482,30 @@ mod tests {
     }
 
     #[test]
-    fn saved_plan_context_rejects_reference_equality_even_for_identical_bytes() {
-        let identity = TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference");
-        let attr_type = AttributeType::reference(identity.clone(), None, None);
+    fn saved_plan_display_equality_compares_reference_bytes_without_a_witness() {
+        let attr_type = AttributeType::reference(
+            TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+            None,
+            None,
+        );
         let value = Value::Concrete(ConcreteValue::String("alias/live".into()));
-        let error = crate::differ::exact_comparison_schema_for_tests()
-            .with_recorded_effects(|comparison| {
-                super::type_aware_equal(
-                    &value,
-                    &value,
-                    Some(&attr_type),
-                    empty_defs_for_schema_walks(),
-                    &comparison,
-                )
-            })
-            .unwrap_err();
-        assert_eq!(error.identity, identity);
+        let other = Value::Concrete(ConcreteValue::String("key/a".into()));
+        crate::differ::exact_comparison_schema_for_tests().with_recorded_effects(|comparison| {
+            assert!(super::type_aware_equal(
+                &value,
+                &value,
+                Some(&attr_type),
+                empty_defs_for_schema_walks(),
+                &comparison
+            ));
+            assert!(!super::type_aware_equal(
+                &value,
+                &other,
+                Some(&attr_type),
+                empty_defs_for_schema_walks(),
+                &comparison
+            ));
+        });
     }
 
     #[test]

@@ -1864,9 +1864,15 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v16");
+            .expect_err("a validated schema must always be projectable to the current protocol");
 
-        assert!(error.to_string().contains("protocol v16"), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "protocol v{}",
+                carina_provider_protocol::PROTOCOL_VERSION
+            )),
+            "{error}"
+        );
     }
 
     #[test]

@@ -6345,11 +6345,7 @@ impl CustomTypeCanonicalizationError {
 /// Return the identity carried by an identified scalar or enum declaration.
 pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option<&TypeIdentity> {
     match attribute_type.raw_shape() {
-        RawShape::Reference {
-            identity,
-            pattern: _pattern,
-            length: _length,
-        } => Some(identity),
+        RawShape::Reference { .. } => None,
         RawShape::String { identity, .. }
         | RawShape::Int { identity, .. }
         | RawShape::Float { identity, .. } => identity,
@@ -6442,15 +6438,6 @@ pub fn canonicalize_custom_type_value(
         }
     })?;
     match (declared_type.raw_shape(), value) {
-        (
-            RawShape::Reference {
-                identity: _identity,
-                pattern: _pattern,
-                length: _length,
-            },
-            Value::Concrete(ConcreteValue::String(value)),
-        ) => Ok(Some(CanonicalCustomTypeValue::from_literal_string(value))),
-
         (
             RawShape::String {
                 identity: _,
@@ -7035,6 +7022,10 @@ fn validate_declared_custom_type_locally(
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, crate::schema::TypeError> {
     declared_type.validate_identified_scalar_value(value)?;
+    // Reference identities choose the plan resolver, never guest validation.
+    if matches!(declared_type.raw_shape(), RawShape::Reference { .. }) {
+        return Ok(None);
+    }
     canonicalize_custom_type_value(declared_type, value)
         .map_err(CustomTypeCanonicalizationError::into_type_error)
 }

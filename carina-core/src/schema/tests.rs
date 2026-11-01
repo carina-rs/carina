@@ -2130,7 +2130,13 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v16() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v16"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "protocol v{}",
+            carina_provider_protocol::PROTOCOL_VERSION
+        )),
+        "{error}"
+    );
     assert!(error.contains("transform"), "{error}");
 }
 
@@ -2163,7 +2169,13 @@ fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v16"), "{rendered}");
+    assert!(
+        rendered.contains(&format!(
+            "protocol v{}",
+            carina_provider_protocol::PROTOCOL_VERSION
+        )),
+        "{rendered}"
+    );
 }
 
 #[test]

@@ -189,16 +189,18 @@ resolve-references: func(requests: list<reference-request>)
 ```
 
 Results are positional; the host retains resource/path fan-out and never
-sends unknown/deferred leaves. Reject length mismatches and `resolved`
-values that are not valid key ARNs (as `invalid-reference`). The outer
+sends unknown/deferred leaves. Core rejects length mismatches and empty
+`resolved` values (as `invalid-reference`). The shared guest resolver
+validates the canonical key ARN shape through its `KmsKeyArn` output type;
+core remains provider-agnostic. The outer
 error covers whole-call failure and aborts planning. The variants map
 one-to-one onto D6's Rust enums; the guest classifies AWS error codes, so
 the host never parses error strings. The SDK default fails every request
 with `invalid-reference` naming the unsupported type identity.
 
 Use main's protocol version plus one at merge, advancing
-`MIN_SUPPORTED_PROTOCOL_VERSION` to match, with no shim. Main is 15 now;
-#4162 plans 16. Do not reserve a version.
+`MIN_SUPPORTED_PROTOCOL_VERSION` to match, with no shim. Do not reserve a
+version.
 
 ## Migration
 
@@ -229,7 +231,7 @@ requirement together.
   planning with the source chain; current `NotFound` becomes a diff.
   Instance region/account scope for bare forms; ARN forms keep their own
   region/account and are never rewritten to the instance's.
-- **WASM/host:** positional batches, length mismatch, non-ARN success,
+- **WASM/host:** positional batches, length mismatch, empty success,
   unsupported defaults, error/timeout transport and cache isolation by
   instance/type/value. Unknowns and schema-only loading make no KMS calls;
   schema-only loading makes no credential requests.
