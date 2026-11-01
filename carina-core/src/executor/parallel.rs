@@ -439,7 +439,7 @@ pub fn classify_stalled_effects<S>(
         .collect::<Vec<_>>();
     let mut indices = remaining.iter().copied().collect::<Vec<_>>();
     indices.sort_unstable();
-    indices
+    let mut failures = indices
         .into_iter()
         .map(|idx| {
             let Some(cycle) = reachable_cycle(idx, deps_of, &cycles, completed) else {
@@ -473,7 +473,16 @@ pub fn classify_stalled_effects<S>(
             };
             (idx, kind)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // A blocked effect may precede the SCC owner in plan order. Render every
+    // cycle once before emitting references to the cycle "above".
+    failures.sort_by_key(|(idx, kind)| {
+        (
+            !matches!(kind, EffectFailureKind::DependencyCycle { .. }),
+            *idx,
+        )
+    });
+    failures
 }
 
 pub(super) async fn execute_effects_sequential<

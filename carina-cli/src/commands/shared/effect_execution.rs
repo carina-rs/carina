@@ -51,9 +51,9 @@ fn record_import_failure<S: Clone>(
     observer: &dyn ExecutionObserver<S>,
     effect: &Effect<S>,
     kind: EffectFailureKind,
+    progress: ProgressInfo,
 ) {
     iteration.mutate(|result| {
-        let completed = result.success_count + result.failure_count() + 1;
         result.failure_sink().record(
             observer,
             FailureReport::Effect {
@@ -62,10 +62,7 @@ fn record_import_failure<S: Clone>(
                 context: FailureEventContext {
                     recovery: None,
                     duration: std::time::Duration::ZERO,
-                    progress: ProgressInfo {
-                        completed,
-                        total: completed,
-                    },
+                    progress,
                 },
             },
         );
@@ -86,7 +83,22 @@ pub(crate) async fn execute_import_effects<S: Clone>(
     observer: &dyn ExecutionObserver<S>,
 ) {
     let cleanup_loop = shutdown.cleanup_aware_loop();
-    for effect in plan.effects() {
+    let completed_before_imports = result.success_count
+        + result.failure_count()
+        + result.partial_count
+        + result.skip_count
+        + result.interrupted_count;
+    let imports = || {
+        plan.effects()
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Import { .. }))
+    };
+    let total = completed_before_imports + imports().count();
+    for (position, effect) in imports().enumerate() {
+        let progress = ProgressInfo {
+            completed: completed_before_imports + position + 1,
+            total,
+        };
         if let Effect::Import { id, identifier } = effect {
             let cleanup_wait = match cleanup_loop.step() {
                 LoopStep::Continue(wait) => wait,
@@ -117,6 +129,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                             format!("Import failed for {id}"),
                             e,
                         ),
+                        progress,
                     );
                     continue;
                 }
@@ -134,6 +147,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                             ),
                             error,
                         ),
+                        progress,
                     );
                     continue;
                 }
@@ -174,6 +188,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                             EffectFailureKind::message(format!(
                                 "Import failed: resource {id} with id {identifier_display} not found"
                             )),
+                            progress,
                         );
                     }
                 }
@@ -186,6 +201,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                             format!("Import failed for {id}"),
                             e,
                         ),
+                        progress,
                     );
                 }
             }
@@ -465,10 +481,48 @@ mod tests {
         );
     }
 
-    /// Companion check: a concrete-string identifier still flows
-    /// through to the provider unchanged. Guards against an overly-
-    /// aggressive future tweak to `resolve_import_identifier` that
-    /// would block the happy path.
+    #[tokio::test]
+    async fn import_failures_report_real_plan_position_and_total() {
+        struct ProgressRecorder(Mutex<Vec<(usize, usize)>>);
+        impl ExecutionObserver for ProgressRecorder {
+            fn on_event(&self, event: &carina_core::executor::ExecutionEvent<'_>) {
+                if let carina_core::executor::ExecutionEvent::EffectFailed { progress, .. } = event
+                {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((progress.completed, progress.total));
+                }
+            }
+        }
+        let mut plan = Plan::new();
+        for name in ["first", "second", "third"] {
+            plan.add(Effect::Import {
+                id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "test.resource",
+                    name,
+                )),
+                identifier: Value::Concrete(ConcreteValue::String(name.into())),
+            });
+        }
+        let observer = ProgressRecorder(Mutex::new(Vec::new()));
+        let mut result = empty_result();
+        // These effects completed in the executor before the import phase.
+        result.success_count = 2;
+        execute_import_effects(
+            &plan,
+            &ReadRecorder::new(),
+            &mut result,
+            &ShutdownToken::running(),
+            &ExecutionCheckpointSink::noop(),
+            &observer,
+        )
+        .await;
+        assert_eq!(*observer.0.lock().unwrap(), [(3, 5), (4, 5), (5, 5)]);
+        assert_eq!(result.failure_count(), 3);
+    }
+
+    /// A concrete-string identifier still flows through to the provider unchanged.
     #[tokio::test]
     async fn execute_import_effects_passes_concrete_identifier_through() {
         let id = ResourceId::with_identity("aws.s3.Bucket", "b");

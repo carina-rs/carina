@@ -11,7 +11,8 @@ use carina_state::BackendError;
 
 use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 
-/// Final execution summary with the actual failed endpoints and typed causes.
+/// Final endpoint/kind summary retaining typed causes for programmatic use.
+/// Full cause chains have already been streamed through the failure sink.
 #[derive(Debug, Clone)]
 pub struct ExecutionFailureReport {
     summary: String,
@@ -39,13 +40,7 @@ impl std::fmt::Display for ExecutionFailureReport {
                 .endpoint()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "module constraint".into());
-            let reason = failure
-                .to_string()
-                .lines()
-                .map(str::trim)
-                .collect::<Vec<_>>()
-                .join(" ");
-            write!(f, "\n  {endpoint}: {reason}")?;
+            write!(f, "\n  {endpoint}: {}", failure.kind().label())?;
         }
         Ok(())
     }

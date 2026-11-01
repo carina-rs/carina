@@ -10932,11 +10932,13 @@ fn failed_apply_final_error_names_endpoint_and_typed_cause() {
     let error = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
     let rendered = error.to_string();
     assert!(
-        rendered.contains("create test.resource.failed") && rendered.contains("root detail"),
+        rendered.contains("create test.resource.failed: execution error")
+            && !rendered.contains("root detail"),
         "final error lost retained failures: {rendered}"
     );
     let AppError::ExecutionFailed(report) = error else {
         panic!("failure summaries must be typed");
     };
     assert_eq!(report.failures().len(), 1);
+    assert!(report.failures()[0].to_string().contains("root detail"));
 }

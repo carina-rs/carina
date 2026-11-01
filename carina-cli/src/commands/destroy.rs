@@ -26,7 +26,7 @@ use carina_core::executor::{
 };
 use carina_core::parser::WaitBinding;
 use carina_core::plan::{Plan, PlanError};
-use carina_core::provider::Provider;
+use carina_core::provider::{Provider, ProviderError};
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
@@ -216,6 +216,29 @@ struct DestroyExecuted {
     unknown_count: usize,
     cancelled: bool,
     cancel: ShutdownToken,
+}
+
+/// Every deferred retry owns the provider failure that made it necessary.
+/// The number of failed attempts cannot outlive its reportable cause.
+struct DeleteRetryFailure {
+    attempts: usize,
+    last_error: ProviderError,
+}
+
+impl DeleteRetryFailure {
+    fn exhausted(self, no_progress: bool) -> EffectFailureKind {
+        let context = format!(
+            "retries exhausted after {} attempt{}{}",
+            self.attempts,
+            if self.attempts == 1 { "" } else { "s" },
+            if no_progress {
+                " (no progress possible)"
+            } else {
+                ""
+            },
+        );
+        EffectFailureKind::provider_with_context(context, self.last_error)
+    }
 }
 
 fn record_destroy_failure<S>(
@@ -923,9 +946,9 @@ async fn run_destroy_locked_owned(
     let mut dispatched: HashSet<usize> = HashSet::new();
     let all_indices = display_order.clone();
 
-    // Track retry counts for dependency-violation retries
+    // Retain the last provider cause as well as the failed-attempt count.
     let max_retries: usize = 3;
-    let mut retry_counts: HashMap<usize, usize> = HashMap::new();
+    let mut retry_failures: HashMap<usize, DeleteRetryFailure> = HashMap::new();
     // Indices waiting for at least one other effect to complete before retrying.
     // They are moved back to the ready pool when `in_flight.next()` returns.
     let mut retry_pending: HashSet<usize> = HashSet::new();
@@ -1081,19 +1104,17 @@ async fn run_destroy_locked_owned(
             if remaining.is_empty() {
                 break;
             }
-            // Check if all remaining are retry-pending items (deadlock: no
-            // progress possible because every pending item needs something
-            // else to complete first, but nothing else is running).
-            let all_retried = remaining.iter().all(|idx| retry_counts.contains_key(idx));
-            if all_retried {
-                for &idx in &remaining {
+            // No other deletion can unblock these retries. Report their last
+            // provider causes first; the next iteration skips their dependent
+            // deletes instead of misdiagnosing attempted work as undispatched.
+            let mut exhausted_retries = false;
+            for &idx in &remaining {
+                if let Some(retry) = retry_failures.remove(&idx) {
                     let (_, effect) = &resource_info[idx];
                     record_destroy_failure(
                         &mut failures,
                         effect,
-                        EffectFailureKind::message(
-                            "destroy retries exhausted (no progress possible)",
-                        ),
+                        retry.exhausted(true),
                         |failure| {
                             let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
                                 &completed_counter,
@@ -1107,8 +1128,12 @@ async fn run_destroy_locked_owned(
                     failed_indices.insert(idx);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
+                    retry_pending.remove(&idx);
+                    exhausted_retries = true;
                 }
-                break;
+            }
+            if exhausted_retries {
+                continue 'destroy;
             }
             // Non-retry cycle: retain one shared cycle and attribute every
             // remaining effect to it instead of silently counting failures.
@@ -1171,6 +1196,7 @@ async fn run_destroy_locked_owned(
 
         match delete_result {
             Ok(()) => {
+                retry_failures.remove(&finished_idx);
                 let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                 let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(
                     &completed_counter,
@@ -1188,7 +1214,7 @@ async fn run_destroy_locked_owned(
                 destroyed_instances.record(destroyed);
             }
             Err(e) => {
-                let retries = retry_counts.get(&finished_idx).copied().unwrap_or(0);
+                let retries = retry_failures.get(&finished_idx).map_or(0, |retry| retry.attempts);
                 let has_pending_or_in_flight = !in_flight.is_empty()
                     || all_indices
                         .iter()
@@ -1197,11 +1223,11 @@ async fn run_destroy_locked_owned(
                     && retries < max_retries
                     && has_pending_or_in_flight
                 {
-                    *retry_counts.entry(finished_idx).or_insert(0) += 1;
+                    let retry_num = retries + 1;
+                    retry_failures.insert(finished_idx, DeleteRetryFailure { attempts: retry_num, last_error: e });
                     completed_indices.remove(&finished_idx);
                     dispatched.remove(&finished_idx);
                     retry_pending.insert(finished_idx);
-                    let retry_num = retry_counts[&finished_idx];
                     let outcome = NonFailureOutcome::retrying(format!(
                         "{} - dependency violation, will retry ({}/{})",
                         format_effect(effect),
@@ -1210,11 +1236,17 @@ async fn run_destroy_locked_owned(
                     ));
                     active_progress.finish(outcome);
                 } else {
+                    retry_failures.remove(&finished_idx);
+                    let kind = if retries > 0 {
+                        DeleteRetryFailure { attempts: retries + 1, last_error: e }.exhausted(false)
+                    } else {
+                        EffectFailureKind::provider(e)
+                    };
                     let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
                     record_destroy_failure(
                         &mut failures,
                         effect,
-                        EffectFailureKind::provider(e),
+                        kind,
                         |failure| {
                             let outcome = FailedOutcome::new(
                                 format_destroy_outcome_summary(
@@ -2138,7 +2170,6 @@ mod tests {
         ProviderConfigCaptureFactory, provider_default_tags_local_resource_fixture,
         provider_default_tags_missing_upstream_fixture, provider_upstream_fixture,
     };
-    use carina_core::provider::ProviderError;
     use std::sync::{Arc, Mutex};
 
     #[path = "cancellation_fixture.rs"]
@@ -2183,6 +2214,61 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_delete_retry_retains_typed_provider_source_in_final_report() {
+        let effect: Effect = Effect::Delete {
+            id: ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.resource",
+                "blocked",
+                None,
+            ),
+            identifier: carina_core::provider::AppliedIdentifier::new("blocked-id").unwrap(),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: Some("blocked".into()),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let mut sink = FailureSink::default();
+        let mut streamed = String::new();
+        let kind = DeleteRetryFailure {
+            attempts: 2,
+            last_error: ProviderError::internal_caused_by(
+                "DependencyViolation",
+                std::io::Error::other("blocking ENI eni-distinctive"),
+            ),
+        }
+        .exhausted(true);
+        record_destroy_failure(&mut sink, &effect, kind, |failure| {
+            streamed = failure.to_string();
+        });
+        assert!(
+            streamed.contains("blocking ENI eni-distinctive"),
+            "{streamed}"
+        );
+        let AppError::ExecutionFailed(report) = destroy_execution_error(0, sink.failures(), 0, 0)
+        else {
+            panic!("destroy final report must retain typed failures");
+        };
+        let EffectFailureKind::Provider { error, .. } = report.failures()[0].kind() else {
+            panic!("retry exhaustion must stay a provider failure");
+        };
+        assert!(error.as_error().source().unwrap().is::<ProviderError>());
+        assert!(
+            report.failures()[0]
+                .to_string()
+                .contains("blocking ENI eni-distinctive")
+        );
+        assert!(
+            report
+                .to_string()
+                .contains("delete mock.test.resource.blocked: provider error")
+        );
+        assert!(!report.to_string().contains("blocking ENI eni-distinctive"));
+    }
+
+    #[test]
     fn destroy_final_error_retains_failed_endpoint_and_source() {
         let effect: Effect = Effect::Create(carina_core::resource::ResolvedResource::new(
             carina_core::resource::Resource::new("test.resource", "failed"),
@@ -2197,13 +2283,15 @@ mod tests {
         let error = destroy_execution_error(0, &[failure], 0, 0);
         let rendered = error.to_string();
         assert!(
-            rendered.contains("create test.resource.failed") && rendered.contains("root detail"),
+            rendered.contains("create test.resource.failed: provider error")
+                && !rendered.contains("root detail"),
             "{rendered}"
         );
         let AppError::ExecutionFailed(report) = error else {
             panic!("destroy failures must remain typed");
         };
         assert_eq!(report.failures().len(), 1);
+        assert!(report.failures()[0].to_string().contains("root detail"));
     }
 
     #[derive(Clone, Default)]

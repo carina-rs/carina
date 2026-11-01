@@ -97,6 +97,12 @@ pub enum PlanErrorKind {
     },
     SchemaNotRegistered(SchemaNotRegisteredError),
     ReplacementCannotCoexist(ReplacementCannotCoexistError),
+    /// A referenced producer cannot coexist with its old generation, but a
+    /// managed or deferred dependent requires its replacement first.
+    CreateBeforeDestroyRequiredByDependent {
+        dependent: String,
+        cause: CreateBeforeDestroyError,
+    },
     /// An existing state row cannot safely be mutated because it has no
     /// provider identifier.
     MissingProviderIdentifier,
@@ -310,6 +316,9 @@ impl PlanErrorKind {
             },
             Self::SchemaNotRegistered(err) => write!(f, "{err}"),
             Self::ReplacementCannotCoexist(err) => write!(f, "{err}"),
+            Self::CreateBeforeDestroyRequiredByDependent { dependent, cause } => {
+                write!(f, "{cause}; create_before_destroy required by dependent `{dependent}`")
+            }
             Self::MissingProviderIdentifier => f.write_str(
                 "saved state has no provider identifier; add a `removed` block for this resource and apply it, then add an `import` block with the provider identifier to restore management",
             ),
@@ -426,6 +435,7 @@ impl PlanError {
             kind @ (PlanErrorKind::PreventDestroy { .. }
             | PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::ReplacementCannotCoexist(_)
+            | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
             | PlanErrorKind::MissingProviderIdentifier
             | PlanErrorKind::CreateInFlightOrphan
             | PlanErrorKind::DestroyCreateInFlight

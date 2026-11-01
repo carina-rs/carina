@@ -1262,7 +1262,8 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
         warning.file = warning_file.clone();
     }
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
-        deferred.file = warning_file.clone();
+        deferred.source_file = warning_file.clone();
+        deferred.file = Some(display_file.clone());
     }
 }
 

@@ -1109,6 +1109,20 @@ pub enum EffectFailureKind {
 }
 
 impl EffectFailureKind {
+    /// Short final-summary label. The observer renders the full cause once.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Provider { .. } => "provider error",
+            Self::Execution { .. } => "execution error",
+            Self::DeferredMaterialization { .. } => "deferred materialization failure",
+            Self::MissingDependency { .. } => "missing dependency",
+            Self::DependencyCycle { .. } => "dependency cycle",
+            Self::BlockedByDependencyCycle { .. } => "blocked by the dependency cycle above",
+            Self::NoProgress { .. } => "no scheduler progress",
+            Self::ModuleConstraint { .. } => "module constraint failure",
+        }
+    }
+
     pub fn provider(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Provider {
             error: ReportedError::new(error),
@@ -1210,9 +1224,7 @@ impl std::fmt::Display for EffectFailureKind {
                 )
             }
             Self::DependencyCycle { cycle } => cycle.fmt(formatter),
-            Self::BlockedByDependencyCycle { cycle } => {
-                write!(formatter, "blocked by {cycle}")
-            }
+            Self::BlockedByDependencyCycle { .. } => formatter.write_str(self.label()),
             Self::NoProgress { waiting_on } => {
                 if waiting_on.is_empty() {
                     formatter.write_str("no progress: effect was not dispatched despite all dependencies completing")
@@ -1272,8 +1284,50 @@ impl std::fmt::Display for EffectFailure {
     }
 }
 
-/// Private-storage failure ledger. Recording always emits the typed event
-/// before retaining the same value; there is no observer-free insertion API.
+/// Proof that a failure has been retained by a [`FailureSink`]. Only the sink
+/// can issue this borrowed token, and it only lends it to the observer.
+pub struct RecordedFailure<'a> {
+    failure: &'a EffectFailure,
+}
+
+impl std::ops::Deref for RecordedFailure<'_> {
+    type Target = EffectFailure;
+
+    fn deref(&self) -> &Self::Target {
+        self.failure
+    }
+}
+
+impl std::fmt::Display for RecordedFailure<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
+/// Private-storage failure ledger. Recording retains the failure and emits
+/// its typed event together; there is no observer-free insertion API.
+///
+/// An unretained effect failure cannot be reported by constructing an event:
+///
+/// ```compile_fail
+/// use carina_core::effect::Effect;
+/// use carina_core::executor::{EffectFailure, ExecutionEvent, ProgressInfo};
+/// fn unretained<'a>(effect: &'a Effect, failure: &'a EffectFailure) -> ExecutionEvent<'a> {
+///     ExecutionEvent::EffectFailed {
+///         effect, failure, recovery: None, duration: std::time::Duration::ZERO,
+///         progress: ProgressInfo { completed: 1, total: 1 },
+///     }
+/// }
+/// ```
+///
+/// Module constraint failures must use the same ledger:
+///
+/// ```compile_fail
+/// use carina_core::executor::{EffectFailure, ExecutionEvent};
+/// fn unretained(failure: &EffectFailure) -> ExecutionEvent<'_> {
+///     ExecutionEvent::ModuleConstraintFailed { failure }
+/// }
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct FailureSink {
     failures: Vec<EffectFailure>,
@@ -1294,29 +1348,31 @@ impl FailureSink {
     }
 
     pub fn record<S>(&mut self, observer: &dyn ExecutionObserver<S>, report: FailureReport<'_, S>) {
-        let failure = match report {
+        let (failure, effect_context) = match report {
             FailureReport::Effect {
                 effect,
                 kind,
                 context,
-            } => {
-                let failure = EffectFailure::new(effect, kind);
-                observer.on_event(&ExecutionEvent::EffectFailed {
-                    effect,
-                    failure: &failure,
-                    recovery: context.recovery,
-                    duration: context.duration,
-                    progress: context.progress,
-                });
-                failure
-            }
+            } => (EffectFailure::new(effect, kind), Some((effect, context))),
             FailureReport::ModuleConstraint(failure) => {
-                let failure = EffectFailure::module_constraint(failure);
-                observer.on_event(&ExecutionEvent::ModuleConstraintFailed { failure: &failure });
-                failure
+                (EffectFailure::module_constraint(failure), None)
             }
         };
         self.failures.push(failure);
+        let recorded = RecordedFailure {
+            failure: self.failures.last().expect("just retained a failure"),
+        };
+        if let Some((effect, context)) = effect_context {
+            observer.on_event(&ExecutionEvent::EffectFailed {
+                effect,
+                failure: &recorded,
+                recovery: context.recovery,
+                duration: context.duration,
+                progress: context.progress,
+            });
+        } else {
+            observer.on_event(&ExecutionEvent::ModuleConstraintFailed { failure: &recorded });
+        }
     }
 }
 
@@ -1639,7 +1695,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     },
     EffectFailed {
         effect: &'a Effect<S>,
-        failure: &'a EffectFailure,
+        failure: &'a RecordedFailure<'a>,
         recovery: Option<&'a crate::plan::PlanError>,
         duration: Duration,
         progress: ProgressInfo,
@@ -1684,7 +1740,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     },
     /// A terminal module constraint failed without an owning provider effect.
     ModuleConstraintFailed {
-        failure: &'a EffectFailure,
+        failure: &'a RecordedFailure<'a>,
     },
 }
 

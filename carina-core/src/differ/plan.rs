@@ -1139,10 +1139,16 @@ fn promote_referenced_replaces_to_cbd(
     let ref_targets = pending_reference_targets(pending_replaces, false);
     let mut promote = Vec::new();
 
-    let managed_dependencies = dependents
-        .managed
-        .iter()
-        .map(|resource| (Some(&resource.id), get_resource_dependencies(resource)));
+    let managed_dependencies = dependents.managed.iter().map(|resource| {
+        (
+            Some(&resource.id),
+            resource
+                .binding
+                .clone()
+                .unwrap_or_else(|| resource.id.identity_display().to_string()),
+            get_resource_dependencies(resource),
+        )
+    });
     let deferred_dependencies = dependents.deferred.iter().map(|deferred| {
         let mut dependencies =
             get_resource_dependencies(deferred.template_resource().as_resource());
@@ -1152,10 +1158,10 @@ fn promote_referenced_replaces_to_cbd(
             dependencies.remove(local);
         }
         dependencies.extend(deferred.root_bindings());
-        (None, dependencies)
+        (None, deferred.target().display_name(), dependencies)
     });
 
-    for (dependent_id, deps) in managed_dependencies.chain(deferred_dependencies) {
+    for (dependent_id, dependent_name, deps) in managed_dependencies.chain(deferred_dependencies) {
         for dep in &deps {
             let Some(replaced_identity) = ref_targets.get(dep) else {
                 continue;
@@ -1168,21 +1174,32 @@ fn promote_referenced_replaces_to_cbd(
             {
                 continue;
             }
-            promote.push(replaced_identity.clone());
+            promote.push((replaced_identity.clone(), dependent_name.clone()));
         }
     }
 
-    promote.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    promote.dedup();
+    promote.sort_by(|(left_id, left_name), (right_id, right_name)| {
+        left_id
+            .as_str()
+            .cmp(right_id.as_str())
+            .then_with(|| left_name.cmp(right_name))
+    });
+    promote.dedup_by(|(left, _), (right, _)| left == right);
 
-    for identity in promote {
+    for (identity, dependent) in promote {
         let result = pending_replaces
             .get_mut(&identity)
             .map(|pending| mark_pending_create_before_destroy(pending, registry));
         if let Some(Err(err)) = result
             && let Some(pending) = pending_replaces.remove(&identity)
         {
-            plan.add_error(PlanError::new(pending.create.id.clone(), err.into()));
+            plan.add_error(PlanError::new(
+                pending.create.id.clone(),
+                PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
+                    dependent,
+                    cause: err,
+                },
+            ));
         }
     }
 }

@@ -420,6 +420,9 @@ pub struct DeferredForExpression<
     T: PlaceholderKind = LoopSlot,
 > {
     pub file: Option<String>,
+    // Parser diagnostics and warning correlation use the original source path,
+    // independently of the portable diagnostic file. Never serialized.
+    pub(crate) source_file: Option<String>,
     pub line: usize,
     pub header: String,
     target: DeferredForTarget,
@@ -465,6 +468,7 @@ impl<S, P: PlaceholderKind, T: PlaceholderKind> DeferredForExpression<S, P, T> {
         let template_resource = template_resource.into_materialized_for_target(&target);
         let deferred_effect_id = deferred_effect_id(&target, &template_resource);
         Self {
+            source_file: file.clone(),
             file,
             line,
             header,
@@ -577,6 +581,7 @@ pub(crate) enum DeferredForResourceExpressionError {
 #[derive(Debug, Clone)]
 pub struct ParsedDeferredForExpression<P: PlaceholderKind = ParserPlaceholder> {
     pub file: Option<String>,
+    pub(crate) source_file: Option<String>,
     pub line: usize,
     pub span: SourceSpan,
     pub header: String,
@@ -602,6 +607,7 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
     ) -> Self {
         let body = body.into_materialized_for_target(&target);
         Self {
+            source_file: file.clone(),
             file,
             line,
             span,
@@ -679,7 +685,7 @@ impl<P: PlaceholderKind> ParsedDeferredForExpression<P> {
             known_bindings.to_vec(),
             self.span,
         );
-        Some(match &self.file {
+        Some(match &self.source_file {
             Some(path) => error.in_file(path),
             None => error,
         })
@@ -699,6 +705,7 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
         }
         let Self {
             file,
+            source_file,
             line,
             span,
             header,
@@ -726,7 +733,7 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
             DeferredForBody::Resource(resource) => *resource,
             DeferredForBody::Read(data_source) => {
                 return Err(DeferredForResourceExpressionError::Unsupported {
-                    file,
+                    file: source_file,
                     error: Box::new(DeferredForBodyUnsupportedError {
                         line,
                         header,
@@ -740,7 +747,7 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
             }
             DeferredForBody::ModuleCall(call) => {
                 return Err(DeferredForResourceExpressionError::Unsupported {
-                    file,
+                    file: source_file,
                     error: Box::new(DeferredForBodyUnsupportedError {
                         line,
                         header,
@@ -753,7 +760,7 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
                 });
             }
         };
-        Ok(DeferredForExpression::from_template_resource(
+        let mut expression = DeferredForExpression::from_template_resource(
             file,
             line,
             header,
@@ -761,7 +768,9 @@ impl ParsedDeferredForExpression<ParserPlaceholder> {
             iterable,
             binding,
             template_resource,
-        ))
+        );
+        expression.source_file = source_file;
+        Ok(expression)
     }
 }
 
@@ -788,6 +797,7 @@ impl From<DeferredForExpression> for SavedDeferredForExpression {
     fn from(expression: DeferredForExpression) -> Self {
         let DeferredForExpression {
             file,
+            source_file: _,
             line,
             header,
             target,
@@ -1177,6 +1187,7 @@ impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
     ) -> Result<DeferredForExpression<S>, crate::resource::LeftoverPlaceholder> {
         let Self {
             file,
+            source_file,
             line,
             header,
             target,
@@ -1187,7 +1198,7 @@ impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
         } = self;
         let template_resource = template_resource
             .try_map_resource(Resource::<S, ParserPlaceholder>::into_loop_template)?;
-        Ok(DeferredForExpression::from_template_resource(
+        let mut expression = DeferredForExpression::from_template_resource(
             file,
             line,
             header,
@@ -1195,7 +1206,9 @@ impl<S> DeferredForExpression<S, ParserPlaceholder, ParserPlaceholder> {
             iterable.into_expanded()?,
             binding,
             template_resource,
-        ))
+        );
+        expression.source_file = source_file;
+        Ok(expression)
     }
 }
 
@@ -5962,7 +5975,7 @@ impl<E> ExpandedFile<E> {
                 (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::List(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
-                        file: deferred.file.clone(),
+                        file: deferred.source_file.clone(),
                         line: deferred.line,
                         kind: WarningKind::DeferredFor,
                         span: None,
@@ -5977,7 +5990,7 @@ impl<E> ExpandedFile<E> {
                 | (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
                     mismatched_indices.push(idx);
                     new_warnings.push(ParseWarning {
-                        file: deferred.file.clone(),
+                        file: deferred.source_file.clone(),
                         line: deferred.line,
                         kind: WarningKind::DeferredFor,
                         span: None,
@@ -6024,7 +6037,9 @@ fn retain_non_matching_deferred_for_warnings(
     deferred: &DeferredForExpression,
 ) {
     warnings.retain(|w| {
-        w.kind != WarningKind::DeferredFor || w.line != deferred.line || w.file != deferred.file
+        w.kind != WarningKind::DeferredFor
+            || w.line != deferred.line
+            || w.file != deferred.source_file
     });
 }
 

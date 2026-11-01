@@ -2288,12 +2288,19 @@ async fn dependency_cycle_records_members_and_emits_failure_events() {
         members == HashSet::from([&first_id, &second_id])
     }));
     let events = observer.events();
-    for id in [&first_id, &second_id] {
-        let event = effect_failure_event(&events, id);
-        assert!(event.contains("dependency cycle"), "event: {event}");
-        assert!(event.contains(&first_id.to_string()), "event: {event}");
-        assert!(event.contains(&second_id.to_string()), "event: {event}");
-    }
+    let cycle = effect_failure_event(&events, &first_id);
+    assert!(cycle.contains("dependency cycle"), "event: {cycle}");
+    assert!(cycle.contains(&first_id.to_string()), "event: {cycle}");
+    assert!(cycle.contains(&second_id.to_string()), "event: {cycle}");
+    let blocked = effect_failure_event(&events, &second_id);
+    assert!(
+        blocked.contains("blocked by the dependency cycle above"),
+        "event: {blocked}"
+    );
+    assert!(
+        !blocked.contains(&first_id.to_string()),
+        "blocked events must not repeat the cycle: {blocked}"
+    );
 }
 
 #[test]

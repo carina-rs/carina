@@ -40,12 +40,17 @@ impl Scenario {
     }
 
     fn carina(&self, args: &[&str]) -> Output {
+        self.carina_from(&self.project, args, &[])
+    }
+
+    fn carina_from(&self, cwd: &Path, args: &[&str], environment: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_carina"))
-            .current_dir(&self.project)
+            .current_dir(cwd)
             .env("NO_COLOR", "1")
             .env_remove("CLICOLOR_FORCE")
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
             .env("CARINA_MOCK_OP_LOG", &self.operation_log)
+            .envs(environment.iter().copied())
             .args(args)
             .output()
             .expect("run carina")
@@ -145,9 +150,15 @@ fn assert_absent_iterable_failure(output: &Output) {
         .1;
     assert!(
         final_report.contains("deferred create")
-            && final_report.contains("src.tags")
-            && final_report.contains("binding `rs`"),
-        "final error must name the failed endpoint and reason: {final_report}"
+            && final_report.contains("deferred materialization failure"),
+        "final error must name the failed endpoint and kind: {final_report}"
+    );
+    assert_eq!(
+        stderr
+            .matches("deferred-for iterable `src.tags` is absent")
+            .count(),
+        1,
+        "{stderr}"
     );
 }
 
@@ -227,6 +238,147 @@ fn deferred_for_absent_iterable_saved_plan_apply_reports_location() {
     let scenario = Scenario::new(ABSENT_ITERABLE_CONFIG);
     assert_success("carina plan --out", &scenario.save_plan());
     assert_absent_iterable_failure(&scenario.apply_saved_plan());
+}
+
+#[test]
+fn saved_deferred_diagnostic_is_project_relative_for_absolute_project_path() {
+    assert_saved_diagnostic_from_another_cwd(false);
+}
+
+#[test]
+fn saved_deferred_diagnostic_is_project_relative_for_relative_project_path() {
+    assert_saved_diagnostic_from_another_cwd(true);
+}
+
+fn assert_saved_diagnostic_from_another_cwd(relative: bool) {
+    let scenario = Scenario::new(ABSENT_ITERABLE_CONFIG);
+    let plan_cwd = scenario.project.join("planning-cwd");
+    let apply_cwd = scenario.project.join("applying-cwd");
+    fs::create_dir(&plan_cwd).unwrap();
+    fs::create_dir(&apply_cwd).unwrap();
+    let project_arg = if relative {
+        ".."
+    } else {
+        scenario.project.to_str().unwrap()
+    };
+    let plan_path = scenario.project.join("p.plan");
+    assert_success(
+        "save plan from another cwd",
+        &scenario.carina_from(
+            &plan_cwd,
+            &["plan", project_arg, "--out", plan_path.to_str().unwrap()],
+            &[],
+        ),
+    );
+    let plan = read_json(&plan_path);
+    let template = plan["plan"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|effect| {
+            effect
+                .get("DeferredCreate")
+                .map(|payload| &payload["template"])
+        })
+        .expect("saved deferred-create template");
+    assert_eq!(template["file"], "main.crn");
+    assert_eq!(template["line"], 2);
+    let output = scenario.carina_from(
+        &apply_cwd,
+        &[
+            "apply",
+            plan_path.to_str().unwrap(),
+            "--auto-approve",
+            "--lock=false",
+        ],
+        &[],
+    );
+    assert_absent_iterable_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("../main.crn") && !stderr.contains(scenario.project.to_str().unwrap()),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn destroy_retry_exhaustion_reports_distinctive_provider_reason() {
+    // The mock's original provider error includes the identity. Put the AWS
+    // retry classification and a distinctive blocker in it without adding a
+    // second mock-only failure protocol.
+    let scenario = Scenario::new(
+        r#"let DependencyViolation_eni_4174_a = mock.test.resource { name = "a" }
+let DependencyViolation_eni_4174_b = mock.test.resource { name = "b" }
+"#,
+    );
+    assert_success("initial apply", &scenario.apply_config());
+    let output = scenario.carina_from(
+        &scenario.project,
+        &[
+            "destroy",
+            ".",
+            "--auto-approve",
+            "--lock=false",
+            "--refresh=false",
+            "--parallelism",
+            "1",
+        ],
+        &[("CARINA_MOCK_DELETE_FAIL_FOR", "*")],
+    );
+    assert!(!output.status.success(), "{}", output_text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("retries exhausted after 4 attempts"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for test.resource.DependencyViolation_eni_4174_a"), "{stderr}");
+    assert!(
+        stderr.contains("delete mock.test.resource.DependencyViolation_eni_4174_a: provider error"),
+        "{stderr}"
+    );
+    assert_eq!(
+        scenario.state()["resources"].as_array().unwrap().len(),
+        2,
+        "failed deletes must remain in state"
+    );
+}
+
+#[test]
+fn destroy_stalled_retry_keeps_provider_reason_and_skips_its_dependency() {
+    let scenario = Scenario::new(
+        r#"let producer = mock.test.resource { name = "producer" }
+let DependencyViolation_eni_4174 = mock.test.resource {
+  name = "consumer"
+  parent = producer.identifier
+}
+"#,
+    );
+    assert_success("initial apply", &scenario.apply_config());
+    let output = scenario.carina_from(
+        &scenario.project,
+        &[
+            "destroy",
+            ".",
+            "--auto-approve",
+            "--lock=false",
+            "--refresh=false",
+            "--parallelism",
+            "1",
+        ],
+        &[(
+            "CARINA_MOCK_DELETE_FAIL_FOR",
+            "test.resource.DependencyViolation_eni_4174",
+        )],
+    );
+    assert!(!output.status.success(), "{}", output_text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("retries exhausted after 1 attempt (no progress possible)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for test.resource.DependencyViolation_eni_4174"), "{stderr}");
+    assert!(stderr.contains("1 failed, 1 skipped"), "{stderr}");
+    assert_eq!(scenario.state()["resources"].as_array().unwrap().len(), 2);
 }
 
 #[test]

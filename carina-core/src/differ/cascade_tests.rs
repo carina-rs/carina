@@ -544,16 +544,20 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
     assert_eq!(plan.errors()[0].resource_id, vpc_id);
     assert_eq!(
         &plan.errors()[0].kind,
-        &PlanErrorKind::ReplacementCannotCoexist(ReplacementCannotCoexistError {
-            resource_type: "ec2.Vpc".to_string(),
-            resource_identity: "vpc".to_string(),
-        })
+        &PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
+            dependent: "subnet".into(),
+            cause: ReplacementCannotCoexistError {
+                resource_type: "ec2.Vpc".to_string(),
+                resource_identity: "vpc".to_string(),
+            }
+            .into(),
+        }
     );
     assert_eq!(
         plan.errors()[0]
             .display_with_project_dir(std::path::Path::new("."))
             .to_string(),
-        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
+        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original; create_before_destroy required by dependent `subnet`"
     );
 }
 
@@ -891,6 +895,183 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
         assert!(
             !replacement_metadata(&plan, &id).create_before_destroy,
             "the loop-local vpc must not refer to the top-level producer"
+        );
+    }
+}
+
+fn deferred_create_cbd_plan(
+    producer_binding: &str,
+    target: crate::parser::DeferredForTarget,
+    schemas: &SchemaRegistry,
+) -> (Plan, ResourceId) {
+    use crate::parser::{DeferredForExpression, ForBinding};
+    use crate::resource::{LoopSlot, ModuleSource};
+
+    let (managed, unresolved) = vpc_resources(false);
+    let id = managed.id.clone();
+    let managed =
+        ResolvedResource::collect_resolved([managed.with_binding(producer_binding)]).unwrap();
+    let unresolved =
+        ResolvedResource::collect_resolved([unresolved.with_binding(producer_binding)]).unwrap();
+    let template: Resource<ModuleSource, LoopSlot> = Resource::new("ec2.Subnet", "subnets");
+    let deferred = DeferredForExpression::new(
+        Some("main.crn".into()),
+        2,
+        format!("for subnet in {producer_binding}.subnets"),
+        target,
+        ref_value(producer_binding, "subnets"),
+        ForBinding::Simple("subnet".into()),
+        template,
+    );
+    let (schemas, provider) = crate::provider::comparison_fixture_for_test(
+        schemas,
+        managed.iter().map(|resource| &resource.id),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(id.clone(), standard_states().remove(&id).unwrap())]),
+        &schemas,
+        &[],
+    );
+    let mut plan = create_plan_with_cascades(
+        &managed,
+        CascadeDependents::new(&unresolved, [&deferred]),
+        &[],
+        &provider,
+        PlanPriorStates::new(&current, &Orphans::new()),
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &[],
+        &HashSet::new(),
+    )
+    .unwrap();
+    plan.add(Effect::DeferredCreate(
+        crate::effect::DeferredCreatePayload {
+            template: Box::new(deferred),
+        },
+    ));
+    (plan, id)
+}
+
+fn assert_deferred_create_cbd_is_acyclic(plan: &Plan, producer: &ResourceId) {
+    use crate::effect::deps::{ScheduleInputs, build_effect_dependency_analysis};
+    assert!(!plan.has_errors(), "{:?}", plan.errors());
+    assert!(replacement_metadata(plan, producer).create_before_destroy);
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredCreate(_)))
+    );
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredReplace(_)))
+    );
+    let deps = build_effect_dependency_analysis(
+        plan.effects(),
+        &HashMap::new(),
+        &[],
+        ScheduleInputs::Apply,
+    )
+    .unwrap()
+    .into_deps_of();
+    let mut completed = HashSet::new();
+    loop {
+        let ready = deps
+            .iter()
+            .filter_map(|(idx, waiting)| {
+                (!completed.contains(idx) && waiting.is_subset(&completed)).then_some(*idx)
+            })
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            break;
+        }
+        completed.extend(ready);
+    }
+    assert_eq!(completed.len(), deps.len(), "{deps:?}");
+}
+
+#[test]
+fn unbound_deferred_for_promotes_replaced_producer_to_cbd() {
+    let parsed = crate::parser::parse(
+        "let vpc = ec2.Vpc { name = 'vpc' }\nfor subnet in vpc.subnets { ec2.Subnet { name = subnet } }",
+        &crate::parser::ProviderContext::default(),
+    ).unwrap().into_expanded().unwrap();
+    let target = parsed.deferred_for_expressions()[0].target().clone();
+    assert!(matches!(
+        target,
+        crate::parser::DeferredForTarget::Unbound { .. }
+    ));
+    let (plan, id) = deferred_create_cbd_plan("vpc", target, &base_schemas(false));
+    assert_deferred_create_cbd_is_acyclic(&plan, &id);
+}
+
+#[test]
+fn module_scoped_deferred_for_promotes_its_prefixed_producer_to_cbd() {
+    let (plan, id) = deferred_create_cbd_plan(
+        "network.vpc",
+        crate::parser::DeferredForTarget::bound("network.subnets").unwrap(),
+        &base_schemas(false),
+    );
+    assert_deferred_create_cbd_is_acyclic(&plan, &id);
+}
+
+#[test]
+fn deferred_create_without_prior_children_promotes_replaced_producer_to_cbd() {
+    let (plan, id) = deferred_create_cbd_plan(
+        "vpc",
+        crate::parser::DeferredForTarget::bound("subnets").unwrap(),
+        &base_schemas(false),
+    );
+    assert_deferred_create_cbd_is_acyclic(&plan, &id);
+}
+
+#[test]
+fn impossible_cbd_promotion_names_deferred_and_managed_dependents() {
+    let mut schemas = base_schemas(false);
+    schemas.insert(
+        "",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("cidr_block", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let (deferred, _) = deferred_create_cbd_plan(
+        "vpc",
+        crate::parser::DeferredForTarget::bound("subnets").unwrap(),
+        &schemas,
+    );
+    let (managed_vpc, unresolved_vpc) = vpc_resources(false);
+    let (managed_subnet, unresolved_subnet) = subnet_resources(false, false);
+    let managed = plan_for(
+        vec![managed_vpc, managed_subnet],
+        vec![unresolved_vpc, unresolved_subnet],
+        standard_states(),
+        &schemas,
+    );
+    for (plan, dependent) in [(&deferred, "subnets"), (&managed, "subnet")] {
+        assert_eq!(plan.errors().len(), 1, "{:?}", plan.errors());
+        let message = plan.errors()[0]
+            .display_with_project_dir(std::path::Path::new("."))
+            .to_string();
+        assert!(
+            message.contains("cannot coexist with the original"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("required by dependent `{dependent}`")),
+            "{message}"
         );
     }
 }
