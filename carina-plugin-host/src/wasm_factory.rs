@@ -6667,9 +6667,10 @@ impl WasmProvider {
             }
         };
         // Persisted resume state has no scheduling metadata, while WIT requires
-        // both fields. The WIT/SDK contract marks these first-call values as
-        // non-authoritative; the provider's returned pending phase drives the
-        // host from this point onward.
+        // both fields. This operation-phase placeholder allows saved read-back
+        // tokens to resume with an identifier: SDK dispatch only rejects a
+        // backward phase transition. Returned pending or preserved progress
+        // establishes the phase used by subsequent polls.
         let initial = self.call_resume_record(
             id.clone(),
             wit_id,
