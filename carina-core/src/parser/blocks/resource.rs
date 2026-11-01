@@ -20,8 +20,9 @@ use crate::parser::{
 };
 use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in_sink};
 use crate::resource::{
-    ConcreteValue, DeferredValue, Directives, LoopElementOrigin, LoopProvenance, ParsedIgnorePath,
-    ParsedIgnorePathSegment, ResourceId, ResourceIdentity,
+    AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
+    AuthoredDirectives as Directives, DiagnosticSourceLocations, LoopElementOrigin, LoopProvenance,
+    ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName, ResourceId, ResourceIdentity,
 };
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -42,9 +43,15 @@ pub(in crate::parser) fn parse_anonymous_resource(
 }
 
 pub(crate) enum ResourceParseTarget {
-    Pending { origin: Option<LoopElementOrigin> },
-    Bound { binding: String },
-    DeferredForTemplate { target: BoundDeferredTarget },
+    Pending {
+        origin: Option<LoopElementOrigin>,
+    },
+    Bound {
+        binding: String,
+    },
+    DeferredForTemplate {
+        target: BoundDeferredTarget<RelativeBindingName>,
+    },
 }
 
 pub(crate) fn parse_resource_for_target(
@@ -116,7 +123,7 @@ pub(crate) fn parse_resource_for_target(
                 ResourceIdentity::new(binding.clone()),
                 directives.provider_instance.clone(),
             ),
-            Some(binding),
+            Some(RelativeBindingName::new(binding)),
             LoopProvenance::default(),
         ),
         ResourceParseTarget::DeferredForTemplate { target } => (
@@ -125,7 +132,7 @@ pub(crate) fn parse_resource_for_target(
                 &resource_type,
                 directives.provider_instance.clone(),
             ),
-            Some(target.template_address().to_string()),
+            Some(target.template_address().binding_address().clone()),
             LoopProvenance::default(),
         ),
     };
@@ -432,7 +439,7 @@ pub(crate) fn parse_read_resource_expr(
         id,
         attributes: attributes.into_iter().collect(),
         directives,
-        binding: Some(binding_name.to_string()),
+        binding: Some(RelativeBindingName::new(binding_name)),
         dependency_bindings: BTreeSet::new(),
         module_source: None,
         quoted_string_attrs,
@@ -507,6 +514,7 @@ fn parse_directives(
                     });
                 }
                 let mut names = Vec::new();
+                let mut source_lines = Vec::new();
                 for element in list.into_inner() {
                     let element_line = element.line_col().0;
                     let eval = parse_expression_eval(element, ctx)?;
@@ -516,8 +524,11 @@ fn parse_directives(
                         element_line,
                         BindingNameUse::Dependency,
                     )?);
+                    source_lines.push(element_line);
                 }
-                directives.depends_on = names;
+                directives.depends_on = names.into_iter().map(RelativeBindingName::new).collect();
+                directives.depends_on_diagnostic_sources =
+                    DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }
             "provider" => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
@@ -697,18 +708,26 @@ fn eval_as_binding_name(
             }
         }
         EvalValue::User(Value::Deferred(DeferredValue::Placeholder(
-            crate::resource::ParserPlaceholder::ModuleArgument { name, .. },
+            crate::resource::ParserPlaceholder::ModuleArgument {
+                name,
+                diagnostic: _,
+            },
         ))) if matches!(usage, BindingNameUse::Dependency) => Ok(name),
         EvalValue::User(Value::Deferred(DeferredValue::Placeholder(
-            crate::resource::ParserPlaceholder::ModuleArgument { name, .. },
+            crate::resource::ParserPlaceholder::ModuleArgument {
+                name,
+                diagnostic: _,
+            },
         ))) => Err(ParseError::InvalidExpression {
             line,
             message: format!(
                 "directives.provider: module parameter '{name}' cannot be used as a provider instance"
             ),
         }),
-        EvalValue::User(Value::Deferred(DeferredValue::BindingRef { binding })) => Ok(binding),
-        EvalValue::ProvisionalReference { binding } => Ok(binding),
+        EvalValue::User(Value::Deferred(DeferredValue::BindingRef { binding })) => {
+            Ok(binding.into_string())
+        }
+        EvalValue::ProvisionalReference { binding } => Ok(binding.into_string()),
         EvalValue::User(Value::Concrete(ConcreteValue::EnumIdentifier(name))) => {
             Ok(name.to_string())
         }

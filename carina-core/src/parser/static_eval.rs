@@ -9,12 +9,12 @@ use super::error::ParseError;
 use crate::eval_value::EvalValue;
 use crate::parser::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use crate::resource::{
-    AccessMissPolicy, ConcreteValue, DeferredValue, InterpolationPart as GenericInterpolationPart,
-    ParserPlaceholder,
+    AccessMissPolicy, AuthoredConcreteValue as ConcreteValue,
+    AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
+    BindingAddress, ConcreteValue as GenericConcreteValue, DeferredValue as GenericDeferredValue,
+    InterpolationPart as GenericInterpolationPart, ParserPlaceholder, Value as GenericValue,
 };
 use std::collections::HashSet;
-
-type InterpolationPart = GenericInterpolationPart<ParserPlaceholder>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IfConditionDependency {
@@ -214,43 +214,49 @@ pub(crate) fn decide_if_condition(
 }
 
 /// Check whether a Value is fully static (no runtime dependencies).
-pub(crate) fn is_static_value(value: &Value) -> bool {
+pub(crate) fn is_static_value<B: BindingAddress>(
+    value: &GenericValue<ParserPlaceholder, B>,
+) -> bool {
     match value {
-        Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Concrete(ConcreteValue::Int(_))
-        | Value::Concrete(ConcreteValue::Float(_))
-        | Value::Concrete(ConcreteValue::Bool(_))
-        | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_)) => true,
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_static_value),
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_static_value),
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
+        GenericValue::Concrete(GenericConcreteValue::String(_))
+        | GenericValue::Concrete(GenericConcreteValue::EnumIdentifier(_))
+        | GenericValue::Concrete(GenericConcreteValue::CanonicalEnum(_))
+        | GenericValue::Concrete(GenericConcreteValue::Int(_))
+        | GenericValue::Concrete(GenericConcreteValue::Float(_))
+        | GenericValue::Concrete(GenericConcreteValue::Bool(_))
+        | GenericValue::Concrete(GenericConcreteValue::Duration(_))
+        | GenericValue::Concrete(GenericConcreteValue::StringList(_)) => true,
+        GenericValue::Concrete(GenericConcreteValue::List(items)) => {
+            items.iter().all(is_static_value)
+        }
+        GenericValue::Concrete(GenericConcreteValue::Map(map)) => map.values().all(is_static_value),
+        GenericValue::Deferred(
+            GenericDeferredValue::FunctionCall { args, .. }
+            | GenericDeferredValue::ResolvedFunctionCall { args, .. },
         ) => args.iter().all(|argument| {
             argument.handle().is_some() || argument.value().is_some_and(is_static_value)
         }),
-        Value::Deferred(DeferredValue::Access(access)) => is_static_value(access.base()),
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+        GenericValue::Deferred(GenericDeferredValue::Access(access)) => {
+            is_static_value(access.base())
+        }
+        GenericValue::Deferred(GenericDeferredValue::IntegerArithmetic(expression)) => {
             is_static_value(expression.lhs()) && is_static_value(expression.rhs())
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+        GenericValue::Deferred(GenericDeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
-                InterpolationPart::Literal(_) => true,
-                InterpolationPart::Expr(value) => is_static_value(value),
+                GenericInterpolationPart::Literal(_) => true,
+                GenericInterpolationPart::Expr(value) => is_static_value(value),
             })
         }
-        Value::Deferred(DeferredValue::ModuleIf(_))
-        | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::Coalesce { .. })
-        | Value::Deferred(DeferredValue::Unavailable { .. })
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
-        | Value::Deferred(DeferredValue::Unknown(_))
-        | Value::Deferred(DeferredValue::Placeholder(_)) => false,
-        Value::Deferred(DeferredValue::Secret(inner)) => is_static_value(inner),
+        GenericValue::Deferred(GenericDeferredValue::ModuleIf(_))
+        | GenericValue::Deferred(GenericDeferredValue::ResourceRef { .. })
+        | GenericValue::Deferred(GenericDeferredValue::BindingRef { .. })
+        | GenericValue::Deferred(GenericDeferredValue::Coalesce { .. })
+        | GenericValue::Deferred(GenericDeferredValue::Unavailable { .. })
+        | GenericValue::Deferred(GenericDeferredValue::RedactedSecret { .. })
+        | GenericValue::Deferred(GenericDeferredValue::Unknown(_))
+        | GenericValue::Deferred(GenericDeferredValue::Placeholder(_)) => false,
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => is_static_value(inner),
     }
 }
 

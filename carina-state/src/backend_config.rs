@@ -1,7 +1,10 @@
 //! Schema-backed state backend configuration.
 
 use carina_core::parser;
-use carina_core::resource::{ConcreteValue, PlaceholderKind, Value, ValueString};
+use carina_core::resource::{
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, NoPlaceholder, PlaceholderKind, Value,
+    ValueString,
+};
 use carina_core::schema::{
     AttributeType, DslTransform, TypeError, TypeIdentity, ValidatedConfigSchema,
 };
@@ -32,7 +35,7 @@ impl BackendConfig {
 
     /// Convert the checked representation to the parser shape used by saved
     /// plans. Enum values use API spelling.
-    pub fn to_parser_config(&self) -> parser::BackendConfig {
+    pub fn to_parser_config(&self) -> parser::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> {
         match self {
             Self::S3(settings) => {
                 let mut attributes = HashMap::from([
@@ -269,11 +272,11 @@ fn local_schema() -> ValidatedConfigSchema {
     .expect("the built-in local backend config schema must be valid")
 }
 
-fn canonicalize_attributes<P: PlaceholderKind>(
-    config: &parser::BackendConfig<P>,
+fn canonicalize_attributes<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
     schema: &ValidatedConfigSchema,
     required: &[&'static str],
-) -> (HashMap<String, Value<P>>, Vec<BackendAttributeError>) {
+) -> (HashMap<String, Value<P, B>>, Vec<BackendAttributeError>) {
     let mut errors = Vec::new();
     for attribute in required {
         if !config.attributes.contains_key(*attribute) {
@@ -322,11 +325,11 @@ fn canonicalize_attributes<P: PlaceholderKind>(
     (canonicalized, errors)
 }
 
-fn invalid_resolved_shape<P: PlaceholderKind>(
+fn invalid_resolved_shape<P: PlaceholderKind, B: BindingAddress>(
     backend_type: &str,
     attribute: &str,
     expected: &str,
-    value: &Value<P>,
+    value: &Value<P, B>,
 ) -> BackendAttributeError {
     BackendAttributeError::InvalidAttribute {
         backend_type: backend_type.to_string(),
@@ -338,8 +341,8 @@ fn invalid_resolved_shape<P: PlaceholderKind>(
     }
 }
 
-fn take_string<P: PlaceholderKind>(
-    attributes: &mut HashMap<String, Value<P>>,
+fn take_string<P: PlaceholderKind, B: BindingAddress>(
+    attributes: &mut HashMap<String, Value<P, B>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<ValueString>, BackendAttributeError> {
@@ -357,8 +360,8 @@ fn take_string<P: PlaceholderKind>(
     }
 }
 
-fn take_bool<P: PlaceholderKind>(
-    attributes: &mut HashMap<String, Value<P>>,
+fn take_bool<P: PlaceholderKind, B: BindingAddress>(
+    attributes: &mut HashMap<String, Value<P, B>>,
     backend_type: &str,
     attribute: &str,
 ) -> Result<Option<bool>, BackendAttributeError> {
@@ -389,8 +392,8 @@ fn collect_attribute<T>(
     }
 }
 
-fn resolve_s3_backend<P: PlaceholderKind>(
-    config: &parser::BackendConfig<P>,
+fn resolve_s3_backend<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
 ) -> Result<BackendConfig, BackendConfigError> {
     let (mut attributes, mut errors) =
         canonicalize_attributes(config, &s3_schema(), &["bucket", "key"]);
@@ -440,8 +443,8 @@ fn resolve_s3_backend<P: PlaceholderKind>(
     }))
 }
 
-fn resolve_local_backend<P: PlaceholderKind>(
-    config: &parser::BackendConfig<P>,
+fn resolve_local_backend<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
 ) -> Result<BackendConfig, BackendConfigError> {
     let (mut attributes, mut errors) = canonicalize_attributes(config, &local_schema(), &[]);
     let path = collect_attribute(
@@ -455,10 +458,12 @@ fn resolve_local_backend<P: PlaceholderKind>(
     Ok(BackendConfig::Local(LocalBackendSettings { path }))
 }
 
-impl<P: PlaceholderKind> TryFrom<&parser::BackendConfig<P>> for BackendConfig {
+impl<P: PlaceholderKind, B: BindingAddress> TryFrom<&parser::BackendConfig<P, B>>
+    for BackendConfig
+{
     type Error = BackendConfigError;
 
-    fn try_from(config: &parser::BackendConfig<P>) -> Result<Self, Self::Error> {
+    fn try_from(config: &parser::BackendConfig<P, B>) -> Result<Self, Self::Error> {
         match config.backend_type.as_str() {
             S3_BACKEND_TYPE => resolve_s3_backend(config),
             LOCAL_BACKEND_TYPE => resolve_local_backend(config),

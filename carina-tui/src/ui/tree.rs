@@ -167,7 +167,10 @@ mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, Value};
+    use carina_core::resource::{
+        AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
+        ExpandedResource as Resource, ExpandedValue as Value, ResolvedResource,
+    };
     use carina_core::schema::SchemaRegistry;
 
     use crate::ui::test_render::{
@@ -176,6 +179,17 @@ mod tests {
 
     fn create(resource: Resource) -> Effect {
         Effect::Create(ResolvedResource::new(resource))
+    }
+
+    fn absolute(binding: &str) -> AbsoluteBindingAddress {
+        carina_core::resource::absolute_binding_address_for_test(binding)
+    }
+
+    fn root_ref(binding: &str, attribute: &str) -> Value {
+        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
+            .resolve_root_for_test()
+            .into_expanded()
+            .expect("tree fixture contains no parser placeholder")
     }
 
     #[test]
@@ -191,7 +205,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(create(
             Resource::new("ec2.Vpc", "my-vpc")
-                .with_binding("vpc")
+                .with_absolute_binding(absolute("vpc"))
                 .with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
@@ -199,11 +213,8 @@ mod tests {
         ));
         plan.add(create(
             Resource::new("ec2.Subnet", "my-subnet")
-                .with_binding("subnet")
-                .with_attribute(
-                    "vpc_id",
-                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-                ),
+                .with_absolute_binding(absolute("subnet"))
+                .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
         ));
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
@@ -216,23 +227,17 @@ mod tests {
     fn tree_connector_multiple_children() {
         let mut plan = Plan::new();
         plan.add(create(
-            Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
+            Resource::new("ec2.Vpc", "my-vpc").with_absolute_binding(absolute("vpc")),
         ));
         plan.add(create(
             Resource::new("ec2.Subnet", "subnet-a")
-                .with_binding("subnet_a")
-                .with_attribute(
-                    "vpc_id",
-                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-                ),
+                .with_absolute_binding(absolute("subnet_a"))
+                .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
         ));
         plan.add(create(
             Resource::new("ec2.Subnet", "subnet-b")
-                .with_binding("subnet_b")
-                .with_attribute(
-                    "vpc_id",
-                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-                ),
+                .with_absolute_binding(absolute("subnet_b"))
+                .with_attribute("vpc_id", root_ref("vpc", "vpc_id")),
         ));
         let app = App::for_plan(&plan, &SchemaRegistry::new());
 
@@ -249,29 +254,21 @@ mod tests {
     fn selected_ancestor_row_keeps_connector_indent_unstyled() {
         let mut plan = Plan::new();
         plan.add(create(
-            Resource::new("test.Root", "root").with_binding("root"),
+            Resource::new("test.Root", "root").with_absolute_binding(absolute("root")),
         ));
         plan.add(create(
             Resource::new("test.Parent", "parent")
-                .with_binding("parent")
-                .with_attribute(
-                    "root_id",
-                    Value::resource_ref("root".to_string(), "id".to_string(), vec![]),
-                ),
+                .with_absolute_binding(absolute("parent"))
+                .with_attribute("root_id", root_ref("root", "id")),
         ));
         plan.add(create(
             Resource::new("test.Ancestor", "ancestor")
-                .with_binding("ancestor")
-                .with_attribute(
-                    "parent_id",
-                    Value::resource_ref("parent".to_string(), "id".to_string(), vec![]),
-                ),
+                .with_absolute_binding(absolute("ancestor"))
+                .with_attribute("parent_id", root_ref("parent", "id")),
         ));
         plan.add(create(
-            Resource::new("test.Leaf", "matching-leaf").with_attribute(
-                "ancestor_id",
-                Value::resource_ref("ancestor".to_string(), "id".to_string(), vec![]),
-            ),
+            Resource::new("test.Leaf", "matching-leaf")
+                .with_attribute("ancestor_id", root_ref("ancestor", "id")),
         ));
         let mut app = App::for_plan(&plan, &SchemaRegistry::new());
         app.search_query = "matching-leaf".to_string();

@@ -17,6 +17,10 @@ path = "src/aws.rs"
 name = "carina-provider-mock-http-aws-unused"
 path = "src/aws_unused.rs"
 
+[[bin]]
+name = "carina-provider-mock-http-sdk-only"
+path = "src/sdk_only.rs"
+
 [dependencies]
 carina-plugin-sdk = { path = "../carina-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
@@ -25,5 +29,3 @@ serde = { version = "1", features = ["derive"] }
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x", "test-util"] }
 futures = "0.3"
 serde_json = "1"
-wasi = "0.14"
-wit-bindgen = { workspace = true }

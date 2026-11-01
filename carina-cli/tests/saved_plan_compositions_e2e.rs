@@ -500,7 +500,7 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
     let bindings = saved_plan
         .compositions
         .iter()
-        .filter_map(|composition| composition.binding.as_deref())
+        .filter_map(|composition| composition.binding.as_ref().map(|binding| binding.as_str()))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         bindings,
@@ -534,7 +534,9 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
     let published = saved_plan
         .compositions
         .iter()
-        .find(|composition| composition.binding.as_deref() == Some("published"))
+        .find(|composition| {
+            composition.binding.as_ref().map(|binding| binding.as_str()) == Some("published")
+        })
         .expect("bound call with outputs");
     assert!(
         published.signature.attributes.contains_key("identifier"),
@@ -552,7 +554,9 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
     let silent = saved_plan
         .compositions
         .iter()
-        .find(|composition| composition.binding.as_deref() == Some("silent"))
+        .find(|composition| {
+            composition.binding.as_ref().map(|binding| binding.as_str()) == Some("silent")
+        })
         .expect("bound call without outputs");
     assert!(
         silent.signature.attributes.is_empty(),

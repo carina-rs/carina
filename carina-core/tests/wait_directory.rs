@@ -37,7 +37,8 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
     );
     assert_eq!(wait.timeout_secs, Some(75 * 60));
     assert_eq!(wait.depends_on, vec!["validation_record"]);
-    assert_eq!(wait.until_predicate.lhs_segments, vec!["cert", "status"]);
+    assert_eq!(wait.until_predicate.root, "cert");
+    assert_eq!(wait.until_predicate.attribute_segments, vec!["status"]);
     assert_eq!(
         wait.until_predicate.rhs,
         Value::Concrete(ConcreteValue::String(

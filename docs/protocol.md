@@ -1,5 +1,80 @@
 # Provider protocol versions
 
+The current protocol and minimum supported provider protocol are both **16**.
+
+| Protocol version | Minimum provider protocol | Change |
+|------------------|---------------------------|--------|
+| 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
+| 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
+| 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 16
+
+Protocol v16 makes declared anonymous identity a closed schema mode and changes
+its address semantics. `PROTOCOL_VERSION` and
+`MIN_SUPPORTED_PROTOCOL_VERSION` are both 16. A v16 host therefore rejects a
+v15 provider through the existing version check before attempting to decode
+its schemas. This is required because the v15 top-level `identity` boolean
+meant “add this value to the configured create-only hash inputs” and earlier
+providers could set it on mutable attributes. Interpreting that boolean with
+v16 semantics would silently change addresses or produce a misleading schema
+decode error.
+
+Every top-level `AttributeSchema` and nested `StructField` schema JSON record
+now carries a required `identity` value from the closed enum `none`, `required`,
+or `when_present`; the field has no serde default. Nested fields also carry the
+required `create_only` boolean introduced with nested identity. The host
+rebuilds decoded records through the same input-mode and create-only builders
+used by native schemas. Both identity modes require create-only scalar or enum
+leaves. Identity is rejected on provider-populated values, on a collection or
+struct value itself, below lists, maps, or unions, and below a
+provider-populated ancestor. `when_present` is additionally valid only for
+optional input. These declarations participate in semantic schema fingerprint
+encoding v7.
+
+For anonymous resources, one or more declared identity paths select the
+identity-only address encoding; other create-only values are excluded. If no
+identity path is declared, the host retains the create-only fallback. Nested
+paths are represented as typed attribute/struct-field segments in the host and
+are never transported as a dotted string. A `required` identity must be
+written, even when its schema input is optional. An omitted `when_present`
+identity instead contributes a dedicated typed absence value. Once written,
+either mode has the same rules: a stable written value or authored expression
+is required at plan time. Written values are schema-canonicalized. References
+and composite expressions whose leaves are references or literals are hashed
+by their deterministic authored spelling, and generated names hash their
+authored prefix as a separate typed value. A written `Unknown` or
+`Unavailable` value, placeholder, secret, or expression containing such a leaf
+is incomplete identity rather than absence; the user can give the resource a
+name with `let` when no stable identity material exists.
+
+The declared-identity hash encoding is typed and length-prefixed. It contains
+the length-prefixed domain `carina-anonymous-identity-v1`; the sorted
+provider-identity entry count and each length-prefixed key and value; then the
+identity-path count. Each path has its segment count followed by segments
+tagged `0` for an attribute or `1` for a struct field and a length-prefixed
+name. Its value then has a kind tag: `0` for `Written`, `1` for
+`ReferenceExpression`, `2` for `Prefix`, `3` for `PrefixExpression`, or `4`
+for `Absent`. Tags 0 through 3 retain their existing spelling payload; tag 4
+has no payload. Counts and lengths are unsigned 64-bit little-endian integers.
+The address suffix is the first 32 bits of the SHA-256 digest, interpreted in
+big-endian byte order. Consequently absence cannot collide with any written
+value, including the empty string.
+
+During anonymous-address reconciliation, an absent desired `when_present`
+identity matches only a candidate state row whose corresponding attribute or
+field is also absent. It does not match an empty string or any other written
+value. This lets migration to the declared-identity address select the same
+real-world object without conflating omission with an unresolved value.
+
+Nested create-only leaves in an unordered list are compared as a multiset,
+independent of element order and mutable sibling fields. Reordering alone is
+not a create-only change. Adding an element with an authored create-only leaf
+is a create-only change and therefore replaces the resource.
+
+The WIT world is unchanged in v16; the incompatible representation is in the
+schema JSON records. Hosts and providers must both use protocol v16.
+
 ## Version 15
 
 Protocol v15 separates an asynchronous mutation from its post-mutation
@@ -180,6 +255,11 @@ Saved-plan format 36 adds typed deferred-for templates and stage-specific
 placeholder values. Deferred template attributes are serialized only through
 their `template_resource`. Older plans are rejected with the same replan
 guidance; the state format remains unchanged.
+
+Saved-plan format 37 requires `file` (a relative path or null) and `line` on
+each deferred-for template so apply-time failures retain their source location.
+Absolute diagnostic paths are not persisted. Format 36 and older plans must
+be regenerated; there is no saved-plan backward compatibility.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host

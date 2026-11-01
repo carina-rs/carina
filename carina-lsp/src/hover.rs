@@ -7,13 +7,15 @@ use crate::document::Document;
 use crate::enclosing_block::{EnclosingBlock, ResourceTypePatterns, StructPath, enclosing_block};
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, display_string_literal};
-use carina_core::resource::{ConcreteValue, ParserPlaceholder, Value as GenericValue};
+use carina_core::resource::{
+    ConcreteValue, ParserPlaceholder, RelativeBindingName, Value as GenericValue,
+};
 use carina_core::schema::EffectiveSchemaNode;
 #[cfg(test)]
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::{CompletionValue, SchemaRegistry, ValidatedResourceSchema};
 
-type Value = GenericValue<ParserPlaceholder>;
+type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
 /// Find the `source` path of a `let <alias> = use {...}` declaration
 /// for `alias`. Tries the buffer's own parse first, then walks sibling

@@ -380,11 +380,7 @@ mod tests {
             &carina_core::schema::SchemaRegistry::new(),
         )
         .unwrap();
-        let parsed = loaded
-            .parsed
-            .into_expanded()
-            .expect("provider fixture contains no parser placeholders");
-        let config = parsed.providers.first().unwrap();
+        let config = loaded.parsed.providers.first().unwrap();
         let installed = carina_provider_resolver::find_installed_provider(project, config).unwrap();
         let grants = TrustedLocalGrants::parse(&[], None).unwrap();
         let class = installed

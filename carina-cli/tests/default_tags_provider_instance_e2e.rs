@@ -172,7 +172,7 @@ let b = mock.test.resource {
     let resource_index = plan
         .sorted_resources
         .iter()
-        .position(|resource| resource.binding.as_deref() == Some("b"))
+        .position(|resource| resource.binding.as_ref().map(|binding| binding.as_str()) == Some("b"))
         .expect("resource b must be present");
     let resource = &plan.sorted_resources[resource_index];
 

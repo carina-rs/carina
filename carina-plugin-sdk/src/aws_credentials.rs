@@ -96,31 +96,13 @@ impl fmt::Display for AwsCredentialError {
 
 impl std::error::Error for AwsCredentialError {}
 
-#[cfg(target_arch = "wasm32")]
-mod bindings {
-    crate::__carina_wit_bindgen!({
-        world: "carina-provider-aws",
-        // LLD concatenates same-named sections; the consumer's export bindings
-        // use the default name, so the SDK bindings need their own suffix.
-        type_section_suffix: "carina-plugin-sdk-aws-credentials",
-        with: {
-            "wasi:io/poll@0.2.6": ::wasi::io::poll,
-            "wasi:io/error@0.2.6": ::wasi::io::error,
-            "wasi:io/streams@0.2.6": ::wasi::io::streams,
-            "wasi:clocks/monotonic-clock@0.2.6": ::wasi::clocks::monotonic_clock,
-            "wasi:http/types@0.2.6": ::wasi::http::types,
-            "wasi:http/outgoing-handler@0.2.6": ::wasi::http::outgoing_handler,
-        },
-    });
-}
-
 /// Requests the current host-resolved base credentials.
 ///
 /// Native provider builds receive a typed error because the import exists only
 /// in an AWS-world Wasm guest.
 #[cfg(target_arch = "wasm32")]
 pub fn current() -> Result<AwsCredentials, AwsCredentialError> {
-    use bindings::carina::provider::aws_credentials as wit;
+    use carina_plugin_bindings_aws_credentials::carina::provider::aws_credentials as wit;
 
     let credentials = wit::current_credentials().map_err(|error| match error {
         wit::AwsCredentialError::NotFound(message) => AwsCredentialError::NotFound(message),

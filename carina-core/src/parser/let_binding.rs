@@ -509,13 +509,13 @@ fn parse_primary_inner_with_resource_or_module(
         Rule::upstream_state_expr => {
             let line = ctx.original_position(&inner)?.line();
             let us = parse_upstream_state_expr(inner, binding_name_str)?;
-            if ctx.upstream_states.contains_key(&us.binding) {
+            if ctx.upstream_states.contains_key(us.binding.as_str()) {
                 return Err(ParseError::DuplicateBinding {
-                    name: us.binding,
+                    name: us.binding.to_string(),
                     line,
                 });
             }
-            ctx.upstream_states.insert(us.binding.clone(), us);
+            ctx.upstream_states.insert(us.binding.to_string(), us);
             Ok((
                 upstream_state_structural_handle(binding_name_str),
                 vec![],

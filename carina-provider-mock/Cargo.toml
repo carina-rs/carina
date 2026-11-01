@@ -25,6 +25,3 @@ uuid = { version = "1", features = ["v4"] }
 carina-core = { path = "../carina-core", features = ["test-utils"] }
 carina-state = { path = "../carina-state" }
 tempfile = "3"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wit-bindgen = { workspace = true }

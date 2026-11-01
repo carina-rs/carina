@@ -1,22 +1,31 @@
 use super::*;
+use crate::parser::ExpandedProviderConfig as ProviderConfig;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    AccessPath, ApplyTimeUnknown, CompositionCall, CompositionCallPath, LoopModulePrefixOrigin,
-    LoopProvenance, ModuleInstanceScope, ModuleSource, PendingReRead, ReReadReason,
-    Resource as StagedResource, ResourceIdentity, Subscript, ValueString,
+    AbsoluteBindingAddress, ApplyTimeUnknown, ExpandedAccessPath as AccessPath,
+    ExpandedCompositionCall as CompositionCall, ExpandedCompositionCallPath as CompositionCallPath,
+    ExpandedConcreteValue as ConcreteValue, ExpandedDeferredValue as DeferredValue,
+    ExpandedInterpolationPart as InterpolationPart, ExpandedResource as Resource,
+    ExpandedValue as Value, LoopModulePrefixOrigin, LoopProvenance, LoopSlot, ModuleInstanceScope,
+    ModuleSource, PendingReRead, ReReadReason, RelativeBindingName, ResourceIdentity, RootScope,
+    Subscript, ValueString,
 };
 use crate::schema::{
     AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
-    ResourceSchema, SchemaRegistry, TypeIdentity, ValidatedConfigSchema,
+    ResourceSchema, SchemaRegistry, StructField, TypeIdentity, ValidatedConfigSchema,
     ValidatedProviderSchemaWitness, enum_identity,
 };
 use indexmap::IndexMap;
 use std::path::Path;
 
-type Value = crate::resource::Value<crate::resource::NoPlaceholder>;
-type ConcreteValue = crate::resource::ConcreteValue<crate::resource::NoPlaceholder>;
-type DeferredValue = crate::resource::DeferredValue<crate::resource::NoPlaceholder>;
-type Resource = StagedResource<ModuleSource, crate::resource::NoPlaceholder>;
+type LoopValue = crate::resource::Value<LoopSlot>;
+type LoopConcreteValue = crate::resource::ConcreteValue<LoopSlot>;
+type LoopDeferredValue = crate::resource::DeferredValue<LoopSlot>;
+type LoopResource = crate::resource::Resource<ModuleSource, LoopSlot>;
+
+fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
+    RootScope::new().resolve(RelativeBindingName::new(binding))
+}
 
 fn concrete_string(value: impl Into<ValueString>) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
@@ -65,11 +74,12 @@ where
     let state_info = registry
         .get(provider, resource_type, crate::schema::SchemaKind::Resource)
         .map(|schema| {
-            AnonymousIdStateInfo::try_from_state_attributes(
+            AnonymousIdStateInfo::try_from_state_row(
                 origin_id.clone(),
                 projected_id.clone(),
                 schema.schema(),
                 &attributes,
+                &HashMap::new(),
             )
         })
         .unwrap_or_else(|| {
@@ -107,7 +117,7 @@ fn live_module_source(name: &str, instance: &str) -> ModuleSource {
         CompositionCallPath::direct(CompositionCall {
             id: crate::parser::ModuleCallId::test_dummy_in(format!("{instance}.crn")),
             module_name: name.to_string(),
-            binding: Some(instance.to_string()),
+            binding: Some(absolute_binding(instance)),
             instance: instance.to_string(),
             module_source: Some(format!("./{name}")),
             module_directory: None,
@@ -117,12 +127,17 @@ fn live_module_source(name: &str, instance: &str) -> ModuleSource {
 }
 
 fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
-    crate::parser::parse_file(
+    let parsed = crate::parser::parse_file(
         source,
         Path::new(file),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("valid loop fixture")
+    .expect("valid loop fixture");
+    crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        Path::new("."),
+    )
+    .expect("loop fixture crosses the module-resolution seam")
     .into_expanded()
     .expect("loop fixture contains no parser placeholders")
     .resources
@@ -150,6 +165,7 @@ fn loop_identity_only_registry() -> SchemaRegistry {
         ResourceSchema::new("ec2.Vpc")
             .attribute(
                 AttributeSchema::optional("identity_input", AttributeType::string())
+                    .create_only()
                     .identity()
                     .build(),
             )
@@ -295,6 +311,21 @@ fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Vec<ResolvedMove> {
+    try_reconcile_anonymous_identifiers(
+        resources,
+        registry,
+        find_state_by_type,
+        find_state_by_binding,
+    )
+    .expect("anonymous reconciliation comparison fixture must resolve")
+}
+
+fn try_reconcile_anonymous_identifiers(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
+) -> Result<Vec<ResolvedMove>, AnonymousIdentifierReconciliationError> {
     let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
         registry,
         resources.iter().map(|resource| &resource.id),
@@ -317,7 +348,6 @@ fn reconcile_anonymous_identifiers(
         find_state_by_binding,
         &claims,
     )
-    .expect("anonymous reconciliation comparison fixture must resolve")
 }
 
 fn resolved_move_identity_pairs(moves: &[ResolvedMove]) -> Vec<(String, String)> {
@@ -452,6 +482,7 @@ fn route53_record_set_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::optional("type", AttributeType::string())
+                .create_only()
                 .identity()
                 .build(),
         )
@@ -493,6 +524,7 @@ fn route53_state_entry(registry: &SchemaRegistry, name: &str) -> AnonymousIdStat
         [
             ("name", concrete_string("carina-rs.dev")),
             ("hosted_zone_id", concrete_string("Z123")),
+            ("type", concrete_string("A")),
         ],
     )
 }
@@ -528,9 +560,82 @@ fn simhash_suffix_for_test(identifier: &str) -> SimHash {
     }
 }
 
+fn budget_identity_schema() -> ResourceSchema {
+    ResourceSchema::new("budgets.Budget")
+        .attribute(
+            AttributeSchema::required(
+                "budget",
+                AttributeType::struct_(
+                    "BudgetData",
+                    vec![
+                        StructField::optional("budget_name", AttributeType::string())
+                            .create_only()
+                            .identity()
+                            .build(),
+                        StructField::required("budget_type", AttributeType::string()).build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "notifications_with_subscribers",
+                AttributeType::list(AttributeType::string()),
+            )
+            .create_only()
+            .build(),
+        )
+}
+
+fn budget_resource(name: Option<&str>, notification: &str) -> Resource {
+    let mut resource = Resource::pending_with_provider("mock", "budgets.Budget", None);
+    let mut budget = IndexMap::new();
+    if let Some(name) = name {
+        budget.insert("budget_name".to_string(), concrete_string(name));
+    }
+    budget.insert("budget_type".to_string(), concrete_string("COST"));
+    resource.set_attr(
+        "budget".to_string(),
+        Value::Concrete(ConcreteValue::Map(budget)),
+    );
+    resource.set_attr(
+        "notifications_with_subscribers".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![concrete_string(notification)])),
+    );
+    resource
+}
+
+fn record_set_identity_schema() -> ResourceSchema {
+    ResourceSchema::new("route53.RecordSet")
+        .attribute(
+            AttributeSchema::required("hosted_zone_id", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required("type", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("aliases", AttributeType::list(AttributeType::string()))
+                .create_only()
+                .build(),
+        )
+}
+
 #[test]
 fn anonymous_identity_basis_is_unavailable_without_a_schema() {
-    let resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &SchemaRegistry::new()),
@@ -540,7 +645,7 @@ fn anonymous_identity_basis_is_unavailable_without_a_schema() {
 
 #[test]
 fn schema_less_anonymous_resources_do_not_create_attribute_derived_conflicts() {
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::pending_with_provider("mock", "unknown.Widget", None),
         Resource::pending_with_provider("mock", "unknown.Widget", None),
     ];
@@ -566,7 +671,7 @@ fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("alpha".into())),
@@ -576,6 +681,766 @@ fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set
         classify_anonymous_identity_basis(&resource, &registry),
         Some(AnonymousIdentityBasis::AttributeDerived),
     );
+}
+
+#[test]
+fn anonymous_missing_declared_identity_is_a_typed_error() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resources = vec![budget_resource(None, "actual")];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("missing declared identity must be rejected");
+
+    assert!(matches!(
+        error,
+        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Anonymous resource of type 'mock.budgets.Budget' cannot derive an address because \
+         identity value 'budget.budget_name' is not available as a written value or authored \
+         expression at plan time. Write the identity value or give the resource a name with \
+         `let`.",
+    );
+}
+
+#[test]
+fn secret_declared_identity_is_incomplete_and_suggests_a_let_binding() {
+    let registry = scalar_identity_registry();
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(
+            "must-not-reach-the-address-hash",
+        )))),
+    );
+    let mut resources = vec![resource];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("secret plaintext must not participate in a declared-identity address");
+
+    let AnonymousIdentityError::IncompleteDeclaredIdentity(incomplete) = &error else {
+        panic!("expected incomplete declared identity, got {error}");
+    };
+    assert_eq!(
+        incomplete
+            .missing_paths()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["name"],
+    );
+    assert!(error.to_string().contains("name with `let`"), "{error}");
+    assert!(resources[0].id.identity_str().is_none());
+}
+
+#[test]
+fn legacy_create_only_secret_remains_a_stable_identity_input() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.legacy_secret")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("legacy create-only fixture schema must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "test.legacy_secret", None);
+    resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(
+            "legacy-hash-material",
+        )))),
+    );
+    let mut resources = vec![resource];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("the legacy create-only hash continues to accept secret values");
+
+    assert!(
+        resources[0]
+            .id
+            .identity_str()
+            .is_some_and(|identity| identity.starts_with("mock_test_legacy_secret_")),
+    );
+}
+
+#[test]
+fn anonymous_deferred_declared_identity_is_a_typed_error() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resource = LoopResource::pending_with_provider("mock", "budgets.Budget", None);
+    resource.set_attr(
+        "budget",
+        LoopValue::Concrete(LoopConcreteValue::Map(IndexMap::from([
+            (
+                "budget_name".to_string(),
+                LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
+            ),
+            (
+                "budget_type".to_string(),
+                LoopValue::Concrete(LoopConcreteValue::String("COST".into())),
+            ),
+        ]))),
+    );
+    let mut resources = vec![resource];
+    let providers = CanonicalizedProviderConfigs::<LoopSlot>::from_configs_for_test(Vec::new());
+    let resources = crate::value::canonicalize_resources_with_schemas(&mut resources, &registry)
+        .expect("loop-placeholder identity fixture must canonicalize");
+
+    let error = compute_anonymous_identifiers_with_provider_configs(
+        resources,
+        &providers,
+        &registry,
+        AnonymousIdentityConflictPolicy::RejectAttributeDerived,
+        &|_| Vec::new(),
+    )
+    .expect_err("deferred declared identity must be rejected");
+
+    assert!(matches!(
+        error,
+        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
+    ));
+}
+
+#[test]
+fn anonymous_reference_valued_declared_identity_produces_a_stable_address() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("identity schema fixture must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "name",
+        Value::root_resource_ref("source", "name", Vec::new()),
+    );
+    let mut resources = vec![resource];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("a reference expression is a complete declared identity value");
+
+    assert!(
+        resources[0]
+            .id
+            .identity_str()
+            .is_some_and(|identity| identity.starts_with("mock_test_resource_")),
+        "the anonymous address must be known before the reference resolves",
+    );
+}
+
+fn scalar_identity_registry() -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("identity schema fixture must be valid"),
+    );
+    registry
+}
+
+fn when_present_identity_registry() -> SchemaRegistry {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.optional_identity")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .identity_when_present()
+                    .build(),
+            )
+            .validate()
+            .expect("when-present identity schema fixture must be valid"),
+    );
+    registry
+}
+
+#[test]
+fn when_present_identity_absence_has_a_distinct_address_from_every_written_fixture() {
+    let registry = when_present_identity_registry();
+    let absent = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    let mut empty = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    empty.set_attr("name", concrete_string(""));
+    let mut marker_like = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    marker_like.set_attr("name", concrete_string("Absent"));
+    let mut resources = vec![absent, empty, marker_like];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("absence and written values are complete, disjoint identity inputs");
+
+    let identities = resources
+        .iter()
+        .map(|resource| resource.id.identity_str().expect("computed address"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(identities.len(), resources.len());
+}
+
+#[test]
+fn nested_when_present_identity_distinguishes_an_absent_field_from_an_empty_string() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.nested_optional_identity")
+            .attribute(
+                AttributeSchema::required(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("name", AttributeType::string())
+                                .create_only()
+                                .identity_when_present()
+                                .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("nested when-present identity schema fixture must be valid"),
+    );
+    let mut absent = Resource::pending_with_provider("mock", "test.nested_optional_identity", None);
+    absent.set_attr(
+        "settings",
+        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+    );
+    let mut empty = Resource::pending_with_provider("mock", "test.nested_optional_identity", None);
+    empty.set_attr(
+        "settings",
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "name".to_string(),
+            concrete_string(""),
+        )]))),
+    );
+    let mut resources = vec![absent, empty];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("nested absence is a complete identity value");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn written_unknown_when_present_identity_remains_incomplete() {
+    let registry = when_present_identity_registry();
+    let mut resource = Resource::pending_with_provider("mock", "test.optional_identity", None);
+    resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::PendingReRead(
+            PendingReRead::new(ReReadReason::NotFound),
+        ))),
+    );
+    let mut resources = vec![resource];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("a written unknown is not the same as an absent identity value");
+
+    assert!(matches!(
+        error,
+        AnonymousIdentityError::IncompleteDeclaredIdentity(_)
+    ));
+    assert!(resources[0].id.identity_str().is_none());
+}
+
+fn anonymous_identity_for_value(registry: &SchemaRegistry, value: Value) -> ResourceId {
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr("name", value);
+    let mut resources = vec![resource];
+    compute_anonymous_identifiers_for_test(&mut resources, &[], registry, &|_| Vec::new())
+        .expect("the authored expression is a complete identity value");
+    resources.remove(0).id
+}
+
+#[test]
+fn interpolation_over_reference_declared_identity_has_a_stable_address() {
+    let registry = scalar_identity_registry();
+    let expression = || {
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("/aws/ecs/".into()),
+            InterpolationPart::Expr(Value::root_resource_ref(
+                "cluster",
+                "cluster_name",
+                Vec::new(),
+            )),
+        ]))
+    };
+
+    let first = anonymous_identity_for_value(&registry, expression());
+    let second = anonymous_identity_for_value(&registry, expression());
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn function_call_over_reference_declared_identity_has_a_stable_address() {
+    let registry = scalar_identity_registry();
+    let expression = || {
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![Value::root_resource_ref("cluster", "cluster_name", Vec::new()).into()],
+            source_line: 0.into(),
+        })
+    };
+
+    let first = anonymous_identity_for_value(&registry, expression());
+    let second = anonymous_identity_for_value(&registry, expression());
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn written_and_reference_expression_identity_spellings_do_not_collide() {
+    let registry = scalar_identity_registry();
+    let mut written = Resource::pending_with_provider("mock", "test.resource", None);
+    written.set_attr("name", concrete_string("ResourceRef(zone.id)"));
+    let mut referenced = Resource::pending_with_provider("mock", "test.resource", None);
+    referenced.set_attr("name", Value::root_resource_ref("zone", "id", Vec::new()));
+    let mut resources = vec![written, referenced];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("typed identity values must occupy disjoint hash domains");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn written_and_prefix_identity_spellings_do_not_collide() {
+    let registry = scalar_identity_registry();
+    let mut written = Resource::pending_with_provider("mock", "test.resource", None);
+    written.set_attr("name", concrete_string("Prefix(\"app-\")"));
+    let mut prefixed = Resource::pending_with_provider("mock", "test.resource", None);
+    prefixed
+        .prefixes
+        .insert("name".to_string(), "app-".to_string());
+    let mut resources = vec![written, prefixed];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("prefixes must occupy their own typed identity hash domain");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn declared_identity_prefix_expression_hashes_by_spelling_with_distinct_kind() {
+    let registry = scalar_identity_registry();
+    let reference = || Value::root_resource_ref("prefix_source", "value", Vec::new());
+    let mut direct = Resource::pending_with_provider("mock", "test.resource", None);
+    direct.set_attr("name", reference());
+    let mut prefixed = Resource::pending_with_provider("mock", "test.resource", None);
+    prefixed.set_attr("name_prefix", reference());
+    let mut resources = vec![direct, prefixed];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("an authored prefix expression is a complete identity input");
+
+    assert_ne!(
+        resources[0].id, resources[1].id,
+        "an identity value expression and prefix expression need distinct hash tags",
+    );
+}
+
+#[test]
+fn named_resource_is_unaffected_by_missing_declared_identity() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let incomplete = budget_resource(None, "actual");
+    let mut named = Resource::with_provider(
+        "mock",
+        "budgets.Budget",
+        ResourceIdentity::new("monthly_budget"),
+        None,
+    );
+    named.binding = Some(absolute_binding("monthly_budget"));
+    named.attributes = incomplete.attributes;
+    let mut resources = vec![named];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("named resources do not require declared identity for addressing");
+    assert_eq!(resources[0].id.identity_str(), Some("monthly_budget"));
+}
+
+#[test]
+fn anonymous_incomplete_composite_identity_is_classified_as_incomplete() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema fixture must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "route53.RecordSet", None);
+    resource.set_attr("hosted_zone_id".to_string(), concrete_string("Z1"));
+    resource.set_attr("name".to_string(), concrete_string("www.example.com"));
+    // `type`, the third component of the natural key, is intentionally absent.
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        Some(AnonymousIdentityBasis::IncompleteDeclaredIdentity),
+    );
+}
+
+#[test]
+fn declared_nested_identity_excludes_mutable_create_only_values_from_address() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+
+    let mut before = vec![budget_resource(Some("monthly"), "actual")];
+    let mut after = vec![budget_resource(Some("monthly"), "forecasted")];
+    compute_anonymous_identifiers_for_test(&mut before, &[], &registry, &|_| Vec::new())
+        .expect("first budget identity");
+    compute_anonymous_identifiers_for_test(&mut after, &[], &registry, &|_| Vec::new())
+        .expect("second budget identity");
+
+    assert_eq!(before[0].id, after[0].id);
+}
+
+#[test]
+fn different_nested_identity_values_produce_different_addresses() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resources = vec![
+        budget_resource(Some("monthly"), "actual"),
+        budget_resource(Some("annual"), "actual"),
+    ];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("different nested identity values must not collide");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn generic_generated_address_collision_is_rejected_across_provider_instances() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::required("immutable", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let resource = |provider_instance: Option<&str>| {
+        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+        resource.id.provider_instance = provider_instance.map(str::to_string);
+        resource.set_attr("immutable", concrete_string("same"));
+        resource
+    };
+    let mut resources = vec![resource(None), resource(Some("west"))];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("a generic generated address must remain globally collision-checked");
+
+    let AnonymousIdentityError::Collision(collision) = error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::SharedAddress,
+    );
+}
+
+#[test]
+fn equal_declared_identity_values_are_a_typed_error_suggesting_let() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resources = vec![
+        budget_resource(Some("monthly"), "actual"),
+        budget_resource(Some("monthly"), "forecasted"),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("equal declared identity must be rejected");
+
+    let AnonymousIdentityError::Collision(collision) = &error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
+            same_identifier: true,
+        },
+    );
+    assert!(
+        error.to_string().contains("equal declared identity values"),
+        "{error}",
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("Give one of them a name with `let`"),
+        "{error}",
+    );
+}
+
+#[test]
+fn equal_declared_identity_values_are_rejected_across_provider_instances() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let resource = |provider_instance: Option<&str>| {
+        let mut resource = budget_resource(Some("monthly"), "actual");
+        resource.id.provider_instance = provider_instance.map(str::to_string);
+        resource
+    };
+    let mut resources = vec![resource(None), resource(Some("west"))];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("state-key aliases across provider instances must be rejected");
+
+    let AnonymousIdentityError::Collision(collision) = &error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
+            same_identifier: true,
+        },
+    );
+    assert!(
+        error.to_string().contains("equal declared identity values"),
+        "{error}",
+    );
+}
+
+#[test]
+fn equal_declared_identity_values_are_rejected_across_module_scopes() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut resources = vec![
+        budget_resource(Some("monthly"), "actual")
+            .with_module_source(live_module_source("budget", "module_one")),
+        budget_resource(Some("monthly"), "forecasted")
+            .with_module_source(live_module_source("budget", "module_two")),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("module address prefixes must not hide equal real-world identities");
+
+    let AnonymousIdentityError::Collision(collision) = &error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
+            same_identifier: false,
+        },
+    );
+    assert!(
+        error.to_string().contains("equal declared identity values"),
+        "{error}",
+    );
+}
+
+#[test]
+fn composite_identity_hashes_every_record_set_key_component() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema"),
+    );
+    let record = |zone: &str, name: &str, record_type: &str| {
+        let mut resource = Resource::pending_with_provider("mock", "route53.RecordSet", None);
+        resource.set_attr("hosted_zone_id".to_string(), concrete_string(zone));
+        resource.set_attr("name".to_string(), concrete_string(name));
+        resource.set_attr("type".to_string(), concrete_string(record_type));
+        resource
+    };
+    let mut resources = vec![
+        record("Z1", "www.example.com", "A"),
+        record("Z2", "www.example.com", "A"),
+        record("Z1", "api.example.com", "A"),
+        record("Z1", "www.example.com", "AAAA"),
+    ];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("each complete composite key is distinct");
+
+    let identities = resources
+        .iter()
+        .map(|resource| resource.id.identity_str().unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(identities.len(), resources.len());
+}
+
+fn reference_record_set(zone_binding: &str, name: &str, record_type: &str) -> Resource {
+    let mut resource = Resource::pending_with_provider("mock", "route53.RecordSet", None);
+    resource.set_attr(
+        "hosted_zone_id".to_string(),
+        Value::root_resource_ref(zone_binding, "id", Vec::new()),
+    );
+    resource.set_attr("name".to_string(), concrete_string(name));
+    resource.set_attr("type".to_string(), concrete_string(record_type));
+    resource
+}
+
+#[test]
+fn equal_reference_expressions_and_written_identity_values_are_duplicates() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema"),
+    );
+    let mut resources = vec![
+        reference_record_set("zone", "www.example.com", "A"),
+        reference_record_set("zone", "www.example.com", "A"),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("the same reference expression and written key must be a duplicate");
+
+    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    assert!(
+        error.to_string().contains("equal declared identity values"),
+        "{error}",
+    );
+}
+
+#[test]
+fn different_reference_expressions_are_distinct_identity_values() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema"),
+    );
+    let mut resources = vec![
+        reference_record_set("primary_zone", "www.example.com", "A"),
+        reference_record_set("secondary_zone", "www.example.com", "A"),
+    ];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("different authored references remain distinct even if they later resolve equally");
+
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn longer_reference_chain_is_a_complete_identity_value() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .identity()
+                    .build(),
+            )
+            .validate()
+            .expect("identity schema fixture must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "name",
+        Value::root_resource_ref("source", "details", vec!["generated_name".to_string()]),
+    );
+    let mut resources = vec![resource];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("a longer resource-reference chain is complete at plan time");
+
+    assert!(resources[0].id.identity_str().is_some());
+}
+
+#[test]
+fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
+    let reference =
+        Value::root_resource_ref("source", "details", vec!["generated_name".to_string()]);
+    let source = AnonymousIdBindingStateInfo {
+        name: "source".to_string(),
+        attribute_values: HashMap::from([(
+            "details".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "generated_name".to_string(),
+                concrete_string("resolved-name"),
+            )]))),
+        )]),
+    };
+
+    let resolved = resolve_deferred_create_only_value(&reference, &|binding| {
+        (binding == "source")
+            .then(|| source.clone())
+            .into_iter()
+            .collect()
+    });
+
+    assert_eq!(resolved, Some(concrete_string("resolved-name")));
 }
 
 #[test]
@@ -592,11 +1457,11 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "immutable_name".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("source", "name"),
+            path: AccessPath::root("source", "name"),
         }),
     );
 
@@ -610,6 +1475,7 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
 fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -618,7 +1484,7 @@ fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource
         .prefixes
         .insert("immutable_name".to_string(), "example-".to_string());
@@ -641,7 +1507,7 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
         "mock",
         schema.validate().expect("schema fixture must be valid"),
     );
-    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    let mut resource: Resource = Resource::pending_with_provider("mock", "test.resource", None);
     resource.set_attr(
         "immutable_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("example-".into())),
@@ -654,9 +1520,10 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
 }
 
 #[test]
-fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
+fn identity_attribute_prefix_values_produce_distinct_anonymous_addresses() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -674,17 +1541,22 @@ fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
         .insert("immutable_name".to_string(), "beta-".to_string());
     let mut resources = vec![alpha, beta];
 
-    let result =
-        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("resolved identity prefixes must produce complete addresses");
 
-    assert!(result.is_ok(), "prefixes must not collide: {result:?}");
+    assert!(
+        resources
+            .iter()
+            .all(|resource| resource.id.identity().is_some())
+    );
     assert_ne!(resources[0].id, resources[1].id);
 }
 
 #[test]
-fn unresolved_identity_prefix_values_produce_distinct_stable_identifiers() {
+fn unresolved_identity_prefix_values_produce_distinct_anonymous_addresses() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -705,12 +1577,13 @@ fn unresolved_identity_prefix_values_produce_distinct_stable_identifiers() {
     );
     let mut resources = vec![alpha, beta];
 
-    let result =
-        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("unresolved identity prefixes must produce complete addresses");
 
     assert!(
-        result.is_ok(),
-        "unresolved prefix inputs must be hashed: {result:?}"
+        resources
+            .iter()
+            .all(|resource| resource.id.identity().is_some())
     );
     assert_ne!(resources[0].id, resources[1].id);
 }
@@ -762,9 +1635,11 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
         &crate::parser::ProviderContext::default(),
     )
     .expect("the parser must preserve the authored use for typed validation");
-    let parsed =
-        crate::module_resolver::resolve_modules_providerless(parsed, std::path::Path::new("."))
-            .expect("the fixture crosses module resolution before readiness validation");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+        std::path::Path::new("."),
+    )
+    .expect("the fixture crosses module resolution before readiness validation");
     let error = crate::validation::resolve_bare_binding_uses(
         parsed,
         &SchemaRegistry::new(),
@@ -830,7 +1705,7 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
         resource.set_attr(
             "source".to_string(),
             Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::with_fields_and_subscripts(
+                path: AccessPath::root_with_fields_and_subscripts(
                     "source",
                     "values",
                     vec![],
@@ -859,9 +1734,10 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
 }
 
 #[test]
-fn unresolved_and_resolved_prefix_forms_hash_to_the_same_identity() {
+fn unresolved_and_resolved_identity_prefix_forms_have_the_same_complete_identity() {
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
             .identity()
             .build(),
     );
@@ -885,13 +1761,174 @@ fn unresolved_and_resolved_prefix_forms_hash_to_the_same_identity() {
     compute_anonymous_identifiers_for_test(&mut unresolved_resources, &[], &registry, &|_| {
         Vec::new()
     })
-    .expect("unresolved prefix identity");
+    .expect("unresolved identity prefix must be complete");
     compute_anonymous_identifiers_for_test(&mut resolved_resources, &[], &registry, &|_| {
         Vec::new()
     })
-    .expect("resolved prefix identity");
+    .expect("resolved identity prefix must be complete");
 
     assert_eq!(unresolved_resources[0].id, resolved_resources[0].id);
+}
+
+#[test]
+fn declared_identity_prefix_is_complete_and_hashes_the_same_before_and_after_resolution() {
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    let mut unresolved = Resource::pending_with_provider("mock", "test.resource", None);
+    unresolved.set_attr("immutable_name_prefix", concrete_string("service-"));
+    let mut resolved = Resource::pending_with_provider("mock", "test.resource", None);
+    resolved
+        .prefixes
+        .insert("immutable_name".to_string(), "service-".to_string());
+    resolved.set_attr("immutable_name", concrete_string("service-random"));
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&unresolved, &registry),
+        Some(AnonymousIdentityBasis::Stable),
+    );
+    assert_eq!(
+        classify_anonymous_identity_basis(&resolved, &registry),
+        Some(AnonymousIdentityBasis::Stable),
+    );
+
+    let mut unresolved = vec![unresolved];
+    let mut resolved = vec![resolved];
+    compute_anonymous_identifiers_for_test(&mut unresolved, &[], &registry, &|_| Vec::new())
+        .expect("unresolved prefix must produce a complete declared identity");
+    compute_anonymous_identifiers_for_test(&mut resolved, &[], &registry, &|_| Vec::new())
+        .expect("resolved prefix must produce a complete declared identity");
+
+    assert_eq!(unresolved[0].id, resolved[0].id);
+}
+
+#[test]
+fn declared_identity_reconciliation_classifies_both_prefix_forms_as_complete() {
+    let schema = ResourceSchema::new("test.resource").attribute(
+        AttributeSchema::optional("immutable_name", AttributeType::string())
+            .create_only()
+            .identity()
+            .build(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        schema.validate().expect("schema fixture must be valid"),
+    );
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.resource",
+        "mock_test_resource_11111111",
+        None,
+        None,
+        [("immutable_name", concrete_string("service-existing"))],
+    )];
+    let unresolved = Resource::with_provider(
+        "mock",
+        "test.resource",
+        ResourceIdentity::new("mock_test_resource_22222222"),
+        None,
+    )
+    .with_attribute("immutable_name_prefix", concrete_string("service-"));
+    let mut resolved = Resource::with_provider(
+        "mock",
+        "test.resource",
+        ResourceIdentity::new("mock_test_resource_33333333"),
+        None,
+    );
+    resolved
+        .prefixes
+        .insert("immutable_name".to_string(), "service-".to_string());
+    resolved.set_attr("immutable_name", concrete_string("service-random"));
+
+    for resource in [unresolved, resolved] {
+        let destination = resource.id.identity_str().unwrap().to_string();
+        let moves = reconcile_anonymous_identifiers(
+            std::slice::from_ref(&resource),
+            &registry,
+            &|_provider, _resource_type| state_entries.clone(),
+            &|_binding| Vec::new(),
+        );
+        assert_eq!(
+            resolved_move_identity_pairs(&moves),
+            vec![("mock_test_resource_11111111".to_string(), destination)],
+        );
+    }
+}
+
+fn canonical_record_type_identity_schema() -> ResourceSchema {
+    ResourceSchema::new("route53.RecordSet").attribute(
+        AttributeSchema::required(
+            "type",
+            AttributeType::enum_(
+                enum_identity("RecordType", Some("mock.route53.RecordSet")),
+                Some(vec!["A".to_string(), "AAAA".to_string()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+        )
+        .create_only()
+        .identity()
+        .build(),
+    )
+}
+
+fn canonical_record_type_resource(value: Value) -> Resource {
+    Resource::pending_with_provider("mock", "route53.RecordSet", None).with_attribute("type", value)
+}
+
+#[test]
+fn declared_identity_hash_canonicalizes_enum_identifier_and_string_values() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        canonical_record_type_identity_schema()
+            .validate()
+            .expect("record type identity schema must be valid"),
+    );
+    let mut identifier = vec![canonical_record_type_resource(Value::Concrete(
+        ConcreteValue::enum_identifier("a"),
+    ))];
+    let mut string = vec![canonical_record_type_resource(concrete_string("A"))];
+
+    compute_anonymous_identifiers_for_test(&mut identifier, &[], &registry, &|_| Vec::new())
+        .expect("enum identifier identity must compute");
+    compute_anonymous_identifiers_for_test(&mut string, &[], &registry, &|_| Vec::new())
+        .expect("string identity must compute");
+
+    assert_eq!(identifier[0].id, string[0].id);
+}
+
+#[test]
+fn equal_canonical_declared_identity_values_report_a_duplicate() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        canonical_record_type_identity_schema()
+            .validate()
+            .expect("record type identity schema must be valid"),
+    );
+    let mut resources = vec![
+        canonical_record_type_resource(Value::Concrete(ConcreteValue::enum_identifier("a"))),
+        canonical_record_type_resource(concrete_string("A")),
+    ];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("canonical-equal declared identity values must be rejected");
+
+    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    assert!(error.to_string().contains("equal declared identity values"));
 }
 
 #[test]
@@ -904,7 +1941,7 @@ fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
         Resource::pending_with_provider("mock", "test.resource", None),
     ];
@@ -930,7 +1967,7 @@ fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
         Resource::pending_with_provider("mock", "test.resource", Some("west".to_string())),
     ];
@@ -972,7 +2009,7 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
     );
 
     let mut named = Resource::pending_with_provider("mock", "other.resource", None);
-    named.binding = Some("named".to_string());
+    named.binding = Some(absolute_binding("named"));
 
     let module_one = Resource::pending_with_provider("mock", "other.resource", None)
         .with_module_source(live_module_source("fixture", "module_one"));
@@ -1002,7 +2039,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     let make_resource = || {
-        let mut resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
+        let mut resource: Resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
         resource.set_attr(
             "route_table_id".to_string(),
             Value::Concrete(ConcreteValue::String("rtb-123".into())),
@@ -1955,6 +2992,190 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
 }
 
 #[test]
+fn state_row_identity_values_use_the_original_permanent_name_override() {
+    let schema = ResourceSchema::new("test.unique_identity")
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .with_unique_name_attribute("name")
+        .validate()
+        .expect("schema fixture must be valid");
+    let mut desired = Resource::pending_with_provider("mock", "test.unique_identity", None);
+    desired.set_attr("name", concrete_string("role"));
+    let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
+    let attributes = HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]);
+    let without_override =
+        StateRowIdentityValues::from_state_row(&schema, &attributes, &HashMap::new());
+    let with_override = StateRowIdentityValues::from_state_row(
+        &schema,
+        &attributes,
+        &HashMap::from([(
+            "name".to_string(),
+            crate::name_override::NameOverride {
+                temp_value: "role-a1b2c3d4".to_string(),
+                original_value: Some("role".to_string()),
+            },
+        )]),
+    );
+    let context = crate::differ::exact_comparison_context_for_tests();
+    assert_eq!(
+        desired_values.compare_row(&without_override, &schema, &context),
+        DeclaredIdentityRowOutcome::Mismatch,
+    );
+    assert_eq!(
+        desired_values.compare_row(&with_override, &schema, &context),
+        DeclaredIdentityRowOutcome::Match,
+    );
+}
+
+#[test]
+fn reconcile_unknown_name_override_origin_requires_an_explicit_moved_block() {
+    let schema = ResourceSchema::new("test.unique_identity")
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .with_unique_name_attribute("name")
+        .validate()
+        .expect("schema fixture must be valid");
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+
+    let mut desired = Resource::with_provider(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_22222222",
+        None,
+    );
+    desired.set_attr("name", concrete_string("role"));
+
+    let origin_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_11111111",
+        None,
+    );
+    let state_entry = AnonymousIdStateInfo::try_from_state_row(
+        origin_id,
+        None,
+        registry
+            .get(
+                "mock",
+                "test.unique_identity",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("registered schema")
+            .schema(),
+        &HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]),
+        &HashMap::from([(
+            "name".to_string(),
+            crate::name_override::NameOverride {
+                temp_value: "role-a1b2c3d4".to_string(),
+                original_value: None,
+            },
+        )]),
+    )
+    .expect("state fixture is comparable by provider and type");
+
+    let error = try_reconcile_anonymous_identifiers(
+        &[desired],
+        &registry,
+        &|_provider, _resource_type| vec![state_entry.clone()],
+        &|_binding| Vec::new(),
+    )
+    .expect_err("an unknown override origin must not silently become delete plus create");
+
+    let AnonymousIdentifierReconciliationError::UnknownIdentityOverrideOrigin(error) = error else {
+        panic!("expected typed unknown override-origin error, got {error}");
+    };
+    assert_eq!(error.candidate_rows().len(), 1);
+    assert_eq!(error.candidate_rows()[0].attributes(), ["name"]);
+    let message = error.to_string();
+    assert!(
+        message.contains("mock_test_unique_identity_11111111"),
+        "{message}",
+    );
+    assert!(message.contains("moved"), "{message}");
+}
+
+#[test]
+fn reconcile_override_hidden_identity_row_with_comparable_mismatch_is_ignored() {
+    let schema = ResourceSchema::new("test.unique_identity")
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required("scope", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .with_unique_name_attribute("name")
+        .validate()
+        .expect("schema fixture must be valid");
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+
+    let mut desired = Resource::with_provider(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_22222222",
+        None,
+    );
+    desired.set_attr("name", concrete_string("new-role"));
+    desired.set_attr("scope", concrete_string("new-scope"));
+
+    let origin_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_11111111",
+        None,
+    );
+    let state_entry = AnonymousIdStateInfo::try_from_state_row(
+        origin_id,
+        None,
+        registry
+            .get(
+                "mock",
+                "test.unique_identity",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("registered schema")
+            .schema(),
+        &HashMap::from([
+            ("name".to_string(), concrete_string("old-role-temporary")),
+            ("scope".to_string(), concrete_string("old-scope")),
+        ]),
+        &HashMap::from([(
+            "name".to_string(),
+            crate::name_override::NameOverride {
+                temp_value: "old-role-temporary".to_string(),
+                original_value: None,
+            },
+        )]),
+    )
+    .expect("state fixture is comparable by provider and type");
+
+    let moves = try_reconcile_anonymous_identifiers(
+        &[desired],
+        &registry,
+        &|_provider, _resource_type| vec![state_entry.clone()],
+        &|_binding| Vec::new(),
+    )
+    .expect("a comparable identity mismatch makes the orphan an ordinary delete");
+
+    assert!(moves.is_empty());
+}
+
+#[test]
 fn full_and_partial_create_only_matches_emit_moves_without_changing_resource_ids() {
     let schema = ResourceSchema::new("iam.role")
         .attribute(
@@ -2465,6 +3686,7 @@ fn test_identity_attribute_prevents_collision() {
         )
         .attribute(
             AttributeSchema::optional("type", AttributeType::string())
+                .create_only()
                 .identity()
                 .build(),
         )
@@ -2546,6 +3768,490 @@ fn test_identity_attribute_prevents_collision() {
         resources[1].id.identity_str().expect("resolved identity"),
         "different identity attr values should produce different identifiers"
     );
+}
+
+#[test]
+fn reconcile_identity_declared_address_migration_matches_nested_state_identity() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut desired = vec![budget_resource(Some("monthly"), "forecasted")];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("desired budget identity");
+    let destination = desired[0].id.identity_str().unwrap().to_string();
+    let old_address = "mock_budgets_budget_0ddc0ffe";
+    assert_ne!(old_address, destination);
+
+    let mut budget = IndexMap::new();
+    budget.insert("budget_name".to_string(), concrete_string("monthly"));
+    budget.insert("budget_type".to_string(), concrete_string("COST"));
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "budgets.Budget",
+        old_address,
+        None,
+        None,
+        [
+            ("budget", Value::Concrete(ConcreteValue::Map(budget))),
+            (
+                "notifications_with_subscribers",
+                Value::Concrete(ConcreteValue::List(vec![concrete_string("actual")])),
+            ),
+        ],
+    )];
+
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(old_address.to_string(), destination)],
+    );
+}
+
+#[test]
+fn reconcile_when_present_absence_matches_only_a_state_row_with_the_attribute_absent() {
+    let registry = when_present_identity_registry();
+    let mut desired = vec![Resource::pending_with_provider(
+        "mock",
+        "test.optional_identity",
+        None,
+    )];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("absent when-present identity must produce a destination address");
+    let destination = desired[0].id.identity_str().unwrap().to_string();
+    let absent_row = "mock_test_optional_identity_11111111";
+    let written_row = "mock_test_optional_identity_22222222";
+    let state_entries = vec![
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            absent_row,
+            None,
+            None,
+            std::iter::empty::<(&str, Value)>(),
+        ),
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            written_row,
+            None,
+            None,
+            [("name", concrete_string(""))],
+        ),
+    ];
+
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(absent_row.to_string(), destination)],
+    );
+}
+
+fn redacted_identity_value() -> Value {
+    let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
+    let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
+        .expect("valid persisted secret digest");
+    Value::Deferred(DeferredValue::RedactedSecret { hash })
+}
+
+#[test]
+fn reconcile_when_present_absence_does_not_match_a_redacted_secret() {
+    let registry = when_present_identity_registry();
+    let mut desired = vec![Resource::pending_with_provider(
+        "mock",
+        "test.optional_identity",
+        None,
+    )];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("absent when-present identity must produce a destination address");
+    let state_entry = anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.optional_identity",
+        "mock_test_optional_identity_11111111",
+        None,
+        None,
+        [("name", redacted_identity_value())],
+    );
+    let schema = registry.get_for(&desired[0]).unwrap();
+    let schema = schema.schema();
+    let desired_values = DesiredIdentityValues::from_resource(&desired[0], schema, &|_| Vec::new());
+
+    assert_eq!(
+        desired_values.compare_row(
+            &state_entry.identity_values,
+            schema,
+            &crate::differ::exact_comparison_context_for_tests(),
+        ),
+        DeclaredIdentityRowOutcome::Mismatch,
+        "a persisted redacted secret is present even though it cannot be compared",
+    );
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| vec![state_entry.clone()],
+        &|_binding| Vec::new(),
+    );
+    assert!(
+        moves.is_empty(),
+        "a present secret must not migrate to absence"
+    );
+}
+
+#[test]
+fn reconcile_when_present_absence_selects_the_absent_row_beside_a_redacted_secret() {
+    let registry = when_present_identity_registry();
+    let mut desired = vec![Resource::pending_with_provider(
+        "mock",
+        "test.optional_identity",
+        None,
+    )];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("absent when-present identity must produce a destination address");
+    let destination = desired[0].id.identity_str().unwrap().to_string();
+    let absent_row = "mock_test_optional_identity_22222222";
+    let state_entries = vec![
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            "mock_test_optional_identity_11111111",
+            None,
+            None,
+            [("name", redacted_identity_value())],
+        ),
+        anonymous_state_entry_without_attributes(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            absent_row,
+        ),
+    ];
+
+    let moves = try_reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    )
+    .expect("the secret row must not make the absent row ambiguous");
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(absent_row.to_string(), destination)],
+    );
+}
+
+#[test]
+fn nested_when_present_absence_does_not_match_redacted_state() {
+    let schema = ResourceSchema::new("test.nested_optional_identity")
+        .attribute(
+            AttributeSchema::required(
+                "settings",
+                AttributeType::struct_(
+                    "Settings",
+                    vec![
+                        StructField::optional("name", AttributeType::string())
+                            .create_only()
+                            .identity_when_present()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("nested when-present identity schema must be valid");
+    let desired = Resource::pending_with_provider("mock", "test.nested_optional_identity", None)
+        .with_attribute(
+            "settings",
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        );
+    let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
+    let redacted_leaf = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "name".to_string(),
+        redacted_identity_value(),
+    )])));
+
+    for settings in [redacted_leaf, redacted_identity_value()] {
+        let state = StateRowIdentityValues::from_state_row(
+            &schema,
+            &HashMap::from([("settings".to_string(), settings)]),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            desired_values.compare_row(
+                &state,
+                &schema,
+                &crate::differ::exact_comparison_context_for_tests(),
+            ),
+            DeclaredIdentityRowOutcome::Mismatch,
+            "a redacted leaf or ancestor cannot prove that the path is absent",
+        );
+    }
+}
+
+#[test]
+fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted_state() {
+    let registry = when_present_identity_registry();
+    let resolved = Resource::pending_with_provider("mock", "test.optional_identity", None)
+        .with_attribute("name", concrete_string("service-existing"));
+    let prefix = Resource::pending_with_provider("mock", "test.optional_identity", None)
+        .with_attribute("name_prefix", concrete_string("service-"));
+
+    for desired in [resolved, prefix] {
+        let schema = registry.get_for(&desired).unwrap();
+        let schema = schema.schema();
+        let desired_values =
+            DesiredIdentityValues::from_resource(&desired, schema, &|_| Vec::new());
+        let state = StateRowIdentityValues::from_state_row(
+            schema,
+            &HashMap::from([("name".to_string(), redacted_identity_value())]),
+            &HashMap::new(),
+        );
+        let context = crate::differ::exact_comparison_context_for_tests();
+
+        assert!(matches!(
+            desired_values.compare_row(&state, schema, &context),
+            DeclaredIdentityRowOutcome::Undecidable(_),
+        ));
+        let absent =
+            StateRowIdentityValues::from_state_row(schema, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            desired_values.compare_row(&absent, schema, &context),
+            DeclaredIdentityRowOutcome::Mismatch,
+        );
+    }
+}
+
+#[test]
+fn reconcile_declared_identity_migration_evaluates_interpolation_over_state_backed_reference() {
+    let registry = scalar_identity_registry();
+    let mut desired = Resource::pending_with_provider("mock", "test.resource", None);
+    desired.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::root_resource_ref("zone", "name", Vec::new())),
+            InterpolationPart::Literal("-x".into()),
+        ])),
+    );
+    let mut desired = vec![desired];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("authored interpolation must have an address before migration");
+    let destination = desired[0]
+        .id
+        .identity_str()
+        .expect("computed destination")
+        .to_string();
+    let legacy = "mock_test_resource_11111111";
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.resource",
+        legacy,
+        None,
+        None,
+        [("name", concrete_string("example-x"))],
+    )];
+    let binding_entries = [binding_state_entry("zone", "zone", &[("name", "example")])];
+
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|binding| binding_state_entries_for(&binding_entries, binding),
+    );
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(legacy.to_string(), destination)],
+    );
+}
+
+#[test]
+fn reconcile_unresolved_declared_identity_with_legacy_candidate_requires_moved() {
+    let registry = scalar_identity_registry();
+    let mut desired = Resource::pending_with_provider("mock", "test.resource", None);
+    desired.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::root_resource_ref("missing_zone", "name", Vec::new())),
+            InterpolationPart::Literal("-x".into()),
+        ])),
+    );
+    let mut desired = vec![desired];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("authored interpolation must have an address before migration");
+    let legacy = "mock_test_resource_11111111";
+    let state_entries = vec![anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.resource",
+        legacy,
+        None,
+        None,
+        [("name", concrete_string("example-x"))],
+    )];
+
+    let error = try_reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    )
+    .expect_err("an unresolved identity with an unclaimed legacy row needs an explicit move");
+
+    let AnonymousIdentifierReconciliationError::UnresolvedDeclaredIdentity(error) = error else {
+        panic!("expected typed unresolved declared-identity error, got {error}");
+    };
+    assert_eq!(error.candidate_rows().len(), 1);
+    let message = error.to_string();
+    assert!(message.contains(legacy), "{message}");
+    assert!(message.contains("moved"), "{message}");
+}
+
+#[test]
+fn reconcile_unresolved_declared_identity_ignores_a_mismatched_orphan_row() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema fixture must be valid"),
+    );
+    let mut desired = vec![reference_record_set("new_zone", "new.example.com.", "A")];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("authored hosted-zone reference must have a plan-time address");
+    let orphan = anonymous_state_entry(
+        &registry,
+        "mock",
+        "route53.RecordSet",
+        "mock_route53_record_set_11111111",
+        None,
+        None,
+        [
+            ("hosted_zone_id", concrete_string("Z-OLD")),
+            ("name", concrete_string("old.example.com.")),
+            ("type", concrete_string("A")),
+        ],
+    );
+
+    let moves = try_reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| vec![orphan.clone()],
+        &|_binding| Vec::new(),
+    )
+    .expect("the differing record name proves this is not a state migration");
+
+    assert!(moves.is_empty());
+}
+
+#[test]
+fn reconcile_complete_declared_identity_rejects_multiple_legacy_state_matches() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        budget_identity_schema()
+            .validate()
+            .expect("budget schema fixture must be valid"),
+    );
+    let mut desired = vec![budget_resource(Some("monthly"), "forecasted")];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("desired budget identity");
+    let destination = desired[0].id.clone();
+    let state_entry = |name: &str| {
+        let budget = IndexMap::from([
+            ("budget_name".to_string(), concrete_string("monthly")),
+            ("budget_type".to_string(), concrete_string("COST")),
+        ]);
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "budgets.Budget",
+            name,
+            None,
+            None,
+            [("budget", Value::Concrete(ConcreteValue::Map(budget)))],
+        )
+    };
+    let state_entries = vec![
+        state_entry("mock_budgets_budget_11111111"),
+        state_entry("mock_budgets_budget_22222222"),
+    ];
+    let (_, comparison_provider) = crate::provider::comparison_fixture_for_test(
+        &registry,
+        desired.iter().map(|resource| &resource.id),
+    );
+    let claims = StateBlockClaims::empty();
+    let find_state_by_type = |provider: &str, resource_type: &str| {
+        claims.screen_entries(
+            provider,
+            resource_type,
+            state_entries.clone(),
+            AnonymousIdStateInfo::name,
+        )
+    };
+
+    let error = super::reconcile_anonymous_identifiers(
+        &desired,
+        &[],
+        &registry,
+        &comparison_provider,
+        &find_state_by_type,
+        &|_binding| Vec::new(),
+        &claims,
+    )
+    .expect_err("multiple complete declared-identity matches must be rejected");
+
+    let AnonymousIdentifierReconciliationError::AmbiguousDeclaredIdentity(ambiguous) = &error
+    else {
+        panic!("expected typed ambiguous declared-identity error, got {error}");
+    };
+    assert_eq!(
+        ambiguous.resource().identity_str(),
+        destination.identity_str().unwrap()
+    );
+    assert_eq!(
+        ambiguous
+            .candidate_rows()
+            .iter()
+            .map(|candidate| candidate.identity_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "mock_budgets_budget_11111111",
+            "mock_budgets_budget_22222222"
+        ]
+    );
+    let message = error.to_string();
+    assert!(message.contains(&destination.to_string()), "{message}");
+    assert!(
+        message.contains("mock_budgets_budget_11111111"),
+        "{message}"
+    );
+    assert!(
+        message.contains("mock_budgets_budget_22222222"),
+        "{message}"
+    );
+    assert!(message.contains("moved"), "{message}");
 }
 
 #[test]
@@ -2794,13 +4500,13 @@ fn subnet_route_table_association_resource(
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(route_table_binding, "id"),
+            path: AccessPath::root(route_table_binding, "id"),
         }),
     );
     resource.set_attr(
         "subnet_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(subnet_binding, "id"),
+            path: AccessPath::root(subnet_binding, "id"),
         }),
     );
     resource
@@ -2862,7 +4568,7 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
     let deferred = Resource::new("test.Widget", "deferred").with_attribute(
         "config",
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("source", "config"),
+            path: AccessPath::root("source", "config"),
         }),
     );
     let find_state = |binding: &str| {
@@ -2926,7 +4632,12 @@ fn non_empty_create_only_value_keeps_its_deterministic_identity_string() {
         Value::Concrete(ConcreteValue::String("configured".into())),
     )])));
     let resource = Resource::new("test.Widget", "example").with_attribute("config", value.clone());
-    let hash_inputs = stable_anonymous_hash_inputs(&resource, &schema);
+    let schema = schema.validate().expect("schema fixture must be valid");
+    let AnonymousIdentityInputs::CreateOnly(hash_inputs) =
+        anonymous_identity_inputs(&resource, &schema)
+    else {
+        panic!("a schema without declared identity must retain create-only hashing");
+    };
 
     assert_eq!(
         hash_inputs.get("config"),
@@ -2963,7 +4674,7 @@ fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new(route_table_binding, "id"),
+            path: AccessPath::root(route_table_binding, "id"),
         }),
     );
     resource
@@ -3393,7 +5104,7 @@ fn test_reconcile_deferred_binding_ambiguous_yields_no_value() {
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
-            path: crate::resource::AccessPath::new("private_rtb", "id"),
+            path: crate::resource::ExpandedAccessPath::root("private_rtb", "id"),
         }),
     );
     let resources = vec![resource];
@@ -3725,7 +5436,7 @@ fn canonical_enum_create_only_comparison_preserves_identity_hash_material() {
 #[test]
 fn upstream_unknown_identity_hash_strings_remain_stable() {
     let export = Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-        path: AccessPath::new("network", "vpc_id"),
+        path: AccessPath::root("network", "vpc_id"),
     }));
     assert_eq!(
         deterministic_value_string(&export),
@@ -3734,7 +5445,7 @@ fn upstream_unknown_identity_hash_strings_remain_stable() {
 
     let all_exports = Value::Deferred(DeferredValue::Unknown(
         ApplyTimeUnknown::UpstreamAllExports {
-            binding: "network".into(),
+            binding: absolute_binding("network"),
         },
     ));
     assert_eq!(
@@ -3924,7 +5635,7 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
     // anonymous resource. Two attribute-derived anonymous declarations of the
     // same kind are rejected before reconciliation in production.
     let mut live_resource = prior_resources.remove(0);
-    live_resource.binding = Some(live_name.clone());
+    live_resource.binding = Some(absolute_binding(&live_name));
     let mut resources = vec![live_resource, simhash_eip_resource("staging")];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .unwrap();
@@ -4880,7 +6591,7 @@ fn test_reconcile_skips_let_bound_resources() {
     // A let-bound resource whose name does NOT exist in state
     let mut ingress_new =
         Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_new", None);
-    ingress_new.binding = Some("ingress_new".to_string());
+    ingress_new.binding = Some(absolute_binding("ingress_new"));
     ingress_new.set_attr(
         "cidr_ip".to_string(),
         Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
@@ -5381,7 +7092,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -5415,7 +7126,7 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
 fn test_detect_rename_reference_form_matches_bare_name_and_arn() {
     let registry = lambda_permission_reference_registry();
     let mut resource = Resource::with_provider("mock", "lambda.Permission", "invoke", None);
-    resource.binding = Some("invoke".to_string());
+    resource.binding = Some(absolute_binding("invoke"));
     resource.set_attr("function_name", concrete_string("processor"));
     let state_entry = anonymous_state_entry(
         &registry,
@@ -5444,7 +7155,7 @@ fn test_detect_rename_reference_form_matches_bare_name_and_arn() {
 fn test_detect_rename_reference_form_prefix_uses_canonical_candidate_key() {
     let registry = lambda_permission_reference_registry();
     let mut resource = Resource::with_provider("mock", "lambda.Permission", "invoke", None);
-    resource.binding = Some("invoke".to_string());
+    resource.binding = Some(absolute_binding("invoke"));
     resource
         .prefixes
         .insert("function_name".to_string(), "processor-".to_string());
@@ -5477,7 +7188,7 @@ fn test_detect_rename_resolves_deferred_create_only_attrs_from_state_bindings() 
 
     let mut resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
-    resource.binding = Some("nat_gw".to_string());
+    resource.binding = Some(absolute_binding("nat_gw"));
     let resources = vec![resource];
     let state_entries = vec![association_state_entry(
         &schemas,
@@ -5529,7 +7240,7 @@ fn test_detect_rename_matches_map_create_only_attr() {
         "zone".to_string() => Value::Concrete(ConcreteValue::String("a".into())),
     }));
     let mut resource = Resource::with_provider("awscc", "test.MapIdentity", "mapped", None);
-    resource.binding = Some("mapped".to_string());
+    resource.binding = Some(absolute_binding("mapped"));
     resource.set_attr("settings".to_string(), settings.clone());
     let resources = vec![resource];
     let state_entries = vec![anonymous_state_entry(
@@ -5579,7 +7290,7 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
     )));
     let priority = Value::Concrete(ConcreteValue::Int(7));
     let mut resource = Resource::with_provider("awscc", "test.TypedIdentity", "typed", None);
-    resource.binding = Some("typed".to_string());
+    resource.binding = Some(absolute_binding("typed"));
     resource.set_attr("domain".to_string(), domain.clone());
     resource.set_attr("priority".to_string(), priority.clone());
     let resources = vec![resource];
@@ -5635,7 +7346,7 @@ fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_m
         "awscc.ec2.Eip.Domain.standard".to_string(),
     ));
     let mut resource = Resource::with_provider("awscc", "ec2.Eip", "typed", None);
-    resource.binding = Some("typed".to_string());
+    resource.binding = Some(absolute_binding("typed"));
     resource.set_attr(
         "domains".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
@@ -5695,7 +7406,7 @@ fn test_detect_rename_skips_ambiguous_resolved_create_only_matches() {
     let schemas = subnet_route_table_association_registry();
     let mut resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
-    resource.binding = Some("nat_gw".to_string());
+    resource.binding = Some(absolute_binding("nat_gw"));
     let resources = vec![resource];
     let state_entries = vec![
         association_state_entry(
@@ -5776,7 +7487,7 @@ fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() 
         "nat_gw",
         None,
     );
-    named.binding = Some("nat_gw".to_string());
+    named.binding = Some(absolute_binding("nat_gw"));
     let state_entries = vec![anonymous_state_entry(
         &schemas,
         "awscc",
@@ -5823,7 +7534,7 @@ fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() 
     ];
     let mut ambiguous_resource =
         subnet_route_table_association_resource("nat_gw", "private_rtb", "private_subnet");
-    ambiguous_resource.binding = Some("nat_gw".to_string());
+    ambiguous_resource.binding = Some(absolute_binding("nat_gw"));
     let ambiguous = detect_anonymous_to_named_renames_with_bindings_for_test(
         &[ambiguous_resource],
         &schemas,
@@ -5881,7 +7592,7 @@ fn test_detect_rename_simhash_fallback_rejects_explicit_create_only_mismatches()
 
     let mut named = anonymous_resources.remove(0);
     named.id = ResourceId::with_provider_identity("awscc", "ec2.Eip", "eip", None);
-    named.binding = Some("eip".to_string());
+    named.binding = Some(absolute_binding("eip"));
 
     let mut current_schemas = SchemaRegistry::new();
     current_schemas.insert(
@@ -5940,7 +7651,7 @@ fn test_detect_rename_does_not_match_unresolvable_create_only_ref() {
             .expect("schema fixture must be valid"),
     );
     let mut resource = route_with_deferred_route_table("route", "missing_rtb");
-    resource.binding = Some("route".to_string());
+    resource.binding = Some(absolute_binding("route"));
     let resources = vec![resource];
     let state_entries = vec![route_state_entry(
         &schemas,
@@ -5975,7 +7686,7 @@ fn test_detect_rename_invalid_enum_is_typed_unresolved_and_does_not_rename() {
             .expect("enum schema fixture must be valid"),
     );
     let mut resource = Resource::with_provider("awscc", "ec2.Eip", "eip", None);
-    resource.binding = Some("eip".to_string());
+    resource.binding = Some(absolute_binding("eip"));
     resource.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::enum_identifier(
@@ -6035,7 +7746,7 @@ fn test_detect_anonymous_to_named_skips_claimed_from() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6086,7 +7797,7 @@ fn test_detect_anonymous_to_named_skips_claimed_to() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6267,7 +7978,7 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6300,7 +8011,7 @@ fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
     let binding_name = "sso";
     let orphan_name = "sso_instance_0ac0620303071530";
     let mut resource = Resource::with_provider("awscc", "sso.Instance", binding_name, None);
-    resource.binding = Some(binding_name.to_string());
+    resource.binding = Some(absolute_binding(binding_name));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6400,7 +8111,7 @@ fn test_detect_rename_skips_ambiguous_matches() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6445,7 +8156,7 @@ fn test_detect_rename_ignores_non_hash_state_names() {
     let schemas = make_sso_instance_registry();
 
     let mut resource = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    resource.binding = Some("sso".to_string());
+    resource.binding = Some(absolute_binding("sso"));
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6517,7 +8228,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
 
     // Step 2: user wraps the same resource in a `let` binding.
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6586,7 +8297,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
 
     // Let-bound resource with wildly different attributes.
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("completely-different".into())),
@@ -6672,7 +8383,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     ];
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6705,7 +8416,7 @@ fn test_detect_rename_no_create_only_skips_8_char_hash_entries() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -6774,7 +8485,7 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     ];
 
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
-    let_bound.binding = Some("sso".to_string());
+    let_bound.binding = Some(absolute_binding("sso"));
     let_bound.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".into())),
@@ -7259,13 +8970,15 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         "for cidr in ['10.0.0.0/16', '10.1.0.0/16'] {\n  mock.ec2.Vpc { identity_input = cidr }\n}\n",
     )
     .expect("write loop fixture");
-    let mut parsed = crate::config_loader::parse_directory(
+    let parsed = crate::config_loader::parse_directory(
         fixture.path(),
         &crate::parser::ProviderContext::default(),
     )
-    .expect("directory parses")
-    .into_expanded()
-    .expect("directory fixture contains no parser placeholders");
+    .expect("directory parses");
+    let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
+        .expect("directory fixture crosses the module-resolution seam")
+        .into_expanded()
+        .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =
@@ -7491,7 +9204,7 @@ fn legacy_loop_detector_compares_concrete_subset_when_other_inputs_are_reference
     let mut resources = parse_loop_fixture(source, "subnet.crn");
     resources[0].set_attr(
         "vpc_id",
-        Value::resource_ref("network", "vpc_id", Vec::new()),
+        Value::root_resource_ref("network", "vpc_id", Vec::new()),
     );
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -7672,7 +9385,7 @@ fn moved_to_allows_bound_map_keys_that_begin_with_underscore() {
     )
     .expect("bound map-key move destinations parse");
 
-    let resources = vec![
+    let resources: Vec<Resource> = vec![
         Resource::with_provider("mock", "ec2.Vpc", "items._private", None),
         Resource::with_provider("mock", "ec2.Vpc", "items['a._b']", None),
     ];
@@ -7785,7 +9498,7 @@ fn legacy_loop_detector_moves_named_and_anonymous_module_leaves() {
 
     let mut named =
         Resource::with_provider("mock", "test.NamedLeaf", "web_0123456789abcdef.named", None);
-    named.binding = Some("named".to_string());
+    named.binding = Some(absolute_binding("named"));
     named.loop_provenance = provenance();
     let mut anonymous = Resource::with_provider(
         "mock",

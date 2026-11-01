@@ -40,7 +40,7 @@ pub struct TypeIdentity {
 
 /// A validated long-form reference template.
 ///
-/// The only placeholders accepted by protocol v13 are `{partition}`,
+/// The only placeholders accepted by protocol v16 are `{partition}`,
 /// `{region}`, `{account}`, and `{name}`. The `{name}` placeholder appears
 /// exactly once and denotes the short form of the reference.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1609,7 +1609,7 @@ pub struct ResourceSchema {
     pub operation_config: Option<OperationConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validators: Vec<ValidatorType>,
-    /// Protocol-v13 cardinality constraints over sibling attributes.
+    /// Protocol-v16 cardinality constraints over sibling attributes.
     /// Required even when empty so version skew fails during JSON loading.
     pub field_groups: Vec<FieldGroup>,
     /// Whether the resource type is protected from destruction unless the
@@ -1689,6 +1689,24 @@ impl OperationConfig {
     }
 }
 
+/// How a create-only schema value contributes to anonymous identity.
+///
+/// This is a closed protocol-v16 enum. The field carrying it is required on
+/// every attribute and struct-field record so host/provider skew fails before
+/// schema semantics can be misinterpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityMode {
+    /// The value does not participate in anonymous identity.
+    None,
+    /// The value must be available at plan time, even when its input mode is
+    /// optional.
+    Required,
+    /// An omitted optional value contributes the dedicated absent marker; a
+    /// written value must still be available at plan time.
+    WhenPresent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttributeSchema {
     pub name: String,
@@ -1718,9 +1736,10 @@ pub struct AttributeSchema {
     /// `None` = auto-detect, `Some(false)` = explicitly non-removable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removable: Option<bool>,
-    /// Whether this attribute contributes to anonymous resource identity hashing.
-    #[serde(default)]
-    pub identity: bool,
+    /// How this attribute contributes to anonymous resource identity hashing.
+    /// Required in protocol v16 so older providers fail the version check
+    /// before this changed meaning can be decoded.
+    pub identity: IdentityMode,
     /// Whether this attribute is populated asynchronously after Create returns.
     #[serde(default)]
     pub deferred_populate: bool,
@@ -1818,7 +1837,7 @@ pub enum AttributeType {
     Struct {
         name: String,
         fields: Vec<StructField>,
-        /// Required in protocol v13, including when empty.
+        /// Required in protocol v16, including when empty.
         field_groups: Vec<FieldGroup>,
     },
     #[serde(rename = "union")]
@@ -1974,8 +1993,14 @@ pub struct StructField {
     #[serde(default)]
     pub read_only: bool,
     /// Whether this nested field is accepted on write but omitted from reads.
-    /// Required in protocol v13 so host/provider skew fails loudly.
+    /// Required in protocol v16 so host/provider skew fails loudly.
     pub write_only: bool,
+    /// Whether changing this nested user-input field requires replacement.
+    /// Required in protocol v16 so host/provider skew fails loudly.
+    pub create_only: bool,
+    /// How this immutable nested field contributes to anonymous identity.
+    /// Required in protocol v16 so host/provider skew fails loudly.
+    pub identity: IdentityMode,
     /// Whether this nested field is populated asynchronously after Create returns.
     #[serde(default)]
     pub deferred_populate: bool,
@@ -1986,13 +2011,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_v13_requires_field_groups_on_resources_and_structs() {
+    fn protocol_v16_requires_field_groups_on_resources_and_structs() {
         let resource_error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
             "resource_type": "test.Widget",
             "attributes": {},
             "default_prevent_destroy": false
         }))
-        .expect_err("protocol v13 resource field_groups must not default")
+        .expect_err("protocol v16 resource field_groups must not default")
         .to_string();
         assert!(resource_error.contains("field_groups"), "{resource_error}");
 
@@ -2001,19 +2026,19 @@ mod tests {
             "name": "Choice",
             "fields": []
         }))
-        .expect_err("protocol v13 struct field_groups must not default")
+        .expect_err("protocol v16 struct field_groups must not default")
         .to_string();
         assert!(struct_error.contains("field_groups"), "{struct_error}");
     }
 
     #[test]
-    fn protocol_v13_requires_default_prevent_destroy_on_resources() {
+    fn protocol_v16_requires_default_prevent_destroy_on_resources() {
         let error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
             "resource_type": "test.Resource",
             "attributes": {},
             "field_groups": []
         }))
-        .expect_err("protocol v13 default_prevent_destroy must not default")
+        .expect_err("protocol v16 default_prevent_destroy must not default")
         .to_string();
 
         assert!(error.contains("default_prevent_destroy"), "{error}");
@@ -2260,8 +2285,8 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v15_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 15);
+    fn ordered_maps_preserve_v16_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 16);
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
@@ -2608,6 +2633,8 @@ mod tests {
                 provider_name: None,
                 read_only: false,
                 write_only: true,
+                create_only: true,
+                identity: IdentityMode::Required,
                 deferred_populate: false,
             }],
             field_groups: vec![],
@@ -2619,6 +2646,8 @@ mod tests {
             panic!("round-tripped attribute must remain a struct");
         };
         assert!(fields[0].write_only);
+        assert!(fields[0].create_only);
+        assert_eq!(fields[0].identity, IdentityMode::Required);
         assert_eq!(json, serde_json::to_string(&back).unwrap());
     }
 
@@ -2631,9 +2660,44 @@ mod tests {
                 "required":false
             }"#,
         )
-        .expect_err("protocol v13 requires write_only on every struct field");
+        .expect_err("protocol v16 requires write_only on every struct field");
 
         assert!(error.to_string().contains("missing field `write_only`"));
+    }
+
+    #[test]
+    fn protocol_v16_requires_nested_create_only_and_identity_mode() {
+        let missing_create_only = serde_json::from_str::<StructField>(
+            r#"{
+                "name":"budget_name",
+                "field_type":{"type":"String"},
+                "required":false,
+                "write_only":false,
+                "identity":"required"
+            }"#,
+        )
+        .expect_err("protocol v16 requires create_only on every struct field");
+        assert!(
+            missing_create_only
+                .to_string()
+                .contains("missing field `create_only`")
+        );
+
+        let missing_identity = serde_json::from_str::<StructField>(
+            r#"{
+                "name":"budget_name",
+                "field_type":{"type":"String"},
+                "required":false,
+                "write_only":false,
+                "create_only":true
+            }"#,
+        )
+        .expect_err("protocol v16 requires identity on every struct field");
+        assert!(
+            missing_identity
+                .to_string()
+                .contains("missing field `identity`")
+        );
     }
 
     #[test]
@@ -2643,11 +2707,55 @@ mod tests {
                 "name":"status",
                 "attr_type":{"type":"String"},
                 "required":false,
-                "keyed_partial_update":null
+                "keyed_partial_update":null,
+                "identity":"none"
             }"#,
         )
         .unwrap();
         assert!(!attr.deferred_populate);
+    }
+
+    #[test]
+    fn protocol_v16_identity_mode_is_closed_and_required_on_every_schema_record() {
+        for mode in [
+            IdentityMode::None,
+            IdentityMode::Required,
+            IdentityMode::WhenPresent,
+        ] {
+            let json = serde_json::to_value(mode).expect("identity mode serializes");
+            let decoded: IdentityMode =
+                serde_json::from_value(json).expect("identity mode deserializes");
+            assert_eq!(decoded, mode);
+        }
+        assert!(serde_json::from_value::<IdentityMode>(serde_json::json!("future")).is_err());
+
+        let missing_attribute_identity =
+            serde_json::from_value::<AttributeSchema>(serde_json::json!({
+                "name": "name",
+                "attr_type": {"type": "String"},
+                "required": false,
+                "keyed_partial_update": null
+            }))
+            .expect_err("protocol v16 requires identity on every attribute");
+        assert!(
+            missing_attribute_identity
+                .to_string()
+                .contains("missing field `identity`")
+        );
+
+        let missing_field_identity = serde_json::from_value::<StructField>(serde_json::json!({
+            "name": "name",
+            "field_type": {"type": "String"},
+            "required": false,
+            "write_only": false,
+            "create_only": false
+        }))
+        .expect_err("protocol v16 requires identity on every struct field");
+        assert!(
+            missing_field_identity
+                .to_string()
+                .contains("missing field `identity`")
+        );
     }
 
     #[test]
@@ -2676,6 +2784,7 @@ mod tests {
                 "attr_type": {"type": "list", "element_type": {"type": "String"}},
                 "required": false,
                 "keyed_partial_update": keyed_partial_update,
+                "identity": "none",
             });
             let attr: AttributeSchema = serde_json::from_value(json.clone()).unwrap();
             json = serde_json::to_value(attr).unwrap();
@@ -3041,6 +3150,8 @@ mod tests {
                         provider_name: None,
                         read_only: false,
                         write_only: false,
+                        create_only: false,
+                        identity: IdentityMode::None,
                         deferred_populate: false,
                     }],
                     field_groups: vec![],
@@ -3139,6 +3250,8 @@ mod tests {
                         provider_name: None,
                         read_only: false,
                         write_only: false,
+                        create_only: false,
+                        identity: IdentityMode::None,
                         deferred_populate: false,
                     }],
                     field_groups: vec![],

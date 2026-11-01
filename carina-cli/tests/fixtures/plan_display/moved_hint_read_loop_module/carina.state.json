@@ -29,7 +29,11 @@
         "nested_write_only": {}
       },
       "protected": false,
-      "directives": {},
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
       "prefixes": {},
       "name_overrides": {},
       "explicit": {
@@ -59,7 +63,11 @@
         "nested_write_only": {}
       },
       "protected": false,
-      "directives": {},
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": false
+      },
       "prefixes": {},
       "name_overrides": {},
       "explicit": {
@@ -75,6 +83,5 @@
       "binding": "r.validation_record",
       "dependency_bindings": ["r.cert"]
     }
-  ],
-  "exports": {}
+  ]
 }

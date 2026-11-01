@@ -3,7 +3,11 @@ use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
 use crate::provider::ReferenceScope;
-use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
+use crate::resource::{
+    CanonicalEnumValue, ExpandedConcreteValue as ConcreteValue,
+    ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource, ExpandedValue as Value,
+    ValueString,
+};
 use crate::schema::{
     ReferenceForm, ReferenceForms, ReferenceTemplate, ResourceSchema, TypeIdentity,
 };

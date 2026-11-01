@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::parser::display_string_literal;
-use crate::resource::{ConcreteValue, DeferredValue, PlaceholderKind, Value};
+use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, PlaceholderKind, Value};
 
 /// Value-derived description used in type-mismatch diagnostics.
 ///
@@ -17,7 +17,7 @@ pub struct ValueDescription(String);
 
 impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
-    pub fn of<P: PlaceholderKind>(value: &Value<P>) -> Self {
+    pub fn of<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> Self {
         Self(match value {
             Value::Deferred(DeferredValue::ModuleIf(_)) => "module conditional".to_string(),
             Value::Concrete(ConcreteValue::String(value)) => value

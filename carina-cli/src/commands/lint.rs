@@ -41,43 +41,46 @@ fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning
         .collect()
 }
 
-fn mixed_tag_key_style_warnings_for_population<E, D>(
+fn mixed_tag_key_style_warnings_for_population<E, D, B: carina_core::resource::BindingAddress>(
     root_inputs: &[(PathBuf, String)],
     parsed: &carina_core::parser::File<
         E,
         carina_core::resource::ParserPlaceholder,
         carina_core::resource::ParserPlaceholder,
         D,
+        B,
     >,
     base_dir: &Path,
-) -> Vec<LintWarning>
-where
-    D: carina_core::parser::DeferredForPhaseTraversal,
-{
+) -> Vec<LintWarning> {
     let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
     mixed_tag_key_style_warnings(&tag_keys)
 }
 
 enum LintFile {
-    Blocked(carina_core::parser::InferredFile),
+    Blocked(carina_core::config_loader::InferredRootDirectory),
     Resolved(carina_core::parser::ModuleResolvedInferredFile),
 }
 
 impl LintFile {
-    fn iter_top_level_resources(
+    fn collect_list_struct_attrs(
         &self,
-    ) -> Box<
-        dyn Iterator<
-                Item = carina_core::parser::TopLevelResourceRef<
-                    '_,
-                    carina_core::resource::ModuleSource,
-                    carina_core::resource::ParserPlaceholder,
-                >,
-            > + '_,
-    > {
+        schemas: &carina_core::schema::SchemaRegistry,
+        all_list_struct_attrs: &mut HashSet<String>,
+        block_name_suggestions: &mut HashMap<String, String>,
+    ) {
         match self {
-            Self::Blocked(parsed) => Box::new(parsed.iter_top_level_resources()),
-            Self::Resolved(parsed) => Box::new(parsed.iter_top_level_resources()),
+            Self::Blocked(parsed) => collect_list_struct_attrs_for_population(
+                parsed.parsed(),
+                schemas,
+                all_list_struct_attrs,
+                block_name_suggestions,
+            ),
+            Self::Resolved(parsed) => collect_list_struct_attrs_for_population(
+                parsed,
+                schemas,
+                all_list_struct_attrs,
+                block_name_suggestions,
+            ),
         }
     }
 
@@ -88,10 +91,44 @@ impl LintFile {
     ) -> Vec<LintWarning> {
         match self {
             Self::Blocked(parsed) => {
-                mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+                mixed_tag_key_style_warnings_for_population(root_inputs, parsed.parsed(), base_dir)
             }
             Self::Resolved(parsed) => {
                 mixed_tag_key_style_warnings_for_population(root_inputs, parsed, base_dir)
+            }
+        }
+    }
+}
+
+fn collect_list_struct_attrs_for_population<E, D, B: carina_core::resource::BindingAddress>(
+    parsed: &carina_core::parser::File<
+        E,
+        carina_core::resource::ParserPlaceholder,
+        carina_core::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    schemas: &carina_core::schema::SchemaRegistry,
+    all_list_struct_attrs: &mut HashSet<String>,
+    block_name_suggestions: &mut HashMap<String, String>,
+) {
+    for resource in parsed.iter_top_level_resources() {
+        let schema = match resource {
+            carina_core::parser::TopLevelResourceRef::Resource(resource) => {
+                schemas.get_for(resource)
+            }
+            carina_core::parser::TopLevelResourceRef::DataSource(data_source) => {
+                schemas.get_for_data_source(data_source)
+            }
+            carina_core::parser::TopLevelResourceRef::LiveComposition(_) => None,
+        };
+        if let Some(schema) = schema {
+            let schema = schema.as_schema();
+            all_list_struct_attrs.extend(list_struct_attr_names(schema));
+            for (attribute_name, attribute_schema) in schema.attributes() {
+                if let Some(block_name) = attribute_schema.block_name() {
+                    block_name_suggestions.insert(attribute_name.clone(), block_name.to_string());
+                }
             }
         }
     }
@@ -183,24 +220,11 @@ pub fn run_lint(
     // carina#3181: walk every top-level resource — managed and data
     // source schemas can both carry List<Struct> attributes. compositions
     // have no schema, so `get_for` returns `None` for them.
-    for rref in parsed.iter_top_level_resources() {
-        let schema = match rref {
-            carina_core::parser::TopLevelResourceRef::Resource(m) => schemas.get_for(m),
-            carina_core::parser::TopLevelResourceRef::DataSource(d) => {
-                schemas.get_for_data_source(d)
-            }
-            carina_core::parser::TopLevelResourceRef::LiveComposition(_) => None,
-        };
-        if let Some(schema) = schema {
-            let schema = schema.as_schema();
-            all_list_struct_attrs.extend(list_struct_attr_names(schema));
-            for (attr_name, attr_schema) in schema.attributes() {
-                if let Some(block_name) = attr_schema.block_name() {
-                    block_name_suggestions.insert(attr_name.clone(), block_name.to_string());
-                }
-            }
-        }
-    }
+    parsed.collect_list_struct_attrs(
+        schemas,
+        &mut all_list_struct_attrs,
+        &mut block_name_suggestions,
+    );
 
     // Scan each source file for list literal usage of List<Struct> attributes
     let mut warnings: Vec<LintWarning> = module_boundary_findings

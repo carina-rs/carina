@@ -1,0 +1,3 @@
+let zone = mock.route53.HostedZone {
+  name = "example.com."
+}

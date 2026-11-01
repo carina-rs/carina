@@ -1,20 +1,28 @@
 use super::*;
 use crate::parser::{
-    ArgumentOrigin, BindingName, LoadedProviderContext, ModuleArgument, ParsedFile,
-    ProviderContext, UntilPredicateAst, WaitBinding,
+    ArgumentOrigin, LoadedProviderContext, ModuleArgument, ParsedFile, ProviderContext,
+    RelativeBindingName, UntilPredicateAst, WaitBinding,
 };
 use crate::resource::{
-    CompositionCall, CompositionCallPath, DataSource, LiveComposition, LiveCompositionArgument,
-    LiveCompositionAttribute, LiveCompositionSignature, NoPlaceholder, Resource,
+    AbsoluteBindingAddress, AuthoredCompositionCall as CompositionCall,
+    AuthoredCompositionCallPath as CompositionCallPath, AuthoredDataSource as DataSource,
+    AuthoredLiveComposition as LiveComposition,
+    AuthoredLiveCompositionArgument as LiveCompositionArgument,
+    AuthoredLiveCompositionAttribute as LiveCompositionAttribute,
+    AuthoredLiveCompositionSignature as LiveCompositionSignature, AuthoredResource as Resource,
+    NoPlaceholder, RootScope,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-type RuntimeValue = GenericValue<NoPlaceholder>;
-type RuntimeConcreteValue = crate::resource::ConcreteValue<NoPlaceholder>;
-type RuntimeDeferredValue = crate::resource::DeferredValue<NoPlaceholder>;
-type RuntimeInterpolationPart = crate::resource::InterpolationPart<NoPlaceholder>;
-type RuntimeInferredExportParam = crate::parser::InferredExportParam<NoPlaceholder>;
+type RuntimeValue = GenericValue<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeConcreteValue = crate::resource::ConcreteValue<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeDeferredValue = crate::resource::DeferredValue<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeInterpolationPart =
+    crate::resource::InterpolationPart<NoPlaceholder, AbsoluteBindingAddress>;
+type RuntimeInferredExportParam =
+    crate::parser::InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
+type RelativeRuntimeValue = GenericValue<NoPlaceholder, RelativeBindingName>;
 
 fn local_type(type_expr: TypeExpr) -> TypeExpr {
     type_expr
@@ -101,7 +109,7 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
         static_type: unknown.clone(),
         default: None,
         description: None,
-        validations: Vec::<ValidationBlock<ParserPlaceholder>>::new(),
+        validations: Vec::<ValidationBlock<ParserPlaceholder, RelativeBindingName>>::new(),
     });
     parsed
         .attribute_params
@@ -156,12 +164,12 @@ fn consumer_resolution_is_distinct_from_parser_types_and_preserves_inference_fai
     };
     let inferred = ParsedFile::default().map_export_params(|_exports| {
         vec![
-            InferredExportParam::<ParserPlaceholder> {
+            InferredExportParam::<ParserPlaceholder, RelativeBindingName> {
                 name: "inferred_export".to_string(),
                 static_type: ExportStaticType::Inferred(StaticType::Known(unknown.clone())),
                 value: None,
             },
-            InferredExportParam::<ParserPlaceholder> {
+            InferredExportParam::<ParserPlaceholder, RelativeBindingName> {
                 name: "failed_export".to_string(),
                 static_type: ExportStaticType::Inferred(StaticType::Unchecked(
                     InferredUncheckedReason::InferenceFailed(failure.clone()),
@@ -320,7 +328,9 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     );
 }
 
-fn validate_resource_ref_types_for_test<E: crate::parser::ExportParamLike>(
+fn validate_resource_ref_types_for_test<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
+>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
@@ -1688,11 +1698,11 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
     )
 }
 
-fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition<ParserPlaceholder> {
+fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition {
     let call = CompositionCall {
         id: crate::parser::ModuleCallId::test_dummy_in(format!("{binding}.crn")),
         module_name: "test_module".to_string(),
-        binding: Some(binding.to_string()),
+        binding: Some(binding.into()),
         instance: binding.to_string(),
         module_source: None,
         module_directory: None,
@@ -1719,7 +1729,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition<Parse
                 .collect(),
             pending_constraints: Vec::new(),
         },
-        binding: Some(binding.to_string()),
+        binding: Some(binding.into()),
         dependency_bindings: Default::default(),
         module_name: "test_module".to_string(),
         instance: binding.to_string(),
@@ -1728,7 +1738,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> LiveComposition<Parse
     }
 }
 
-fn set_composition_module(composition: &mut LiveComposition<ParserPlaceholder>, module_name: &str) {
+fn set_composition_module(composition: &mut LiveComposition, module_name: &str) {
     composition.module_name = module_name.to_string();
     let call = CompositionCall {
         id: composition.call_path.immediate().id.clone(),
@@ -2224,12 +2234,15 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -2297,12 +2310,15 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -2520,12 +2536,15 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -4664,6 +4683,7 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         static_type: crate::static_type::ExportStaticType::Declared(local_type(schema_type)),
         value: Some(
             authored()
+                .resolve_root(&RootScope::new())
                 .into_expanded()
                 .expect("authored enum contains no parser placeholders"),
         ),
@@ -4939,6 +4959,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -4963,7 +4984,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
         CompositionCall {
             id: crate::parser::ModuleCallId::test_dummy_in(source),
             module_name: label.to_string(),
-            binding: Some(label.to_string()),
+            binding: Some(label.into()),
             instance: label.to_string(),
             module_source: None,
             module_directory: None,
@@ -5010,6 +5031,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
     ];
     let mut parsed = empty_parsed();
     parsed.compositions = compositions;
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
@@ -5038,6 +5060,7 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
@@ -5089,6 +5112,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         );
         parsed.compositions.push(consumer);
     }
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
@@ -5142,6 +5166,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
         );
         parsed.compositions.push(consumer);
     }
+    let parsed = parsed.resolve_root(&RootScope::new());
 
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
@@ -5205,6 +5230,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     );
     let mut parsed = empty_parsed();
     parsed.compositions.extend([source, consumer]);
+    let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
@@ -5457,12 +5483,15 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -5764,7 +5793,10 @@ fn resolve_and_validate_export_params(
             Ok::<_, crate::resource::LeftoverPlaceholder>(RuntimeInferredExportParam {
                 name: export.name,
                 static_type: export.static_type,
-                value: export.value.map(Value::into_expanded).transpose()?,
+                value: export
+                    .value
+                    .map(|value| value.resolve_root(&RootScope::new()).into_expanded())
+                    .transpose()?,
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -6077,8 +6109,11 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
             .with_binding("r")
             .with_attribute(
                 "identifier",
-                RuntimeValue::Concrete(RuntimeConcreteValue::String(identifier.into())),
-            );
+                Value::Concrete(ConcreteValue::String(identifier.into())),
+            )
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .expect("resource fixture contains no parser placeholder");
         ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[resource],
             compositions: &[],
@@ -6092,7 +6127,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
     let exports = [RuntimeInferredExportParam {
         name: "id".into(),
         static_type: crate::static_type::ExportStaticType::Declared(local_type(TypeExpr::String)),
-        value: Some(RuntimeValue::resource_ref("r", "identifier", vec![])),
+        value: Some(RuntimeValue::root_resource_ref("r", "identifier", vec![])),
     }];
     let provider_context = loaded_context_for_test(ProviderContext::default());
     let pre_apply =
@@ -6745,12 +6780,15 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
     parsed.wait_bindings.push(WaitBinding {
-        binding: BindingName::from("cert_issued"),
-        target: BindingName::from("cert"),
+        binding: RelativeBindingName::from("cert_issued"),
+        target: RelativeBindingName::from("cert"),
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
-            lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: RuntimeValue::Concrete(RuntimeConcreteValue::String("issued".into())),
+            root: "cert".into(),
+            attribute_segments: vec!["status".to_string()],
+            rhs: RelativeRuntimeValue::Concrete(crate::resource::ConcreteValue::String(
+                "issued".into(),
+            )),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -7345,12 +7383,12 @@ fn rendered_typecheck_result_skips_value_unknown() {
     // (e.g. from a deferred-for body where a typed module-call argument
     // is bound to the loop var) must short-circuit rather than emit
     // `expected <type>, got unknown`.
-    use crate::resource::{ApplyTimeUnknown, DeferredValue, Value};
+    use crate::resource::{AuthoredApplyTimeUnknown as ApplyTimeUnknown, DeferredValue};
     use crate::validation::TypeExpr;
 
     let unknown = Value::Deferred(DeferredValue::Unknown(
         ApplyTimeUnknown::UpstreamAllExports {
-            binding: "upstream".to_string(),
+            binding: "upstream".into(),
         },
     ));
     let cfg = ProviderContext::default();
@@ -7622,7 +7660,7 @@ fn ref_with_chained_field_on_struct_flags_unknown_field() {
     );
 }
 
-type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, GenericValue>>>>;
+type ValidateConfigCallLog = std::sync::Arc<std::sync::Mutex<Vec<IndexMap<String, RuntimeValue>>>>;
 
 /// Test-only factory that records every call to `validate_config` so a
 /// test can assert what attributes did or didn't cross the WASM-equivalent
@@ -7667,7 +7705,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, GenericValue>) -> String {
+    fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
         String::new()
     }
 
@@ -7804,7 +7842,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, GenericValue>) -> String {
+        fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
             String::new()
         }
 
@@ -7872,18 +7910,18 @@ fn value_contains_unresolved_ref_detects_nested_resource_ref() {
     // `assume_role = { role_arn = upstream.arn }` shape) must be
     // detected so the validate path drops that attribute from the
     // WASM `validate_config` payload.
-    use crate::resource::{AccessPath, DeferredValue};
+    use crate::resource::AccessPath;
 
-    let role_arn = Value::Deferred(DeferredValue::ResourceRef {
-        path: AccessPath::new("mgmt", "role_arn"),
+    let role_arn = RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+        path: AccessPath::root("mgmt", "role_arn"),
     });
-    let mut inner: IndexMap<String, Value> = IndexMap::new();
+    let mut inner: IndexMap<String, RuntimeValue> = IndexMap::new();
     inner.insert("role_arn".to_string(), role_arn);
     inner.insert(
         "session_name".to_string(),
-        Value::Concrete(ConcreteValue::String("sess".into())),
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("sess".into())),
     );
-    let assume_role = Value::Concrete(ConcreteValue::Map(inner));
+    let assume_role = RuntimeValue::Concrete(RuntimeConcreteValue::Map(inner));
 
     assert!(
         value_contains_unresolved_ref(&assume_role),
@@ -7893,12 +7931,12 @@ fn value_contains_unresolved_ref_detects_nested_resource_ref() {
 
 #[test]
 fn value_contains_unresolved_ref_false_for_pure_literal() {
-    let mut m: IndexMap<String, Value> = IndexMap::new();
+    let mut m: IndexMap<String, RuntimeValue> = IndexMap::new();
     m.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("ap-northeast-1".into())),
     );
-    let v = Value::Concrete(ConcreteValue::Map(m));
+    let v = RuntimeValue::Concrete(RuntimeConcreteValue::Map(m));
 
     assert!(
         !value_contains_unresolved_ref(&v),
@@ -7908,12 +7946,12 @@ fn value_contains_unresolved_ref_false_for_pure_literal() {
 
 #[test]
 fn value_contains_unresolved_ref_detects_list_element() {
-    use crate::resource::{AccessPath, DeferredValue};
+    use crate::resource::AccessPath;
 
-    let v = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("ok".into())),
-        Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("x", "y"),
+    let v = RuntimeValue::Concrete(RuntimeConcreteValue::List(vec![
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("ok".into())),
+        RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+            path: AccessPath::root("x", "y"),
         }),
     ]));
     assert!(
@@ -7924,21 +7962,21 @@ fn value_contains_unresolved_ref_detects_list_element() {
 
 #[test]
 fn value_contains_unresolved_ref_unwraps_secret() {
-    use crate::resource::{AccessPath, DeferredValue};
+    use crate::resource::AccessPath;
 
-    let secret_with_ref = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-        DeferredValue::ResourceRef {
-            path: AccessPath::new("vault", "token"),
-        },
-    ))));
+    let secret_with_ref = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
+        RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+            path: AccessPath::root("vault", "token"),
+        }),
+    )));
     assert!(
         value_contains_unresolved_ref(&secret_with_ref),
         "Secret(ResourceRef) must propagate the unresolved signal",
     );
 
-    let secret_literal = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("plaintext".into()),
-    ))));
+    let secret_literal = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
+        RuntimeValue::Concrete(RuntimeConcreteValue::String("plaintext".into())),
+    )));
     assert!(
         !value_contains_unresolved_ref(&secret_literal),
         "Secret(literal) must not be flagged",
@@ -8286,7 +8324,9 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
     CompositionAttributeRefError {
         error: AttributeParamRefError {
             attribute: "bad".to_string(),
-            path: ReferencePath::Binding("source".to_string()),
+            path: crate::resource::ReferencePath::Binding(
+                RootScope::new().resolve("source".into()),
+            ),
             kind: ModuleCallRefErrorKind::TypeMismatch {
                 expected: "String".to_string(),
                 actual: "Int".to_string(),
@@ -8354,23 +8394,28 @@ fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
         actual: "Int".to_string(),
         declared: None,
     };
-    let path = ReferencePath::Binding("source".to_string());
+    let path = ReferencePath::Binding("source".into());
     let finding =
         ModuleCallFindingMessage::ReferenceType(Box::new(ModuleCallReferenceDiagnostic {
             call_label: "child".to_string(),
             identity: ModuleCallReferenceIdentity {
                 call: first.module_calls[0].id().clone(),
                 argument: "value".to_string(),
-                path: path.clone(),
+                path: ModuleCallDiagnosticPath::Authored(path.clone()),
+                reference_position: Some(0),
+                binding_use: None,
                 kind: kind.clone(),
             },
+            display_path: ModuleCallDiagnosticPath::Authored(path.clone()),
         }));
     let resolver_error = ModuleCallRefError {
         call_label: "child".to_string(),
         identity: ModuleCallReferenceIdentity {
             call: second.module_calls[0].id().clone(),
             argument: "value".to_string(),
-            path,
+            path: ModuleCallDiagnosticPath::Authored(path),
+            reference_position: Some(0),
+            binding_use: None,
             kind,
         },
         argument_span: second.module_calls[0].source_span(),
