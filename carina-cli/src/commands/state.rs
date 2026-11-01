@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use crate::output_style::Colorize;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
-use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -340,7 +340,7 @@ impl StateCommands {
 
 /// Run state subcommands
 pub async fn run_state_command(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     command: StateCommands,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
@@ -350,15 +350,15 @@ pub async fn run_state_command(
             bucket_name,
             force,
             path,
-        } => run_state_bucket_delete(user_dirs, &bucket_name, force, &path, provider_context).await,
+        } => run_state_bucket_delete(runtime, &bucket_name, force, &path, provider_context).await,
         StateCommands::Refresh { path, lock } => {
-            run_state_refresh(user_dirs, &path, lock, provider_context, cancel).await
+            run_state_refresh(runtime, &path, lock, provider_context, cancel).await
         }
         StateCommands::Migrate {
             check,
             state_url,
             provider_schemas,
-        } => run_state_migration_check(user_dirs, &check, &state_url, &provider_schemas).await,
+        } => run_state_migration_check(runtime, &check, &state_url, &provider_schemas).await,
         StateCommands::Forget {
             resource_type,
             identity,
@@ -366,6 +366,7 @@ pub async fn run_state_command(
             path,
         } => {
             run_state_forget(
+                runtime,
                 &resource_type,
                 &identity,
                 auto_approve,
@@ -376,7 +377,13 @@ pub async fn run_state_command(
             .await
         }
         StateCommands::List { path, state_url } => {
-            run_state_list(path.as_deref(), state_url.as_deref(), provider_context).await
+            run_state_list(
+                runtime,
+                path.as_deref(),
+                state_url.as_deref(),
+                provider_context,
+            )
+            .await
         }
         StateCommands::Lookup {
             query,
@@ -385,6 +392,7 @@ pub async fn run_state_command(
             json,
         } => {
             run_state_lookup(
+                runtime,
                 &query,
                 path.as_deref(),
                 state_url.as_deref(),
@@ -400,6 +408,7 @@ pub async fn run_state_command(
             json,
         } => {
             run_state_show(
+                runtime,
                 path.as_deref(),
                 state_url.as_deref(),
                 tui,
@@ -414,7 +423,7 @@ pub async fn run_state_command(
 /// Classify a copied pre-v21 state against the current expanded graph without
 /// initializing a provider, reading upstream state, or writing any state.
 async fn run_state_migration_check(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     config_dir: &Path,
     state_file: &LocalStateFile,
     provider_schema_args: &[String],
@@ -467,7 +476,7 @@ async fn run_state_migration_check(
     }
     let base_dir = get_base_dir(config_dir);
     let providers = MigrationCheckProviderLoad::load(
-        user_dirs,
+        runtime,
         &parsed.providers,
         base_dir,
         &provider_schema_overrides,
@@ -488,7 +497,7 @@ async fn run_state_migration_check(
     };
     let migrated_rows = migration.migrated_rows();
     let warning_count = migration.warning_count();
-    let _validated = migration.report_and_validate()?;
+    let _validated = migration.report_and_validate(runtime.color_mode())?;
     println!(
         "State dependency migration check passed: {} row(s) classified, {} orphan/deposed warning(s); no state was written.",
         migrated_rows, warning_count
@@ -556,6 +565,7 @@ fn format_state_forget_target(
 }
 
 async fn confirm_state_forget<R>(
+    runtime: &crate::runtime::CommandRuntime,
     reader: R,
     cancel: ShutdownToken,
     auto_approve: bool,
@@ -563,6 +573,7 @@ async fn confirm_state_forget<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    let color_mode = runtime.color_mode();
     if auto_approve {
         return Ok(StateForgetConfirmation::Confirmed);
     }
@@ -570,16 +581,16 @@ where
     println!(
         "{}",
         "Forget this create-outcome-unknown state row?"
-            .yellow()
-            .bold()
+            .yellow(color_mode)
+            .bold(color_mode)
     );
     println!(
         "  {}",
         "Only continue after confirming that the resource does not exist. Type 'yes' to confirm."
-            .yellow()
+            .yellow(color_mode)
     );
     let input = {
-        let _reveal = CursorReveal::new();
+        let _reveal = CursorReveal::new(runtime.cursor());
         print!("\n  Enter a value: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|error| error.to_string())?;
         let result = crate::signal::read_line_until_cancelled(reader, cancel).await;
@@ -592,13 +603,14 @@ where
         Ok(StateForgetConfirmation::Confirmed)
     } else {
         println!();
-        println!("{}", "State forget cancelled.".yellow());
+        println!("{}", "State forget cancelled.".yellow(color_mode));
         Ok(StateForgetConfirmation::Cancelled)
     }
 }
 
 /// Remove the recovery row for a create whose outcome is unknown.
 pub async fn run_state_forget(
+    runtime: &crate::runtime::CommandRuntime,
     namespaced_type: &str,
     identity: &str,
     auto_approve: bool,
@@ -606,6 +618,7 @@ pub async fn run_state_forget(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let address = state_forget_address(namespaced_type, identity)?;
     let loaded = load_configuration_with_config(
         path,
@@ -624,15 +637,16 @@ pub async fn run_state_forget(
         .await
         .map_err(AppError::Backend)?;
 
-    println!("{}", "Acquiring state lock...".cyan());
+    println!("{}", "Acquiring state lock...".cyan(color_mode));
     let lock = backend
         .acquire_lock("state forget")
         .await
         .map_err(|error| map_lock_error(error, path))?;
-    println!("  {} Lock acquired", "✓".green());
+    println!("  {} Lock acquired", "✓".green(color_mode));
 
     let reader = tokio::io::BufReader::new(tokio::io::stdin());
     let operation = run_state_forget_locked(
+        runtime,
         backend.as_ref(),
         &lock,
         &address,
@@ -645,7 +659,7 @@ pub async fn run_state_forget(
     let release =
         release_lock_after_execute(backend.as_ref(), StateLockRef::Held(&lock), &cancel).await;
     if release.is_ok() {
-        println!("  {} Lock released", "✓".green());
+        println!("  {} Lock released", "✓".green(color_mode));
     }
     operation?;
     release
@@ -686,7 +700,9 @@ impl AsMut<StateFile> for StateForgetWriteState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_state_forget_locked<R>(
+    runtime: &crate::runtime::CommandRuntime,
     backend: &dyn StateBackend,
     lock: &LockInfo,
     address: &StateBlockAddress,
@@ -698,6 +714,7 @@ async fn run_state_forget_locked<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    let color_mode = runtime.color_mode();
     let state =
         crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
             .await?
@@ -708,7 +725,7 @@ where
         .map_err(|source| AppError::from_state_forget(source, project_dir))?;
 
     println!("{}", format_state_forget_target(address, row.resource()));
-    if confirm_state_forget(reader, cancel, auto_approve).await?
+    if confirm_state_forget(runtime, reader, cancel, auto_approve).await?
         == StateForgetConfirmation::Cancelled
     {
         return Ok(());
@@ -723,8 +740,8 @@ where
     println!(
         "{} {}",
         "Forgot create-outcome-unknown current instance:"
-            .green()
-            .bold(),
+            .green(color_mode)
+            .bold(color_mode),
         display_state_forget_address(address)
     );
     Ok(())
@@ -732,6 +749,7 @@ where
 
 /// Run force-unlock command
 pub async fn run_force_unlock(
+    color_mode: crate::output_style::ColorMode,
     lock_id: &str,
     path: &Path,
     provider_context: &ProviderContext,
@@ -751,12 +769,22 @@ pub async fn run_force_unlock(
 
     // Administrative lock recovery uses the shared old-backend-on-drift
     // selector without emitting the read-command warning.
-    println!("{}", "Force unlocking state...".yellow().bold());
+    println!(
+        "{}",
+        "Force unlocking state..."
+            .yellow(color_mode)
+            .bold(color_mode)
+    );
     println!("Lock ID: {}", lock_id);
 
     match BackendSelection::force_unlock(base_dir, backend_config.as_ref(), lock_id).await {
         Ok(()) => {
-            println!("{}", "State has been successfully unlocked.".green().bold());
+            println!(
+                "{}",
+                "State has been successfully unlocked."
+                    .green(color_mode)
+                    .bold(color_mode)
+            );
             Ok(())
         }
         Err(BackendError::LockNotFound(_)) => Err(AppError::Config(format!(
@@ -779,10 +807,12 @@ pub async fn run_force_unlock(
 /// is `Some`. When both are `None`, the existing behavior applies and
 /// the path defaults to `.`.
 async fn load_state_file(
+    runtime: &crate::runtime::CommandRuntime,
     path: Option<&Path>,
     state_url: Option<&str>,
     provider_context: &ProviderContext,
 ) -> Result<Option<StateFile>, AppError> {
+    let color_mode = runtime.color_mode();
     if let Some(raw) = state_url {
         let url = StateUrl::parse(raw).map_err(AppError::Backend)?;
         return load_state_from_url(&url)
@@ -808,6 +838,7 @@ async fn load_state_file(
 
     let base_dir = get_base_dir(path);
     let backend = resolve_backend_for_read(
+        color_mode,
         base_dir,
         path,
         backend_config.as_ref(),
@@ -975,11 +1006,13 @@ fn deposed_state_marker(key: &DeposedKey, identifier: &str) -> String {
 
 /// Run state list command
 async fn run_state_list(
+    runtime: &crate::runtime::CommandRuntime,
     path: Option<&Path>,
     state_url: Option<&str>,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = require_state_file(load_state_file(path, state_url, provider_context).await?)?;
+    let state =
+        require_state_file(load_state_file(runtime, path, state_url, provider_context).await?)?;
 
     if state.resources().is_empty() {
         println!("No resources in state.");
@@ -1248,13 +1281,15 @@ fn missing_attribute_error<T>(rs: &ResourceState, attr: &str) -> Result<T, AppEr
 
 /// Run state lookup command
 async fn run_state_lookup(
+    runtime: &crate::runtime::CommandRuntime,
     query: &str,
     path: Option<&Path>,
     state_url: Option<&str>,
     json_output: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = require_state_file(load_state_file(path, state_url, provider_context).await?)?;
+    let state =
+        require_state_file(load_state_file(runtime, path, state_url, provider_context).await?)?;
     let output = format_state_lookup(&state, query, json_output)?;
     println!("{}", output);
     Ok(())
@@ -1365,13 +1400,14 @@ fn format_attributes_for_show(
 
 /// Run state show command
 async fn run_state_show(
+    runtime: &crate::runtime::CommandRuntime,
     path: Option<&Path>,
     state_url: Option<&str>,
     tui: bool,
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let state = load_state_file(path, state_url, provider_context).await?;
+    let state = load_state_file(runtime, path, state_url, provider_context).await?;
 
     let Some(state) = state else {
         if json {
@@ -1436,12 +1472,13 @@ async fn run_state_show(
 
 /// Run state bucket delete command
 async fn run_state_bucket_delete(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     bucket_name: &str,
     force: bool,
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -1471,21 +1508,24 @@ async fn run_state_bucket_delete(
     // that command wiring before asking the operator to confirm deletion; the
     // resolved provider values needed for construction can wait until after
     // confirmation.
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     println!(
         "{}",
         "WARNING: This will delete the state bucket and all state history."
-            .red()
-            .bold()
+            .red(color_mode)
+            .bold(color_mode)
     );
-    println!("Bucket: {}", bucket_name.yellow());
+    println!("Bucket: {}", bucket_name.yellow(color_mode));
 
     if !force {
         println!();
-        println!("{}", "Type the bucket name to confirm deletion:".yellow());
+        println!(
+            "{}",
+            "Type the bucket name to confirm deletion:".yellow(color_mode)
+        );
         print!("  Enter bucket name: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
@@ -1496,7 +1536,7 @@ async fn run_state_bucket_delete(
 
         if input.trim() != bucket_name {
             println!();
-            println!("{}", "Deletion cancelled.".yellow());
+            println!("{}", "Deletion cancelled.".yellow(color_mode));
             return Ok(());
         }
     }
@@ -1504,6 +1544,7 @@ async fn run_state_bucket_delete(
     let provider_name = selection.provider_name();
     let resource_type = selection.resource_type();
     let provider_inputs = load_state_bucket_delete_provider_inputs(
+        runtime,
         validated_config.resources(),
         base_dir,
         provider_context,
@@ -1518,7 +1559,7 @@ async fn run_state_bucket_delete(
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
-    println!("{}", "Emptying bucket...".cyan());
+    println!("{}", "Emptying bucket...".cyan(color_mode));
 
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
@@ -1548,8 +1589,8 @@ async fn run_state_bucket_delete(
             println!(
                 "{}",
                 format!("Deleted state bucket: {}", bucket_name)
-                    .green()
-                    .bold()
+                    .green(color_mode)
+                    .bold(color_mode)
             );
             Ok(())
         }
@@ -1581,11 +1622,13 @@ fn state_bucket_delete_request(
 }
 
 async fn load_state_bucket_delete_provider_inputs<E>(
+    runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
+        runtime,
         parsed,
         base_dir,
         provider_context,
@@ -1612,12 +1655,13 @@ async fn create_state_bucket_delete_provider<R>(
 
 /// Run state refresh command
 pub async fn run_state_refresh(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     lock: bool,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -1627,7 +1671,7 @@ pub async fn run_state_refresh(
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
@@ -1645,19 +1689,19 @@ pub async fn run_state_refresh(
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
-        println!("{}", "Acquiring state lock...".cyan());
+        println!("{}", "Acquiring state lock...".cyan(color_mode));
         let li = backend
             .acquire_lock("refresh")
             .await
             .map_err(|error| map_lock_error(error, path))?;
-        println!("  {} Lock acquired", "✓".green());
+        println!("  {} Lock acquired", "✓".green(color_mode));
         StateLock::held(li)
     } else {
         println!(
             "{}",
             "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         StateLock::disabled_by_cli_flag()
     };
@@ -1678,7 +1722,7 @@ pub async fn run_state_refresh(
         && release_result.is_ok()
         && matches!(op_result, Err(AppError::Interrupted))
     {
-        println!("  {} Lock released", "✓".green());
+        println!("  {} Lock released", "✓".green(color_mode));
     }
     op_result?;
     release_result
@@ -1692,6 +1736,7 @@ pub(crate) async fn run_state_refresh_locked(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = validated_config.context().runtime().color_mode();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the refresh lock before the "no
     // resources" short-circuit returns — see
@@ -1713,7 +1758,7 @@ pub(crate) async fn run_state_refresh_locked(
         } else {
             "No resources in state. Nothing to refresh."
         };
-        println!("{}", msg.yellow());
+        println!("{}", msg.yellow(color_mode));
         return Ok(());
     }
 
@@ -1721,6 +1766,7 @@ pub(crate) async fn run_state_refresh_locked(
     let (ctx, parsed) = validated_config.context_and_resources();
 
     let provider_inputs = load_and_resolve_provider_configs(
+        validated_config.context().runtime(),
         parsed,
         base_dir,
         provider_context,
@@ -1741,7 +1787,7 @@ pub(crate) async fn run_state_refresh_locked(
         get_provider_with_ctx(ctx, provider_inputs.configs(), ProgressSink::Human).await?;
 
     println!();
-    let progress = ProgressBackend::new(ProgressSink::Human);
+    let progress = ProgressBackend::new(color_mode, ProgressSink::Human);
     let refresh_phase = RefreshPhase::start(&progress);
 
     // Read states for all resources using identifier from state.
@@ -1757,7 +1803,7 @@ pub(crate) async fn run_state_refresh_locked(
                     managed_reads.push((resource.id.clone(), present.identifier().clone()));
                 }
                 Current::MissingIdentifier(state) => {
-                    warn_missing_provider_identifier(&resource.id);
+                    warn_missing_provider_identifier(color_mode, &resource.id);
                     missing_provider_identifier_ids.insert(resource.id.clone());
                     managed_current.insert(resource.id.clone(), Current::MissingIdentifier(state));
                 }
@@ -1772,8 +1818,14 @@ pub(crate) async fn run_state_refresh_locked(
             }
         }
     }
-    let (managed_states, mut already_refreshed) =
-        refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
+    let (managed_states, mut already_refreshed) = refresh_existing_resources_until_cancelled(
+        #[cfg(test)]
+        ctx.runtime(),
+        &provider,
+        managed_reads,
+        &cancel,
+    )
+    .await?;
     managed_current.extend(managed_states);
     match cancel.phase() {
         ShutdownPhase::Running => {}
@@ -1793,6 +1845,8 @@ pub(crate) async fn run_state_refresh_locked(
         .map(|sf| sf.build_orphans(&pre_expansion_desired_ids))
         .unwrap_or_default();
     let (refreshed_orphans, refreshed_orphan_ids) = refresh_orphans_until_cancelled(
+        #[cfg(test)]
+        ctx.runtime(),
         &provider,
         loaded_orphans,
         state_file.as_ref(),
@@ -1807,7 +1861,7 @@ pub(crate) async fn run_state_refresh_locked(
             Current::CreateInFlight(_pending) => {}
             Current::CreateOutcomeUnknown(_unknown) => {}
             Current::MissingIdentifier(_state) => {
-                warn_missing_provider_identifier(id);
+                warn_missing_provider_identifier(color_mode, id);
                 missing_provider_identifier_ids.insert(id.clone());
             }
         }
@@ -1940,7 +1994,7 @@ pub(crate) async fn run_state_refresh_locked(
         if let DataSourceValue::DeferredToApply(unresolved) = value {
             eprintln!(
                 "{}",
-                format_deferred_state_refresh_warning(resource, unresolved).yellow()
+                format_deferred_state_refresh_warning(resource, unresolved).yellow(color_mode)
             );
         }
     }
@@ -2048,6 +2102,7 @@ pub(crate) async fn run_state_refresh_locked(
             None => continue, // Not in state, skip
         };
         diff_display_update_resource_with_provider(
+            color_mode,
             &resource.resolved_id(),
             fresh_current,
             &mut state,
@@ -2069,6 +2124,7 @@ pub(crate) async fn run_state_refresh_locked(
             None => continue,
         };
         diff_display_update_resource_with_provider(
+            color_mode,
             orphan_id,
             fresh_current,
             &mut state,
@@ -2081,6 +2137,7 @@ pub(crate) async fn run_state_refresh_locked(
     }
 
     let deposed_summary = refresh_deposed_generations_until_cancelled(
+        color_mode,
         &provider,
         &mut state,
         &resolved_resources,
@@ -2145,7 +2202,7 @@ pub(crate) async fn run_state_refresh_locked(
             },
         )?;
         let resolution = crate::commands::shared::state_writeback::materialize_exports(&values)?;
-        resolution.write_into(&mut state)
+        resolution.write_into(color_mode, &mut state)
     } else {
         SkippedExports::default()
     };
@@ -2169,10 +2226,18 @@ pub(crate) async fn run_state_refresh_locked(
             &deposed_summary,
         )
     );
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} State saved (serial: {})",
+        "✓".green(color_mode),
+        state.serial
+    );
 
     if !skipped_exports.is_empty() {
-        println!("  {} {}", "!".yellow(), skipped_exports.count_description());
+        println!(
+            "  {} {}",
+            "!".yellow(color_mode),
+            skipped_exports.count_description()
+        );
         return Err(AppError::Config(skipped_exports.failure_message()));
     }
 
@@ -2213,6 +2278,7 @@ fn format_state_refresh_summary(
 }
 
 async fn refresh_existing_resources_until_cancelled(
+    #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
     provider: &dyn Provider,
     reads: Vec<(ResourceId, AppliedIdentifier)>,
     cancel: &ShutdownToken,
@@ -2260,7 +2326,7 @@ async fn refresh_existing_resources_until_cancelled(
         let next_in_flight = async {
             if draining {
                 crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
-                    cancel,
+                    runtime, cancel,
                 )
                 .await;
             }
@@ -2313,6 +2379,7 @@ async fn refresh_existing_resources_until_cancelled(
 }
 
 async fn refresh_orphans_until_cancelled(
+    #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
     provider: &dyn Provider,
     loaded: LoadedOrphans,
     state_file: Option<&StateFile>,
@@ -2368,7 +2435,7 @@ async fn refresh_orphans_until_cancelled(
         let next_in_flight = async {
             if draining {
                 crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
-                    cancel,
+                    runtime, cancel,
                 )
                 .await;
             }
@@ -2417,13 +2484,13 @@ async fn refresh_orphans_until_cancelled(
     Ok((refreshed_orphans, refreshed))
 }
 
-fn warn_missing_provider_identifier(id: &ResourceId) {
+fn warn_missing_provider_identifier(color_mode: crate::output_style::ColorMode, id: &ResourceId) {
     eprintln!(
         "{}",
         format!(
             "Warning: {id}: saved state has no provider identifier and was not refreshed; the row was preserved. Add a `removed` block and apply it, then add an `import` block with the real provider identifier to restore management."
         )
-        .yellow()
+        .yellow(color_mode)
     );
 }
 
@@ -2446,6 +2513,7 @@ struct DeposedRefreshSummary {
 }
 
 async fn refresh_deposed_generations_until_cancelled<P>(
+    color_mode: crate::output_style::ColorMode,
     provider: &P,
     state: &mut carina_state::StateFile,
     desired_resources: &[ResolvedResource],
@@ -2485,7 +2553,7 @@ where
                         deposed_state_marker(&target.generation.key, &target.generation.identifier),
                         target.generation.key,
                     )
-                    .yellow()
+                    .yellow(color_mode)
                 );
                 summary.failed_generations += 1;
                 continue;
@@ -2523,7 +2591,7 @@ where
                         deposed_state_marker(&target.generation.key, &target.generation.identifier),
                         err
                     )
-                    .yellow()
+                    .yellow(color_mode)
                 );
                 summary.failed_generations += 1;
                 continue;
@@ -2540,11 +2608,11 @@ where
             summary.removed_generations += 1;
             println!(
                 "  {} \"{}\" {}:",
-                target.id.display_type().cyan(),
+                target.id.display_type().cyan(color_mode),
                 target.id.identity_display(),
                 deposed_state_marker(&target.generation.key, &target.generation.identifier)
             );
-            println!("    {} resource no longer exists", "-".red());
+            println!("    {} resource no longer exists", "-".red(color_mode));
             println!();
             continue;
         }
@@ -2597,11 +2665,11 @@ where
         )?;
         println!(
             "  {} \"{}\" {}:",
-            target.id.display_type().cyan(),
+            target.id.display_type().cyan(color_mode),
             target.id.identity_display(),
             deposed_state_marker(&target.generation.key, &target.generation.identifier)
         );
-        println!("    {} attributes refreshed", "~".yellow());
+        println!("    {} attributes refreshed", "~".yellow(color_mode));
         println!();
     }
 
@@ -2713,6 +2781,7 @@ struct StateRefreshCounts {
 
 #[allow(clippy::too_many_arguments)]
 fn diff_display_update_resource_with_provider(
+    color_mode: crate::output_style::ColorMode,
     id: &ResolvedResourceId,
     fresh_current: &Current,
     state: &mut carina_state::StateFile,
@@ -2740,7 +2809,7 @@ fn diff_display_update_resource_with_provider(
             counts.unchanged += 1;
             println!(
                 "  {} \"{}\"{}:",
-                id.display_type().cyan(),
+                id.display_type().cyan(color_mode),
                 identity,
                 label_suffix,
             );
@@ -2752,7 +2821,7 @@ fn diff_display_update_resource_with_provider(
             counts.unchanged += 1;
             println!(
                 "  {} \"{}\"{}:",
-                id.display_type().cyan(),
+                id.display_type().cyan(color_mode),
                 identity,
                 label_suffix,
             );
@@ -2826,7 +2895,10 @@ fn diff_display_update_resource_with_provider(
     if !exists {
         // Resource was deleted externally
         has_changes = true;
-        changes.push(format!("    {} resource no longer exists", "-".red()));
+        changes.push(format!(
+            "    {} resource no longer exists",
+            "-".red(color_mode)
+        ));
     } else {
         // Check for modified, added, and removed attributes
         let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
@@ -2852,29 +2924,29 @@ fn diff_display_update_resource_with_provider(
                     has_changes = true;
                     changes.push(format!(
                         "    {} {}: {} {} {}",
-                        "~".yellow(),
+                        "~".yellow(color_mode),
                         key,
-                        format_value(old).red(),
-                        "\u{2192}".dimmed(),
-                        format_value(new).green(),
+                        format_value(old).red(color_mode),
+                        "\u{2192}".dimmed(color_mode),
+                        format_value(new).green(color_mode),
                     ));
                 }
                 (Some(old), None) => {
                     has_changes = true;
                     changes.push(format!(
                         "    {} {}: {}",
-                        "-".red(),
+                        "-".red(color_mode),
                         key,
-                        format_value(old).red(),
+                        format_value(old).red(color_mode),
                     ));
                 }
                 (None, Some(new)) => {
                     has_changes = true;
                     changes.push(format!(
                         "    {} {}: {}",
-                        "+".green(),
+                        "+".green(color_mode),
                         key,
-                        format_value(new).green(),
+                        format_value(new).green(color_mode),
                     ));
                 }
                 _ => {}
@@ -2886,7 +2958,7 @@ fn diff_display_update_resource_with_provider(
         counts.updated += 1;
         println!(
             "  {} \"{}\"{}:",
-            id.display_type().cyan(),
+            id.display_type().cyan(color_mode),
             identity,
             label_suffix,
         );
@@ -2909,7 +2981,9 @@ fn diff_display_update_resource_with_provider(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn diff_display_update_resource(
+    color_mode: crate::output_style::ColorMode,
     id: &ResolvedResourceId,
     fresh_current: &Current,
     state: &mut carina_state::StateFile,
@@ -2921,6 +2995,7 @@ fn diff_display_update_resource(
     let (schemas, provider) =
         carina_core::provider::comparison_fixture_for_test(schemas, std::iter::once(id.as_inner()));
     diff_display_update_resource_with_provider(
+        color_mode,
         id,
         fresh_current,
         state,
@@ -2936,7 +3011,7 @@ fn diff_display_update_resource(
 mod tests {
     use super::*;
     use crate::commands::shared::cancellation_test_support::{
-        CancellationFixtureBase, MOCK_PROVIDER_ENV_LOCK, ScopedEnv, install_refresh_drain_barrier,
+        CancellationFixtureBase, install_refresh_drain_barrier,
     };
     use crate::provider_upstream_test_support::{
         ProviderConfigCaptureFactory, provider_default_tags_local_resource_fixture,
@@ -3037,6 +3112,7 @@ mod tests {
 
     #[test]
     fn state_refresh_counts_reference_form_equivalent_value_as_unchanged() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
         use carina_core::schema::{
             ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
@@ -3102,7 +3178,13 @@ mod tests {
         provider.add_provider(
             "aws".to_string(),
             InitializedProvider::for_test(
-                Box::new(carina_provider_mock::MockProvider::new()),
+                Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                ),
                 ReferenceScope::available("aws", "us-east-1", "123456789012")
                     .expect("fixture scope is valid"),
             ),
@@ -3110,6 +3192,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource_with_provider(
+            color_mode,
             &ResolvedResourceId::new(desired.id.clone()),
             &fresh,
             &mut state,
@@ -3213,6 +3296,7 @@ mod tests {
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3260,6 +3344,7 @@ mod tests {
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3292,6 +3377,7 @@ mod tests {
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
             &provider_configs,
@@ -3331,7 +3417,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_without_downstream_state_ignores_missing_provider_upstream() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
@@ -3343,7 +3429,7 @@ mod tests {
         .unwrap();
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
+        let providers = ProviderLoad::load(&runtime, &parsed.providers, &downstream).unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -3367,10 +3453,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(&runtime, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -3394,10 +3480,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(&runtime, &parsed.providers, &base_dir).unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -3424,6 +3510,7 @@ mod tests {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         let parsed = resolve_authored_file_for_test(parsed, &downstream);
         let inputs = load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
             &ProviderContext::default(),
@@ -3432,6 +3519,7 @@ mod tests {
         .expect("state bucket delete provider inputs must resolve");
         let received_role_arn = Arc::new(Mutex::new(None));
         let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3482,6 +3570,7 @@ mod tests {
         let parsed = resolve_authored_file_for_test(parsed, &downstream);
 
         let error = match load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
             &ProviderContext::default(),
@@ -3506,6 +3595,7 @@ mod tests {
         parsed.providers[0].name = "test".to_string();
         let parsed = resolve_authored_file_for_test(parsed, &base_dir);
         let inputs = load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &base_dir,
             &ProviderContext::default(),
@@ -3514,6 +3604,7 @@ mod tests {
         .expect("bucket delete must not load tag-only upstream state");
         let received_role_arn = Arc::new(Mutex::new(None));
         let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3562,6 +3653,7 @@ mod tests {
         let parsed = resolve_authored_file_for_test(parsed, temp.path());
 
         let inputs = load_state_bucket_delete_provider_inputs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             temp.path(),
             &ProviderContext::default(),
@@ -3570,6 +3662,7 @@ mod tests {
         .expect("deferred default tags must not block bucket provider construction");
         let received_role_arn = Arc::new(Mutex::new(None));
         let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -3902,6 +3995,7 @@ mod tests {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(CancellingDataSourceRefreshFactory {
                 reads: reads.clone(),
@@ -3993,6 +4087,7 @@ mod tests {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory {
                 reads: reads.clone(),
@@ -4071,6 +4166,7 @@ mod tests {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ModuleConstraintRefreshFactory { reads })],
             &provider_configs,
@@ -4179,6 +4275,7 @@ mod tests {
         let read = Arc::new(AtomicBool::new(false));
 
         let error = run_state_forget_locked(
+            &crate::test_support::TestCommandRuntime::new(),
             &backend,
             &LockInfo::for_test("state forget"),
             &StateBlockAddress::new("mock", "test.Resource", "unknown"),
@@ -4261,6 +4358,7 @@ mod tests {
         let fixture = state_forget_fixture(&outcome_unknown_state_fixture());
 
         run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "unknown",
             true,
@@ -4281,6 +4379,7 @@ mod tests {
         let fixture = state_forget_fixture(&outcome_unknown_state_with_deposed_fixture());
 
         run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "unknown",
             true,
@@ -4323,6 +4422,7 @@ mod tests {
         let fixture = state_forget_fixture(&state);
 
         let error = run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "normal",
             true,
@@ -4352,6 +4452,7 @@ mod tests {
             .expect("hold fixture lock");
 
         let error = run_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             "mock.test.Resource",
             "unknown",
             true,
@@ -4375,6 +4476,7 @@ mod tests {
     #[tokio::test]
     async fn state_forget_confirmation_requires_yes_and_auto_approve_skips_input() {
         let cancelled = confirm_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             tokio::io::BufReader::new("no\n".as_bytes()),
             ShutdownToken::running(),
             false,
@@ -4384,6 +4486,7 @@ mod tests {
         assert_eq!(cancelled, StateForgetConfirmation::Cancelled);
 
         let confirmed = confirm_state_forget(
+            &crate::test_support::TestCommandRuntime::new(),
             tokio::io::BufReader::new(tokio::io::empty()),
             ShutdownToken::running(),
             true,
@@ -4579,7 +4682,6 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_loads_providers_once() {
-        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = CancellationFixtureBase::new();
         let state_path = fixture.state_path().display();
         fixture.write_crn(format!(
@@ -4587,9 +4689,9 @@ mod tests {
         ));
         fixture.write_backend_lock();
 
-        let load_count = crate::wiring::track_provider_loads_for_test();
+        let loads_before = fixture.runtime().provider_load_count();
         run_state_refresh(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             false,
             &ProviderContext::default(),
@@ -4599,7 +4701,7 @@ mod tests {
         .expect("empty state refresh must succeed");
 
         assert_eq!(
-            load_count.count(),
+            fixture.runtime().provider_load_count() - loads_before,
             1,
             "validation and locked refresh must share one provider load"
         );
@@ -4607,9 +4709,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-        let fixture = CancellationFixtureBase::new();
+        let mut fixture = CancellationFixtureBase::new();
         let state_path = fixture.state_path().display();
         fixture.write_crn(format!(
             "backend local {{ path = \"{state_path}\" }}\n\
@@ -4642,18 +4742,28 @@ mod tests {
         .expect("write mock provider state");
         let read_ready_path = fixture.readiness_path("mock-read-ready");
         let read_outcome_path = fixture.readiness_path("mock-read-outcome");
-        let _provider_env = [
-            ScopedEnv::set("CARINA_MOCK_STATE_FILE", &provider_state_path),
-            ScopedEnv::set("CARINA_MOCK_READ_DELAY_MS_FOR", "test.resource.managed"),
-            ScopedEnv::set("CARINA_MOCK_READ_DELAY_MS", "60000"),
-            ScopedEnv::set("CARINA_MOCK_READ_READY_PATH", &read_ready_path),
-            ScopedEnv::set("CARINA_MOCK_READ_OUTCOME_PATH", &read_outcome_path),
-        ];
-        let drain_barrier = install_refresh_drain_barrier(fixture.shutdown_token());
+        fixture.configure_mock(
+            carina_provider_mock::MockBehavior {
+                read_delay: Some(carina_provider_mock::SelectedDelay {
+                    address: "test.resource.managed".to_string(),
+                    duration: std::time::Duration::from_millis(60000),
+                }),
+                observations: carina_provider_mock::MockObservations {
+                    read_ready: Some(std::path::PathBuf::from(&read_ready_path)),
+                    read_outcome: Some(std::path::PathBuf::from(&read_outcome_path)),
+                    ..carina_provider_mock::MockObservations::default()
+                },
+                ..carina_provider_mock::MockBehavior::default()
+            },
+            carina_provider_mock::MockScope::file(std::path::PathBuf::from(&provider_state_path))
+                .unwrap(),
+        );
+        let drain_barrier =
+            install_refresh_drain_barrier(fixture.runtime(), fixture.shutdown_token());
 
         let provider_context = ProviderContext::default();
         let refresh = run_state_refresh(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             &provider_context,
@@ -4709,7 +4819,10 @@ mod tests {
         assert!(!fixture.lock_path().exists(), "lock must be released");
     }
 
-    async fn assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(loop_target: &str) {
+    async fn assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(
+        color_mode: crate::output_style::ColorMode,
+        loop_target: &str,
+    ) {
         let source = r#"
                 let source = aws.service.Source {
                     name = "source"
@@ -4851,6 +4964,7 @@ mod tests {
             .with_saved_attr_hydration()
             .with_read_state(&child.id, "widget-1", refreshed);
         let (orphans, already_refreshed) = refresh_orphans_until_cancelled(
+            &crate::test_support::TestCommandRuntime::new(),
             &provider,
             state_file.build_orphans(&desired_ids),
             Some(&state_file),
@@ -4874,12 +4988,13 @@ mod tests {
                 already_refreshed,
             })
             .seal(carina_core::data_source_value::DataSourceValues::empty());
-        let progress = ProgressBackend::plain(std::io::sink());
+        let progress = ProgressBackend::plain(color_mode, std::io::sink());
         let refresh_phase = RefreshPhase::start(&progress);
         let mut validated_config = ValidatedConfig::from_factories_with_additional_schemas_for_test::<
             carina_core::resource::NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
         >(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             Vec::new(),
             &[],
@@ -4935,12 +5050,18 @@ mod tests {
 
     #[tokio::test]
     async fn state_refresh_expansion_hydrates_lifted_saved_enum_attrs() {
-        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs("let widgets = ").await;
+        let color_mode = crate::output_style::ColorMode::Plain;
+        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(
+            color_mode,
+            "let widgets = ",
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn state_refresh_unbound_expansion_hydrates_lifted_saved_enum_attrs() {
-        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs("").await;
+        let color_mode = crate::output_style::ColorMode::Plain;
+        assert_state_refresh_expansion_hydrates_lifted_saved_enum_attrs(color_mode, "").await;
     }
 
     fn deposed_format_state() -> StateFile {
@@ -5545,6 +5666,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generations_drops_gone_updates_alive_and_preserves_current() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let gone_key = deposed_key("gone-key");
         let alive_key = deposed_key("alive-key");
         let mut state = StateFile::new();
@@ -5592,6 +5714,7 @@ mod tests {
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5637,6 +5760,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_removes_shell_row_when_gone() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5657,6 +5781,7 @@ mod tests {
         );
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5680,6 +5805,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_carries_previous_write_only_value_when_read_omits_it() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5722,6 +5848,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5748,6 +5875,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_ignores_provider_echo_for_write_only_value() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5788,6 +5916,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5810,6 +5939,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_masks_plaintext_secret_from_provider_read() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5840,6 +5970,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(desired)],
@@ -5865,6 +5996,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_deposed_generation_carries_schema_write_only_plaintext_without_desired_secret()
     {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -5905,6 +6037,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5932,6 +6065,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_rehashes_existing_hash_without_desired_secret() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
@@ -5960,6 +6094,7 @@ mod tests {
         );
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -5995,6 +6130,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_merges_nested_secret_hash_per_leaf_and_converges() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
@@ -6030,6 +6166,7 @@ mod tests {
         );
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -6052,6 +6189,7 @@ mod tests {
         assert!(!secret.contains("plain-secret"));
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -6074,6 +6212,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_preserves_all_host_metadata_and_prevent_destroy() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.Subnet",
@@ -6151,6 +6290,7 @@ mod tests {
         );
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6244,7 +6384,10 @@ mod tests {
         ));
     }
 
-    fn refresh_reordered_list(list_type: AttributeType) -> StateRefreshCounts {
+    fn refresh_reordered_list(
+        color_mode: crate::output_style::ColorMode,
+        list_type: AttributeType,
+    ) -> StateRefreshCounts {
         let id = ResourceId::with_provider_identity("test", "example.Lists", "main", None);
         let desired = Resource::with_provider("test", "example.Lists", "main", None);
         let mut state = StateFile::new();
@@ -6277,6 +6420,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id),
             &Current::from_state(fresh),
             &mut state,
@@ -6292,6 +6436,7 @@ mod tests {
 
     #[test]
     fn current_refresh_treats_empty_non_marker_struct_and_absent_as_unchanged() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("test", "example.Settings", "main", None);
         let desired = resolved(Resource::with_provider(
             "test",
@@ -6327,6 +6472,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id),
             &Current::from_state(fresh),
             &mut state,
@@ -6343,6 +6489,7 @@ mod tests {
 
     #[test]
     fn current_refresh_seeds_unrecorded_from_empty_desired_without_promoting_tags() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::explicit::ExplicitFields;
 
@@ -6382,6 +6529,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6422,6 +6570,7 @@ mod tests {
 
     #[test]
     fn current_refresh_keeps_prior_authored_tags_when_desired_has_removed_them() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::differ::{Diff, diff_for_test as diff};
         use carina_core::explicit::ExplicitFields;
 
@@ -6483,6 +6632,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6522,6 +6672,7 @@ mod tests {
     }
 
     fn diff_after_failed_update_and_state_refresh(
+        color_mode: crate::output_style::ColorMode,
         applied: Resource,
         desired: Resource,
         provider_attributes: HashMap<String, Value>,
@@ -6592,6 +6743,7 @@ mod tests {
         // the next plan. The provider still reports the pre-update value.
         let mut counts = StateRefreshCounts::default();
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(provider_state.clone()),
             &mut refreshed_state,
@@ -6626,6 +6778,7 @@ mod tests {
 
     #[test]
     fn state_refresh_nested_struct_pending_removal_after_failed_update_is_replanned() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::differ::Diff;
 
         let settings = |description: Option<&str>| {
@@ -6648,6 +6801,7 @@ mod tests {
             .with_attribute("settings", settings(None));
 
         let (result, explicit) = diff_after_failed_update_and_state_refresh(
+            color_mode,
             applied,
             desired,
             HashMap::from([("settings".to_string(), applied_settings)]),
@@ -6667,6 +6821,7 @@ mod tests {
 
     #[test]
     fn state_refresh_list_element_nested_pending_removal_after_failed_update_is_replanned() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         use carina_core::differ::Diff;
 
         let rule = |port, description: Option<&str>| {
@@ -6694,6 +6849,7 @@ mod tests {
             .with_attribute("rules", desired_rules);
 
         let (result, explicit) = diff_after_failed_update_and_state_refresh(
+            color_mode,
             applied,
             desired,
             HashMap::from([("rules".to_string(), applied_rules)]),
@@ -6713,7 +6869,11 @@ mod tests {
 
     #[test]
     fn current_refresh_ignores_reordered_unordered_list() {
-        let counts = refresh_reordered_list(AttributeType::unordered_list(AttributeType::string()));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts = refresh_reordered_list(
+            color_mode,
+            AttributeType::unordered_list(AttributeType::string()),
+        );
 
         assert_eq!(counts.updated, 0);
         assert_eq!(counts.unchanged, 1);
@@ -6721,7 +6881,9 @@ mod tests {
 
     #[test]
     fn current_refresh_reports_reordered_ordered_list() {
-        let counts = refresh_reordered_list(AttributeType::list(AttributeType::string()));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts =
+            refresh_reordered_list(color_mode, AttributeType::list(AttributeType::string()));
 
         assert_eq!(counts.updated, 1);
         assert_eq!(counts.unchanged, 0);
@@ -6729,10 +6891,14 @@ mod tests {
 
     #[test]
     fn current_refresh_ignores_reordered_unordered_string_or_list_union() {
-        let counts = refresh_reordered_list(AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::unordered_list(AttributeType::string()),
-        ]));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts = refresh_reordered_list(
+            color_mode,
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::unordered_list(AttributeType::string()),
+            ]),
+        );
 
         assert_eq!(counts.updated, 0);
         assert_eq!(counts.unchanged, 1);
@@ -6740,10 +6906,14 @@ mod tests {
 
     #[test]
     fn current_refresh_reports_reordered_ordered_string_or_list_union() {
-        let counts = refresh_reordered_list(AttributeType::union(vec![
-            AttributeType::string(),
-            AttributeType::list(AttributeType::string()),
-        ]));
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let counts = refresh_reordered_list(
+            color_mode,
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::list(AttributeType::string()),
+            ]),
+        );
 
         assert_eq!(counts.updated, 1);
         assert_eq!(counts.unchanged, 0);
@@ -6751,6 +6921,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_rehashes_existing_hash_without_desired_secret() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
         state
@@ -6768,6 +6939,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6798,6 +6970,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_merges_nested_secret_hash_per_leaf_and_converges() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
@@ -6825,6 +6998,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6851,6 +7025,7 @@ mod tests {
         assert_eq!(counts.unchanged, 0);
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6878,6 +7053,7 @@ mod tests {
 
     #[test]
     fn current_refresh_drops_schema_write_only_plaintext_absent_from_desired() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
@@ -6906,6 +7082,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -6929,6 +7106,7 @@ mod tests {
 
     #[test]
     fn current_refresh_carries_previous_write_only_value_instead_of_desired() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
             .with_attribute("password", string_value("new"));
@@ -6958,6 +7136,7 @@ mod tests {
         );
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id),
             &Current::from_state(fresh),
             &mut state,
@@ -6980,6 +7159,7 @@ mod tests {
 
     #[test]
     fn current_refresh_carries_plain_raw_legacy_marker_in_write_only_attribute() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
@@ -7010,6 +7190,7 @@ mod tests {
         );
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -7033,6 +7214,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_hydrates_unreturned_attributes() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -7062,6 +7244,7 @@ mod tests {
             );
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -7097,6 +7280,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_lifts_enum_state_and_is_stable() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -7142,6 +7326,7 @@ mod tests {
         let desired = Resource::with_provider("awscc", "service.Widget", "main", None);
 
         let first = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             std::slice::from_ref(&resolved(desired.clone())),
@@ -7172,6 +7357,7 @@ mod tests {
         );
 
         let second = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             std::slice::from_ref(&resolved(desired.clone())),
@@ -7201,6 +7387,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_matches_masking_authority_by_provider_instance() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         let mut row = ResourceState::new("db.Instance", "main", "awscc");
         row.deposed.push(deposed_instance(
@@ -7240,6 +7427,7 @@ mod tests {
             Resource::with_provider("awscc", "db.Instance", "main", Some("west".to_string()));
 
         refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[resolved(wrong_instance), resolved(right_instance)],
@@ -7264,6 +7452,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_deposed_generation_read_error_leaves_entry_untouched() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let key = deposed_key("error-key");
         let mut state = StateFile::new();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
@@ -7282,6 +7471,7 @@ mod tests {
             DeposedRefreshTestProvider::default().with_read_error(&id, "vpc-old", "read failed");
 
         let summary = refresh_deposed_generations_until_cancelled(
+            color_mode,
             &provider,
             &mut state,
             &[],
@@ -7311,6 +7501,7 @@ mod tests {
 
     #[test]
     fn current_instance_refresh_preserves_deposed_entries() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let key = deposed_key("old-key");
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let mut state = StateFile::new();
@@ -7335,6 +7526,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
+            color_mode,
             &ResolvedResourceId::new(id.clone()),
             &Current::from_state(fresh.clone()),
             &mut state,
@@ -7355,6 +7547,7 @@ mod tests {
 
     #[tokio::test]
     async fn force_unlock_without_backend_uses_local_backend() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         // When no backend block is configured, run_force_unlock should
         // fall back to the anchored default local backend instead of erroring with
         // "No backend configuration found. force-unlock requires a backend."
@@ -7366,7 +7559,7 @@ mod tests {
         // Call force-unlock with a dummy lock ID.
         // The local backend will return LockNotFound because there is no lock file,
         // but crucially it should NOT return "No backend configuration found".
-        let result = run_force_unlock("dummy-lock-id", &path, &provider_context).await;
+        let result = run_force_unlock(color_mode, "dummy-lock-id", &path, &provider_context).await;
 
         // Should get LockNotFound (the local backend works), not a config error
         match &result {

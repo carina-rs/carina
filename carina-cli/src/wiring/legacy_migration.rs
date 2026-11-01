@@ -10,9 +10,9 @@ use carina_state::{
     LegacyClassificationOutcome, LegacyDependencyClassification, StateFile,
     UnvalidatedLegacyMigration,
 };
-use colored::Colorize;
 
 use crate::error::AppError;
+use crate::output_style::{ColorMode, Colorize};
 
 /// Configuration and materialization evidence travel as one owned value.
 /// Commands can inspect it, but only the materializer can construct Planned.
@@ -149,7 +149,10 @@ impl<E> ClassifiedLegacyGraph<E> {
         }
     }
 
-    pub(crate) fn report_and_validate(self) -> Result<ValidatedLegacyGraph<E>, AppError> {
+    pub(crate) fn report_and_validate(
+        self,
+        color_mode: ColorMode,
+    ) -> Result<ValidatedLegacyGraph<E>, AppError> {
         match self {
             Self::Current(graph) => Ok(ValidatedLegacyGraph {
                 graph: graph.validate()?,
@@ -158,7 +161,7 @@ impl<E> ClassifiedLegacyGraph<E> {
             }),
             Self::Migrating(migration) => {
                 let validated = migration
-                    .report_and_validate(report_legacy_warning)
+                    .report_and_validate(|warning| report_legacy_warning(color_mode, warning))
                     .map_err(|error| AppError::Backend(error.into()))?;
                 Ok(ValidatedLegacyGraph {
                     graph: validated.graph,
@@ -217,17 +220,21 @@ pub(crate) fn classify_legacy_state<E>(
 }
 
 pub(crate) fn replay_legacy_migration(
+    color_mode: ColorMode,
     state: StateFile,
     classification: LegacyDependencyClassification,
 ) -> Result<StateFile, AppError> {
     state
         .replay_legacy_graph(classification)
-        .report_and_validate(report_legacy_warning)
+        .report_and_validate(|warning| report_legacy_warning(color_mode, warning))
         .map(|validated| validated.state)
         .map_err(|error| AppError::Backend(error.into()))
 }
 
-fn report_legacy_warning(warning: &carina_state::LegacyDestroyOrderingWarning) {
+fn report_legacy_warning(
+    color_mode: ColorMode,
+    warning: &carina_state::LegacyDestroyOrderingWarning,
+) {
     let generation = warning
         .generation
         .as_ref()
@@ -240,7 +247,7 @@ fn report_legacy_warning(warning: &carina_state::LegacyDestroyOrderingWarning) {
                     "Warning: destroy ordering for {}{} is partially unknown: legacy dependency {:?} no longer resolves.",
                     warning.row, generation, legacy_name
                 )
-                .yellow()
+                .yellow(color_mode)
             );
     }
 }

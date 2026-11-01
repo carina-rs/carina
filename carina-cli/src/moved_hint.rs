@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::output_style::Colorize;
 use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
 use carina_core::plan::Plan;
 use carina_core::provider::{ComparisonResolutionError, ProviderRouter};
 use carina_core::resource::{Current, ResolvedResource, ResolvedResourceId, ResourceId, Value};
 use carina_core::schema::{SchemaRegistry, ValidatedResourceSchema};
-use colored::Colorize;
 
 /// One plan-time suggestion. Rendering belongs to this typed value rather
 /// than to any individual CLI print site.
@@ -134,9 +134,9 @@ impl MovedBlockHints {
     }
 
     /// Print these diagnostics to stderr using the CLI's warning color.
-    pub fn eprint(&self) {
+    pub fn eprint(&self, color_mode: crate::output_style::ColorMode) {
         if !self.is_empty() {
-            eprintln!("{}", self.to_string().yellow());
+            eprintln!("{}", self.to_string().yellow(color_mode));
         }
     }
 }

@@ -1246,8 +1246,17 @@ mod tests {
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(carina_core::provider::InitializeOutcome::unavailable()
-                    .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
+                Ok(
+                    carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                        Box::new(
+                            carina_provider_mock::ConfiguredBuiltinMock::new(
+                                carina_provider_mock::MockBehavior::default(),
+                                carina_provider_mock::MockScope::memory(),
+                            )
+                            .create_provider(),
+                        ),
+                    ),
+                )
             })
         }
 
@@ -1290,6 +1299,7 @@ mod tests {
 
     fn wasm_context(name: &'static str, bytes: &[u8]) -> ValidatedConfig<()> {
         ValidatedConfig::for_test(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![LoadedProviderFactory::for_test_with_bytes(
                 Box::new(ArtifactFactory { name }),
@@ -1301,6 +1311,7 @@ mod tests {
 
     fn wasm_load(name: &'static str, bytes: &[u8]) -> ProviderLoad {
         ProviderLoad::for_test(
+            &crate::test_support::TestCommandRuntime::new(),
             vec![LoadedProviderFactory::for_test_with_bytes(
                 Box::new(ArtifactFactory { name }),
                 bytes,
@@ -1310,14 +1321,23 @@ mod tests {
     }
 
     fn builtin_context() -> ValidatedConfig<()> {
-        ValidatedConfig::from_factories_for_test((), Vec::new(), &[])
+        ValidatedConfig::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            (),
+            Vec::new(),
+            &[],
+        )
     }
 
     fn builtin_load() -> ProviderLoad {
         ProviderLoad::for_test_with_provider_phase::<
             carina_core::resource::NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
-        >(Vec::new(), &[])
+        >(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &[],
+        )
     }
 
     fn saved_provider_configs(
@@ -1387,7 +1407,13 @@ mod tests {
             provider.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
                 InitializedProvider::for_test(
-                    Box::new(carina_provider_mock::MockProvider::new()),
+                    Box::new(
+                        carina_provider_mock::ConfiguredBuiltinMock::new(
+                            carina_provider_mock::MockBehavior::default(),
+                            carina_provider_mock::MockScope::memory(),
+                        )
+                        .create_provider(),
+                    ),
                     scope,
                 ),
             );
@@ -1862,7 +1888,11 @@ mod tests {
 
         let rehydrated = pending
             .verify_historical(
-                &carina_provider_mock::MockProvider::new(),
+                &carina_provider_mock::ConfiguredBuiltinMock::new(
+                    carina_provider_mock::MockBehavior::default(),
+                    carina_provider_mock::MockScope::memory(),
+                )
+                .create_provider(),
                 &mut actual_states,
                 &mut verified_planned_states,
                 &HistoricalResourceAddresses::from_plan(&plan),

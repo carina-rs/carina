@@ -1573,7 +1573,11 @@ mod tests {
 
     #[test]
     fn replace_pair_is_one_node_with_forcing_attributes() {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name("replace_create_only");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
+        let fixture =
+            crate::fixture_plan::build_plan_from_fixture_name(&runtime, "replace_create_only")
+                .expect("fixture mock inputs must be valid");
         let model = build_model(PlanImageInput {
             plan: &fixture.plan,
             desired_resources: &[],
@@ -1605,7 +1609,11 @@ mod tests {
 
     #[test]
     fn replacement_blast_radius_reaches_transitive_dependents() {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name("replace_create_only");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
+        let fixture =
+            crate::fixture_plan::build_plan_from_fixture_name(&runtime, "replace_create_only")
+                .expect("fixture mock inputs must be valid");
         let mut plan = fixture.plan;
         let consumer = named_resource("consumer", &["alpha"]);
         let alpha = ResolvedResourceId::new(ResourceId::with_provider_identity(
@@ -1756,8 +1764,13 @@ mod tests {
 
     #[test]
     fn complex_fixture_preserves_cascade_connector_delete_blast_and_module() {
-        let fixture =
-            crate::fixture_plan::build_plan_from_fixture_name("plan_image_module_cascade");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(
+            &runtime,
+            "plan_image_module_cascade",
+        )
+        .expect("fixture mock inputs must be valid");
         let model = build_model(PlanImageInput {
             plan: &fixture.plan,
             desired_resources: &fixture.desired_resources,

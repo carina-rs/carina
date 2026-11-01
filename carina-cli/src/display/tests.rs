@@ -1,6 +1,6 @@
 use super::*;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 
 use crate::plan_summary::PlanChangeSummary;
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
@@ -26,6 +26,7 @@ fn concrete(value: ConcreteValue) -> Value {
 
 #[allow(clippy::too_many_arguments)]
 fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
+    color_mode: crate::output_style::ColorMode,
     plan: &Plan<S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
@@ -35,8 +36,13 @@ fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
 ) -> String {
-    let provider = crate::fixture_plan::provider_router_for_plan(plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(
+        &crate::test_support::TestCommandRuntime::new(),
+        plan,
+    )
+    .expect("fixture mock inputs must be valid");
     format_plan_with_delete_instances(
+        color_mode,
         plan,
         summary,
         detail,
@@ -131,16 +137,22 @@ fn make_resource(
 /// `.unwrap()` could theoretically panic if `dep_idx` were invalid.
 #[test]
 fn test_print_plan_with_external_dependency_does_not_panic() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     // Resource "b" depends on "a", but "a" is NOT in the plan.
     // This simulates an external/unresolved dependency.
     let a = make_resource("test.resource", "a", "a", &[]);
     let b = make_resource("test.resource", "b", "b", &[&a]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(b)));
-    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(
+        &crate::test_support::TestCommandRuntime::new(),
+        &plan,
+    )
+    .expect("fixture mock inputs must be valid");
 
     // Should not panic
     print_plan(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -164,6 +176,7 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
 
 #[test]
 fn apply_plan_displays_missing_persisted_destroy_dependency_warning() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let id = ResolvedResourceId::new(ResourceId::with_identity("test.resource", "orphan"));
     let missing = ResolvedResourceId::new(ResourceId::with_identity("test.resource", "vanished"));
     let generation = carina_core::effect::EffectGeneration::Current;
@@ -186,6 +199,7 @@ fn apply_plan_displays_missing_persisted_destroy_dependency_warning() {
     );
 
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -211,15 +225,21 @@ fn apply_plan_displays_missing_persisted_destroy_dependency_warning() {
 /// dependents map is accessed with valid indices.
 #[test]
 fn test_print_plan_with_internal_dependency_does_not_panic() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let a = make_resource("test.resource", "a", "a", &[]);
     let b = make_resource("test.resource", "b", "b", &[&a]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(a)));
     plan.add(Effect::Create(resolved(b)));
-    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(
+        &crate::test_support::TestCommandRuntime::new(),
+        &plan,
+    )
+    .expect("fixture mock inputs must be valid");
 
     // Should not panic
     print_plan(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -753,15 +773,21 @@ fn test_format_compact_name_anonymous_with_hint() {
 /// print attribute lines.
 #[test]
 fn test_print_plan_compact_does_not_panic() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
     let rt = make_resource("ec2.RouteTable", "rt", "rt", &[&vpc]);
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(vpc)));
     plan.add(Effect::Create(resolved(rt)));
-    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(
+        &crate::test_support::TestCommandRuntime::new(),
+        &plan,
+    )
+    .expect("fixture mock inputs must be valid");
 
     // Should not panic
     print_plan(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -786,6 +812,7 @@ fn test_print_plan_compact_does_not_panic() {
 /// Test compact mode hides provider attributes for anonymous resources.
 #[test]
 fn test_print_plan_compact_with_anonymous_resources() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let mut anon: Resource = Resource::new("ec2.route", "hash_anon");
     anon.set_attr(
         "destination_cidr_block".to_string(),
@@ -798,10 +825,15 @@ fn test_print_plan_compact_with_anonymous_resources() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(anon)));
-    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(
+        &crate::test_support::TestCommandRuntime::new(),
+        &plan,
+    )
+    .expect("fixture mock inputs must be valid");
 
     // Should not panic; anonymous resources should show hints
     print_plan(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -910,6 +942,7 @@ fn test_extract_compact_hint_considers_all_resource_attributes() {
 
 #[test]
 fn test_deferred_create_renders_deferred_until_apply_marker() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let mut template_resource: Resource<ModuleSource, LoopSlot> =
         Resource::with_provider("aws", "route53.Record", "validation_records", None);
     template_resource.binding = Some(absolute_binding("validation_records"));
@@ -934,6 +967,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
     )));
 
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -1095,10 +1129,12 @@ fn deferred_replace_validation_records_effect() -> Effect {
 
 #[test]
 fn test_deferred_replace_renders_top_level() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let mut plan = Plan::new();
     plan.add(deferred_replace_validation_records_effect());
 
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -1128,6 +1164,7 @@ fn test_deferred_replace_renders_top_level() {
 
 #[test]
 fn test_deferred_replace_renders_dependent_children() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let mut dependent = Resource::new("acm.CertificateValidation", "cert-validation");
     dependent.binding = Some(absolute_binding("cert_validation"));
     dependent.set_attr(
@@ -1146,6 +1183,7 @@ fn test_deferred_replace_renders_dependent_children() {
     )));
 
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -1178,12 +1216,14 @@ fn test_deferred_replace_renders_dependent_children() {
 
 #[test]
 fn test_deferred_replace_keeps_unrelated_same_type_delete() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(certificate_resource())));
     plan.add(delete_record_effect("old_record"));
     plan.add(deferred_replace_validation_records_effect());
 
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -1421,16 +1461,17 @@ fn format_effect_move_separates_type_and_name_with_space() {
 
 #[test]
 fn colored_value_list_elements_colored_individually() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let rendered = render_value(&concrete(ConcreteValue::List(vec![
         concrete(ConcreteValue::String("hello".into())),
         concrete(ConcreteValue::String("world".into())),
     ])));
-    let result = colored_value(&rendered);
+    let result = colored_value(color_mode, &rendered);
     // Each quoted string should be green, not the whole list
     assert!(result.contains('['));
     assert!(result.contains(']'));
     // The individual strings should have color codes
-    let green_hello = "'hello'".green().to_string();
+    let green_hello = "'hello'".green(color_mode).to_string();
     assert!(
         result.contains(&green_hello),
         "Expected green-colored hello in: {}",
@@ -1440,8 +1481,12 @@ fn colored_value_list_elements_colored_individually() {
 
 #[test]
 fn colored_value_resource_reference_is_cyan_from_span_kind() {
-    let result = colored_value(&render_value(&root_resource_ref("binding", "attr")));
-    let cyan_elem = "binding.attr".cyan().to_string();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let result = colored_value(
+        color_mode,
+        &render_value(&root_resource_ref("binding", "attr")),
+    );
+    let cyan_elem = "binding.attr".cyan(color_mode).to_string();
     assert!(
         result.contains(&cyan_elem),
         "Expected cyan ref in: {}",
@@ -1451,6 +1496,7 @@ fn colored_value_resource_reference_is_cyan_from_span_kind() {
 
 #[test]
 fn colored_value_map_values_colored() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "Name".to_string(),
@@ -1458,9 +1504,9 @@ fn colored_value_map_values_colored() {
         ),
         ("count".to_string(), Value::Concrete(ConcreteValue::Int(42))),
     ])));
-    let result = colored_value(&render_value(&value));
-    let green_val = "'test-vpc'".green().to_string();
-    let white_val = "42".white().to_string();
+    let result = colored_value(color_mode, &render_value(&value));
+    let green_val = "'test-vpc'".green(color_mode).to_string();
+    let white_val = "42".white(color_mode).to_string();
     assert!(
         result.contains(&green_val),
         "Expected green string value in: {}",
@@ -1475,6 +1521,7 @@ fn colored_value_map_values_colored() {
 
 #[test]
 fn colored_value_map_key_apostrophe_does_not_swallow_following_values() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "it's".to_string(),
@@ -1486,14 +1533,15 @@ fn colored_value_map_key_apostrophe_does_not_swallow_following_values() {
         ),
     ])));
 
-    let result = colored_value(&render_value(&value));
+    let result = colored_value(color_mode, &render_value(&value));
     assert!(result.contains(r#""it's": "#));
-    assert!(result.contains(&"'first'".green().to_string()));
-    assert!(result.contains(&"true".yellow().to_string()));
+    assert!(result.contains(&"'first'".green(color_mode).to_string()));
+    assert!(result.contains(&"true".yellow(color_mode).to_string()));
 }
 
 #[test]
 fn colored_value_keeps_interpolation_with_quoted_argument_as_one_list_element() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let interpolation: Value =
         Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
             Value::Deferred(DeferredValue::FunctionCall {
@@ -1513,13 +1561,14 @@ fn colored_value_keeps_interpolation_with_quoted_argument_as_one_list_element() 
         Value::Concrete(ConcreteValue::String("next".into())),
     ]));
 
-    let result = colored_value(&render_value(&value));
-    assert!(result.contains(&r#""${join("it's", x)}""#.green().to_string()));
-    assert!(result.contains(&"'next'".green().to_string()));
+    let result = colored_value(color_mode, &render_value(&value));
+    assert!(result.contains(&r#""${join("it's", x)}""#.green(color_mode).to_string()));
+    assert!(result.contains(&"'next'".green(color_mode).to_string()));
 }
 
 #[test]
 fn colored_value_does_not_split_colon_inside_vertical_string() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let value: Value = Value::Concrete(ConcreteValue::StringList(vec![
         "a: b".into(),
         "a value long enough to force this list onto vertical lines in plan output".into(),
@@ -1528,21 +1577,23 @@ fn colored_value_does_not_split_colon_inside_vertical_string() {
 
     assert!(rendered.plain().contains("\n"));
     assert!(
-        colored_value(&rendered).contains(&"'a: b'".green().to_string()),
+        colored_value(color_mode, &rendered).contains(&"'a: b'".green(color_mode).to_string()),
         "the colon-bearing string must remain one green span"
     );
 }
 
 #[test]
 fn colored_value_empty_list() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let value: Value = Value::Concrete(ConcreteValue::List(Vec::new()));
-    assert_eq!(colored_value(&render_value(&value)), "[]");
+    assert_eq!(colored_value(color_mode, &render_value(&value)), "[]");
 }
 
 #[test]
 fn colored_value_empty_map() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::new()));
-    assert_eq!(colored_value(&render_value(&value)), "{}");
+    assert_eq!(colored_value(color_mode, &render_value(&value)), "{}");
 }
 
 /// Strip ANSI SGR (color) escape sequences for assertion purposes.
@@ -1597,19 +1648,17 @@ fn multiline_list_of_maps_for_gutter_test() -> Value {
 
 #[test]
 fn render_value_ansi_restores_gutter_without_styling_line_boundaries() {
-    struct ColorOverrideGuard;
-    impl Drop for ColorOverrideGuard {
-        fn drop(&mut self) {
-            colored::control::unset_override();
-        }
-    }
+    let color_mode = crate::output_style::ColorMode::Ansi;
 
-    colored::control::set_override(true);
-    let _guard = ColorOverrideGuard;
     let prefix = "     │  ";
     let rendered = PrettyValue::new(multiline_list_of_maps_for_gutter_test())
         .render(PrettyLayout::for_attribute(prefix.chars().count(), "items"));
-    let ansi = render_value_ansi(&rendered, AnsiValueStyle::Semantic, Some(prefix));
+    let ansi = render_value_ansi(
+        color_mode,
+        &rendered,
+        AnsiValueStyle::Semantic,
+        Some(prefix),
+    );
     let plain = strip_ansi(&ansi);
 
     assert!(
@@ -1648,32 +1697,37 @@ fn render_value_ansi_restores_gutter_without_styling_line_boundaries() {
 
 #[test]
 fn render_value_ansi_single_line_with_gutter_is_unchanged() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let rendered = render_value(&concrete(ConcreteValue::List(Vec::new())));
     assert_eq!(
-        render_value_ansi(&rendered, AnsiValueStyle::Semantic, Some("     │  ")),
+        render_value_ansi(
+            color_mode,
+            &rendered,
+            AnsiValueStyle::Semantic,
+            Some("     │  ")
+        ),
         "[]"
     );
 }
 
 #[test]
 fn render_value_ansi_space_only_prefix_preserves_pretty_layout() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let prefix = "      ";
     let rendered = PrettyValue::new(multiline_list_of_maps_for_gutter_test())
         .render(PrettyLayout::for_attribute(prefix.chars().count(), "items"));
-    let output = render_value_ansi(&rendered, AnsiValueStyle::Semantic, Some(prefix));
+    let output = render_value_ansi(
+        color_mode,
+        &rendered,
+        AnsiValueStyle::Semantic,
+        Some(prefix),
+    );
     assert_eq!(strip_ansi(&output), rendered.plain());
 }
 
 #[test]
 fn colored_value_preserves_vertical_list_layout() {
-    struct ColorOverrideGuard;
-    impl Drop for ColorOverrideGuard {
-        fn drop(&mut self) {
-            colored::control::unset_override();
-        }
-    }
-    colored::control::set_override(true);
-    let _guard = ColorOverrideGuard;
+    let color_mode = crate::output_style::ColorMode::Ansi;
 
     // `PrettyValue::render` emits a multi-line bracketed form for lists that
     // exceed the 80-col threshold. `colored_value` must NOT collapse the
@@ -1686,13 +1740,15 @@ fn colored_value_preserves_vertical_list_layout() {
     ]));
     let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(0, "values"));
     let input = rendered.plain();
-    let result = colored_value(&rendered);
+    let result = colored_value(color_mode, &rendered);
     let stripped = strip_ansi(&result);
     assert_eq!(
         stripped, input,
         "vertical layout (newlines, indent, trailing comma, closing bracket) must be preserved verbatim",
     );
-    let green_a = format!("'{}'", "a".repeat(40)).green().to_string();
+    let green_a = format!("'{}'", "a".repeat(40))
+        .green(color_mode)
+        .to_string();
     assert!(
         result.contains(&green_a),
         "string atoms inside the vertical list should still be colored: {result:?}",
@@ -1701,13 +1757,14 @@ fn colored_value_preserves_vertical_list_layout() {
 
 #[test]
 fn colored_value_preserves_vertical_list_closing_bracket_alone() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     // The closing `]` sits on its own line, indented to the parent. This is
     // the most layout-fragile token — earlier impls collapsed it into the
     // previous line as `,]`. Pin its standalone-line preservation explicitly.
     let value: Value = Value::Concrete(ConcreteValue::StringList(vec!["x".repeat(80).into()]));
     let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(0, "values"));
     let input = rendered.plain();
-    let result = colored_value(&rendered);
+    let result = colored_value(color_mode, &rendered);
     let stripped = strip_ansi(&result);
     assert_eq!(stripped, input);
     assert!(
@@ -1718,6 +1775,7 @@ fn colored_value_preserves_vertical_list_closing_bracket_alone() {
 
 #[test]
 fn colored_value_preserves_vertical_map_layout() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     // Same constraint for `format_map_vertical` output.
     let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
@@ -1728,7 +1786,7 @@ fn colored_value_preserves_vertical_map_layout() {
     ])));
     let rendered = PrettyValue::new(value).render(PrettyLayout::for_attribute(75, "value"));
     let input = rendered.plain();
-    let result = colored_value(&rendered);
+    let result = colored_value(color_mode, &rendered);
     let stripped = strip_ansi(&result);
     assert_eq!(
         stripped, input,
@@ -1744,6 +1802,7 @@ fn plan_export_duration_renders_canonical() {
 
 #[test]
 fn plan_export_values_use_the_core_value_formatter() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::ExportChange;
     use carina_core::resource::RawEnumIdentifier;
 
@@ -1766,13 +1825,14 @@ fn plan_export_values_use_the_core_value_formatter() {
     };
 
     assert_eq!(
-        strip_ansi(&format_export_change(&change)),
+        strip_ansi(&format_export_change(color_mode, &change)),
         "  + settings = {ratio: 1.0, region: aws.Region.ap_northeast_1}\n"
     );
 }
 
 #[test]
 fn plan_summary_carries_the_exact_export_changes_rendered_by_text_output() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::ExportChange;
 
     let plan = Plan::new();
@@ -1788,6 +1848,7 @@ fn plan_summary_carries_the_exact_export_changes_rendered_by_text_output() {
         &[],
     );
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &summary,
         DetailLevel::None,
@@ -1810,6 +1871,7 @@ fn plan_summary_carries_the_exact_export_changes_rendered_by_text_output() {
 
 #[test]
 fn persisted_plan_export_maps_use_the_core_value_formatter() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::ExportChange;
 
     let change = ExportChange::Removed {
@@ -1821,13 +1883,14 @@ fn persisted_plan_export_maps_use_the_core_value_formatter() {
     };
 
     assert_eq!(
-        strip_ansi(&format_export_change(&change)),
+        strip_ansi(&format_export_change(color_mode, &change)),
         "  - settings = {ratio: 1.0}\n"
     );
 }
 
 #[test]
 fn modified_plan_export_formats_old_and_new_floats_identically() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use crate::commands::plan::ExportChange;
 
     for (value, expected) in [
@@ -1843,7 +1906,7 @@ fn modified_plan_export_formats_old_and_new_floats_identically() {
         };
 
         assert_eq!(
-            strip_ansi(&format_export_change(&change)),
+            strip_ansi(&format_export_change(color_mode, &change)),
             format!("  ~ ratio = {expected} → {expected}\n")
         );
     }
@@ -1895,6 +1958,7 @@ fn format_deferred_value_duration_renders_canonical() {
 /// the leading-whitespace prefix of each line carries no escape byte.
 #[test]
 fn delete_pretty_attribute_does_not_strike_indentation() {
+    let color_mode = crate::output_style::ColorMode::Ansi;
     use indexmap::IndexMap;
 
     // A nested map forces `PrettyValue::render` into a multi-line
@@ -1936,13 +2000,10 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
     // Force ANSI styling on: the test harness' stdout is not a TTY, so
     // `colored` auto-disables escapes and the bug (which is *in* the
     // escape placement) would be invisible without this override.
-    colored::control::set_override(true);
 
     let mut out = String::new();
     // Non-empty `attr_prefix` so continuation lines have a real indent.
-    render_detail_row(&mut out, &row, &effect, "    ");
-
-    colored::control::unset_override();
+    render_detail_row(color_mode, &mut out, &row, &effect, "    ");
 
     // A style that opens on one line and resets on a later line keeps
     // strikethrough/red active across the intervening newline(s), so
@@ -1994,6 +2055,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
 
 #[test]
 fn forcing_changed_uses_plain_green_cli_value() {
+    let color_mode = crate::output_style::ColorMode::Ansi;
     let row = DetailRow::ChangedForcesReplacement {
         key: "name".to_string(),
         old: render_value(&concrete(ConcreteValue::String("old".into()))),
@@ -2012,10 +2074,8 @@ fn forcing_changed_uses_plain_green_cli_value() {
         changed_attributes: vec!["name".to_string()],
     };
 
-    colored::control::set_override(true);
     let mut out = String::new();
-    render_detail_row(&mut out, &row, &effect, "  ");
-    colored::control::unset_override();
+    render_detail_row(color_mode, &mut out, &row, &effect, "  ");
 
     assert!(
         out.contains("\u{1b}[32m'new'\u{1b}[0m"),
@@ -2025,6 +2085,7 @@ fn forcing_changed_uses_plain_green_cli_value() {
 
 #[test]
 fn forcing_changed_multiline_green_style_does_not_cross_newline() {
+    let color_mode = crate::output_style::ColorMode::Ansi;
     let new = PrettyValue::new(concrete(ConcreteValue::StringList(vec![
         "new".repeat(30).into(),
     ])))
@@ -2048,10 +2109,8 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
         changed_attributes: vec!["rules".to_string()],
     };
 
-    colored::control::set_override(true);
     let mut out = String::new();
-    render_detail_row(&mut out, &row, &effect, "  ");
-    colored::control::unset_override();
+    render_detail_row(color_mode, &mut out, &row, &effect, "  ");
 
     assert!(
         !out.contains("\u{1b}[32m\n"),
@@ -2065,6 +2124,7 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
 
 #[test]
 fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let row = DetailRow::StringListDiff {
         key: "items".to_string(),
         unchanged: Vec::new(),
@@ -2085,7 +2145,7 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
     };
 
     let mut out = String::new();
-    render_detail_row(&mut out, &row, &effect, "");
+    render_detail_row(color_mode, &mut out, &row, &effect, "");
 
     assert!(
         strip_ansi(&out).contains("  + 'a'\n"),
@@ -2101,7 +2161,12 @@ fn string_list_diff_renders_preformatted_literals_without_adding_quotes() {
 /// file.
 #[test]
 fn test_composition_header_renders_module_with_source_path() {
-    let header = strip_ansi(&format_composition_header("r", Some("./modules/infra")));
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let header = strip_ansi(&format_composition_header(
+        color_mode,
+        "r",
+        Some("./modules/infra"),
+    ));
     assert_eq!(header, r#"  ▾ module "r" (./modules/infra)"#);
 }
 
@@ -2111,13 +2176,15 @@ fn test_composition_header_renders_module_with_source_path() {
 /// line — never as a literal "None" or an empty `()`.
 #[test]
 fn test_composition_header_drops_parens_for_none_source_path() {
-    let header = strip_ansi(&format_composition_header("r", None));
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let header = strip_ansi(&format_composition_header(color_mode, "r", None));
     assert_eq!(header, r#"  ▾ module "r""#);
 }
 
 #[test]
 fn module_header_sigil_is_module_specific_not_create() {
-    let module_sigil = Sigil::module_header();
+    let color_mode = crate::output_style::ColorMode::Plain;
+    let module_sigil = Sigil::module_header(color_mode);
     let create_sigil =
         Effect::Create(resolved(Resource::new("aws.s3.Bucket", "x"))).display_glyph();
 
@@ -2130,10 +2197,12 @@ fn module_header_sigil_is_module_specific_not_create() {
 
 #[test]
 fn every_top_level_sigil_starts_at_left_margin_column() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     fn raw_sigil(raw: &'static str) -> Sigil {
+        let color_mode = crate::output_style::ColorMode::Plain;
         Sigil {
             raw,
-            rendered: raw.normal(),
+            rendered: raw.normal(color_mode),
         }
     }
 
@@ -2147,11 +2216,11 @@ fn every_top_level_sigil_starts_at_left_margin_column() {
         ("effect_move", raw_sigil("->")),
         ("effect_replace_create_before_destroy", raw_sigil("+/-")),
         ("effect_replace_delete_before_create", raw_sigil("-/+")),
-        ("module_header", Sigil::module_header()),
-        ("deferred_for", Sigil::deferred_for_expression()),
-        ("export_added", Sigil::export_added()),
-        ("export_modified", Sigil::export_modified()),
-        ("export_removed", Sigil::export_removed()),
+        ("module_header", Sigil::module_header(color_mode)),
+        ("deferred_for", Sigil::deferred_for_expression(color_mode)),
+        ("export_added", Sigil::export_added(color_mode)),
+        ("export_modified", Sigil::export_modified(color_mode)),
+        ("export_removed", Sigil::export_removed(color_mode)),
     ];
 
     for (label, sigil) in cases {
@@ -2167,6 +2236,7 @@ fn every_top_level_sigil_starts_at_left_margin_column() {
 
 #[test]
 fn module_children_render_with_tree_connectors() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::resource::{CallSite, EphemeralId, ExpansionTrace, PersistentId};
     use carina_core::schema::SchemaRegistry;
 
@@ -2190,6 +2260,7 @@ fn module_children_render_with_tree_connectors() {
     trace.record(PersistentId::new(role_id), vec![cluster_site]);
 
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -2215,6 +2286,7 @@ fn module_children_render_with_tree_connectors() {
 
 #[test]
 fn module_child_connector_gutter_extends_through_nested_dependents() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::resource::{CallSite, EphemeralId, ExpansionTrace, PersistentId};
     use carina_core::schema::SchemaRegistry;
 
@@ -2245,6 +2317,7 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     trace.record(PersistentId::new(bucket_id), vec![cluster_site]);
 
     let output = strip_ansi(&format_plan_for_test(
+        color_mode,
         &plan,
         &PlanChangeSummary::new(
             &plan,
@@ -2270,6 +2343,7 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
 
 #[test]
 fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let from_id = ResourceId::with_identity("aws.s3.Bucket", "cluster/old_logs");
     let to_id = ResourceId::with_identity("aws.s3.Bucket", "cluster/logs");
     let mut updated = Resource::new("aws.s3.Bucket", "cluster/logs");
@@ -2290,11 +2364,16 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
 
     let moved_origins = HashMap::new();
     let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
-    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(
+        &crate::test_support::TestCommandRuntime::new(),
+        &plan,
+    )
+    .expect("fixture mock inputs must be valid");
     let mut ctx = TreeRenderContext {
         out: format!(
             "{}\n",
             strip_ansi(&format_composition_header(
+                color_mode,
                 "cluster",
                 Some("./modules/cluster")
             ))
@@ -2318,6 +2397,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
 
     let rendered_attrs = ctx
         .render_children(
+            color_mode,
             &[ChildRenderItem::Normal(0)],
             ChildRenderOptions {
                 parent_indent: 0,
@@ -2349,6 +2429,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
 
 #[test]
 fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let mut parent = make_resource("aws.s3.Bucket", "parent", "parent", &[]);
     parent.set_attr(
         "bucket",
@@ -2375,7 +2456,11 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
 
     let moved_origins = HashMap::new();
     let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
-    let provider = crate::fixture_plan::provider_router_for_plan(&plan);
+    let provider = crate::fixture_plan::provider_router_for_plan(
+        &crate::test_support::TestCommandRuntime::new(),
+        &plan,
+    )
+    .expect("fixture mock inputs must be valid");
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
@@ -2396,7 +2481,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     };
 
     let rendered_attrs = ctx
-        .format_render_item(&ChildRenderItem::Normal(0), 0, true, "", None)
+        .format_render_item(color_mode, &ChildRenderItem::Normal(0), 0, true, "", None)
         .expect("display fixture must have an initialized provider route");
     let output = strip_ansi(&ctx.out);
 
@@ -2409,4 +2494,37 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
         ctx.printed.contains(&1),
         "suppressed move dependent should be consumed"
     );
+}
+
+#[test]
+fn simultaneous_ansi_and_plain_rendering_keep_local_policy() {
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|threads| {
+        let a_start = start.clone();
+        let ansi = threads.spawn(move || {
+            let rendered = render_value(&concrete(ConcreteValue::String("one\ntwo".into())));
+            a_start.wait();
+            let output = render_value_ansi(
+                crate::output_style::ColorMode::Ansi,
+                &rendered,
+                AnsiValueStyle::Semantic,
+                Some("  │ "),
+            );
+            assert!(output.contains('\x1b'));
+            output
+        });
+        let plain = threads.spawn(move || {
+            let rendered = render_value(&concrete(ConcreteValue::String("one\ntwo".into())));
+            start.wait();
+            let output = render_value_ansi(
+                crate::output_style::ColorMode::Plain,
+                &rendered,
+                AnsiValueStyle::Semantic,
+                Some("  │ "),
+            );
+            assert!(!output.contains('\x1b'));
+            output
+        });
+        assert_eq!(strip_ansi(&ansi.join().unwrap()), plain.join().unwrap());
+    });
 }

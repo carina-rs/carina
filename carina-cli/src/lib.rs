@@ -6,9 +6,13 @@ pub mod error;
 pub mod fixture_plan;
 pub mod kms;
 pub mod moved_hint;
+pub mod output_style;
 pub mod plan_image;
 pub mod plan_summary;
+pub mod runtime;
 pub mod signal;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 pub mod wiring;
 
 pub(crate) mod legacy_name_overrides;
@@ -569,58 +573,5 @@ impl DetailLevel {
             DetailLevel::Explicit => carina_core::detail_rows::DetailLevel::Explicit,
             DetailLevel::None => carina_core::detail_rows::DetailLevel::NamesOnly,
         }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use carina_core::{
-        effect::{DeferredCreatePayload, DeferredReplacePayload, NonEmptyDeletes},
-        parser::{ExpandedDeferredForExpression, ExpandedParsedFile},
-        resource::{PersistedDestroyDependencies, ResolvedResourceId, Resource},
-    };
-    pub fn compiled_loop(template: Box<ExpandedDeferredForExpression>) -> DeferredCreatePayload {
-        let mut configuration = ExpandedParsedFile::default();
-        configuration.upstream_states = ["orgs", "upstream"]
-            .into_iter()
-            .map(|binding| carina_core::parser::UpstreamState {
-                binding: super::absolute_binding_for_test(binding),
-                source: "upstream".into(),
-            })
-            .collect();
-        configuration.resources = ["cert", "parent", "primary", "fallback"]
-            .into_iter()
-            .map(|binding| {
-                Resource::with_provider("mock", "test.resource", binding, None)
-                    .with_absolute_binding(super::absolute_binding_for_test(binding))
-            })
-            .collect();
-        let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
-            .expect("fixture graph");
-        let (template, dependency_template) = graph
-            .compile_deferred_for(*template)
-            .expect("fixture loop dependencies");
-        DeferredCreatePayload::new(Box::new(template), dependency_template)
-    }
-    pub fn compiled_replace(
-        deletes: NonEmptyDeletes,
-        template: Box<ExpandedDeferredForExpression>,
-    ) -> DeferredReplacePayload {
-        let payload = compiled_loop(template);
-        DeferredReplacePayload {
-            deletes,
-            template: payload.template,
-            dependency_template: payload.dependency_template,
-        }
-    }
-    pub fn persisted(
-        rows: impl IntoIterator<Item = ResolvedResourceId>,
-    ) -> PersistedDestroyDependencies {
-        PersistedDestroyDependencies::from_test_dependencies(rows)
-    }
-    pub fn resolved(resource: Resource) -> carina_core::resource::ResolvedResource {
-        carina_core::resource::ResolvedResource::collect_resolved([resource])
-            .expect("fixture graph resolves")
-            .remove(0)
     }
 }

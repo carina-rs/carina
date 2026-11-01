@@ -325,6 +325,7 @@ fn apply_path_propagates_module_wait_binding() {
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test_with_provider_phase(
+        &carina_cli::test_support::TestCommandRuntime::new(),
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -448,6 +449,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
     let providers = ProviderLoad::for_test_with_provider_phase(
+        &carina_cli::test_support::TestCommandRuntime::new(),
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),
@@ -520,6 +522,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let base_dir = get_base_dir(&caller);
 
     let providers = ProviderLoad::for_test_with_provider_phase(
+        &carina_cli::test_support::TestCommandRuntime::new(),
         carina_cli::wiring::LoadedProviderFactory::for_test(vec![
             Box::new(AwsStub) as Box<dyn ProviderFactory>
         ]),

@@ -4,7 +4,7 @@ use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -461,7 +461,13 @@ mod provider_scope_evidence_tests {
             router.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
                 InitializedProvider::for_test(
-                    Box::new(carina_provider_mock::MockProvider::new()),
+                    Box::new(
+                        carina_provider_mock::ConfiguredBuiltinMock::new(
+                            carina_provider_mock::MockBehavior::default(),
+                            carina_provider_mock::MockScope::memory(),
+                        )
+                        .create_provider(),
+                    ),
                     scope,
                 ),
             );
@@ -515,6 +521,7 @@ mod provider_scope_evidence_tests {
         )
         .expect("provider configs resolve");
         let wiring = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             vec![Box::new(
                 crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
@@ -530,7 +537,13 @@ mod provider_scope_evidence_tests {
         provider.add_provider_instance(
             ProviderInstanceKey::new("test", None),
             InitializedProvider::for_test(
-                Box::new(carina_provider_mock::MockProvider::new()),
+                Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                ),
                 available("ap-northeast-1"),
             ),
         );
@@ -1929,7 +1942,11 @@ fn test_provider_router(instances: &BTreeSet<ProviderInstanceKey>) -> ProviderRo
         provider.add_provider_instance(
             instance.clone(),
             carina_core::provider::InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::MockProvider::new(),
+                carina_provider_mock::ConfiguredBuiltinMock::new(
+                    carina_provider_mock::MockBehavior::default(),
+                    carina_provider_mock::MockScope::memory(),
+                )
+                .create_provider(),
             )),
         );
     }
@@ -3367,20 +3384,24 @@ mod historical_display_tests {
                     .unwrap(),
             );
             let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let runtime = crate::test_support::TestCommandRuntime::with_mock(
+                carina_provider_mock::MockBehavior::default().with_reference_table(
+                    serde_json::from_value(serde_json::json!({
+                        "alias/shared": {"Ok": {"Resolved": "key/shared"}},
+                        "alias/historical": {"Err": {"AccessDenied": {
+                            "kind": "api_error", "message": "historical row lookup denied"
+                        }}}
+                    }))
+                    .unwrap(),
+                ),
+                carina_provider_mock::MockScope::memory(),
+            );
             let mut provider = ProviderRouter::new();
             provider.add_provider(
                 "mock".into(),
                 InitializedProvider::unavailable(Box::new(CountingReferences {
                     calls: calls.clone(),
-                    inner: carina_provider_mock::MockProvider::new().with_reference_table(
-                        serde_json::from_value(serde_json::json!({
-                            "alias/shared": {"Ok": {"Resolved": "key/shared"}},
-                            "alias/historical": {"Err": {"AccessDenied": {
-                                "kind": "api_error", "message": "historical row lookup denied"
-                            }}}
-                        }))
-                        .unwrap(),
-                    ),
+                    inner: runtime.builtin_mock().unwrap().create_provider(),
                 })),
             );
             let target = Resource::with_provider("mock", "test.reference", "example", None)
@@ -3517,7 +3538,9 @@ mod historical_display_tests {
         };
         assert_eq!(diagnostics.errors(), &[expected]);
         assert_eq!(
-            diagnostics.render_and_abort(Path::new(".")).to_string(),
+            diagnostics
+                .render_and_abort(crate::output_style::ColorMode::Plain, Path::new("."))
+                .to_string(),
             "plan failed with 1 error(s)"
         );
         assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3561,18 +3584,22 @@ mod historical_display_tests {
                 .validate()
                 .unwrap(),
         );
+        let runtime = crate::test_support::TestCommandRuntime::with_mock(
+            carina_provider_mock::MockBehavior::default().with_reference_table(
+                serde_json::from_value(serde_json::json!({
+                    "alias/new": {"Ok": {"Resolved": "key/new"}},
+                    "key/planning": {"Ok": {"Resolved": "key/planning"}},
+                    "key/display": {"Ok": {"Resolved": "key/display"}}
+                }))
+                .unwrap(),
+            ),
+            carina_provider_mock::MockScope::memory(),
+        );
         let mut provider = ProviderRouter::new();
         provider.add_provider(
             "mock".into(),
             InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::MockProvider::new().with_reference_table(
-                    serde_json::from_value(serde_json::json!({
-                        "alias/new": {"Ok": {"Resolved": "key/new"}},
-                        "key/planning": {"Ok": {"Resolved": "key/planning"}},
-                        "key/display": {"Ok": {"Resolved": "key/display"}}
-                    }))
-                    .unwrap(),
-                ),
+                runtime.builtin_mock().unwrap().create_provider(),
             )),
         );
         let target = Resource::with_provider("mock", "test.reference", "new", None)
@@ -3665,6 +3692,7 @@ mod historical_display_tests {
                 .await
                 .unwrap();
             let output = crate::display::format_prepared_plan(
+                runtime.color_mode(),
                 &display.value,
                 &summary,
                 Some(&schemas),
@@ -4400,7 +4428,12 @@ mod managed_current_serde_tests {
             wait_bindings: Vec::new(),
         }
         .record_for_test(
-            &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+            &crate::wiring::ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
             Vec::new(),
         )
         .expect("test plan provider evidence must be valid")
@@ -4686,7 +4719,12 @@ mod managed_current_serde_tests {
         });
         let plan = contents
             .record_for_test(
-                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+                &crate::wiring::ValidatedConfig::from_factories_for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    (),
+                    Vec::new(),
+                    &[],
+                ),
                 Vec::new(),
             )
             .expect("test plan provider evidence must be valid");
@@ -4744,7 +4782,12 @@ mod managed_current_serde_tests {
         });
         let plan = contents
             .record_for_test(
-                &crate::wiring::ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+                &crate::wiring::ValidatedConfig::from_factories_for_test(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    (),
+                    Vec::new(),
+                    &[],
+                ),
                 Vec::new(),
             )
             .expect("test plan provider evidence must be valid");
@@ -5384,7 +5427,7 @@ pub(crate) fn detect_state_drift(
 /// until the test creates `<dir>/proceed`. The wait is bounded so a
 /// broken test cannot hang the binary forever. It has no effect on
 /// the concurrency contract.
-async fn drift_detection_test_barrier() {
+async fn drift_detection_test_barrier(runtime: &crate::runtime::CommandRuntime) {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
     // Matches the test side's t0_done tolerance. Generous because the
     // repo runs process-per-test under heavily parallel nextest, where
@@ -5394,10 +5437,9 @@ async fn drift_detection_test_barrier() {
     // timeout) and this is test-only anyway, so it cannot hang prod.
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    let Ok(dir) = std::env::var("CARINA_TEST_PLAN_DRIFT_HANDSHAKE_DIR") else {
+    let Some(dir) = &runtime.hooks().plan_drift_handshake_dir else {
         return;
     };
-    let dir = std::path::PathBuf::from(dir);
     let _ = std::fs::write(dir.join("t0_done"), b"");
     let proceed = dir.join("proceed");
     let deadline = tokio::time::Instant::now() + MAX_WAIT;
@@ -5420,7 +5462,7 @@ fn plan_row_request(detail: DetailLevel, tui: bool, json: bool) -> crate::wiring
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_plan(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     out: Option<&Path>,
     image: Option<&ResolvedPlanImageTarget>,
@@ -5433,6 +5475,7 @@ pub async fn run_plan(
     strict_iam: bool,
     provider_context: &ProviderContext,
 ) -> Result<bool, AppError> {
+    let color_mode = runtime.color_mode();
     let progress_sink = if json || tui {
         ProgressSink::MachineStdout
     } else {
@@ -5447,7 +5490,7 @@ pub async fn run_plan(
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let mut validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
@@ -5458,6 +5501,7 @@ pub async fn run_plan(
     let parsed = validated_config.resources().parsed();
 
     let plan_backend = resolve_backend_for_read(
+        color_mode,
         base_dir,
         path,
         parsed.backend.as_ref(),
@@ -5567,19 +5611,19 @@ pub async fn run_plan(
         let backend_resource_type = plan_backend
             .resource_type()
             .ok_or("Backend does not specify a resource type")?;
-        progress_sink.line("Bootstrap Plan:".cyan().bold());
+        progress_sink.line("Bootstrap Plan:".cyan(color_mode).bold(color_mode));
         progress_sink.line(format!(
             "  {} {} (state bucket)",
-            "+".green(),
+            "+".green(color_mode),
             format!(
                 "{}.{}.{}",
                 backend_provider, backend_resource_type, state_bucket_name
             )
-            .green()
+            .green(color_mode)
         ));
         progress_sink.line(format!(
             "  {} Resource definition will be added to .crn file",
-            "→".cyan()
+            "→".cyan(color_mode)
         ));
         progress_sink.blank_line();
     }
@@ -5602,7 +5646,7 @@ pub async fn run_plan(
     if !refresh {
         eprintln!(
             "{}",
-            "Warning: using cached managed-resource state (--refresh=false). Data sources are still read, but the plan may not reflect actual managed infrastructure.".yellow()
+            "Warning: using cached managed-resource state (--refresh=false). Data sources are still read, but the plan may not reflect actual managed infrastructure.".yellow(color_mode)
         );
     }
 
@@ -5641,12 +5685,12 @@ pub async fn run_plan(
     // baseline, so nothing could have gone stale and even a re-read
     // *failure* is not worth a "may be stale" warning.
     if let Some(snapshot_t0) = state_snapshot_t0.as_ref() {
-        drift_detection_test_barrier().await;
+        drift_detection_test_barrier(runtime).await;
         match plan_backend.read_state().await {
             Ok(state_t1) => {
                 let state_t1 = state_t1.map(|loaded| loaded.into_state());
                 if let Some(drift) = detect_state_drift(Some(snapshot_t0), state_t1.as_ref()) {
-                    eprintln!("{}", drift.warning(path).yellow());
+                    eprintln!("{}", drift.warning(path).yellow(color_mode));
                 }
             }
             // A failed re-read is not fatal: the plan already computed
@@ -5659,7 +5703,7 @@ pub async fn run_plan(
                         "Warning: could not re-read state to check for \
                          concurrent changes ({e}); plan output may be stale."
                     )
-                    .yellow()
+                    .yellow(color_mode)
                 );
             }
         }
@@ -5668,7 +5712,7 @@ pub async fn run_plan(
     let planned = match &ctx.plan {
         crate::wiring::PlanOutcome::Planned(planned) => planned,
         crate::wiring::PlanOutcome::Diagnostics(diagnostics) => {
-            return Err(diagnostics.render_and_abort(path));
+            return Err(diagnostics.render_and_abort(color_mode, path));
         }
     };
 
@@ -5748,7 +5792,7 @@ pub async fn run_plan(
 
     if json {
         if let Some(note) = drift_note.as_ref() {
-            eprintln!("{}", note.yellow());
+            eprintln!("{}", note.yellow(color_mode));
         }
         // `build_plan_file` propagates serialization and provider-evidence
         // failures so the user sees an actionable plan-save diagnostic
@@ -5769,11 +5813,14 @@ pub async fn run_plan(
         // exact directive change set as machine-readable current-format data. Keep
         // the human-readable rendering on stderr as well.
         if !directive_changes.is_empty() {
-            eprint!("{}", format_persisted_directive_changes(&directive_changes));
+            eprint!(
+                "{}",
+                format_persisted_directive_changes(color_mode, &directive_changes)
+            );
         }
-        moved_hints.eprint();
+        moved_hints.eprint(color_mode);
         if let Some(result) = iam_preflight_result.as_ref() {
-            crate::commands::iam_preflight::emit_warnings(result);
+            crate::commands::iam_preflight::emit_warnings(color_mode, result);
         }
     } else {
         match planned {
@@ -5788,6 +5835,7 @@ pub async fn run_plan(
             crate::wiring::PlannedPlan::Rendered { .. }
             | crate::wiring::PlannedPlan::Unrendered { .. } => {
                 crate::display::print_planned_plan(
+                    color_mode,
                     planned,
                     &summary,
                     Some(ctx_wiring.schemas()),
@@ -5800,17 +5848,20 @@ pub async fn run_plan(
         }
         if let Some(note) = drift_note.as_ref().filter(|_| !tui) {
             println!();
-            println!("{}", note.yellow());
+            println!("{}", note.yellow(color_mode));
         }
         if tui && !directive_changes.is_empty() {
-            eprint!("{}", format_persisted_directive_changes(&directive_changes));
+            eprint!(
+                "{}",
+                format_persisted_directive_changes(color_mode, &directive_changes)
+            );
         }
-        moved_hints.eprint();
+        moved_hints.eprint(color_mode);
         if let Some(result) = iam_preflight_result.as_ref() {
             if tui {
-                crate::commands::iam_preflight::emit_warnings(result);
+                crate::commands::iam_preflight::emit_warnings(color_mode, result);
             } else {
-                crate::commands::iam_preflight::print_warnings(result);
+                crate::commands::iam_preflight::print_warnings(color_mode, result);
             }
         }
     }
@@ -5819,8 +5870,8 @@ pub async fn run_plan(
         eprintln!(
             "{}",
             "Error: IAM preflight check failed in strict mode"
-                .red()
-                .bold()
+                .red(color_mode)
+                .bold(color_mode)
         );
         return Err(AppError::Validation(
             "IAM preflight check failed in strict mode".to_string(),
@@ -5869,15 +5920,15 @@ pub async fn run_plan(
         progress_sink.blank_line();
         progress_sink.line(
             format!("Plan saved to {}", out_path.display())
-                .green()
-                .bold(),
+                .green(color_mode)
+                .bold(color_mode),
         );
         progress_sink.line(
             format!(
                 "To apply this plan, run: `{}`",
                 ProjectCommand::new("apply", out_path)
             )
-            .cyan(),
+            .cyan(color_mode),
         );
     }
 
@@ -5889,7 +5940,7 @@ pub async fn run_plan(
         // End command-wide cursor hiding before the image so the guard's
         // restore sequence cannot become trailing stdout after the protocol
         // bytes. The later guard/exit restores are claim-once no-ops.
-        crate::cursor::restore_cursor();
+        runtime.cursor().restore();
         write_inline_image(rendered_inline_image, std::io::stdout().lock())?;
     }
 
@@ -5946,6 +5997,7 @@ pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     let state_blocks = validated_config.reconcile_identities_with_state(state_file);
 
     let provider_inputs = load_and_resolve_provider_configs(
+        validated_config.context().runtime(),
         validated_config.resources().parsed(),
         base_dir,
         provider_context,
@@ -6197,6 +6249,7 @@ impl ResolvedProviderInputs {
 /// command chooses both missing-state policy and load scope; provider
 /// construction then requires the returned typed configs.
 pub(crate) async fn load_and_resolve_provider_configs<E>(
+    runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
@@ -6207,6 +6260,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
     let remote_bindings = match scope {
         ProviderUpstreamScope::All => {
             load_upstream_states(
+                runtime,
                 &parsed.upstream_states,
                 base_dir,
                 provider_context,
@@ -6217,6 +6271,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
         }
         ProviderUpstreamScope::ProviderReferences => {
             load_provider_referenced_upstream_states(
+                runtime,
                 parsed,
                 base_dir,
                 provider_context,
@@ -6258,6 +6313,7 @@ struct ProviderReferencedUpstream {
 }
 
 async fn load_provider_referenced_upstream_states<E>(
+    runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
@@ -6271,6 +6327,7 @@ async fn load_provider_referenced_upstream_states<E>(
             required_by,
         } = referenced;
         let loaded = load_upstream_states(
+            runtime,
             std::slice::from_ref(&upstream),
             base_dir,
             provider_context,
@@ -6417,12 +6474,14 @@ fn provider_referenced_upstream_states<E>(
 /// errors remain hard errors regardless — they indicate structural
 /// problems the user must fix before plan output can mean anything.
 pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddress>(
+    runtime: &crate::runtime::CommandRuntime,
     upstream_states: &[UpstreamState<B>],
     base_dir: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
     policy: UpstreamMissingStatePolicy,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
+    let color_mode = runtime.color_mode();
     let mut result = HashMap::new();
 
     for us in upstream_states {
@@ -6444,7 +6503,7 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
         }
 
         let backend_result =
-            build_upstream_backend(us, &source_abs, provider_context, cycle_guard).await;
+            build_upstream_backend(runtime, us, &source_abs, provider_context, cycle_guard).await;
         cycle_guard.remove(&source_abs);
         let backend = backend_result?;
 
@@ -6470,7 +6529,7 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
                     us.binding,
                     source_abs.display()
                 );
-                eprintln!("{}", msg.yellow());
+                eprintln!("{}", msg.yellow(color_mode));
                 // Omit the binding entirely. In the typed resolver, a loaded
                 // empty export map is complete (`Absent`) while no snapshot is
                 // available yet is `Unknown`; representing both as an empty
@@ -6487,11 +6546,13 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
 /// carina-rs/carina#2608), then build the backend honoring local-path
 /// anchoring. Shared between strict and lenient upstream loaders.
 async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
+    runtime: &crate::runtime::CommandRuntime,
     us: &UpstreamState<B>,
     source_abs: &Path,
     provider_context: &ProviderContext,
     cycle_guard: &mut HashSet<PathBuf>,
 ) -> Result<ResolvedReadBackend, AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         source_abs,
         provider_context,
@@ -6524,12 +6585,14 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
         .map(carina_core::parser::BackendConfig::into_expanded)
         .transpose()?;
     resolve_backend_for_read(
+        color_mode,
         source_abs,
         source_abs,
         backend_config.as_ref(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::UpstreamSource {
             source_dir: source_abs,
+            runtime,
         },
     )
     .await
@@ -6647,6 +6710,7 @@ mod load_upstream_states_tests {
         let parsed = resolve_file_for_test(parsed, dir.path());
 
         let error = match load_and_resolve_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             dir.path(),
             &ProviderContext::default(),
@@ -6694,6 +6758,7 @@ mod load_upstream_states_tests {
         let parsed = resolve_file_for_test(parsed, dir.path());
 
         let error = match load_and_resolve_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             dir.path(),
             &ProviderContext::default(),
@@ -6753,6 +6818,7 @@ mod load_upstream_states_tests {
         let parsed = resolve_file_for_test(parsed, temp.path());
 
         let inputs = load_and_resolve_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             temp.path(),
             &ProviderContext::default(),
@@ -6799,6 +6865,7 @@ mod load_upstream_states_tests {
         let parsed = resolve_file_for_test(parsed, &downstream);
 
         let inputs = load_and_resolve_provider_configs(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed,
             &downstream,
             &ProviderContext::default(),
@@ -6862,6 +6929,7 @@ mod load_upstream_states_tests {
 
         let base_dir = dir.path().parent().unwrap();
         let result = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             base_dir,
             &ProviderContext::default(),
@@ -6914,6 +6982,7 @@ mod load_upstream_states_tests {
             source: dir.path().to_path_buf(),
         }];
         let result = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             dir.path().parent().unwrap(),
             &ProviderContext::default(),
@@ -6963,6 +7032,7 @@ mod load_upstream_states_tests {
             source: dir.path().to_path_buf(),
         }];
         let result = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             dir.path().parent().unwrap(),
             &ProviderContext::default(),
@@ -7005,6 +7075,7 @@ mod load_upstream_states_tests {
         guard.insert(dir_a.canonicalize().unwrap());
 
         let err = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             &dir_a,
             &ProviderContext::default(),
@@ -7023,6 +7094,7 @@ mod load_upstream_states_tests {
             source: PathBuf::from("/nonexistent/carina/upstream/path"),
         }];
         let err = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             Path::new("/"),
             &ProviderContext::default(),
@@ -7057,6 +7129,7 @@ mod load_upstream_states_tests {
         }];
         let base_dir = dir.path().parent().unwrap();
         let err = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             base_dir,
             &ProviderContext::default(),
@@ -7096,6 +7169,7 @@ mod load_upstream_states_tests {
         }];
         let base_dir = dir.path().parent().unwrap();
         let result = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             base_dir,
             &ProviderContext::default(),
@@ -7173,6 +7247,7 @@ let internal = upstream_state {{ source = '{}' }}"#,
         }];
 
         let result = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             &a_dir,
             &ProviderContext::default(),
@@ -7242,6 +7317,7 @@ let back = upstream_state {{ source = '{}' }}"#,
         guard.insert(root.path().canonicalize().unwrap());
 
         let err = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &upstream_states,
             root.path(),
             &ProviderContext::default(),
@@ -7265,7 +7341,7 @@ mod run_plan_upstream_state_tests {
 
     #[tokio::test]
     async fn run_plan_resolves_upstream_state_exports() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir_a = tmp.path().join("a");
         let dir_b = tmp.path().join("b");
@@ -7303,7 +7379,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .unwrap();
 
         let has_changes = run_plan(
-            &user_dirs,
+            &runtime,
             &dir_b,
             None,
             None,
@@ -7338,6 +7414,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .expect("exports-only fixture has no parser placeholders");
         let mut guard = seed_cycle_guard(&dir_b);
         let bindings = load_upstream_states(
+            &runtime,
             &parsed.upstream_states,
             &dir_b,
             &ProviderContext::default(),
@@ -7380,7 +7457,7 @@ exports { region: String = "ap-northeast-1" }"#,
 
     #[tokio::test]
     async fn run_plan_allows_missing_upstream_referenced_only_by_default_tags() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         let missing = tmp.path().join("missing");
@@ -7407,7 +7484,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .unwrap();
 
         run_plan(
-            &user_dirs,
+            &runtime,
             &project,
             None,
             None,
@@ -7474,7 +7551,7 @@ mod run_plan_out_tests {
 
     #[tokio::test]
     async fn run_plan_loads_provider_wiring_once() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::write(
@@ -7488,9 +7565,9 @@ mod run_plan_out_tests {
         )
         .unwrap();
 
-        let load_count = crate::wiring::track_provider_loads_for_test();
+        let loads_before = runtime.provider_load_count();
         run_plan(
-            &user_dirs,
+            &runtime,
             dir,
             None,
             None,
@@ -7507,7 +7584,7 @@ mod run_plan_out_tests {
         .expect("plan should succeed");
 
         assert_eq!(
-            load_count.count(),
+            runtime.provider_load_count() - loads_before,
             1,
             "one command must construct exactly one provider load"
         );
@@ -7515,7 +7592,7 @@ mod run_plan_out_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn run_plan_out_surfaces_file_provider_load_error() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let source_path = dir.join("broken-provider.wasm");
@@ -7534,7 +7611,7 @@ mod run_plan_out_tests {
         .unwrap();
 
         let error = run_plan(
-            &user_dirs,
+            &runtime,
             dir,
             Some(&dir.join("plan.json")),
             None,
@@ -7659,7 +7736,12 @@ mod run_plan_out_tests {
             None,
             &Some(state_file),
             &ctx,
-            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
         )
         .expect("saved plan should serialize");
         let UnresolvedSavedEffect::Create(created_effect) = &saved.plan.effects()[0] else {
@@ -7704,7 +7786,7 @@ mod run_plan_out_tests {
 
     #[tokio::test]
     async fn provider_attributes_observe_reconciled_prefixed_resource_names() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::write(
@@ -7742,7 +7824,7 @@ mod run_plan_out_tests {
 
         let plan_path = dir.join("plan.json");
         run_plan(
-            &user_dirs,
+            &runtime,
             dir,
             Some(&plan_path),
             None,
@@ -7774,7 +7856,7 @@ mod run_plan_out_tests {
     // carina.state.json, and carina-providers.lock (#2583).
     #[tokio::test]
     async fn run_plan_out_file_ends_with_trailing_newline() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::write(
@@ -7791,7 +7873,7 @@ mod run_plan_out_tests {
 
         let plan_path = dir.join("plan.json");
         run_plan(
-            &user_dirs,
+            &runtime,
             dir,
             Some(&plan_path),
             None,
@@ -7818,7 +7900,7 @@ mod run_plan_out_tests {
 
     #[tokio::test]
     async fn run_plan_does_not_write_image_when_out_file_fails() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         fs::write(
@@ -7836,7 +7918,7 @@ mod run_plan_out_tests {
         let image = resolved_image_target(image_path.clone(), ImageTheme::Light);
         let missing_parent_out = dir.join("missing/plan.json");
         let result = run_plan(
-            &user_dirs,
+            &runtime,
             dir,
             Some(&missing_parent_out),
             Some(&image),
@@ -8049,7 +8131,12 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
         )
         .expect("saved plan should serialize");
 
@@ -8139,7 +8226,12 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
         )
         .expect("saved plan should serialize prepared compositions");
 
@@ -8200,7 +8292,12 @@ mod run_plan_out_tests {
             None,
             &None,
             &ctx,
-            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
         )
         .expect_err("a secret-bearing upstream snapshot must be rejected")
         .to_string();
@@ -8255,6 +8352,7 @@ mod run_plan_out_tests {
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let wiring = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             (),
             Vec::new(),
             &[configured],

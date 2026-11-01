@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 use serde::Serialize;
 
 use carina_core::config_loader::{
@@ -64,7 +64,11 @@ pub fn validate_with_factories(
     };
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::for_test_with_provider_phase(factories, &parsed.providers);
+    let providers = ProviderLoad::for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        factories,
+        &parsed.providers,
+    );
 
     let mut error_reports: Vec<String> = Vec::new();
     error_reports.extend(
@@ -107,7 +111,11 @@ pub fn validated_resource_ids_with_factories(
     };
     let parsed = loaded.parsed;
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::for_test_with_provider_phase(factories, &parsed.providers);
+    let providers = ProviderLoad::for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        factories,
+        &parsed.providers,
+    );
 
     // This adapter exercises only the resource-enumeration half of validate.
     // Keep the identical module/name-resolution seam, but do not reject a
@@ -247,11 +255,12 @@ fn validated_entries<E>(
 }
 
 pub fn run_validate(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     json: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -275,11 +284,11 @@ pub fn run_validate(
     parsed.print_warnings();
 
     if !json {
-        println!("{}", "Validating...".cyan());
+        println!("{}", "Validating...".cyan(color_mode));
     }
 
     let (providers, provider_load_error) =
-        ProviderLoad::load_reporting(user_dirs, &parsed.providers, base_dir);
+        ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
     let validation_report =
         providers.validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations);
@@ -370,8 +379,8 @@ pub fn run_validate(
     println!(
         "{}",
         format!("✓ {} resources validated successfully.", entries.len())
-            .green()
-            .bold()
+            .green(color_mode)
+            .bold(color_mode)
     );
 
     for entry in &entries {
@@ -385,14 +394,14 @@ pub fn run_validate(
                 "⚠ Unused let binding '{}'. Consider using an anonymous resource instead.",
                 binding
             )
-            .yellow()
+            .yellow(color_mode)
         );
     }
 
     for (file_path, message) in &duplicate_warnings {
         println!(
             "{}",
-            format!("⚠ {}:{}", file_path.display(), message).yellow()
+            format!("⚠ {}:{}", file_path.display(), message).yellow(color_mode)
         );
     }
 
@@ -496,7 +505,7 @@ mod tests {
 
     #[test]
     fn hard_provider_load_error_keeps_unrelated_static_validation_error() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let runtime = crate::test_support::TestCommandRuntime::new();
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(
             fixture.path().join("main.crn"),
@@ -518,14 +527,9 @@ backend s3 {
         )
         .unwrap();
 
-        let error = run_validate(
-            &user_dirs,
-            fixture.path(),
-            false,
-            &ProviderContext::default(),
-        )
-        .expect_err("loader and backend validation errors must both fail validation")
-        .to_string();
+        let error = run_validate(&runtime, fixture.path(), false, &ProviderContext::default())
+            .expect_err("loader and backend validation errors must both fail validation")
+            .to_string();
 
         assert!(
             error.contains("declared more than once with a source"),
@@ -563,8 +567,11 @@ backend s3 {
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load provider-routing fixture");
-        let providers =
-            ProviderLoad::for_test_with_provider_phase(Vec::new(), &loaded.parsed.providers);
+        let providers = ProviderLoad::for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &loaded.parsed.providers,
+        );
 
         let error = match providers.validate_config_pair(
             loaded.parsed,

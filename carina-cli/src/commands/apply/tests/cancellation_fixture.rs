@@ -1,3 +1,4 @@
+use carina_provider_mock::{MockBehavior, MockScope, SelectedDelay};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -9,7 +10,7 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::shutdown::testing::TestShutdownTrigger;
 
 use crate::commands::shared::cancellation_test_support::{
-    CancellationFixtureBase, LockLossBackend, ScopedEnv,
+    CancellationFixtureBase, LockLossBackend,
 };
 use crate::commands::shared::observer::CliObserver;
 
@@ -43,7 +44,6 @@ pub(super) struct ApplyCancellationFixture {
     cancel_after_successes: Option<usize>,
     success_count: Arc<AtomicUsize>,
     provider_ready_path: Option<std::path::PathBuf>,
-    _provider_env: Vec<ScopedEnv>,
 }
 
 impl ApplyCancellationFixture {
@@ -54,8 +54,19 @@ impl ApplyCancellationFixture {
             cancel_after_successes: None,
             success_count: Arc::new(AtomicUsize::new(0)),
             provider_ready_path: None,
-            _provider_env: Vec::new(),
         }
+    }
+
+    pub(super) fn runtime(&self) -> &crate::runtime::CommandRuntime {
+        self.base.runtime()
+    }
+    pub(super) fn configure_mock(&mut self, behavior: MockBehavior, scope: MockScope) {
+        self.base.configure_mock(behavior, scope);
+    }
+    pub(super) fn use_mock_file(&mut self, path: std::path::PathBuf) {
+        self.base.update_mock(|_, scope| {
+            *scope = MockScope::file(path).expect("absolute fixture mock path");
+        });
     }
 
     pub(super) fn with_resources<const N: usize>(self, names: [&str; N]) -> Self {
@@ -110,26 +121,24 @@ impl ApplyCancellationFixture {
 
     pub(super) fn with_blocked_create(mut self, name: &str) -> Self {
         let ready_path = self.base.readiness_path("mock-create-ready");
-        self._provider_env = vec![
-            ScopedEnv::set(
-                "CARINA_MOCK_CREATE_DELAY_MS_FOR",
-                format!("test.resource.{name}"),
-            ),
-            ScopedEnv::set("CARINA_MOCK_CREATE_DELAY_MS", "60000"),
-            ScopedEnv::set("CARINA_MOCK_CREATE_READY_PATH", &ready_path),
-        ];
+        self.base.update_mock(|behavior, _| {
+            behavior.create_delay = Some(SelectedDelay {
+                address: format!("test.resource.{name}"),
+                duration: Duration::from_secs(60),
+            });
+            behavior.observations.create_ready = Some(ready_path.clone());
+        });
         self.provider_ready_path = Some(ready_path);
         self
     }
 
     pub(super) fn with_delayed_create(mut self, name: &str, delay: Duration) -> Self {
-        self._provider_env = vec![
-            ScopedEnv::set(
-                "CARINA_MOCK_CREATE_DELAY_MS_FOR",
-                format!("test.resource.{name}"),
-            ),
-            ScopedEnv::set("CARINA_MOCK_CREATE_DELAY_MS", delay.as_millis().to_string()),
-        ];
+        self.base.update_mock(|behavior, _| {
+            behavior.create_delay = Some(SelectedDelay {
+                address: format!("test.resource.{name}"),
+                duration: delay,
+            });
+        });
         self
     }
 
@@ -181,17 +190,22 @@ impl ApplyCancellationFixture {
 
     pub(super) fn observer_factory<S: Send + Sync + 'static>(
         &self,
-    ) -> impl Fn(&Plan<S>, &std::path::Path) -> Box<dyn ExecutionObserver<S>> + '_ {
-        move |plan, project_dir| {
+    ) -> impl Fn(
+        crate::output_style::ColorMode,
+        &Plan<S>,
+        &std::path::Path,
+    ) -> Box<dyn ExecutionObserver<S>>
+    + '_ {
+        move |color_mode, plan, project_dir| {
             if let Some(threshold) = self.cancel_after_successes {
                 Box::new(CancellingObserver {
-                    inner: CliObserver::new(plan, project_dir),
+                    inner: CliObserver::new(color_mode, plan, project_dir),
                     success_count: Arc::clone(&self.success_count),
                     threshold,
                     shutdown_trigger: self.base.shutdown_trigger(),
                 })
             } else {
-                Box::new(CliObserver::new(plan, project_dir))
+                Box::new(CliObserver::new(color_mode, plan, project_dir))
             }
         }
     }
