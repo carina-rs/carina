@@ -4,7 +4,7 @@ use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -134,6 +134,40 @@ impl LockEntryKind {
             | LockEntryKind::File => None,
         }
     }
+
+    fn resolution_slot(&self) -> LockEntryResolutionSlot<'_> {
+        match self {
+            Self::Version {
+                version: _,
+                constraint,
+            } => LockEntryResolutionSlot::Version(constraint.as_deref()),
+            Self::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint,
+            } => LockEntryResolutionSlot::GithubRelease(constraint.as_deref()),
+            Self::Revision {
+                revision,
+                resolved_sha: _,
+                artifact_id: _,
+            } => LockEntryResolutionSlot::Revision(revision),
+            Self::RegistryRevision {
+                revision,
+                version: _,
+            } => LockEntryResolutionSlot::RegistryRevision(revision),
+            Self::File => LockEntryResolutionSlot::File,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockEntryResolutionSlot<'a> {
+    Version(Option<&'a str>),
+    GithubRelease(Option<&'a str>),
+    Revision(&'a str),
+    RegistryRevision(&'a str),
+    File,
 }
 
 /// Uninhabited marker for an entry that cannot carry registry metadata.
@@ -2366,8 +2400,28 @@ pub struct LockFile {
     version: u32,
     registry_host: BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
     pub provider: Vec<LockEntry<RegistryLock>>,
+    egress: BTreeMap<EgressArtifactKey, crate::EgressLockRecord>,
     legacy: Vec<LegacyLockEntry>,
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+}
+
+/// Identity of the lock entry that owns an egress record.
+///
+/// Remote provider sources can legitimately have multiple locked artifacts,
+/// so the source alone is not an artifact identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EgressArtifactKey {
+    source: String,
+    sha256: String,
+}
+
+impl EgressArtifactKey {
+    fn from_entry(entry: &LockEntry<RegistryLock>) -> Self {
+        Self {
+            source: canonical_lock_source(&entry.source),
+            sha256: entry.sha256.clone(),
+        }
+    }
 }
 
 enum SourceLockEntry<'a> {
@@ -2391,8 +2445,16 @@ struct SerializableLockFile<'a> {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum SerializableProviderEntry<'a> {
-    Current(&'a LockEntry<RegistryLock>),
+    Current(SerializableCurrentProviderEntry<'a>),
     Legacy(&'a toml::Table),
+}
+
+#[derive(Serialize)]
+struct SerializableCurrentProviderEntry<'a> {
+    #[serde(flatten)]
+    entry: &'a LockEntry<RegistryLock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    egress: Option<&'a crate::EgressLockRecord>,
 }
 
 mod registry_lock_with_host {
@@ -2508,6 +2570,27 @@ struct LockFileVersion {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedLockFile {
+    #[serde(rename = "version")]
+    _version: u32,
+    #[serde(default)]
+    registry_host: BTreeMap<String, RegistryHostLock>,
+    #[serde(default)]
+    provider: Vec<CurrentProviderEntry>,
+    #[serde(default)]
+    unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+}
+
+#[derive(Deserialize)]
+struct CurrentProviderEntry {
+    #[serde(flatten)]
+    entry: LockEntry<RegistryLock>,
+    #[serde(default)]
+    egress: Option<crate::EgressLockRecord>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedLockFileV4 {
     #[serde(rename = "version")]
     _version: u32,
     #[serde(default)]
@@ -3108,6 +3191,7 @@ fn finish_legacy_lock_migration(
     let lock_file = LockFile::from_parts(
         registry_host,
         provider,
+        BTreeMap::new(),
         unpinned_registry_ratchets,
         legacy,
         path,
@@ -3412,6 +3496,7 @@ impl Default for LockFile {
             version: Self::CURRENT_VERSION,
             registry_host: BTreeMap::new(),
             provider: Vec::new(),
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         }
@@ -3771,7 +3856,7 @@ impl LockFile {
                 }
             }
             4 => {
-                let unchecked: UncheckedLockFile = parse_lock_table(&table, path)?;
+                let unchecked: UncheckedLockFileV4 = parse_lock_table(&table, path)?;
                 if let Some(entry) = unchecked.provider.iter().find(|entry| {
                     entry.registry.as_ref().is_some_and(|registry| {
                         registry.sequence_anchor == RegistrySequenceAnchor::ResetPending
@@ -3789,7 +3874,16 @@ impl LockFile {
                     .iter()
                     .map(|entry| entry.source.clone())
                     .collect();
-                let lock_file = Self::from_unchecked(unchecked, legacy_entries, path, project_dir)?;
+                let registry_host = canonicalize_registry_host_keys(unchecked.registry_host, path)?;
+                let lock_file = Self::from_parts(
+                    registry_host,
+                    unchecked.provider,
+                    BTreeMap::new(),
+                    unchecked.unpinned_registry_ratchets,
+                    legacy_entries,
+                    path,
+                    project_dir,
+                )?;
                 Ok(LoadedLockFile::Migrated {
                     lock_file,
                     migration: LockFileMigration {
@@ -3872,11 +3966,28 @@ impl LockFile {
         path: &Path,
         project_dir: &Path,
     ) -> Result<Self, LockFileError> {
-        let registry_host = canonicalize_registry_host_keys(unchecked.registry_host, path)?;
+        let UncheckedLockFile {
+            _version: _,
+            registry_host,
+            provider,
+            unpinned_registry_ratchets,
+        } = unchecked;
+        let registry_host = canonicalize_registry_host_keys(registry_host, path)?;
+        let mut egress = BTreeMap::new();
+        let provider = provider
+            .into_iter()
+            .map(|current| {
+                if let Some(record) = current.egress {
+                    egress.insert(EgressArtifactKey::from_entry(&current.entry), record);
+                }
+                current.entry
+            })
+            .collect();
         Self::from_parts(
             registry_host,
-            unchecked.provider,
-            unchecked.unpinned_registry_ratchets,
+            provider,
+            egress,
+            unpinned_registry_ratchets,
             legacy,
             path,
             project_dir,
@@ -3886,6 +3997,7 @@ impl LockFile {
     fn from_parts(
         registry_host: BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
         provider: Vec<LockEntry<RegistryLock>>,
+        egress: BTreeMap<EgressArtifactKey, crate::EgressLockRecord>,
         unpinned_registry_ratchets: UnpinnedRegistryRatchets,
         legacy: Vec<LegacyLockEntry>,
         path: &Path,
@@ -3951,6 +4063,7 @@ impl LockFile {
             version: Self::CURRENT_VERSION,
             registry_host,
             provider,
+            egress,
             legacy,
             unpinned_registry_ratchets,
         };
@@ -3967,7 +4080,12 @@ impl LockFile {
         let provider = self
             .provider
             .iter()
-            .map(SerializableProviderEntry::Current)
+            .map(|entry| {
+                SerializableProviderEntry::Current(SerializableCurrentProviderEntry {
+                    entry,
+                    egress: self.egress.get(&EgressArtifactKey::from_entry(entry)),
+                })
+            })
             .chain(
                 self.legacy
                     .iter()
@@ -4009,6 +4127,154 @@ impl LockFile {
         self.provider
             .iter()
             .find(|e| Self::sources_match(&e.source, source))
+    }
+
+    fn find_by_remote_config<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        config: &ProviderConfig<P, B>,
+        source: &RemoteSource,
+    ) -> Option<&LockEntry<RegistryLock>> {
+        let source_key = source.source_key();
+        self.provider.iter().find(|entry| {
+            Self::sources_match(&entry.source, source_key.as_str())
+                && lock_entry_matches_remote_config(entry, config, source)
+        })
+    }
+
+    /// Return the egress record owned by the lock entry for this exact
+    /// verified declaration's canonical source.
+    pub fn locked_egress(
+        &self,
+        declaration: &crate::VerifiedEgressDeclaration,
+        project_dir: &Path,
+    ) -> Option<crate::LockedEgress> {
+        self.locked_egress_for_artifact(
+            declaration.source(),
+            declaration.sha256().as_str(),
+            project_dir,
+        )
+    }
+
+    fn locked_egress_for_artifact(
+        &self,
+        source: &crate::CanonicalSource,
+        sha256: &str,
+        project_dir: &Path,
+    ) -> Option<crate::LockedEgress> {
+        let entry = self.find_by_verified_artifact(source, sha256, project_dir)?;
+        let locked_source = crate::CanonicalSource::from_lock_source(&entry.source, project_dir)?;
+        let record = self
+            .egress
+            .get(&EgressArtifactKey::from_entry(entry))?
+            .clone();
+        Some(crate::LockedEgress::new(
+            locked_source,
+            crate::Sha256::from_lock(entry.sha256.clone()),
+            record,
+            project_dir,
+        ))
+    }
+
+    fn find_by_verified_artifact(
+        &self,
+        source: &crate::CanonicalSource,
+        sha256: &str,
+        project_dir: &Path,
+    ) -> Option<&LockEntry<RegistryLock>> {
+        self.provider.iter().find(|entry| {
+            let source_matches = if source.is_file() {
+                crate::CanonicalSource::from_lock_source(&entry.source, project_dir).as_ref()
+                    == Some(source)
+            } else {
+                Self::sources_match(&entry.source, &source.to_string())
+            };
+            source_matches && (source.is_file() || entry.sha256 == sha256)
+        })
+    }
+
+    fn egress_record_for_display(
+        &self,
+        source: &crate::CanonicalSource,
+        project_dir: &Path,
+    ) -> Option<&crate::EgressLockRecord> {
+        self.provider.iter().find_map(|entry| {
+            let locked_source =
+                crate::CanonicalSource::from_lock_source(&entry.source, project_dir)?;
+            if &locked_source != source {
+                return None;
+            }
+            self.egress.get(&EgressArtifactKey::from_entry(entry))
+        })
+    }
+
+    fn explicit_egress_for_carry_over(
+        &self,
+        declaration: &crate::VerifiedEgressDeclaration,
+        project_dir: &Path,
+    ) -> Option<crate::LockedEgress> {
+        self.provider.iter().find_map(|entry| {
+            let locked_source =
+                crate::CanonicalSource::from_lock_source(&entry.source, project_dir)?;
+            if &locked_source != declaration.source() {
+                return None;
+            }
+            let record = self.egress.get(&EgressArtifactKey::from_entry(entry))?;
+            if record.hosts()? != declaration.patterns() {
+                return None;
+            }
+            let locked = crate::LockedEgress::new(
+                locked_source,
+                crate::Sha256::from_lock(entry.sha256.clone()),
+                record.clone(),
+                project_dir,
+            );
+            locked.explicit_consent().is_some().then_some(locked)
+        })
+    }
+
+    fn record_egress_consent(
+        &mut self,
+        declaration: &crate::VerifiedEgressDeclaration,
+        consent: crate::EgressConsent,
+        project_dir: &Path,
+    ) -> Result<(), crate::EgressConsentError> {
+        crate::ConsentedEgress::from_consent(declaration.clone(), consent.clone())?;
+        let record = match consent {
+            crate::EgressConsent::CarinaRsSigned(_) => {
+                crate::EgressLockRecord::carina_rs_signed(declaration.patterns().clone())
+            }
+            crate::EgressConsent::Explicit(_) => {
+                crate::EgressLockRecord::explicit(declaration.patterns().clone())
+            }
+        };
+        let entry = self
+            .find_by_verified_artifact(
+                declaration.source(),
+                declaration.sha256().as_str(),
+                project_dir,
+            )
+            .ok_or(crate::EgressConsentError::MissingLockEntry)?;
+        let artifact_key = EgressArtifactKey::from_entry(entry);
+        self.egress.insert(artifact_key, record);
+        Ok(())
+    }
+
+    fn clear_empty_egress_declaration(
+        &mut self,
+        declaration: crate::VerifiedEgressDeclaration,
+        project_dir: &Path,
+    ) -> Result<(), crate::EgressConsentError> {
+        crate::ConsentedEgress::nothing_declared(declaration.clone())?;
+        let entry = self
+            .find_by_verified_artifact(
+                declaration.source(),
+                declaration.sha256().as_str(),
+                project_dir,
+            )
+            .ok_or(crate::EgressConsentError::MissingLockEntry)?;
+        let artifact_key = EgressArtifactKey::from_entry(entry);
+        self.egress.remove(&artifact_key);
+        Ok(())
     }
 
     fn find_registry_by_source_with_index(&self, source: &str) -> Option<(usize, &RegistryLock)> {
@@ -4386,16 +4652,74 @@ impl LockFile {
             self.unpinned_registry_ratchets
                 .remove(&canonical_lock_source(&entry.source));
         }
-        if let Some(existing) = self
+        let matching_source_count = self
             .provider
-            .iter_mut()
-            .find(|e| Self::sources_match(&e.source, &entry.source))
-        {
+            .iter()
+            .filter(|existing| Self::sources_match(&existing.source, &entry.source))
+            .count();
+        let matching_slot = self.provider.iter().position(|existing| {
+            Self::sources_match(&existing.source, &entry.source)
+                && existing.kind.resolution_slot() == entry.kind.resolution_slot()
+        });
+        let replacement = matching_slot.or_else(|| {
+            (matching_source_count == 1).then(|| {
+                self.provider
+                    .iter()
+                    .position(|existing| Self::sources_match(&existing.source, &entry.source))
+                    .expect("the source count proves a matching entry exists")
+            })
+        });
+        if let Some(index) = replacement {
+            let existing = &mut self.provider[index];
+            let old_key = EgressArtifactKey::from_entry(existing);
+            let egress = self.egress.remove(&old_key);
             *existing = entry;
+            if let Some(egress) = egress {
+                self.egress
+                    .entry(EgressArtifactKey::from_entry(existing))
+                    .or_insert(egress);
+            }
         } else {
             self.provider.push(entry);
         }
     }
+}
+
+/// Failure to derive the only hostname permission accepted by a runtime
+/// provider instance from the installed bytes and the project lock.
+#[derive(Debug)]
+pub enum LockedEgressLoadError {
+    LockFile(LockFileError),
+}
+
+impl fmt::Display for LockedEgressLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LockFile(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LockedEgressLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LockFile(source) => source.source(),
+        }
+    }
+}
+
+/// Load the optional egress record for the canonical source of these exact
+/// verified bytes. The host binds it to the declaration from the same load.
+pub fn load_locked_egress(
+    project_dir: &Path,
+    load: &VerifiedLoad,
+) -> Result<Option<crate::LockedEgress>, LockedEgressLoadError> {
+    let Some(loaded) = LockFile::load(project_dir).map_err(LockedEgressLoadError::LockFile)? else {
+        return Ok(None);
+    };
+    let (lock_file, _migration) = loaded.into_parts();
+    let source = crate::CanonicalSource::from_load(load);
+    Ok(lock_file.locked_egress_for_artifact(&source, load.artifact().sha256(), project_dir))
 }
 
 fn load_lock_file(project_dir: &Path) -> Result<Option<LockFile>, LockFileError> {
@@ -4657,6 +4981,7 @@ enum InstalledArtifact {
         path: WasmArtifactPath,
         bytes: ProviderArtifactBytes,
         source: FileSource,
+        canonical_source: PathBuf,
         project_dir: PathBuf,
     },
 }
@@ -4669,6 +4994,7 @@ impl InstalledProvider {
                 path,
                 bytes: _,
                 source: _,
+                canonical_source: _,
                 project_dir: _,
             } => path,
         }
@@ -4684,6 +5010,7 @@ impl InstalledProvider {
                 path: _,
                 bytes: _,
                 source,
+                canonical_source: _,
                 project_dir: _,
             } => ProviderArtifactProvenance::File {
                 source: format!("file://{}", source.path()),
@@ -4714,11 +5041,20 @@ impl InstalledProvider {
                 path.as_path().display()
             )
         })?;
+        let canonical_source =
+            crate::egress::canonical_project_relative_path(project_dir, Path::new(source.path()))
+                .map_err(|error| {
+                format!(
+                    "Failed to derive project-relative provider source {}: {error}",
+                    source.path()
+                )
+            })?;
         Ok(Self {
             artifact: InstalledArtifact::File {
                 path,
                 bytes,
                 source,
+                canonical_source,
                 project_dir: project_dir.to_path_buf(),
             },
             provider_name,
@@ -4732,6 +5068,7 @@ impl InstalledProvider {
                 path: _,
                 bytes,
                 source: _,
+                canonical_source: _,
                 project_dir: _,
             } => bytes.clone(),
         }
@@ -4755,11 +5092,19 @@ impl InstalledProvider {
                 path: _,
                 bytes,
                 source,
+                canonical_source,
                 project_dir,
             } => {
                 let (trust, notice, path) =
                     local_provider_trust(source, bytes, project_dir, grants, notice_sink);
-                (trust, notice, ProviderLoadSource::LocalFile { path })
+                (
+                    trust,
+                    notice,
+                    ProviderLoadSource::LocalFile {
+                        path,
+                        canonical_source: canonical_source.clone(),
+                    },
+                )
             }
         };
         let identity = ProviderLoadIdentity::new(self.provider_name.clone(), trust, source)?;
@@ -4769,11 +5114,30 @@ impl InstalledProvider {
         Ok(identity)
     }
 
+    fn verified_load<E>(
+        &self,
+        user_dirs: &UserDirs,
+        grants: &TrustedLocalGrants,
+    ) -> Result<VerifiedLoad, ProviderArtifactLoadError<E>> {
+        let mut notice_sink = |line: &str| eprintln!("{line}");
+        let identity = self
+            .load_identity(user_dirs, grants, &mut notice_sink)
+            .map_err(|error| self.with_identity_error(error))?;
+        let bytes = self.artifact_bytes();
+        let artifact = match &self.artifact {
+            InstalledArtifact::LockFile(artifact) => {
+                LoadedArtifactIdentity::locked(&bytes, artifact.source().clone(), artifact.pin())
+            }
+            InstalledArtifact::File { .. } => LoadedArtifactIdentity::file(&bytes),
+        };
+        Ok(VerifiedLoad::new(bytes, identity, artifact))
+    }
+
     /// Attach this artifact's provenance to a load failure without flattening
     /// the underlying error. Display always renders the load error first.
     pub fn with_load_error<E>(&self, error: E) -> ProviderArtifactLoadError<E> {
         ProviderArtifactLoadError {
-            error: ProviderArtifactLoadFailure::Loader(error),
+            error: ProviderArtifactLoadFailure::Loader(Box::new(error)),
             provider_name: self.provider_name.clone(),
             artifact_path: self.path().as_path().to_path_buf(),
             provenance: Box::new(self.provenance()),
@@ -4829,12 +5193,7 @@ impl InstalledProvider {
             InstalledArtifact::LockFile(artifact) => {
                 LoadedArtifactIdentity::locked(&bytes, artifact.source().clone(), artifact.pin())
             }
-            InstalledArtifact::File {
-                path: _path,
-                bytes: _installed_bytes,
-                source: _source,
-                project_dir: _project_dir,
-            } => LoadedArtifactIdentity::file(&bytes),
+            InstalledArtifact::File { .. } => LoadedArtifactIdentity::file(&bytes),
         };
         loader(VerifiedLoad::new(bytes, identity, artifact))
             .await
@@ -5016,7 +5375,7 @@ pub struct ProviderArtifactLoadError<E> {
 #[derive(Debug)]
 enum ProviderArtifactLoadFailure<E> {
     Identity(Box<ProviderLoadIdentityError>),
-    Loader(E),
+    Loader(Box<E>),
 }
 
 impl<E> ProviderArtifactLoadError<E> {
@@ -5030,7 +5389,7 @@ impl<E> ProviderArtifactLoadError<E> {
     pub fn loader_error(&self) -> Option<&E> {
         match &self.error {
             ProviderArtifactLoadFailure::Identity(_) => None,
-            ProviderArtifactLoadFailure::Loader(error) => Some(error),
+            ProviderArtifactLoadFailure::Loader(error) => Some(error.as_ref()),
         }
     }
 
@@ -5057,7 +5416,7 @@ impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let error: &dyn fmt::Display = match &self.error {
             ProviderArtifactLoadFailure::Identity(error) => error.as_ref(),
-            ProviderArtifactLoadFailure::Loader(error) => error,
+            ProviderArtifactLoadFailure::Loader(error) => error.as_ref(),
         };
         write!(
             f,
@@ -8144,17 +8503,23 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
 
 fn annotate_version_lock_entry(
     source: &RemoteSourceKey,
+    version: &str,
     constraint: Option<&VersionConstraint>,
     lock_file: &mut LockFile,
 ) {
-    if let Some(entry) = lock_file
-        .provider
-        .iter_mut()
-        .find(|entry| LockFile::sources_match(&entry.source, source.as_str()))
-        && let LockEntryKind::Version {
-            constraint: locked_constraint,
-            ..
-        } = &mut entry.kind
+    if let Some(entry) = lock_file.provider.iter_mut().find(|entry| {
+        LockFile::sources_match(&entry.source, source.as_str())
+            && matches!(
+                &entry.kind,
+                LockEntryKind::Version {
+                    version: locked_version,
+                    constraint: _
+                } if locked_version == version
+            )
+    }) && let LockEntryKind::Version {
+        constraint: locked_constraint,
+        ..
+    } = &mut entry.kind
     {
         *locked_constraint = constraint.map(|constraint| constraint.raw.clone());
     }
@@ -8162,19 +8527,27 @@ fn annotate_version_lock_entry(
 
 fn annotate_github_release_lock_entry(
     source: &RemoteSourceKey,
+    version: &Version,
     constraint: Option<&VersionConstraint>,
     lock_file: &mut LockFile,
 ) {
-    if let Some(entry) = lock_file
-        .provider
-        .iter_mut()
-        .find(|entry| LockFile::sources_match(&entry.source, source.as_str()))
-        && let LockEntryKind::GithubRelease {
-            version: _,
-            tag: _,
-            asset_id: _,
-            constraint: locked_constraint,
-        } = &mut entry.kind
+    if let Some(entry) = lock_file.provider.iter_mut().find(|entry| {
+        LockFile::sources_match(&entry.source, source.as_str())
+            && matches!(
+                &entry.kind,
+                LockEntryKind::GithubRelease {
+                    version: locked_version,
+                    tag: _,
+                    asset_id: _,
+                    constraint: _
+                } if locked_version == version
+            )
+    }) && let LockEntryKind::GithubRelease {
+        version: _,
+        tag: _,
+        asset_id: _,
+        constraint: locked_constraint,
+    } = &mut entry.kind
     {
         *locked_constraint = constraint.map(|constraint| constraint.raw.clone());
     }
@@ -8526,7 +8899,7 @@ where
                 lock_file,
                 registry_http,
             )?;
-            annotate_version_lock_entry(&source_key, config.version.as_ref(), lock_file);
+            annotate_version_lock_entry(&source_key, &version, config.version.as_ref(), lock_file);
             Ok(path)
         }
         (ProviderSource::Remote(RemoteSource::GithubDirect(github_source)), None) => {
@@ -8548,7 +8921,12 @@ where
                 lock_file,
                 github,
             )?;
-            annotate_github_release_lock_entry(&source_key, config.version.as_ref(), lock_file);
+            annotate_github_release_lock_entry(
+                &source_key,
+                release.version(),
+                config.version.as_ref(),
+                lock_file,
+            );
             Ok(path)
         }
     }
@@ -8572,21 +8950,13 @@ fn resolve_file_provider(
     let sha = install_project_artifact_atomically(install_lock, src_path.as_path(), &dest)
         .map_err(|e| format!("Failed to link file:// provider: {e}"))?;
 
-    if let Some(entry) = lock_file
-        .provider
-        .iter_mut()
-        .find(|entry| LockFile::sources_match(&entry.source, source))
-    {
-        entry.sha256 = sha;
-    } else {
-        lock_file.provider.push(LockEntry {
-            name: provider_name.to_string(),
-            source: source.to_string(),
-            kind: LockEntryKind::File,
-            sha256: sha,
-            registry: None,
-        });
-    }
+    lock_file.upsert(LockEntry {
+        name: provider_name.to_string(),
+        source: source.to_string(),
+        kind: LockEntryKind::File,
+        sha256: sha,
+        registry: None,
+    });
 
     Ok(dest)
 }
@@ -8646,6 +9016,133 @@ pub fn find_file_provider_source(
     InstalledProvider::file_source(path, config.name.clone(), file_source, base_dir)
 }
 
+fn lock_entry_matches_remote_config<P: PlaceholderKind, B: BindingAddress>(
+    entry: &LockEntry<RegistryLock>,
+    config: &ProviderConfig<P, B>,
+    source: &RemoteSource,
+) -> bool {
+    match (source, config.revision.as_deref(), &entry.kind) {
+        (
+            RemoteSource::Registry(_),
+            Some(requested),
+            LockEntryKind::RegistryRevision {
+                revision,
+                version: _,
+            },
+        ) => revision == requested,
+        (
+            RemoteSource::GithubDirect(_),
+            Some(requested),
+            LockEntryKind::Revision {
+                revision,
+                resolved_sha: _,
+                artifact_id: _,
+            },
+        ) => revision == requested,
+        (
+            RemoteSource::Registry(_),
+            None,
+            LockEntryKind::Version {
+                version,
+                constraint: _,
+            },
+        ) => config
+            .version
+            .as_ref()
+            .is_none_or(|constraint| constraint.matches(version).unwrap_or(false)),
+        (
+            RemoteSource::GithubDirect(_),
+            None,
+            LockEntryKind::GithubRelease {
+                version,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            },
+        ) => config
+            .version
+            .as_ref()
+            .is_none_or(|constraint| constraint.req.matches(version)),
+        (
+            RemoteSource::Registry(_),
+            Some(_),
+            LockEntryKind::Version {
+                version: _,
+                constraint: _,
+            }
+            | LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            }
+            | LockEntryKind::Revision {
+                revision: _,
+                resolved_sha: _,
+                artifact_id: _,
+            }
+            | LockEntryKind::File,
+        )
+        | (
+            RemoteSource::GithubDirect(_),
+            Some(_),
+            LockEntryKind::Version {
+                version: _,
+                constraint: _,
+            }
+            | LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            }
+            | LockEntryKind::RegistryRevision {
+                revision: _,
+                version: _,
+            }
+            | LockEntryKind::File,
+        )
+        | (
+            RemoteSource::Registry(_),
+            None,
+            LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            }
+            | LockEntryKind::Revision {
+                revision: _,
+                resolved_sha: _,
+                artifact_id: _,
+            }
+            | LockEntryKind::RegistryRevision {
+                revision: _,
+                version: _,
+            }
+            | LockEntryKind::File,
+        )
+        | (
+            RemoteSource::GithubDirect(_),
+            None,
+            LockEntryKind::Version {
+                version: _,
+                constraint: _,
+            }
+            | LockEntryKind::Revision {
+                revision: _,
+                resolved_sha: _,
+                artifact_id: _,
+            }
+            | LockEntryKind::RegistryRevision {
+                revision: _,
+                version: _,
+            }
+            | LockEntryKind::File,
+        ) => false,
+    }
+}
+
 fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
     config: &ProviderConfig<P, B>,
@@ -8653,129 +9150,16 @@ fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
     lock_file: &'lock LockFile,
 ) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
     let source_key = remote_source.source_key();
-    let lock_entry = match lock_file.find_source_entry(&source_key) {
-        Some(SourceLockEntry::Typed(entry)) => Some(entry),
-        Some(SourceLockEntry::Legacy(entry)) => {
-            return Err(FindInstalledProviderError::LegacyEntry(
-                entry.error(base_dir),
-            ));
-        }
-        None => None,
-    };
-    let selected = if let Some(requested_revision) = &config.revision {
-        match remote_source {
-            RemoteSource::Registry(_) => lock_entry.and_then(|lock_entry| match &lock_entry.kind {
-                LockEntryKind::RegistryRevision {
-                    revision,
-                    version: _,
-                } if revision == requested_revision => Some(lock_entry),
-                LockEntryKind::RegistryRevision {
-                    revision: _,
-                    version: _,
-                }
-                | LockEntryKind::Version {
-                    version: _,
-                    constraint: _,
-                }
-                | LockEntryKind::GithubRelease {
-                    version: _,
-                    tag: _,
-                    asset_id: _,
-                    constraint: _,
-                }
-                | LockEntryKind::Revision {
-                    revision: _,
-                    resolved_sha: _,
-                    artifact_id: _,
-                }
-                | LockEntryKind::File => None,
-            }),
-            RemoteSource::GithubDirect(_) => {
-                lock_entry.and_then(|lock_entry| match &lock_entry.kind {
-                    LockEntryKind::Revision {
-                        revision: _,
-                        resolved_sha: _,
-                        artifact_id: _,
-                    } => Some(lock_entry),
-                    LockEntryKind::Version {
-                        version: _,
-                        constraint: _,
-                    }
-                    | LockEntryKind::GithubRelease {
-                        version: _,
-                        tag: _,
-                        asset_id: _,
-                        constraint: _,
-                    }
-                    | LockEntryKind::RegistryRevision {
-                        revision: _,
-                        version: _,
-                    }
-                    | LockEntryKind::File => None,
-                })
-            }
-        }
-    } else {
-        match remote_source {
-            RemoteSource::Registry(_) => lock_entry.and_then(|lock_entry| match &lock_entry.kind {
-                LockEntryKind::Version {
-                    version: _,
-                    constraint: _,
-                } => Some(lock_entry),
-                LockEntryKind::GithubRelease {
-                    version: _,
-                    tag: _,
-                    asset_id: _,
-                    constraint: _,
-                }
-                | LockEntryKind::Revision {
-                    revision: _,
-                    resolved_sha: _,
-                    artifact_id: _,
-                }
-                | LockEntryKind::RegistryRevision {
-                    revision: _,
-                    version: _,
-                }
-                | LockEntryKind::File => None,
-            }),
-            RemoteSource::GithubDirect(_) => match lock_entry.map(|entry| (&entry.kind, entry)) {
-                Some((
-                    LockEntryKind::GithubRelease {
-                        version: _,
-                        tag: _,
-                        asset_id: _,
-                        constraint: _,
-                    },
-                    entry,
-                )) => Some(entry),
-                Some((
-                    LockEntryKind::Version {
-                        version: _,
-                        constraint: _,
-                    },
-                    _,
-                ))
-                | Some((
-                    LockEntryKind::Revision {
-                        revision: _,
-                        resolved_sha: _,
-                        artifact_id: _,
-                    },
-                    _,
-                ))
-                | Some((
-                    LockEntryKind::RegistryRevision {
-                        revision: _,
-                        version: _,
-                    },
-                    _,
-                ))
-                | Some((LockEntryKind::File, _))
-                | None => None,
-            },
-        }
-    };
+    if let Some(legacy) = lock_file
+        .legacy
+        .iter()
+        .find(|entry| LockFile::sources_match(&entry.source, source_key.as_str()))
+    {
+        return Err(FindInstalledProviderError::LegacyEntry(
+            legacy.error(base_dir),
+        ));
+    }
+    let selected = lock_file.find_by_remote_config(config, remote_source);
 
     selected
         .map(|lock_entry| {
@@ -8874,10 +9258,11 @@ pub fn provider_artifact_fingerprint(
 
 /// Find an already-installed provider without downloading.
 ///
-/// Checks the project-local provider cache and lock file. Unlike a bare path,
-/// the returned artifact always retains the lock/file provenance that selected
-/// it. This is used by the LSP to avoid editor-triggered downloads as well as
-/// by CLI load paths after `carina init` has installed the artifact.
+/// Checks the project-local provider cache and lock file. For `file://`
+/// providers, the returned artifact always retains the lock/file
+/// provenance that selected it. This is used by the LSP to avoid
+/// editor-triggered downloads as well as by CLI load paths after `carina init`
+/// has installed the artifact.
 pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &Path,
     config: &ProviderConfig<P, B>,
@@ -8943,35 +9328,41 @@ fn try_reuse_locked_registry_version(
     constraint: Option<&VersionConstraint>,
     lock_file: &LockFile,
 ) -> Option<String> {
-    let entry = lock_file.find_by_source_key(source)?;
-    match &entry.kind {
-        LockEntryKind::Version {
-            version,
-            constraint: _,
-        } => match constraint {
-            Some(constraint) if constraint.matches(version).unwrap_or(false) => {
+    lock_file.provider.iter().find_map(|entry| {
+        if !LockFile::sources_match(&entry.source, source.as_str()) {
+            return None;
+        }
+        match &entry.kind {
+            LockEntryKind::Version {
+                version,
+                constraint: _,
+            } if constraint
+                .is_none_or(|constraint| constraint.matches(version).unwrap_or(false)) =>
+            {
                 Some(version.clone())
             }
-            None => Some(version.clone()),
-            _ => None,
-        },
-        LockEntryKind::GithubRelease {
-            version: _,
-            tag: _,
-            asset_id: _,
-            constraint: _,
+            LockEntryKind::Version {
+                version: _,
+                constraint: _,
+            }
+            | LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
+            }
+            | LockEntryKind::Revision {
+                revision: _,
+                resolved_sha: _,
+                artifact_id: _,
+            }
+            | LockEntryKind::RegistryRevision {
+                revision: _,
+                version: _,
+            }
+            | LockEntryKind::File => None,
         }
-        | LockEntryKind::Revision {
-            revision: _,
-            resolved_sha: _,
-            artifact_id: _,
-        }
-        | LockEntryKind::RegistryRevision {
-            revision: _,
-            version: _,
-        }
-        | LockEntryKind::File => None,
-    }
+    })
 }
 
 fn try_reuse_locked_github_release(
@@ -8979,43 +9370,41 @@ fn try_reuse_locked_github_release(
     constraint: Option<&VersionConstraint>,
     lock_file: &LockFile,
 ) -> Result<Option<ResolvedGithubRelease>, String> {
-    let entry = match lock_file.find_source_entry(source) {
-        Some(SourceLockEntry::Typed(entry)) => entry,
-        Some(SourceLockEntry::Legacy(_)) | None => return Ok(None),
-    };
-    match &entry.kind {
-        LockEntryKind::GithubRelease {
-            version,
-            tag,
-            asset_id,
-            constraint: _,
-        } => {
-            if let Some(constraint) = constraint
-                && !constraint.req.matches(version)
-            {
-                return Ok(None);
+    Ok(lock_file.provider.iter().find_map(|entry| {
+        if !LockFile::sources_match(&entry.source, source.as_str()) {
+            return None;
+        }
+        match &entry.kind {
+            LockEntryKind::GithubRelease {
+                version,
+                tag,
+                asset_id,
+                constraint: _,
+            } if constraint.is_none_or(|constraint| constraint.req.matches(version)) => Some(
+                ResolvedGithubRelease::from_lock_entry(version.clone(), tag.clone(), *asset_id),
+            ),
+            LockEntryKind::GithubRelease {
+                version: _,
+                tag: _,
+                asset_id: _,
+                constraint: _,
             }
-            Ok(Some(ResolvedGithubRelease::from_lock_entry(
-                version.clone(),
-                tag.clone(),
-                *asset_id,
-            )))
+            | LockEntryKind::Version {
+                version: _,
+                constraint: _,
+            }
+            | LockEntryKind::Revision {
+                revision: _,
+                resolved_sha: _,
+                artifact_id: _,
+            }
+            | LockEntryKind::RegistryRevision {
+                revision: _,
+                version: _,
+            }
+            | LockEntryKind::File => None,
         }
-        LockEntryKind::Version {
-            version: _,
-            constraint: _,
-        }
-        | LockEntryKind::Revision {
-            revision: _,
-            resolved_sha: _,
-            artifact_id: _,
-        }
-        | LockEntryKind::RegistryRevision {
-            revision: _,
-            version: _,
-        }
-        | LockEntryKind::File => Ok(None),
-    }
+    }))
 }
 
 fn resolve_github_release<G: GithubHttp + ?Sized>(
@@ -9151,8 +9540,8 @@ pub enum LockMode {
     /// Default for `carina init`: error on mismatch between `.crn` and lock,
     /// but a provider absent from the lock (first-time add) is accepted.
     Normal,
-    /// Rebuild the lock from scratch: ignore existing entries and resolve
-    /// every provider as if starting fresh. Set by `carina init --upgrade`.
+    /// Re-resolve every configured provider while retaining unrelated lock
+    /// entries. Set by `carina init --upgrade`.
     Upgrade,
     /// Strict CI mode: the lock must match the `.crn` exactly. A provider
     /// present in `.crn` but missing from the lock is an error.
@@ -9177,9 +9566,10 @@ impl fmt::Display for LockMismatchError {
 
 impl std::error::Error for LockMismatchError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ResolveAllError {
     LockMismatch(LockMismatchError),
+    Egress(Box<EgressInitializationError>),
     Other(String),
 }
 
@@ -9187,6 +9577,7 @@ impl fmt::Display for ResolveAllError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LockMismatch(error) => error.fmt(formatter),
+            Self::Egress(error) => error.fmt(formatter),
             Self::Other(message) => formatter.write_str(message),
         }
     }
@@ -9195,7 +9586,8 @@ impl fmt::Display for ResolveAllError {
 impl std::error::Error for ResolveAllError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::LockMismatch(error) => Some(error),
+            Self::LockMismatch(error) => error.source(),
+            Self::Egress(error) => error.source(),
             Self::Other(_) => None,
         }
     }
@@ -9207,9 +9599,65 @@ impl From<LockMismatchError> for ResolveAllError {
     }
 }
 
+impl From<EgressInitializationError> for ResolveAllError {
+    fn from(error: EgressInitializationError) -> Self {
+        Self::Egress(Box::new(error))
+    }
+}
+
 impl From<String> for ResolveAllError {
     fn from(message: String) -> Self {
         Self::Other(message)
+    }
+}
+
+#[derive(Debug)]
+pub enum EgressInitializationError {
+    Installed(FindInstalledProviderError),
+    Artifact(Box<ProviderArtifactLoadError<crate::EgressSectionError>>),
+    LockedConsent(crate::EgressConsentError),
+    Consent(crate::EgressConsentError),
+    NonInteractive { source: crate::CanonicalSource },
+    Refused { source: crate::CanonicalSource },
+    Prompt(io::Error),
+}
+
+impl fmt::Display for EgressInitializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Installed(source) => source.fmt(formatter),
+            Self::Artifact(source) => source.fmt(formatter),
+            Self::LockedConsent(source) => write!(
+                formatter,
+                "locked egress consent is missing or stale: {source}"
+            ),
+            Self::Consent(source) => source.fmt(formatter),
+            Self::NonInteractive { source } => write!(
+                formatter,
+                "provider source {source} requires explicit egress consent, but stdin is not a terminal; re-run with `--accept-egress {source}` or add the source to the comma-separated CARINA_ACCEPT_EGRESS list"
+            ),
+            Self::Refused { source } => {
+                write!(
+                    formatter,
+                    "egress consent was not granted for provider source {source}"
+                )
+            }
+            Self::Prompt(source) => write!(formatter, "failed to read egress consent: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for EgressInitializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Installed(source) => source.source(),
+            Self::Artifact(source) => source.source(),
+            Self::Consent(source) => source.source(),
+            Self::LockedConsent(_)
+            | Self::Prompt(_)
+            | Self::NonInteractive { .. }
+            | Self::Refused { .. } => None,
+        }
     }
 }
 
@@ -9226,8 +9674,7 @@ impl From<String> for ResolveAllError {
 /// - (`--locked` only) provider present in `.crn` but missing from the lock.
 ///
 /// Orphan lock entries (present in lock, absent in `.crn`) are intentionally
-/// not reported here — they don't block `init` and the normal resolve loop
-/// leaves them in place. `--upgrade` is the way to prune.
+/// not reported here and remain retained by every resolution mode.
 /// `project_dir` is the user-facing project argument rendered in any mismatch
 /// remediation.
 pub fn check_lock_mismatch(
@@ -9252,7 +9699,9 @@ pub fn check_lock_mismatch(
         let source_key = remote_source.source_key();
 
         let lock_entry = match lock_file.find_source_entry(&source_key) {
-            Some(SourceLockEntry::Typed(entry)) => entry,
+            Some(SourceLockEntry::Typed(first_entry)) => lock_file
+                .find_by_remote_config(config, remote_source)
+                .unwrap_or(first_entry),
             Some(SourceLockEntry::Legacy(entry)) => {
                 match &entry.reason {
                     LegacyReason::GithubDirectVersionWithoutTag {
@@ -9593,6 +10042,29 @@ pub fn resolve_all(
     )
 }
 
+/// Resolve providers and record or verify the egress declaration carried by
+/// each exact installed artifact.
+pub fn resolve_all_with_egress(
+    user_dirs: &UserDirs,
+    install_lock: &ProviderInstallLock,
+    providers: &[ProviderConfig],
+    mode: LockMode,
+    accepted_sources: &crate::AcceptedEgressSources,
+) -> Result<HashMap<String, WasmArtifactPath>, ResolveAllError> {
+    let github_http = UreqGithubHttp;
+    let token_provider = EnvironmentGithubTokenProvider;
+    let github = GithubApi::with_token_provider(&github_http, &token_provider);
+    resolve_all_with_http_and_egress(
+        user_dirs,
+        install_lock,
+        providers,
+        mode,
+        &UreqRegistryHttp,
+        &github,
+        ResolveEgress::Initialize(accepted_sources),
+    )
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 pub fn resolve_all_with_fixture_registry(
     user_dirs: &UserDirs,
@@ -9639,11 +10111,42 @@ where
     R: RegistryHttp,
     G: GithubHttp + ?Sized,
 {
+    resolve_all_with_http_and_egress(
+        user_dirs,
+        install_lock,
+        providers,
+        mode,
+        registry_http,
+        github,
+        ResolveEgress::Skip,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ResolveEgress<'a> {
+    Skip,
+    Initialize(&'a crate::AcceptedEgressSources),
+}
+
+fn resolve_all_with_http_and_egress<R, G>(
+    user_dirs: &UserDirs,
+    install_lock: &ProviderInstallLock,
+    providers: &[ProviderConfig],
+    mode: LockMode,
+    registry_http: &R,
+    github: &GithubApi<'_, G>,
+    egress: ResolveEgress<'_>,
+) -> Result<HashMap<String, WasmArtifactPath>, ResolveAllError>
+where
+    R: RegistryHttp,
+    G: GithubHttp + ?Sized,
+{
     let base_dir = install_lock.project_dir();
     let mut lock_file = install_lock
         .load_lock_file_or_default()
         .map_err(|error| error.to_string())?;
     lock_file.report_migration();
+    let previous_lock_file = lock_file.clone();
 
     // Fail before installing any provider artifact or rewriting the lock if it
     // disagrees with .crn.
@@ -9652,6 +10155,7 @@ where
     check_lock_mismatch(providers, &lock_file, mode, base_dir)?;
 
     let mut resolved = HashMap::new();
+    let mut initialized_egress = InitializedEgressDeclarations::default();
 
     for config in providers {
         let source = match &config.source {
@@ -9669,6 +10173,29 @@ where
             github,
         )?;
 
+        match egress {
+            ResolveEgress::Skip => {}
+            ResolveEgress::Initialize(accepted_sources) => {
+                let installed = installed_provider_from_resolved(
+                    base_dir,
+                    config,
+                    source,
+                    &artifact_path,
+                    &lock_file,
+                )?;
+                let resolved_egress = resolved_egress_declaration(user_dirs, &installed)?;
+                initialize_resolved_egress(
+                    base_dir,
+                    resolved_egress,
+                    &previous_lock_file,
+                    &mut lock_file,
+                    mode,
+                    accepted_sources,
+                    &mut initialized_egress,
+                )?;
+            }
+        }
+
         resolved.insert(config.name.clone(), artifact_path);
     }
 
@@ -9679,6 +10206,304 @@ where
     }
 
     Ok(resolved)
+}
+
+struct ResolvedEgressDeclaration {
+    declaration: crate::VerifiedEgressDeclaration,
+    signed: Option<crate::CarinaRsSigned>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EgressDeclarationKey {
+    source: String,
+    patterns: BTreeSet<crate::HostPattern>,
+}
+
+impl From<&crate::VerifiedEgressDeclaration> for EgressDeclarationKey {
+    fn from(declaration: &crate::VerifiedEgressDeclaration) -> Self {
+        Self {
+            source: declaration.source().to_string(),
+            patterns: declaration.patterns().clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct InitializedEgressDeclarations {
+    explicit: BTreeMap<EgressDeclarationKey, crate::ExplicitConsent>,
+}
+
+fn resolved_egress_declaration(
+    user_dirs: &UserDirs,
+    installed: &InstalledProvider,
+) -> Result<ResolvedEgressDeclaration, ResolveAllError> {
+    let grants = TrustedLocalGrants::default();
+    let load = installed
+        .verified_load::<crate::EgressSectionError>(user_dirs, &grants)
+        .map_err(|source| EgressInitializationError::Artifact(Box::new(source)))?;
+    let declaration = crate::VerifiedEgressDeclaration::read(&load).map_err(|source| {
+        EgressInitializationError::Artifact(Box::new(installed.with_load_error(source)))
+    })?;
+    Ok(ResolvedEgressDeclaration {
+        declaration,
+        signed: load.carina_rs_signed(),
+    })
+}
+
+fn initialize_resolved_egress(
+    base_dir: &Path,
+    resolved: ResolvedEgressDeclaration,
+    previous_lock_file: &LockFile,
+    lock_file: &mut LockFile,
+    mode: LockMode,
+    accepted_sources: &crate::AcceptedEgressSources,
+    initialized: &mut InitializedEgressDeclarations,
+) -> Result<(), ResolveAllError> {
+    initialize_resolved_egress_with(
+        base_dir,
+        resolved,
+        previous_lock_file,
+        lock_file,
+        mode,
+        initialized,
+        &mut |source| explicit_consent_given(source, accepted_sources),
+    )
+}
+
+fn initialize_resolved_egress_with(
+    base_dir: &Path,
+    resolved: ResolvedEgressDeclaration,
+    previous_lock_file: &LockFile,
+    lock_file: &mut LockFile,
+    mode: LockMode,
+    initialized: &mut InitializedEgressDeclarations,
+    consent_given: &mut impl FnMut(
+        &crate::CanonicalSource,
+    ) -> Result<crate::egress::ConsentGiven, ResolveAllError>,
+) -> Result<(), ResolveAllError> {
+    let ResolvedEgressDeclaration {
+        declaration,
+        signed,
+    } = resolved;
+
+    if mode == LockMode::Locked {
+        let locked = lock_file.locked_egress(&declaration, base_dir);
+        crate::ConsentedEgress::from_lock(locked.as_ref(), declaration, signed)
+            .map_err(EgressInitializationError::LockedConsent)?;
+        return Ok(());
+    }
+
+    let previous_record = previous_lock_file
+        .egress_record_for_display(declaration.source(), base_dir)
+        .cloned();
+
+    if declaration.patterns().is_empty() {
+        if previous_record.is_some() {
+            print_egress_change(declaration.source(), previous_record.as_ref(), &declaration);
+        }
+        lock_file
+            .clear_empty_egress_declaration(declaration, base_dir)
+            .map_err(EgressInitializationError::Consent)?;
+        return Ok(());
+    }
+
+    if let Some(signed) = signed {
+        match previous_record
+            .as_ref()
+            .and_then(crate::EgressLockRecord::hosts)
+        {
+            Some(previous) if previous == declaration.patterns() => println!(
+                "Provider source {}: egress hosts unchanged",
+                declaration.source()
+            ),
+            Some(_) | None => {
+                print_egress_change(declaration.source(), previous_record.as_ref(), &declaration);
+            }
+        }
+        lock_file
+            .record_egress_consent(
+                &declaration,
+                crate::EgressConsent::CarinaRsSigned(signed),
+                base_dir,
+            )
+            .map_err(EgressInitializationError::Consent)?;
+        return Ok(());
+    }
+
+    let declaration_key = EgressDeclarationKey::from(&declaration);
+    if let Some(consent) = initialized.explicit.get(&declaration_key).cloned() {
+        lock_file
+            .record_egress_consent(
+                &declaration,
+                crate::EgressConsent::Explicit(consent),
+                base_dir,
+            )
+            .map_err(EgressInitializationError::Consent)?;
+        return Ok(());
+    }
+
+    if let Some(previous) =
+        previous_lock_file.explicit_egress_for_carry_over(&declaration, base_dir)
+        && let Some(explicit) = previous.explicit_consent()
+        && let Ok(carried) = crate::ExplicitConsent::carry_over(explicit, &declaration)
+    {
+        println!(
+            "Provider source {}: egress hosts unchanged",
+            declaration.source()
+        );
+        lock_file
+            .record_egress_consent(
+                &declaration,
+                crate::EgressConsent::Explicit(carried.clone()),
+                base_dir,
+            )
+            .map_err(EgressInitializationError::Consent)?;
+        initialized.explicit.insert(declaration_key, carried);
+        return Ok(());
+    }
+
+    print_egress_change(declaration.source(), previous_record.as_ref(), &declaration);
+    let given = consent_given(declaration.source())?;
+    let consent = crate::ExplicitConsent::granted(&declaration, given);
+    lock_file
+        .record_egress_consent(
+            &declaration,
+            crate::EgressConsent::Explicit(consent.clone()),
+            base_dir,
+        )
+        .map_err(EgressInitializationError::Consent)?;
+    initialized.explicit.insert(declaration_key, consent);
+    Ok(())
+}
+
+fn explicit_consent_given(
+    source: &crate::CanonicalSource,
+    accepted_sources: &crate::AcceptedEgressSources,
+) -> Result<crate::egress::ConsentGiven, ResolveAllError> {
+    if let Some(given) = accepted_sources.accepts(source) {
+        return Ok(given);
+    }
+    if !io::stdin().is_terminal() {
+        return Err(EgressInitializationError::NonInteractive {
+            source: source.clone(),
+        }
+        .into());
+    }
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    crate::egress::prompt_for_explicit_consent(source, &mut input, &mut output)
+        .map_err(EgressInitializationError::Prompt)?
+        .ok_or_else(|| {
+            EgressInitializationError::Refused {
+                source: source.clone(),
+            }
+            .into()
+        })
+}
+
+fn installed_provider_from_resolved(
+    base_dir: &Path,
+    config: &ProviderConfig,
+    source: &ProviderSource,
+    artifact_path: &WasmArtifactPath,
+    lock_file: &LockFile,
+) -> Result<InstalledProvider, ResolveAllError> {
+    match source {
+        ProviderSource::File(file_source) => InstalledProvider::file_source(
+            artifact_path.clone(),
+            config.name.clone(),
+            file_source.clone(),
+            base_dir,
+        )
+        .map_err(ResolveAllError::Other),
+        ProviderSource::Remote(remote_source) => {
+            let selection = select_locked_artifact(base_dir, config, remote_source, lock_file)
+                .map_err(EgressInitializationError::Installed)?
+                .ok_or_else(|| {
+                    ResolveAllError::Other(format!(
+                        "resolved provider source {} has no matching lock entry",
+                        remote_source.source_key()
+                    ))
+                })?;
+            installed_provider_from_lock(&config.name, selection, base_dir)
+                .map_err(ResolveAllError::Other)
+        }
+    }
+}
+
+fn print_egress_change(
+    source: &crate::CanonicalSource,
+    previous: Option<&crate::EgressLockRecord>,
+    declaration: &crate::VerifiedEgressDeclaration,
+) {
+    match previous.and_then(|previous| previous.hosts()) {
+        Some(previous) if previous != declaration.patterns() => {
+            println!("Provider source {source}: egress hosts changed");
+            for pattern in declaration.patterns().difference(previous) {
+                println!("{}", egress_diff_line('+', pattern));
+            }
+            for pattern in previous.difference(declaration.patterns()) {
+                println!("{}", egress_diff_line('-', pattern));
+            }
+        }
+        Some(_) => {
+            println!("Provider source {source}: explicit egress consent is required");
+            print_egress_declaration(declaration.patterns());
+        }
+        None if previous.is_some() => {
+            println!(
+                "Provider source {source}: locked egress record is invalid; explicit egress consent is required"
+            );
+            print_egress_declaration(declaration.patterns());
+        }
+        None => {
+            println!("Provider source {source} declares these egress hosts:");
+            print_egress_declaration(declaration.patterns());
+        }
+    }
+    print_any_depth_warning(declaration.patterns());
+}
+
+fn egress_diff_line(sign: char, pattern: &crate::HostPattern) -> String {
+    if pattern.is_any_depth() {
+        format!("  {sign} {pattern}  [ANY DEPTH — review carefully]")
+    } else {
+        format!("  {sign} {pattern}")
+    }
+}
+
+fn print_egress_declaration(patterns: &BTreeSet<crate::HostPattern>) {
+    let any_depth = patterns
+        .iter()
+        .filter(|pattern| pattern.is_any_depth())
+        .collect::<Vec<_>>();
+    if !any_depth.is_empty() {
+        println!("  ANY DEPTH (review carefully):");
+        for pattern in any_depth {
+            println!("    {pattern}");
+        }
+    }
+    let other = patterns
+        .iter()
+        .filter(|pattern| !pattern.is_any_depth())
+        .collect::<Vec<_>>();
+    if !other.is_empty() {
+        println!("  Exact or one-label hosts:");
+        for pattern in other {
+            println!("    {pattern}");
+        }
+    }
+    if patterns.is_empty() {
+        println!("  (no hostname egress)");
+    }
+}
+
+fn print_any_depth_warning(patterns: &BTreeSet<crate::HostPattern>) {
+    if patterns.iter().any(|pattern| pattern.is_any_depth()) {
+        println!(
+            "  A **. pattern allows the provider to reach a host at any depth below that suffix."
+        );
+    }
 }
 
 /// Validate that locked provider versions still satisfy the configured constraints.
@@ -9702,7 +10527,11 @@ pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
         let source_key = remote_source.source_key();
 
         let lock_entry = match lock_file.find_source_entry(&source_key) {
-            Some(SourceLockEntry::Typed(entry)) => Some(entry),
+            Some(SourceLockEntry::Typed(first_entry)) => Some(
+                lock_file
+                    .find_by_remote_config(config, remote_source)
+                    .unwrap_or(first_entry),
+            ),
             Some(SourceLockEntry::Legacy(entry)) => {
                 return Err(LockConstraintError::LegacyEntry(Box::new(
                     entry.error(base_dir),
@@ -12027,6 +12856,7 @@ transparency_log_present = false
                     transparency_log_present: true,
                 }),
             }],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         }
@@ -12589,6 +13419,7 @@ sha256 = "malformed"
                 sha256: "abc123".into(),
                 registry: None,
             }],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
@@ -12621,6 +13452,7 @@ sha256 = "malformed"
                 sha256: "abc123".into(),
                 registry: None,
             }],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
@@ -12672,6 +13504,7 @@ sha256 = "abc"
                 sha256: "abc123".into(),
                 registry: None,
             }],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
@@ -12702,6 +13535,7 @@ sha256 = "abc"
                 "main",
                 "81b6910fb34e84784daac2a02c915e821b2da570",
             )],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
@@ -12732,6 +13566,7 @@ sha256 = "abc"
                 sha256: "abc".into(),
                 registry: None,
             }],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
@@ -12741,6 +13576,554 @@ sha256 = "abc"
         let loaded =
             LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, LockEntryKind::File);
+    }
+
+    #[test]
+    fn egress_lock_record_roundtrips_with_sorted_multiline_hosts() {
+        let input = r#"version = 5
+
+[[provider]]
+name = "test"
+source = "file:///tmp/my-provider.wasm"
+mode = "file"
+sha256 = "abc"
+
+[provider.egress]
+consent = "explicit"
+hosts = ["z.example.com", "**.example.com", "a.example.com"]
+"#;
+        let lock = LockFile::from_toml_str(input, Path::new("carina-providers.lock")).unwrap();
+
+        let serialized = lock.to_toml_string().unwrap();
+        assert!(serialized.contains("[provider.egress]"), "{serialized}");
+        assert!(
+            serialized.contains("consent = \"explicit\""),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains(
+                "hosts = [\n    \"**.example.com\",\n    \"a.example.com\",\n    \"z.example.com\",\n]"
+            ),
+            "{serialized}"
+        );
+
+        let reparsed =
+            LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
+        assert_eq!(reparsed.egress, lock.egress);
+    }
+
+    fn remote_egress_component(hosts: &[&str], marker: &str) -> Vec<u8> {
+        let declaration = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "hosts": hosts,
+        }))
+        .unwrap();
+        let mut component = wasm_encoder::Component::new();
+        component.section(&wasm_encoder::CustomSection {
+            name: Cow::Borrowed("carina:egress"),
+            data: Cow::Owned(declaration),
+        });
+        component.section(&wasm_encoder::CustomSection {
+            name: Cow::Borrowed("test:artifact-marker"),
+            data: Cow::Owned(marker.as_bytes().to_vec()),
+        });
+        component.finish()
+    }
+
+    fn remote_egress_load(source: &str, hosts: &[&str], marker: &str) -> VerifiedLoad {
+        let bytes = remote_egress_component(hosts, marker);
+        let identity = ProviderLoadIdentity::new(
+            "mock".into(),
+            ProviderTrust::untrusted(),
+            ProviderLoadSource::Remote {
+                source: source_key(source),
+            },
+        )
+        .unwrap();
+        VerifiedLoad::for_test(bytes, identity)
+    }
+
+    fn signed_registry_egress_load(hosts: &[&str], marker: &str) -> VerifiedLoad {
+        let bytes = remote_egress_component(hosts, marker);
+        let source = source_key("carina-rs/aws");
+        let sha256 = sha256_bytes(&bytes);
+        let user_dirs = carina_core::TestUserDirs::new();
+        let signer = signature_pin(
+            "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml@refs/heads/main",
+            "https://token.actions.githubusercontent.com",
+        );
+        let verified_signer = verified_signer(
+            "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml@refs/heads/main",
+            "https://token.actions.githubusercontent.com",
+            "260157389",
+            "123",
+            "refs/heads/main",
+            "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml",
+        );
+        record_verified_registry_origin_download(
+            &user_dirs,
+            &source,
+            "https://downloads.example.test/aws.wasm",
+            &sha256,
+            &signer,
+            &verified_signer,
+        )
+        .unwrap();
+        let verified_identity = load_user_verified_identity(&user_dirs, &sha256, &source)
+            .unwrap()
+            .unwrap();
+        let trust = ProviderTrust::from_verified_remote(&verified_identity).unwrap();
+        let identity =
+            ProviderLoadIdentity::new("aws".into(), trust, ProviderLoadSource::Remote { source })
+                .unwrap();
+        VerifiedLoad::for_test(bytes, identity)
+    }
+
+    fn single_remote_egress_lock(
+        load: &VerifiedLoad,
+        version: &str,
+        record: Option<crate::EgressLockRecord>,
+    ) -> LockFile {
+        let ProviderLoadSource::Remote { source } = load.identity().source() else {
+            panic!("test load must have a remote source");
+        };
+        let entry = LockEntry {
+            name: "aws".into(),
+            source: source.to_string(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: Some(format!("={version}")),
+            },
+            sha256: load.artifact().sha256().into(),
+            registry: None,
+        };
+        let mut lock = LockFile::default();
+        if let Some(record) = record {
+            lock.egress
+                .insert(EgressArtifactKey::from_entry(&entry), record);
+        }
+        lock.provider.push(entry);
+        lock
+    }
+
+    fn initialize_signed_registry_version_bump(
+        previous_load: &VerifiedLoad,
+        current_load: &VerifiedLoad,
+    ) {
+        let previous_declaration = crate::VerifiedEgressDeclaration::read(previous_load).unwrap();
+        let previous_record =
+            crate::EgressLockRecord::carina_rs_signed(previous_declaration.patterns().clone());
+        let previous = single_remote_egress_lock(previous_load, "1.0.0", Some(previous_record));
+        let mut current = single_remote_egress_lock(current_load, "1.0.1", None);
+        let declaration = crate::VerifiedEgressDeclaration::read(current_load).unwrap();
+        let signed = current_load
+            .carina_rs_signed()
+            .expect("the registry fixture load must mint signed evidence");
+        let mut initialized = InitializedEgressDeclarations::default();
+
+        initialize_resolved_egress_with(
+            Path::new("."),
+            ResolvedEgressDeclaration {
+                declaration,
+                signed: Some(signed),
+            },
+            &previous,
+            &mut current,
+            LockMode::Normal,
+            &mut initialized,
+            &mut |_| panic!("signed registry egress must not request explicit consent"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn remote_version_bump_displays_changed_unchanged_and_removed_egress_hosts() {
+        const CHILD_ENV: &str = "CARINA_TEST_REMOTE_EGRESS_VERSION_BUMP_DISPLAY";
+        const TEST_NAME: &str = "provider_resolver::tests::remote_version_bump_displays_changed_unchanged_and_removed_egress_hosts";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST_NAME, "--exact", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child test failed: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("  + added.remote.example.com"), "{stdout}");
+            assert!(
+                stdout.contains("  - removed.remote.example.com"),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("Provider source carina-rs/aws: egress hosts unchanged"),
+                "{stdout}"
+            );
+            assert!(stdout.contains("  - removed.empty.example.com"), "{stdout}");
+            return;
+        }
+
+        let changed_previous =
+            signed_registry_egress_load(&["removed.remote.example.com"], "changed-previous");
+        let changed_current =
+            signed_registry_egress_load(&["added.remote.example.com"], "changed-current");
+        initialize_signed_registry_version_bump(&changed_previous, &changed_current);
+
+        let unchanged_previous =
+            signed_registry_egress_load(&["same.remote.example.com"], "unchanged-previous");
+        let unchanged_current =
+            signed_registry_egress_load(&["same.remote.example.com"], "unchanged-current");
+        initialize_signed_registry_version_bump(&unchanged_previous, &unchanged_current);
+
+        let emptied_previous =
+            signed_registry_egress_load(&["removed.empty.example.com"], "emptied-previous");
+        let emptied_current = signed_registry_egress_load(&[], "emptied-current");
+        initialize_signed_registry_version_bump(&emptied_previous, &emptied_current);
+    }
+
+    fn duplicate_remote_egress_lock(source: &str, loads: [&VerifiedLoad; 2]) -> LockFile {
+        let mut lock = LockFile::default();
+        for (index, load) in loads.into_iter().enumerate() {
+            lock.provider.push(LockEntry {
+                name: format!("mock-{index}"),
+                source: source.into(),
+                kind: LockEntryKind::Version {
+                    version: format!("1.0.{index}"),
+                    constraint: Some(format!("=1.0.{index}")),
+                },
+                sha256: load.artifact().sha256().into(),
+                registry: None,
+            });
+            let declaration = crate::VerifiedEgressDeclaration::read(load).unwrap();
+            let key = EgressArtifactKey::from_entry(lock.provider.last().unwrap());
+            lock.egress.insert(
+                key,
+                crate::EgressLockRecord::explicit(declaration.patterns().clone()),
+            );
+        }
+        lock
+    }
+
+    #[test]
+    fn duplicate_remote_source_egress_records_load_by_artifact_sha256() {
+        let source = "example/widget";
+        let first = remote_egress_load(source, &["first.example.com"], "first");
+        let second = remote_egress_load(source, &["second.example.com"], "second");
+        let lock = duplicate_remote_egress_lock(source, [&first, &second]);
+        let project = tempfile::tempdir().unwrap();
+
+        for (constraint, expected_sha256) in [
+            ("=1.0.0", first.artifact().sha256()),
+            ("=1.0.1", second.artifact().sha256()),
+        ] {
+            let config = versioned_config(source, constraint);
+            let remote_source = provider_source(source);
+            let selection = select_locked_artifact(project.path(), &config, &remote_source, &lock)
+                .unwrap()
+                .expect("each configured version selects its own lock entry");
+            assert_eq!(selection.lock_entry.sha256, expected_sha256);
+        }
+
+        lock.save(&provider_lock_path(project.path())).unwrap();
+
+        for (load, allowed, denied) in [
+            (&first, "first.example.com", "second.example.com"),
+            (&second, "second.example.com", "first.example.com"),
+        ] {
+            let locked = load_locked_egress(project.path(), load)
+                .unwrap()
+                .expect("each artifact has its own egress record");
+            let declaration = crate::VerifiedEgressDeclaration::read(load).unwrap();
+            let consented =
+                crate::ConsentedEgress::from_lock(Some(&locked), declaration, None).unwrap();
+
+            assert!(consented.allows(allowed));
+            assert!(!consented.allows(denied));
+        }
+    }
+
+    fn initialize_duplicate_remote_declarations(loads: [&VerifiedLoad; 2]) -> (usize, LockFile) {
+        let ProviderLoadSource::Remote { source } = loads[0].identity().source() else {
+            panic!("test load must have a remote source");
+        };
+        let source = source.to_string();
+        let mut lock = duplicate_remote_egress_lock(&source, loads);
+        lock.egress.clear();
+        let previous = lock.clone();
+        let mut initialized = InitializedEgressDeclarations::default();
+        let mut prompts = 0;
+        let mut prompt = |source: &crate::CanonicalSource| {
+            prompts += 1;
+            let mut answer = std::io::Cursor::new(b"yes\n");
+            crate::egress::prompt_for_explicit_consent(source, &mut answer, &mut Vec::new())
+                .unwrap()
+                .ok_or_else(|| ResolveAllError::Other("test prompt refused consent".into()))
+        };
+
+        for load in loads {
+            let declaration = crate::VerifiedEgressDeclaration::read(load).unwrap();
+            initialize_resolved_egress_with(
+                Path::new("."),
+                ResolvedEgressDeclaration {
+                    declaration,
+                    signed: None,
+                },
+                &previous,
+                &mut lock,
+                LockMode::Normal,
+                &mut initialized,
+                &mut prompt,
+            )
+            .unwrap();
+        }
+        (prompts, lock)
+    }
+
+    #[test]
+    fn init_requests_consent_for_each_distinct_declaration_of_one_source() {
+        let source = "example/widget";
+        let first = remote_egress_load(source, &["first.example.com"], "first");
+        let second = remote_egress_load(source, &["second.example.com"], "second");
+
+        let (prompts, lock) = initialize_duplicate_remote_declarations([&first, &second]);
+
+        assert_eq!(prompts, 2);
+        assert_eq!(lock.egress.len(), 2);
+        assert_eq!(
+            lock.to_toml_string()
+                .unwrap()
+                .matches("[provider.egress]")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn init_requests_consent_once_for_identical_declarations_of_one_source() {
+        let source = "example/widget";
+        let first = remote_egress_load(source, &["same.example.com"], "first");
+        let second = remote_egress_load(source, &["same.example.com"], "second");
+
+        let (prompts, lock) = initialize_duplicate_remote_declarations([&first, &second]);
+
+        assert_eq!(prompts, 1);
+        assert_eq!(lock.egress.len(), 2);
+        assert_eq!(
+            lock.to_toml_string()
+                .unwrap()
+                .matches("[provider.egress]")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn empty_egress_declaration_serializes_as_empty_array() {
+        let input = r#"version = 5
+
+[[provider]]
+name = "test"
+source = "file:///tmp/my-provider.wasm"
+mode = "file"
+sha256 = "abc"
+
+[provider.egress]
+consent = "explicit"
+hosts = []
+"#;
+        let lock = LockFile::from_toml_str(input, Path::new("carina-providers.lock")).unwrap();
+        let serialized = lock.to_toml_string().unwrap();
+        assert!(serialized.contains("hosts = []"), "{serialized}");
+    }
+
+    #[test]
+    fn invalid_egress_host_is_retained_as_entry_local_no_consent_state() {
+        let input = r#"version = 5
+
+[[provider]]
+name = "test"
+source = "file:///tmp/my-provider.wasm"
+mode = "file"
+sha256 = "abc"
+
+[provider.egress]
+consent = "explicit"
+hosts = ["*.com"]
+"#;
+        let lock = LockFile::from_toml_str(input, Path::new("carina-providers.lock")).unwrap();
+        let artifact_key = EgressArtifactKey::from_entry(&lock.provider[0]);
+        let record = lock
+            .egress
+            .get(&artifact_key)
+            .expect("the invalid record remains attached to its provider entry");
+        assert!(record.hosts().is_none());
+
+        let serialized = lock.to_toml_string().unwrap();
+        assert!(serialized.contains("\"*.com\""), "{serialized}");
+    }
+
+    #[test]
+    fn file_egress_records_do_not_cross_match_cwd_and_project_relative_sources() {
+        const CHILD_ENV: &str = "CARINA_TEST_FILE_EGRESS_SOURCE_COORDINATES";
+        const TEST_NAME: &str = "provider_resolver::tests::file_egress_records_do_not_cross_match_cwd_and_project_relative_sources";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join("project")).unwrap();
+            fs::write(root.path().join("mock-http.wasm"), b"provider a").unwrap();
+            fs::write(root.path().join("project/mock-http.wasm"), b"provider b").unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([TEST_NAME, "--exact", "--nocapture"])
+                .current_dir(root.path())
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child test failed: {output:?}");
+            return;
+        }
+
+        let project_dir = Path::new("project");
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "provider-a".into(),
+            source: "file://mock-http.wasm".into(),
+            kind: LockEntryKind::File,
+            sha256: "provider-a-sha256".into(),
+            registry: None,
+        });
+        lock.upsert(LockEntry {
+            name: "provider-b".into(),
+            source: "file://project/mock-http.wasm".into(),
+            kind: LockEntryKind::File,
+            sha256: "provider-b-sha256".into(),
+            registry: None,
+        });
+
+        let provider_a_pattern = crate::HostPattern::parse("a.example.com").unwrap();
+        let provider_a_key = EgressArtifactKey::from_entry(&lock.provider[0]);
+        lock.egress.insert(
+            provider_a_key.clone(),
+            crate::EgressLockRecord::explicit(BTreeSet::from([provider_a_pattern.clone()])),
+        );
+
+        let mut component = wasm_encoder::Component::new();
+        component.section(&wasm_encoder::CustomSection {
+            name: Cow::Borrowed("carina:egress"),
+            data: Cow::Borrowed(br#"{"version":1,"hosts":["b.example.com"]}"#),
+        });
+        let canonical_source = crate::egress::canonical_project_relative_path(
+            project_dir,
+            Path::new("project/mock-http.wasm"),
+        )
+        .unwrap();
+        assert_eq!(canonical_source, Path::new("mock-http.wasm"));
+        let identity = ProviderLoadIdentity::new(
+            "provider-b".into(),
+            ProviderTrust::untrusted(),
+            ProviderLoadSource::LocalFile {
+                path: std::path::absolute("project/mock-http.wasm").unwrap(),
+                canonical_source,
+            },
+        )
+        .unwrap();
+        let load = VerifiedLoad::for_test(component.finish(), identity);
+        let declaration = crate::VerifiedEgressDeclaration::read(&load).unwrap();
+        let mut answer = std::io::Cursor::new(b"yes\n");
+        let given = crate::egress::prompt_for_explicit_consent(
+            declaration.source(),
+            &mut answer,
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .unwrap();
+        let consent =
+            crate::EgressConsent::Explicit(crate::ExplicitConsent::granted(&declaration, given));
+
+        lock.record_egress_consent(&declaration, consent, project_dir)
+            .unwrap();
+
+        assert_eq!(
+            lock.egress.get(&provider_a_key).unwrap().hosts().unwrap(),
+            &BTreeSet::from([provider_a_pattern])
+        );
+        let provider_b_key = EgressArtifactKey::from_entry(&lock.provider[1]);
+        assert_eq!(
+            lock.egress.get(&provider_b_key).unwrap().hosts().unwrap(),
+            declaration.patterns()
+        );
+    }
+
+    #[test]
+    fn egress_diff_marks_any_depth_patterns_prominently() {
+        let any_depth = crate::HostPattern::parse("**.example.com").unwrap();
+        let exact = crate::HostPattern::parse("api.example.com").unwrap();
+
+        assert_eq!(
+            egress_diff_line('+', &any_depth),
+            "  + **.example.com  [ANY DEPTH — review carefully]"
+        );
+        assert_eq!(egress_diff_line('-', &exact), "  - api.example.com");
+    }
+
+    #[test]
+    fn egress_lock_subtable_denies_unknown_fields() {
+        let input = r#"version = 5
+
+[[provider]]
+name = "test"
+source = "file:///tmp/my-provider.wasm"
+mode = "file"
+sha256 = "abc"
+
+[provider.egress]
+consent = "explicit"
+hosts = []
+unexpected = true
+"#;
+        assert!(matches!(
+            LockFile::from_toml_str(input, Path::new("carina-providers.lock")),
+            Err(LockFileError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn misspelled_egress_subtable_is_ignored_and_fails_closed() {
+        let input = r#"version = 5
+
+[[provider]]
+name = "test"
+source = "file:///tmp/my-provider.wasm"
+mode = "file"
+sha256 = "abc"
+
+[provider.egres]
+consent = "explicit"
+hosts = ["api.example.com"]
+"#;
+        let lock = LockFile::from_toml_str(input, Path::new("carina-providers.lock")).unwrap();
+
+        assert!(lock.egress.is_empty());
+    }
+
+    #[test]
+    fn missing_or_migrated_egress_subtable_has_no_consent() {
+        let without_egress = r#"version = 5
+
+[[provider]]
+name = "test"
+source = "file:///tmp/my-provider.wasm"
+mode = "file"
+sha256 = "abc"
+"#;
+        let current =
+            LockFile::from_toml_str(without_egress, Path::new("carina-providers.lock")).unwrap();
+        assert!(current.egress.is_empty());
+
+        let v4_with_ignored_egress = without_egress.replacen("version = 5", "version = 4", 1)
+            + "\n[provider.egress]\nconsent = \"explicit\"\nhosts = []\nunexpected = true\n";
+        let migrated =
+            LockFile::from_toml_str(&v4_with_ignored_egress, Path::new("carina-providers.lock"))
+                .unwrap();
+        assert!(migrated.egress.is_empty());
     }
 
     /// A lock file with an unknown or missing `mode` tag fails to parse instead
@@ -15400,6 +16783,7 @@ transparency_log_present = false
                     transparency_log_present: false,
                 }),
             }],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
@@ -17695,6 +19079,55 @@ transparency_log_present = true
     }
 
     #[test]
+    fn upgrade_retains_unconfigured_provider_legacy_and_egress_records() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let project = tempfile::tempdir().unwrap();
+        let configured = project.path().join("configured.wasm");
+        fs::write(&configured, b"configured provider").unwrap();
+        fs::write(
+            provider_lock_path(project.path()),
+            r#"version = 5
+
+[[provider]]
+name = "orphan"
+source = "file://orphan.wasm"
+mode = "file"
+sha256 = "orphan-sha"
+
+[provider.egress]
+consent = "explicit"
+hosts = ["api.example.com"]
+
+[[provider]]
+name = "legacy"
+source = "github.com/example/legacy"
+mode = "version"
+version = "1.0.0"
+sha256 = "legacy-sha"
+future_protection_field = "retain-me"
+"#,
+        )
+        .unwrap();
+        let config = provider_config(&format!("file://{}", configured.display()), None);
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+
+        resolve_all(&user_dirs, &install_lock, &[config], LockMode::Upgrade).unwrap();
+
+        let lock = fs::read_to_string(provider_lock_path(project.path())).unwrap();
+        assert!(lock.contains("source = \"file://orphan.wasm\""), "{lock}");
+        assert!(lock.contains("[provider.egress]"), "{lock}");
+        assert!(lock.contains("hosts = [\"api.example.com\"]"), "{lock}");
+        assert!(
+            lock.contains("source = \"github.com/example/legacy\""),
+            "{lock}"
+        );
+        assert!(
+            lock.contains("future_protection_field = \"retain-me\""),
+            "{lock}"
+        );
+    }
+
+    #[test]
     fn resolve_all_locked_saves_file_provider_lock_state() {
         let user_dirs = carina_core::TestUserDirs::new();
         let tmp = tempfile::tempdir().unwrap();
@@ -17714,6 +19147,64 @@ transparency_log_present = true
         let entry = lock.find_by_source(&source).unwrap();
         assert_eq!(entry.kind, LockEntryKind::File);
         assert_eq!(entry.sha256, sha256_bytes(wasm));
+    }
+
+    #[test]
+    fn resolve_all_locked_persists_new_registry_signer_pin_and_sequence_anchor() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let project = tempfile::tempdir().unwrap();
+        let lock_path = provider_lock_path(project.path());
+        let mut lock = LockFile::default();
+        lock.upsert_registry(
+            LockEntry {
+                name: "awscc".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::Version {
+                    version: SIGNED_FIXTURE_VERSION.into(),
+                    constraint: None,
+                },
+                sha256: sha256_bytes(SIGNED_FIXTURE_ARTIFACT),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    sequence: RegistrySequence::Present(7),
+                    sequence_anchor: RegistrySequenceAnchor::Unestablished,
+                    valid_until_present: true,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: RegistrySignatureProtection::Required(SignerPinState::Unpinned),
+                    transparency_log_present: false,
+                }),
+            },
+            registry_host_lock("https://registry.carina-rs.dev/v1/providers/"),
+        )
+        .unwrap();
+        lock.save(&lock_path).unwrap();
+
+        resolve_all_with_http(
+            &user_dirs,
+            project.path(),
+            &[provider_config("carina-rs/aws", None)],
+            LockMode::Locked,
+            &signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200),
+        )
+        .unwrap();
+
+        let saved = load_lock_file_for_test(&lock_path).unwrap().unwrap();
+        let registry = saved
+            .find_by_source("carina-rs/aws")
+            .unwrap()
+            .registry
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            registry.sequence_anchor,
+            RegistrySequenceAnchor::Established(7)
+        );
+        let RegistrySignatureProtection::Required(SignerPinState::Current(pin)) =
+            &registry.signature
+        else {
+            panic!("a locked resolve must persist the verified signer pin");
+        };
+        assert_eq!(pin.source.oidc_issuer, SIGNED_FIXTURE_ISSUER);
     }
 
     #[test]
@@ -19980,6 +21471,7 @@ transparency_log_present = true
                     transparency_log_present: false,
                 }),
             }],
+            egress: BTreeMap::new(),
             legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
@@ -24102,6 +25594,81 @@ future_protection_field = "retain-me"
     }
 
     #[tokio::test]
+    async fn installed_file_provider_keeps_installed_bytes_after_source_rebuild() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        let original_bytes = b"local provider installed by init";
+        let rebuilt_bytes = b"local provider rebuilt after init";
+        fs::write(&source_path, original_bytes).unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        resolve_all(
+            &user_dirs,
+            &install_lock,
+            std::slice::from_ref(&config),
+            LockMode::Normal,
+        )
+        .unwrap();
+
+        let rebuilt_path = project.path().join("rebuilt-local-provider.wasm");
+        fs::write(&rebuilt_path, rebuilt_bytes).unwrap();
+        fs::rename(&rebuilt_path, &source_path).unwrap();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let loaded = installed
+            .load_with(&user_dirs, &no_local_grants(), |verified| async move {
+                Ok::<_, std::convert::Infallible>(verified.bytes().as_bytes().to_vec())
+            })
+            .await
+            .unwrap();
+
+        assert_ne!(installed.path().as_path(), source_path);
+        assert_eq!(loaded, original_bytes);
+        assert_ne!(loaded, rebuilt_bytes);
+    }
+
+    #[tokio::test]
+    async fn installed_file_provider_rejects_trust_after_source_rebuild_without_init() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("local-provider.wasm");
+        fs::write(&source_path, b"local provider installed by init").unwrap();
+        let config = provider_config(&format!("file://{}", source_path.display()), None);
+        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        resolve_all(
+            &user_dirs,
+            &install_lock,
+            std::slice::from_ref(&config),
+            LockMode::Normal,
+        )
+        .unwrap();
+
+        let replacement = project.path().join("rebuilt-local-provider.wasm");
+        fs::write(&replacement, b"different rebuilt provider bytes").unwrap();
+        fs::rename(replacement, &source_path).unwrap();
+        let installed = find_installed_provider(project.path(), &config).unwrap();
+        let grants =
+            TrustedLocalGrants::parse(&[format!("{}=aws", source_path.display())], None).unwrap();
+        let mut notices = Vec::new();
+
+        let class = installed
+            .load_with_notice_sink(
+                &user_dirs,
+                &grants,
+                |line| notices.push(line.to_string()),
+                |verified| async move {
+                    Ok::<_, std::convert::Infallible>(verified.identity().trust().class())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(class, ProviderTrustClass::Untrusted);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("does not match the installed bytes"));
+    }
+
+    #[tokio::test]
     async fn file_load_identity_hashes_the_retained_bytes() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
@@ -24181,7 +25748,9 @@ future_protection_field = "retain-me"
         assert_eq!(class, ProviderTrustClass::Untrusted);
         assert!(matches!(
             source,
-            crate::ProviderLoadSource::LocalFile { path } if path == canonical_source_path
+            crate::ProviderLoadSource::LocalFile { path, canonical_source }
+                if path == canonical_source_path
+                    && canonical_source == Path::new("local-provider.wasm")
         ));
     }
 

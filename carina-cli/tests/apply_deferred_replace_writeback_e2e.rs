@@ -217,7 +217,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         Value::Concrete(ConcreteValue::String("alias".into())),
     );
 
-    let mut template_resource: carina_core::resource::Resource<
+    let template_resource: carina_core::resource::Resource<
         carina_core::resource::ModuleSource,
         LoopSlot,
         AbsoluteBindingAddress,
@@ -227,25 +227,27 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         carina_core::resource::ResourceIdentity::try_from("validation_records".to_string())
             .unwrap(),
         None,
-    );
-    template_resource.binding = Some(absolute_binding("validation_records"));
-    let template = DeferredForExpression {
-        file: Some("main.crn".to_string()),
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "mock.test.resource".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: absolute_binding("validation_records"),
-        },
-        iterable: Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
+    )
+    .with_absolute_binding(carina_core::resource::absolute_binding_address_for_test(
+        "validation_records",
+    ));
+    let template = DeferredForExpression::new(
+        Some("main.crn".to_string()),
+        1,
+        "for opt in cert.domain_validation_options".to_string(),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        Value::<NoPlaceholder, RelativeBindingName>::resource_ref(
             "cert",
             "domain_validation_options",
             Vec::new(),
         )
         .resolve_root_for_test(),
-        binding: ForBinding::Simple("opt".to_string()),
+        ForBinding::Simple("opt".to_string()),
         template_resource,
-    };
+    );
 
     let validation_id =
         ResourceId::with_provider_identity("mock", "test.resource", "validation_records[0]", None);
@@ -264,10 +266,6 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
         template: Box::new(template),
     })));
     plan.add(Effect::Create(resolved(alias.clone())));

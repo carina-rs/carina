@@ -995,7 +995,7 @@ fn resource_sink<
         Some(ResourceRef::Deferred {
             resource,
             deferred: _deferred,
-        }) => schemas.get_for(resource)?.schema(),
+        }) => schemas.get_for(resource.as_resource())?.schema(),
         None => return None,
     };
     let mut segments = path.segments().iter();
@@ -3645,9 +3645,11 @@ pub fn validate_resources<
                     ResourceRef::Resource(resource) => {
                         anonymous_resource_schema_key(resource, registry, known_providers)
                     }
-                    ResourceRef::Deferred { resource, .. } => {
-                        anonymous_resource_schema_key(resource, registry, known_providers)
-                    }
+                    ResourceRef::Deferred { resource, .. } => anonymous_resource_schema_key(
+                        resource.as_resource(),
+                        registry,
+                        known_providers,
+                    ),
                     ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
                 },
             ))
@@ -3705,23 +3707,23 @@ pub fn validate_resources<
                     }
                 }
                 ResourceRef::Deferred { resource, .. } => {
-                    let schema = registry.get_for(resource);
+                    let schema = registry.get_for(resource.as_resource());
                     validate_resource_values(
-                        &resource.id,
-                        &resource.quoted_string_attrs,
-                        &resource.attributes,
+                        resource.id(),
+                        resource.quoted_string_attrs(),
+                        resource.attributes(),
                         schema,
                         ValidatableKind::Resource,
                         &mut context,
                     );
                     if let Some(schema) = schema
                         && let Err(errors) =
-                            crate::resource::resolve_ignore_changes(resource, &schema)
+                            crate::resource::resolve_ignore_changes(resource.as_resource(), &schema)
                     {
                         context.all_errors.extend(
                             errors
                                 .into_iter()
-                                .map(|error| format!("{}: {}", resource.id, error)),
+                                .map(|error| format!("{}: {}", resource.id(), error)),
                         );
                     }
                 }
@@ -3923,7 +3925,7 @@ fn validate_resource_ref_types_inner<
             ResourceRef::Deferred {
                 resource: m,
                 deferred: _deferred,
-            } => registry.get_for(m),
+            } => registry.get_for(m.as_resource()),
         };
         let Some(validated_schema) = schema else {
             continue;

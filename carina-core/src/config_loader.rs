@@ -1318,8 +1318,10 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
             parsed
                 .parsed_deferred_for_expressions()
                 .iter()
-                .filter_map(|deferred| match &deferred.body {
-                    crate::parser::DeferredForBody::Resource(resource) => Some(resource.id.clone()),
+                .filter_map(|deferred| match deferred.body() {
+                    crate::parser::DeferredForBody::Resource(resource) => {
+                        Some(resource.id().clone())
+                    }
                     crate::parser::DeferredForBody::Read(data_source) => {
                         Some(data_source.id.clone())
                     }
@@ -1366,13 +1368,9 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
         }
     }
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
-        deferred.target.set_loop_display_file(&display_file);
-        match &mut deferred.body {
-            crate::parser::DeferredForBody::Resource(resource) => {
-                resource.loop_provenance.set_display_file(&display_file);
-            }
-            crate::parser::DeferredForBody::Read(_)
-            | crate::parser::DeferredForBody::ModuleCall(_) => {}
+        deferred.set_loop_display_file(&display_file);
+        if let Some(provenance) = deferred.template_loop_provenance_mut() {
+            provenance.set_display_file(&display_file);
         }
     }
     for deferred in &mut parsed.deferred_module_ifs {
@@ -2748,17 +2746,10 @@ let orgs = upstream_state {
         };
         assert_eq!(deferred.header, "for x in src.list");
         assert_eq!(deferred.line, 3);
-        assert_eq!(deferred.resource_type, "mock.test.resource");
-        assert_eq!(
-            deferred
-                .template_resource
-                .binding
-                .as_ref()
-                .map(crate::resource::AbsoluteBindingAddress::as_str),
-            Some("res_items[?]")
-        );
+        assert_eq!(deferred.resource_type(), "mock.test.resource");
+        assert_eq!(deferred.template_resource_binding(), Some("res_items[?]"));
         assert!(matches!(
-            deferred.template_resource.get_attr("comment"),
+            deferred.template_resource().attributes().get("comment"),
             Some(crate::resource::Value::Deferred(
                 crate::resource::DeferredValue::Secret(_)
             ))

@@ -49,6 +49,7 @@ hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 wasmprinter = "0.245.1"
+wasm-encoder = "0.245.1"
 wat = "1"
 wit-component = { version = "0.245.1", features = ["dummy-module"] }
 wit-parser = "0.245.1"

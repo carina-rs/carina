@@ -306,15 +306,15 @@ let disabled = choice { flag = false }
 
     let enabled = deferred("enabled.seed");
     assert_eq!(
-        enabled.template_resource.get_attr("name"),
+        enabled.template_resource().attributes().get("name"),
         Some(&ExpandedValue::Concrete(ExpandedConcreteValue::String(
             "seed".into()
         ))),
     );
     assert_eq!(
         enabled
-            .template_resource
-            .dependency_bindings
+            .template_resource()
+            .dependency_bindings()
             .iter()
             .map(|binding| binding.as_str())
             .collect::<BTreeSet<_>>(),
@@ -325,7 +325,7 @@ let disabled = choice { flag = false }
     let disabled = deferred("disabled.seed");
     assert!(
         matches!(
-            disabled.template_resource.get_attr("name"),
+            disabled.template_resource().attributes().get("name"),
             Some(crate::resource::Value::Deferred(
                 crate::resource::DeferredValue::Placeholder(ParserPlaceholder::Loop(
                     LoopSlot::Value,
@@ -333,12 +333,15 @@ let disabled = choice { flag = false }
             ))
         ),
         "the selected false branch must retain only the loop placeholder: {:?}",
-        disabled.template_resource.get_attr("name"),
+        disabled.template_resource().attributes().get("name"),
     );
     assert!(
-        disabled.template_resource.dependency_bindings.is_empty(),
+        disabled
+            .template_resource()
+            .dependency_bindings()
+            .is_empty(),
         "the unselected seed reference must not leave a dependency edge: {:?}",
-        disabled.template_resource.dependency_bindings,
+        disabled.template_resource().dependency_bindings(),
     );
 }
 
@@ -1295,27 +1298,19 @@ fn parsed_deferred_resource(
         RelativeBindingName,
     >,
 ) -> ParsedDeferredForExpression {
-    let DeferredForExpression {
-        file,
-        line,
-        header,
-        resource_type: _,
-        target,
-        iterable,
-        binding,
-        template_resource,
-    } = expression;
-    ParsedDeferredForExpression {
-        file,
-        line,
-        span: SourceSpan::dummy(),
-        header,
-        target,
-        iterable,
-        iterable_state: crate::parser::ParsedDeferredForIterableState::Deferred,
-        binding,
-        body: DeferredForBody::Resource(Box::new(template_resource)),
-    }
+    ParsedDeferredForExpression::new(
+        (
+            expression.file.clone(),
+            expression.line,
+            SourceSpan::dummy(),
+            expression.header.clone(),
+        ),
+        expression.target().clone(),
+        expression.iterable.clone(),
+        crate::parser::ParsedDeferredForIterableState::Deferred,
+        expression.binding.clone(),
+        DeferredForBody::Resource(Box::new(expression.template_resource().clone())),
+    )
 }
 
 fn resolve_anonymous_loop_module_fixture(
@@ -7893,17 +7888,15 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             quoted_string_attrs: std::collections::HashSet::new(),
         });
         m.parsed_deferred_for_expressions_mut()
-            .push(parsed_deferred_resource(DeferredForExpression {
-                file: None,
-                line: 7,
-                header: "for _, opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.RecordSet".to_string(),
-                target: DeferredForTarget::Bound {
-                    binding: "_domain_validation_options".into(),
-                },
-                iterable: Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Map("_".to_string(), "opt".to_string()),
-                template_resource: Resource {
+            .push(parsed_deferred_resource(DeferredForExpression::new(
+                None,
+                7,
+                "for _, opt in cert.domain_validation_options".to_string(),
+                DeferredForTarget::bound(RelativeBindingName::new("_domain_validation_options"))
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("cert", "domain_validation_options", Vec::new()),
+                ForBinding::Map("_".to_string(), "opt".to_string()),
+                Resource {
                     id: ResourceId::with_identity("route53.RecordSet", "placeholder"),
                     attributes: {
                         // The loop body references the module-internal
@@ -7931,7 +7924,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
                     loop_provenance: Default::default(),
                     quoted_string_attrs: std::collections::HashSet::new(),
                 },
-            }));
+            )));
         m
     };
 
@@ -7974,7 +7967,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // `binding_name` is the generated-resource address prefix →
     // prefixed unconditionally (mirrors `Resource.binding`).
     assert_eq!(
-        d.target.bound_binding(),
+        d.target().bound_binding(),
         Some("r._domain_validation_options"),
         "PR-B must instance-prefix binding_name"
     );
@@ -7995,11 +7988,11 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     // intra-module ref must be prefixed, and module_source stamped, so
     // the generated RecordSet wires to the prefixed module certificate.
     // Round-3 review found this load-bearing path had zero coverage.
-    let DeferredForBody::Resource(template_resource) = &d.body else {
+    let DeferredForBody::Resource(template_resource) = d.body() else {
         panic!("deferred test body must remain a resource")
     };
     let validated_cert = template_resource
-        .attributes
+        .attributes()
         .get("validated_cert")
         .expect("template attr preserved");
     match validated_cert {
@@ -8015,16 +8008,16 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     }
     assert!(
         matches!(
-            template_resource.module_source,
-            Some(crate::resource::ModuleSource::Module(ref source)) if source.instance() == "r"
+            template_resource.module_source(),
+            Some(crate::resource::ModuleSource::Module(source)) if source.instance() == "r"
         ),
         "template_resource must carry the module instance source; got: {:?}",
-        template_resource.module_source
+        template_resource.module_source()
     );
 }
 
 #[test]
-fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
+fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
     use crate::parser::{DeferredForTarget, ForBinding};
 
     let mut module = create_test_module_with_anonymous_resource();
@@ -8038,20 +8031,16 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
     });
     module
         .parsed_deferred_for_expressions_mut()
-        .push(parsed_deferred_resource(DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for _, account in accounts.items".to_string(),
-            resource_type: "awscc.sso.Assignment".to_string(),
-            target: DeferredForTarget::Bound {
-                binding: "assignments".into(),
-            },
-            iterable: Value::Deferred(DeferredValue::BindingRef {
-                binding: "accounts".into(),
-            }),
-            binding: ForBinding::Map("_".to_string(), "account".to_string()),
-            template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
-        }));
+        .push(parsed_deferred_resource(DeferredForExpression::new(
+            None,
+            1,
+            "for _, account in accounts.items".to_string(),
+            DeferredForTarget::bound(RelativeBindingName::new("assignments"))
+                .expect("fixture binding is valid"),
+            Value::resource_ref("accounts", "items", Vec::new()),
+            ForBinding::Map("_".to_string(), "account".to_string()),
+            Resource::pending_with_provider("awscc", "sso.Assignment", None),
+        )));
 
     let resolver = {
         let mut resolver = ModuleResolver::new(".");
@@ -8075,7 +8064,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
         .into_iter()
         .next()
         .unwrap();
-    let DeferredForBody::Resource(first) = first.body else {
+    let DeferredForBody::Resource(first) = first.into_body() else {
         panic!("deferred test body must remain a resource")
     };
     let second_expanded = resolver.expand_module_call(&call, "second").unwrap();
@@ -8084,13 +8073,13 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
         .into_iter()
         .next()
         .unwrap();
-    let DeferredForBody::Resource(second) = second.body else {
+    let DeferredForBody::Resource(second) = second.into_body() else {
         panic!("deferred test body must remain a resource")
     };
 
-    assert_eq!(first.id.identity_str(), None);
-    assert_eq!(second.id.identity_str(), None);
-    assert_ne!(first.id, second.id);
+    assert_eq!(first.id().identity_str(), Some("first.assignments[?]"));
+    assert_eq!(second.id().identity_str(), Some("second.assignments[?]"));
+    assert_ne!(first.id(), second.id());
 }
 
 /// carina#3126 PR-B negative case: a deferred iterable supplied through
@@ -8112,19 +8101,15 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
         // `accounts` is a module argument, so its caller-expanded address is
         // substituted rather than acquiring the callee's instance prefix.
         m.parsed_deferred_for_expressions_mut()
-            .push(parsed_deferred_resource(DeferredForExpression {
-                file: None,
-                line: 3,
-                header: "for _, a in accounts.list".to_string(),
-                resource_type: "awscc.sso.Assignment".to_string(),
-                target: DeferredForTarget::Bound {
-                    binding: "_list".into(),
-                },
-                iterable: Value::Deferred(DeferredValue::BindingRef {
-                    binding: "accounts".into(),
-                }),
-                binding: ForBinding::Map("_".to_string(), "a".to_string()),
-                template_resource: Resource {
+            .push(parsed_deferred_resource(DeferredForExpression::new(
+                None,
+                3,
+                "for _, a in accounts.list".to_string(),
+                DeferredForTarget::bound(RelativeBindingName::new("_list"))
+                    .expect("fixture binding is valid"),
+                Value::resource_ref("accounts", "list", Vec::new()),
+                ForBinding::Map("_".to_string(), "a".to_string()),
+                Resource {
                     id: ResourceId::with_identity("sso.Assignment", "placeholder"),
                     attributes: HashMap::new().into_iter().collect(),
                     directives: Directives::default(),
@@ -8137,7 +8122,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
                     loop_provenance: Default::default(),
                     quoted_string_attrs: std::collections::HashSet::new(),
                 },
-            }));
+            )));
         m
     };
 
@@ -8163,9 +8148,10 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     let expanded = resolver.expand_module_call(&call, "prod").unwrap();
     let d = &expanded.parsed_deferred_for_expressions()[0];
     // `binding_name` is a synthesized address prefix → always prefixed.
-    assert_eq!(d.target.bound_binding(), Some("prod._list"));
-    // The caller's already-absolute `accounts` address must stay
-    // unprefixed. A second prefix would make this `prod.accounts`.
+    assert_eq!(d.target().bound_binding(), Some("prod._list"));
+    // `accounts` is NOT module-internal → must stay UNPREFIXED
+    // (caller-collision guard). A regression to unconditional
+    // prefixing would make this `prod.accounts` and fail here.
     assert_eq!(
         d.root_bindings()
             .iter()
@@ -8255,7 +8241,7 @@ let r = registry {
         parsed.deferred_for_expressions()
     );
     let d = &parsed.deferred_for_expressions()[0];
-    assert_eq!(d.resource_type, "aws.route53.RecordSet");
+    assert_eq!(d.resource_type(), "aws.route53.RecordSet");
     assert!(
         d.reference_candidates()
             .contains("r.cert.domain_validation_options")
@@ -8265,7 +8251,7 @@ let r = registry {
     // carina#4109: because this loop has no `let` binding, its generated
     // resources stay anonymous; only the migration-only legacy base receives
     // the module-instance prefix.
-    let crate::parser::DeferredForTarget::Unbound { template } = &d.target else {
+    let crate::parser::DeferredForTarget::Unbound { template } = d.target() else {
         panic!("unbound module loop must remain an unbound deferred target")
     };
     assert_eq!(
@@ -8318,7 +8304,7 @@ let second = for item in source.second {
     let comments = parsed
         .deferred_for_expressions()
         .iter()
-        .map(|deferred| deferred.template_resource.get_attr("comment"))
+        .map(|deferred| deferred.template_resource().attributes().get("comment"))
         .collect::<Vec<_>>();
     assert_eq!(
         comments,

@@ -7064,7 +7064,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let anonymous_loop = expanded
         .deferred_for_expressions()
         .iter()
-        .find(|deferred| matches!(deferred.target, DeferredForTarget::Unbound { .. }))
+        .find(|deferred| matches!(deferred.target(), DeferredForTarget::Unbound { .. }))
         .expect("fixture has one unbound deferred loop");
     let mut loop_children = carina_core::parser::expand_deferred_children(
         anonymous_loop,
@@ -9192,22 +9192,23 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     let template_resource = Resource::with_provider("test", "thing", "deferred", None)
         .with_attribute("rule", rule.clone())
         .resolve_root_for_test();
-    let deferred = carina_core::parser::DeferredForExpression {
-        file: Some("main.crn".to_string()),
-        line: 4,
-        header: "for item in pending.items".to_string(),
-        resource_type: "test.thing".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: absolute_binding("items"),
-        },
-        iterable: Value::<
-            carina_core::resource::ParserPlaceholder,
-            carina_core::resource::RelativeBindingName,
-        >::resource_ref("pending", "items", Vec::new())
-        .resolve_root_for_test(),
-        binding: carina_core::parser::ForBinding::Simple("item".to_string()),
-        template_resource,
-    };
+    let deferred =
+        carina_core::parser::DeferredForExpression::new(
+            Some("main.crn".to_string()),
+            4,
+            "for item in pending.items".to_string(),
+            carina_core::parser::DeferredForTarget::bound(
+                carina_core::resource::absolute_binding_address_for_test("items"),
+            )
+            .expect("fixture binding is valid"),
+            Value::<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::RelativeBindingName,
+            >::resource_ref("pending", "items", Vec::new())
+            .resolve_root_for_test(),
+            carina_core::parser::ForBinding::Simple("item".to_string()),
+            template_resource,
+        );
     let mut evaluated = carina_core::parser::ParsedFile::default();
     evaluated.resources = vec![resource];
     let unresolved = evaluated.clone();
@@ -9235,12 +9236,7 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
             .contains_key("rule")
     );
     let evaluated_deferred = &canonical_unresolved.parsed().deferred_for_expressions()[0];
-    assert!(
-        evaluated_deferred
-            .template_resource
-            .attributes
-            .contains_key("rules")
-    );
+    assert!(evaluated_deferred.attributes().contains_key("rules"));
 
     let unresolved_resources = canonical_unresolved.unresolved();
     assert!(unresolved_resources[0].attributes.contains_key("rules"));
@@ -9288,6 +9284,61 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     assert_eq!(
         errors[0].to_string(),
         "test.thing.direct: cannot use both 'rule' and 'rules' (they refer to the same attribute)"
+    );
+}
+
+#[test]
+fn deferred_block_name_conflict_reports_materialized_template_address() {
+    let schema = ResourceSchema::new("thing")
+        .attribute(
+            AttributeSchema::optional(
+                "rules",
+                AttributeType::list(AttributeType::struct_(
+                    "Rule",
+                    vec![StructField::optional("action", AttributeType::string()).build()],
+                )),
+            )
+            .with_block_name("rule")
+            .build(),
+        )
+        .validate()
+        .expect("block-name fixture schema must be valid");
+    let ctx = WiringContext::new_for_test_with_additional_schemas::<
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+    >(Vec::new(), &[], [("test".to_string(), schema)]);
+    let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
+    let template_resource = Resource::with_provider("test", "thing", "pending", None)
+        .with_attribute("rule", rules.clone())
+        .with_attribute("rules", rules);
+    let deferred = carina_core::parser::DeferredForExpression::new(
+        Some("main.crn".to_string()),
+        4,
+        "for item in pending.items".to_string(),
+        carina_core::parser::DeferredForTarget::bound(absolute_binding("rs"))
+            .expect("fixture binding is valid"),
+        Value::resource_ref("pending", "items", Vec::new()).resolve_root_for_test(),
+        carina_core::parser::ForBinding::Simple("item".to_string()),
+        template_resource,
+    );
+    let unresolved = carina_core::parser::ParsedFile::default();
+    let mut evaluated = resolve_file_for_test(carina_core::parser::ParsedFile::default());
+    evaluated.replace_deferred_for_expressions(
+        carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([deferred]),
+    );
+
+    let errors = resolve_config_names_with_ctx(
+        &ValidationPipelineAccess::new(),
+        &ctx,
+        evaluated,
+        carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
+    )
+    .expect_err("mixed block and attribute syntax must fail");
+
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        "test.thing.rs[?]: cannot use both 'rule' and 'rules' (they refer to the same attribute)"
     );
 }
 
@@ -10498,9 +10549,10 @@ mod read_with_retry_identifier_tests {
 // ---------------------------------------------------------------------
 #[test]
 fn deferred_template_binding_match_requires_single_numeric_index() {
-    let target = carina_core::parser::DeferredForTarget::Bound {
-        binding: absolute_binding("validation_records"),
-    };
+    let target = carina_core::parser::DeferredForTarget::bound(
+        carina_core::resource::absolute_binding_address_for_test("validation_records"),
+    )
+    .expect("fixture binding is valid");
     assert!(binding_matches_deferred_template(
         &absolute_binding("validation_records[0]"),
         &target
@@ -10528,28 +10580,22 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
         Resource::with_provider("aws", "route53.Record", "validation_records", None);
     template_resource.binding = Some(absolute_binding("validation_records"));
 
-    carina_core::parser::DeferredForExpression {
-        file: Some("main.crn".to_string()),
-        line: 12,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: absolute_binding("validation_records"),
-        },
-        iterable: root_resource_ref("cert", "domain_validation_options"),
-        binding: carina_core::parser::ForBinding::Simple("opt".to_string()),
+    carina_core::parser::DeferredForExpression::new(
+        Some("main.crn".to_string()),
+        12,
+        "for opt in cert.domain_validation_options".to_string(),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        root_resource_ref("cert", "domain_validation_options"),
+        carina_core::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
-    }
+    )
 }
 
 fn deferred_replace_test_target() -> DeferredCreateTarget {
     DeferredCreateTarget {
-        id: ResolvedResourceId::with_provider_identity(
-            "aws",
-            "__deferred_for",
-            "validation_records",
-            None,
-        ),
         template: deferred_replace_test_template(),
     }
 }
@@ -10582,7 +10628,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
 
     let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
         Effect::DeferredReplace(payload) => {
-            Some((&payload.deletes, &payload.id, &payload.template))
+            Some((&payload.deletes, payload.id(), &payload.template))
         }
         _ => None,
     });
@@ -10593,12 +10639,15 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
         deferred_replaces.next().is_none(),
         "plan must contain exactly one DeferredReplace"
     );
-    assert_eq!(id, &target.id);
+    assert_eq!(id, target.id());
     assert_eq!(
         template.root_bindings(),
         std::collections::BTreeSet::from([absolute_binding("cert")])
     );
-    assert_eq!(template.target.bound_binding(), Some("validation_records"));
+    assert_eq!(
+        template.target().bound_binding(),
+        Some("validation_records")
+    );
     assert_eq!(deletes.len(), 1);
     assert_eq!(
         deletes[0].id,
@@ -10625,7 +10674,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
         !plan
             .effects()
             .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
         "absorbed target must not also remain as DeferredCreate"
     );
 }
@@ -10642,7 +10691,6 @@ fn unbound_deferred_test_target() -> DeferredCreateTarget {
     .into_expanded()
     .expect("unbound deferred-loop fixture has no parser placeholders");
     DeferredCreateTarget::from_deferred(&parsed.deferred_for_expressions()[0])
-        .expect("deferred target has a system identity")
 }
 
 fn delete_effect_for_unbound_child(
@@ -10722,7 +10770,7 @@ fn unbound_deferred_create_keeps_unrelated_anonymous_delete_plain() {
     assert!(
         plan.effects()
             .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
         "an unrelated anonymous row does not belong to this loop",
     );
     assert!(
@@ -10794,7 +10842,7 @@ fn deferred_create_targets_do_not_absorb_deposed_deletes() {
     assert!(
         plan.effects()
             .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
         "deposed delete must not turn the deferred create into DeferredReplace"
     );
     assert!(
@@ -10830,7 +10878,7 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
     assert!(
         plan.effects()
             .iter()
-            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+            .any(|effect| matches!(effect, Effect::DeferredCreate(_))),
         "unmatched target must stay a plain DeferredCreate"
     );
     assert!(
@@ -12156,6 +12204,37 @@ mod kind_default_source_tests {
 /// must combine the host's structured instantiation diagnostic with the
 /// resolver's typed lock provenance. Neither half may be re-derived at a
 /// command-specific consumer.
+fn push_test_leb128_u32(bytes: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        bytes.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn append_test_custom_section(component: &mut Vec<u8>, name: &str, payload: &[u8]) {
+    let mut contents = Vec::new();
+    push_test_leb128_u32(
+        &mut contents,
+        u32::try_from(name.len()).expect("custom section name length fits u32"),
+    );
+    contents.extend_from_slice(name.as_bytes());
+    contents.extend_from_slice(payload);
+
+    component.push(0);
+    push_test_leb128_u32(
+        component,
+        u32::try_from(contents.len()).expect("custom section length fits u32"),
+    );
+    component.extend_from_slice(&contents);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let user_dirs = carina_core::TestUserDirs::new();
@@ -12179,8 +12258,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         &resolved_sha,
     );
     std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &wasm_path,
+    let mut wasm = wat::parse_str(
         r#"
             (component
               (type $empty (instance))
@@ -12189,6 +12267,8 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         "#,
     )
     .unwrap();
+    append_test_custom_section(&mut wasm, "carina:egress", br#"{"version":1,"hosts":[]}"#);
+    std::fs::write(&wasm_path, wasm).unwrap();
 
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
@@ -12401,7 +12481,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
         .get("awscc")
         .expect("invalid WASM fixture must be reported during factory loading");
     assert!(
-        load_error.contains("Failed to load WASM component"),
+        load_error.contains("failed to read provider component"),
         "{load_error}"
     );
     assert!(load_error.contains("carina-providers.lock"), "{load_error}");

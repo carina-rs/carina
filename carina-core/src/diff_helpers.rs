@@ -3,15 +3,18 @@
 //! These helpers extract the pure computation logic (no formatting/coloring)
 //! shared by CLI/TUI plan rendering and state refresh reporting.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
 use crate::differ::ComparisonContext;
-use crate::resource::Value;
+use crate::resource::{CanonicalComparisonAttributes, Value};
 use crate::schema::{
     AttributeType, ResourceSchema, ValidatedResourceSchema, empty_defs_for_schema_walks,
 };
+use crate::value::CanonicalState;
 
 /// Schema-aware value equality shared by the plan renderer
 /// (`detail_rows`) and the unchanged-count helper below (carina#3073).
@@ -63,13 +66,18 @@ pub fn resource_attribute_values_equal(
     let effective_type = attribute.value_type();
     let old = attribute.canonicalize_state(old.clone());
     let new = attribute.canonicalize_state(new.clone());
-    schema_aware_equal(
-        &old,
-        &new,
-        Some(effective_type.as_type()),
-        effective_type.defs(),
-        context,
-    )
+    match (old, new) {
+        (CanonicalState::Absent, CanonicalState::Absent) => true,
+        (CanonicalState::Present(old), CanonicalState::Present(new)) => schema_aware_equal(
+            &old,
+            &new,
+            Some(effective_type.as_type()),
+            effective_type.defs(),
+            context,
+        ),
+        (CanonicalState::Present(_), CanonicalState::Absent)
+        | (CanonicalState::Absent, CanonicalState::Present(_)) => false,
+    }
 }
 
 /// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
@@ -234,8 +242,8 @@ pub(crate) fn list_element_type<'a>(
 /// `schema = None`, behavior is the schema-blind `semantically_equal`
 /// path (unchanged for embedded / test callers).
 pub fn compute_unchanged_count(
-    from_attrs: &HashMap<String, Value>,
-    to_attrs: &HashMap<String, Value>,
+    from_attrs: &CanonicalComparisonAttributes,
+    to_attrs: &CanonicalComparisonAttributes,
     exclude: Option<&std::collections::HashSet<&str>>,
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
@@ -441,9 +449,17 @@ mod tests {
         exclude: Option<&std::collections::HashSet<&str>>,
         schema: Option<&ResourceSchema>,
     ) -> usize {
+        let canonicalize = |attributes| match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(attributes),
+            ),
+        };
+        let from_attrs = canonicalize(from_attrs.clone());
+        let to_attrs = canonicalize(to_attrs.clone());
         super::compute_unchanged_count(
-            from_attrs,
-            to_attrs,
+            &from_attrs,
+            &to_attrs,
             exclude,
             schema,
             &crate::differ::exact_comparison_context_for_tests(),

@@ -1,8 +1,8 @@
 use super::*;
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::resource::{
-    AbsoluteBindingAddress, ConcreteValue, Directives, LoopSlot, ModuleSource, NoPlaceholder,
-    ResolvedResource, Resource, ResourceId, State, Value,
+    AbsoluteBindingAddress, ConcreteValue, Directives, NoPlaceholder, ResolvedResource, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_core::value::format_value;
@@ -117,30 +117,26 @@ fn removed_plan_shows_each_abandoned_deposed_generation() {
 
 #[test]
 fn deferred_create_uses_create_symbol_and_kind() {
-    let template_resource: Resource<ModuleSource, LoopSlot, AbsoluteBindingAddress> =
-        Resource::new("route53.Record", "validation_records")
+    let template_resource =
+        Resource::with_provider("aws", "route53.Record", "validation_records", None)
             .with_absolute_binding(absolute("validation_records"));
-    let deferred = DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "aws.route53.Record".to_string(),
-        target: carina_core::parser::DeferredForTarget::Bound {
-            binding: absolute("validation_records"),
-        },
-        iterable: root_ref("cert", "domain_validation_options"),
-        binding: ForBinding::Simple("opt".to_string()),
+    let deferred = DeferredForExpression::new(
+        None,
+        1,
+        "for opt in cert.domain_validation_options".to_string(),
+        carina_core::parser::DeferredForTarget::bound(
+            carina_core::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        root_ref("cert", "domain_validation_options"),
+        ForBinding::Simple("opt".to_string()),
         template_resource,
-    };
+    );
 
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(deferred),
-    });
+    plan.add(Effect::DeferredCreate(
+        carina_core::effect::DeferredCreatePayload::new(Box::new(deferred)),
+    ));
 
     let app = App::for_plan(&plan, &SchemaRegistry::new());
     assert_eq!(app.nodes.len(), 1);

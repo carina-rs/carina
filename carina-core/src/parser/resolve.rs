@@ -810,19 +810,17 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
-        match &mut deferred.body {
-            super::DeferredForBody::Resource(resource) => {
-                for value in resource.attributes.values_mut() {
-                    *value = resolve_function_calls_only(
-                        value,
-                        &binding_map,
-                        fn_ctx.config,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
-                    )?;
-                }
-            }
-            super::DeferredForBody::Read(_) | super::DeferredForBody::ModuleCall(_) => {}
+        let Some(attributes) = deferred.template_attributes_mut() else {
+            continue;
+        };
+        for value in attributes.values_mut() {
+            *value = resolve_function_calls_only(
+                value,
+                &binding_map,
+                fn_ctx.config,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
         }
     }
 
@@ -2298,12 +2296,12 @@ for item in source.arn {
         )
         .expect("parse deferred for fixture");
         let crate::parser::DeferredForBody::Resource(template) =
-            &parsed.parsed_deferred_for_expressions()[0].body
+            parsed.parsed_deferred_for_expressions()[0].body()
         else {
             panic!("deferred fixture body must be a resource")
         };
         assert!(matches!(
-            template.attributes.get("comment"),
+            template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
         ));
 
@@ -2311,12 +2309,12 @@ for item in source.arn {
             .expect("resolve deferred template functions");
 
         let crate::parser::DeferredForBody::Resource(template) =
-            &parsed.parsed_deferred_for_expressions()[0].body
+            parsed.parsed_deferred_for_expressions()[0].body()
         else {
             panic!("deferred fixture body must be a resource")
         };
         assert!(matches!(
-            template.attributes.get("comment"),
+            template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
     }

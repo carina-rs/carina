@@ -25,7 +25,9 @@ use carina_core::resource::{
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{GuestCallBudget, WasmProviderFactory};
-use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
+use carina_provider_resolver::{
+    LockFile, ProviderLoadIdentity, ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
+};
 
 fn mock_identity() -> ProviderLoadIdentity {
     ProviderLoadIdentity::for_test("mock", ProviderTrustClass::Untrusted)
@@ -36,10 +38,11 @@ fn mock_load(bytes: &[u8]) -> VerifiedLoad {
 }
 
 fn mock_http_load(bytes: &[u8]) -> VerifiedLoad {
-    VerifiedLoad::for_test(
-        bytes,
-        ProviderLoadIdentity::for_test("mock_http", ProviderTrustClass::Untrusted),
-    )
+    mock_http_load_with_class(bytes, ProviderTrustClass::Untrusted)
+}
+
+fn mock_http_load_with_class(bytes: &[u8], class: ProviderTrustClass) -> VerifiedLoad {
+    VerifiedLoad::for_test(bytes, ProviderLoadIdentity::for_test("mock_http", class))
 }
 
 fn mock_identifier() -> AppliedIdentifier {
@@ -266,14 +269,78 @@ macro_rules! skip_if_no_http_wasm {
 async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read WASM provider");
-    let factory =
-        WasmProviderFactory::from_bytes_with_cache_dir(mock_load(&wasm_bytes), cache.path())
-            .await
-            .expect("Failed to load WASM provider");
+    let load = mock_load(&wasm_bytes);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+    )
+    .await
+    .expect("Failed to load WASM provider");
     (factory, cache)
 }
 
 async fn load_http_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
+    load_http_factory_with_class(wasm, ProviderTrustClass::Untrusted).await
+}
+
+async fn load_http_factory_with_class(
+    wasm: &std::path::Path,
+    class: ProviderTrustClass,
+) -> (WasmProviderFactory, tempfile::TempDir) {
+    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
+    let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
+    let load = mock_http_load_with_class(&wasm_bytes, class);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+    )
+    .await
+    .expect("Failed to load HTTP probe WASM provider");
+    (factory, cache)
+}
+
+fn explicit_test_egress(
+    load: &carina_provider_resolver::VerifiedLoad,
+    lock_dir: &std::path::Path,
+) -> Option<carina_provider_resolver::LockedEgress> {
+    let declaration = VerifiedEgressDeclaration::read(load)
+        .expect("test provider must carry a valid or empty egress declaration");
+    let canonical_source = declaration.source().to_string();
+    let source = canonical_source
+        .strip_prefix("file://")
+        .map(|path| format!("file://{}", lock_dir.join(path).display()))
+        .unwrap_or(canonical_source);
+    let sha256 = declaration.sha256().as_str();
+    let hosts = declaration
+        .patterns()
+        .iter()
+        .map(|pattern| format!("    {:?},", pattern.to_string()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if declaration.patterns().is_empty() {
+        return None;
+    }
+    let lock = format!(
+        "version = 5\n\n[[provider]]\nname = \"ignored-consent-name\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {sha256:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n"
+    );
+    std::fs::write(lock_dir.join("carina-providers.lock"), lock).expect("write test egress lock");
+    let (lock, _migration) = LockFile::load(lock_dir)
+        .expect("load test egress lock")
+        .expect("test egress lock exists")
+        .into_parts();
+    let locked = lock
+        .locked_egress(&declaration, lock_dir)
+        .expect("test lock has egress consent for the canonical source");
+    Some(locked)
+}
+
+async fn load_schema_http_factory(
+    wasm: &std::path::Path,
+) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
     let factory =
@@ -768,6 +835,132 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn declared_host_is_allowed_before_the_test_route_replaces_resolution() {
+    let path = skip_if_no_http_wasm!();
+    let Some((server_address, server)) = spawn_http_ok_server() else {
+        return;
+    };
+    let (factory, _cache) = load_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", server_address);
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock_http",
+        "test.send_phase",
+        "declared-egress-host",
+        None,
+    );
+    let resource = http_send_phase_resource(
+        "declared-egress-host",
+        &format!("http://phase-test.invalid:{}/", server_address.port()),
+        "POST",
+        "declared",
+    );
+
+    let state = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect("the declared request should be dispatched"),
+    );
+    let bytes_read = server.join().expect("loopback server should finish");
+
+    assert!(bytes_read > 0);
+    assert_eq!(http_probe_outcome(&state), "success");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_only_instance_denies_even_a_declared_host() {
+    let path = skip_if_no_http_wasm!();
+    let socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
+        socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+        Ok(socket)
+    }) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("SKIP: sandbox cannot reserve a loopback port: {error}");
+            return;
+        }
+    };
+    let address = socket.local_addr().expect("reserved socket has an address");
+    let (factory, _cache) = load_schema_http_factory(&path).await;
+    let factory = factory.with_http_test_route("phase-test.invalid", address);
+    let attributes = indexmap::IndexMap::from([(
+        "validate_egress_url".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            format!("http://phase-test.invalid:{}/", address.port()).into(),
+        )),
+    )]);
+    let config = resolved_provider_config(factory.name(), attributes);
+
+    let error = carina_core::executor::prepare_provider_ready_config(&factory, &config)
+        .expect_err("the schema-only guest store must have no egress");
+    drop(socket);
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("phase-test.invalid")
+            && rendered.contains("consented egress declaration"),
+        "unexpected schema-only denial: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_kinds_do_not_inherit_amazonaws_egress() {
+    let path = skip_if_no_http_wasm!();
+    for class in [
+        ProviderTrustClass::Aws,
+        ProviderTrustClass::GitHub,
+        ProviderTrustClass::Untrusted,
+    ] {
+        let socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
+            socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
+            Ok(socket)
+        }) {
+            Ok(socket) => socket,
+            Err(error) => {
+                eprintln!("SKIP: sandbox cannot reserve a loopback port: {error}");
+                return;
+            }
+        };
+        let address = socket.local_addr().expect("reserved socket has an address");
+        let (factory, _cache) = load_http_factory_with_class(&path, class).await;
+        let factory = factory.with_http_test_route("sts.amazonaws.com", address);
+        let provider = factory
+            .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+            .await
+            .expect("provider should initialize");
+        let id = ResourceId::with_provider_identity(
+            "mock_http",
+            "test.send_phase",
+            "amazonaws-denied",
+            None,
+        );
+        let resource = http_send_phase_resource(
+            "amazonaws-denied",
+            &format!("http://sts.amazonaws.com:{}/", address.port()),
+            "POST",
+            "denied",
+        );
+
+        let failure = provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource).await)
+            .await
+            .expect_err("kind alone must not grant amazonaws.com egress");
+        drop(socket);
+        let rendered = create_failure_error(failure).to_string();
+        assert!(
+            rendered.contains("sts.amazonaws.com")
+                && rendered.contains("consented egress declaration"),
+            "unexpected {class:?} denial: {rendered}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classification() {
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
@@ -802,7 +995,7 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
         rendered.contains("mock_http")
             && rendered.contains("file:///test-providers/mock_http.wasm")
             && rendered.contains("example.invalid")
-            && rendered.contains("host is not in the allow-list")
+            && rendered.contains("host is not in the provider's consented egress declaration")
             && rendered.contains("WASM guest call stopped by the host egress policy")
             && rendered.contains("create call:"),
         "unexpected host-policy denial: {rendered}"

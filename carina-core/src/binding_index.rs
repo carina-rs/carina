@@ -2611,7 +2611,7 @@ pub fn managed_binding_stability_from_plan<S>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => {}
         }
     }

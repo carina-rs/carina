@@ -148,8 +148,9 @@ fn plan_for(
     );
     let plan_input_states =
         crate::resource::into_plan_input_current_map_from_states(current_states, &schemas, &[]);
+    let desired = crate::resource::plan_input_desired_resources(&resolved, &schemas);
     create_plan_with_cascades(
-        &resolved,
+        &desired,
         &unresolved,
         &[],
         &provider,

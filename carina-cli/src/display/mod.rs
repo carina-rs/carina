@@ -105,7 +105,7 @@ impl Sigil {
     fn from_effect<S>(effect: &Effect<S>) -> Self {
         let raw = effect.display_glyph();
         let rendered = match effect {
-            Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
+            Effect::Create(_) | Effect::DeferredCreate(_) => raw.green().bold(),
             Effect::ResumeCreate { .. } => raw.cyan().bold(),
             Effect::Update { .. } => raw.yellow().bold(),
             Effect::DeferredReplace(_) => raw.magenta().bold(),
@@ -524,7 +524,7 @@ fn format_deferred_for_expression(
         out,
         "{}{} {}",
         line_prefix,
-        deferred.resource_type.cyan().bold(),
+        deferred.resource_type().cyan().bold(),
         format!("(N records after {upstream} resolves)").dimmed()
     )
     .unwrap();
@@ -922,7 +922,8 @@ impl<'a, S> TreeRenderContext<'a, S> {
                 )
                 .unwrap();
             }
-            Effect::DeferredCreate { template, .. } => {
+            Effect::DeferredCreate(payload) => {
+                let template = &payload.template;
                 let verb = deferred_for_verb(self.plan, template);
                 let display_name = deferred_for_display_name(template, verb);
                 let display_name = display_name.green().bold();
@@ -930,7 +931,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {}",
                     line_prefix,
-                    template.resource_type.cyan().bold(),
+                    template.resource_type().cyan().bold(),
                     display_name
                 )
                 .unwrap();
@@ -958,7 +959,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
                     self.out,
                     "{}{} {}",
                     line_prefix,
-                    template.resource_type.cyan().bold(),
+                    template.resource_type().cyan().bold(),
                     display_name
                 )
                 .unwrap();
@@ -1134,7 +1135,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
             | Effect::Remove { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => true,
         }
     }
@@ -1280,7 +1281,7 @@ fn format_plan_tree<'a, S>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => None,
         })
         .collect();
@@ -1654,7 +1655,7 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => colored_value(value),
             };
             let annotation_suffix = annotation_suffix(annotation.as_deref());
@@ -1680,7 +1681,7 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => {
                     render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
                 }
@@ -1720,7 +1721,7 @@ fn render_detail_row<S>(out: &mut String, row: &DetailRow, effect: &Effect<S>, a
                     | Effect::Move { .. }
                     | Effect::ReleaseListKeys { .. }
                     | Effect::Wait { .. }
-                    | Effect::DeferredCreate { .. }
+                    | Effect::DeferredCreate(_)
                     | Effect::DeferredReplace(_) => {
                         render_value_ansi(&pretty, AnsiValueStyle::Semantic, Some(attr_prefix))
                     }
@@ -2319,17 +2320,17 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
             let binding = identity.to_string();
             format!("Wait {} (until {})", binding, until_surface)
         }
-        Effect::DeferredCreate { id, template } => {
+        Effect::DeferredCreate(payload) => {
             format!(
                 "Expand deferred for {} (waits on {})",
-                id.human(),
-                template.binding_description()
+                payload.id().human(),
+                payload.template.binding_description()
             )
         }
         Effect::DeferredReplace(payload) => {
             format!(
                 "Deferred replace {} (waits on {})",
-                payload.id.human(),
+                payload.id().human(),
                 payload.template.binding_description()
             )
         }

@@ -69,8 +69,10 @@ fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingNam
             module
                 .parsed_deferred_for_expressions()
                 .iter()
-                .filter_map(|deferred| match &deferred.target {
-                    crate::parser::DeferredForTarget::Bound { binding } => Some(binding.clone()),
+                .filter_map(|deferred| match deferred.target() {
+                    crate::parser::DeferredForTarget::Bound(bound) => {
+                        Some(bound.binding_address().clone())
+                    }
                     crate::parser::DeferredForTarget::Unbound { template: _ } => None,
                 }),
         )
@@ -79,7 +81,7 @@ fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingNam
                 .parsed_deferred_for_expressions()
                 .iter()
                 .filter_map(|deferred| match &deferred.body {
-                    DeferredForBody::Resource(resource) => resource.binding.clone(),
+                    DeferredForBody::Resource(resource) => resource.binding_address().cloned(),
                     DeferredForBody::Read(data_source) => data_source.binding.clone(),
                     DeferredForBody::ModuleCall(call) => call.binding_name.clone(),
                 }),
@@ -947,10 +949,10 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     DeferredForBody::Resource(resource) => (
                         module
                             .parser_binding_metadata
-                            .resource_source_file(&resource.id),
+                            .resource_source_file(resource.id()),
                         module
                             .parser_binding_metadata
-                            .template_dependency_values(&resource.id),
+                            .template_dependency_values(resource.id()),
                     ),
                     DeferredForBody::Read(data_source) => (
                         module
@@ -2239,7 +2241,7 @@ fn reject_dropped_conditional_references(
             if found.is_none() {
                 found = match &deferred.body {
                     DeferredForBody::Resource(resource) => {
-                        resource.attributes.values().find_map(&dropped_value)
+                        resource.attributes().values().find_map(&dropped_value)
                     }
                     DeferredForBody::Read(data_source) => {
                         data_source.attributes.values().find_map(&dropped_value)
@@ -3741,10 +3743,11 @@ fn expand_parsed_deferred_for_expression(
         .map(|origin| origin.legacy_address().clone())
         .unwrap_or_else(|| LegacyLoopAddress::new(instance_identity.as_str()));
     let target = match target {
-        crate::parser::DeferredForTarget::Bound { binding } => {
-            crate::parser::DeferredForTarget::Bound {
-                binding: resolver.resolve_declared_binding(binding)?,
-            }
+        crate::parser::DeferredForTarget::Bound(bound) => {
+            let binding = resolver.resolve_declared_binding(bound.binding_address())?;
+            crate::parser::DeferredForTarget::Bound(
+                bound.clone().map_bindings(&mut |_relative| binding.clone()),
+            )
         }
         crate::parser::DeferredForTarget::Unbound { template } => {
             let mut template = template.clone();
@@ -3780,13 +3783,13 @@ fn expand_parsed_deferred_for_expression(
     };
     let body = match body {
         DeferredForBody::Resource(resource) => {
-            DeferredForBody::Resource(Box::new(expand_module_resource_with_identity(
-                resource,
+            DeferredForBody::resource(expand_module_resource_with_identity(
+                resource.as_resource(),
                 dependency_values,
                 &instance_identity,
                 module_call,
                 resolver,
-            )?))
+            )?)
         }
         DeferredForBody::Read(data_source) => DeferredForBody::Read(Box::new(
             expand_module_data_source(data_source, dependency_values, resolver)?,
@@ -3796,17 +3799,14 @@ fn expand_parsed_deferred_for_expression(
         }
     };
 
-    Ok(ParsedDeferredForExpression {
-        file: file.clone(),
-        line: *line,
-        span: *span,
-        header: header.clone(),
+    Ok(ParsedDeferredForExpression::new(
+        (file.clone(), *line, *span, header.clone()),
         target,
         iterable,
         iterable_state,
-        binding: binding.clone(),
+        binding.clone(),
         body,
-    })
+    ))
 }
 
 #[derive(Debug)]
@@ -4914,6 +4914,23 @@ fn rewrite_binding_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_deferred_target_prefix_matches_instance_prefix_spelling() {
+        let target = crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("children"))
+            .expect("fixture target is valid");
+        for prefix in ["root", "root.branch[0].leaf"] {
+            let scope = ModuleInstanceScope::for_call("module", Some(prefix), prefix);
+            let resolved = target
+                .clone()
+                .map_bindings(&mut |binding| scope.resolve(binding));
+            assert_eq!(resolved.binding(), format!("{prefix}.children"));
+            assert_eq!(
+                resolved.template_address().to_string(),
+                format!("{prefix}.children[?]")
+            );
+        }
+    }
 
     #[test]
     fn anonymous_module_reconcile_remaps_loop_current_prefix_only() {

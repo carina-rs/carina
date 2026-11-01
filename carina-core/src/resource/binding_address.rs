@@ -11,6 +11,8 @@ mod private {
     pub struct Derivation;
 
     pub trait Sealed: Sized {
+        fn deferred_template(&self, authority: Derivation) -> Self;
+
         fn with_index(&self, index: i64, authority: Derivation) -> Self;
 
         fn with_map_key(&self, key: &ValueString, authority: Derivation) -> Self;
@@ -240,6 +242,13 @@ pub trait BindingAddress:
 }
 
 impl private::Sealed for RelativeBindingName {
+    fn deferred_template(&self, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            format!("{}[?]", self.as_str()),
+            [&self.0],
+        ))
+    }
+
     fn with_index(&self, index: i64, _authority: private::Derivation) -> Self {
         Self(ValueString::derived_from(
             format!("{}[{index}]", self.as_str()),
@@ -270,6 +279,13 @@ impl BindingAddress for RelativeBindingName {
 }
 
 impl private::Sealed for AbsoluteBindingAddress {
+    fn deferred_template(&self, _authority: private::Derivation) -> Self {
+        Self(ValueString::derived_from(
+            format!("{}[?]", self.as_str()),
+            [&self.0],
+        ))
+    }
+
     fn with_index(&self, index: i64, _authority: private::Derivation) -> Self {
         Self::with_index(self, index)
     }
@@ -295,6 +311,10 @@ impl BindingAddress for AbsoluteBindingAddress {
 
 pub(crate) fn binding_with_index<B: BindingAddress>(binding: &B, index: i64) -> B {
     <B as private::Sealed>::with_index(binding, index, private::Derivation)
+}
+
+pub(crate) fn deferred_template_binding<B: BindingAddress>(binding: &B) -> B {
+    <B as private::Sealed>::deferred_template(binding, private::Derivation)
 }
 
 pub(crate) fn binding_with_map_key<B: BindingAddress>(binding: &B, key: &ValueString) -> B {

@@ -60,7 +60,8 @@ impl Scenario {
     }
 
     fn init(&self) -> Output {
-        self.carina(&["init", "."])
+        let source = format!("file://{}", self.provider_source.display());
+        self.carina(&["init", ".", "--accept-egress", &source])
     }
 
     fn plan(&self) -> Output {

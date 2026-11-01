@@ -9,7 +9,7 @@
 //! Legacy loop addresses remain crate-private migration provenance rather than
 //! public live resource identities.
 
-mod binding_address;
+pub(crate) mod binding_address;
 mod enum_value;
 mod ignore_changes;
 mod loop_origin;
@@ -893,10 +893,9 @@ impl From<PendingResourceIdentityError> for ResolvedResourceError {
 /// Re-resolve authored resource directives that depend on the provider schema.
 ///
 /// Deferred anonymous-loop templates intentionally still have pending identities
-/// when a saved plan is loaded. Their directives must nevertheless be checked
-/// against the fingerprint-validated schemas before apply; identity validation
-/// remains the responsibility of [`ResolvedResource::resolve_with_schemas`]
-/// after the template has been materialized.
+/// when a saved plan is loaded. Bound templates instead expose their derived
+/// materialized address while directives are checked, so diagnostics name the
+/// template (for example, `items[?]`) rather than a pending placeholder.
 pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind, B: BindingAddress>(
     resource: &mut Resource<S, P, B>,
     registry: &crate::schema::SchemaRegistry,
@@ -10837,7 +10836,10 @@ impl Current {
         }
     }
 
-    fn into_plan_input(mut self) -> PlanInputCurrent {
+    fn into_plan_input(
+        mut self,
+        schema: Option<&crate::schema::ResourceSchema>,
+    ) -> PlanInputCurrent {
         match &mut self {
             Self::Absent(state) => state.0.materialize_partial_read_unknowns(),
             Self::Present(present) => present.state.materialize_partial_read_unknowns(),
@@ -10845,7 +10847,25 @@ impl Current {
             Self::CreateOutcomeUnknown(_unknown) => {}
             Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
         }
-        PlanInputCurrent(self)
+        let attributes = match &self {
+            Self::Absent(state) => Some(state.state().attributes.clone()),
+            Self::Present(present) => Some(present.state().attributes.clone()),
+            Self::MissingIdentifier(state) => Some(state.state().attributes.clone()),
+            Self::CreateInFlight(_) | Self::CreateOutcomeUnknown(_) => None,
+        };
+        let comparison_attributes = match (attributes, schema) {
+            (Some(attributes), Some(schema)) => {
+                CanonicalComparisonAttributes::canonicalize(attributes, schema)
+            }
+            (Some(attributes), None) => CanonicalComparisonAttributes::from_unschematized(
+                UnschematizedComparisonAttributes::new(attributes),
+            ),
+            (None, _) => CanonicalComparisonAttributes::default(),
+        };
+        PlanInputCurrent {
+            current: self,
+            comparison_attributes,
+        }
     }
 }
 
@@ -10864,19 +10884,191 @@ pub fn fixture_present_current(state: State, identifier: AppliedIdentifier) -> C
 /// Managed current state after plan-only canonicalization and unknown
 /// reconstruction.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PlanInputCurrent(Current);
+pub struct PlanInputCurrent {
+    current: Current,
+    comparison_attributes: CanonicalComparisonAttributes,
+}
 
 impl PlanInputCurrent {
     pub(crate) fn absent(id: ResourceId) -> Self {
-        Current::absent(id).into_plan_input()
+        Current::absent(id).into_plan_input(None)
     }
 
     pub fn current(&self) -> &Current {
-        &self.0
+        &self.current
+    }
+
+    pub(crate) fn comparison_attributes(&self) -> &CanonicalComparisonAttributes {
+        &self.comparison_attributes
     }
 
     pub fn into_current(self) -> Current {
-        self.0
+        self.current
+    }
+}
+
+/// Desired resource split into comparison and provider-boundary views.
+///
+/// The comparison view uses the same canonical absence representation as
+/// [`PlanInputCurrent`]. The authored resource remains untouched so create and
+/// update effects send explicit empty objects to the provider.
+#[derive(Debug)]
+pub struct PlanInputDesired<'a> {
+    authored: &'a ResolvedResource,
+    comparison_attributes: CanonicalComparisonAttributes,
+}
+
+/// Attribute map whose schema-known values use the canonical absence form.
+///
+/// This is the only map shape accepted by desired/current comparison views
+/// built after the plan-input boundary. Construction applies state-style
+/// post-order canonicalization without mutating the provider-bound resource.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CanonicalComparisonAttributes {
+    attributes: HashMap<String, Value>,
+}
+
+/// Attribute values used only when no resource schema exists.
+///
+/// The wrapper makes schema-less passthrough construction explicit instead of
+/// presenting it as an already-canonical comparison map.
+pub(crate) struct UnschematizedComparisonAttributes(HashMap<String, Value>);
+
+impl UnschematizedComparisonAttributes {
+    pub(crate) fn new(attributes: HashMap<String, Value>) -> Self {
+        Self(attributes)
+    }
+}
+
+impl CanonicalComparisonAttributes {
+    /// Build the state-style canonical comparison view for one resource.
+    pub fn canonicalize(
+        mut attributes: HashMap<String, Value>,
+        schema: &crate::schema::ResourceSchema,
+    ) -> Self {
+        crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
+        Self { attributes }
+    }
+
+    pub(crate) fn from_unschematized(attributes: UnschematizedComparisonAttributes) -> Self {
+        Self {
+            attributes: attributes.0,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.attributes.get(key)
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.attributes.contains_key(key)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.attributes.keys()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.attributes.iter()
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.attributes.get_mut(key)
+    }
+
+    pub(crate) fn with_missing_values_from(
+        &self,
+        fallback: &Self,
+        mut include: impl FnMut(&str, &Value) -> bool,
+    ) -> Self {
+        let mut combined = self.clone();
+        for (key, value) in fallback {
+            if !combined.contains_key(key) && include(key, value) {
+                combined.attributes.insert(key.clone(), value.clone());
+            }
+        }
+        combined
+    }
+}
+
+impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
+    type Item = (&'a String, &'a Value);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.attributes.iter()
+    }
+}
+
+impl IntoIterator for CanonicalComparisonAttributes {
+    type Item = (String, Value);
+    type IntoIter = std::collections::hash_map::IntoIter<String, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.attributes.into_iter()
+    }
+}
+
+impl<'a> PlanInputDesired<'a> {
+    pub fn authored(&self) -> &'a ResolvedResource {
+        self.authored
+    }
+
+    pub(crate) fn comparison_attributes(&self) -> &CanonicalComparisonAttributes {
+        &self.comparison_attributes
+    }
+
+    pub(crate) fn with_resource_schema(
+        authored: &'a ResolvedResource,
+        schema: Option<&crate::schema::ResourceSchema>,
+    ) -> Self {
+        let attributes = authored.resolved_attributes();
+        let comparison_attributes = match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                UnschematizedComparisonAttributes::new(attributes),
+            ),
+        };
+        Self {
+            authored,
+            comparison_attributes,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PlanInputDesiredResources<'a> {
+    authored: &'a [ResolvedResource],
+    comparison: Vec<PlanInputDesired<'a>>,
+}
+
+impl<'a> PlanInputDesiredResources<'a> {
+    pub fn authored(&self) -> &'a [ResolvedResource] {
+        self.authored
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &PlanInputDesired<'a>> {
+        self.comparison.iter()
+    }
+}
+
+/// Build desired comparison inputs without mutating provider-bound values.
+pub fn plan_input_desired_resources<'a>(
+    resources: &'a [ResolvedResource],
+    schemas: &crate::schema::SchemaRegistry,
+) -> PlanInputDesiredResources<'a> {
+    let comparison = resources
+        .iter()
+        .map(|authored| {
+            let schema = schemas
+                .get_for(authored.as_resource())
+                .map(|schema| schema.schema().as_schema());
+            PlanInputDesired::with_resource_schema(authored, schema)
+        })
+        .collect();
+    PlanInputDesiredResources {
+        authored: resources,
+        comparison,
     }
 }
 
@@ -10889,7 +11081,16 @@ pub fn into_plan_input_current_map<S>(
     crate::utils::lift_current_state_enum_leaves(&mut current, resources, schemas);
     current
         .into_iter()
-        .map(|(id, current)| (id, current.into_plan_input()))
+        .map(|(id, current)| {
+            let schema = schemas
+                .get(
+                    &id.provider,
+                    &id.resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .map(|schema| schema.schema().as_schema());
+            (id, current.into_plan_input(schema))
+        })
         .collect()
 }
 
@@ -10916,7 +11117,16 @@ pub fn plan_input_current_map_from_refs<'a, S: 'a>(
     }
     current
         .into_iter()
-        .map(|(id, current)| (id, current.into_plan_input()))
+        .map(|(id, current)| {
+            let schema = schemas
+                .get(
+                    &id.provider,
+                    &id.resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .map(|schema| schema.schema().as_schema());
+            (id, current.into_plan_input(schema))
+        })
         .collect()
 }
 

@@ -97,8 +97,8 @@ use carina_core::differ::{
 };
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
-    DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, MoveAuthority,
-    NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove,
+    DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration,
+    MoveAuthority, NonEmptyDeletes, OutcomeUnknownImportReplacement, ResolvedMove,
 };
 use carina_core::executor::normalized::{
     apply_desired_normalization_slice, is_value_fully_concrete_for_expansion,
@@ -108,6 +108,7 @@ use carina_core::executor::{
     ProviderReadyConfig, UnresolvedDataSourceInput, UnresolvedResource,
     prepare_provider_ready_config, unresolved_data_source_inputs,
 };
+use carina_core::hint::ProjectCommand;
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
@@ -132,8 +133,7 @@ use carina_core::resource::DeferredValue;
 use carina_core::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, Current, DataSource, Directives,
     LiveComposition, ModuleSource, NoPlaceholder, ParserPlaceholder, PartialReadMarker,
-    PlaceholderKind, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
-    ResourceIdentityError, State, Value,
+    PlaceholderKind, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 #[cfg(any(test, feature = "test-utils"))]
 use carina_core::schema::ValidatedResourceSchema;
@@ -976,13 +976,10 @@ impl ProviderLoad {
         providers: &[ProviderConfig<P, B>],
         base_dir: &Path,
     ) -> (ReportingProviderLoad, Option<AppError>) {
-        match Self::load(user_dirs, providers, base_dir) {
-            Ok(Self {
-                context,
-                load_errors,
-            }) => (
+        match build_schema_factories_from_providers(user_dirs, providers, base_dir) {
+            Ok((factories, load_errors)) => (
                 ReportingProviderLoad {
-                    context,
+                    context: WiringContext::new(factories, providers),
                     load_errors,
                 },
                 None,
@@ -1871,6 +1868,12 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
 /// Provider factories paired with provider-specific load diagnostics.
 type ProviderFactoryLoad = (Vec<LoadedProviderFactory>, HashMap<String, String>);
 
+#[derive(Clone, Copy)]
+enum ProviderFactoryNetwork {
+    SchemaOnly,
+    Runtime,
+}
+
 #[derive(Debug)]
 pub(crate) enum ProviderFactoryDiagnostic {
     LockConstraint(carina_provider_resolver::LockConstraintError),
@@ -2130,7 +2133,30 @@ fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     let providers = provider_loading_configs(providers);
     carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
 
-    build_factories_from_providers_impl(user_dirs, &providers, base_dir, true)
+    build_factories_from_providers_impl(
+        user_dirs,
+        &providers,
+        base_dir,
+        true,
+        ProviderFactoryNetwork::Runtime,
+    )
+}
+
+fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
+    user_dirs: &carina_core::UserDirs,
+    providers: &[ProviderConfig<P, B>],
+    base_dir: &Path,
+) -> Result<ProviderFactoryLoad, AppError> {
+    let providers = provider_loading_configs(providers);
+    carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
+
+    build_factories_from_providers_impl(
+        user_dirs,
+        &providers,
+        base_dir,
+        true,
+        ProviderFactoryNetwork::SchemaOnly,
+    )
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -2156,8 +2182,13 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingA
         ));
     }
 
-    let (factories, load_errors) =
-        build_factories_from_providers_impl(user_dirs, &providers, base_dir, false)?;
+    let (factories, load_errors) = build_factories_from_providers_impl(
+        user_dirs,
+        &providers,
+        base_dir,
+        false,
+        ProviderFactoryNetwork::SchemaOnly,
+    )?;
     Ok((
         factories,
         load_errors
@@ -2172,6 +2203,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
     providers: &[ProviderConfig<carina_core::resource::NoPlaceholder, B>],
     base_dir: &Path,
     report_errors: bool,
+    network: ProviderFactoryNetwork,
 ) -> Result<ProviderFactoryLoad, AppError> {
     #[cfg(test)]
     record_tracked_provider_load();
@@ -2179,6 +2211,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
     let grant_inputs =
         TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
     let loader_user_dirs = user_dirs.clone();
+    let loader_project_dir = base_dir.to_path_buf();
     build_factories_from_providers_impl_using(
         user_dirs,
         providers,
@@ -2187,8 +2220,24 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
         grant_inputs,
         move |verified| {
             let user_dirs = loader_user_dirs.clone();
+            let project_dir = loader_project_dir.clone();
             async move {
-                carina_plugin_host::WasmProviderFactory::from_bytes(verified, &user_dirs).await
+                match network {
+                    ProviderFactoryNetwork::SchemaOnly => {
+                        carina_plugin_host::WasmProviderFactory::from_bytes(verified, &user_dirs)
+                            .await
+                    }
+                    ProviderFactoryNetwork::Runtime => {
+                        let locked_egress =
+                            carina_provider_resolver::load_locked_egress(&project_dir, &verified)?;
+                        carina_plugin_host::WasmProviderFactory::from_bytes_with_egress(
+                            verified,
+                            &user_dirs,
+                            locked_egress.as_ref(),
+                        )
+                        .await
+                    }
+                }
             }
         },
     )
@@ -2290,7 +2339,14 @@ where
                 // Final UI boundary: `ProviderArtifactLoadError::Display`
                 // renders the structured host chain first, followed by the
                 // resolver-owned provenance and mode-accurate hint.
-                let reason = error.to_string();
+                let reason = if matches!(
+                    error.loader_error(),
+                    Some(carina_plugin_host::WasmProviderLoadError::EgressConsent(_))
+                ) {
+                    format!("{error}\nRun `{}`.", ProjectCommand::new("init", base_dir))
+                } else {
+                    error.to_string()
+                };
                 if report_errors {
                     eprintln!("{}", reason.red());
                 }
@@ -4118,6 +4174,9 @@ fn source_provider_kind_mismatch_from_load_error(
             provider_source: source.to_string(),
         }),
         carina_plugin_host::WasmProviderLoadError::PrecompiledDeserialization(_)
+        | carina_plugin_host::WasmProviderLoadError::EgressDeclaration(_)
+        | carina_plugin_host::WasmProviderLoadError::EgressLock(_)
+        | carina_plugin_host::WasmProviderLoadError::EgressConsent(_)
         | carina_plugin_host::WasmProviderLoadError::Instantiation(_)
         | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
         | carina_plugin_host::WasmProviderLoadError::Other(_) => None,
@@ -4281,41 +4340,27 @@ impl RefreshableChildIds {
 /// delete effects for prior indexed iterations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredCreateTarget {
-    pub id: ResolvedResourceId,
     pub template: carina_core::parser::DeferredForExpression,
 }
 
 impl DeferredCreateTarget {
-    fn from_deferred(deferred: &carina_core::parser::DeferredForExpression) -> Option<Self> {
-        let template_id = &deferred.template_resource.id;
-        let identity = match ResourceIdentity::try_from(deferred.target.scheduler_key().to_string())
-        {
-            Ok(identity) => identity,
-            Err(ResourceIdentityError::Empty) => return None,
-        };
-        let id = ResolvedResourceId::with_provider_identity(
-            template_id.provider.clone(),
-            template_id.resource_type.clone(),
-            identity,
-            template_id.provider_instance.clone(),
-        );
-        Some(Self {
-            id,
+    fn from_deferred(deferred: &carina_core::parser::DeferredForExpression) -> Self {
+        Self {
             template: deferred.clone(),
-        })
+        }
+    }
+
+    pub fn id(&self) -> &ResolvedResourceId {
+        self.template.deferred_effect_id()
     }
 
     fn to_effect(&self) -> Effect {
-        Effect::DeferredCreate {
-            id: self.id.clone(),
-            template: Box::new(self.template.clone()),
-        }
+        Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(self.template.clone())))
     }
 
     fn to_deferred_replace_effect(&self, deletes: Vec<DeferredReplaceDelete>) -> Effect {
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
-            id: self.id.clone(),
             template: Box::new(self.template.clone()),
         }))
     }
@@ -6117,8 +6162,10 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         state_file,
         override_aware_resources.resources(),
     );
+    let plan_input_desired =
+        carina_core::resource::plan_input_desired_resources(&resolved_resources, context.schemas());
     let mut plan = create_plan_with_cascades(
-        &resolved_resources,
+        &plan_input_desired,
         &resolved_unresolved_resources,
         &data_sources_for_plan,
         provider,
@@ -6633,9 +6680,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
                     | carina_core::resolver::ValueResolution::Absent
                     | carina_core::resolver::ValueResolution::Unknown(_),
                 ) => {
-                    if let Some(target) = DeferredCreateTarget::from_deferred(deferred) {
-                        deferred_create_targets.push(target);
-                    }
+                    deferred_create_targets.push(DeferredCreateTarget::from_deferred(deferred));
                     DeferredForExpansionChoice::Retain
                 }
                 // Let the shared expansion path render the path-aware error.
@@ -8110,7 +8155,7 @@ pub fn add_state_block_effects(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => true,
         });
     }
@@ -8173,15 +8218,15 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                 };
 
                 if deletes_to_absorb.contains(id.as_inner())
-                    || id.provider != target.template.template_resource.id.provider
-                    || id.resource_type != target.template.template_resource.id.resource_type
+                    || id.provider != target.template.template_resource_id().provider
+                    || id.resource_type != target.template.template_resource_id().resource_type
                     || id.provider_instance
-                        != target.template.template_resource.id.provider_instance
+                        != target.template.template_resource_id().provider_instance
                 {
                     return None;
                 }
                 let matches = binding.as_ref().is_some_and(|binding| {
-                    binding_matches_deferred_template(binding, &target.template.target)
+                    binding_matches_deferred_template(binding, target.template.target())
                 });
                 matches.then(|| DeferredReplaceDelete {
                     id: id.clone(),
@@ -8223,7 +8268,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => true,
         });
     }

@@ -15,8 +15,8 @@ use crate::effect::deps::{
     ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
 };
 use crate::effect::{
-    DeferredReplaceDelete, DeferredReplacePayload, DeletedInstanceKey, EffectGeneration,
-    NonEmptyDeletes, ReleasedListKey, ReleasedListKeys,
+    DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload, DeletedInstanceKey,
+    EffectGeneration, NonEmptyDeletes, ReleasedListKey, ReleasedListKeys,
 };
 use crate::plan::Plan;
 use crate::provider::{
@@ -140,18 +140,18 @@ fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExp
     template_resource.set_attr("name", for_value_access(&["resource_record", "name"]));
     template_resource.set_attr("value", for_value_access(&["resource_record", "value"]));
 
-    crate::parser::DeferredForExpression {
-        file: None,
-        line: 1,
-        header: "for opt in cert.domain_validation_options".to_string(),
-        resource_type: "test.ValidationRecord".to_string(),
-        target: crate::parser::DeferredForTarget::Bound {
-            binding: absolute_binding("validation_records"),
-        },
-        iterable: Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-        binding: crate::parser::ForBinding::Simple("opt".to_string()),
+    crate::parser::DeferredForExpression::new(
+        None,
+        1,
+        "for opt in cert.domain_validation_options".to_string(),
+        crate::parser::DeferredForTarget::bound(
+            crate::resource::absolute_binding_address_for_test("validation_records"),
+        )
+        .expect("fixture binding is valid"),
+        Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
+        crate::parser::ForBinding::Simple("opt".to_string()),
         template_resource,
-    }
+    )
 }
 
 fn anonymous_deferred_collision_fixture() -> (
@@ -330,10 +330,6 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
                     blocked_by_updates: HashSet::new(),
                 }])
                 .expect("fixture has one delete"),
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "__deferred_for",
-                    "validation_records",
-                )),
                 template: Box::new(validation_deferred_for_expression()),
             })),
         ],
@@ -3712,13 +3708,9 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
 
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
-    plan.add(Effect::DeferredCreate {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(validation_deferred_for_expression()),
-    });
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(validation_deferred_for_expression()),
+    )));
     let schemas = deferred_child_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
@@ -8779,8 +8771,9 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &schemas,
         managed.iter().map(|resource| &resource.id),
     );
+    let desired = crate::resource::plan_input_desired_resources(&managed, &schemas);
     let plan = create_plan_with_cascades(
-        &managed,
+        &desired,
         &unresolved,
         &[],
         &comparison_provider,
@@ -9842,13 +9835,9 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
 async fn deferred_create_reports_iterable_reference_when_binding_missing() {
     let provider = MockProvider::new();
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(validation_deferred_for_expression()),
-    });
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(validation_deferred_for_expression()),
+    )));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -9872,7 +9861,7 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
     assert_eq!(result.failure_count, 1);
     assert!(
         observer.events().iter().any(|event| {
-            event.contains("failed:__deferred_for.validation_records")
+            event.contains("failed:test.validation_records")
                 && event.contains("cert.domain_validation_options")
         }),
         "events: {:?}",
@@ -9893,13 +9882,9 @@ async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_err
     ));
     let mut plan = Plan::new();
     plan.add(create_effect(child));
-    plan.add(Effect::DeferredCreate {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "anonymous_collision",
-        )),
-        template: Box::new(template),
-    });
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(template),
+    )));
     let input = ExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
@@ -9941,13 +9926,9 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
         State::existing(collision_id.clone(), HashMap::new()).with_identifier("new")
     ));
     let mut plan = Plan::new();
-    plan.add(Effect::DeferredCreate {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "anonymous_state_collision",
-        )),
-        template: Box::new(template),
-    });
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(template),
+    )));
     let current = Current::from_state(
         State::existing(collision_id.clone(), HashMap::new()).with_identifier("existing"),
     );
@@ -9998,10 +9979,6 @@ fn legacy_unbound_deferred_replace(
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "anonymous_legacy_replace",
-        )),
         template: Box::new(template),
     }))
 }
@@ -10118,13 +10095,9 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
         explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
     });
-    plan.add(Effect::DeferredCreate {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "anonymous_remint",
-        )),
-        template: Box::new(template),
-    });
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(template),
+    )));
     let current = Current::from_state(
         State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
     );
@@ -10171,13 +10144,9 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
 
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
-    plan.add(Effect::DeferredCreate {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(validation_deferred_for_expression()),
-    });
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(validation_deferred_for_expression()),
+    )));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -10200,7 +10169,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
 
     assert_eq!(result.failure_count, 1);
     assert!(observer.events().iter().any(|event| {
-        event.contains("failed:__deferred_for.validation_records")
+        event.contains("failed:test.validation_records")
             && event.contains("domain_validation_options")
     }));
 }
@@ -10224,13 +10193,9 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
 
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
-    plan.add(Effect::DeferredCreate {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
-        template: Box::new(validation_deferred_for_expression()),
-    });
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(validation_deferred_for_expression()),
+    )));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -10253,7 +10218,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
 
     assert_eq!(result.failure_count, 1);
     assert!(observer.events().iter().any(|event| {
-        event.contains("failed:__deferred_for.validation_records")
+        event.contains("failed:test.validation_records")
             && event.contains("expected list")
             && event.contains("got map")
     }));
@@ -10325,10 +10290,6 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
             },
         ])
         .expect("fixture has deletes"),
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
         template: Box::new(validation_deferred_for_expression()),
     })));
 
@@ -10421,10 +10382,6 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
         template: Box::new(validation_deferred_for_expression()),
     })));
 
@@ -10680,10 +10637,6 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "__deferred_for",
-            "validation_records",
-        )),
         template: Box::new(validation_deferred_for_expression()),
     })));
 

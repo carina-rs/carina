@@ -197,7 +197,9 @@ use crate::resource::{
     RawEnumIdentifier, RelativeBindingName, Resource, ResourceId, Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
-use crate::value::{CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value};
+use crate::value::{
+    CanonicalState, CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value,
+};
 
 mod fingerprint;
 mod resolved_attr_type;
@@ -1762,7 +1764,7 @@ impl RootlessType {
     }
 
     /// Canonicalize provider or persisted state for this rootless type.
-    pub fn canonicalize_state(&self, value: Value) -> Value {
+    pub fn canonicalize_state(&self, value: Value) -> CanonicalState {
         self.schema.canonicalize_state(value)
     }
 
@@ -1934,7 +1936,7 @@ impl Schema {
     }
 
     /// Canonicalize provider or persisted state against this schema's root.
-    pub(crate) fn canonicalize_state(&self, value: Value) -> Value {
+    pub(crate) fn canonicalize_state(&self, value: Value) -> CanonicalState {
         crate::value::canonicalize_state_with_type_and_ancestry(
             value,
             &self.root,
@@ -2754,6 +2756,22 @@ pub(crate) fn empty_defs_for_schema_walks()
     use std::sync::OnceLock;
     static EMPTY: OnceLock<std::collections::BTreeMap<String, AttributeType>> = OnceLock::new();
     EMPTY.get_or_init(std::collections::BTreeMap::new)
+}
+
+/// Whether this provider or persisted-state value represents absence.
+///
+/// The decision is made only from the value and its fully Ref-resolved type: an
+/// empty map means absence for a struct that declares at least one field.
+/// Zero-field structs remain real marker values.
+pub(crate) fn reads_as_absent<H: PlaceholderKind, B: BindingAddress>(
+    value: &Value<H, B>,
+    resolved_type: ResolvedAttrType<'_>,
+) -> bool {
+    matches!(value, Value::Concrete(ConcreteValue::Map(map)) if map.is_empty())
+        && matches!(
+            &resolved_type.as_attr().kind,
+            AttrTypeKind::Struct { fields, .. } if !fields.is_empty()
+        )
 }
 
 impl AttributeType {
@@ -4528,7 +4546,7 @@ impl Ord for FitExactness {
 /// validation or enum resolution a second time.
 pub(crate) struct Fit<'a> {
     exactness: FitExactness,
-    pub(crate) attr: &'a AttributeType,
+    pub(crate) attr: ResolvedAttrType<'a>,
     pub(crate) kind: FitKind<'a>,
 }
 
@@ -4582,7 +4600,7 @@ impl Fit<'_> {
     ) -> Fit<'a> {
         Fit {
             exactness,
-            attr,
+            attr: ResolvedAttrType::new_after_peel(attr),
             kind,
         }
     }
@@ -8056,7 +8074,7 @@ impl<'a> EffectiveAttribute<'a> {
 
     /// Canonicalize provider or persisted state with this attribute's
     /// effective ancestry.
-    pub fn canonicalize_state(&self, value: Value) -> Value {
+    pub fn canonicalize_state(&self, value: Value) -> CanonicalState {
         self.value_type().canonicalize_state(value)
     }
 
@@ -8213,7 +8231,7 @@ impl<'a> EffectiveType<'a> {
 
     /// Canonicalize provider or persisted state without discarding the
     /// reference path that determines nested field modes.
-    pub fn canonicalize_state(&self, value: Value) -> Value {
+    pub fn canonicalize_state(&self, value: Value) -> CanonicalState {
         crate::value::canonicalize_state_with_type_and_ancestry(
             value,
             self.attr_type,
@@ -11611,17 +11629,36 @@ fn resolve_block_names_detailed<S, P: PlaceholderKind, B: BindingAddress>(
 ) -> Vec<BlockNameConflict> {
     resources
         .iter_mut()
-        .filter_map(|resource| {
-            let schema = registry.get_for(resource)?;
-            Some(resolve_attribute_block_names(
+        .flat_map(|resource| {
+            resolve_managed_attribute_block_names(
                 &resource.id,
                 &mut resource.attributes,
-                None,
-                schema.as_schema(),
-            ))
+                None::<&IndexMap<String, Value<P, B>>>,
+                registry,
+            )
         })
-        .flatten()
         .collect()
+}
+
+fn resolve_managed_attribute_block_names<
+    P: PlaceholderKind,
+    B: BindingAddress,
+    AB: BindingAddress,
+>(
+    id: &ResourceId,
+    attributes: &mut IndexMap<String, Value<P, B>>,
+    authored_attributes: Option<&IndexMap<String, Value<P, AB>>>,
+    registry: &SchemaRegistry,
+) -> Vec<BlockNameConflict> {
+    let Some(schema) = registry.get(&id.provider, &id.resource_type, SchemaKind::Resource) else {
+        return Vec::new();
+    };
+    resolve_attribute_block_names_with_authored(
+        id,
+        attributes,
+        authored_attributes,
+        schema.as_schema(),
+    )
 }
 
 fn resolve_block_names_detailed_with_authored<
@@ -11636,20 +11673,18 @@ fn resolve_block_names_detailed_with_authored<
 ) -> Vec<BlockNameConflict> {
     resources
         .iter_mut()
-        .filter_map(|resource| {
-            let schema = registry.get_for(resource)?;
+        .flat_map(|resource| {
             let authored_attributes = authored
                 .iter()
                 .find(|candidate| candidate.id == resource.id)
                 .map(|candidate| &candidate.attributes);
-            Some(resolve_attribute_block_names_with_authored(
+            resolve_managed_attribute_block_names(
                 &resource.id,
                 &mut resource.attributes,
                 authored_attributes,
-                schema.as_schema(),
-            ))
+                registry,
+            )
         })
-        .flatten()
         .collect()
 }
 
@@ -11689,9 +11724,11 @@ fn resolve_file_block_names<
                     registry,
                 ));
             }
-            crate::parser::ResourceMut::Deferred { resource } => {
-                conflicts.extend(resolve_block_names_detailed(
-                    std::slice::from_mut(resource),
+            crate::parser::ResourceMut::Deferred { id, attributes } => {
+                conflicts.extend(resolve_managed_attribute_block_names(
+                    id,
+                    attributes,
+                    None::<&IndexMap<String, Value<T, B>>>,
                     registry,
                 ));
             }
@@ -11731,11 +11768,11 @@ where
     parsed
         .iter_all_resources()
         .find_map(|resource| match resource {
-            crate::parser::ResourceRef::Resource(resource)
-            | crate::parser::ResourceRef::Deferred {
+            crate::parser::ResourceRef::Resource(resource) if resource.id == *id => Some(resource),
+            crate::parser::ResourceRef::Deferred {
                 resource,
                 deferred: _,
-            } if resource.id == *id => Some(resource),
+            } if resource.id() == id => Some(resource.as_resource()),
             crate::parser::ResourceRef::Resource(_)
             | crate::parser::ResourceRef::LiveComposition(_)
             | crate::parser::ResourceRef::DataSource(_)
@@ -11788,13 +11825,13 @@ where
                     registry,
                 ));
             }
-            crate::parser::ResourceMut::Deferred { resource } => {
-                let authored_resources = managed_resource_by_id(authored, &resource.id)
-                    .map(std::slice::from_ref)
-                    .unwrap_or_default();
-                conflicts.extend(resolve_block_names_detailed_with_authored(
-                    std::slice::from_mut(resource),
-                    authored_resources,
+            crate::parser::ResourceMut::Deferred { id, attributes } => {
+                let authored_attributes =
+                    managed_resource_by_id(authored, id).map(|resource| &resource.attributes);
+                conflicts.extend(resolve_managed_attribute_block_names(
+                    id,
+                    attributes,
+                    authored_attributes,
                     registry,
                 ));
             }

@@ -2175,7 +2175,10 @@ impl StateIdentityValues {
         observed_attributes: &HashMap<String, Value>,
     ) -> Self {
         let mut canonical = observed_attributes.clone();
-        crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
+        crate::value::canonicalize_state_attribute_map_with_schema(
+            &mut canonical,
+            schema.as_schema(),
+        );
         let resource_schema = schema.as_schema();
         let create_only = resource_schema
             .create_only_attributes()
@@ -2476,20 +2479,20 @@ fn canonical_or_resolved_create_only_value(
     schema: &ResourceSchema,
     attribute: &str,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
-) -> Result<ResolvedCreateOnlyValue, UnresolvedReason> {
-    let canonical = if let Some(resolved) =
-        resolve_deferred_create_only_value(value, find_state_by_binding)
-    {
-        crate::value::canonicalize_state_attribute_value_with_schema(resolved, schema, attribute)
-    } else {
-        crate::value::canonicalize_desired_attribute_value_with_schema(
-            value.clone(),
-            schema,
-            attribute,
-        )
-        .map_err(UnresolvedReason::Type)?
-    };
-    ResolvedCreateOnlyValue::from_value(canonical).ok_or(UnresolvedReason::NotComparable)
+) -> Result<Option<ResolvedCreateOnlyValue>, UnresolvedReason> {
+    let resolved = resolve_deferred_create_only_value(value, find_state_by_binding)
+        .unwrap_or_else(|| value.clone());
+    let canonical =
+        crate::value::canonicalize_desired_attribute_value_with_schema(resolved, schema, attribute)
+            .map_err(UnresolvedReason::Type)?;
+    let canonical =
+        crate::value::canonicalize_state_attribute_value_with_schema(canonical, schema, attribute);
+    match canonical {
+        crate::value::CanonicalState::Absent => Ok(None),
+        crate::value::CanonicalState::Present(value) => ResolvedCreateOnlyValue::from_value(value)
+            .map(Some)
+            .ok_or(UnresolvedReason::NotComparable),
+    }
 }
 
 #[derive(Clone)]
@@ -2585,8 +2588,9 @@ enum UnresolvedReason {
 
 /// Desired create-only values selected by a resource schema.
 ///
-/// Every configured desired attribute is retained as either a resolved value
-/// or an unresolved marker. Persisted values use the separate
+/// Every configured desired attribute with a comparison presence is retained
+/// as either a resolved value or an unresolved marker. Values canonicalized to
+/// absence are indistinguishable from unconfigured attributes. Persisted values use the separate
 /// [`StateCreateOnlyValues`] type so unresolved desired values cannot enter the
 /// state side of a comparison.
 pub struct DesiredCreateOnlyValues {
@@ -2609,32 +2613,33 @@ fn desired_comparable_values<'attribute, S>(
                     DesiredCreateOnlyValue::Prefix(prefix.clone()),
                 ));
             }
-            resource.get_attr(attribute).map(|value| {
-                let value = match canonical_or_resolved_create_only_value(
-                    value,
-                    schema,
-                    attribute,
-                    find_state_by_binding,
-                ) {
-                    Ok(value) => DesiredCreateOnlyValue::Resolved(value),
-                    Err(error) => {
-                        match error {
-                            UnresolvedReason::NotComparable => tracing::debug!(
-                                attribute,
-                                reason = "value has no stable comparison form",
-                                "stable value is not available for identity comparison"
-                            ),
-                            UnresolvedReason::Type(error) => tracing::debug!(
-                                attribute,
-                                error = ?error,
-                                "stable value is not available for identity comparison"
-                            ),
-                        }
-                        DesiredCreateOnlyValue::Unresolved
+            let value = resource.get_attr(attribute)?;
+            let canonical = canonical_or_resolved_create_only_value(
+                value,
+                schema,
+                attribute,
+                find_state_by_binding,
+            );
+            let value = match canonical {
+                Ok(None) => return None,
+                Ok(Some(value)) => DesiredCreateOnlyValue::Resolved(value),
+                Err(error) => {
+                    match error {
+                        UnresolvedReason::NotComparable => tracing::debug!(
+                            attribute,
+                            reason = "value has no stable comparison form",
+                            "stable value is not available for identity comparison"
+                        ),
+                        UnresolvedReason::Type(error) => tracing::debug!(
+                            attribute,
+                            error = ?error,
+                            "stable value is not available for identity comparison"
+                        ),
                     }
-                };
-                (attribute.to_string(), value)
-            })
+                    DesiredCreateOnlyValue::Unresolved
+                }
+            };
+            Some((attribute.to_string(), value))
         })
         .collect()
 }
@@ -2786,7 +2791,10 @@ impl StateCreateOnlyValues {
         observed_attributes: &HashMap<String, Value>,
     ) -> Self {
         let mut canonical = observed_attributes.clone();
-        crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
+        crate::value::canonicalize_state_attribute_map_with_schema(
+            &mut canonical,
+            schema.as_schema(),
+        );
         let values = schema
             .as_schema()
             .create_only_attributes()

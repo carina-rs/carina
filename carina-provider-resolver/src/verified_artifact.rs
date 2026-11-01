@@ -164,6 +164,10 @@ impl VerifiedLoad {
         &self.artifact
     }
 
+    pub fn carina_rs_signed(&self) -> Option<crate::CarinaRsSigned> {
+        crate::CarinaRsSigned::for_load(self)
+    }
+
     pub(crate) fn new(
         bytes: ProviderArtifactBytes,
         identity: ProviderLoadIdentity,
@@ -177,7 +181,7 @@ impl VerifiedLoad {
     }
 
     /// Construct a bound load for host tests that do not run the resolver.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(bytes: impl AsRef<[u8]>, identity: ProviderLoadIdentity) -> Self {
         let bytes = ProviderArtifactBytes(Arc::from(bytes.as_ref()));
         let artifact = LoadedArtifactIdentity::file(&bytes);

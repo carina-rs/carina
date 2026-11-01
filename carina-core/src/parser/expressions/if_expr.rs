@@ -410,7 +410,7 @@ fn parse_if_body(
                 Ok(IfBodyResult::Resource(Box::new(resource)))
             }
             (IfBodyForm::DataSource, Rule::read_resource_expr) => {
-                target.reject_unbound_read(LoopKind::If)?;
+                target.bound_read_target(LoopKind::If)?;
                 let data_source = parse_read_resource_expr(
                     inner,
                     &local_ctx,
@@ -424,9 +424,7 @@ fn parse_if_body(
                 let mut call =
                     parse_module_call(inner, &local_ctx, preprocessed_file, source_file)?;
                 call.binding_name = match target {
-                    LoopParseTarget::Bound { binding: _ } => Some(
-                        crate::resource::RelativeBindingName::new(target.scheduler_key()),
-                    ),
+                    LoopParseTarget::Bound(bound) => Some(bound.binding_address().clone()),
                     LoopParseTarget::Unbound(_) => None,
                 };
                 call.set_loop_origin(target.if_origin());

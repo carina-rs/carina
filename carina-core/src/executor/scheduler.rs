@@ -27,7 +27,10 @@ pub(super) struct PureMetaStep<'a, S> {
 impl<'a, S> PureMetaStep<'a, S> {
     fn from_effect(effect: &'a Effect<S>) -> Option<Self> {
         match effect {
-            Effect::DeferredCreate { template, .. } => Some(Self { effect, template }),
+            Effect::DeferredCreate(payload) => Some(Self {
+                effect,
+                template: payload.template.as_ref(),
+            }),
             Effect::DeferredReplace(payload) => Some(Self {
                 effect,
                 template: payload.template.as_ref(),
@@ -77,8 +80,8 @@ pub(super) fn failure_dependency_keys<S>(effect: &Effect<S>) -> Vec<SchedulerKey
 /// User-facing label for waiting and dependency-failure messages.
 pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
     match effect {
-        Effect::DeferredCreate { template, .. } => Some(template.target.display_name()),
-        Effect::DeferredReplace(payload) => Some(payload.template.target.display_name()),
+        Effect::DeferredCreate(payload) => Some(payload.template.target().display_name()),
+        Effect::DeferredReplace(payload) => Some(payload.template.target().display_name()),
         Effect::ReleaseListKeys { .. } => None,
         Effect::Read { .. }
         | Effect::Create(_)
@@ -275,7 +278,7 @@ impl<'a, S> FailureView<'a, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::EffectGeneration;
+    use crate::effect::{DeferredCreatePayload, EffectGeneration};
 
     #[test]
     fn resource_identity_does_not_collide_with_binding_failure_key() {
@@ -350,17 +353,11 @@ mod tests {
         .into_expanded()
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = parsed.deferred_for_expressions()[0].clone();
-        let scheduler_key = template.target.scheduler_key().to_string();
+        let scheduler_key = template.target().scheduler_key().to_string();
         assert!(scheduler_key.starts_with("_loop_"));
 
         let effects = vec![
-            Effect::DeferredCreate {
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "__deferred_for",
-                    "failed_unbound_loop",
-                )),
-                template: Box::new(template),
-            },
+            Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(template))),
             Effect::Delete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test.Child",

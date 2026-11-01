@@ -262,6 +262,15 @@ S1 was chosen. Only the person whose `carina init` writes a new declaration
 into the lock is asked. Other team members and CI consent by accepting the
 committed lock, which is the same model as carina-rs-signed providers.
 
+**What D5 does and does not protect.** An `explicit` record in the lock is an
+unauthenticated assertion: anyone who can commit to the repository can add
+one that matches their provider's declaration, and plan/apply then run with
+no prompt. That is the D5 model (committing the lock is the consent), so the
+protection is review of the lock diff, which shows each provider's hosts
+one per line. The type rules still guarantee that the recorded hosts equal
+the declaration in the loaded bytes, and that no hand edit can claim the
+`carina-rs-signed` class.
+
 ### D6. Unchanged declaration across a byte change carries consent over (chosen)
 
 Options considered:
@@ -310,7 +319,10 @@ plus an equal declaration with the same source (see Types).
   canonical path for a `file://` source. The configured name never takes
   part in consent identity.
 - **Which instances need consent.** The declaration is read and validated
-  whenever a provider is loaded, and a malformed section fails every command.
+  whenever a provider is loaded. A malformed or missing section is a provider
+  load error, handled by each command's existing load-failure policy:
+  validate and lint report it, plan and apply fail, and fmt treats it like
+  any other provider load failure on its best-effort path.
   Consent is required only where a runtime (credentialed) instance is
   created. `validate`, `fmt`, and the LSP use only the kind-less
   info/schemas instance, which gets no egress (above). They never need
@@ -318,7 +330,9 @@ plus an equal declaration with the same source (see Types).
 - **`carina init` modes.**
   - `--upgrade` rebuilds the lock from scratch. It reads the old entries'
     consent records before discarding them, so D6's carry-over still applies.
-  - `--locked` never writes the lock, so it never prompts. A missing or
+  - `--locked` never prompts and never records or changes an egress record.
+    It still saves the other lock state exactly as on `main` (signer pins,
+    registry sequence anchors). A missing or
     changed declaration is a hard error.
   - `--accept-egress` together with `--locked` is rejected as a flag
     conflict.
@@ -342,12 +356,55 @@ Options considered:
 
 The second was chosen. For `file://` sources:
 
-- A rebuild with an unchanged declaration loads without `carina init`.
-- A rebuild with a changed declaration cannot create runtime instances
-  until `carina init` shows the diff and asks.
+- File providers still load the copy that `carina init` installed, as on
+  `main`, so a rebuild takes effect only after `carina init`.
+- At that init, an unchanged declaration carries consent over without a
+  prompt. A changed declaration shows the diff and asks.
 
 Lock-controlled sources keep the full binding, because the resolver already
 refuses bytes whose `sha256` differs from the lock.
+
+**The canonical path is project-relative (chosen, during Phase 1).** It is
+normalized relative to the directory that holds `carina-providers.lock`,
+never as a machine-specific absolute path. The lock's `source` spelling for
+file providers stays as it is on `main`. A lock committed on one machine
+therefore loads with the same consent on CI and on other machines. A test
+pins this by copying one project to two different absolute directories.
+
+### D9. Resolved-address policy per kind (chosen, during Phase 1)
+
+The adversarial review found that a declared name can resolve to loopback,
+private or other-cloud metadata addresses. Before this decision, post-DNS
+vetting denied only AWS metadata and link-local addresses. The maintainer
+chose option P2:
+
+| Resolved address | `Aws` kind | Other kinds, schema-only |
+|---|---|---|
+| Loopback (127.0.0.0/8, ::1), unspecified (0.0.0.0, ::) | denied | denied |
+| Private (RFC 1918, fc00::/7, CGNAT 100.64.0.0/10) | allowed (VPC interface endpoints / PrivateLink) | denied |
+| Metadata (AWS IMDS/ECS, Alibaba 100.100.100.200, Azure 168.63.129.16) | AWS endpoints only | denied |
+| Link-local | denied | denied |
+
+How the policy is enforced:
+
+- Whether private addresses are allowed is a field of the per-kind
+  partition, next to `credential_partition` and `metadata_endpoints`. It is
+  not a check each caller makes.
+- Every address is canonicalised before classification, so IPv4-mapped and
+  NAT64-embedded IPv6 forms cannot bypass the policy.
+- `--trust-local-provider PATH=aws` builds are `Aws` kind and get the same
+  private-address allowance. The user explicitly trusted them as AWS, and
+  they already receive credentials, so withholding private addresses would
+  add no protection. The partition is decided by kind alone.
+- Metadata classification wins over the private range. For example,
+  100.100.100.200 is inside CGNAT and is still denied to the `Aws` kind.
+
+Options considered and rejected:
+
+- **P1** denies private addresses for every kind. It breaks PrivateLink for
+  aws and awscc.
+- **P3** keeps the old vetting. It leaves a third-party path into the user's
+  internal network.
 
 ## Types
 
@@ -426,8 +483,19 @@ enum GuestNetwork {
 | `consent = "carina-rs-signed"` | `signed` is `Some` and was minted for `decl.source` and `decl.sha256`. A hand-edited `file://` entry, or a trusted-local `=aws` grant, therefore cannot claim lock-commit consent |
 | `consent = "explicit"` | It is accepted as a previously granted `ExplicitConsent` for `decl.source` |
 
-`from_consent` applies the same equality checks. There is no other public
-constructor, and no egress-specific test constructor. Tests build a
+`from_consent` applies the same equality checks.
+
+**`ConsentedEgress::nothing_declared(decl)` (added during Phase 1).** This
+constructor succeeds only when the declaration is empty, so the value it
+produces permits no host. It needs no consent and no lock record. A provider
+with no `wasi:http` import, or with an empty list, therefore never makes
+`carina init` prompt or fail non-interactively. If that provider later
+declares hosts, the declaration is new and goes through the normal consent
+flow. Every value that permits at least one host still comes from one of
+the two consent producers.
+
+There is no other public constructor, and no egress-specific test
+constructor. Tests build a
 `VerifiedLoad` through the existing test-utils resolver paths and use the
 same functions. The test-only `from_precompiled` path has no raw bytes, so
 it can only build `GuestNetwork::SchemaOnly`.
@@ -452,8 +520,9 @@ item, so a structural error fails the build. Structural errors are a
 wildcard in a position other than the leftmost label, an empty or oversized
 label, a non-ASCII character, or an IP-literal shape. The public-suffix and
 reserved-name checks need the Public Suffix List and cannot run in `const`,
-so they run in the host, which repeats every check anyway, and in an SDK
-test helper that provider crates can call from their own tests.
+so they run in the host, which repeats every check anyway. Provider crates
+can run the same full check in their own tests by calling `HostPattern::parse`
+through the SDK; there is one implementation, in `carina-provider-protocol`.
 
 ## Lock format (folded into v5)
 
@@ -485,7 +554,8 @@ How the sub-table is written:
 
 - `hosts` is written one pattern per line in sorted order, so a lock diff
   shows exactly which hosts were added or removed for which provider.
-- An empty declaration is written as `hosts = []`.
+- An empty declaration writes no sub-table. It needs no consent
+  (`ConsentedEgress::nothing_declared`, see Types).
 - The sub-table holds no user identity, timestamp or machine data. Who
   consented is visible from the commit.
 
@@ -515,14 +585,14 @@ Entries that have no egress record:
 - For lock-controlled artifacts (registry, GitHub release, revision), the
   resolver already refuses bytes whose `sha256` differs from the lock, so
   `decl.sha256` equals the locked `sha256`.
-- For `file://` sources, the resolver does not compare today (the sha is
-  refreshed by each init, and load uses whatever bytes are on disk). The
-  maintainer chose to keep that (D8): for a `file://` source, consent binds
+- For `file://` sources, each init refreshes the recorded sha and
+  re-installs the copy that loads use (unchanged from `main`). The
+  maintainer chose (D8) not to bind file consent to the sha: for a `file://` source, consent binds
   the canonical path and the declaration, and the recorded `sha256` is
   informational.
-  - A rebuild with an unchanged declaration loads without `carina init`.
-  - A rebuild whose section differs from the lock is refused at
-    runtime-instance creation until `carina init` shows the diff and asks.
+  - After a rebuild, `carina init` carries consent over without a prompt
+    when the declaration is unchanged, and shows the diff and asks when it
+    changed.
 
 ## Impact
 
@@ -537,7 +607,7 @@ Entries that have no egress record:
 | Host | `HostPattern`, `VerifiedEgressDeclaration`, `ConsentedEgress` and `GuestNetwork` (which replaces `kind: Option<ProviderKind>` in the HTTP hooks); `check_host` takes `GuestNetwork`; `HttpTestRoute` moves after the policy check; `HTTP_ALLOWED_HOST_SUFFIXES` is deleted |
 | Resolver | Mints `CarinaRsSigned` on carina-rs-verified remote loads; lock v5 gains `[provider.egress]`; `--upgrade` keeps the old consent records for carry-over |
 | CLI | `carina init` gains the consent prompt, the diff display, `--accept-egress <source>` and `CARINA_ACCEPT_EGRESS` (conflicts with `--locked`); runtime-instance creation in plan, apply and destroy requires `ConsentedEgress` |
-| LSP, validate, fmt | Section validity is checked on load; no consent is needed (schema-only instance) |
+| LSP, validate, fmt | Section validity is checked on load; failures follow each command's load-failure policy; no consent is needed (schema-only instance) |
 | carina-provider-aws | Bump SDK rev; declare `**.amazonaws.com`, `**.amazonaws.com.cn` |
 | carina-provider-awscc | Same as aws |
 | carina-provider-mock-http | Declares its test hosts. The integration tests keep using `HttpTestRoute` for routing, and assert that a host outside the declaration is denied |

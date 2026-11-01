@@ -618,6 +618,9 @@ where
     };
     for (idx, effect) in effects.iter().enumerate() {
         let effect = effect.as_ref();
+        if matches!(effect, Effect::ReleaseListKeys { .. }) {
+            continue;
+        }
         for key in effect.scheduling_keys() {
             let targets = targets_by_key.entry(key).or_default();
             if matches!(effect, Effect::Delete { .. }) {
@@ -1391,7 +1394,7 @@ mod tests {
                 | Effect::Move { .. }
                 | Effect::ReleaseListKeys { .. }
                 | Effect::Wait { .. }
-                | Effect::DeferredCreate { .. }
+                | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => None,
             })
             .collect();

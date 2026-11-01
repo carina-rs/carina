@@ -2739,18 +2739,8 @@ where
     P: PlaceholderKind,
     T: PlaceholderKind,
 {
-    let crate::parser::DeferredForExpression {
-        file: _file,
-        line: _line,
-        header: _header,
-        resource_type: _resource_type,
-        target: _target,
-        iterable,
-        binding: _binding,
-        template_resource,
-    } = template;
-    contains_redacted_secret(iterable)
-        || attributes_contain_redacted_secret(template_resource.attributes.values())
+    contains_redacted_secret(&template.iterable)
+        || attributes_contain_redacted_secret(template.attributes().values())
 }
 
 pub(crate) fn unresolved_effect_contains_redacted_secret(
@@ -2775,8 +2765,8 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
             .iter()
             .any(|key| contains_redacted_secret(key.retained_value())),
         UnresolvedSavedEffect::Wait { until, .. } => contains_redacted_secret(until.value()),
-        UnresolvedSavedEffect::DeferredCreate { template, .. } => {
-            deferred_template_contains_redacted_secret(template)
+        UnresolvedSavedEffect::DeferredCreate(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
         }
         UnresolvedSavedEffect::DeferredReplace(payload) => {
             deferred_template_contains_redacted_secret(&payload.template)
@@ -2846,13 +2836,12 @@ pub(crate) fn effect_contains_redacted_secret<S>(effect: &crate::effect::Effect<
             interval: _interval,
             explicit_dependencies: _explicit_dependencies,
         } => contains_redacted_secret(until.value()),
-        Effect::DeferredCreate { id: _id, template } => {
-            deferred_template_contains_redacted_secret(template)
+        Effect::DeferredCreate(payload) => {
+            deferred_template_contains_redacted_secret(&payload.template)
         }
         Effect::DeferredReplace(payload) => {
             let crate::effect::DeferredReplacePayload {
                 deletes: _deletes,
-                id: _id,
                 template,
             } = payload.as_ref();
             deferred_template_contains_redacted_secret(template)
@@ -4189,9 +4178,8 @@ fn redact_deferred_template(
 ) -> Result<crate::parser::DeferredForExpression, SerializationError> {
     let mut redacted = template.clone();
     redacted.iterable = redact_secrets_only(&template.iterable)?;
-    redacted.template_resource.attributes = template
-        .template_resource
-        .attributes
+    *redacted.template_attributes_mut() = template
+        .attributes()
         .iter()
         .map(|(key, value)| redact_secrets_only(value).map(|value| (key.clone(), value)))
         .collect::<Result<_, _>>()?;
@@ -4202,7 +4190,7 @@ fn redact_deferred_template(
 pub fn redact_secrets_in_effect(
     effect: &crate::effect::Effect,
 ) -> Result<crate::effect::Effect, SerializationError> {
-    use crate::effect::{DeferredReplacePayload, Effect};
+    use crate::effect::{DeferredCreatePayload, DeferredReplacePayload, Effect};
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
             resource: crate::resource::ResolvedDataSource::new(redact_secrets_in_data_source(
@@ -4283,14 +4271,12 @@ pub fn redact_secrets_in_effect(
         // typed predicate over scalar values, surface form is the
         // user-authored source. Clone through unchanged.
         Effect::Wait { .. } => effect.clone(),
-        Effect::DeferredCreate { id, template } => Effect::DeferredCreate {
-            id: id.clone(),
-            template: Box::new(redact_deferred_template(template)?),
-        },
+        Effect::DeferredCreate(payload) => Effect::DeferredCreate(DeferredCreatePayload::new(
+            Box::new(redact_deferred_template(&payload.template)?),
+        )),
         Effect::DeferredReplace(payload) => {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                 deletes: payload.deletes.clone(),
-                id: payload.id.clone(),
                 template: Box::new(redact_deferred_template(&payload.template)?),
             }))
         }
@@ -4318,7 +4304,7 @@ fn create_effect_ids<S>(plan: &crate::plan::Plan<S>) -> Vec<Option<crate::resour
             | crate::effect::Effect::Move { .. }
             | crate::effect::Effect::ReleaseListKeys { .. }
             | crate::effect::Effect::Wait { .. }
-            | crate::effect::Effect::DeferredCreate { .. }
+            | crate::effect::Effect::DeferredCreate(_)
             | crate::effect::Effect::DeferredReplace(_) => None,
         })
         .collect()
@@ -4374,7 +4360,7 @@ pub fn redact_secrets_in_plan_with_desired_and_historical(
                 | crate::effect::Effect::Move { .. }
                 | crate::effect::Effect::ReleaseListKeys { .. }
                 | crate::effect::Effect::Wait { .. }
-                | crate::effect::Effect::DeferredCreate { .. }
+                | crate::effect::Effect::DeferredCreate(_)
                 | crate::effect::Effect::DeferredReplace(_) => redact_secrets_in_effect(effect)?,
             };
             if let crate::effect::Effect::Update { from, .. } = &mut effect {
@@ -4442,7 +4428,7 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
     deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
 ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
-    use crate::effect::{DeferredReplacePayload, Effect};
+    use crate::effect::{DeferredCreatePayload, DeferredReplacePayload, Effect};
 
     let mut out = plan.clone();
     let effects = plan
@@ -4515,18 +4501,16 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
                     .expect("guarded by contains_redacted_secret"),
                 })
             }
-            Effect::DeferredCreate { id, template } => {
-                let template = rehydrate_deferred_template(template, deferred_templates)?;
-                Ok(Effect::DeferredCreate {
-                    id: id.clone(),
-                    template: Box::new(template),
-                })
+            Effect::DeferredCreate(payload) => {
+                let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
+                Ok(Effect::DeferredCreate(DeferredCreatePayload::new(
+                    Box::new(template),
+                )))
             }
             Effect::DeferredReplace(payload) => {
                 let template = rehydrate_deferred_template(&payload.template, deferred_templates)?;
                 Ok(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes: payload.deletes.clone(),
-                    id: payload.id.clone(),
                     template: Box::new(template),
                 })))
             }
@@ -4557,13 +4541,13 @@ fn rehydrate_deferred_template<S: Clone, T>(
     let candidate = candidates
         .iter()
         .find(|candidate| {
-            candidate.target.same_system_target(&saved.target)
-                && candidate.resource_type == saved.resource_type
+            candidate.target().same_system_target(saved.target())
+                && candidate.resource_type() == saved.resource_type()
                 && candidate.root_bindings() == saved.root_bindings()
         })
         .ok_or_else(|| {
             SecretRehydrationSiteError::new(
-                format!("deferred for {}", saved.target.display_name()),
+                format!("deferred for {}", saved.target().display_name()),
                 SecretRehydrationError::ShapeMismatch,
             )
         })?;
@@ -4571,17 +4555,17 @@ fn rehydrate_deferred_template<S: Clone, T>(
     if let Some(value) = rehydrate_secret_entry(
         &saved.iterable,
         Some(&candidate.iterable),
-        format!("deferred iterable {}", saved.target.display_name()),
+        format!("deferred iterable {}", saved.target().display_name()),
         SecretRehydrationCandidate::Evaluated,
     )? {
         out.iterable = value;
     }
 
-    for (key, saved_value) in &mut out.template_resource.attributes {
+    for (key, saved_value) in out.template_attributes_mut() {
         if let Some(value) = rehydrate_secret_entry(
             saved_value,
-            candidate.template_resource.attributes.get(key),
-            format!("deferred resource {}.{key}", saved.target.display_name()),
+            candidate.attributes().get(key),
+            format!("deferred resource {}.{key}", saved.target().display_name()),
             SecretRehydrationCandidate::Evaluated,
         )? {
             *saved_value = value;
@@ -4751,7 +4735,7 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<S: Clone>(
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
+            | Effect::DeferredCreate(_)
             | Effect::DeferredReplace(_) => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
@@ -5136,8 +5120,7 @@ fn is_string_or_list_of_strings(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    let unwrapped = peel_custom(attr_type);
-    let Some(members) = crate::schema::union_members_with_defs(unwrapped, defs) else {
+    let Some(members) = crate::schema::union_members_with_defs(attr_type, defs) else {
         return false;
     };
     if members.len() != 2 {
@@ -5149,26 +5132,18 @@ fn is_string_or_list_of_strings(
         let Some(member) = member else {
             return false;
         };
-        match &peel_custom(member.as_attr()).kind {
+        match &member.as_attr().kind {
             AttrTypeKind::String { .. } => has_string = true,
             AttrTypeKind::List {
                 element_type: inner,
                 ..
-            } if matches!(
-                &peel_custom(inner.as_ref()).kind,
-                AttrTypeKind::String { .. }
-            ) =>
-            {
+            } if matches!(&inner.kind, AttrTypeKind::String { .. }) => {
                 has_list_of_string = true;
             }
             _ => return false,
         }
     }
     has_string && has_list_of_string
-}
-
-fn peel_custom(t: &AttributeType) -> &AttributeType {
-    t
 }
 
 /// Where a strict desired value came from. Both variants must be fully
@@ -5179,6 +5154,26 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
 pub(crate) enum DesiredValueSource {
     AuthoredDsl,
     ProviderOutput,
+}
+
+/// Result of canonicalizing a provider or persisted-state value.
+///
+/// `Absent` is distinct from an empty value so every state container walker
+/// must decide whether to remove its key. Desired-value canonicalization never
+/// produces `Absent`; authored empty objects remain available to providers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonicalState<H: PlaceholderKind = crate::resource::NoPlaceholder> {
+    Present(Value<H>),
+    Absent,
+}
+
+impl<H: PlaceholderKind> CanonicalState<H> {
+    pub fn into_present(self) -> Option<Value<H>> {
+        match self {
+            Self::Present(value) => Some(value),
+            Self::Absent => None,
+        }
+    }
 }
 
 /// Internal recursion policy. Public and crate-visible callers enter through
@@ -5465,9 +5460,9 @@ pub(crate) fn canonicalize_state_attribute_value_with_schema(
     value: Value,
     schema: &crate::schema::ResourceSchema,
     attribute: &str,
-) -> Value {
+) -> CanonicalState {
     let Some(attribute_schema) = schema.attributes.get(attribute) else {
-        return value;
+        return CanonicalState::Present(value);
     };
     canonicalize_state_with_type_and_ancestry(
         value,
@@ -5491,6 +5486,8 @@ fn canonicalize_state_with_type(
         defs,
         crate::schema::FieldAncestry::WRITABLE,
     )
+    .into_present()
+    .expect("state fixture must remain present")
 }
 
 pub(crate) fn canonicalize_state_with_type_and_ancestry(
@@ -5498,13 +5495,12 @@ pub(crate) fn canonicalize_state_with_type_and_ancestry(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     ancestry: crate::schema::FieldAncestry,
-) -> Value {
-    unwrap_infallible(canonicalize_with_type_for_purpose(
+) -> CanonicalState {
+    unwrap_infallible(canonicalize_state_entry_with_type(
         value,
         attr_type,
         defs,
         ancestry,
-        CanonicalizationPurpose::State,
         PreserveEnumResolutionErrors,
     ))
 }
@@ -5538,31 +5534,80 @@ fn canonicalize_with_type_for_purpose<
     error_policy: P,
 ) -> Result<Value<H, B>, P::Error> {
     let mut visited_refs = Vec::new();
-    let unwrapped = peel_custom(
-        attr_type
-            .resolve_refs_with_defs_on_path(defs, &mut visited_refs)
-            .as_attr(),
-    );
-    if let Some(fit) = crate::schema::fit_value_to_resolved_type_on_path(
-        unwrapped,
-        &value,
-        defs,
-        ancestry,
-        purpose,
-        &mut visited_refs,
-    ) {
-        return canonicalize_with_fit(value, fit, defs, purpose, error_policy);
-    }
-
-    canonicalize_without_fit(
+    let resolved_type = attr_type.resolve_refs_with_defs_on_path(defs, &mut visited_refs);
+    canonicalize_resolved_value_for_purpose(
         value,
-        unwrapped,
+        resolved_type,
         defs,
         ancestry,
         purpose,
         error_policy,
         &mut visited_refs,
     )
+}
+
+fn canonicalize_state_entry_with_type<H: PlaceholderKind, P: CanonicalizationErrorPolicy>(
+    value: Value<H>,
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    ancestry: crate::schema::FieldAncestry,
+    error_policy: P,
+) -> Result<CanonicalState<H>, P::Error> {
+    let mut visited_refs = Vec::new();
+    let resolved_type = attr_type.resolve_refs_with_defs_on_path(defs, &mut visited_refs);
+    canonicalize_resolved_value_for_purpose(
+        value,
+        resolved_type,
+        defs,
+        ancestry,
+        CanonicalizationPurpose::State,
+        error_policy,
+        &mut visited_refs,
+    )
+    .map(|value| {
+        if crate::schema::reads_as_absent(&value, resolved_type) {
+            CanonicalState::Absent
+        } else {
+            CanonicalState::Present(value)
+        }
+    })
+}
+
+fn canonicalize_resolved_value_for_purpose<
+    'a,
+    H: PlaceholderKind,
+    B: BindingAddress,
+    P: CanonicalizationErrorPolicy,
+>(
+    value: Value<H, B>,
+    resolved_type: crate::schema::ResolvedAttrType<'a>,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    ancestry: crate::schema::FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+    error_policy: P,
+    visited_refs: &mut Vec<&'a str>,
+) -> Result<Value<H, B>, P::Error> {
+    let resolved_attr = resolved_type.as_attr();
+    if let Some(fit) = crate::schema::fit_value_to_resolved_type_on_path(
+        resolved_attr,
+        &value,
+        defs,
+        ancestry,
+        purpose,
+        visited_refs,
+    ) {
+        canonicalize_with_fit(value, fit, defs, purpose, error_policy)
+    } else {
+        canonicalize_without_fit(
+            value,
+            resolved_attr,
+            defs,
+            ancestry,
+            purpose,
+            error_policy,
+            visited_refs,
+        )
+    }
 }
 
 /// Consume a successful fit witness without re-validating any selected Union
@@ -5575,7 +5620,8 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
 ) -> Result<Value<H, B>, P::Error> {
-    if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr, defs) {
+    if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(fit.attr.as_attr(), defs)
+    {
         return Ok(canonicalize_to_string_list(value));
     }
 
@@ -5685,10 +5731,17 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
             let fields = map
                 .into_iter()
                 .zip(fits)
-                .map(|((key, value), fit)| {
-                    let value = canonicalize_with_fit(value, fit, defs, purpose, error_policy)
-                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))?;
-                    Ok((key, value))
+                .filter_map(|((key, value), fit)| {
+                    let resolved_type = fit.attr;
+                    canonicalize_with_fit(value, fit, defs, purpose, error_policy)
+                        .map_err(|error| error_policy.at_struct_field(key.clone(), error))
+                        .map(|value| {
+                            (!(matches!(purpose, CanonicalizationPurpose::State)
+                                && crate::schema::reads_as_absent(&value, resolved_type)))
+                            .then_some(value)
+                        })
+                        .transpose()
+                        .map(|result| result.map(|value| (key, value)))
                 })
                 .collect::<Result<IndexMap<_, _>, P::Error>>()?;
             Ok(Value::Concrete(ConcreteValue::Map(fields)))
@@ -5886,7 +5939,7 @@ fn canonicalize_without_fit<
         {
             let canonical = canonicalize_without_fit(
                 value,
-                peel_custom(member),
+                member,
                 defs,
                 ancestry,
                 purpose,
@@ -6037,10 +6090,10 @@ fn canonicalize_without_fit<
                 .expect("Shape::Struct must expose struct fields internally");
             let canonicalized = map
                 .into_iter()
-                .map(|(key, value)| {
-                    let canonical =
-                        match crate::schema::struct_field_for_key(fields, &key, ancestry) {
-                            Some(field) => canonicalize_with_type_for_purpose(
+                .filter_map(|(key, value)| {
+                    match crate::schema::struct_field_for_key(fields, &key, ancestry) {
+                        Some(field) => {
+                            let canonicalized = canonicalize_with_type_for_purpose(
                                 value,
                                 &field.field_type,
                                 defs,
@@ -6048,10 +6101,19 @@ fn canonicalize_without_fit<
                                 purpose,
                                 error_policy,
                             )
-                            .map_err(|error| error_policy.at_struct_field(key.clone(), error))?,
-                            None => value,
-                        };
-                    Ok((key, canonical))
+                            .map(|value| {
+                                let resolved_type = field.field_type.resolve_refs_with_defs(defs);
+                                (!(matches!(purpose, CanonicalizationPurpose::State)
+                                    && crate::schema::reads_as_absent(&value, resolved_type)))
+                                .then_some(value)
+                            });
+                            canonicalized
+                                .map_err(|error| error_policy.at_struct_field(key.clone(), error))
+                                .transpose()
+                                .map(|result| result.map(|value| (key, value)))
+                        }
+                        None => Some(Ok((key, value))),
+                    }
                 })
                 .collect::<Result<IndexMap<_, _>, P::Error>>()?;
             finish_no_fit(
@@ -6426,19 +6488,17 @@ fn reject_unresolved_enum_identifiers_in_attributes<
 /// unrecognized enum-positioned strings as literal state text.
 pub(crate) fn canonicalize_state_attribute_map_with_schema<Attributes>(
     attributes: &mut Attributes,
-    schema: &crate::schema::ValidatedResourceSchema,
+    schema: &crate::schema::ResourceSchema,
 ) where
     Attributes:
         Default + IntoIterator<Item = (String, Value)> + std::iter::FromIterator<(String, Value)>,
 {
     *attributes = std::mem::take(attributes)
         .into_iter()
-        .map(|(key, value)| {
-            let canonical = match schema.effective_attribute(&key) {
-                Some(attribute) => attribute.canonicalize_state(value),
-                None => value,
-            };
-            (key, canonical)
+        .filter_map(|(key, value)| {
+            canonicalize_state_attribute_value_with_schema(value, schema, &key)
+                .into_present()
+                .map(|value| (key, value))
         })
         .collect();
 }
@@ -6710,7 +6770,7 @@ pub fn canonicalize_states_with_schemas(
             continue;
         };
         if let Some(attributes) = current.attributes_mut() {
-            canonicalize_state_attribute_map_with_schema(attributes, schema.schema());
+            canonicalize_state_attribute_map_with_schema(attributes, schema.as_schema());
         }
     }
 }
@@ -6828,7 +6888,7 @@ mod tests {
             )]))),
         )]);
 
-        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
 
         let Value::Concrete(ConcreteValue::Map(output)) = &attributes["output"] else {
             panic!("output must remain a map");
@@ -6837,6 +6897,309 @@ mod tests {
             output.get("mode"),
             Some(Value::Concrete(ConcreteValue::StringList(values)))
                 if values == &[ValueString::from("api_value")]
+        ));
+    }
+
+    #[test]
+    fn state_canonicalization_cascades_without_a_fit_and_is_idempotent() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let archive_policy = AttributeType::struct_(
+            "ArchivePolicy",
+            vec![StructField::required("retention_days", AttributeType::int()).build()],
+        );
+        let schema = ResourceSchema::new("test.Widget")
+            .with_def("ArchivePolicy", archive_policy)
+            .attribute(
+                AttributeSchema::optional("archive_policy", AttributeType::ref_("ArchivePolicy"))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional(
+                                "archive_policy",
+                                AttributeType::ref_("ArchivePolicy"),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let empty_map = || Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        let mut attributes = IndexMap::from([
+            ("archive_policy".to_string(), empty_map()),
+            (
+                "settings".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "archive_policy".to_string(),
+                    empty_map(),
+                )]))),
+            ),
+        ]);
+
+        assert_eq!(
+            schema
+                .effective_attribute("archive_policy")
+                .expect("archive_policy attribute")
+                .canonicalize_state(empty_map()),
+            CanonicalState::Absent,
+        );
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
+
+        assert!(!attributes.contains_key("archive_policy"));
+        assert!(
+            !attributes.contains_key("settings"),
+            "the parent struct must become absent after its only child becomes absent"
+        );
+
+        let canonical_once = attributes.clone();
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
+        assert_eq!(
+            attributes, canonical_once,
+            "state canonicalization must be idempotent"
+        );
+    }
+
+    #[test]
+    fn state_canonicalization_cascades_empty_required_struct_from_successful_fit() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "output",
+                    AttributeType::struct_(
+                        "Output",
+                        vec![
+                            StructField::optional(
+                                "archive_policy",
+                                AttributeType::struct_(
+                                    "ArchivePolicy",
+                                    vec![
+                                        StructField::required(
+                                            "retention_days",
+                                            AttributeType::int(),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let mut attributes = IndexMap::from([(
+            "output".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "archive_policy".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            )]))),
+        )]);
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
+
+        assert!(
+            !attributes.contains_key("output"),
+            "the fitted parent struct must become absent after its only child becomes absent"
+        );
+    }
+
+    #[test]
+    fn state_canonicalization_is_idempotent_when_dropping_a_required_field_changes_fit() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let settings_type = AttributeType::struct_(
+            "Settings",
+            vec![
+                StructField::required(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![StructField::optional("label", AttributeType::string()).build()],
+                    ),
+                )
+                .build(),
+                StructField::optional("keep", AttributeType::string()).build(),
+            ],
+        );
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("settings", settings_type).build())
+            .validate()
+            .expect("schema fixture must be valid");
+        let settings = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+            (
+                "keep".to_string(),
+                Value::Concrete(ConcreteValue::String("present".into())),
+            ),
+        ])));
+        let mut visited_refs = Vec::new();
+        let attribute = &schema.as_schema().attributes["settings"];
+        let resolved = attribute
+            .attr_type
+            .resolve_refs_with_defs_on_path(&schema.as_schema().defs, &mut visited_refs);
+        assert!(
+            crate::schema::fit_value_to_resolved_type_on_path(
+                resolved.as_attr(),
+                &settings,
+                &schema.as_schema().defs,
+                crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
+                CanonicalizationPurpose::State,
+                &mut visited_refs,
+            )
+            .is_some(),
+            "the first pass must exercise the fit worker"
+        );
+        let mut attributes = IndexMap::from([("settings".to_string(), settings)]);
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
+        let canonical_once = attributes.clone();
+        let canonical_settings = &canonical_once["settings"];
+        let mut visited_refs = Vec::new();
+        assert!(
+            crate::schema::fit_value_to_resolved_type_on_path(
+                resolved.as_attr(),
+                canonical_settings,
+                &schema.as_schema().defs,
+                crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
+                CanonicalizationPurpose::State,
+                &mut visited_refs,
+            )
+            .is_none(),
+            "dropping the required config field must route the second pass through no-fit"
+        );
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
+        assert_eq!(attributes, canonical_once);
+    }
+
+    #[test]
+    fn state_canonicalization_drops_empty_all_optional_struct_and_keeps_zero_field_marker() {
+        use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+
+        let optional_config = AttributeType::struct_(
+            "OptionalConfig",
+            vec![StructField::optional("label", AttributeType::string()).build()],
+        );
+        let marker = AttributeType::struct_("Marker", Vec::new());
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("marker", marker.clone()).build())
+            .attribute(
+                AttributeSchema::optional("optional_config", optional_config.clone()).build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("optional_config", optional_config).build(),
+                            StructField::optional("marker", marker).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid");
+        let mut attributes = IndexMap::from([
+            (
+                "marker".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+            (
+                "optional_config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            ),
+            (
+                "settings".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "optional_config".to_string(),
+                        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                    ),
+                    (
+                        "marker".to_string(),
+                        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                    ),
+                ]))),
+            ),
+        ]);
+
+        let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        assert_eq!(
+            schema
+                .effective_attribute("optional_config")
+                .expect("optional_config attribute")
+                .canonicalize_state(empty.clone()),
+            CanonicalState::Absent,
+        );
+        assert_eq!(
+            schema
+                .effective_attribute("marker")
+                .expect("marker attribute")
+                .canonicalize_state(empty.clone()),
+            CanonicalState::Present(empty),
+        );
+
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
+
+        assert!(attributes.contains_key("marker"));
+        assert!(!attributes.contains_key("optional_config"));
+        let Some(Value::Concrete(ConcreteValue::Map(settings))) = attributes.get("settings") else {
+            panic!("settings must remain a map");
+        };
+        assert!(!settings.contains_key("optional_config"));
+        assert!(settings.contains_key("marker"));
+    }
+
+    #[test]
+    fn reads_as_absent_owns_the_empty_value_and_resolved_struct_type_decision() {
+        use crate::schema::StructField;
+
+        let non_empty_struct = AttributeType::struct_(
+            "Config",
+            vec![StructField::optional("label", AttributeType::string()).build()],
+        );
+        let marker = AttributeType::struct_("Marker", Vec::new());
+        let map = AttributeType::map(AttributeType::string());
+        let defs = crate::schema::empty_defs_for_schema_walks();
+        let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        let populated = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "label".to_string(),
+            Value::Concrete(ConcreteValue::String("configured".into())),
+        )])));
+
+        assert!(crate::schema::reads_as_absent(
+            &empty,
+            non_empty_struct.resolve_refs_with_defs(defs),
+        ));
+        assert!(!crate::schema::reads_as_absent(
+            &populated,
+            non_empty_struct.resolve_refs_with_defs(defs),
+        ));
+        assert!(!crate::schema::reads_as_absent(
+            &empty,
+            marker.resolve_refs_with_defs(defs),
+        ));
+        assert!(!crate::schema::reads_as_absent(
+            &empty,
+            map.resolve_refs_with_defs(defs),
         ));
     }
 
@@ -6861,7 +7224,7 @@ mod tests {
         let original = Value::Concrete(ConcreteValue::String("api_value".into()));
         let mut attributes = IndexMap::from([("rule".to_string(), original.clone())]);
 
-        canonicalize_state_attribute_map_with_schema(&mut attributes, &schema);
+        canonicalize_state_attribute_map_with_schema(&mut attributes, schema.as_schema());
 
         assert_eq!(attributes["rule"], original);
     }
@@ -12161,7 +12524,10 @@ mod tests {
             )])),
         );
 
-        let canon = schema.canonicalize_state(Value::Concrete(ConcreteValue::Map(policy)));
+        let canon = schema
+            .canonicalize_state(Value::Concrete(ConcreteValue::Map(policy)))
+            .into_present()
+            .expect("policy document fixture must remain present");
         let Value::Concrete(ConcreteValue::Map(policy)) = canon else {
             panic!("expected policy document map");
         };
@@ -12371,7 +12737,10 @@ mod tests {
         let value = Value::Concrete(ConcreteValue::Map(map));
 
         assert!(schema.validate(&value).is_ok());
-        let canon = schema.canonicalize_state(value);
+        let canon = schema
+            .canonicalize_state(value)
+            .into_present()
+            .expect("recursive struct fixture must remain present");
         let Value::Concrete(ConcreteValue::Map(map)) = canon else {
             panic!("expected Map");
         };
@@ -12395,7 +12764,10 @@ mod tests {
         let value = Value::Concrete(ConcreteValue::String("x".into()));
 
         assert!(schema.validate(&value).is_ok());
-        let canon = schema.canonicalize_state(value);
+        let canon = schema
+            .canonicalize_state(value)
+            .into_present()
+            .expect("string fixture must remain present");
         assert_eq!(
             canon,
             Value::Concrete(ConcreteValue::StringList(vec!["x".into()]))
@@ -12419,7 +12791,13 @@ mod tests {
         };
         let value = Value::Concrete(ConcreteValue::String("x".into()));
 
-        assert_eq!(schema.canonicalize_state(value.clone()), value);
+        assert_eq!(
+            schema
+                .canonicalize_state(value.clone())
+                .into_present()
+                .expect("mutual-ref fixture must remain present"),
+            value
+        );
     }
 
     #[test]
@@ -12476,7 +12854,10 @@ mod tests {
 
         assert!(schema.validate(&value).is_ok());
         assert_eq!(
-            schema.canonicalize_state(value),
+            schema
+                .canonicalize_state(value)
+                .into_present()
+                .expect("recursive list fixture must remain present"),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::List(vec![Value::Concrete(ConcreteValue::StringList(vec![
                     "x".into(),
@@ -13502,10 +13883,10 @@ mod tests {
 
     #[test]
     fn redact_secrets_in_deferred_create_redacts_and_rehydrates_template() {
-        use crate::effect::Effect;
-        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
+        use crate::effect::{DeferredCreatePayload, Effect};
+        use crate::parser::{DeferredForExpression, ForBinding};
         use crate::plan::Plan;
-        use crate::resource::{PathSegment, ResourceId};
+        use crate::resource::PathSegment;
 
         let placeholder_inner = crate::resource::apply_postfix_access(
             LoopValue::Deferred(LoopDeferredValue::Placeholder(LoopSlot::Value)),
@@ -13534,38 +13915,28 @@ mod tests {
         > = crate::resource::Resource::new("aws.route53.RecordSet", "validation_records");
         template_resource.set_attr("name", placeholder.clone());
         template_resource.set_attr("comment", secret.clone());
-        let effect = Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "validation_records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: None,
-                line: 1,
-                header: "for opt in cert.domain_validation_options".to_string(),
-                resource_type: "aws.route53.RecordSet".to_string(),
-                target: crate::parser::DeferredForTarget::Bound {
-                    binding: absolute_binding("validation_records"),
-                },
-                iterable: Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
+        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+            DeferredForExpression::new(
+                None,
+                1,
+                "for opt in cert.domain_validation_options".to_string(),
+                crate::parser::DeferredForTarget::bound(
+                    crate::resource::absolute_binding_address_for_test("validation_records"),
+                )
+                .expect("fixture binding is valid"),
+                Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
+                ForBinding::Simple("opt".to_string()),
                 template_resource,
-            }),
-        };
+            ),
+        )));
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact deferred secret");
-        let Effect::DeferredCreate {
-            template: redacted_template,
-            ..
-        } = &redacted
-        else {
+        let Effect::DeferredCreate(redacted_payload) = &redacted else {
             panic!("expected deferred create");
         };
+        let redacted_template = &redacted_payload.template;
         assert!(matches!(
-            redacted_template
-                .template_resource
-                .attributes
-                .get("comment"),
+            redacted_template.attributes().get("comment"),
             Some(LoopValue::Deferred(
                 LoopDeferredValue::RedactedSecret { .. }
             ))
@@ -13574,10 +13945,10 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(effect.clone());
         let redacted_plan = redact_secrets_in_plan(&plan).expect("redact deferred plan");
-        let Effect::DeferredCreate { template, .. } = &effect else {
+        let Effect::DeferredCreate(payload) = &effect else {
             unreachable!();
         };
-        let deferred_templates = resolved_deferred_templates([template.as_ref().clone()]);
+        let deferred_templates = resolved_deferred_templates([payload.template.as_ref().clone()]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &redacted_plan,
             &HashMap::new(),
@@ -13586,27 +13957,21 @@ mod tests {
             &deferred_templates,
         )
         .expect("unchanged deferred template secret should rehydrate");
-        let Effect::DeferredCreate { template, .. } = &rehydrated.effects()[0] else {
+        let Effect::DeferredCreate(payload) = &rehydrated.effects()[0] else {
             panic!("expected rehydrated deferred create");
         };
+        let template = &payload.template;
         assert!(matches!(
-            template.template_resource.attributes.get("comment"),
+            template.attributes().get("comment"),
             Some(LoopValue::Deferred(LoopDeferredValue::Secret(_)))
         ));
-        assert!(
-            !template
-                .template_resource
-                .attributes
-                .values()
-                .any(contains_redacted_secret)
-        );
+        assert!(!template.attributes().values().any(contains_redacted_secret));
     }
 
     #[test]
     fn deferred_template_redaction_uses_template_resource_as_single_projection() {
-        use crate::effect::Effect;
-        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
-        use crate::resource::ResourceId;
+        use crate::effect::{DeferredCreatePayload, Effect};
+        use crate::parser::{DeferredForExpression, ForBinding};
 
         let secret = |plaintext: &str| {
             LoopValue::Deferred(LoopDeferredValue::Secret(Box::new(LoopValue::Concrete(
@@ -13618,32 +13983,28 @@ mod tests {
             LoopSlot,
         > = crate::resource::Resource::new("aws.route53.RecordSet", "records");
         template_resource.set_attr("comment", secret("authoritative"));
-        let effect = Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "records",
-            )),
-            template: Box::new(DeferredForExpression {
-                file: None,
-                line: 1,
-                header: "for opt in cert.options".to_string(),
-                resource_type: "aws.route53.RecordSet".to_string(),
-                target: crate::parser::DeferredForTarget::Bound {
-                    binding: absolute_binding("records"),
-                },
-                iterable: Value::root_resource_ref("cert", "options", Vec::new()),
-                binding: ForBinding::Simple("opt".to_string()),
+        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(
+            DeferredForExpression::new(
+                None,
+                1,
+                "for opt in cert.options".to_string(),
+                crate::parser::DeferredForTarget::bound(
+                    crate::resource::absolute_binding_address_for_test("records"),
+                )
+                .expect("fixture binding is valid"),
+                Value::root_resource_ref("cert", "options", Vec::new()),
+                ForBinding::Simple("opt".to_string()),
                 template_resource,
-            }),
-        };
+            ),
+        )));
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact deferred template");
-        let Effect::DeferredCreate { template, .. } = redacted else {
+        let Effect::DeferredCreate(payload) = redacted else {
             panic!("expected deferred create");
         };
+        let template = payload.template;
         let canonical = template
-            .template_resource
-            .attributes
+            .attributes()
             .get("comment")
             .expect("template resource comment");
 
@@ -13657,9 +14018,8 @@ mod tests {
 
     #[test]
     fn deferred_template_redaction_noops_without_placeholders() {
-        use crate::effect::Effect;
-        use crate::parser::{ExpandedDeferredForExpression as DeferredForExpression, ForBinding};
-        use crate::resource::ResourceId;
+        use crate::effect::{DeferredCreatePayload, Effect};
+        use crate::parser::{DeferredForExpression, ForBinding};
 
         let canonical =
             LoopValue::Concrete(crate::resource::ConcreteValue::String("canonical".into()));
@@ -13672,44 +14032,31 @@ mod tests {
         > = crate::resource::Resource::new("mock.test.resource", "children");
         template_resource.set_attr("comment", canonical.clone());
         template_resource.set_attr("identifier", display_only.clone());
-        let template = DeferredForExpression {
-            file: None,
-            line: 1,
-            header: "for child in parent.children".to_string(),
-            resource_type: "mock.test.resource".to_string(),
-            target: crate::parser::DeferredForTarget::Bound {
-                binding: absolute_binding("children"),
-            },
-            iterable: Value::root_resource_ref("parent", "children", Vec::new()),
-            binding: ForBinding::Simple("child".to_string()),
+        let template = DeferredForExpression::new(
+            None,
+            1,
+            "for child in parent.children".to_string(),
+            crate::parser::DeferredForTarget::bound(
+                crate::resource::absolute_binding_address_for_test("children"),
+            )
+            .expect("fixture binding is valid"),
+            Value::root_resource_ref("parent", "children", Vec::new()),
+            ForBinding::Simple("child".to_string()),
             template_resource,
-        };
-        let effect = Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "children",
-            )),
-            template: Box::new(template.clone()),
-        };
+        );
+        let effect = Effect::DeferredCreate(DeferredCreatePayload::new(Box::new(template.clone())));
 
         let redacted = redact_secrets_in_effect(&effect).expect("redact placeholder-free template");
-        let Effect::DeferredCreate {
-            template: redacted_template,
-            ..
-        } = redacted
-        else {
+        let Effect::DeferredCreate(redacted_payload) = redacted else {
             panic!("expected deferred create")
         };
+        let redacted_template = redacted_payload.template;
         assert_eq!(redacted_template.as_ref(), &template);
 
         let mut plan = crate::plan::Plan::new();
-        plan.add(Effect::DeferredCreate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "__deferred_for",
-                "children",
-            )),
-            template: redacted_template,
-        });
+        plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+            redacted_template,
+        )));
         let deferred_templates = resolved_deferred_templates([]);
         let rehydrated = rehydrate_plan_desired_secrets(
             &plan,
@@ -13719,17 +14066,12 @@ mod tests {
             &deferred_templates,
         )
         .expect("placeholder-free template must not need a candidate");
-        let Effect::DeferredCreate {
-            template: output, ..
-        } = &rehydrated.effects()[0]
-        else {
+        let Effect::DeferredCreate(payload) = &rehydrated.effects()[0] else {
             panic!("expected deferred create")
         };
+        let output = &payload.template;
         assert_eq!(output.as_ref(), &template);
-        assert_eq!(
-            output.template_resource.attributes.get("identifier"),
-            Some(&display_only),
-        );
+        assert_eq!(output.attributes().get("identifier"), Some(&display_only),);
     }
 
     fn replacement_plan_with_previous_attributes(

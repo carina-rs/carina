@@ -1453,6 +1453,42 @@ let duplicate = mock.test.resource {
 }
 
 #[test]
+fn unbound_deferred_template_type_error_keeps_authored_source_location() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"provider mock {}
+let src = mock.test.resource { name = "src" }
+let n = 5
+
+for _, t in (src.tags ?? {}) {
+  mock.test.resource { name = n }
+}
+"#,
+    )]);
+    let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
+        SchemaRegistry::new(),
+        |mut registry, schema| {
+            registry.insert("mock", schema);
+            registry
+        },
+    );
+
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    let mismatch = diagnostics
+        .iter()
+        .find(|message| message.contains("Type mismatch: expected String, got Int"))
+        .unwrap_or_else(|| panic!("missing deferred-template type error: {diagnostics:#?}"));
+    assert!(
+        mismatch.contains("main.crn at line 6\nType mismatch: expected String, got Int"),
+        "the template must retain the authored source lookup: {mismatch}",
+    );
+    assert!(
+        !mismatch.contains("<pending>"),
+        "a stable parse-time template id must prevent pending-id fallback: {mismatch}",
+    );
+}
+
+#[test]
 fn postfix_wrong_shape_access_has_cli_lsp_parity_for_local_and_wait_bindings() {
     let fixture = write_fixture(&[
         ("providers.crn", "provider mock {}\n"),

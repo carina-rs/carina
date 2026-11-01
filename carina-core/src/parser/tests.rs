@@ -597,8 +597,9 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
         .expect("deferred iterable fixture parses"),
     );
     let template_count = parsed.deferred_for_expressions()[0]
-        .template_resource
-        .get_attr("count")
+        .template_resource()
+        .attributes()
+        .get("count")
         .expect("template count");
     assert!(matches!(
         template_count,
@@ -837,20 +838,23 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     template_resource
         .attributes
         .insert("name".to_string(), empty());
+    let target = DeferredForTarget::bound(crate::resource::RelativeBindingName::new("items"))
+        .expect("fixture binding is valid");
+    let body = DeferredForBody::resource(template_resource);
     file.parsed_deferred_for_expressions_mut()
-        .push(ParsedDeferredForExpression {
-            file: Some("loops.crn".to_string()),
-            line: 1,
-            span: SourceSpan::dummy(),
-            header: "for item in pending.items".to_string(),
-            target: DeferredForTarget::Bound {
-                binding: "items".into(),
-            },
-            iterable: empty(),
-            iterable_state: ParsedDeferredForIterableState::Deferred,
-            binding: ForBinding::Simple("item".to_string()),
-            body: DeferredForBody::Resource(Box::new(template_resource)),
-        });
+        .push(ParsedDeferredForExpression::new(
+            (
+                Some("loops.crn".to_string()),
+                1,
+                SourceSpan::dummy(),
+                "for item in pending.items".to_string(),
+            ),
+            target,
+            empty(),
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".to_string()),
+            body,
+        ));
 
     let rendered = file
         .validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)
@@ -915,22 +919,25 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
         .attributes
         .insert("name".to_string(), empty_interpolation_placeholder());
     let mut file = ParsedFile::default();
+    let target = DeferredForTarget::bound(crate::resource::RelativeBindingName::new("items"))
+        .expect("fixture binding is valid");
+    let body = DeferredForBody::resource(template_resource);
     file.parsed_deferred_for_expressions_mut()
-        .push(ParsedDeferredForExpression {
-            file: Some("loops.crn".to_string()),
-            line: 1,
-            span: SourceSpan::dummy(),
-            header: "for item in pending.items".to_string(),
-            target: DeferredForTarget::Bound {
-                binding: "items".into(),
-            },
-            iterable: Value::Deferred(DeferredValue::BindingRef {
+        .push(ParsedDeferredForExpression::new(
+            (
+                Some("loops.crn".to_string()),
+                1,
+                SourceSpan::dummy(),
+                "for item in pending.items".to_string(),
+            ),
+            target,
+            Value::Deferred(DeferredValue::BindingRef {
                 binding: "pending.items".into(),
             }),
-            iterable_state: ParsedDeferredForIterableState::Deferred,
-            binding: ForBinding::Simple("item".to_string()),
-            body: DeferredForBody::Resource(Box::new(template_resource)),
-        });
+            ParsedDeferredForIterableState::Deferred,
+            ForBinding::Simple("item".to_string()),
+            body,
+        ));
 
     let rendered = file
         .validate_expansion_boundary(ParserPlaceholderBoundary::ExpandedFile)
@@ -1030,7 +1037,7 @@ fn iter_all_resources_yields_direct_then_deferred() {
     let ResourceRef::Deferred { resource, deferred } = items[1] else {
         panic!("expected a resolved deferred resource, got {:?}", items[1]);
     };
-    assert_eq!(resource.id, deferred.template_resource.id);
+    assert_eq!(resource.id(), deferred.template_resource_id());
     assert!(matches!(items[1].context(), ResourceContext::Deferred(_)));
 }
 
@@ -1046,10 +1053,10 @@ fn resolved_resource_iterator_is_phase_exhaustive() {
             ResourceRef::DataSource(data_source) => data_source.id.resource_type.as_str(),
             ResourceRef::Deferred { resource, deferred } => {
                 assert_eq!(
-                    resource.id.resource_type,
-                    deferred.template_resource.id.resource_type
+                    resource.id().resource_type,
+                    deferred.template_resource_id().resource_type
                 );
-                resource.id.resource_type.as_str()
+                resource.id().resource_type.as_str()
             }
         })
         .collect::<Vec<_>>();
@@ -7608,7 +7615,7 @@ fn deferred_unbound_target_round_trips() {
         .unwrap(),
     );
 
-    let target = &parsed.deferred_for_expressions()[0].target;
+    let target = parsed.deferred_for_expressions()[0].target();
     assert!(matches!(target, DeferredForTarget::Unbound { .. }));
     let json = serde_json::to_string(target).unwrap();
     let decoded: DeferredForTarget<crate::resource::AbsoluteBindingAddress> =
@@ -7760,7 +7767,7 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
         cross_deferred_for_resolution_seam(parse(input, &ProviderContext::default()).unwrap());
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
-    let DeferredForTarget::Unbound { template } = &result.deferred_for_expressions()[0].target
+    let DeferredForTarget::Unbound { template } = result.deferred_for_expressions()[0].target()
     else {
         panic!("top-level deferred loop must remain unbound")
     };
@@ -11726,9 +11733,9 @@ let calls = for x in src.list { child { item = x } }
 
     let bodies = &parsed.parsed_deferred_for_expressions();
     assert_eq!(bodies.len(), 3);
-    assert!(matches!(bodies[0].body, DeferredForBody::Resource(_)));
-    assert!(matches!(bodies[1].body, DeferredForBody::Read(_)));
-    assert!(matches!(bodies[2].body, DeferredForBody::ModuleCall(_)));
+    assert!(matches!(bodies[0].body(), DeferredForBody::Resource(_)));
+    assert!(matches!(bodies[1].body(), DeferredForBody::Read(_)));
+    assert!(matches!(bodies[2].body(), DeferredForBody::ModuleCall(_)));
 }
 
 #[test]
@@ -11750,11 +11757,11 @@ let resources = for x in src.list {
     let [deferred] = parsed.parsed_deferred_for_expressions() else {
         panic!("expected one deferred loop")
     };
-    let DeferredForBody::Resource(template) = &deferred.body else {
+    let DeferredForBody::Resource(template) = deferred.body() else {
         panic!("expected a deferred resource body")
     };
     assert_eq!(
-        template.directives.prevent_destroy_setting(),
+        template.directives().prevent_destroy_setting(),
         PreventDestroy::Unspecified,
         "a non-literal false must not opt out of schema-default protection"
     );
@@ -11835,9 +11842,9 @@ let calls = for x in src.list { child { item = x } }
             resources[1]
         );
     };
-    assert_eq!(resource.id.resource_type, "test.resource");
+    assert_eq!(resource.id().resource_type, "test.resource");
     assert_eq!(deferred.header, "for x in src.list");
-    assert!(matches!(deferred.body, DeferredForBody::Resource(_)));
+    assert!(matches!(deferred.body(), DeferredForBody::Resource(_)));
     let ResourceContext::Deferred(context) = resources[1].context() else {
         panic!("expected parser-side deferred context");
     };
@@ -11911,7 +11918,7 @@ let mod_items = for x in items { child { item = x } }
         ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
     ));
     assert!(matches!(
-        &deferred.body,
+        deferred.body(),
         DeferredForBody::ModuleCall(call) if call.module_name == "child"
     ));
 }
@@ -11940,7 +11947,7 @@ fn deferred_for_read_body_with_bare_unbound_iterable_records_finalization_error(
         ParsedDeferredForIterableState::UndefinedIdentifier { name } if name == "items"
     ));
     assert!(matches!(
-        &deferred.body,
+        deferred.body(),
         DeferredForBody::Read(data_source)
             if data_source.id.resource_type == "iam.Roles"
     ));
@@ -15169,11 +15176,11 @@ fn extract_directives_depends_on_in_for_loop_resource() {
         .parsed_deferred_for_expressions()
         .first()
         .expect("for expression present");
-    let DeferredForBody::Resource(template) = &deferred.body else {
+    let DeferredForBody::Resource(template) = deferred.body() else {
         panic!("deferred fixture body must be a resource")
     };
     assert_eq!(
-        template.directives.depends_on,
+        template.directives().depends_on,
         vec!["role".to_string()],
         "for-body resource template should carry directives.depends_on"
     );
@@ -17711,10 +17718,10 @@ mod loop_var_field_access_matrix {
         // The template body must carry the deferred postfix operation, not a
         // resource ResourceRef (which would never resolve for a loop var) and
         // not a bare loop slot (which would lose the `.k`).
-        let tmpl = &p.deferred_for_expressions()[0].template_resource;
+        let tmpl = p.deferred_for_expressions()[0].template_resource();
         assert!(
             matches!(
-                tmpl.get_attr("name"),
+                tmpl.attributes().get("name"),
                 Some(GenericValue::Deferred(GenericDeferredValue::Access(access)))
                     if matches!(
                         access.base(),
@@ -17727,7 +17734,7 @@ mod loop_var_field_access_matrix {
                     )
             ),
             "deferred template must carry postfix Access; got {:?}",
-            tmpl.get_attr("name")
+            tmpl.attributes().get("name")
         );
         let mut items = IndexMap::new();
         items.insert(
@@ -17789,10 +17796,13 @@ mod loop_var_field_access_matrix {
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 2);
 
         for deferred in parsed.parsed_deferred_for_expressions() {
-            let DeferredForBody::Resource(template_resource) = &deferred.body else {
+            let DeferredForBody::Resource(template_resource) = deferred.body() else {
                 panic!("deferred fixture body must be a resource")
             };
-            let name = template_resource.get_attr("name").expect("template name");
+            let name = template_resource
+                .attributes()
+                .get("name")
+                .expect("template name");
             assert!(
                 matches!(
                     access_root(name),
@@ -17834,8 +17844,9 @@ mod loop_var_field_access_matrix {
         for deferred in expanded.deferred_for_expressions() {
             let root = loop_access_root(
                 deferred
-                    .template_resource
-                    .get_attr("name")
+                    .template_resource()
+                    .attributes()
+                    .get("name")
                     .expect("expanded template name"),
             );
             assert!(matches!(

@@ -10,6 +10,35 @@ use super::error::ParseError;
 #[grammar = "parser/carina.pest"]
 struct CarinaParser;
 
+/// A binding name whose spelling is guaranteed by the parser grammar.
+///
+/// Construction is limited to grammar-produced let-binding names and the
+/// parser's own identifier-shaped synthetic bindings. Consumers can therefore
+/// use the value without re-validating it as a resource identity.
+pub(super) struct ParserBindingName(String);
+
+impl ParserBindingName {
+    pub(super) fn from_let_binding_pair(pair: pest::iterators::Pair<'_, Rule>) -> Self {
+        assert!(
+            matches!(pair.as_rule(), Rule::identifier | Rule::discard_pattern),
+            "let-binding grammar must yield an identifier or discard pattern"
+        );
+        Self(pair.as_str().to_string())
+    }
+
+    pub(super) fn integer_operand(line: usize, column: usize) -> Self {
+        Self(format!("__integer_operand_{line}_{column}"))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(super) fn into_string(self) -> String {
+        self.0
+    }
+}
+
 /// An owned, heredoc-preprocessed file that can yield pest pairs borrowing its
 /// transformed source while retaining the original-position mapping.
 pub(crate) struct PreprocessedFile {
