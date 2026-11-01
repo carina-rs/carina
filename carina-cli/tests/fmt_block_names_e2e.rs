@@ -407,7 +407,7 @@ async fn recursive_fmt_uses_each_files_directory_and_matches_lsp() {
 #[tokio::test]
 async fn recursive_cli_formats_imported_module_with_callers_lsp_schemas() {
     let project = tempfile::tempdir().unwrap();
-    let root = project.path().canonicalize().unwrap();
+    let root = std::path::absolute(project.path()).unwrap();
     let caller = root.join("caller");
     let module = root.join("modules").join("m");
     std::fs::create_dir_all(&caller).unwrap();

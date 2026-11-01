@@ -827,14 +827,17 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
     let mut directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     directory.push("tests/fixtures/dependency_key_collision");
     let parsed = crate::config_loader::parse_directory(
-        &directory,
+        &crate::paths::ResolvedPath::new(&directory).unwrap(),
         &crate::parser::ProviderContext::default(),
     )
     .expect("multi-file collision fixture parses");
-    let parsed = crate::module_resolver::resolve_modules_providerless(parsed, &directory)
-        .expect("multi-file collision fixture crosses root expansion")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("collision fixture contains no parser placeholders");
+    let parsed = crate::module_resolver::resolve_modules_providerless(
+        parsed,
+        &crate::paths::ResolvedPath::new(&directory).unwrap(),
+    )
+    .expect("multi-file collision fixture crosses root expansion")
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("collision fixture contains no parser placeholders");
     let mut unresolved = parsed.resources;
 
     let anonymous = unresolved

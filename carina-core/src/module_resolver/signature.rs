@@ -1,5 +1,5 @@
+use crate::paths::ResolvedPath;
 use std::collections::HashMap;
-use std::path::Path;
 
 use indexmap::IndexMap;
 
@@ -70,14 +70,18 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
 /// Load and resolve every module signature imported by `parsed`.
 pub fn load_resolved_module_signatures<E, B: crate::resource::BindingAddress, D>(
     parsed: &File<E, crate::resource::ParserPlaceholder, crate::resource::ParserPlaceholder, D, B>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> ResolvedModuleSignatures {
+    let base_dir = base_dir.clone();
     parsed
         .uses
         .iter()
         .filter_map(|import| {
-            super::load_module(&base_dir.join(&import.path))
+            base_dir
+                .join(&import.path)
+                .ok()
+                .and_then(|path| super::load_module(&path))
                 .map(|module| (import.alias.clone(), resolved_signature(&module, config)))
         })
         .collect()

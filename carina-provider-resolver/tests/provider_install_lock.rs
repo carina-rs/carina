@@ -23,7 +23,9 @@ fn acquiring_for_nonexistent_project_creates_nothing() {
     let parent = tempfile::tempdir().unwrap();
     let project = parent.path().join("missing");
 
-    let error = match ProviderInstallLock::acquire(&project) {
+    let error = match ProviderInstallLock::acquire(
+        &carina_core::paths::ResolvedPath::new(&project).unwrap(),
+    ) {
         Ok(_) => panic!("acquiring a lock for a nonexistent project must fail"),
         Err(error) => error,
     };
@@ -39,7 +41,10 @@ fn resolving_unchanged_file_provider_twice_leaves_only_final_artifact() {
     let source = project.path().join("provider.wasm");
     fs::write(&source, b"provider wasm").unwrap();
     let provider = file_provider("test", &source);
-    let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+    let install_lock = ProviderInstallLock::acquire(
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+    )
+    .unwrap();
     let user_dirs = UserDirs::under(&project.path().join("user"));
 
     let first = resolve_all(
@@ -76,7 +81,10 @@ fn concurrent_resolutions_preserve_both_lock_entries() {
         let start = Arc::clone(&start);
         std::thread::spawn(move || {
             start.wait();
-            let install_lock = ProviderInstallLock::acquire(&project_dir).unwrap();
+            let install_lock = ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            )
+            .unwrap();
             resolve_all(&user_dirs, &install_lock, &[provider], LockMode::Normal).unwrap();
         })
     });
@@ -85,7 +93,9 @@ fn concurrent_resolutions_preserve_both_lock_entries() {
         thread.join().unwrap();
     }
 
-    let loaded = LockFile::load(project.path()).unwrap().unwrap();
+    let loaded = LockFile::load(&carina_core::paths::ResolvedPath::new(project.path()).unwrap())
+        .unwrap()
+        .unwrap();
     let (lock_file, _) = loaded.into_parts();
     let mut names = lock_file
         .provider

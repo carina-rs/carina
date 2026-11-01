@@ -279,7 +279,7 @@ fn registry_like_fixture() -> TempDir {
 fn validate_enumerates_deferred_for_body_over_same_config_read_attr() {
     let fixture = registry_like_fixture();
     let ids = carina_cli::commands::validate::validated_resource_ids_with_factories(
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         factories(),
     );
 
@@ -327,7 +327,7 @@ let resources = for name in names {
     )]);
 
     let ids = carina_cli::commands::validate::validated_resource_ids_with_factories(
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         factories(),
     );
     let listing = ids.join("\n");
@@ -356,8 +356,10 @@ fn validate_reports_runtime_deferred_module_call_body_at_resolution_seam() {
     )
     .expect("child module");
 
-    let errors =
-        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    let errors = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        factories(),
+    );
     assert!(
         errors.iter().any(|error| {
             error.contains("for item in cert.domain_validation_options")
@@ -382,8 +384,10 @@ fn validate_reports_runtime_deferred_read_body_at_resolution_seam() {
         ),
     ]);
 
-    let errors =
-        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    let errors = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        factories(),
+    );
     assert!(
         errors.iter().any(|error| {
             error.contains("for item in cert.domain_validation_options")
@@ -417,8 +421,10 @@ fn validate_reports_imported_deferred_body_at_owning_call() {
     )
     .expect("grandchild module");
 
-    let errors =
-        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    let errors = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        factories(),
+    );
     let error = errors
         .iter()
         .find(|error| error.contains("cannot use module call `grandchild`"))
@@ -454,8 +460,10 @@ fn validate_reports_every_rejected_loop_across_files() {
     )
     .expect("child module");
 
-    let errors =
-        carina_cli::commands::validate::validate_with_factories(fixture.path(), factories());
+    let errors = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        factories(),
+    );
     let rejected = errors
         .iter()
         .filter(|error| error.contains("only a managed resource body can be deferred"))

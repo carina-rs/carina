@@ -2662,7 +2662,7 @@ pub struct CompositionAttributeRefError {
     pub error: AttributeParamRefError<AbsoluteBindingAddress>,
     pub module_name: String,
     pub module_source: Option<String>,
-    pub module_directory: Option<std::path::PathBuf>,
+    pub module_directory: Option<crate::paths::ResolvedPath>,
     pub call_paths: Vec<CompositionCallPath>,
     reference_position: usize,
 }
@@ -2672,12 +2672,18 @@ impl CompositionAttributeRefError {
         self.module_source.as_deref().unwrap_or(&self.module_name)
     }
 
-    fn module_identity(&self) -> String {
+    fn module_identity(&self) -> CompositionModuleIdentity {
         self.module_directory
             .as_ref()
-            .map(|path| path.display().to_string())
-            .or_else(|| self.module_source.clone())
-            .unwrap_or_else(|| self.module_name.clone())
+            .map(|path| CompositionModuleIdentity::Directory(path.identity()))
+            .unwrap_or_else(|| {
+                CompositionModuleIdentity::Authored(
+                    self.module_source
+                        .as_ref()
+                        .unwrap_or(&self.module_name)
+                        .clone(),
+                )
+            })
     }
 }
 
@@ -2792,8 +2798,14 @@ struct CompositionModuleCallErrorKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CompositionModuleIdentity {
+    Directory(crate::paths::CanonicalPath),
+    Authored(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CompositionAttributeErrorKey {
-    module_identity: String,
+    module_identity: CompositionModuleIdentity,
     attribute: String,
     reference_position: usize,
     kind: CompositionRefErrorKindKey,
@@ -6291,7 +6303,7 @@ pub enum ModuleCallReferenceChecks {
 pub struct ModuleCallCheckInput<'a, 'bindings, E, C: ?Sized = LoadedProviderContext> {
     pub authored: &'a crate::parser::File<E>,
     pub semantic: Option<&'a crate::parser::File<E>>,
-    pub base_dir: Option<&'a std::path::Path>,
+    pub base_dir: Option<&'a crate::paths::ResolvedPath>,
     pub imported_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     pub provider_context: &'a C,
     pub schemas: &'a SchemaRegistry,
@@ -6320,12 +6332,12 @@ struct ModuleCallChecker<'a> {
     provider_context: typecheck::TypecheckProviderContext<'a>,
     schemas: &'a SchemaRegistry,
     findings: Vec<ModuleCallFinding>,
-    active_modules: HashSet<std::path::PathBuf>,
+    active_modules: HashSet<crate::paths::CanonicalPath>,
 }
 
 struct ModuleFileCheckContext<'a, 'bindings, E> {
     semantic: Option<&'a crate::parser::File<E>>,
-    base_dir: Option<&'a std::path::Path>,
+    base_dir: Option<&'a crate::paths::ResolvedPath>,
     signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     binding_use_report: &'a BindingUseReport,
     bindings: &'a BindingIndex<'bindings>,
@@ -6748,7 +6760,7 @@ impl ModuleCallChecker<'_> {
         &mut self,
         file: &crate::parser::File<E>,
         call: &ModuleCall,
-        base_dir: Option<&std::path::Path>,
+        base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
     ) {
         let Some(import) = file
@@ -6764,14 +6776,16 @@ impl ModuleCallChecker<'_> {
     fn check_nested_import(
         &mut self,
         import: &crate::parser::UseStatement,
-        base_dir: Option<&std::path::Path>,
+        base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
     ) {
         let Some(base_dir) = base_dir else {
             return;
         };
-        let module_dir = base_dir.join(&import.path);
-        let guard = std::fs::canonicalize(&module_dir).unwrap_or_else(|_error| module_dir.clone());
+        let Ok(module_dir) = base_dir.join(&import.path) else {
+            return;
+        };
+        let guard = module_dir.identity();
         if !self.active_modules.insert(guard.clone()) {
             return;
         }

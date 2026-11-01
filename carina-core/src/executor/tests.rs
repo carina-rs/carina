@@ -174,7 +174,7 @@ fn anonymous_deferred_collision_fixture() -> (
     .expect("unbound deferred loop parses");
     let parsed = crate::module_resolver::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("deferred fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
@@ -7134,7 +7134,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         .expect("pre-apply reference resolution succeeds");
     let parsed = crate::module_resolver::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("reference alias fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())

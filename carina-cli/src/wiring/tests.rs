@@ -45,10 +45,13 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
     let project = tempfile::tempdir().unwrap();
     let source = project.path().join("main.crn");
     std::fs::write(&source, "let orgs = upstream_state { source = '../orgs' }\nlet rows = for item in orgs.ids { mock.test.resource { name = item } }\n").unwrap();
-    let loaded = carina_core::config_loader::load_configuration(project.path()).unwrap();
+    let loaded = carina_core::config_loader::load_configuration(
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+    )
+    .unwrap();
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         loaded.parsed,
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -213,7 +216,12 @@ fn successful_validation_report_returns_the_resolved_file_as_a_result() {
     let providers = ProviderLoad::for_test(Vec::new(), &[]);
     let parsed = carina_core::parser::InferredFile::default();
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
-    let report = providers.validation_report(&parsed, Path::new("."), true, &[]);
+    let report = providers.validation_report(
+        &parsed,
+        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        true,
+        &[],
+    );
 
     let resolved = report
         .into_result()
@@ -580,7 +588,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     .expect("write typed resource fixture");
 
     let loaded = load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -675,7 +683,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
     .expect("write unordered enum resource fixture");
 
     let loaded = load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -779,14 +787,14 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
     .expect("write named resource fixture");
 
     let loaded = load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         loaded.parsed,
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -885,7 +893,7 @@ let first = test.thing {
             .expect("write competing resources fixture");
 
         let loaded = load_configuration_with_config(
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &carina_core::parser::ProviderContext::default(),
             &SchemaRegistry::new(),
         )
@@ -998,7 +1006,7 @@ let direct = awscc.ec2.Route {
             .expect("write competing resources fixture");
 
         let loaded = load_configuration_with_config(
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &carina_core::parser::ProviderContext::default(),
             &SchemaRegistry::new(),
         )
@@ -1116,7 +1124,7 @@ query {}
         .expect("root fixture must parse");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        &root_dir,
+        &carina_core::paths::ResolvedPath::new(&root_dir).unwrap(),
         &config,
         &SchemaRegistry::new(),
     )
@@ -1208,7 +1216,7 @@ outer {{}}
         .expect("root fixture must parse");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        &root_dir,
+        &carina_core::paths::ResolvedPath::new(&root_dir).unwrap(),
         &config,
         &SchemaRegistry::new(),
     )
@@ -1284,7 +1292,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
 
     let evaluated_error = match incomplete_load().validate_evaluated_config(
         carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
-        Path::new("."),
+        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         true,
         &[],
     ) {
@@ -1295,7 +1303,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     let pair_error = match incomplete_load().validate_config_pair(
         carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(invalid_config()),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
-        Path::new("."),
+        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         true,
         &[],
     ) {
@@ -1321,7 +1329,7 @@ attributes {
     )
     .unwrap();
     let loaded = carina_core::config_loader::load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -1333,7 +1341,7 @@ attributes {
         .validate_config_pair(
             loaded.parsed,
             loaded.unresolved_parsed,
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             false,
             &loaded.duplicate_declarations,
         )
@@ -1380,7 +1388,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     let error = match providers.validate_config_pair(
         carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
         unresolved,
-        Path::new("."),
+        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         false,
         &[],
     ) {
@@ -1412,7 +1420,7 @@ fn plan_style_config_pair_rejects_undefined_deferred_for_iterable() {
     .expect("write root configuration");
 
     let loaded = carina_core::config_loader::load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -1422,7 +1430,7 @@ fn plan_style_config_pair_rejects_undefined_deferred_for_iterable() {
     let error = match providers.validate_config_pair(
         loaded.parsed,
         loaded.unresolved_parsed,
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         false,
         &loaded.duplicate_declarations,
     ) {
@@ -1460,7 +1468,7 @@ fn plan_style_config_pair_rejects_module_internal_undefined_deferred_for_iterabl
     .expect("write root configuration");
 
     let loaded = carina_core::config_loader::load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -1470,7 +1478,7 @@ fn plan_style_config_pair_rejects_module_internal_undefined_deferred_for_iterabl
     let error = match providers.validate_config_pair(
         loaded.parsed,
         loaded.unresolved_parsed,
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         false,
         &loaded.duplicate_declarations,
     ) {
@@ -1522,7 +1530,7 @@ fn plan_style_config_pair_reports_every_undefined_deferred_for_iterable() {
     .expect("write root configuration");
 
     let loaded = carina_core::config_loader::load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -1532,7 +1540,7 @@ fn plan_style_config_pair_reports_every_undefined_deferred_for_iterable() {
     let error = match providers.validate_config_pair(
         loaded.parsed,
         loaded.unresolved_parsed,
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         false,
         &loaded.duplicate_declarations,
     ) {
@@ -1565,8 +1573,11 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let (providers, hard_error) =
-        ProviderLoad::load_reporting(&user_dirs, &[provider.clone(), provider], base.path());
+    let (providers, hard_error) = ProviderLoad::load_reporting(
+        &user_dirs,
+        &[provider.clone(), provider],
+        &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+    );
     assert!(
         hard_error
             .as_ref()
@@ -1576,7 +1587,12 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
 
     let parsed = carina_core::parser::InferredFile::default();
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
-    let report = providers.validation_report(&parsed, base.path(), true, &[]);
+    let report = providers.validation_report(
+        &parsed,
+        &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+        true,
+        &[],
+    );
 
     assert!(report.errors().is_empty());
     assert!(report.schemas().iter().next().is_none());
@@ -1610,7 +1626,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let (factories, errors) = build_factories_from_providers_impl_using(
         &user_dirs,
         &[] as &[carina_core::parser::ExpandedProviderConfig],
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         false,
         &invalid,
         move |_verified| {
@@ -1631,7 +1647,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let result = build_factories_from_providers_impl_using(
         &user_dirs,
         std::slice::from_ref(&config),
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         false,
         &invalid,
         move |_verified| {
@@ -1660,7 +1676,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
     let (factories, errors) = build_factories_from_providers_impl_using(
         &user_dirs,
         &[config],
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         false,
         &valid,
         move |verified| {
@@ -1717,7 +1733,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     let result = build_factories_from_providers_impl_using(
         &user_dirs,
         &configs,
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         true,
         &inputs,
         move |_verified| {
@@ -1744,7 +1760,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
     let (factories, errors) = build_factories_from_providers_impl_using(
         &user_dirs,
         &configs,
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         false,
         &inputs,
         move |_verified| {
@@ -1793,7 +1809,7 @@ async fn aws_credential_load_error_maps_to_typed_startup_error() {
     let result = build_factories_from_providers_impl_using(
         &user_dirs,
         &[config],
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         true,
         &grants,
         |verified| {
@@ -1902,7 +1918,7 @@ where
 {
     carina_core::module_resolver::resolve_modules_with_providerless_config(
         carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
     )
@@ -2344,8 +2360,11 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let installed =
-        carina_provider_resolver::find_file_provider_source(tmp.path(), &config).unwrap();
+    let installed = carina_provider_resolver::find_file_provider_source(
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &config,
+    )
+    .unwrap();
 
     let reported_mismatch = installed.with_load_error(
         carina_plugin_host::WasmProviderLoadError::ProviderNameMismatch {
@@ -2391,7 +2410,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let result = build_factories_from_providers_impl_using(
         &user_dirs,
         std::slice::from_ref(&config),
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         true,
         &inputs,
         |_verified| async {
@@ -2413,7 +2432,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let result = build_factories_from_providers_impl_using(
         &user_dirs,
         std::slice::from_ref(&config),
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         true,
         &trusted_inputs,
         |_verified| async { panic!("trusted identity mismatch must fail before the WASM loader") },
@@ -2429,7 +2448,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let (factories, errors) = build_factories_from_providers_impl_using(
         &user_dirs,
         std::slice::from_ref(&config),
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         false,
         &inputs,
         |_verified| async {
@@ -2471,7 +2490,7 @@ async fn unverified_official_factory_load_case() {
         panic!("official source must be remote")
     };
     let wasm_path = carina_provider_resolver::cache_path_wasm(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &remote_source.source_key(),
         version,
     );
@@ -2487,7 +2506,10 @@ async fn unverified_official_factory_load_case() {
             asset_id: serde_json::from_str("42").unwrap(),
             constraint: None,
         },
-        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
+        sha256: carina_provider_resolver::sha256_file(
+            &carina_core::paths::ResolvedPath::new(&wasm_path).unwrap(),
+        )
+        .unwrap(),
         registry: None,
     });
     lock.save(&project.path().join("carina-providers.lock"))
@@ -2509,7 +2531,7 @@ async fn unverified_official_factory_load_case() {
     let result = build_factories_from_providers_impl_using(
         &user_dirs,
         std::slice::from_ref(&config),
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         false,
         &inputs,
         move |_verified| {
@@ -2613,7 +2635,7 @@ where
     let (mut factories, _) = build_factories_from_providers(
         &user_dirs,
         provider_configs.as_provider_configs(),
-        base_dir,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
     )?;
     factories.extend(LoadedProviderFactory::for_test(fixture_factories));
     let wiring = ValidatedWiring::for_test_with_provider_phase(
@@ -6895,7 +6917,7 @@ fn legacy_loop_detector_resolves_ref_only_ambiguity_through_state_view() {
 
     let parsed = resolve_file_for_test(
         load_configuration_with_config(
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &carina_core::parser::ProviderContext::default(),
             &SchemaRegistry::new(),
         )
@@ -7000,14 +7022,14 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     .expect("write named fixture");
 
     let loaded = load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         loaded.parsed,
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -7182,14 +7204,14 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     .expect("write deferred-loop fixture");
 
     let loaded = load_configuration_with_config(
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
     .expect("load multi-file fixture");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         loaded.parsed,
-        project.path(),
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -10598,7 +10620,9 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
         carina_core::validation::ModuleCallCheckInput {
             authored: &authored,
             semantic: Some(&authored),
-            base_dir: Some(std::path::Path::new(".")),
+            base_dir: Some(
+                &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+            ),
             imported_signatures: &module_signatures,
             provider_context: provider_ctx,
             schemas: ctx.schemas(),
@@ -10972,7 +10996,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(input, config)?;
         Ok(carina_core::module_resolver::resolve_modules_providerless(
             carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )?)
     }
 
@@ -12309,7 +12333,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         parsed => panic!("expected GitHub source: {parsed}"),
     };
     let wasm_path = carina_provider_resolver::revision_resolver::cache_path_revision(
-        base,
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
         &github_source,
         &resolved_sha,
     );
@@ -12335,7 +12359,10 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
             resolved_sha: resolved_sha.clone(),
             artifact_id: test_artifact_id(42),
         },
-        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
+        sha256: carina_provider_resolver::sha256_file(
+            &carina_core::paths::ResolvedPath::new(&wasm_path).unwrap(),
+        )
+        .unwrap(),
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
@@ -12356,7 +12383,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let (factories, errors) = build_factories_from_providers_impl_using(
         &user_dirs,
         &[config],
-        base,
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
         false,
         &inputs,
         move |verified| {
@@ -12423,7 +12450,12 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, errors) = build_factories_from_providers(&user_dirs, &[config], base).unwrap();
+    let (factories, errors) = build_factories_from_providers(
+        &user_dirs,
+        &[config],
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+    )
+    .unwrap();
     let rendered = errors
         .get("awscc")
         .expect("missing locked artifact must reach the CLI diagnostic boundary");
@@ -12452,8 +12484,11 @@ async fn registry_source_reaches_cli_artifact_loader() {
     let ProviderSource::Remote(remote_source) = &provider_source else {
         panic!("registry source must parse as remote")
     };
-    let wasm_path =
-        carina_provider_resolver::cache_path_wasm(base, &remote_source.source_key(), version);
+    let wasm_path = carina_provider_resolver::cache_path_wasm(
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &remote_source.source_key(),
+        version,
+    );
     std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
     std::fs::write(&wasm_path, b"not a wasm component").unwrap();
 
@@ -12465,7 +12500,10 @@ async fn registry_source_reaches_cli_artifact_loader() {
             version: version.into(),
             constraint: None,
         },
-        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
+        sha256: carina_provider_resolver::sha256_file(
+            &carina_core::paths::ResolvedPath::new(&wasm_path).unwrap(),
+        )
+        .unwrap(),
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
@@ -12481,7 +12519,12 @@ async fn registry_source_reaches_cli_artifact_loader() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, errors) = build_factories_from_providers(&user_dirs, &[config], base).unwrap();
+    let (factories, errors) = build_factories_from_providers(
+        &user_dirs,
+        &[config],
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+    )
+    .unwrap();
     let rendered = errors
         .get("awscc")
         .expect("the invalid fixture should fail only after registry resolution");
@@ -12502,8 +12545,11 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     let ProviderSource::Remote(remote_source) = &provider_source else {
         panic!("registry source must parse as remote")
     };
-    let wasm_path =
-        carina_provider_resolver::cache_path_wasm(base, &remote_source.source_key(), version);
+    let wasm_path = carina_provider_resolver::cache_path_wasm(
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+        &remote_source.source_key(),
+        version,
+    );
     std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
     std::fs::write(&wasm_path, b"not a wasm component").unwrap();
 
@@ -12515,7 +12561,10 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
             version: version.into(),
             constraint: None,
         },
-        sha256: carina_provider_resolver::sha256_file(&wasm_path).unwrap(),
+        sha256: carina_provider_resolver::sha256_file(
+            &carina_core::paths::ResolvedPath::new(&wasm_path).unwrap(),
+        )
+        .unwrap(),
         registry: None,
     });
     lock.save(&base.join("carina-providers.lock")).unwrap();
@@ -12530,9 +12579,12 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let (factories, errors) =
-        build_factories_from_providers(&user_dirs, std::slice::from_ref(&config), base)
-            .expect("registry source must reach the single factory-load boundary");
+    let (factories, errors) = build_factories_from_providers(
+        &user_dirs,
+        std::slice::from_ref(&config),
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+    )
+    .expect("registry source must reach the single factory-load boundary");
     let load_error = errors
         .get("awscc")
         .expect("invalid WASM fixture must be reported during factory loading");
@@ -12566,8 +12618,11 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
-    let installed =
-        carina_provider_resolver::find_file_provider_source(tmp.path(), &config).unwrap();
+    let installed = carina_provider_resolver::find_file_provider_source(
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &config,
+    )
+    .unwrap();
 
     let error = runtime_instantiation_error_with_provenance(
         &installed,
@@ -12622,8 +12677,12 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, load_errors) =
-        build_factories_from_providers_for_formatting(&user_dirs, &[config], base).unwrap();
+    let (factories, load_errors) = build_factories_from_providers_for_formatting(
+        &user_dirs,
+        &[config],
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+    )
+    .unwrap();
 
     assert!(factories.is_empty());
     assert!(!load_errors.is_empty());
@@ -12666,11 +12725,14 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         default_tags: IndexMap::new(),
     };
 
-    let runtime_error =
-        match build_factories_from_providers(&user_dirs, std::slice::from_ref(&config), base) {
-            Err(error) => error,
-            Ok(_) => panic!("unversioned provider lock must be returned as an error"),
-        };
+    let runtime_error = match build_factories_from_providers(
+        &user_dirs,
+        std::slice::from_ref(&config),
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("unversioned provider lock must be returned as an error"),
+    };
     let rendered = runtime_error.to_string();
     assert!(
         rendered.contains("predates lock format versioning"),
@@ -12698,8 +12760,12 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     );
     assert!(std::error::Error::source(&runtime_error).is_none());
 
-    let (factories, load_errors) =
-        build_factories_from_providers_for_formatting(&user_dirs, &[config], base).unwrap();
+    let (factories, load_errors) = build_factories_from_providers_for_formatting(
+        &user_dirs,
+        &[config],
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+    )
+    .unwrap();
     assert!(factories.is_empty());
     let formatting_error = load_errors
         .get("carina-providers.lock")
@@ -12766,7 +12832,11 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         default_tags: IndexMap::new(),
     };
 
-    let result = build_factories_from_providers(&user_dirs, &[config], base);
+    let result = build_factories_from_providers(
+        &user_dirs,
+        &[config],
+        &carina_core::paths::ResolvedPath::new(base).unwrap(),
+    );
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("mismatched provider lock must be returned as an error"),
@@ -13538,10 +13608,12 @@ exports { team_prefix: String = "x" }"#,
                 source: std::path::PathBuf::from("../network"),
             });
 
-        let mut cycle_guard = crate::commands::plan::seed_cycle_guard(&consumer_dir);
+        let mut cycle_guard = crate::commands::plan::seed_cycle_guard(
+            &carina_core::paths::ResolvedPath::new(&consumer_dir).unwrap(),
+        );
         let remote_bindings = crate::commands::plan::load_upstream_states(
             &parsed.upstream_states,
-            &consumer_dir,
+            &carina_core::paths::ResolvedPath::new(&consumer_dir).unwrap(),
             &carina_core::parser::ProviderContext::default(),
             &mut cycle_guard,
             crate::commands::plan::UpstreamMissingStatePolicy::Lenient,

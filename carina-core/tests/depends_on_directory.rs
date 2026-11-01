@@ -16,8 +16,11 @@ fn depends_on_resolves_across_sibling_files_in_directory() {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("tests/fixtures/depends_on/basic");
 
-    let parsed = parse_directory(&dir, &ProviderContext::default())
-        .expect("parse_directory should succeed for valid fixture");
+    let parsed = parse_directory(
+        &carina_core::paths::ResolvedPath::new(&dir).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("parse_directory should succeed for valid fixture");
 
     let bucket = parsed
         .resources

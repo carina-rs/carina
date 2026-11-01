@@ -269,7 +269,10 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
 }
 
 fn cli_validate(fixture: &TempDir) -> Vec<String> {
-    carina_cli::commands::validate::validate_with_factories(fixture.path(), factories())
+    carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        factories(),
+    )
 }
 
 const PROVIDERS_CRN: &str = r#"provider aws {

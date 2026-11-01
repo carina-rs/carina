@@ -308,7 +308,10 @@ fn validate_rejects_fake_custom_type_name() {
     let fixture = write_fixture("TotallyMadeUpType");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags
@@ -329,7 +332,10 @@ fn validate_rejects_renamed_legacy_custom_type_name() {
     let fixture = write_fixture("IamOidcProviderArn");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags
@@ -351,7 +357,10 @@ fn validate_rejects_fake_dotted_custom_type() {
     let fixture = write_fixture("list(aws.iam.TotallyFake.Arn)");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags.iter().any(|d| {
@@ -372,7 +381,10 @@ fn validate_rejects_fake_dotted_custom_type_without_bad_suggestion() {
     let fixture = write_fixture("aws.foo.TotallyMadeUp.Xyz");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags.iter().any(|d| {
@@ -398,7 +410,10 @@ fn validate_rejects_wider_bare_provider_dotted_type() {
     let fixture = write_fixture("aws.Arn");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags
@@ -417,7 +432,10 @@ fn validate_accepts_registered_dotted_custom_type() {
     let fixture = write_fixture("list(aws.iam.Policy.Arn)");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         !diags.iter().any(|d| d.contains("unknown custom type")),
@@ -434,7 +452,10 @@ fn validate_snake_case_suggests_dotted_registered_identity() {
     let fixture = write_fixture("iam_policy_arn");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags.iter().any(|d| {
@@ -462,7 +483,7 @@ fn validate_suggests_full_identity_for_non_final_segment_typo() {
     let caller = fixture.path().join("caller");
 
     let diags = carina_cli::commands::validate::validate_with_factories(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         factories_with_generic_arn(),
     );
 
@@ -494,7 +515,7 @@ fn validate_no_suggestion_for_far_dotted_typo() {
     let caller = fixture.path().join("caller");
 
     let diags = carina_cli::commands::validate::validate_with_factories(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         factories_with_generic_arn(),
     );
 
@@ -524,7 +545,7 @@ fn validate_suggests_for_distance1_final_segment_typo() {
     let caller = fixture.path().join("caller");
 
     let diags = carina_cli::commands::validate::validate_with_factories(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         factories_with_generic_arn(),
     );
 
@@ -550,7 +571,10 @@ fn validate_accepts_builtin_custom_type_name() {
     let fixture = write_fixture("Ipv4Cidr");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         !diags.iter().any(|d| d.contains("unknown custom type")),
@@ -565,7 +589,10 @@ fn validate_routes_registered_bare_identity_through_its_provider_owner() {
     let fixture = write_fixture("TestToken");
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags
@@ -605,7 +632,7 @@ let vpc = awscc.ec2.Vpc {
     .unwrap();
 
     let diags = carina_cli::commands::validate::validate_with_factories(
-        &dir.path().join("inner"),
+        &carina_core::paths::ResolvedPath::new(dir.path().join("inner")).unwrap(),
         factories(),
     );
 
@@ -641,7 +668,7 @@ exports {
     .unwrap();
 
     let diags = carina_cli::commands::validate::validate_with_factories(
-        &dir.path().join("inner"),
+        &carina_core::paths::ResolvedPath::new(dir.path().join("inner")).unwrap(),
         factories(),
     );
 
@@ -669,7 +696,10 @@ fn validate_rejects_fake_custom_type_in_standalone_module() {
     let fixture = write_fixture("TotallyMadeUpType");
     let inner = fixture.path().join("inner");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&inner, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&inner).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags

@@ -1397,15 +1397,17 @@ mod tests {
         )
         .expect("write deferred loop fixture");
         let parsed = carina_core::config_loader::parse_directory(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &carina_core::parser::ProviderContext::default(),
         )
         .expect("parse deferred loop fixture");
-        let mut parsed =
-            carina_core::module_resolver::resolve_modules_providerless(parsed, fixture.path())
-                .expect("cross the deferred-body resolution seam")
-                .into_expanded(&carina_core::schema::SchemaRegistry::new())
-                .expect("deferred loop fixture must contain no parser placeholders");
+        let mut parsed = carina_core::module_resolver::resolve_modules_providerless(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        )
+        .expect("cross the deferred-body resolution seam")
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .expect("deferred loop fixture must contain no parser placeholders");
         let template = parsed
             .deferred_for_expressions_mut()
             .pop()

@@ -1,7 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use carina_core::paths::{CanonicalPath, DisplayPath};
 
 use crate::provider_trust::{ProviderTrust, ProviderTrustClass};
 
@@ -20,12 +22,23 @@ impl GrantOrigin {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TrustedLocalGrant {
-    canonical_path: PathBuf,
+    canonical_path: CanonicalPath,
+    display_path: DisplayPath,
     class: ProviderTrustClass,
     origin: GrantOrigin,
 }
+
+impl PartialEq for TrustedLocalGrant {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_path == other.canonical_path
+            && self.class == other.class
+            && self.origin == other.origin
+    }
+}
+
+impl Eq for TrustedLocalGrant {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedLocalGrants(Vec<TrustedLocalGrant>);
@@ -55,10 +68,10 @@ impl TrustedLocalGrants {
         Ok(Self(grants))
     }
 
-    pub(crate) fn matching(&self, canonical_path: &Path) -> Option<&TrustedLocalGrant> {
+    pub(crate) fn matching(&self, canonical_path: &CanonicalPath) -> Option<&TrustedLocalGrant> {
         self.0
             .iter()
-            .find(|grant| grant.canonical_path == canonical_path)
+            .find(|grant| &grant.canonical_path == canonical_path)
     }
 }
 
@@ -70,7 +83,7 @@ impl TrustedLocalGrant {
     pub(crate) fn notice(&self) -> String {
         format!(
             "carina: trusting local provider {} as {} ({})",
-            self.canonical_path.display(),
+            self.display_path,
             trust_class_name(self.class),
             self.origin.label(),
         )
@@ -88,6 +101,11 @@ pub enum GrantParseError {
     NotWasm {
         value: String,
     },
+    Absolutize {
+        value: String,
+        path: PathBuf,
+        source: io::Error,
+    },
     Canonicalize {
         value: String,
         path: PathBuf,
@@ -95,7 +113,7 @@ pub enum GrantParseError {
     },
     NotAFile {
         value: String,
-        path: PathBuf,
+        path: DisplayPath,
     },
     UnknownKind {
         value: String,
@@ -104,7 +122,7 @@ pub enum GrantParseError {
         value: OsString,
     },
     ConflictingGrant {
-        path: PathBuf,
+        path: DisplayPath,
         first_kind: ProviderTrustClass,
         second_kind: ProviderTrustClass,
     },
@@ -125,19 +143,20 @@ impl fmt::Display for GrantParseError {
                 formatter,
                 "invalid trusted local provider grant {value:?}: provider path must name a .wasm file"
             ),
-            Self::Canonicalize {
-                value,
-                path,
-                source,
-            } => write!(
+            Self::Absolutize { value, path, .. } => write!(
                 formatter,
-                "invalid trusted local provider grant {value:?}: failed to canonicalize {}: {source}",
+                "invalid trusted local provider grant {value:?}: failed to make {} absolute",
+                path.display()
+            ),
+            Self::Canonicalize { value, path, .. } => write!(
+                formatter,
+                "invalid trusted local provider grant {value:?}: failed to canonicalize {}",
                 path.display()
             ),
             Self::NotAFile { value, path } => write!(
                 formatter,
                 "invalid trusted local provider grant {value:?}: {} is not a file",
-                path.display()
+                path
             ),
             Self::UnknownKind { value } => write!(
                 formatter,
@@ -154,7 +173,7 @@ impl fmt::Display for GrantParseError {
             } => write!(
                 formatter,
                 "conflicting trusted local provider grants for {}: KIND is both {} and {}",
-                path.display(),
+                path,
                 trust_class_name(*first_kind),
                 trust_class_name(*second_kind)
             ),
@@ -165,7 +184,7 @@ impl fmt::Display for GrantParseError {
 impl std::error::Error for GrantParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Canonicalize { source, .. } => Some(source),
+            Self::Absolutize { source, .. } | Self::Canonicalize { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -183,7 +202,7 @@ fn insert_grant(
             return Ok(());
         }
         return Err(GrantParseError::ConflictingGrant {
-            path: grant.canonical_path,
+            path: grant.display_path,
             first_kind: existing.class,
             second_kind: grant.class,
         });
@@ -209,16 +228,26 @@ fn parse_grant(value: &str, origin: GrantOrigin) -> Result<TrustedLocalGrant, Gr
             value: value.to_string(),
         });
     }
-    let canonical_path =
-        std::fs::canonicalize(&path).map_err(|source| GrantParseError::Canonicalize {
+    let display_path = DisplayPath::new(&path).map_err(|source| GrantParseError::Absolutize {
+        value: value.to_string(),
+        path: path.clone(),
+        source,
+    })?;
+    let resolved_path = carina_core::paths::ResolvedPath::new(&path)
+        .and_then(|file| {
+            file.metadata()?;
+            Ok(file)
+        })
+        .map_err(|source| GrantParseError::Canonicalize {
             value: value.to_string(),
             path: path.clone(),
             source,
         })?;
-    if !canonical_path.is_file() {
+    let canonical_path = resolved_path.identity();
+    if !resolved_path.is_file() {
         return Err(GrantParseError::NotAFile {
             value: value.to_string(),
-            path: canonical_path,
+            path: display_path,
         });
     }
     let class = match kind {
@@ -232,6 +261,7 @@ fn parse_grant(value: &str, origin: GrantOrigin) -> Result<TrustedLocalGrant, Gr
     };
     Ok(TrustedLocalGrant {
         canonical_path,
+        display_path,
         class,
         origin,
     })
@@ -248,6 +278,48 @@ fn trust_class_name(class: ProviderTrustClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn grant_absolutize_error_retains_its_distinct_operation_and_source() {
+        let error = GrantParseError::Absolutize {
+            value: "provider.wasm=aws".into(),
+            path: PathBuf::from("provider.wasm"),
+            source: io::Error::new(io::ErrorKind::NotFound, "current directory unavailable"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("absolute"), "{message}");
+        assert!(!message.contains("canonicalize"), "{message}");
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grant_notice_and_conflict_preserve_symlink_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let provider = link.join("provider.wasm");
+        std::fs::write(&provider, b"provider").unwrap();
+        let grants = TrustedLocalGrants::parse(&[grant(&provider, "aws")], None).unwrap();
+        let notice = grants.0[0].notice();
+        assert!(notice.contains(&provider.display().to_string()), "{notice}");
+        assert!(!notice.contains(&real.display().to_string()), "{notice}");
+
+        let error = TrustedLocalGrants::parse(
+            &[
+                grant(&real.join("provider.wasm"), "aws"),
+                grant(&provider, "github"),
+            ],
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&provider.display().to_string()), "{error}");
+        assert!(!error.contains(&real.display().to_string()), "{error}");
+    }
 
     fn grant(path: &Path, kind: &str) -> String {
         format!("{}={kind}", path.display())
@@ -264,8 +336,8 @@ mod tests {
 
         let grants = TrustedLocalGrants::parse(&[], env.to_str()).unwrap();
 
-        let aws_path = std::fs::canonicalize(&aws).unwrap();
-        let github_path = std::fs::canonicalize(&github).unwrap();
+        let aws_path = CanonicalPath::new(&aws).unwrap();
+        let github_path = CanonicalPath::new(&github).unwrap();
         assert_eq!(
             grants.matching(&aws_path).unwrap().trust().class(),
             ProviderTrustClass::Aws
@@ -340,7 +412,7 @@ mod tests {
 
         assert!(
             grants
-                .matching(&std::fs::canonicalize(provider).unwrap())
+                .matching(&CanonicalPath::new(provider).unwrap())
                 .is_some()
         );
     }
@@ -360,7 +432,7 @@ mod tests {
 
         assert!(matches!(&error, GrantParseError::ConflictingGrant { .. }));
         assert!(error.to_string().contains("conflicting"));
-        assert!(error.to_string().contains(&provider.display().to_string()));
+        assert!(error.to_string().contains(&alias.display().to_string()));
     }
 
     #[test]
@@ -384,14 +456,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let provider = temp.path().join("provider.wasm");
         std::fs::write(&provider, b"provider").unwrap();
-        let canonical = std::fs::canonicalize(&provider).unwrap();
+        let canonical = CanonicalPath::new(&provider).unwrap();
         let grants = TrustedLocalGrants::parse(&[grant(&provider, "aws")], None).unwrap();
 
         assert_eq!(
             grants.matching(&canonical).unwrap().notice(),
             format!(
                 "carina: trusting local provider {} as aws (--trust-local-provider)",
-                canonical.display()
+                provider.display()
             )
         );
     }
@@ -401,7 +473,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let provider = temp.path().join("provider.wasm");
         std::fs::write(&provider, b"provider").unwrap();
-        let canonical = std::fs::canonicalize(&provider).unwrap();
+        let canonical = CanonicalPath::new(&provider).unwrap();
         let value = grant(&provider, "github");
         let grants = TrustedLocalGrants::parse(&[], Some(&value)).unwrap();
 
@@ -409,7 +481,7 @@ mod tests {
             grants.matching(&canonical).unwrap().notice(),
             format!(
                 "carina: trusting local provider {} as github (CARINA_TRUST_LOCAL_PROVIDER)",
-                canonical.display()
+                provider.display()
             )
         );
     }

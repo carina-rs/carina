@@ -128,7 +128,7 @@ fn cli_diagnostics_at(
     path: &std::path::Path,
 ) -> Vec<String> {
     carina_cli::commands::validate::validate_with_factories(
-        path,
+        &carina_core::paths::ResolvedPath::new(path).unwrap(),
         carina_cli::wiring::LoadedProviderFactory::for_test(factories),
     )
 }
@@ -138,7 +138,7 @@ fn cli_validated_file(
     fixture: &TempDir,
 ) -> carina_core::parser::ExpandedInferredFile {
     let loaded = carina_core::config_loader::load_configuration_with_config(
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -150,7 +150,12 @@ fn cli_validated_file(
         &parsed.providers,
     );
     let validated = providers
-        .validate_evaluated_config(parsed, fixture.path(), false, &duplicate_declarations)
+        .validate_evaluated_config(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            false,
+            &duplicate_declarations,
+        )
         .expect("CLI validation fixture must pass");
     validated.evaluated_resources_for_test().clone()
 }
@@ -298,14 +303,14 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
     let context = loaded_providers.provider_context();
     let schemas = loaded_providers.schema_registry();
     let directory = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
-        base_dir,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
         context,
         &HashMap::new(),
     )
     .expect("the fixture directory must parse before module expansion");
     let signatures = carina_core::module_resolver::load_resolved_module_signatures(
         &directory.parsed,
-        base_dir,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
         context,
     );
     let binding_use_report = carina_core::validation::check_bare_binding_uses(
@@ -326,7 +331,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
         carina_core::validation::ModuleCallCheckInput {
             authored: &directory.parsed,
             semantic: Some(&directory.parsed),
-            base_dir: Some(base_dir),
+            base_dir: Some(&carina_core::paths::ResolvedPath::new(base_dir).unwrap()),
             imported_signatures: &signatures,
             provider_context: context,
             schemas,
@@ -337,7 +342,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
     );
     match carina_core::module_resolver::resolve_modules_with_diagnostics(
         &directory.parsed,
-        base_dir,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
         context,
         schemas,
         &covered_findings,
@@ -1018,7 +1023,7 @@ fn standalone_module_type_resolution_keeps_cli_location_and_lsp_range() {
     };
     let directory_failure =
         match carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
-            &module,
+            &carina_core::paths::ResolvedPath::new(&module).unwrap(),
             &strict_context,
             &HashMap::new(),
         ) {
@@ -3338,7 +3343,7 @@ awscc.cloudfront.Distribution {
 "#,
     )]);
     let bootstrap = carina_core::config_loader::load_configuration_with_config(
-        matching.path(),
+        &carina_core::paths::ResolvedPath::new(matching.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -3464,14 +3469,14 @@ awscc.cloudfront.Distribution {
 
     let config = carina_core::parser::ProviderContext::default();
     let loaded = carina_core::config_loader::load_configuration_with_config(
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &config,
         &schemas,
     )
     .expect("load caller configuration");
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         loaded.parsed,
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &config,
         &schemas,
     )

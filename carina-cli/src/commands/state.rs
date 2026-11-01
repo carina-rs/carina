@@ -6,7 +6,7 @@ use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::config_loader::load_configuration_with_config;
 use carina_core::data_source_value::DataSourceValue;
 #[cfg(test)]
 use carina_core::deps::sort_resources_by_dependencies;
@@ -118,8 +118,8 @@ fn format_deferred_state_refresh_warning(
 /// degrade silently to no candidates. Older files are migrated in memory;
 /// future versions print the version-gate error and produce no candidates.
 fn read_local_state_for_completion() -> Option<StateFile> {
-    let path = std::path::Path::new("carina.state.json");
-    let contents = std::fs::read_to_string(path).ok()?;
+    let path = carina_core::paths::ResolvedPath::new("carina.state.json").ok()?;
+    let contents = path.read_to_string().ok()?;
     match parse_local_state_for_completion(&contents) {
         Ok(state) => Some(state),
         Err(e @ BackendError::StateVersionTooNew { .. }) => {
@@ -495,8 +495,11 @@ pub async fn run_state_forget(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let address = state_forget_address(namespaced_type, identity)?;
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let loaded = load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
@@ -505,8 +508,14 @@ pub async fn run_state_forget(
         .backend
         .map(carina_core::parser::BackendConfig::into_expanded)
         .transpose()?;
-    let verified_backend =
-        verify_for_mutation(path, backend_config.as_ref(), DriftCommand::ForgetState)?;
+    super::apply::symlink_retarget_test_barrier("CARINA_TEST_STATE_FORGET_CONFIG_HANDSHAKE_DIR")
+        .await;
+    let verified_backend = verify_for_mutation(
+        base_dir,
+        path,
+        backend_config.as_ref(),
+        DriftCommand::ForgetState,
+    )?;
     let backend = verified_backend
         .resolve()
         .await
@@ -588,13 +597,15 @@ pub async fn run_force_unlock(
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let parsed = load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?
     .parsed;
-    let base_dir = get_base_dir(path);
     let backend_config = parsed
         .backend
         .clone()
@@ -646,8 +657,11 @@ async fn load_state_file(
     let default_path = PathBuf::from(".");
     let path = path.unwrap_or(&default_path);
 
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let loaded = load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
@@ -658,7 +672,6 @@ async fn load_state_file(
         .map(carina_core::parser::BackendConfig::into_expanded)
         .transpose()?;
 
-    let base_dir = get_base_dir(path);
     let backend = resolve_backend_for_read(
         base_dir,
         path,
@@ -1260,8 +1273,11 @@ async fn run_state_bucket_delete(
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let loaded = load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
@@ -1284,7 +1300,6 @@ async fn run_state_bucket_delete(
     let selection = BackendSelection::for_bucket_delete(settings, bucket_name)
         .map_err(|error| AppError::Config(error.into_message()))?;
 
-    let base_dir = get_base_dir(path);
     // Provider loading depends only on the authored source/version. Validate
     // that command wiring before asking the operator to confirm deletion; the
     // resolved provider values needed for construction can wait until after
@@ -1400,7 +1415,7 @@ fn state_bucket_delete_request(
 
 async fn load_state_bucket_delete_provider_inputs<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
-    base_dir: &Path,
+    base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
@@ -1436,20 +1451,25 @@ pub async fn run_state_refresh(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let loaded = load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
-    let base_dir = get_base_dir(path);
+    super::apply::symlink_retarget_test_barrier("CARINA_TEST_STATE_REFRESH_CONFIG_HANDSHAKE_DIR")
+        .await;
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
+        base_dir,
         path,
         validated_config.resources().backend.as_ref(),
         DriftCommand::RefreshState,
@@ -1506,7 +1526,7 @@ pub(crate) async fn run_state_refresh_locked(
     mut validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
-    base_dir: &std::path::Path,
+    base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
@@ -2754,14 +2774,14 @@ mod tests {
 
     fn resolve_file_for_test<E>(
         parsed: carina_core::parser::ExpandedFile<E>,
-        _base_dir: &Path,
+        _base_dir: &carina_core::paths::ResolvedPath,
     ) -> carina_core::parser::ExpandedFile<E> {
         parsed
     }
 
     fn resolve_authored_file_for_test<E>(
         parsed: carina_core::parser::File<E>,
-        base_dir: &Path,
+        base_dir: &carina_core::paths::ResolvedPath,
     ) -> carina_core::parser::ExpandedFile<
         <E::Absolute as carina_core::parser::IntoExpandedExportParam<
             carina_core::resource::AbsoluteBindingAddress,
@@ -2985,7 +3005,10 @@ mod tests {
     #[tokio::test]
     async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = resolve_authored_file_for_test(parsed, &downstream);
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        );
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
@@ -3001,7 +3024,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -3032,7 +3055,10 @@ mod tests {
                 binding: carina_core::resource::RelativeBindingName::new("unrelated"),
                 source: PathBuf::from("../unrelated"),
             });
-        let parsed = resolve_authored_file_for_test(parsed, &downstream);
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        );
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
@@ -3045,7 +3071,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -3064,7 +3090,10 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
-        let parsed = resolve_authored_file_for_test(parsed, &downstream);
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        );
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
@@ -3078,7 +3107,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -3119,11 +3148,16 @@ mod tests {
         .unwrap();
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        )
+        .unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-                &downstream,
+                &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
                 true,
                 &[],
             )
@@ -3133,7 +3167,7 @@ mod tests {
             validated_config,
             backend.as_ref(),
             StateLock::disabled_for_test().as_ref(),
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -3146,11 +3180,16 @@ mod tests {
         let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
+        )
+        .unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-                &base_dir,
+                &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
                 true,
                 &[],
             )
@@ -3160,7 +3199,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            &base_dir,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -3173,11 +3212,16 @@ mod tests {
         let user_dirs = carina_core::TestUserDirs::new();
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = non_empty_refresh_backend("mock");
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base_dir).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
+        )
+        .unwrap();
         let validated_config = providers
             .validate_evaluated_config(
                 carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-                &base_dir,
+                &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
                 true,
                 &[],
             )
@@ -3187,7 +3231,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            &base_dir,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -3198,10 +3242,13 @@ mod tests {
     #[tokio::test]
     async fn state_bucket_delete_prepares_resolved_upstream_provider_config() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
-        let parsed = resolve_authored_file_for_test(parsed, &downstream);
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        );
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
         )
         .await
@@ -3255,11 +3302,14 @@ mod tests {
                 .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
         )
         .unwrap();
-        let parsed = resolve_authored_file_for_test(parsed, &downstream);
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        );
 
         let error = match load_state_bucket_delete_provider_inputs(
             &parsed,
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
         )
         .await
@@ -3280,10 +3330,13 @@ mod tests {
     async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
         let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
         parsed.providers[0].name = "test".to_string();
-        let parsed = resolve_authored_file_for_test(parsed, &base_dir);
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
+        );
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
-            &base_dir,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
             &ProviderContext::default(),
         )
         .await
@@ -3335,11 +3388,14 @@ mod tests {
                 .contains_key("default_tags"),
             "the fixture must exercise the parser shape used by bucket delete"
         );
-        let parsed = resolve_authored_file_for_test(parsed, temp.path());
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
 
         let inputs = load_state_bucket_delete_provider_inputs(
             &parsed,
-            temp.path(),
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::default(),
         )
         .await
@@ -3679,7 +3735,10 @@ mod tests {
         parsed
             .data_sources
             .push(DataSource::with_provider("test", "lookup", "second", None));
-        let parsed = resolve_file_for_test(parsed, Path::new("."));
+        let parsed = resolve_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        );
         let backend = non_empty_refresh_backend("test");
         let root = ShutdownToken::running();
         let (trigger, cancel) = root.with_graceful_shutdown_trigger();
@@ -3699,7 +3758,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            temp.path(),
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::default(),
             cancel,
         )
@@ -3764,7 +3823,10 @@ mod tests {
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
-        let parsed = resolve_file_for_test(parsed, Path::new("."));
+        let parsed = resolve_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        );
 
         let mut state = StateFile::new();
         state
@@ -3789,7 +3851,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            temp.path(),
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -3842,7 +3904,10 @@ mod tests {
             binding: None,
         });
         parsed.compositions.push(composition);
-        let parsed = resolve_file_for_test(parsed, Path::new("."));
+        let parsed = resolve_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        );
 
         let mut state = StateFile::new();
         state
@@ -3865,7 +3930,7 @@ mod tests {
             validated_config,
             &backend,
             StateLock::disabled_for_test().as_ref(),
-            temp.path(),
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::default(),
             ShutdownToken::running(),
         )
@@ -4446,7 +4511,10 @@ mod tests {
         )
         .expect("test config should parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
-        let parsed = resolve_authored_file_for_test(parsed, Path::new("."));
+        let parsed = resolve_authored_file_for_test(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        );
 
         let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let source = parsed

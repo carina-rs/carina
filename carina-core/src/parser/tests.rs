@@ -656,7 +656,7 @@ where
 {
     crate::module_resolver::resolve_modules_with_providerless_config(
         crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         &ProviderContext::default(),
         &crate::schema::SchemaRegistry::new(),
     )
@@ -4304,8 +4304,12 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     .unwrap();
 
     let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-        parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
-        tmp.path(),
+        parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ProviderContext::default(),
+        )
+        .unwrap(),
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &ProviderContext::default(),
         &crate::schema::SchemaRegistry::new(),
     )
@@ -4347,8 +4351,12 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     .unwrap();
 
     let parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-        parse_directory(tmp.path(), &ProviderContext::default()).unwrap(),
-        tmp.path(),
+        parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ProviderContext::default(),
+        )
+        .unwrap(),
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &ProviderContext::default(),
         &crate::schema::SchemaRegistry::new(),
     )
@@ -12137,7 +12145,10 @@ let vpc = awscc.ec2.Vpc {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), main_input).unwrap();
     std::fs::write(fixture.path().join("exports.crn"), exports_input).unwrap();
-    let loaded = crate::config_loader::load_configuration(fixture.path()).unwrap();
+    let loaded = crate::config_loader::load_configuration(
+        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+    )
+    .unwrap();
 
     let unused = crate::validation::check_unused_bindings(&loaded.authored_bindings);
     assert!(
@@ -13065,7 +13076,7 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
     ));
     let err = crate::module_resolver::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect_err("finalization must reject the bare undefined iterable");
     let crate::module_resolver::ModuleError::Parse(parse_error) = err.root_cause() else {
@@ -14123,12 +14134,18 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("directory fixture must parse");
-    let parsed = resolve_modules(parsed, tmp.path())
-        .expect("module expansion must succeed")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("module fixture contains no parser placeholders");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("directory fixture must parse");
+    let parsed = resolve_modules(
+        parsed,
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+    )
+    .expect("module expansion must succeed")
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("module fixture contains no parser placeholders");
     let record = parsed
         .resources
         .iter()
@@ -14167,8 +14184,11 @@ fn parse_directory_preserves_direct_attr_dotted_string_literal() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("directory fixture must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("directory fixture must parse");
     let target = parsed
         .resources
         .iter()
@@ -14212,8 +14232,11 @@ fn parse_directory_preserves_export_param_dotted_string_literal() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("directory fixture must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("directory fixture must parse");
     let export = parsed
         .export_params
         .iter()
@@ -14331,8 +14354,11 @@ fn parse_subscript_on_upstream_state_in_sibling_file() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream subscript must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("cross-file upstream subscript must parse");
     let res = parsed
         .resources
         .iter()
@@ -14387,8 +14413,11 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream subscript inside ${...} must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("cross-file upstream subscript inside ${...} must parse");
     let res = parsed
         .resources
         .iter()
@@ -14460,8 +14489,11 @@ fn parse_dot_notation_on_upstream_state_in_sibling_file() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream dot-notation must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("cross-file upstream dot-notation must parse");
     let res = parsed
         .resources
         .iter()
@@ -14511,8 +14543,11 @@ fn parse_dot_notation_on_upstream_state_inside_string_interpolation_sibling_file
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("cross-file upstream dot-notation inside ${...} must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("cross-file upstream dot-notation inside ${...} must parse");
     let res = parsed
         .resources
         .iter()
@@ -14584,8 +14619,11 @@ fn parse_directory_resolves_sibling_user_fn_with_static_args() {
     use crate::config_loader::parse_directory;
     let tmp = sibling_user_fn_fixture("timestamp()");
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("sibling-file user-fn with static args must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("sibling-file user-fn with static args must parse");
     let res = parsed
         .resources
         .iter()
@@ -14606,8 +14644,11 @@ fn parse_directory_folds_coalesce_after_sibling_function_resolves() {
     use crate::config_loader::parse_directory;
     let tmp = sibling_user_fn_fixture("timestamp() ?? 'fallback'");
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("sibling-file function in coalesce must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("sibling-file function in coalesce must parse");
     let value = parsed
         .resources
         .iter()
@@ -14643,8 +14684,11 @@ fn parse_directory_resolves_sibling_function_in_coalesce_default() {
     )
     .unwrap();
 
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("sibling function in a coalesce default should resolve");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("sibling function in a coalesce default should resolve");
     let selected = parsed.variables.get("selected");
     let Some(Value::Deferred(DeferredValue::Coalesce { default, .. })) = selected else {
         panic!("unresolved left should retain coalesce, got {selected:?}")
@@ -14660,7 +14704,10 @@ fn parse_directory_truly_undefined_fn_with_static_args_still_errors() {
     use crate::config_loader::parse_directory;
     let tmp = sibling_user_fn_fixture("no_such_fn()");
 
-    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    let result = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    );
     assert!(
         result.is_err(),
         "directory parse must error when calling a fn that exists nowhere in the directory"
@@ -14694,8 +14741,11 @@ fn parse_directory_resolves_sibling_user_fn_in_top_level_let() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("top-level `let` calling a sibling user-fn must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("top-level `let` calling a sibling user-fn must parse");
     let v = parsed
         .variables
         .get("v")
@@ -14726,7 +14776,10 @@ fn parse_directory_truly_undefined_fn_in_top_level_let_still_errors() {
         "#,
     )
     .unwrap();
-    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    let result = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    );
     assert!(
         result.is_err(),
         "top-level `let v = no_such_fn()` must error when no `fn no_such_fn` exists in the directory"
@@ -14748,8 +14801,11 @@ fn parse_directory_resolves_sibling_user_fn_in_let_list() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("helpers.crn"), "fn ts() { \"2026\" }\n").unwrap();
     std::fs::write(tmp.path().join("main.crn"), "let xs = [ts(), \"static\"]\n").unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("List containing sibling user-fn must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("List containing sibling user-fn must parse");
     let v = parsed.variables.get("xs").expect("xs present");
     match v {
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -14774,8 +14830,11 @@ fn parse_directory_resolves_sibling_user_fn_in_let_map() {
         "let m = { created_at = ts() }\n",
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("Map containing sibling user-fn must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("Map containing sibling user-fn must parse");
     let v = parsed.variables.get("m").expect("m present");
     match v {
         Value::Concrete(ConcreteValue::Map(map)) => {
@@ -14799,8 +14858,11 @@ fn parse_directory_resolves_sibling_user_fn_in_let_interpolation() {
         "let s = \"prefix-${ts()}-suffix\"\n",
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("Interpolation containing sibling user-fn must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("Interpolation containing sibling user-fn must parse");
     let v = parsed.variables.get("s").expect("s present");
     assert!(
         matches!(v, Value::Concrete(ConcreteValue::String(s)) if s == "prefix-2026-suffix"),
@@ -14818,7 +14880,10 @@ fn parse_directory_truly_undefined_fn_in_let_list_still_errors() {
         "let xs = [no_such_fn(), \"static\"]\n",
     )
     .unwrap();
-    let result = parse_directory(tmp.path(), &ProviderContext::default());
+    let result = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    );
     assert!(
         result.is_err(),
         "List containing a truly-undefined fn must error"
@@ -15220,8 +15285,11 @@ fn parse_duration_in_directory_scoped_fixture() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file fixture with a Duration must parse");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("multi-file fixture with a Duration must parse");
     let cert = parsed
         .resources
         .iter()
@@ -15533,8 +15601,11 @@ fn parse_provider_expr_named_instance_visible_across_files() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("multi-file directory parse must succeed");
 
     assert_eq!(
         parsed.providers.len(),
@@ -15810,8 +15881,11 @@ fn extract_directives_provider_visible_across_files() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("multi-file directory parse must succeed");
     let cert = parsed
         .resources
         .iter()
@@ -16007,8 +16081,11 @@ fn check_provider_instance_routing_multi_file_named_instance() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("multi-file directory parse must succeed");
     let errs = crate::parser::check_provider_instance_routing(&parsed);
     assert!(
         errs.is_empty(),
@@ -16066,8 +16143,11 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
         "#,
     )
     .unwrap();
-    let parsed = parse_directory(tmp.path(), &ProviderContext::default())
-        .expect("multi-file directory parse must succeed");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("multi-file directory parse must succeed");
 
     let us = parsed
         .providers
@@ -16495,8 +16575,11 @@ fn postfix_index_on_sibling_let_bound_computed_value_is_directory_scoped() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("sibling let-bound computed value must be visible to postfix access");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("sibling let-bound computed value must be visible to postfix access");
     let value = parsed
         .export_params
         .iter()
@@ -16777,8 +16860,11 @@ fn lexical_child_scope_ids_are_unique_across_sibling_files() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("parse sibling lexical scopes");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("parse sibling lexical scopes");
     let uses = parsed
         .bare_binding_uses()
         .uses()
@@ -17037,8 +17123,11 @@ fn directory_function_resolution_reports_the_authored_call_line() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("an unknown deferred function must fail after directory resolution");
+    let error = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect_err("an unknown deferred function must fail after directory resolution");
     assert!(
         error.contains("at line 3"),
         "expected the authored function-call line, got {error}",
@@ -17056,8 +17145,11 @@ fn deferred_call_in_user_function_body_reports_the_body_line() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("a deferred call in a function body must fail after directory resolution");
+    let error = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect_err("a deferred call in a function body must fail after directory resolution");
     assert!(
         error.contains("at line 2"),
         "expected the function-body expression line, got {error}",
@@ -17169,8 +17261,11 @@ let name = resource_name(vpc)
     context
         .resource_types
         .insert(("mock".to_string(), "test.Thing".to_string()));
-    let parsed = parse_directory(directory.path(), &context)
-        .expect("Ref-typed parameters accept resources declared in sibling files");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+    )
+    .expect("Ref-typed parameters accept resources declared in sibling files");
 
     assert_resource_reference_shape(
         parsed.variables.get("name").expect("function result"),
@@ -17283,8 +17378,11 @@ fn forward_structural_handle_is_pending_after_directory_kind_resolution() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a forward structural handle reaches typed validation");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("a forward structural handle reaches typed validation");
     let consumer = parsed
         .resources
         .iter()
@@ -17314,8 +17412,11 @@ fn sibling_structural_handle_is_pending_after_directory_kind_resolution() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a sibling structural handle reaches typed validation");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("a sibling structural handle reaches typed validation");
     let consumer = parsed
         .resources
         .iter()
@@ -17347,8 +17448,11 @@ fn integer_arithmetic_rejects_a_structural_handle_from_a_sibling_file_in_both_po
         )
         .unwrap();
 
-        let error = parse_directory(directory.path(), &ProviderContext::default())
-            .expect_err("a resource handle cannot be an arithmetic operand");
+        let error = parse_directory(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &ProviderContext::default(),
+        )
+        .expect_err("a resource handle cannot be an arithmetic operand");
         assert!(
             error.contains("'b' is a resource, not a value"),
             "expression {expression:?} produced an unexpected diagnostic: {error}"
@@ -17386,8 +17490,11 @@ fn forward_value_binding_remains_a_value() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a forward value binding remains valid");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("a forward value binding remains valid");
     assert_eq!(
         resource_attribute(&parsed, "test.Consumer", "name"),
         Value::Concrete(ConcreteValue::String("value".into())),
@@ -17419,8 +17526,11 @@ let us = provider mock {}
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("directives accept typed sibling handles");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("directives accept typed sibling handles");
     let consumer = parsed
         .resources
         .iter()
@@ -17577,8 +17687,11 @@ fn postfix_access_preserves_sibling_deferred_for_binding_as_resource_address() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("sibling structural bindings must be typed as references");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("sibling structural bindings must be typed as references");
     let value = |name: &str| {
         parsed
             .export_params
@@ -17657,8 +17770,11 @@ fn sibling_structural_alias_field_access_uses_the_canonical_resource() {
     )
     .unwrap();
 
-    let parsed = parse_directory(directory.path(), &ProviderContext::default())
-        .expect("a sibling structural alias remains typed through the fixed point");
+    let parsed = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("a sibling structural alias remains typed through the fixed point");
     let value = resource_attribute(&parsed, "test.Consumer", "name");
     assert_eq!(
         value,
@@ -17717,8 +17833,11 @@ fn sibling_computed_handles_keep_the_bare_handle_diagnostic() {
     )
     .unwrap();
 
-    let error = parse_directory(directory.path(), &ProviderContext::default())
-        .expect_err("the sibling value cannot contain a bare resource handle");
+    let error = parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect_err("the sibling value cannot contain a bare resource handle");
     let message = error.to_string();
     assert!(
         message.contains("'q' is a resource, not a value"),

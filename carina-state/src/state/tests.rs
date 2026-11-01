@@ -5868,7 +5868,9 @@ fn canonical_binding_error_preserves_the_typed_serde_source() {
         absolute_binding("app.children[\"key\"]"),
         terminal,
     )
-    .with_state_read_location("/tmp/project/carina.state.json");
+    .with_state_read_location(
+        &carina_core::paths::DisplayPath::new("/tmp/project/carina.state.json").unwrap(),
+    );
     let source = std::error::Error::source(&error).expect("serde error must not be flattened");
     let source = source
         .downcast_ref::<serde_json::Error>()
@@ -5893,7 +5895,9 @@ fn state_json_wrapper_renders_serde_detail_without_rewording_it() {
         let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource]);
         let error = check_and_migrate(&json)
             .expect_err("invalid binding must fail to load")
-            .with_state_read_location("/tmp/project/carina.state.json");
+            .with_state_read_location(
+                &carina_core::paths::DisplayPath::new("/tmp/project/carina.state.json").unwrap(),
+            );
         let message = error.to_string();
         assert!(
             message.contains(detail),

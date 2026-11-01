@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
+use carina_core::paths::{DisplayPath, PathIdentity};
 use carina_core::provider_source::RemoteSourceKey;
 
 use crate::provider_resolver::RegistrySignatureProtection;
@@ -103,10 +104,11 @@ fn remote_trust_shape(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum ProviderLoadSource {
     LocalFile {
-        path: PathBuf,
+        path: DisplayPath,
+        identity: PathIdentity,
         canonical_source: PathBuf,
     },
     Remote {
@@ -114,14 +116,49 @@ pub enum ProviderLoadSource {
     },
 }
 
+impl ProviderLoadSource {
+    pub fn local_file(path: &carina_core::paths::ResolvedPath, canonical_source: PathBuf) -> Self {
+        let identity = PathIdentity::from(path.identity());
+        let path = path.display().clone();
+        Self::LocalFile {
+            path,
+            identity,
+            canonical_source,
+        }
+    }
+}
+
+impl PartialEq for ProviderLoadSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::LocalFile {
+                    identity,
+                    canonical_source,
+                    ..
+                },
+                Self::LocalFile {
+                    identity: other_identity,
+                    canonical_source: other_source,
+                    ..
+                },
+            ) => canonical_source == other_source && identity == other_identity,
+            (
+                Self::Remote { source },
+                Self::Remote {
+                    source: other_source,
+                },
+            ) => source == other_source,
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for ProviderLoadSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProviderLoadSource::LocalFile {
-                path,
-                canonical_source: _,
-            } => {
-                write!(formatter, "file://{}", path.display())
+            ProviderLoadSource::LocalFile { path, .. } => {
+                write!(formatter, "file://{path}")
             }
             ProviderLoadSource::Remote { source } => source.fmt(formatter),
         }
@@ -182,10 +219,13 @@ impl ProviderLoadIdentity {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(configured_name: impl Into<String>, class: ProviderTrustClass) -> Self {
         let configured_name = configured_name.into();
-        let source = ProviderLoadSource::LocalFile {
-            path: PathBuf::from(format!("/test-providers/{configured_name}.wasm")),
-            canonical_source: PathBuf::from(format!("{configured_name}.wasm")),
-        };
+        let source = ProviderLoadSource::local_file(
+            &carina_core::paths::ResolvedPath::new(format!(
+                "/test-providers/{configured_name}.wasm"
+            ))
+            .unwrap(),
+            PathBuf::from(format!("{configured_name}.wasm")),
+        );
         Self {
             configured_name,
             trust: ProviderTrust {
@@ -302,6 +342,10 @@ impl std::error::Error for UnverifiedOfficialProviderError {}
 
 #[derive(Debug)]
 pub enum ProviderLoadIdentityError {
+    Absolutize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     ConfiguredNameMismatch {
         configured_name: String,
         expected: &'static str,
@@ -342,13 +386,13 @@ impl ProviderLoadIdentityError {
                 configured_name,
                 expected,
             } => Some((configured_name, expected)),
-            Self::UnverifiedOfficial(_) => None,
+            Self::UnverifiedOfficial(_) | Self::Absolutize { .. } => None,
         }
     }
 
     pub fn unverified_official(&self) -> Option<&UnverifiedOfficialProviderError> {
         match self {
-            Self::ConfiguredNameMismatch { .. } => None,
+            Self::ConfiguredNameMismatch { .. } | Self::Absolutize { .. } => None,
             Self::UnverifiedOfficial(error) => Some(error),
         }
     }
@@ -356,7 +400,7 @@ impl ProviderLoadIdentityError {
     pub fn into_unverified_official(self) -> Result<UnverifiedOfficialProviderError, Self> {
         match self {
             Self::UnverifiedOfficial(error) => Ok(error),
-            mismatch @ Self::ConfiguredNameMismatch { .. } => Err(mismatch),
+            other => Err(other),
         }
     }
 }
@@ -364,6 +408,11 @@ impl ProviderLoadIdentityError {
 impl fmt::Display for ProviderLoadIdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Absolutize { path, .. } => write!(
+                formatter,
+                "failed to make local provider path {} absolute",
+                path.display()
+            ),
             Self::ConfiguredNameMismatch {
                 configured_name,
                 expected,
@@ -380,6 +429,7 @@ impl std::error::Error for ProviderLoadIdentityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ConfiguredNameMismatch { .. } => None,
+            Self::Absolutize { source, .. } => Some(source),
             Self::UnverifiedOfficial(error) => Some(error),
         }
     }
@@ -529,14 +579,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn local_provider_load_identity_ignores_symlink_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.wasm");
+        let link = dir.path().join("link.wasm");
+        std::fs::write(&real, b"provider").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let source = |path| {
+            ProviderLoadSource::local_file(
+                &carina_core::paths::ResolvedPath::new(path).unwrap(),
+                PathBuf::from("real.wasm"),
+            )
+        };
+        let real_source = source(real.clone());
+        let link_source = source(link.clone());
+        assert_ne!(real_source.to_string(), link_source.to_string());
+        assert_eq!(real_source, link_source);
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(
+            real_source, link_source,
+            "captured identity must survive alias removal"
+        );
+        let identity = |source| {
+            ProviderLoadIdentity::new("local".into(), ProviderTrust::untrusted(), source).unwrap()
+        };
+        assert_eq!(identity(real_source), identity(link_source));
+
+        let different = dir.path().join("different.wasm");
+        std::fs::write(&different, b"provider").unwrap();
+        assert_ne!(source(real), source(different));
+    }
+
+    #[test]
     fn untrusted_identity_accepts_any_configured_name_without_gaining_privilege() {
         let identity = ProviderLoadIdentity::new(
             "aws".into(),
             ProviderTrust::untrusted(),
-            ProviderLoadSource::LocalFile {
-                path: PathBuf::from("/tmp/aws.wasm"),
-                canonical_source: PathBuf::from("aws.wasm"),
-            },
+            ProviderLoadSource::local_file(
+                &carina_core::paths::ResolvedPath::new("/tmp/aws.wasm").unwrap(),
+                PathBuf::from("aws.wasm"),
+            ),
         )
         .unwrap();
 

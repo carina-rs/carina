@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use carina_core::module_resolver::{self, LoadedModule};
+use carina_core::paths::{CanonicalPath, ResolvedPath};
 
 /// One successfully loaded module in the shared depth-first module walk.
 pub(crate) struct LoadedModuleAtPath {
     diagnostic_path: PathBuf,
-    module_path: PathBuf,
+    module_path: ResolvedPath,
     loaded: LoadedModule,
 }
 
@@ -15,7 +16,7 @@ impl LoadedModuleAtPath {
         &self.diagnostic_path
     }
 
-    pub(crate) fn module_path(&self) -> &Path {
+    pub(crate) fn module_path(&self) -> &ResolvedPath {
         &self.module_path
     }
 
@@ -36,12 +37,16 @@ pub(crate) struct ModuleWalk {
 }
 
 impl ModuleWalk {
-    pub(crate) fn load<E>(parsed: &carina_core::parser::File<E>, base_dir: &Path) -> Self {
+    pub(crate) fn load<E>(parsed: &carina_core::parser::File<E>, base_dir: &ResolvedPath) -> Self {
         let mut walk = Self::default();
+        let base_dir = base_dir.clone();
         let mut visited = HashSet::new();
         for import in &parsed.uses {
+            let Ok(module_path) = base_dir.join(&import.path) else {
+                continue;
+            };
             visit_module(
-                &base_dir.join(&import.path),
+                &module_path,
                 Path::new(&import.path),
                 &mut visited,
                 &mut walk.modules,
@@ -55,18 +60,13 @@ impl ModuleWalk {
     }
 }
 
-fn canonical_guard_path(module_path: &Path) -> PathBuf {
-    std::fs::canonicalize(module_path).unwrap_or_else(|_| module_path.to_path_buf())
-}
-
 fn visit_module(
-    module_path: &Path,
+    module_path: &ResolvedPath,
     diagnostic_path: &Path,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut HashSet<CanonicalPath>,
     modules: &mut Vec<LoadedModuleAtPath>,
 ) {
-    let guard_path = canonical_guard_path(module_path);
-    if !visited.insert(guard_path.clone()) {
+    if !visited.insert(module_path.identity()) {
         return;
     }
 
@@ -77,16 +77,16 @@ fn visit_module(
         .parsed
         .uses
         .iter()
-        .map(|import| {
-            (
-                module_path.join(&import.path),
+        .filter_map(|import| {
+            Some((
+                module_path.join(&import.path).ok()?,
                 diagnostic_path.join(&import.path),
-            )
+            ))
         })
         .collect();
     modules.push(LoadedModuleAtPath {
         diagnostic_path: diagnostic_path.to_path_buf(),
-        module_path: module_path.to_path_buf(),
+        module_path: module_path.clone(),
         loaded,
     });
 

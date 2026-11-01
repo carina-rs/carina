@@ -1,3 +1,4 @@
+use carina_core::paths::ResolvedPath;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -19,7 +20,6 @@ use crate::install_lock::StagedArtifact;
 use crate::provider_resolver::{
     LockEntry, LockEntryKind, LockFile, LockedProviderPin, RegistryLock,
     RegistrySignatureProtection, WasmArtifactPath, cache_path_github_release, cache_path_wasm,
-    sha256_file,
 };
 use crate::provider_trust::{ProviderLoadIdentity, ProviderTrust};
 use crate::revision_resolver::cache_path_revision;
@@ -39,8 +39,8 @@ impl ProviderArtifactBytes {
         &self.0
     }
 
-    pub(crate) fn read(path: &Path) -> io::Result<Self> {
-        std::fs::read(path).map(|bytes| Self(Arc::from(bytes)))
+    pub(crate) fn read(path: &ResolvedPath) -> io::Result<Self> {
+        path.read().map(|bytes| Self(Arc::from(bytes)))
     }
 }
 
@@ -221,7 +221,7 @@ pub struct VerifiedArtifact {
     bytes: ProviderArtifactBytes,
     sha256: String,
     source: RemoteSourceKey,
-    project_dir: PathBuf,
+    project_dir: ResolvedPath,
     pin: LockedProviderPin,
 }
 
@@ -1001,7 +1001,7 @@ impl VerifiedArtifact {
         &self.source
     }
 
-    pub(crate) fn project_dir(&self) -> &Path {
+    pub(crate) fn project_dir(&self) -> &ResolvedPath {
         &self.project_dir
     }
 
@@ -1012,7 +1012,7 @@ impl VerifiedArtifact {
     pub(crate) fn from_existing<R>(
         lock_entry: &LockEntry<R>,
         provider_name: &str,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<Self, VerifiedArtifactError> {
         let selection = lock_artifact_selection(project_dir, lock_entry, provider_name)
             .map_err(VerifiedArtifactError::Other)?;
@@ -1022,7 +1022,7 @@ impl VerifiedArtifact {
     pub(crate) fn from_selection<R>(
         selection: LockArtifactSelection<'_, R>,
         provider_name: &str,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<Self, VerifiedArtifactError> {
         let LockArtifactSelection {
             path,
@@ -1031,8 +1031,16 @@ impl VerifiedArtifact {
             locked_identity,
             pin,
         } = selection;
+        let project = project_dir.clone();
+        let artifact_display = carina_core::paths::DisplayPath::new(path.as_path())
+            .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?;
+        let bytes_path = project
+            .join_display(&artifact_display)
+            .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?;
         Self::verify_bytes_at(
-            path.as_path(),
+            ProviderArtifactBytes::read(&bytes_path).map_err(|error| {
+                VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
+            })?,
             path.clone(),
             LockArtifactIdentity {
                 lock_entry,
@@ -1041,16 +1049,16 @@ impl VerifiedArtifact {
                 pin,
             },
             provider_name,
-            project_dir,
+            &project,
         )
     }
 
     fn verify_bytes_at<R>(
-        bytes_path: &Path,
+        bytes: ProviderArtifactBytes,
         published_path: WasmArtifactPath,
         identity: LockArtifactIdentity<'_, R>,
         provider_name: &str,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<Self, VerifiedArtifactError> {
         let LockArtifactIdentity {
             lock_entry,
@@ -1058,9 +1066,6 @@ impl VerifiedArtifact {
             locked_identity,
             pin,
         } = identity;
-        let bytes = ProviderArtifactBytes::read(bytes_path).map_err(|error| {
-            VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
-        })?;
         let mut hasher = Sha256::new();
         hasher.update(bytes.as_bytes());
         let actual_sha256 = format!("{:x}", hasher.finalize());
@@ -1072,7 +1077,7 @@ impl VerifiedArtifact {
                     locked_identity: locked_identity.to_string(),
                     expected_sha256: lock_entry.sha256.clone(),
                     actual_sha256,
-                    project_dir: project_dir.to_path_buf(),
+                    project_dir: PathBuf::from(project_dir.display().to_string()),
                 },
             )));
         }
@@ -1081,7 +1086,7 @@ impl VerifiedArtifact {
             bytes,
             sha256: actual_sha256,
             source,
-            project_dir: project_dir.to_path_buf(),
+            project_dir: project_dir.clone(),
             pin,
         })
     }
@@ -1198,11 +1203,11 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
 }
 
 pub(crate) fn publish_cached<R>(
-    staged: StagedArtifact<'_>,
+    mut staged: StagedArtifact<'_>,
     lock_entry: &LockEntry<R>,
     provider_name: &str,
 ) -> Result<VerifiedArtifact, VerifiedArtifactError> {
-    let project_dir = staged.project_dir().to_path_buf();
+    let project_dir = staged.project_dir().clone();
     let LockArtifactSelection {
         path,
         lock_entry: _,
@@ -1219,7 +1224,9 @@ pub(crate) fn publish_cached<R>(
         )));
     }
     let verified = VerifiedArtifact::verify_bytes_at(
-        staged.path(),
+        ProviderArtifactBytes(Arc::from(staged.read_bytes().map_err(|error| {
+            VerifiedArtifactError::Other(format!("Failed to read staged WASM binary: {error}"))
+        })?)),
         path,
         LockArtifactIdentity {
             lock_entry,
@@ -1241,7 +1248,7 @@ pub(crate) fn publish_cached<R>(
 }
 
 fn publish_download_verified<R, P>(
-    staged: StagedArtifact<'_>,
+    mut staged: StagedArtifact<'_>,
     pin: ArtifactPin<'_, P, R>,
 ) -> Result<DownloadedArtifact<P>, VerifiedArtifactError> {
     match pin {
@@ -1259,9 +1266,12 @@ fn publish_download_verified<R, P>(
         ArtifactPin::Unpinned {
             first_use: FirstUse { source },
         } => {
-            let sha256 = sha256_file(staged.path()).map_err(|error| {
-                VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
-            })?;
+            let sha256 = staged
+                .read_bytes()
+                .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
+                .map_err(|error| {
+                    VerifiedArtifactError::Other(format!("Failed to hash WASM binary: {error}"))
+                })?;
             let path = staged.destination().clone();
             let published_path = path.as_path().to_path_buf();
             staged.publish().map_err(|error| {
@@ -1318,7 +1328,7 @@ pub(crate) fn publish_unchanged_revision_download<R, P>(
 }
 
 pub(crate) fn lock_artifact_selection<'lock, R>(
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     lock_entry: &'lock LockEntry<R>,
     provider_name: &str,
 ) -> Result<LockArtifactSelection<'lock, R>, String> {
@@ -1642,13 +1652,20 @@ mod tests {
         let downloaded_bytes = b"changed origin bytes";
         let expected_sha256 = format!("{:x}", Sha256::digest(locked_bytes));
         let destination = WasmArtifactPath::new(
-            cache_path_github_release(project.path(), &source, &version),
+            cache_path_github_release(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &version,
+            ),
             "aws",
         )
         .unwrap();
         std::fs::create_dir_all(destination.as_path().parent().unwrap()).unwrap();
         std::fs::write(destination.as_path(), locked_bytes).unwrap();
-        let install_lock = crate::ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = crate::ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut staged = StagedArtifact::for_project(&install_lock, &destination).unwrap();
         staged.write_all(downloaded_bytes).unwrap();
         let mut lock_file = LockFile::default();

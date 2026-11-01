@@ -14,10 +14,12 @@
 //! Both are pure functions so `validate`, LSP diagnostics, and any other
 //! surface can share the same logic without duplicating traversal code.
 
+use crate::paths::ResolvedPath;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::Path;
 
-use crate::config_loader::{find_crn_files_in_dir, parse_directory};
+use crate::config_loader::parse_directory;
 use crate::parser::{
     LoadedProviderContext, ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState,
 };
@@ -190,7 +192,7 @@ impl UpstreamRefDiagnostic for UpstreamFieldError {
 /// An empty directory (no `.crn` files) is treated as "exports nothing"
 /// rather than a parse failure; the user may be mid-setup.
 pub fn resolve_upstream_exports<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &LoadedProviderContext,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
@@ -200,7 +202,7 @@ pub fn resolve_upstream_exports<B: BindingAddress>(
 /// Bootstrap/discovery variant of [`resolve_upstream_exports`]. Module value
 /// checks are limited to provider-independent types.
 pub fn resolve_upstream_exports_providerless<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &ProviderContext,
 ) -> (UpstreamExports<B>, Vec<UpstreamResolveError>) {
@@ -215,7 +217,7 @@ pub fn resolve_upstream_exports_providerless<B: BindingAddress>(
 /// real schema registry so unannotated exports become typed before
 /// downstream type-checks see them.
 pub fn resolve_upstream_exports_with_schemas<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &LoadedProviderContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -231,7 +233,7 @@ pub fn resolve_upstream_exports_with_schemas<B: BindingAddress>(
 /// Bootstrap/discovery variant of
 /// [`resolve_upstream_exports_with_schemas`].
 pub fn resolve_upstream_exports_providerless_with_schemas<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     config: &ProviderContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -245,7 +247,7 @@ pub fn resolve_upstream_exports_providerless_with_schemas<B: BindingAddress>(
 }
 
 fn resolve_upstream_exports_with_context<B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     upstream_states: &[UpstreamState<B>],
     provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -254,11 +256,21 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
     let mut out: UpstreamExports<B> = HashMap::new();
     let mut errors: Vec<UpstreamResolveError> = Vec::new();
     for us in upstream_states {
-        let source_abs = base_dir.join(&us.source);
+        let source_abs = match base_dir.join(&us.source) {
+            Ok(source) => source,
+            Err(error) => {
+                errors.push(UpstreamResolveError {
+                    binding: us.binding.to_string(),
+                    source: us.source.clone(),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
         if !source_abs.is_dir() {
             continue;
         }
-        if matches!(find_crn_files_in_dir(&source_abs), Ok(files) if files.is_empty()) {
+        if matches!(source_abs.crn_files(), Ok(files) if files.is_empty()) {
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
@@ -1367,9 +1379,12 @@ mod tests {
     fn parse_project(source: &str) -> ParsedFile {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("main.crn"), source).unwrap();
-        parse_directory(tmp.path(), &ctx())
-            .expect("parse_directory")
-            .into_parsed()
+        parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ctx(),
+        )
+        .expect("parse_directory")
+        .into_parsed()
     }
 
     fn inference_not_run_entry() -> UpstreamExportEntry {
@@ -1396,7 +1411,7 @@ mod tests {
         fs::write(source.join("main.crn"), "exports {\n  x = [1, 'a']\n}\n").unwrap();
 
         let (exports, errors) = resolve_upstream_exports_with_schemas(
-            root.path(),
+            &crate::paths::ResolvedPath::new(root.path()).unwrap(),
             &[upstream("up", "upstream")],
             &ctx(),
             Some(&SchemaRegistry::new()),
@@ -1451,16 +1466,22 @@ mod tests {
         // within one base_dir (directory-scoped parse is flat), but the rule
         // is that file position inside the base dir is irrelevant: the same
         // relative source string resolves the same way for every declaration.
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         assert!(got.get("orgs").unwrap().contains_key("accounts"));
 
         // Same call a second time with an identical UpstreamState produces
         // the same result — guards against any accidental dependence on
         // declaring-file state.
-        let (got2, errs2) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got2, errs2) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs2.is_empty());
         assert_eq!(got, got2);
     }
@@ -1481,8 +1502,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
 
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
@@ -1506,8 +1530,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
         assert!(keys.contains_key("accounts"));
@@ -1540,8 +1567,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
         assert!(
@@ -1587,8 +1617,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("resolved");
         let entry = keys.get("accounts").expect("accounts export");
@@ -1627,8 +1660,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let entries = got.get("orgs").expect("resolved");
         let entry = entries.get("accounts").expect("accounts export");
@@ -1659,8 +1695,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../missing")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../missing")],
+            &ctx(),
+        );
         assert!(got.is_empty());
         assert!(errs.is_empty());
     }
@@ -1680,8 +1719,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs.is_empty(), "unexpected resolve errors: {errs:?}");
         let keys = got.get("orgs").expect("binding should be resolved");
         assert!(keys.is_empty());
@@ -1696,8 +1738,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(errs.is_empty());
         assert!(got.get("orgs").expect("resolved").is_empty());
     }
@@ -1713,8 +1758,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(!got.contains_key("orgs"));
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].binding, "orgs");
@@ -1748,8 +1796,11 @@ mod tests {
         let base = tmp.path().join("downstream");
         fs::create_dir(&base).unwrap();
 
-        let (got, errs) =
-            resolve_upstream_exports(&base, &[upstream("orgs", "../organizations")], &ctx());
+        let (got, errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &[upstream("orgs", "../organizations")],
+            &ctx(),
+        );
         assert!(!got.contains_key("orgs"));
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].binding, "orgs");
@@ -1999,7 +2050,11 @@ mod tests {
             let arn = bootstrap.oidc_provider_arn
             "#,
         );
-        let parsed = parse_directory(tmp.path(), &ctx()).expect("parse_directory");
+        let parsed = parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ctx(),
+        )
+        .expect("parse_directory");
         // Whitebox: the bare-binding seed surfaces as `BindingRef`,
         // not `ResourceRef`. The type itself proves the seeded shape
         // can no longer impersonate an attribute reference.
@@ -2134,9 +2189,12 @@ mod tests {
             provider_name, source
         );
         fs::write(tmp.path().join("main.crn"), full).unwrap();
-        parse_directory(tmp.path(), &ctx())
-            .expect("parse_directory")
-            .into_parsed()
+        parse_directory(
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &ctx(),
+        )
+        .expect("parse_directory")
+        .into_parsed()
     }
 
     /// Preserve the historical positional-walker coverage while exercising
@@ -3118,9 +3176,13 @@ mod tests {
                 }
             "#,
         );
-        let parsed = parse_directory(&base, &ctx()).expect("parse_directory");
-        let (exports, resolve_errs) =
-            resolve_upstream_exports(&base, &parsed.upstream_states, &ctx());
+        let parsed = parse_directory(&crate::paths::ResolvedPath::new(&base).unwrap(), &ctx())
+            .expect("parse_directory");
+        let (exports, resolve_errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &parsed.upstream_states,
+            &ctx(),
+        );
         assert!(
             resolve_errs.is_empty(),
             "unexpected resolve errors: {resolve_errs:?}"
@@ -3718,9 +3780,13 @@ mod tests {
                 }
             "#,
         );
-        let parsed = parse_directory(&base, &ctx()).expect("parse_directory");
-        let (exports, resolve_errs) =
-            resolve_upstream_exports(&base, &parsed.upstream_states, &ctx());
+        let parsed = parse_directory(&crate::paths::ResolvedPath::new(&base).unwrap(), &ctx())
+            .expect("parse_directory");
+        let (exports, resolve_errs) = resolve_upstream_exports(
+            &crate::paths::ResolvedPath::new(&base).unwrap(),
+            &parsed.upstream_states,
+            &ctx(),
+        );
         assert!(
             resolve_errs.is_empty(),
             "unexpected resolve errors: {resolve_errs:?}"
@@ -4188,7 +4254,7 @@ mod tests {
 
         let upstream_state = upstream("ups", "upstream");
         let (exports, _errors) = resolve_upstream_exports_with_schemas(
-            tmp.path(),
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &[upstream_state],
             &ctx(),
             Some(&crate::schema::SchemaRegistry::new()),
@@ -4248,7 +4314,7 @@ mod tests {
         );
 
         let (exports, errors) = resolve_upstream_exports_with_schemas(
-            tmp.path(),
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &[upstream("ups", "upstream")],
             &config,
             Some(&schemas),
@@ -4284,7 +4350,7 @@ exports { out: Int = instance.out }
         );
 
         let (exports, errors) = resolve_upstream_exports_with_schemas(
-            tmp.path(),
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &[upstream("ups", "upstream")],
             &ctx(),
             Some(&crate::schema::SchemaRegistry::new()),
@@ -4325,7 +4391,7 @@ exports { out: String = instance.out }
         );
 
         let (exports, errors) = resolve_upstream_exports_providerless_with_schemas(
-            tmp.path(),
+            &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &[upstream("ups", "upstream")],
             &ProviderContext::default(),
             Some(&crate::schema::SchemaRegistry::new()),

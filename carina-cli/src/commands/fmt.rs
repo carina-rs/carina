@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use carina_core::config_loader::{
 };
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::{ProviderConfig as GenericProviderConfig, UseStatement};
+use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::resource::ParserPlaceholder;
 use carina_core::schema::collect_all_block_names;
 
@@ -52,12 +54,17 @@ impl FmtMode {
         }
     }
 
-    fn write_file_if_requested(&self, file: &Path, formatted: &str) -> Result<(), AppError> {
+    fn write_file_if_requested(
+        &self,
+        file: &ResolvedPath,
+        label: &Path,
+        formatted: &str,
+    ) -> Result<(), AppError> {
         match self {
             Self::Write => {
-                fs::write(file, formatted)
-                    .map_err(|e| format!("Failed to write {}: {}", file.display(), e))?;
-                println!("{} {}", "Formatted:".green(), file.display());
+                file.atomic_replace(formatted.as_bytes())
+                    .map_err(|e| format!("Failed to write {}: {}", label.display(), e))?;
+                println!("{} {}", "Formatted:".green(), label.display());
                 Ok(())
             }
             Self::Preview | Self::Check { .. } => Ok(()),
@@ -95,7 +102,7 @@ struct FormattingDirectoryConfig {
     uses: Vec<UseStatement>,
 }
 
-fn load_formatting_directory_config(directory: &Path) -> FormattingDirectoryConfig {
+fn load_formatting_directory_config(directory: &ResolvedPath) -> FormattingDirectoryConfig {
     let Some(loaded) = load_configuration(directory).ok() else {
         return FormattingDirectoryConfig::default();
     };
@@ -107,12 +114,12 @@ fn load_formatting_directory_config(directory: &Path) -> FormattingDirectoryConf
 }
 
 fn block_names_from_config<F>(
-    directory: &Path,
+    directory: &ResolvedPath,
     config: &FormattingDirectoryConfig,
     build_factories: &mut F,
 ) -> Result<DirectoryBlockNames, AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingProviderLoad, AppError>,
+    F: FnMut(&[ProviderConfig], &ResolvedPath) -> Result<FormattingProviderLoad, AppError>,
 {
     if config.providers.is_empty() {
         return Ok(DirectoryBlockNames::default());
@@ -131,141 +138,129 @@ where
 
 #[cfg(test)]
 fn block_names_for_dir<F>(
-    directory: &Path,
+    directory: &ResolvedPath,
     mut build_factories: F,
 ) -> Result<DirectoryBlockNames, AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingProviderLoad, AppError>,
+    F: FnMut(&[ProviderConfig], &ResolvedPath) -> Result<FormattingProviderLoad, AppError>,
 {
     let config = load_formatting_directory_config(directory);
     block_names_from_config(directory, &config, &mut build_factories)
 }
 
-fn canonical_directory(directory: &Path) -> PathBuf {
-    directory
-        .canonicalize()
-        .unwrap_or_else(|_| directory.to_path_buf())
-}
+type DirectoryConfigs = HashMap<CanonicalPath, (ResolvedPath, FormattingDirectoryConfig)>;
+type DirectoryImportMap = HashMap<CanonicalPath, BTreeMap<CanonicalPath, ResolvedPath>>;
 
 fn invocation_directory_configs(
-    path: &Path,
-    files: &[PathBuf],
+    root: &ResolvedPath,
+    files: &[ResolvedPath],
     recursive: bool,
-) -> HashMap<PathBuf, FormattingDirectoryConfig> {
-    let directories: BTreeSet<PathBuf> = if recursive {
+) -> Result<DirectoryConfigs, AppError> {
+    let directories = if recursive {
         files
             .iter()
-            .map(|file| canonical_directory(file.parent().unwrap_or(path)))
+            .map(|file| file.parent().unwrap_or_else(|| root.clone()))
             .collect()
     } else {
-        [canonical_directory(path)].into_iter().collect()
+        vec![root.clone()]
     };
-
-    directories
-        .into_iter()
-        .map(|directory| {
+    let mut configs = HashMap::new();
+    for directory in directories {
+        configs.entry(directory.identity()).or_insert_with(|| {
             let config = load_formatting_directory_config(&directory);
             (directory, config)
-        })
-        .collect()
+        });
+    }
+    Ok(configs)
 }
 
-fn imported_module_directory(caller_directory: &Path, import: &UseStatement) -> PathBuf {
-    let module_path = caller_directory.join(&import.path);
-    let module_directory = if module_path.is_dir() {
+fn imported_module_directory(
+    caller_directory: &ResolvedPath,
+    import: &UseStatement,
+) -> std::io::Result<CanonicalPath> {
+    let module_path = caller_directory.join(&import.path)?;
+    let directory = if module_path.is_dir() {
         module_path
-    } else if module_path.extension().is_some_and(|ext| ext == "crn") {
-        module_path.parent().unwrap_or(&module_path).to_path_buf()
+    } else if module_path
+        .display()
+        .extension()
+        .is_some_and(|ext| ext == "crn")
+    {
+        module_path.parent().unwrap_or(module_path)
     } else {
-        let with_extension = module_path.with_extension("crn");
+        let with_extension = module_path.with_extension("crn")?;
         if with_extension.exists() {
-            with_extension
-                .parent()
-                .unwrap_or(&module_path)
-                .to_path_buf()
+            with_extension.parent().unwrap_or(module_path)
         } else {
             module_path
         }
     };
-    canonical_directory(&module_directory)
+    Ok(directory.identity())
 }
 
-fn invocation_import_map(
-    directories: &HashMap<PathBuf, FormattingDirectoryConfig>,
-) -> HashMap<PathBuf, Vec<PathBuf>> {
-    let mut import_map: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-    for (caller_directory, config) in directories {
+fn invocation_import_map(directories: &DirectoryConfigs) -> DirectoryImportMap {
+    let mut import_map = DirectoryImportMap::new();
+    for (identity, (caller, config)) in directories {
         for import in &config.uses {
-            import_map
-                .entry(imported_module_directory(caller_directory, import))
-                .or_default()
-                .push(caller_directory.clone());
+            if let Ok(module) = imported_module_directory(caller, import) {
+                import_map
+                    .entry(module)
+                    .or_default()
+                    .insert(identity.clone(), caller.clone());
+            }
         }
-    }
-    for callers in import_map.values_mut() {
-        callers.sort();
-        callers.dedup();
     }
     import_map
 }
 
 fn nearest_provider_directory(
-    directory: &Path,
-    directories: &HashMap<PathBuf, FormattingDirectoryConfig>,
-) -> Option<PathBuf> {
-    let mut candidate = Some(directory);
-    while let Some(current) = candidate {
-        if directories
-            .get(current)
-            .is_some_and(|config| !config.providers.is_empty())
+    directory: &ResolvedPath,
+    directories: &DirectoryConfigs,
+) -> Option<ResolvedPath> {
+    for identity in directory.identity().ancestors() {
+        if let Some((path, config)) = directories.get(&identity)
+            && !config.providers.is_empty()
         {
-            return Some(current.to_path_buf());
+            return Some(path.clone());
         }
-        candidate = current.parent();
     }
     None
 }
 
 fn resolve_directory_block_names<F>(
-    directory: &Path,
-    directories: &HashMap<PathBuf, FormattingDirectoryConfig>,
-    import_map: &HashMap<PathBuf, Vec<PathBuf>>,
-    cache: &mut HashMap<PathBuf, Arc<DirectoryBlockNames>>,
+    directory: &ResolvedPath,
+    directories: &DirectoryConfigs,
+    import_map: &DirectoryImportMap,
+    cache: &mut HashMap<CanonicalPath, Arc<DirectoryBlockNames>>,
     build_factories: &mut F,
 ) -> Result<Arc<DirectoryBlockNames>, AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingProviderLoad, AppError>,
+    F: FnMut(&[ProviderConfig], &ResolvedPath) -> Result<FormattingProviderLoad, AppError>,
 {
-    let directory = canonical_directory(directory);
-    if let Some(block_names) = cache.get(&directory) {
+    let identity = directory.identity();
+    if let Some(block_names) = cache.get(&identity) {
         return Ok(Arc::clone(block_names));
     }
-
-    if let Some(config) = directories
-        .get(&directory)
-        .filter(|config| !config.providers.is_empty())
+    if let Some((path, config)) = directories
+        .get(&identity)
+        .filter(|(_, config)| !config.providers.is_empty())
     {
-        let block_names = Arc::new(block_names_from_config(
-            &directory,
-            config,
-            build_factories,
-        )?);
-        cache.insert(directory, Arc::clone(&block_names));
+        let block_names = Arc::new(block_names_from_config(path, config, build_factories)?);
+        cache.insert(identity, Arc::clone(&block_names));
         return Ok(block_names);
     }
-
-    let caller_provider_directory = import_map.get(&directory).and_then(|callers| {
+    let caller = import_map.get(&identity).and_then(|callers| {
         callers
-            .iter()
+            .values()
             .find_map(|caller| nearest_provider_directory(caller, directories))
     });
-    let block_names = match caller_provider_directory {
+    let block_names = match caller {
         Some(caller) => {
             resolve_directory_block_names(&caller, directories, import_map, cache, build_factories)?
         }
         None => Arc::new(DirectoryBlockNames::default()),
     };
-    cache.insert(directory, Arc::clone(&block_names));
+    cache.insert(identity, Arc::clone(&block_names));
     Ok(block_names)
 }
 
@@ -300,9 +295,10 @@ fn run_fmt_with_factory_builder<F>(
     mut build_factories: F,
 ) -> Result<(), AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> Result<FormattingProviderLoad, AppError>,
+    F: FnMut(&[ProviderConfig], &ResolvedPath) -> Result<FormattingProviderLoad, AppError>,
 {
-    if path.is_file() {
+    let root = ResolvedPath::new(path).map_err(|error| AppError::Config(error.to_string()))?;
+    if root.is_file() {
         return Err(AppError::Config(format!(
             "expected directory, got file: {}",
             path.display()
@@ -311,9 +307,9 @@ where
 
     let config = FormatConfig::default();
     let files = if recursive {
-        find_crn_files_recursive(path)?
+        find_crn_files_recursive(&root)?
     } else {
-        find_crn_files_in_dir(path)?
+        find_crn_files_in_dir(&root)?
     };
 
     if files.is_empty() {
@@ -323,16 +319,23 @@ where
 
     let mut needs_formatting = Vec::new();
     let mut errors = Vec::new();
-    let directory_configs = invocation_directory_configs(path, &files, recursive);
+    let directory_configs = invocation_directory_configs(&root, &files, recursive)?;
     let import_map = invocation_import_map(&directory_configs);
-    let mut block_names_by_dir: HashMap<PathBuf, Arc<DirectoryBlockNames>> = HashMap::new();
+    let mut block_names_by_dir: HashMap<CanonicalPath, Arc<DirectoryBlockNames>> = HashMap::new();
     let mut provider_load_diagnostics = BTreeSet::new();
 
     for file in &files {
-        let content = fs::read_to_string(file)
-            .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+        // Listing spelling belongs to the CLI argument; it is never used for IO.
+        let label = path.join(
+            file.display()
+                .relative_to(root.display())
+                .unwrap_or_else(|| file.display().to_string()),
+        );
+        let content = file
+            .read_to_string()
+            .map_err(|e| format!("Failed to read {}: {}", label.display(), e))?;
         let block_names = resolve_directory_block_names(
-            file.parent().unwrap_or(path),
+            &file.parent().unwrap_or_else(|| root.clone()),
             &directory_configs,
             &import_map,
             &mut block_names_by_dir,
@@ -348,14 +351,14 @@ where
         match formatter::format_with_block_names(&content, &config, &block_names.block_names) {
             Ok(formatted) => {
                 if content != formatted {
-                    needs_formatting.push((file.clone(), content.clone(), formatted.clone()));
+                    needs_formatting.push((label.clone(), content.clone(), formatted.clone()));
 
-                    mode.print_diff_if_requested(file, &content, &formatted);
-                    mode.write_file_if_requested(file, &formatted)?;
+                    mode.print_diff_if_requested(&label, &content, &formatted);
+                    mode.write_file_if_requested(file, &label, &formatted)?;
                 }
             }
             Err(e) => {
-                errors.push((file.clone(), e.to_string()));
+                errors.push((label.clone(), e.to_string()));
             }
         }
     }
@@ -445,6 +448,24 @@ mod tests {
     use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_diagnostics_preserve_symlink_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        fs::write(real.join("main.crn"), "provider mock {}\n").unwrap();
+        let error = run_fmt_with_factory_builder(&link, FmtMode::Preview, false, |_, directory| {
+            Err(AppError::Config(directory.display().to_string()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(!error.contains(&real.display().to_string()), "{error}");
+    }
 
     #[test]
     fn fmt_mode_from_flags_covers_all_combinations() {
@@ -544,18 +565,26 @@ mod tests {
         .unwrap();
         let mut loaded_provider_names = Vec::new();
 
-        let directory = block_names_for_dir(tmp.path(), |providers, base_dir| {
-            loaded_provider_names.extend(providers.iter().map(|provider| provider.name.clone()));
-            assert_eq!(base_dir, tmp.path());
-            let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(FactoryWithBlockSchema {
-                block_name: "entry_from_factory",
-            })];
-            Ok(FormattingProviderLoad::for_test(
-                LoadedProviderFactory::for_test(factories),
-                providers,
-                HashMap::new(),
-            ))
-        })
+        let directory = block_names_for_dir(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            |providers, base_dir| {
+                loaded_provider_names
+                    .extend(providers.iter().map(|provider| provider.name.clone()));
+                assert_eq!(
+                    base_dir.identity(),
+                    ResolvedPath::new(tmp.path()).unwrap().identity()
+                );
+                let factories: Vec<Box<dyn ProviderFactory>> =
+                    vec![Box::new(FactoryWithBlockSchema {
+                        block_name: "entry_from_factory",
+                    })];
+                Ok(FormattingProviderLoad::for_test(
+                    LoadedProviderFactory::for_test(factories),
+                    providers,
+                    HashMap::new(),
+                ))
+            },
+        )
         .unwrap();
 
         assert_eq!(loaded_provider_names, ["example"]);
@@ -616,34 +645,40 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.crn"), "provider example {}\n").unwrap();
 
-        let skipped = block_names_for_dir(tmp.path(), |providers, _| {
-            Ok(FormattingProviderLoad::for_test(
-                Vec::<LoadedProviderFactory>::new(),
-                providers,
-                HashMap::new(),
-            ))
-        })
+        let skipped = block_names_for_dir(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            |providers, _| {
+                Ok(FormattingProviderLoad::for_test(
+                    Vec::<LoadedProviderFactory>::new(),
+                    providers,
+                    HashMap::new(),
+                ))
+            },
+        )
         .unwrap();
-        let failed = block_names_for_dir(tmp.path(), |providers, _| {
-            Ok(FormattingProviderLoad::for_test(
-                Vec::<LoadedProviderFactory>::new(),
-                providers,
-                HashMap::from([(
-                    "example".to_string(),
-                    ProviderFactoryDiagnostic::Message("load failed".into()),
-                )]),
-            ))
-        })
+        let failed = block_names_for_dir(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            |providers, _| {
+                Ok(FormattingProviderLoad::for_test(
+                    Vec::<LoadedProviderFactory>::new(),
+                    providers,
+                    HashMap::from([(
+                        "example".to_string(),
+                        ProviderFactoryDiagnostic::Message("load failed".into()),
+                    )]),
+                ))
+            },
+        )
         .unwrap();
 
         assert!(skipped.provider_load_diagnostics.is_empty());
         assert!(!failed.provider_load_diagnostics.is_empty());
     }
 
-    fn write_provider_caller(directory: &Path, provider: &str, module_path: &str) {
-        std::fs::create_dir_all(directory).unwrap();
+    fn write_provider_caller(directory: &ResolvedPath, provider: &str, module_path: &str) {
+        directory.create_dir_all().unwrap();
         std::fs::write(
-            directory.join("main.crn"),
+            std::path::PathBuf::from(directory.display().join("main.crn").to_string()),
             format!(
                 r#"provider {provider} {{}}
 
@@ -656,14 +691,15 @@ let imported = use {{
         .unwrap();
     }
 
-    fn write_convertible_module(directory: &Path) -> PathBuf {
-        std::fs::create_dir_all(directory).unwrap();
+    fn write_convertible_module(directory: &ResolvedPath) -> PathBuf {
+        directory.create_dir_all().unwrap();
         std::fs::write(
-            directory.join("arguments.crn"),
+            std::path::PathBuf::from(directory.display().join("arguments.crn").to_string()),
             "arguments {\n  name: String\n}\n",
         )
         .unwrap();
-        let resource = directory.join("resource.crn");
+        let resource =
+            std::path::PathBuf::from(directory.display().join("resource.crn").to_string());
         std::fs::write(
             &resource,
             r#"let target = example.test.resource {
@@ -681,13 +717,26 @@ let imported = use {{
     fn recursive_module_uses_lexicographically_first_callers_block_names() {
         let tmp = tempfile::tempdir().unwrap();
         let module = tmp.path().join("modules").join("m");
-        let resource = write_convertible_module(&module);
-        write_provider_caller(&tmp.path().join("z-caller"), "z", "../modules/m");
-        write_provider_caller(&tmp.path().join("a-caller"), "a", "../modules/m");
+        let resource =
+            write_convertible_module(&carina_core::paths::ResolvedPath::new(&module).unwrap());
+        write_provider_caller(
+            &carina_core::paths::ResolvedPath::new(tmp.path().join("z-caller")).unwrap(),
+            "z",
+            "../modules/m",
+        );
+        write_provider_caller(
+            &carina_core::paths::ResolvedPath::new(tmp.path().join("a-caller")).unwrap(),
+            "a",
+            "../modules/m",
+        );
         let mut built_for = Vec::new();
 
         run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, true, |providers, base_dir| {
-            let directory_name = base_dir.file_name().and_then(|name| name.to_str()).unwrap();
+            let directory_name = base_dir
+                .display()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap();
             built_for.push(directory_name.to_string());
             let block_name = match directory_name {
                 "a-caller" => "entry_from_a",
@@ -715,7 +764,8 @@ let imported = use {{
     fn non_recursive_module_without_caller_in_scope_stays_plain() {
         let tmp = tempfile::tempdir().unwrap();
         let module = tmp.path().join("module");
-        let resource = write_convertible_module(&module);
+        let resource =
+            write_convertible_module(&carina_core::paths::ResolvedPath::new(&module).unwrap());
         let mut builder_calls = 0;
 
         run_fmt_with_factory_builder(&module, FmtMode::Write, false, |providers, _| {
@@ -760,7 +810,11 @@ let imported = use {{
         let mut built_for = Vec::new();
 
         run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, true, |providers, base_dir| {
-            let directory_name = base_dir.file_name().and_then(|name| name.to_str()).unwrap();
+            let directory_name = base_dir
+                .display()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap();
             built_for.push(directory_name.to_string());
             let block_name = match directory_name {
                 "a" => "entries_a",

@@ -4,14 +4,16 @@
 //! file (`carina-backend.lock`) at the project root. Commands compare
 //! the stored snapshot against the current configuration: `init` and
 //! project-backed readers warn and keep reading the locked backend on
-//! mismatch, while mutating commands refuse until `carina init
+//! mismatch, while mutating commands refuse use until `carina init
 //! --migrate-state` explicitly moves state.
 //!
 //! This prevents silently pointing state operations at a different state
 //! file, which could lead to resources being treated as unmanaged or
 //! data loss.
 
+use carina_core::paths::ResolvedPath;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
@@ -138,32 +140,40 @@ impl BackendLock {
     }
 
     /// Path to the lock file under `base_dir` (project root).
-    pub fn lock_path(base_dir: &Path) -> PathBuf {
+    pub fn lock_path(base_dir: &ResolvedPath) -> std::io::Result<ResolvedPath> {
         base_dir.join(LOCK_FILE)
     }
 
     /// Legacy lock path (`.carina/backend-lock.json`).
+    #[cfg(test)]
     fn legacy_lock_path(base_dir: &Path) -> PathBuf {
         base_dir.join(LEGACY_LOCK_DIR).join(LEGACY_LOCK_FILE)
     }
 
     /// Load an existing lock from `base_dir`, returning `None` if no
     /// lock file exists yet. Falls back to the legacy path for migration.
-    pub fn load(base_dir: &Path) -> BackendResult<Option<Self>> {
-        let path = Self::lock_path(base_dir);
+    pub fn load(base_dir: &ResolvedPath) -> BackendResult<Option<Self>> {
+        let base_dir = base_dir.clone();
+        let path = base_dir
+            .join(LOCK_FILE)
+            .map_err(|error| BackendError::Io(error.to_string()))?;
         if path.exists() {
-            return Self::load_from(&path, base_dir);
+            return Self::load_from(&path, &base_dir);
         }
         // Migration: try legacy path
-        let legacy = Self::legacy_lock_path(base_dir);
+        let legacy = base_dir
+            .join(LEGACY_LOCK_DIR)
+            .and_then(|dir| dir.join(LEGACY_LOCK_FILE))
+            .map_err(|error| BackendError::Io(error.to_string()))?;
         if legacy.exists() {
-            return Self::load_from(&legacy, base_dir);
+            return Self::load_from(&legacy, &base_dir);
         }
         Ok(None)
     }
 
-    fn load_from(path: &Path, project_dir: &Path) -> BackendResult<Option<Self>> {
-        let contents = std::fs::read_to_string(path)
+    fn load_from(path: &ResolvedPath, project_dir: &ResolvedPath) -> BackendResult<Option<Self>> {
+        let contents = path
+            .read_to_string()
             .map_err(|e| BackendError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
         let lock: Self = serde_json::from_str(&contents).map_err(|e| {
             BackendError::Serialization(format!(
@@ -175,18 +185,20 @@ impl BackendLock {
         // A syntactically valid JSON lock must still describe a configuration
         // accepted by the current typed backend schema. Validate eagerly so a
         // corrupt or obsolete address cannot participate in drift comparison.
-        let config = lock
-            .to_state_config()
-            .map_err(|error| unreadable_backend_address(path, project_dir, error))?;
+        let config = lock.to_state_config().map_err(|error| {
+            unreadable_backend_address(path.display(), project_dir.display(), error)
+        })?;
         Ok(Some(Self::from_config(&config)))
     }
 
     /// Persist this lock snapshot at the project root.
-    pub fn save(&self, base_dir: &Path) -> BackendResult<()> {
-        let path = Self::lock_path(base_dir);
+    pub fn save(&self, base_dir: &ResolvedPath) -> BackendResult<()> {
+        let path = base_dir
+            .join(LOCK_FILE)
+            .map_err(|error| BackendError::Io(error.to_string()))?;
         let contents = carina_core::utils::pretty_with_newline(self)
             .map_err(|e| BackendError::Serialization(e.to_string()))?;
-        std::fs::write(&path, contents)
+        path.atomic_replace(contents.as_bytes())
             .map_err(|e| BackendError::Io(format!("Failed to write {}: {}", path.display(), e)))?;
         Ok(())
     }
@@ -260,18 +272,17 @@ impl BackendLock {
 }
 
 fn unreadable_backend_address(
-    path: &Path,
-    project_dir: &Path,
+    path: &carina_core::paths::DisplayPath,
+    project_dir: &carina_core::paths::DisplayPath,
     error: BackendError,
 ) -> BackendError {
     let detail = error.to_string();
-    let init_command = ProjectCommand::new("init", project_dir);
+    let init_command = ProjectCommand::for_display_path("init", project_dir);
     let message = format!(
         "Backend lock at {} records a backend address this release cannot read: {detail}. \
          To recover, verify the backend block, then delete `{}` and run `{init_command}` \
          to record it again.",
-        path.display(),
-        path.display(),
+        path, path,
     );
     BackendError::UnreadableBackendAddress {
         message,
@@ -329,22 +340,30 @@ mod tests {
     fn lock_roundtrip_via_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
-        lock.save(tmp.path()).unwrap();
-        let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
+        lock.save(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap();
+        let loaded = BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(lock, loaded);
     }
 
     #[test]
     fn load_returns_none_when_lock_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(BackendLock::load(tmp.path()).unwrap().is_none());
+        assert!(
+            BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn lock_saves_to_project_root() {
         let tmp = tempfile::tempdir().unwrap();
         let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
-        lock.save(tmp.path()).unwrap();
+        lock.save(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap();
         // Should be at root, not in .carina/
         assert!(tmp.path().join("carina-backend.lock").exists());
         assert!(!tmp.path().join(".carina/backend-lock.json").exists());
@@ -356,7 +375,8 @@ mod tests {
     fn lock_file_ends_with_trailing_newline() {
         let tmp = tempfile::tempdir().unwrap();
         let lock = BackendLock::from_config(&make_config("b", "us-east-1"));
-        lock.save(tmp.path()).unwrap();
+        lock.save(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap();
         let bytes = std::fs::read(tmp.path().join("carina-backend.lock")).unwrap();
         assert_eq!(
             bytes.last().copied(),
@@ -376,7 +396,9 @@ mod tests {
         let contents = serde_json::to_string_pretty(&lock).unwrap();
         std::fs::write(legacy_dir.join("backend-lock.json"), contents).unwrap();
         // Load should find it
-        let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
+        let loaded = BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(lock, loaded);
     }
 
@@ -393,9 +415,13 @@ mod tests {
             serde_json::to_string_pretty(&old_lock).unwrap(),
         )
         .unwrap();
-        new_lock.save(tmp.path()).unwrap();
+        new_lock
+            .save(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap();
         // Should load the new one
-        let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
+        let loaded = BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded, new_lock);
     }
 
@@ -521,7 +547,7 @@ mod tests {
             }
         });
         std::fs::write(
-            BackendLock::lock_path(tmp.path()),
+            tmp.path().join(LOCK_FILE),
             serde_json::to_string(&raw).unwrap(),
         )
         .unwrap();
@@ -551,7 +577,9 @@ mod tests {
             ]),
         );
 
-        let loaded = BackendLock::load(tmp.path()).unwrap().unwrap();
+        let loaded = BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap()
+            .unwrap();
 
         assert_eq!(loaded, BackendLock::from_config(&expected_config));
     }
@@ -581,11 +609,12 @@ mod tests {
             }
         });
         std::fs::write(
-            BackendLock::lock_path(tmp.path()),
+            tmp.path().join(LOCK_FILE),
             serde_json::to_string(&raw).unwrap(),
         )
         .unwrap();
-        let error = BackendLock::load(tmp.path()).unwrap_err();
+        let error = BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap_err();
         assert!(error.to_string().contains("encrypt"), "{error}");
         assert!(error.to_string().contains("string or bool"), "{error}");
     }
@@ -593,7 +622,7 @@ mod tests {
     #[test]
     fn obsolete_enum_region_lock_is_rejected_with_recovery_guidance() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = BackendLock::lock_path(tmp.path());
+        let path = tmp.path().join(LOCK_FILE);
         let raw = serde_json::json!({
             "backend_type": S3_BACKEND_TYPE,
             "attributes": {
@@ -603,7 +632,8 @@ mod tests {
             }
         });
         std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
-        let error = BackendLock::load(tmp.path()).unwrap_err();
+        let error = BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap_err();
         let message = error.to_string();
         assert!(message.contains(&path.display().to_string()), "{message}");
         assert!(message.contains("region"), "{message}");
@@ -650,7 +680,8 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
 
-        let error = BackendLock::load(tmp.path()).unwrap_err();
+        let error = BackendLock::load(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
+            .unwrap_err();
         let message = error.to_string();
         assert!(
             message.contains(&format!("delete `{}`", path.display())),

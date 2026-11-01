@@ -1102,11 +1102,13 @@ fn test_explicit_egress(declaration: &VerifiedEgressDeclaration) -> LockedEgress
         ),
     )
     .expect("write egress lock");
-    let (lock, _migration) = carina_provider_resolver::LockFile::load(directory.path())
+    let project =
+        carina_core::paths::ResolvedPath::new(directory.path()).expect("pin fixture project");
+    let (lock, _migration) = carina_provider_resolver::LockFile::load(&project)
         .expect("load egress lock")
         .expect("egress lock exists")
         .into_parts();
-    lock.locked_egress(declaration, directory.path())
+    lock.locked_egress(declaration, &project)
         .expect("lock has consent for the declaration source")
 }
 
@@ -1247,6 +1249,7 @@ impl fmt::Display for EgressDenied {
                 ProviderLoadSource::LocalFile {
                     path: _,
                     canonical_source: _,
+                    ..
                 }
                 | ProviderLoadSource::Remote { source: _ },
                 DestinationDenied::HostNotAllowed
@@ -7702,10 +7705,11 @@ mod tests {
     fn local_provider_label(name: &str) -> Arc<ProviderLabel> {
         Arc::new(ProviderLabel {
             name: name.to_string(),
-            source: ProviderLoadSource::LocalFile {
-                path: PathBuf::from(format!("/test-providers/{name}.wasm")),
-                canonical_source: PathBuf::from(format!("{name}.wasm")),
-            },
+            source: ProviderLoadSource::local_file(
+                &carina_core::paths::ResolvedPath::new(format!("/test-providers/{name}.wasm"))
+                    .unwrap(),
+                PathBuf::from(format!("{name}.wasm")),
+            ),
         })
     }
 
@@ -10324,10 +10328,11 @@ mod tests {
         let error = EgressDenied::new(
             Arc::new(ProviderLabel {
                 name: "mock_http".to_string(),
-                source: ProviderLoadSource::LocalFile {
-                    path: PathBuf::from("/opt/providers/mock_http.wasm"),
-                    canonical_source: PathBuf::from("mock_http.wasm"),
-                },
+                source: ProviderLoadSource::local_file(
+                    &carina_core::paths::ResolvedPath::new("/opt/providers/mock_http.wasm")
+                        .unwrap(),
+                    PathBuf::from("mock_http.wasm"),
+                ),
             }),
             Some(ProviderKind::Untrusted),
             "169.254.169.254".to_string(),

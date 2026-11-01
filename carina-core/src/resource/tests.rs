@@ -3096,7 +3096,7 @@ fn deserialized_unbound_loop_template_still_rejects_read_without_a_source_span()
     .expect("deferred loop parses");
     let parsed = crate::module_resolver::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("deferred fixture crosses the module-resolution seam");
     let crate::parser::DeferredForTarget::Unbound { template } =

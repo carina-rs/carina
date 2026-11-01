@@ -1,6 +1,7 @@
 //! `ModuleResolver` driver: import processing, nested-module resolution,
 //! and the top-level `resolve_modules*` entry points.
 
+use crate::paths::{DisplayPath, ResolvedPath};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -544,11 +545,14 @@ mod diagnostic_status_tests {
 
         let config = ProviderContext::default();
         let schemas = SchemaRegistry::new();
-        let parsed = crate::config_loader::parse_directory(fixture.path(), &config)
-            .expect("parse directory fixture");
+        let parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &config,
+        )
+        .expect("parse directory fixture");
         let result = resolve_modules_with_providerless_diagnostics(
             &parsed,
-            fixture.path(),
+            &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &config,
             &schemas,
             &[],
@@ -787,14 +791,16 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
 pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
     pub(super) base_dir: PathBuf,
+    pub(super) io_base_dir: ResolvedPath,
+    pub(super) module_locations: HashMap<DisplayPath, ResolvedPath>,
     /// Root of the configuration being expanded. Unlike `base_dir`, this does
     /// not change while recursively resolving nested module imports and is
     /// therefore the stable base for user-facing source labels.
     configuration_root: PathBuf,
     /// Cache of loaded modules: path -> ParsedFile
-    pub(super) module_cache: HashMap<PathBuf, ParsedFile>,
+    pub(super) module_cache: HashMap<crate::paths::CanonicalPath, ParsedFile>,
     /// Currently resolving modules (for cycle detection)
-    pub(super) resolving: HashSet<PathBuf>,
+    pub(super) resolving: HashSet<crate::paths::CanonicalPath>,
     /// Imported module definitions by alias
     pub(super) imported_modules: HashMap<String, ParsedFile>,
     /// `use { source = "..." }` paths by alias — the DSL-visible
@@ -817,7 +823,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
 impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
     /// Create a new resolver with the given base directory and default config
     #[cfg(test)]
-    pub(crate) fn new(base_dir: impl AsRef<Path>) -> Self {
+    pub(crate) fn new(base_dir: &ResolvedPath) -> Self {
         static DEFAULT_CONFIG: std::sync::LazyLock<ProviderContext> =
             std::sync::LazyLock::new(ProviderContext::default);
         static EMPTY_SCHEMAS: std::sync::LazyLock<SchemaRegistry> =
@@ -827,7 +833,7 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
 
     /// Create a new resolver with the given base directory and parser configuration
     pub(crate) fn with_config_and_schemas(
-        base_dir: impl AsRef<Path>,
+        base_dir: &ResolvedPath,
         config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
@@ -839,7 +845,7 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
     }
 
     fn with_providerless_config_and_schemas(
-        base_dir: impl AsRef<Path>,
+        base_dir: &ResolvedPath,
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
@@ -851,14 +857,14 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_config(base_dir: impl AsRef<Path>, config: &'cfg ProviderContext) -> Self {
+    pub(crate) fn with_config(base_dir: &ResolvedPath, config: &'cfg ProviderContext) -> Self {
         static EMPTY_SCHEMAS: std::sync::LazyLock<SchemaRegistry> =
             std::sync::LazyLock::new(SchemaRegistry::new);
         Self::with_providerless_config_and_schemas(base_dir, config, &EMPTY_SCHEMAS)
     }
 
     fn with_constraint_reports(
-        base_dir: impl AsRef<Path>,
+        base_dir: &ResolvedPath,
         config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
@@ -868,7 +874,7 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
     }
 
     fn with_providerless_constraint_reports(
-        base_dir: impl AsRef<Path>,
+        base_dir: &ResolvedPath,
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
@@ -880,7 +886,7 @@ impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
 
 impl<'cfg> ModuleResolver<'cfg, DeferredUpstreamTypeResolution> {
     fn for_upstream(
-        base_dir: impl AsRef<Path>,
+        base_dir: &ResolvedPath,
         config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
@@ -892,7 +898,7 @@ impl<'cfg> ModuleResolver<'cfg, DeferredUpstreamTypeResolution> {
     }
 
     fn for_providerless_upstream(
-        base_dir: impl AsRef<Path>,
+        base_dir: &ResolvedPath,
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
@@ -906,12 +912,15 @@ impl<'cfg> ModuleResolver<'cfg, DeferredUpstreamTypeResolution> {
 
 impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     fn with_type_resolution(
-        base_dir: impl AsRef<Path>,
+        base_dir: &ResolvedPath,
         provider_context: crate::validation::typecheck::TypecheckProviderContext<'cfg>,
         schemas: &'cfg SchemaRegistry,
     ) -> Self {
-        let base_dir = base_dir.as_ref().to_path_buf();
+        let io_base_dir = base_dir.clone();
+        let base_dir = std::path::PathBuf::from(base_dir.display().to_string());
         Self {
+            io_base_dir,
+            module_locations: HashMap::new(),
             configuration_root: base_dir.clone(),
             base_dir,
             module_cache: HashMap::new(),
@@ -984,7 +993,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// more `.crn` files. Single-file modules are not supported — pass the
     /// module's directory, not an individual `.crn` file.
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
-        let full_path = self.resolve_path(path);
+        let full_path = self.resolve_path(path)?;
 
         // Distinguish "file exists but isn't a directory" from
         // "path doesn't exist / permission denied": only the former is the
@@ -997,7 +1006,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             });
         }
 
-        let canonical = full_path.canonicalize()?;
+        let canonical = full_path.identity();
+        self.module_locations
+            .insert(full_path.display().clone(), full_path.clone());
 
         // Check for circular import
         if self.resolving.contains(&canonical) {
@@ -1078,12 +1089,15 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// from sibling `.crn` files. Without this, `arguments {}` declared
     /// in `main.crn` would be invisible to `${env}` interpolations in
     /// sibling `role.crn` (#2815). #2817.
-    fn load_directory_module(&self, dir_path: &Path) -> Result<ParsedFile, ModuleError> {
+    fn load_directory_module(&self, dir_path: &ResolvedPath) -> Result<ParsedFile, ModuleError> {
         let paths = sorted_crn_paths_in(dir_path)?;
         let mut files: Vec<(std::path::PathBuf, String)> = Vec::with_capacity(paths.len());
         for path in paths {
-            let content = std::fs::read_to_string(&path)?;
-            files.push((path, content));
+            let content = path.read_to_string()?;
+            files.push((
+                std::path::PathBuf::from(path.display().to_string()),
+                content,
+            ));
         }
         let parsed_files = crate::config_loader::parse_directory_files_located_from_root(
             &files,
@@ -1121,13 +1135,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     }
 
     /// Resolve a relative path to an absolute path
-    fn resolve_path(&self, path: &str) -> PathBuf {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        }
+    fn resolve_path(&self, path: &str) -> std::io::Result<ResolvedPath> {
+        let base = &self.io_base_dir;
+        base.join(path)
     }
 
     /// Process imports and store imported modules
@@ -1185,10 +1195,15 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     fn resolve_nested_modules(
         &mut self,
         parsed: &mut ParsedFile,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
     ) -> Result<(), ModuleError> {
-        // Save and temporarily replace the base_dir and imported_modules
-        let original_base_dir = std::mem::replace(&mut self.base_dir, base_dir.to_path_buf());
+        let base_dir = base_dir.clone();
+        // Save both the diagnostic spelling and pinned IO address.
+        let original_io_base = std::mem::replace(&mut self.io_base_dir, base_dir.clone());
+        let original_base_dir = std::mem::replace(
+            &mut self.base_dir,
+            std::path::PathBuf::from(base_dir.display().to_string()),
+        );
         let original_imported = std::mem::take(&mut self.imported_modules);
         let original_paths = std::mem::take(&mut self.module_paths);
 
@@ -1212,6 +1227,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
         if let Err(e) = result {
             // Restore state on error
+            self.io_base_dir = original_io_base;
             self.base_dir = original_base_dir;
             self.imported_modules = original_imported;
             self.module_paths = original_paths;
@@ -1221,6 +1237,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         match self.validate_reference_types(parsed) {
             Ok(_) => {}
             Err(error) => {
+                self.io_base_dir = original_io_base;
                 self.base_dir = original_base_dir;
                 self.imported_modules = original_imported;
                 self.module_paths = original_paths;
@@ -1229,6 +1246,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         }
 
         // Restore original state
+        self.io_base_dir = original_io_base;
         self.base_dir = original_base_dir;
         self.imported_modules = original_imported;
         self.module_paths = original_paths;
@@ -1244,7 +1262,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
     /// boundary before making expansion available.
     fn check(
         parsed: &'parsed mut crate::parser::File<E>,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
@@ -1256,7 +1274,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
     /// skipping provider-owned custom-type leaves.
     fn check_providerless(
         parsed: &'parsed mut crate::parser::File<E>,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
@@ -1302,7 +1320,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
     /// resolver. Ordinary callers can construct only `RefCheckedModuleGraph`.
     fn check(
         parsed: &'parsed mut crate::parser::File<E>,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         config: &'cfg LoadedProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
@@ -1320,7 +1338,7 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
 
     fn check_providerless(
         parsed: &'parsed mut crate::parser::File<E>,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
         config: &'cfg ProviderContext,
         schemas: &'cfg SchemaRegistry,
     ) -> Result<Self, ModuleError> {
@@ -1420,7 +1438,7 @@ pub fn prepare_root_export_validation(
 /// ```
 pub fn resolve_modules_providerless(
     parsed: ParsedRootDirectory,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     resolve_modules_with_providerless_config(
         parsed,
@@ -1437,7 +1455,7 @@ pub fn resolve_modules_providerless(
 /// the resolver only touches `uses`, `module_calls`, and `resources`.
 pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: RootDirectoryParse<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
@@ -1452,7 +1470,7 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholde
 /// classified first, and provider-owned schema types are left unchecked.
 pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: RootDirectoryParse<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
@@ -1468,7 +1486,7 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
 /// templates for lint/editor analysis.
 pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: RootDirectoryParse<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
@@ -1483,7 +1501,7 @@ pub fn resolve_module_template_with_providerless_config<
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 >(
     parsed: RootDirectoryParse<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
@@ -1502,7 +1520,7 @@ pub(crate) fn resolve_upstream_modules_with_providerless_config<
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 >(
     mut parsed: crate::parser::File<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
@@ -1516,7 +1534,7 @@ pub(crate) fn resolve_upstream_modules_with_config<
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 >(
     mut parsed: crate::parser::File<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
@@ -1533,7 +1551,7 @@ pub(crate) fn resolve_upstream_modules_with_config<
 /// including individual covered members of a mixed reference-type failure.
 pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlaceholder> + Clone>(
     parsed: &RootDirectoryParse<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &LoadedProviderContext,
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
@@ -1553,7 +1571,7 @@ pub fn resolve_modules_with_providerless_diagnostics<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
 >(
     parsed: &RootDirectoryParse<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
@@ -2012,9 +2030,15 @@ mod type_resolution_policy_tests {
         let config = ProviderContext::default();
         let schemas = SchemaRegistry::new();
 
-        let strict = ModuleResolver::with_providerless_config_and_schemas(".", &config, &schemas);
+        let strict = ModuleResolver::with_providerless_config_and_schemas(
+            &crate::paths::ResolvedPath::new(".").unwrap(),
+            &config,
+            &schemas,
+        );
         let upstream = ModuleResolver::<DeferredUpstreamTypeResolution>::for_providerless_upstream(
-            ".", &config, &schemas,
+            &crate::paths::ResolvedPath::new(".").unwrap(),
+            &config,
+            &schemas,
         );
 
         assert_strict(&strict);

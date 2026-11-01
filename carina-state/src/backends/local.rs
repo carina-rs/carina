@@ -4,9 +4,9 @@
 //! It uses a .lock file for simple locking mechanism.
 
 use async_trait::async_trait;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use carina_core::paths::{DisplayPath, ResolvedPath};
+#[cfg(any(test, feature = "test-utils"))]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
@@ -22,9 +22,10 @@ type WriteHook = Arc<dyn Fn(&StateFile) + Send + Sync>;
 /// Local file backend for development and simple use cases
 pub struct LocalBackend {
     /// Path to the state file
-    state_path: PathBuf,
+    state_path: ResolvedPath,
     /// Path to the lock file
-    lock_path: PathBuf,
+    lock_path: ResolvedPath,
+    recovery_path: ResolvedPath,
     /// Tracks the first in-memory state-schema migration observed by
     /// `read_state` on this backend instance, so the warning is emitted
     /// exactly once per backend (carina#3283). `carina plan` reads state
@@ -56,12 +57,12 @@ const RECOVERY_CLAIM_TIMEOUT_SECS: i64 = 30;
 const LOCK_WRITE_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
 struct RecoveryClaimGuard {
-    path: PathBuf,
+    path: ResolvedPath,
 }
 
 impl Drop for RecoveryClaimGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.path.remove();
     }
 }
 
@@ -73,16 +74,28 @@ impl LocalBackend {
     ///
     /// Backend construction outside this crate must go through a typed
     /// [`BackendSelection`](crate::BackendSelection).
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn with_path(state_path: PathBuf) -> Self {
-        let lock_path = state_path.with_extension("lock");
-        Self {
+        Self::with_resolved_path(ResolvedPath::new(state_path).expect("resolve test state path"))
+            .expect("resolve test lock path")
+    }
+
+    pub(crate) fn with_resolved_path(state_path: ResolvedPath) -> BackendResult<Self> {
+        let lock_path = state_path
+            .with_extension("lock")
+            .map_err(|error| BackendError::Io(format!("Failed to locate lock file: {error}")))?;
+        let recovery_path = lock_path.with_extension("lock.recover").map_err(|error| {
+            BackendError::Io(format!("Failed to locate recovery claim: {error}"))
+        })?;
+        Ok(Self {
+            recovery_path,
             state_path,
             lock_path,
             migration_logged: OnceLock::new(),
             state_write: Arc::new(Mutex::new(LocalWriteState::default())),
             #[cfg(test)]
             write_hook: None,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -94,45 +107,30 @@ impl LocalBackend {
     /// Create a LocalBackend from configuration, anchoring relative paths at `base_dir`.
     pub(crate) fn from_config(
         config: &LocalBackendSettings,
-        base_dir: &Path,
+        base_dir: &ResolvedPath,
     ) -> BackendResult<Self> {
-        let path = config
-            .path()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(Self::DEFAULT_STATE_FILE));
-        let path = if path.is_absolute() {
-            path
-        } else {
-            base_dir.join(path)
-        };
-
-        Ok(Self::with_path(path))
+        let path = base_dir
+            .join(config.path().unwrap_or(Self::DEFAULT_STATE_FILE))
+            .map_err(|error| BackendError::Io(format!("Failed to locate state file: {error}")))?;
+        Self::with_resolved_path(path)
     }
 
-    /// Get the state file path
-    pub fn state_path(&self) -> &PathBuf {
-        &self.state_path
+    /// The state file's diagnostic spelling.
+    pub fn state_path(&self) -> &DisplayPath {
+        self.state_path.display()
     }
 
-    fn recovery_path(&self) -> PathBuf {
-        self.lock_path.with_extension("lock.recover")
+    fn recovery_path(&self) -> ResolvedPath {
+        // A sibling of the already-pinned lock, never the project alias.
+        self.recovery_path.clone()
     }
 
-    fn create_lock_file(path: &PathBuf, content: &str) -> std::io::Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        if let Err(err) = file.write_all(content.as_bytes()) {
-            let _ = std::fs::remove_file(path);
-            return Err(err);
-        }
-        if let Err(err) = file.sync_all() {
-            let _ = std::fs::remove_file(path);
-            return Err(err);
-        }
-        Ok(())
+    fn create_lock_file(path: &ResolvedPath, content: &str) -> std::io::Result<()> {
+        path.create_lock(content.as_bytes())
     }
 
-    fn file_written_recently(path: &PathBuf) -> bool {
-        std::fs::metadata(path)
+    fn file_written_recently(path: &ResolvedPath) -> bool {
+        path.metadata()
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
@@ -140,7 +138,7 @@ impl LocalBackend {
     }
 
     async fn remove_lock_if_matches(&self, lock_id: &str) -> BackendResult<()> {
-        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+        let content = match self.lock_path.read_to_string_async().await {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
@@ -157,7 +155,7 @@ impl LocalBackend {
         };
 
         if existing_lock.id() == lock_id {
-            match tokio::fs::remove_file(&self.lock_path).await {
+            match self.lock_path.remove_async().await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -191,7 +189,7 @@ impl LocalBackend {
                 }
             }
 
-            let claim_content = match tokio::fs::read_to_string(&claim_path).await {
+            let claim_content = match claim_path.read_to_string_async().await {
                 Ok(content) => content,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -212,7 +210,7 @@ impl LocalBackend {
             };
 
             if claim_is_stale {
-                match tokio::fs::remove_file(&claim_path).await {
+                match claim_path.remove_async().await {
                     Ok(()) => continue,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(err) => {
@@ -230,7 +228,7 @@ impl LocalBackend {
 
     async fn has_active_recovery_claim(&self) -> BackendResult<bool> {
         let claim_path = self.recovery_path();
-        let claim_content = match tokio::fs::read_to_string(&claim_path).await {
+        let claim_content = match claim_path.read_to_string_async().await {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => {
@@ -251,7 +249,7 @@ impl LocalBackend {
             return Ok(true);
         }
 
-        match tokio::fs::remove_file(&claim_path).await {
+        match claim_path.remove_async().await {
             Ok(()) => Ok(false),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(BackendError::Io(format!(
@@ -261,8 +259,10 @@ impl LocalBackend {
         }
     }
 
-    async fn read_state_file(&self) -> BackendResult<Option<(Vec<u8>, PathBuf)>> {
-        let bytes = match tokio::fs::read(&self.state_path).await {
+    async fn read_state_file(
+        &self,
+    ) -> BackendResult<Option<(Vec<u8>, carina_core::paths::DisplayPath)>> {
+        let bytes = match self.state_path.read_async().await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -272,10 +272,7 @@ impl LocalBackend {
             }
         };
 
-        let state_location = self
-            .state_path
-            .canonicalize()
-            .unwrap_or_else(|_| self.state_path.clone());
+        let state_location = self.state_path.display().clone();
         Ok(Some((bytes, state_location)))
     }
 }
@@ -286,9 +283,8 @@ impl StateBackend for LocalBackend {
         let Some((bytes, state_location)) = self.read_state_file().await? else {
             return Ok(None);
         };
-        let outcome = state::check_and_migrate_bytes(&bytes).map_err(|error| {
-            error.with_state_read_location(state_location.display().to_string())
-        })?;
+        let outcome = state::check_and_migrate_bytes(&bytes)
+            .map_err(|error| error.with_state_read_location(&state_location))?;
         let (state, migration) = outcome.into_parts();
         if let Some(info) = migration {
             log_state_migration_once(
@@ -306,10 +302,7 @@ impl StateBackend for LocalBackend {
         let Some((bytes, state_location)) = self.read_state_file().await? else {
             return Ok(None);
         };
-        Ok(Some(RawState::new(
-            bytes,
-            state_location.display().to_string(),
-        )))
+        Ok(Some(RawState::new(bytes, &state_location)))
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
@@ -350,43 +343,11 @@ impl StateBackend for LocalBackend {
                 return Ok(());
             }
 
-            // A unique path also prevents independent backend instances from
-            // truncating each other's temporary files. The final rename is
-            // still atomic because the file lives beside the destination.
-            let tmp_path = state_path.with_extension(format!("json.tmp.{}", uuid::Uuid::new_v4()));
-            let write_result = (|| -> BackendResult<()> {
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp_path)
-                    .map_err(|error| {
-                        BackendError::Io(format!("Failed to create temp state file: {error}"))
-                    })?;
-                file.write_all(content.as_bytes()).map_err(|error| {
-                    BackendError::Io(format!("Failed to write temp state file: {error}"))
+            state_path
+                .atomic_replace(content.as_bytes())
+                .map_err(|error| {
+                    BackendError::Io(format!("Failed to replace state file: {error}"))
                 })?;
-                file.sync_all().map_err(|error| {
-                    BackendError::Io(format!("Failed to sync temp state file: {error}"))
-                })?;
-                std::fs::rename(&tmp_path, &state_path).map_err(|error| {
-                    BackendError::Io(format!("Failed to rename temp state file: {error}"))
-                })?;
-
-                // Preserve the backend's existing best-effort directory sync
-                // behavior on platforms that cannot fsync a directory.
-                let parent = state_path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                if let Ok(directory) = std::fs::File::open(parent) {
-                    let _ = directory.sync_all();
-                }
-                Ok(())
-            })();
-            if write_result.is_err() {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-            write_result?;
 
             write_state.last_written = Some(StateRevision {
                 lineage: state.lineage.clone(),
@@ -426,7 +387,7 @@ impl StateBackend for LocalBackend {
                 }
             }
 
-            let current_content = match tokio::fs::read_to_string(&self.lock_path).await {
+            let current_content = match self.lock_path.read_to_string_async().await {
                 Ok(content) => content,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -453,7 +414,7 @@ impl StateBackend for LocalBackend {
                 continue;
             };
 
-            let current_content = match tokio::fs::read_to_string(&self.lock_path).await {
+            let current_content = match self.lock_path.read_to_string_async().await {
                 Ok(content) => content,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -475,7 +436,7 @@ impl StateBackend for LocalBackend {
                 _ => {}
             }
 
-            match tokio::fs::remove_file(&self.lock_path).await {
+            match self.lock_path.remove_async().await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -501,7 +462,7 @@ impl StateBackend for LocalBackend {
 
     async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
         // Read the current lock file and verify it still belongs to us
-        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+        let content = match self.lock_path.read_to_string_async().await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(BackendError::LockNotHeld(
@@ -531,29 +492,17 @@ impl StateBackend for LocalBackend {
         let new_content = serde_json::to_string_pretty(&renewed)
             .map_err(|e| BackendError::Serialization(format!("Failed to serialize lock: {}", e)))?;
 
-        let tmp_path = self.lock_path.with_extension("lock.renew.tmp");
-
-        tokio::fs::write(&tmp_path, new_content.as_bytes())
+        self.lock_path
+            .atomic_replace_async(new_content.into_bytes())
             .await
-            .map_err(|e| BackendError::Io(format!("Failed to write temp lock file: {}", e)))?;
-
-        let file = tokio::fs::File::open(&tmp_path).await.map_err(|e| {
-            BackendError::Io(format!("Failed to open temp lock file for sync: {}", e))
-        })?;
-        file.sync_all().await.map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            BackendError::Io(format!("Failed to sync temp lock file: {}", e))
-        })?;
-
-        tokio::fs::rename(&tmp_path, &self.lock_path)
-            .await
-            .map_err(|e| BackendError::Io(format!("Failed to rename temp lock file: {}", e)))?;
+            .map_err(|error| BackendError::Io(format!("Failed to renew lock file: {error}")))?;
 
         // Re-read and verify our lock was not clobbered by a concurrent process.
         // This closes the TOCTOU window between the initial read and the rename.
-        let verify_content = tokio::fs::read_to_string(&self.lock_path)
-            .await
-            .map_err(|e| BackendError::Io(format!("Failed to verify lock after renewal: {}", e)))?;
+        let verify_content =
+            self.lock_path.read_to_string_async().await.map_err(|e| {
+                BackendError::Io(format!("Failed to verify lock after renewal: {}", e))
+            })?;
         let verify_lock = LockInfo::from_json_str(&verify_content).map_err(|e| {
             BackendError::InvalidState(format!("Failed to parse lock after renewal: {}", e))
         })?;
@@ -570,7 +519,7 @@ impl StateBackend for LocalBackend {
 
     async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
         // Verify the lock is still held by us before writing state
-        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+        let content = match self.lock_path.read_to_string_async().await {
             Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(BackendError::LockNotHeld(
@@ -600,7 +549,7 @@ impl StateBackend for LocalBackend {
     }
 
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
-        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+        let content = match self.lock_path.read_to_string_async().await {
             Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(BackendError::LockNotFound(lock.id().to_owned()));
@@ -623,7 +572,8 @@ impl StateBackend for LocalBackend {
             });
         }
 
-        tokio::fs::remove_file(&self.lock_path)
+        self.lock_path
+            .remove_async()
             .await
             .map_err(|e| BackendError::Io(format!("Failed to remove lock file: {}", e)))?;
 
@@ -631,7 +581,7 @@ impl StateBackend for LocalBackend {
     }
 
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
-        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+        let content = match self.lock_path.read_to_string_async().await {
             Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(BackendError::LockNotFound(lock_id.to_string()));
@@ -653,7 +603,8 @@ impl StateBackend for LocalBackend {
             });
         }
 
-        tokio::fs::remove_file(&self.lock_path)
+        self.lock_path
+            .remove_async()
             .await
             .map_err(|e| BackendError::Io(format!("Failed to remove lock file: {}", e)))?;
 
@@ -914,10 +865,14 @@ mod tests {
         let config = local_settings(None);
 
         let base_dir = tempdir().unwrap();
-        let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
+        let backend = LocalBackend::from_config(
+            &config,
+            &carina_core::paths::ResolvedPath::new(base_dir.path()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            backend.state_path(),
-            &base_dir.path().join("carina.state.json")
+            std::path::PathBuf::from(backend.state_path().to_string()),
+            base_dir.path().join("carina.state.json")
         );
     }
 
@@ -927,12 +882,19 @@ mod tests {
         let base_dir = tempdir().unwrap();
         let config = local_settings(Some("custom.state.json".to_string()));
 
-        let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
+        let backend = LocalBackend::from_config(
+            &config,
+            &carina_core::paths::ResolvedPath::new(base_dir.path()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            backend.state_path(),
-            &base_dir.path().join("custom.state.json")
+            std::path::PathBuf::from(backend.state_path().to_string()),
+            base_dir.path().join("custom.state.json")
         );
-        assert_ne!(backend.state_path(), &cwd.join("custom.state.json"));
+        assert_ne!(
+            std::path::PathBuf::from(backend.state_path().to_string()),
+            cwd.join("custom.state.json")
+        );
     }
 
     #[tokio::test]
@@ -941,8 +903,15 @@ mod tests {
         let state_path = tempdir().unwrap().path().join("absolute.state.json");
         let config = local_settings(Some(state_path.to_string_lossy().into_owned()));
 
-        let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
-        assert_eq!(backend.state_path(), &state_path);
+        let backend = LocalBackend::from_config(
+            &config,
+            &carina_core::paths::ResolvedPath::new(base_dir.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(backend.state_path().to_string()),
+            state_path
+        );
     }
 
     #[tokio::test]

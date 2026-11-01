@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use carina_provider_resolver::{
     DiscardedSignerPins, GuardedLockFile, LockFileMigration, ProviderInstallLock, WorkflowPins,
-    provider_lock_path,
 };
 
 use crate::error::AppError;
@@ -71,24 +70,30 @@ pub fn run_providers_command(command: ProvidersCommands) -> Result<(), AppError>
     }
 }
 
-fn acquire_install_lock(base_dir: &Path) -> Result<ProviderInstallLock, AppError> {
-    if !provider_lock_path(base_dir).exists() {
-        return Err(missing_lock_error(base_dir));
+fn acquire_install_lock(path: &Path) -> Result<ProviderInstallLock, AppError> {
+    let root = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    if !root.is_dir()
+        || !root
+            .join("carina-providers.lock")
+            .map_err(|error| AppError::Config(error.to_string()))?
+            .exists()
+    {
+        return Err(missing_lock_error(&root));
     }
-
-    ProviderInstallLock::acquire(base_dir).map_err(|error| {
+    ProviderInstallLock::acquire(&root).map_err(|error| {
         AppError::Config(format!(
             "Failed to acquire provider install lock for {}: {error}",
-            base_dir.display()
+            root.display()
         ))
     })
 }
 
-fn missing_lock_error(base_dir: &Path) -> AppError {
+fn missing_lock_error(base_dir: &carina_core::paths::ResolvedPath) -> AppError {
     AppError::Config(format!(
         "Provider lock file {} does not exist; run `{}` first",
-        provider_lock_path(base_dir).display(),
-        ProjectCommand::new("init", base_dir)
+        base_dir.display().join("carina-providers.lock"),
+        ProjectCommand::for_display_path("init", base_dir.display())
     ))
 }
 
@@ -115,11 +120,11 @@ fn flush_preview() -> Result<(), AppError> {
 }
 
 fn save_lock(lock: &mut GuardedLockFile<'_>) -> Result<(), AppError> {
-    let lock_path = provider_lock_path(lock.project_dir());
+    let lock_path = lock.project_dir().display().join("carina-providers.lock");
     lock.save().map_err(|error| {
         AppError::Config(format!(
             "Failed to save provider lock {}: {error}",
-            lock_path.display()
+            lock_path
         ))
     })
 }

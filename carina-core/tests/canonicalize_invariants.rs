@@ -96,14 +96,17 @@ fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFi
     std::fs::write(root.path().join("canonicalize.crn"), source)
         .expect("write canonicalization fixture");
     let parsed = carina_core::config_loader::parse_directory(
-        root.path(),
+        &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("parse should succeed");
-    carina_core::module_resolver::resolve_modules_providerless(parsed, root.path())
-        .expect("module-resolution boundary should succeed")
-        .into_expanded(&carina_core::schema::SchemaRegistry::new())
-        .expect("canonicalization fixture contains no parser placeholders")
+    carina_core::module_resolver::resolve_modules_providerless(
+        parsed,
+        &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
+    )
+    .expect("module-resolution boundary should succeed")
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
+    .expect("canonicalization fixture contains no parser placeholders")
 }
 
 #[test]

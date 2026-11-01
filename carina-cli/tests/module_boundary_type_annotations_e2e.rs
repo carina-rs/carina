@@ -435,7 +435,10 @@ impl Fixture {
     }
 
     fn validate(&self) -> Vec<String> {
-        carina_cli::commands::validate::validate_with_factories(&self.root, factories())
+        carina_cli::commands::validate::validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(&self.root).unwrap(),
+            factories(),
+        )
     }
 }
 
@@ -496,7 +499,7 @@ let admin = identity_center { role_arns = ["arn:accepted"] }
 fn shared_semantic_identity_annotation_is_conjunctive_across_module_signature_owners() {
     let (_temp, root) = shared_role_arn_directory();
     let accepted = carina_cli::commands::validate::validate_with_factories(
-        &root,
+        &carina_core::paths::ResolvedPath::new(&root).unwrap(),
         shared_role_arn_factories("arn:accepted"),
     );
     assert!(
@@ -505,7 +508,7 @@ fn shared_semantic_identity_annotation_is_conjunctive_across_module_signature_ow
     );
 
     let rejected = carina_cli::commands::validate::validate_with_factories(
-        &root,
+        &carina_core::paths::ResolvedPath::new(&root).unwrap(),
         shared_role_arn_factories("arn:other"),
     );
     assert!(
@@ -941,7 +944,10 @@ let zone = aws.route53.HostedZone {
     )
     .expect("root resources");
 
-    let diagnostics = carina_cli::commands::validate::validate_with_factories(&root, factories());
+    let diagnostics = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&root).unwrap(),
+        factories(),
+    );
     assert!(
         diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("cannot assign aws.logs.LogGroup.Arn to 'name'")

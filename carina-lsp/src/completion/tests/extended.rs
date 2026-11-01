@@ -1741,6 +1741,27 @@ fn upstream_state_source_outside_block_produces_nothing() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn upstream_state_source_symlink_suggestions_resolve_from_the_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    let link = temp.path().join("link");
+    std::fs::create_dir_all(real.join("current")).unwrap();
+    std::fs::create_dir(real.join("neighbor")).unwrap();
+    std::fs::write(real.join("current/main.crn"), "").unwrap();
+    std::fs::write(real.join("neighbor/main.crn"), "").unwrap();
+    std::os::unix::fs::symlink(real.join("current"), &link).unwrap();
+    let provider = test_provider();
+    let doc = create_document("let orgs = upstream_state {\n    source = '");
+    let completions = provider.complete(&doc, Position::new(1, 14), Some(&link));
+    assert!(completions.iter().any(|item| item.label == "'../neighbor'"));
+    for item in completions {
+        let source = item.label.trim_matches('\'');
+        assert!(link.join(source).is_dir(), "invalid suggestion: {source}");
+    }
+}
+
 #[test]
 fn upstream_state_source_matches_partial_prefix() {
     use std::fs;

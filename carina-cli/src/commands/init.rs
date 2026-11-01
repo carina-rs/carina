@@ -2,7 +2,7 @@ use std::path::Path;
 
 use colored::Colorize;
 
-use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::ProviderContext;
 
 use carina_provider_resolver::{self, LockMode, ProviderInstallLock};
@@ -38,14 +38,16 @@ pub async fn run_init(
     force: bool,
     accept_egress: &[String],
 ) -> Result<(), InitError> {
-    let base_dir = get_base_dir(path);
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| InitError::Other(error.to_string()))?;
+    let base_dir = &project;
     let accepted_egress = carina_provider_resolver::AcceptedEgressSources::parse_os(
         accept_egress,
         std::env::var_os("CARINA_ACCEPT_EGRESS").as_deref(),
         base_dir,
     )?;
     run_init_with_provider_resolver(
-        path,
+        base_dir,
         upgrade,
         locked,
         migrate_state,
@@ -65,7 +67,7 @@ pub async fn run_init(
 }
 
 async fn run_init_with_provider_resolver(
-    path: &Path,
+    path: &carina_core::paths::ResolvedPath,
     upgrade: bool,
     locked: bool,
     migrate_state: bool,
@@ -89,12 +91,11 @@ async fn run_init_with_provider_resolver(
         LockMode::Normal
     };
 
-    let base_dir = get_base_dir(path);
-    let path_buf = path.to_path_buf();
+    let base_dir = path;
 
     let provider_context = ProviderContext::default();
     let loaded = load_configuration_with_config(
-        &path_buf,
+        path,
         &provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )
@@ -193,7 +194,12 @@ async fn run_init_with_provider_resolver(
             if !migrate_state {
                 eprintln!(
                     "{}",
-                    drift_warning(drift.existing(), drift.configured(), path).yellow()
+                    drift_warning(
+                        drift.existing(),
+                        drift.configured(),
+                        &std::path::PathBuf::from(path.display().to_string())
+                    )
+                    .yellow()
                 );
                 migration_pending = true;
             } else {
@@ -231,7 +237,7 @@ async fn run_init_with_provider_resolver(
             "{}",
             format!(
                 "Backend migration pending. Provider plugins resolved; run `{}` to complete initialization.",
-                ProjectCommand::new("init --migrate-state", path)
+                ProjectCommand::for_display_path("init --migrate-state", path.display())
             )
             .yellow()
         );
@@ -325,7 +331,7 @@ mod tests {
         http: &FixtureRegistryHttp,
     ) {
         run_init_with_provider_resolver(
-            project,
+            &carina_core::paths::ResolvedPath::new(project).unwrap(),
             false,
             false,
             false,
@@ -352,7 +358,7 @@ mod tests {
         github_http: &FixtureGithubHttp,
     ) {
         run_init_with_provider_resolver(
-            project,
+            &carina_core::paths::ResolvedPath::new(project).unwrap(),
             false,
             false,
             false,
@@ -375,13 +381,17 @@ mod tests {
 
     async fn assert_installed_provider_loads_as_aws(user_dirs: &UserDirs, project: &Path) {
         let loaded = load_configuration_with_config(
-            project,
+            &carina_core::paths::ResolvedPath::new(project).unwrap(),
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .unwrap();
         let config = loaded.parsed.providers.first().unwrap();
-        let installed = carina_provider_resolver::find_installed_provider(project, config).unwrap();
+        let installed = carina_provider_resolver::find_installed_provider(
+            &carina_core::paths::ResolvedPath::new(project).unwrap(),
+            config,
+        )
+        .unwrap();
         let grants = TrustedLocalGrants::parse(&[], None).unwrap();
         let class = installed
             .load_with(user_dirs, &grants, |verified| async move {
@@ -419,8 +429,11 @@ mod tests {
             panic!("test source must be GitHub-direct")
         };
         let source_key = github_source.source_key();
-        let artifact =
-            carina_provider_resolver::cache_path_wasm(project.path(), &source_key, version);
+        let artifact = carina_provider_resolver::cache_path_wasm(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source_key,
+            version,
+        );
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, bytes).unwrap();
         let mut lock = LockFile::default();
@@ -433,7 +446,10 @@ mod tests {
                 asset_id: serde_json::from_str::<AssetId>("42").unwrap(),
                 constraint: None,
             },
-            sha256: carina_provider_resolver::sha256_file(&artifact).unwrap(),
+            sha256: carina_provider_resolver::sha256_file(
+                &carina_core::paths::ResolvedPath::new(&artifact).unwrap(),
+            )
+            .unwrap(),
             registry: None,
         });
         let lock_path = project.path().join("carina-providers.lock");
@@ -594,7 +610,7 @@ mod tests {
         let http = signed_fixture_registry();
 
         run_init_with_provider_resolver(
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             false,
             false,
             false,

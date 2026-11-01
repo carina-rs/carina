@@ -694,7 +694,7 @@ impl StateBackend for S3Backend {
         match self.get_state_object().await? {
             Some((bytes, etag)) => {
                 let outcome = state::check_and_migrate_bytes(&bytes)
-                    .map_err(|error| error.with_state_read_location(state_location.clone()))?;
+                    .map_err(|error| error.with_state_read_remote_location(&state_location))?;
                 let (state, migration) = outcome.into_parts();
                 let loaded_state = if let Some(info) = migration {
                     log_state_migration_once(&self.migration_logged, info, &state_location);
@@ -719,7 +719,7 @@ impl StateBackend for S3Backend {
         Ok(self
             .get_state_object()
             .await?
-            .map(|(bytes, _)| RawState::new(bytes, state_location)))
+            .map(|(bytes, _)| RawState::remote(bytes, state_location)))
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {

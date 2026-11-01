@@ -5,7 +5,8 @@
 //! lock-aware reads, verified mutations, migrations, force-unlock, and
 //! state-bucket deletion distinct at the call site.
 
-use std::path::{Path, PathBuf};
+use carina_core::paths::ResolvedPath;
+use std::path::PathBuf;
 
 use carina_core::parser::BackendConfig as ParserBackendConfig;
 use carina_core::resource::{BindingAddress, PlaceholderKind};
@@ -19,7 +20,7 @@ use crate::backends::{S3_BACKEND_PROVIDER_NAME, S3_BACKEND_RESOURCE_TYPE, StateU
 /// The old and new backend addresses involved in a pending migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendDrift {
-    project_dir: PathBuf,
+    project_dir: ResolvedPath,
     existing: BackendLock,
     configured: BackendLock,
 }
@@ -53,7 +54,7 @@ pub struct BackendSelection {
 pub(crate) enum BackendTarget {
     Configured {
         config: Option<BackendConfig>,
-        base_dir: PathBuf,
+        base_dir: ResolvedPath,
     },
     ExplicitUrl(StateUrl),
 }
@@ -240,7 +241,7 @@ impl ExplicitUrlBackendSelection {
 }
 
 struct BackendInspection {
-    project_dir: PathBuf,
+    project_dir: ResolvedPath,
     configured: Option<BackendConfig>,
     status: BackendDriftStatus,
 }
@@ -252,10 +253,10 @@ impl BackendSelection {
     /// returns its drift metadata without printing. Missing locks are allowed
     /// here so the command layer can retain command-specific policy.
     pub fn for_read<P: PlaceholderKind, B: BindingAddress>(
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
         configured: Option<&ParserBackendConfig<P, B>>,
     ) -> BackendResult<ReadBackendSelection> {
-        let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
+        let inspection = inspect(project_dir, configured)?;
         Self::for_read_inspection(inspection)
     }
 
@@ -281,10 +282,10 @@ impl BackendSelection {
     ///
     /// Only the `Verified` result carries a constructible backend token.
     pub fn verified_for_mutation<P: PlaceholderKind, B: BindingAddress>(
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
         configured: Option<&ParserBackendConfig<P, B>>,
     ) -> BackendResult<MutationBackendSelection> {
-        let inspection = inspect(&canonical_project_dir(project_dir), configured)?;
+        let inspection = inspect(project_dir, configured)?;
         Self::verified_for_mutation_inspection(inspection)
     }
 
@@ -293,7 +294,13 @@ impl BackendSelection {
     ) -> BackendResult<MutationBackendSelection> {
         match inspection.status {
             BackendDriftStatus::Fresh => Ok(MutationBackendSelection::MissingLock {
-                path: BackendLock::lock_path(&inspection.project_dir),
+                path: std::path::PathBuf::from(
+                    inspection
+                        .project_dir
+                        .display()
+                        .join(crate::backend_lock::LOCK_FILE)
+                        .to_string(),
+                ),
             }),
             BackendDriftStatus::Unchanged => Ok(MutationBackendSelection::Verified(
                 VerifiedMutationBackendSelection {
@@ -309,7 +316,7 @@ impl BackendSelection {
 
     /// Resolve the old and new backend addresses carried by a proven drift.
     pub async fn for_migration(drift: &BackendDrift) -> BackendResult<MigrationBackends> {
-        let project_dir = canonical_project_dir(&drift.project_dir);
+        let project_dir = drift.project_dir.clone();
         let source =
             Self::configured_target(Some(drift.existing.to_state_config()?), project_dir.clone());
         let target =
@@ -357,7 +364,7 @@ impl BackendSelection {
     /// Force-release a backend lock, selecting the old locked backend during
     /// pending migration without exposing a general backend capability.
     pub async fn force_unlock<P: PlaceholderKind, B: BindingAddress>(
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
         configured: Option<&ParserBackendConfig<P, B>>,
         lock_id: &str,
     ) -> BackendResult<()> {
@@ -372,7 +379,7 @@ impl BackendSelection {
         &self.target
     }
 
-    fn configured_target(config: Option<BackendConfig>, base_dir: PathBuf) -> Self {
+    fn configured_target(config: Option<BackendConfig>, base_dir: ResolvedPath) -> Self {
         Self {
             target: BackendTarget::Configured { config, base_dir },
         }
@@ -388,14 +395,14 @@ impl BackendSelection {
 
 /// Inspect backend drift without constructing a backend.
 pub fn inspect_backend_drift<P: PlaceholderKind, B: BindingAddress>(
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     configured: Option<&ParserBackendConfig<P, B>>,
 ) -> BackendResult<BackendDriftStatus> {
     inspect(project_dir, configured).map(|inspection| inspection.status)
 }
 
 fn inspect<P: PlaceholderKind, B: BindingAddress>(
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     configured: Option<&ParserBackendConfig<P, B>>,
 ) -> BackendResult<BackendInspection> {
     let configured = configured
@@ -406,10 +413,10 @@ fn inspect<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn inspect_resolved(
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     configured: Option<BackendConfig>,
 ) -> BackendResult<BackendInspection> {
-    let project_dir = project_dir.to_path_buf();
+    let project_dir = project_dir.clone();
     let configured_lock = configured
         .as_ref()
         .map(BackendLock::from_config)
@@ -429,12 +436,6 @@ fn inspect_resolved(
         configured,
         status,
     })
-}
-
-fn canonical_project_dir(project_dir: &Path) -> PathBuf {
-    project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf())
 }
 
 #[cfg(test)]
@@ -482,11 +483,14 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         BackendLock::for_config(Some(&local_config("old.json")))
             .unwrap()
-            .save(project.path())
+            .save(&carina_core::paths::ResolvedPath::new(project.path()).unwrap())
             .unwrap();
 
-        let selected =
-            BackendSelection::for_read(project.path(), Some(&local_config("new.json"))).unwrap();
+        let selected = BackendSelection::for_read(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            Some(&local_config("new.json")),
+        )
+        .unwrap();
         let resolved = selected.resolve_with_drift_warning(|_| {}).await.unwrap();
 
         let Some(BackendConfig::Local(settings)) = resolved.selected_config() else {
@@ -503,10 +507,13 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         BackendLock::for_config(Some(&local_config("old.json")))
             .unwrap()
-            .save(project.path())
+            .save(&carina_core::paths::ResolvedPath::new(project.path()).unwrap())
             .unwrap();
-        let selected =
-            BackendSelection::for_read(project.path(), Some(&local_config("new.json"))).unwrap();
+        let selected = BackendSelection::for_read(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            Some(&local_config("new.json")),
+        )
+        .unwrap();
         let warned = AtomicBool::new(false);
 
         let _backend = selected
@@ -528,11 +535,11 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         BackendLock::for_config(Some(&local_config("old.json")))
             .unwrap()
-            .save(project.path())
+            .save(&carina_core::paths::ResolvedPath::new(project.path()).unwrap())
             .unwrap();
 
         let selected = BackendSelection::verified_for_mutation(
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             Some(&local_config("new.json")),
         )
         .unwrap();
@@ -557,11 +564,13 @@ mod tests {
             .unwrap();
         BackendLock::for_config(Some(&local_config("old.json")))
             .unwrap()
-            .save(project.path())
+            .save(&carina_core::paths::ResolvedPath::new(project.path()).unwrap())
             .unwrap();
-        let BackendDriftStatus::Drifted(drift) =
-            inspect_backend_drift(project.path(), Some(&local_config("new.json"))).unwrap()
-        else {
+        let BackendDriftStatus::Drifted(drift) = inspect_backend_drift(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            Some(&local_config("new.json")),
+        )
+        .unwrap() else {
             panic!("fixture must have pending backend migration")
         };
 
@@ -607,7 +616,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn read_selection_canonicalizes_the_backend_base_directory() {
+    fn read_selection_preserves_symlink_backend_base_directory() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -616,10 +625,14 @@ mod tests {
         let alias = root.path().join("project-alias");
         symlink(&project, &alias).unwrap();
 
-        let selected = BackendSelection::for_read(&alias, None::<&ParserBackendConfig>).unwrap();
+        let selected = BackendSelection::for_read(
+            &carina_core::paths::ResolvedPath::new(&alias).unwrap(),
+            None::<&ParserBackendConfig>,
+        )
+        .unwrap();
         let BackendTarget::Configured { base_dir, .. } = selected.selection.target() else {
             panic!("project read must select a configured backend target")
         };
-        assert_eq!(base_dir, &project.canonicalize().unwrap());
+        assert_eq!(base_dir.display().to_string(), alias.display().to_string());
     }
 }

@@ -313,7 +313,10 @@ let instance = component { }
     }
 
     fn validate(&self) -> Vec<String> {
-        carina_cli::commands::validate::validate_with_factories(&self.caller, factories())
+        carina_cli::commands::validate::validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(&self.caller).unwrap(),
+            factories(),
+        )
     }
 }
 
@@ -656,11 +659,17 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
     );
     let provider_context = loaded_providers.provider_context();
     let schemas = loaded_providers.schemas();
-    let parsed = carina_core::config_loader::parse_directory(&fixture.caller, provider_context)
-        .expect("parse directory-scoped fixture");
+    let parsed = carina_core::config_loader::parse_directory(
+        &carina_core::paths::ResolvedPath::new(&fixture.caller).unwrap(),
+        provider_context,
+    )
+    .expect("parse directory-scoped fixture");
     let parsed = carina_core::module_resolver::resolve_modules_with_config(
         parsed,
-        carina_core::config_loader::get_base_dir(&fixture.caller),
+        &carina_core::paths::ResolvedPath::new(carina_core::config_loader::get_base_dir(
+            &fixture.caller,
+        ))
+        .unwrap(),
         provider_context,
         schemas.schemas(),
     )
@@ -750,7 +759,10 @@ let outer_instance = outer_module { }
     )
     .expect("caller exports");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         diags.is_empty(),
@@ -806,7 +818,10 @@ let outer_instance = outer_module { }
     )
     .expect("caller module call");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert_eq!(
         diags.len(),

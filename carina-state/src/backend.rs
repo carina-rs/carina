@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use carina_core::hint::ProjectCommand;
+use carina_core::paths::DisplayPath;
 use carina_core::resource::{AbsoluteBindingAddress, ResourceIdentityError};
 use std::path::Path;
 use thiserror::Error;
@@ -564,16 +565,31 @@ impl BackendError {
     }
 
     /// Attach the concrete backend location to state-row validation errors.
-    pub fn with_state_location(mut self, location: impl Into<String>) -> Self {
+    pub fn with_state_location(mut self, location: &DisplayPath) -> Self {
         if let Self::InvalidResourceIdentity(error) = &mut self {
-            error.set_state_location(location.into());
+            error.set_state_location(location.to_string());
         }
         self
     }
 
     /// Attach a backend location while retaining the typed decoding error.
-    pub fn with_state_read_location(self, location: impl Into<String>) -> Self {
-        let location = location.into();
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::paths::CanonicalPath;
+    /// use carina_state::BackendError;
+    /// let path = CanonicalPath::new(".").unwrap();
+    /// BackendError::InvalidState("invalid JSON".into()).with_state_read_location(&path);
+    /// ```
+    pub fn with_state_read_location(self, location: &DisplayPath) -> Self {
+        self.with_state_read_location_text(location.to_string())
+    }
+
+    /// Remote locations are URLs, separate from filesystem display paths.
+    pub(crate) fn with_state_read_remote_location(self, location: &str) -> Self {
+        self.with_state_read_location_text(location.to_string())
+    }
+
+    fn with_state_read_location_text(self, location: String) -> Self {
         match self {
             Self::InvalidResourceIdentity(mut error) => {
                 error.set_state_location(location);
@@ -610,15 +626,29 @@ pub type BackendResult<T> = Result<T, BackendError>;
 #[derive(Debug)]
 pub struct RawState {
     bytes: Vec<u8>,
-    display_location: String,
+    location: StateReadLocation,
+}
+
+#[derive(Debug)]
+enum StateReadLocation {
+    File(DisplayPath),
+    Remote(String),
 }
 
 impl RawState {
     /// Construct a raw state read from backend-owned bytes.
-    pub fn new(bytes: Vec<u8>, display_location: impl Into<String>) -> Self {
+    pub fn new(bytes: Vec<u8>, display_location: &DisplayPath) -> Self {
         Self {
             bytes,
-            display_location: display_location.into(),
+            location: StateReadLocation::File(display_location.clone()),
+        }
+    }
+
+    /// Construct a raw read from a remote backend URL.
+    pub(crate) fn remote(bytes: Vec<u8>, url: String) -> Self {
+        Self {
+            bytes,
+            location: StateReadLocation::Remote(url),
         }
     }
 
@@ -633,7 +663,7 @@ impl RawState {
             .map_err(BackendError::InvalidState)?;
         let bytes = carina_core::utils::pretty_with_newline_bytes(state)
             .map_err(|error| BackendError::Serialization(error.to_string()))?;
-        Ok(Self::new(bytes, display_location))
+        Ok(Self::remote(bytes, display_location.into()))
     }
 
     /// Borrow the state-file bytes.
@@ -642,8 +672,18 @@ impl RawState {
     }
 
     /// Return the backend location used in diagnostics and migration warnings.
-    pub fn display_location(&self) -> &str {
-        &self.display_location
+    pub fn display_location(&self) -> String {
+        match &self.location {
+            StateReadLocation::File(path) => path.to_string(),
+            StateReadLocation::Remote(url) => url.clone(),
+        }
+    }
+
+    fn locate_error(&self, error: BackendError) -> BackendError {
+        match &self.location {
+            StateReadLocation::File(path) => error.with_state_read_location(path),
+            StateReadLocation::Remote(url) => error.with_state_read_remote_location(url),
+        }
     }
 }
 
@@ -772,9 +812,9 @@ pub async fn read_published_exports(
         return Ok(None);
     };
     let (exports, migration) = PublishedExports::decode_state_bytes(raw_state.bytes())
-        .map_err(|error| error.with_state_read_location(raw_state.display_location()))?;
+        .map_err(|error| raw_state.locate_error(error))?;
     if let Some(info) = migration {
-        state::log_state_migration(info, raw_state.display_location());
+        state::log_state_migration(info, &raw_state.display_location());
     }
     Ok(Some(exports))
 }

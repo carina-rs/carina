@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 ///
 /// The path is rendered as given by the caller rather than being resolved or
 /// canonicalized here. Project-scoped callers pass the user-supplied project
-/// path; saved-plan flows instead pass the plan's recorded (canonical) source
+/// path; saved-plan flows instead pass the plan's recorded display source
 /// path for project-scoped hints. A hint that names the saved plan itself
 /// passes the user-supplied plan path. Default paths made only of `.`
 /// components are omitted; other paths appear after all subcommand arguments
@@ -13,7 +13,12 @@ use std::path::{Component, Path};
 pub struct ProjectCommand<'a> {
     subcommand: &'static str,
     arguments: Vec<CommandArgument<'a>>,
-    project_dir: &'a Path,
+    project_dir: CommandPath<'a>,
+}
+
+enum CommandPath<'a> {
+    Raw(&'a Path),
+    Display(&'a crate::paths::DisplayPath),
 }
 
 enum CommandArgument<'a> {
@@ -31,7 +36,18 @@ impl<'a> ProjectCommand<'a> {
         Self {
             subcommand,
             arguments: Vec::new(),
-            project_dir,
+            project_dir: CommandPath::Raw(project_dir),
+        }
+    }
+
+    pub fn for_display_path(
+        subcommand: &'static str,
+        project_dir: &'a crate::paths::DisplayPath,
+    ) -> Self {
+        Self {
+            subcommand,
+            arguments: Vec::new(),
+            project_dir: CommandPath::Display(project_dir),
         }
     }
 
@@ -71,9 +87,16 @@ impl fmt::Display for ProjectCommand<'_> {
             }
         }
 
-        if !is_default_project_dir(self.project_dir) {
-            formatter.write_str(" ")?;
-            write_path_word(formatter, self.project_dir)?;
+        match self.project_dir {
+            CommandPath::Raw(path) if !is_default_project_dir(path) => {
+                formatter.write_str(" ")?;
+                write_path_word(formatter, path)?;
+            }
+            CommandPath::Display(path) => {
+                formatter.write_str(" ")?;
+                write_shell_word(formatter, &path.to_string())?;
+            }
+            CommandPath::Raw(_) => {}
         }
 
         Ok(())

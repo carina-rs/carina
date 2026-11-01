@@ -312,10 +312,11 @@ mod tests {
     fn test_provider_label() -> Arc<ProviderLabel> {
         Arc::new(ProviderLabel {
             name: "guest-store-test".to_string(),
-            source: carina_provider_resolver::ProviderLoadSource::LocalFile {
-                path: std::path::PathBuf::from("/test-providers/guest-store-test.wasm"),
-                canonical_source: std::path::PathBuf::from("guest-store-test.wasm"),
-            },
+            source: carina_provider_resolver::ProviderLoadSource::local_file(
+                &carina_core::paths::ResolvedPath::new("/test-providers/guest-store-test.wasm")
+                    .unwrap(),
+                std::path::PathBuf::from("guest-store-test.wasm"),
+            ),
         })
     }
 

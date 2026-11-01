@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
-use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::config_loader::load_configuration_with_config;
 use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
@@ -17,6 +18,8 @@ use carina_core::parser::{
     ExpandedBackendConfig as BackendConfig, ProviderContext, ResolvedProviderConfigs,
     SavedProviderConfigs, UpstreamState,
 };
+use carina_core::paths::ResolvedPath;
+use carina_core::paths::{CanonicalPath, DisplayPath};
 use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
 use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
 use carina_core::provider_source::ProviderSource;
@@ -460,7 +463,8 @@ mod provider_scope_evidence_tests {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-30T00:00:00Z".to_string(),
-            source_path: "test.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("test.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs,
@@ -659,6 +663,9 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 39 pins the display source locator to its planned canonical
+    /// identity so a retargeted symlink requires replanning.
+    ///
     /// Plan format 38 resolves authored lifecycle directives and retains loop
     /// expressions, default origins, and call-site diagnostics in templates.
     /// Earlier plans could have silently discarded safety directives.
@@ -707,11 +714,15 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// Its presence is the plan-only discriminator used by `PlanFileHeader`;
     /// keep its serialized name stable across plan formats.
     pub timestamp: String,
-    /// Original .crn path (informational).
+    /// Absolute source locator, retaining the user's symlink spelling.
+    /// Used for apply-time filesystem access and recovery guidance, never as
+    /// a file-identity key.
     ///
     /// `PlanFileHeader` decodes this field on a best-effort basis to render
     /// replan guidance when the format has a string value for it.
-    pub source_path: String,
+    pub source_path: DisplayPath,
+    /// Canonical source identity captured at plan time; apply rejects retargeting.
+    pub source_identity: CanonicalPath,
     /// State lineage for drift detection
     pub state_lineage: Option<String>,
     /// State serial for drift detection
@@ -821,6 +832,7 @@ impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -842,6 +854,7 @@ impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -880,6 +893,7 @@ impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -901,6 +915,7 @@ impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -984,7 +999,8 @@ struct PlanFileWire {
     version: u32,
     carina_version: String,
     timestamp: String,
-    source_path: String,
+    source_path: DisplayPath,
+    source_identity: CanonicalPath,
     state_lineage: Option<String>,
     state_serial: Option<u64>,
     provider_configs: SavedProviderConfigs,
@@ -1365,6 +1381,7 @@ impl From<PlanFile> for PlanFileWire {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -1391,6 +1408,7 @@ impl From<PlanFile> for PlanFileWire {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -1423,6 +1441,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -1448,6 +1467,7 @@ impl TryFrom<PlanFileWire> for PlanFile {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -1967,7 +1987,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 38;
+    pub const CURRENT_VERSION: u32 = 39;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -2202,6 +2222,7 @@ impl PlanFile {
             carina_version: _carina_version,
             timestamp: _timestamp,
             source_path: _source_path,
+            source_identity: _source_identity,
             state_lineage: _state_lineage,
             state_serial: _state_serial,
             provider_configs,
@@ -3180,6 +3201,7 @@ impl UnresolvedReloadedPlanFile {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -3210,6 +3232,7 @@ impl UnresolvedReloadedPlanFile {
             carina_version,
             timestamp,
             source_path,
+            source_identity,
             state_lineage,
             state_serial,
             provider_configs,
@@ -3301,13 +3324,17 @@ impl ReloadedPlanFile {
             return Ok(());
         }
 
-        let mut candidates = HashMap::with_capacity(evaluated.len());
-        for live in evaluated {
-            let origin = source_identities
-                .saved_origin_id(live.call_path())
-                .map_err(ReloadedCompositionRehydrationError::SourceIdentity)?;
-            candidates.insert(origin, live);
-        }
+        // Register every call source in one eager pass before any missing
+        // candidate can interrupt display mapping for later calls.
+        let origins = evaluated
+            .iter()
+            .map(|live| source_identities.saved_origin_id(live.call_path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ReloadedCompositionRehydrationError::SourceIdentity)?;
+        let candidates = origins
+            .into_iter()
+            .zip(evaluated)
+            .collect::<HashMap<_, _>>();
         let rehydrated = self
             .contents
             .compositions
@@ -3626,7 +3653,8 @@ mod managed_current_serde_tests {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-23T08:00:00Z".to_string(),
-            source_path: "test.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("test.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: serde_json::from_value(serde_json::json!([]))
@@ -4066,7 +4094,7 @@ impl std::fmt::Display for PlanSaveError {
 impl std::error::Error for PlanSaveError {}
 
 fn build_plan_file<E>(
-    path: &Path,
+    path: &ResolvedPath,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
@@ -4090,7 +4118,7 @@ fn build_plan_file<E>(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_plan_file_from_parts<E, R>(
-    path: &Path,
+    path: &ResolvedPath,
     parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
@@ -4114,7 +4142,7 @@ fn build_plan_file_from_parts<E, R>(
 
 #[allow(clippy::too_many_arguments)]
 fn build_plan_file_contents<E>(
-    path: &Path,
+    path: &ResolvedPath,
     parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
     backend_config: Option<BackendConfig>,
@@ -4131,13 +4159,10 @@ fn build_plan_file_contents<E>(
         ctx.sorted_resources.len(),
         "plan resources must stay paired with their authored origins"
     );
-    let source_path = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string();
-    let mut composition_source_identities =
-        CompositionSourceIdentityResolver::new(get_base_dir(path))?;
+    let source = path.clone();
+    let source_path = source.display().clone();
+    let source_identity = source.identity();
+    let mut composition_source_identities = CompositionSourceIdentityResolver::new(&source)?;
 
     let desired_resources: HashMap<ResourceId, Resource> = ctx
         .sorted_resources
@@ -4251,6 +4276,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4202: bumped 38→39 — retain the display source locator and
+        // canonical identity separately, rejecting retargeted source symlinks.
         // carina#4174: bumped 36→37 — deferred-for templates require file
         // (relative path or null) and line for apply-time diagnostics.
         // carina#4094: bumped 35→36 — saved plans use typed deferred-for
@@ -4363,6 +4390,7 @@ fn build_plan_file_contents<E>(
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path,
+        source_identity,
         state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
         state_serial: state_file.as_ref().map(|s| s.serial),
         provider_configs,
@@ -4640,15 +4668,20 @@ pub async fn run_plan(
     } else {
         ProgressSink::Human
     };
+    let project = ResolvedPath::new(path).map_err(|error| AppError::Config(error.to_string()))?;
+    let pinned_out = out
+        .map(ResolvedPath::new)
+        .transpose()
+        .map_err(|error| AppError::Config(format!("Failed to locate plan file: {error}")))?;
     let loaded = load_configuration_with_config(
-        path,
+        &project,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
-    let base_dir = get_base_dir(path);
+    let base_dir = &project;
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     let mut validated_config = providers.validate_config_pair(
         parsed,
@@ -4942,7 +4975,7 @@ pub async fn run_plan(
         // failures so the user sees an actionable plan-save diagnostic
         // instead of a panic backtrace.
         let plan_file = build_plan_file(
-            path,
+            &project,
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
@@ -5014,7 +5047,7 @@ pub async fn run_plan(
 
     let plan_output = if out.is_some() {
         let plan_file = build_plan_file(
-            path,
+            &project,
             provider_inputs.configs(),
             plan_file_backend_config.clone(),
             &state_file,
@@ -5034,7 +5067,7 @@ pub async fn run_plan(
         serial: state.serial,
     });
     let rendered_inline_image = write_plan_artifacts(
-        out.zip(plan_output.as_deref()),
+        pinned_out.as_ref().zip(plan_output.as_deref()),
         (image.is_some() || inline_image.is_some()).then_some(PlanImageArtifactRequest {
             file: image,
             inline: inline_image,
@@ -5092,7 +5125,7 @@ struct PlanImageArtifactRequest<'a> {
 /// already protocol-encoded, but is emitted by `run_plan` only after status
 /// messages so its escape bytes remain the final command output.
 fn write_plan_artifacts(
-    out: Option<(&Path, &str)>,
+    out: Option<(&ResolvedPath, &str)>,
     images: Option<PlanImageArtifactRequest<'_>>,
 ) -> Result<Option<RenderedInlineImage>, AppError> {
     let (rendered_image, rendered_inline_image) = match images {
@@ -5101,7 +5134,8 @@ fn write_plan_artifacts(
     };
 
     if let Some((out_path, contents)) = out {
-        fs::write(out_path, contents)
+        out_path
+            .atomic_replace(contents.as_bytes())
             .map_err(|error| AppError::Config(format!("Failed to write plan file: {error}")))?;
     }
 
@@ -5124,7 +5158,7 @@ pub(crate) struct PreparedPlanIdentityData {
 pub(crate) async fn prepare_plan_identity_and_provider_inputs(
     validated_config: &mut ValidatedConfig,
     state_file: &mut Option<StateFile>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     upstream_policy: UpstreamMissingStatePolicy,
 ) -> Result<PreparedPlanIdentityData, AppError> {
@@ -5320,12 +5354,8 @@ pub fn compute_export_diffs(
 
 /// Seed a cycle guard with the caller's own base directory so that a chain
 /// ending back at the root is detected as a cycle.
-pub(crate) fn seed_cycle_guard(base_dir: &Path) -> HashSet<PathBuf> {
-    let mut guard = HashSet::new();
-    if let Ok(abs) = base_dir.canonicalize() {
-        guard.insert(abs);
-    }
-    guard
+pub(crate) fn seed_cycle_guard(base_dir: &ResolvedPath) -> HashSet<CanonicalPath> {
+    HashSet::from([base_dir.identity()])
 }
 
 /// How a missing upstream state file is handled while loading upstreams.
@@ -5378,7 +5408,7 @@ impl ResolvedProviderInputs {
 /// construction then requires the returned typed configs.
 pub(crate) async fn load_and_resolve_provider_configs<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     policy: UpstreamMissingStatePolicy,
     scope: ProviderUpstreamScope,
@@ -5439,9 +5469,9 @@ struct ProviderReferencedUpstream {
 
 async fn load_provider_referenced_upstream_states<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
-    cycle_guard: &mut HashSet<PathBuf>,
+    cycle_guard: &mut HashSet<CanonicalPath>,
     policy: UpstreamMissingStatePolicy,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
     let mut remote_bindings = HashMap::new();
@@ -5596,24 +5626,31 @@ fn provider_referenced_upstream_states<E>(
 /// problems the user must fix before plan output can mean anything.
 pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddress>(
     upstream_states: &[UpstreamState<B>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
-    cycle_guard: &mut HashSet<PathBuf>,
+    cycle_guard: &mut HashSet<CanonicalPath>,
     policy: UpstreamMissingStatePolicy,
 ) -> Result<HashMap<String, HashMap<String, Value>>, AppError> {
     let mut result = HashMap::new();
 
     for us in upstream_states {
-        let source_abs = base_dir.join(&us.source).canonicalize().map_err(|e| {
-            AppError::Config(format!(
-                "upstream_state '{}': cannot resolve source '{}': {}",
-                us.binding,
-                us.source.display(),
-                e
-            ))
-        })?;
+        let source_abs = base_dir
+            .join(&us.source)
+            .and_then(|source| {
+                source.metadata()?;
+                Ok(source)
+            })
+            .map_err(|e| {
+                AppError::Config(format!(
+                    "upstream_state '{}': cannot resolve source '{}': {}",
+                    us.binding,
+                    us.source.display(),
+                    e
+                ))
+            })?;
 
-        if !cycle_guard.insert(source_abs.clone()) {
+        let source_identity = source_abs.identity();
+        if !cycle_guard.insert(source_identity.clone()) {
             return Err(AppError::Config(format!(
                 "upstream_state '{}': cycle detected at {}",
                 us.binding,
@@ -5623,7 +5660,7 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
 
         let backend_result =
             build_upstream_backend(us, &source_abs, provider_context, cycle_guard).await;
-        cycle_guard.remove(&source_abs);
+        cycle_guard.remove(&source_identity);
         let backend = backend_result?;
 
         let published_exports = backend
@@ -5666,9 +5703,9 @@ pub(crate) async fn load_upstream_states<B: carina_core::resource::BindingAddres
 /// anchoring. Shared between strict and lenient upstream loaders.
 async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
     us: &UpstreamState<B>,
-    source_abs: &Path,
+    source_abs: &ResolvedPath,
     provider_context: &ProviderContext,
-    cycle_guard: &mut HashSet<PathBuf>,
+    cycle_guard: &mut HashSet<CanonicalPath>,
 ) -> Result<ResolvedReadBackend, AppError> {
     let loaded = load_configuration_with_config(
         source_abs,
@@ -5703,7 +5740,7 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
         .transpose()?;
     resolve_backend_for_read(
         source_abs,
-        source_abs,
+        std::path::Path::new(&source_abs.display().to_string()),
         backend_config.as_ref(),
         BackendLockRequirement::AllowMissing,
         ReadBackendWarningPolicy::UpstreamSource {
@@ -5711,7 +5748,9 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
         },
     )
     .await
-    .map_err(|error| error.with_upstream_state_source(source_abs))
+    .map_err(|error| {
+        error.with_upstream_state_source(std::path::Path::new(&source_abs.display().to_string()))
+    })
 }
 
 /// Walk an upstream's transitive `upstream_state` chain *without*
@@ -5726,21 +5765,28 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
 /// bindings — there are none.
 async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
     upstream_states: &[UpstreamState<B>],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
-    cycle_guard: &mut HashSet<PathBuf>,
+    cycle_guard: &mut HashSet<CanonicalPath>,
 ) -> Result<(), AppError> {
     for us in upstream_states {
-        let source_abs = base_dir.join(&us.source).canonicalize().map_err(|e| {
-            AppError::Config(format!(
-                "upstream_state '{}': cannot resolve source '{}': {}",
-                us.binding,
-                us.source.display(),
-                e
-            ))
-        })?;
+        let source_abs = base_dir
+            .join(&us.source)
+            .and_then(|source| {
+                source.metadata()?;
+                Ok(source)
+            })
+            .map_err(|e| {
+                AppError::Config(format!(
+                    "upstream_state '{}': cannot resolve source '{}': {}",
+                    us.binding,
+                    us.source.display(),
+                    e
+                ))
+            })?;
 
-        if !cycle_guard.insert(source_abs.clone()) {
+        let source_identity = source_abs.identity();
+        if !cycle_guard.insert(source_identity.clone()) {
             return Err(AppError::Config(format!(
                 "upstream_state '{}': cycle detected at {}",
                 us.binding,
@@ -5770,7 +5816,7 @@ async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
             Err(e) => Err(e),
         };
 
-        cycle_guard.remove(&source_abs);
+        cycle_guard.remove(&source_identity);
         result?;
     }
     Ok(())
@@ -5787,6 +5833,7 @@ fn resolve_file_for_test<E>(
 #[cfg(test)]
 mod load_upstream_states_tests {
     use super::*;
+    #[cfg(test)]
     use std::fs;
 
     fn write_state(dir: &Path, exports: &[(&str, serde_json::Value)]) {
@@ -5826,7 +5873,7 @@ mod load_upstream_states_tests {
 
         let error = match load_and_resolve_provider_configs(
             &parsed,
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &ProviderContext::default(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::All,
@@ -5873,7 +5920,7 @@ mod load_upstream_states_tests {
 
         let error = match load_and_resolve_provider_configs(
             &parsed,
-            dir.path(),
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
             &ProviderContext::default(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::All,
@@ -5932,7 +5979,7 @@ mod load_upstream_states_tests {
 
         let inputs = load_and_resolve_provider_configs(
             &parsed,
-            temp.path(),
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::default(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::ProviderReferences,
@@ -5978,7 +6025,7 @@ mod load_upstream_states_tests {
 
         let inputs = load_and_resolve_provider_configs(
             &parsed,
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             UpstreamMissingStatePolicy::Strict,
             ProviderUpstreamScope::ProviderReferences,
@@ -6041,7 +6088,7 @@ mod load_upstream_states_tests {
         let base_dir = dir.path().parent().unwrap();
         let result = load_upstream_states(
             &upstream_states,
-            base_dir,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
             &ProviderContext::default(),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
@@ -6084,7 +6131,7 @@ mod load_upstream_states_tests {
         .unwrap();
         carina_state::BackendLock::for_config(Some(&old_backend))
             .unwrap()
-            .save(dir.path())
+            .save(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
             .unwrap();
 
         let upstream_states = vec![UpstreamState {
@@ -6093,7 +6140,7 @@ mod load_upstream_states_tests {
         }];
         let result = load_upstream_states(
             &upstream_states,
-            dir.path().parent().unwrap(),
+            &carina_core::paths::ResolvedPath::new(dir.path().parent().unwrap()).unwrap(),
             &ProviderContext::default(),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
@@ -6142,7 +6189,7 @@ mod load_upstream_states_tests {
         }];
         let result = load_upstream_states(
             &upstream_states,
-            dir.path().parent().unwrap(),
+            &carina_core::paths::ResolvedPath::new(dir.path().parent().unwrap()).unwrap(),
             &ProviderContext::default(),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
@@ -6180,11 +6227,11 @@ mod load_upstream_states_tests {
         }];
 
         let mut guard = HashSet::new();
-        guard.insert(dir_a.canonicalize().unwrap());
+        guard.insert(CanonicalPath::new(&dir_a).unwrap());
 
         let err = load_upstream_states(
             &upstream_states,
-            &dir_a,
+            &carina_core::paths::ResolvedPath::new(&dir_a).unwrap(),
             &ProviderContext::default(),
             &mut guard,
             UpstreamMissingStatePolicy::Strict,
@@ -6192,6 +6239,49 @@ mod load_upstream_states_tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("cycle"), "got: {}", err);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upstream_cycle_guards_preserve_symlink_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let upstreams = [UpstreamState {
+            binding: absolute_binding("self"),
+            source: link.clone(),
+        }];
+        let mut guard = seed_cycle_guard(&carina_core::paths::ResolvedPath::new(&real).unwrap());
+        let error = load_upstream_states(
+            &upstreams,
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
+            &ProviderContext::default(),
+            &mut guard,
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cycle detected"), "{error}");
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(!error.contains(&real.display().to_string()), "{error}");
+        assert_eq!(guard.len(), 1);
+
+        let error = walk_upstream_cycles_only(
+            &upstreams,
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
+            &ProviderContext::default(),
+            &mut guard,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("cycle detected"), "{error}");
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(!error.contains(&real.display().to_string()), "{error}");
+        assert_eq!(guard.len(), 1);
     }
 
     #[tokio::test]
@@ -6202,7 +6292,7 @@ mod load_upstream_states_tests {
         }];
         let err = load_upstream_states(
             &upstream_states,
-            Path::new("/"),
+            &carina_core::paths::ResolvedPath::new(Path::new("/")).unwrap(),
             &ProviderContext::default(),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
@@ -6236,7 +6326,7 @@ mod load_upstream_states_tests {
         let base_dir = dir.path().parent().unwrap();
         let err = load_upstream_states(
             &upstream_states,
-            base_dir,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
             &ProviderContext::default(),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
@@ -6275,7 +6365,7 @@ mod load_upstream_states_tests {
         let base_dir = dir.path().parent().unwrap();
         let result = load_upstream_states(
             &upstream_states,
-            base_dir,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
             &ProviderContext::default(),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Lenient,
@@ -6352,7 +6442,7 @@ let internal = upstream_state {{ source = '{}' }}"#,
 
         let result = load_upstream_states(
             &upstream_states,
-            &a_dir,
+            &carina_core::paths::ResolvedPath::new(&a_dir).unwrap(),
             &ProviderContext::default(),
             &mut HashSet::new(),
             UpstreamMissingStatePolicy::Strict,
@@ -6417,11 +6507,11 @@ let back = upstream_state {{ source = '{}' }}"#,
         // Seed the guard so A → B → A detection still triggers
         // when the downstream itself is the seed; mirrors how the
         // CLI seeds with the project root before recursing.
-        guard.insert(root.path().canonicalize().unwrap());
+        guard.insert(CanonicalPath::new(root.path()).unwrap());
 
         let err = load_upstream_states(
             &upstream_states,
-            root.path(),
+            &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
             &ProviderContext::default(),
             &mut guard,
             UpstreamMissingStatePolicy::Strict,
@@ -6439,6 +6529,7 @@ let back = upstream_state {{ source = '{}' }}"#,
 #[cfg(test)]
 mod run_plan_upstream_state_tests {
     use super::*;
+    #[cfg(test)]
     use std::fs;
 
     #[tokio::test]
@@ -6475,7 +6566,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .unwrap();
 
         crate::commands::ensure_backend_lock(
-            &dir_b,
+            &carina_core::paths::ResolvedPath::new(&dir_b).unwrap(),
             None::<&carina_core::parser::ExpandedBackendConfig>,
         )
         .unwrap();
@@ -6505,7 +6596,7 @@ exports { region: String = "ap-northeast-1" }"#,
         // the same loader path to verify the upstream binding value is
         // reachable to downstream references.
         let parsed = carina_core::config_loader::load_configuration_with_config(
-            &dir_b,
+            &carina_core::paths::ResolvedPath::new(&dir_b).unwrap(),
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
@@ -6514,10 +6605,10 @@ exports { region: String = "ap-northeast-1" }"#,
         .into_parsed()
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("exports-only fixture has no parser placeholders");
-        let mut guard = seed_cycle_guard(&dir_b);
+        let mut guard = seed_cycle_guard(&carina_core::paths::ResolvedPath::new(&dir_b).unwrap());
         let bindings = load_upstream_states(
             &parsed.upstream_states,
-            &dir_b,
+            &carina_core::paths::ResolvedPath::new(&dir_b).unwrap(),
             &ProviderContext::default(),
             &mut guard,
             UpstreamMissingStatePolicy::Strict,
@@ -6579,7 +6670,7 @@ exports { region: String = "ap-northeast-1" }"#,
         )
         .unwrap();
         crate::commands::ensure_backend_lock(
-            &project,
+            &carina_core::paths::ResolvedPath::new(&project).unwrap(),
             None::<&carina_core::parser::ExpandedBackendConfig>,
         )
         .unwrap();
@@ -6613,6 +6704,7 @@ mod run_plan_out_tests {
         LiveCompositionSignature, ModuleConstraintId, PendingModuleConstraint, ResolvedResource,
         ResourceId, Value,
     };
+    #[cfg(test)]
     use std::fs;
 
     fn resolved_image_target(path: PathBuf, theme: ImageTheme) -> ResolvedPlanImageTarget {
@@ -6661,7 +6753,7 @@ mod run_plan_out_tests {
         )
         .unwrap();
         crate::commands::ensure_backend_lock(
-            dir,
+            &carina_core::paths::ResolvedPath::new(dir).unwrap(),
             None::<&carina_core::parser::ExpandedBackendConfig>,
         )
         .unwrap();
@@ -6824,7 +6916,7 @@ mod run_plan_out_tests {
         .unwrap();
 
         let saved = build_plan_file_from_parts(
-            &path,
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
             None,
@@ -6904,7 +6996,7 @@ mod run_plan_out_tests {
         )
         .unwrap();
         crate::commands::ensure_backend_lock(
-            dir,
+            &carina_core::paths::ResolvedPath::new(dir).unwrap(),
             None::<&carina_core::parser::ExpandedBackendConfig>,
         )
         .unwrap();
@@ -6953,7 +7045,7 @@ mod run_plan_out_tests {
         .unwrap();
 
         crate::commands::ensure_backend_lock(
-            dir,
+            &carina_core::paths::ResolvedPath::new(dir).unwrap(),
             None::<&carina_core::parser::ExpandedBackendConfig>,
         )
         .unwrap();
@@ -6996,7 +7088,7 @@ mod run_plan_out_tests {
         )
         .unwrap();
         crate::commands::ensure_backend_lock(
-            dir,
+            &carina_core::paths::ResolvedPath::new(dir).unwrap(),
             None::<&carina_core::parser::ExpandedBackendConfig>,
         )
         .unwrap();
@@ -7052,7 +7144,10 @@ mod run_plan_out_tests {
         let expansion_trace = carina_core::resource::ExpansionTrace::new();
 
         let result = write_plan_artifacts(
-            Some((&out_path, "{}\n")),
+            Some((
+                &carina_core::paths::ResolvedPath::new(&out_path).unwrap(),
+                "{}\n",
+            )),
             Some(PlanImageArtifactRequest {
                 file: Some(&image_target),
                 inline: None,
@@ -7109,7 +7204,10 @@ mod run_plan_out_tests {
         let mut inline_output = Vec::new();
         let result: Result<(), AppError> = (|| {
             let rendered_inline_image = write_plan_artifacts(
-                Some((&out_path, "{}\n")),
+                Some((
+                    &carina_core::paths::ResolvedPath::new(&out_path).unwrap(),
+                    "{}\n",
+                )),
                 Some(PlanImageArtifactRequest {
                     file: Some(&image_target),
                     inline: Some(InlineImageRequest {
@@ -7209,7 +7307,7 @@ mod run_plan_out_tests {
         )
         .unwrap();
         let plan_file = build_plan_file_from_parts(
-            &path,
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
             None,
@@ -7294,7 +7392,7 @@ mod run_plan_out_tests {
         )
         .unwrap();
         let plan_file = build_plan_file_from_parts(
-            &path,
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
             None,
@@ -7350,7 +7448,7 @@ mod run_plan_out_tests {
         .unwrap();
 
         let error = build_plan_file_from_parts(
-            &path,
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
             None,
@@ -7412,7 +7510,7 @@ mod run_plan_out_tests {
         );
 
         let error = build_plan_file_from_parts(
-            &path,
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
             &parsed,
             &provider_configs,
             None,
@@ -7437,8 +7535,10 @@ mod run_plan_out_tests {
     fn composition_identity_plan_save_error_stays_typed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing = temp.path().join("missing-source-root");
-        let identity_error = CompositionSourceIdentityResolver::new(&missing)
-            .expect_err("missing source root must fail canonicalization");
+        let identity_error = CompositionSourceIdentityResolver::new(
+            &carina_core::paths::ResolvedPath::new(&missing).unwrap(),
+        )
+        .expect_err("missing source root must fail canonicalization");
 
         let error = map_plan_save_error(
             PlanSaveError::CompositionSourceIdentity(identity_error),

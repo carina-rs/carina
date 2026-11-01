@@ -911,7 +911,11 @@ fn plan_reports_how_to_repair_a_legacy_empty_identity_row() {
     )
     .expect("write invalid state fixture");
 
-    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    let plan = scenario.carina(&[
+        "plan",
+        "--refresh=false",
+        scenario.project.to_str().unwrap(),
+    ]);
     assert!(
         !plan.status.success(),
         "carina plan must reject the empty identity row\nstdout:\n{}\nstderr:\n{}",
@@ -920,10 +924,7 @@ fn plan_reports_how_to_repair_a_legacy_empty_identity_row() {
     );
 
     let stderr = String::from_utf8(plan.stderr).expect("plan stderr is UTF-8");
-    let project_path = scenario
-        .project
-        .canonicalize()
-        .expect("canonicalize temporary project");
+    let project_path = std::path::absolute(&scenario.project).expect("absolute temporary project");
     let state_path = project_path.join("carina.state.json");
     let plan_command = ProjectCommand::new("plan", &project_path);
     assert!(

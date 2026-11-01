@@ -8785,7 +8785,7 @@ mod substitute_placeholder_tests {
         .expect("deferred unbound loop parses");
         let parsed = crate::module_resolver::resolve_modules_providerless(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded(&crate::schema::SchemaRegistry::new())
@@ -9475,7 +9475,7 @@ mod substitute_placeholder_tests {
         .expect("deferred unbound loop parses");
         let parsed = crate::module_resolver::resolve_modules_providerless(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .expect("deferred fixture crosses the module-resolution seam");
         let target = parsed.deferred_for_expressions()[0].target();

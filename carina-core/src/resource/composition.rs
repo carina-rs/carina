@@ -22,6 +22,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::parser::ValidateExpr;
+use crate::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 use crate::static_type::ConsumerStaticType;
 
 #[cfg(test)]
@@ -632,7 +633,7 @@ pub struct CompositionCall<B: BindingAddress = AbsoluteBindingAddress> {
     pub binding: Option<B>,
     pub instance: String,
     pub module_source: Option<String>,
-    pub module_directory: Option<PathBuf>,
+    pub module_directory: Option<ResolvedPath>,
     /// Validation-only origin when an unbound loop produced this call.
     #[doc(hidden)]
     pub loop_origin: Option<Box<super::LoopElementOrigin>>,
@@ -851,7 +852,7 @@ const MAX_SAVED_SOURCE_PATH_COMPONENTS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "PathBuf", into = "PathBuf")]
-struct SourceRootRelativePath(PathBuf);
+pub(crate) struct SourceRootRelativePath(PathBuf);
 
 /// A saved composition source path violated its portable relative-path
 /// invariant.
@@ -926,6 +927,18 @@ impl From<SourceRootRelativePath> for PathBuf {
 }
 
 impl SourceRootRelativePath {
+    fn stays_under_root(&self) -> bool {
+        self.0
+            .components()
+            .try_fold(0usize, |depth, component| match component {
+                Component::Normal(_) => Some(depth + 1),
+                Component::ParentDir => depth.checked_sub(1),
+                _ => None,
+            })
+            .is_some()
+    }
+
+    #[cfg(test)]
     fn as_path(&self) -> &Path {
         &self.0
     }
@@ -941,23 +954,27 @@ enum SavedSourceFileId {
 /// identity.
 #[derive(Debug)]
 pub enum CompositionSourceIdentityError {
+    Absolutize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     Canonicalize {
         path: PathBuf,
         source: std::io::Error,
     },
     DifferentRoot {
-        path: PathBuf,
-        source_root: PathBuf,
+        path: DisplayPath,
+        source_root: DisplayPath,
     },
     InvalidRelativePath {
-        path: PathBuf,
+        path: DisplayPath,
         source: SavedCompositionSourcePathError,
     },
 }
 
 impl CompositionSourceIdentityError {
-    fn canonicalize(path: &Path) -> Result<PathBuf, Self> {
-        path.canonicalize().map_err(|source| Self::Canonicalize {
+    fn absolutize(path: &Path) -> Result<DisplayPath, Self> {
+        DisplayPath::new(path).map_err(|source| Self::Absolutize {
             path: path.to_path_buf(),
             source,
         })
@@ -967,6 +984,11 @@ impl CompositionSourceIdentityError {
 impl std::fmt::Display for CompositionSourceIdentityError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Absolutize { path, source: _ } => write!(
+                formatter,
+                "failed to make composition source path `{}` absolute",
+                path.to_string_lossy().escape_debug(),
+            ),
             Self::Canonicalize { path, source: _ } => {
                 let path = path.to_string_lossy();
                 write!(
@@ -976,8 +998,8 @@ impl std::fmt::Display for CompositionSourceIdentityError {
                 )
             }
             Self::DifferentRoot { path, source_root } => {
-                let path = path.to_string_lossy();
-                let source_root = source_root.to_string_lossy();
+                let path = path.to_string();
+                let source_root = source_root.to_string();
                 write!(
                     formatter,
                     "composition source path `{}` cannot be expressed relative to source root `{}`",
@@ -986,7 +1008,7 @@ impl std::fmt::Display for CompositionSourceIdentityError {
                 )
             }
             Self::InvalidRelativePath { path, source: _ } => {
-                let path = path.to_string_lossy();
+                let path = path.to_string();
                 write!(
                     formatter,
                     "composition source path `{}` cannot be saved as a source-root-relative path",
@@ -1000,41 +1022,11 @@ impl std::fmt::Display for CompositionSourceIdentityError {
 impl std::error::Error for CompositionSourceIdentityError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Canonicalize { source, .. } => Some(source),
+            Self::Absolutize { source, .. } | Self::Canonicalize { source, .. } => Some(source),
             Self::DifferentRoot { .. } => None,
             Self::InvalidRelativePath { source, .. } => Some(source),
         }
     }
-}
-
-fn relative_path_from_root(root: &Path, path: &Path) -> Option<PathBuf> {
-    let root_components = root.components().collect::<Vec<_>>();
-    let path_components = path.components().collect::<Vec<_>>();
-    let anchor_len = |components: &[Component<'_>]| {
-        components
-            .iter()
-            .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
-            .count()
-    };
-    let root_anchor_len = anchor_len(&root_components);
-    let path_anchor_len = anchor_len(&path_components);
-    if root_components[..root_anchor_len] != path_components[..path_anchor_len] {
-        return None;
-    }
-
-    let common = root_components
-        .iter()
-        .zip(&path_components)
-        .take_while(|(root, path)| root == path)
-        .count();
-    let mut relative = PathBuf::new();
-    for _ in &root_components[common..] {
-        relative.push(Component::ParentDir.as_os_str());
-    }
-    for component in &path_components[common..] {
-        relative.push(component.as_os_str());
-    }
-    Some(relative)
 }
 
 /// Operation-scoped converter from live parser paths to portable saved call
@@ -1042,15 +1034,29 @@ fn relative_path_from_root(root: &Path, path: &Path) -> Option<PathBuf> {
 /// source file is canonicalized at most once.
 #[derive(Debug)]
 pub struct CompositionSourceIdentityResolver {
-    canonical_source_root: PathBuf,
-    canonical_source_files: HashMap<PathBuf, PathBuf>,
+    canonical_source_root: CanonicalPath,
+    io_source_root: ResolvedPath,
+    display_source_root: DisplayPath,
+    canonical_source_files: HashMap<PathBuf, CanonicalPath>,
+    display_source_files: HashMap<SavedSourceFileId, DisplayPath>,
 }
 
 impl CompositionSourceIdentityResolver {
-    pub fn new(source_root: &Path) -> Result<Self, CompositionSourceIdentityError> {
+    pub fn new(source_root: &ResolvedPath) -> Result<Self, CompositionSourceIdentityError> {
+        let display_source_root = source_root.display().clone();
+        source_root
+            .metadata()
+            .map_err(|source| CompositionSourceIdentityError::Canonicalize {
+                path: PathBuf::from(display_source_root.to_string()),
+                source,
+            })?;
+        let io_source_root = source_root.clone();
         Ok(Self {
-            canonical_source_root: CompositionSourceIdentityError::canonicalize(source_root)?,
+            canonical_source_root: io_source_root.identity(),
+            io_source_root,
+            display_source_root,
             canonical_source_files: HashMap::new(),
+            display_source_files: HashMap::new(),
         })
     }
 
@@ -1058,33 +1064,53 @@ impl CompositionSourceIdentityResolver {
         &mut self,
         path: &Path,
     ) -> Result<SavedSourceFileId, CompositionSourceIdentityError> {
+        let display_path = CompositionSourceIdentityError::absolutize(path)?;
         let source = match self.canonical_source_files.get(path) {
             Some(source) => source.clone(),
             None => {
                 // The loader preserves the path as supplied by the process.
                 // Relative source paths therefore resolve against the process
                 // CWD, not against the already-resolved source root.
-                let source = CompositionSourceIdentityError::canonicalize(path)?;
+                let source = self
+                    .io_source_root
+                    .join_display(&display_path)
+                    .and_then(|file| {
+                        file.metadata()?;
+                        Ok(file.identity())
+                    })
+                    .map_err(|source| CompositionSourceIdentityError::Canonicalize {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
                 self.canonical_source_files
                     .insert(path.to_path_buf(), source.clone());
                 source
             }
         };
-        let relative =
-            relative_path_from_root(&self.canonical_source_root, &source).ok_or_else(|| {
-                CompositionSourceIdentityError::DifferentRoot {
-                    path: source.clone(),
-                    source_root: self.canonical_source_root.clone(),
-                }
+        let relative = source
+            .composition_source_relative_to(&self.canonical_source_root)
+            .map_err(
+                |source| CompositionSourceIdentityError::InvalidRelativePath {
+                    path: display_path.clone(),
+                    source,
+                },
+            )?
+            .ok_or_else(|| CompositionSourceIdentityError::DifferentRoot {
+                path: display_path.clone(),
+                source_root: self.display_source_root.clone(),
             })?;
-        let relative_path = relative.clone();
-        let relative = SourceRootRelativePath::try_from(relative).map_err(|source| {
-            CompositionSourceIdentityError::InvalidRelativePath {
-                path: relative_path,
-                source,
-            }
-        })?;
-        Ok(SavedSourceFileId::SourceRootRelative(relative))
+        let identity = SavedSourceFileId::SourceRootRelative(relative);
+        // Multiple authored aliases can identify one file. Pick a stable
+        // spelling so registration order cannot change its diagnostic.
+        self.display_source_files
+            .entry(identity.clone())
+            .and_modify(|known| {
+                if display_path < *known {
+                    *known = display_path.clone();
+                }
+            })
+            .or_insert(display_path);
+        Ok(identity)
     }
 
     pub fn saved_origin_id(
@@ -1093,13 +1119,12 @@ impl CompositionSourceIdentityResolver {
     ) -> Result<SavedCompositionOriginId, CompositionSourceIdentityError> {
         SavedCompositionOriginId::from_live(path, self)
     }
-}
 
-impl SavedSourceFileId {
-    fn display_path(&self) -> &Path {
-        match self {
-            Self::SourceRootRelative(path) => path.as_path(),
-        }
+    /// Authored location of a saved call's file in the current configuration.
+    /// A missing file has no known display spelling; diagnostics can instead
+    /// use its portable relative identity if it stays within the source root.
+    pub fn display_source_file(&self, call: &SavedModuleCallId) -> Option<&DisplayPath> {
+        self.display_source_files.get(&call.source_file)
     }
 }
 
@@ -1158,8 +1183,16 @@ impl SavedModuleCallId {
         })
     }
 
-    pub fn source_file(&self) -> &Path {
-        self.source_file.display_path()
+    /// Portable fallback location when the current configuration has no
+    /// authored display path for this saved call. Outside-root identities may
+    /// contain resolved target names, so only report that they are external.
+    pub fn source_root_relative_location(&self) -> String {
+        let SavedSourceFileId::SourceRootRelative(path) = &self.source_file;
+        if path.stays_under_root() {
+            format!("<source root>/{}", path.0.display())
+        } else {
+            "<source outside source root>".to_string()
+        }
     }
 
     pub fn start_line(&self) -> usize {
@@ -1932,12 +1965,95 @@ mod tests {
     }
 
     #[test]
+    fn saved_call_fallback_only_displays_identities_contained_by_source_root() {
+        for (path, expected) in [
+            ("main.crn", "<source root>/main.crn"),
+            ("nested/../main.crn", "<source root>/nested/../main.crn"),
+            ("../private-target/main.crn", "<source outside source root>"),
+            (
+                "nested/../../private-target/main.crn",
+                "<source outside source root>",
+            ),
+        ] {
+            let call = SavedModuleCallId {
+                source_file: SavedSourceFileId::SourceRootRelative(
+                    SourceRootRelativePath::try_from(PathBuf::from(path)).unwrap(),
+                ),
+                call_span: crate::parser::SourceSpan::dummy().into(),
+                expansion: SavedCallExpansion::Direct,
+            };
+            assert_eq!(call.source_root_relative_location(), expected, "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composition_source_display_mapping_is_independent_of_registration_order() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("module.crn"), "").unwrap();
+        let first = root.path().join("a-alias");
+        let second = root.path().join("z-alias");
+        for alias in [&first, &second] {
+            std::os::unix::fs::symlink(external.path(), alias).unwrap();
+        }
+        let first = first.join("module.crn");
+        let second = second.join("module.crn");
+        let double_root = PathBuf::from(format!("/{}", first.display()));
+
+        for (sources, expected) in [
+            ([&first, &second], &first),
+            ([&second, &first], &first),
+            ([&first, &double_root], &double_root),
+            ([&double_root, &first], &double_root),
+        ] {
+            let mut resolver = CompositionSourceIdentityResolver::new(
+                &crate::paths::ResolvedPath::new(root.path()).unwrap(),
+            )
+            .unwrap();
+            let mut origins = Vec::new();
+            for source in sources {
+                let mut call_path = CompositionCallPath::default();
+                call_path.root.id = crate::parser::ModuleCallId::test_dummy_in(source);
+                origins.push(resolver.saved_origin_id(&call_path).unwrap());
+            }
+            assert_eq!(origins[0], origins[1]);
+            for origin in origins {
+                assert_eq!(
+                    resolver
+                        .display_source_file(origin.root())
+                        .unwrap()
+                        .to_string()
+                        .as_str(),
+                    expected.as_os_str(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composition_source_empty_path_reports_absolutize_failure() {
+        let error = crate::paths::ResolvedPath::new("")
+            .expect_err("an empty source root cannot become an absolute display path");
+        assert!(error.to_string().contains("absolute"), "{error}");
+
+        let root = tempfile::tempdir().unwrap();
+        let mut resolver = CompositionSourceIdentityResolver::new(
+            &crate::paths::ResolvedPath::new(root.path()).unwrap(),
+        )
+        .unwrap();
+        let error = resolver.saved_source_file(Path::new("")).unwrap_err();
+        assert!(error.to_string().contains("absolute"), "{error}");
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
     fn composition_source_identity_error_escapes_untrusted_paths() {
         let escaped_path = PathBuf::from("source\u{1b}[31m.crn");
         let escaped_root = PathBuf::from("root\nline");
         let error = CompositionSourceIdentityError::DifferentRoot {
-            path: escaped_path,
-            source_root: escaped_root,
+            path: DisplayPath::new(escaped_path).unwrap(),
+            source_root: DisplayPath::new(escaped_root).unwrap(),
         };
 
         let rendered = error.to_string();
@@ -2125,8 +2241,10 @@ mod tests {
             quoted_string_attrs: HashSet::new(),
         };
 
-        let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
-            .expect("create composition source identity resolver");
+        let mut source_identities = CompositionSourceIdentityResolver::new(
+            &crate::paths::ResolvedPath::new(source_root.path()).unwrap(),
+        )
+        .expect("create composition source identity resolver");
         let saved = composition
             .into_saved_with_resolver(&mut source_identities)
             .expect("save composition identity");
@@ -2201,13 +2319,16 @@ mod tests {
             }
             .resolve_bindings(&mut |binding| RootScope::new().resolve(binding)),
         );
-        let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
-            .expect("create composition source identity resolver");
+        let mut source_identities = CompositionSourceIdentityResolver::new(
+            &crate::paths::ResolvedPath::new(source_root.path()).unwrap(),
+        )
+        .expect("create composition source identity resolver");
         let origin = source_identities
             .saved_origin_id(&call_path)
             .expect("save external origin");
 
-        let relative = origin.root().source_file();
+        let SavedSourceFileId::SourceRootRelative(relative) = &origin.root().source_file;
+        let relative = relative.as_path();
         assert!(
             relative.starts_with(".."),
             "a sibling module must be represented with parent segments: {}",
@@ -2219,14 +2340,9 @@ mod tests {
             relative.display(),
         );
         assert_eq!(
-            source_root
-                .path()
-                .join(relative)
-                .canonicalize()
+            CanonicalPath::new(source_root.path().join(relative))
                 .expect("resolve saved relative source"),
-            source_file
-                .canonicalize()
-                .expect("canonical external source"),
+            CanonicalPath::new(source_file).expect("canonical external source"),
         );
 
         let json = serde_json::to_value(origin).expect("serialize external origin");
@@ -2267,8 +2383,10 @@ mod tests {
             }
             .resolve_bindings(&mut |binding| RootScope::new().resolve(binding)),
         );
-        let mut source_identities = CompositionSourceIdentityResolver::new(source_root.path())
-            .expect("create composition source identity resolver");
+        let mut source_identities = CompositionSourceIdentityResolver::new(
+            &crate::paths::ResolvedPath::new(source_root.path()).unwrap(),
+        )
+        .expect("create composition source identity resolver");
         let error = source_identities
             .saved_origin_id(&call_path)
             .expect_err("a missing source path must not mint a fallback identity");

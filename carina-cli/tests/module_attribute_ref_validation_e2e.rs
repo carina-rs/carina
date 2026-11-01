@@ -236,7 +236,10 @@ impl Fixture {
     }
 
     fn validate(&self) -> Vec<String> {
-        carina_cli::commands::validate::validate_with_factories(&self.caller, factories())
+        carina_cli::commands::validate::validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(&self.caller).unwrap(),
+            factories(),
+        )
     }
 }
 
@@ -393,7 +396,10 @@ let outer_instance = outer_module { }
     )
     .expect("caller main");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert_unknown_arn(&diags);
     assert!(
@@ -461,7 +467,10 @@ let a_instance = a_module { }
     )
     .expect("caller main");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
     let bad_ref_count = diags
         .iter()
         .filter(|diag| diag.contains("unknown attribute 'arn'"))

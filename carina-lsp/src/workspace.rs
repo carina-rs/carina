@@ -1,10 +1,12 @@
 //! Workspace scanning: discover provider configurations from .crn files.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::{self, ProviderConfig, ProviderContext};
+use carina_core::paths::{CanonicalPath, PathIdentity, ResolvedPath};
 use carina_core::resource::ParserPlaceholder;
 
 #[derive(Debug, Clone)]
@@ -73,32 +75,43 @@ pub(crate) fn discover_providers_by_dir(
     workspace_root: &Path,
 ) -> HashMap<PathBuf, Vec<DiscoveredProviderConfig>> {
     let mut result: HashMap<PathBuf, Vec<DiscoveredProviderConfig>> = HashMap::new();
-    discover_by_dir_recursive(workspace_root, &mut result);
+    if let Ok(root) = ResolvedPath::new(workspace_root) {
+        discover_by_dir_recursive(&root, &mut result, &mut HashSet::new());
+    }
     result
 }
 
 fn discover_by_dir_recursive(
-    dir: &Path,
+    dir: &ResolvedPath,
     result: &mut HashMap<PathBuf, Vec<DiscoveredProviderConfig>>,
+    visited: &mut HashSet<CanonicalPath>,
 ) {
-    let entries = match fs::read_dir(dir) {
+    if !visited.insert(dir.identity()) {
+        return;
+    }
+    let entries = match dir.entries() {
         Ok(entries) => entries,
         Err(_) => return,
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-    paths.sort();
+    let paths = entries;
 
     for path in paths {
         if path.is_dir() {
-            discover_by_dir_recursive(&path, result);
-        } else if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
+            discover_by_dir_recursive(&path, result, visited);
+        } else if path.display().extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = path.read_to_string()
         {
             let ctx = ProviderContext::default();
-            if let Ok(parsed) = parser::parse_file(&content, &path, &ctx)
+            if let Ok(parsed) =
+                parser::parse_file(&content, &PathBuf::from(path.display().to_string()), &ctx)
                 && !parsed.providers.is_empty()
             {
-                let source_dir = path.parent().unwrap_or(dir).to_path_buf();
+                let source_dir = PathBuf::from(
+                    path.parent()
+                        .unwrap_or_else(|| dir.clone())
+                        .display()
+                        .to_string(),
+                );
                 let dir_providers = result.entry(source_dir).or_default();
                 let mut seen: HashSet<ProviderInstanceKey> = dir_providers
                     .iter()
@@ -121,52 +134,67 @@ fn discover_by_dir_recursive(
 /// the relative paths to absolute module directories, and maps each module
 /// to the directories that import it. This allows module files to inherit
 /// their callers' provider schemas.
-pub fn discover_import_map(workspace_root: &Path) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
-    let mut result: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
-    discover_imports_recursive(workspace_root, &mut result);
+pub type ModuleImportMap = HashMap<PathIdentity, BTreeSet<PathIdentity>>;
+
+pub fn discover_import_map(workspace_root: &Path) -> ModuleImportMap {
+    let mut result = ModuleImportMap::new();
+    if let Ok(root) = ResolvedPath::new(workspace_root) {
+        discover_imports_recursive(&root, &mut result, &mut HashSet::new());
+    }
     result
 }
 
-fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, BTreeSet<PathBuf>>) {
-    let entries = match fs::read_dir(dir) {
+fn discover_imports_recursive(
+    dir: &ResolvedPath,
+    result: &mut ModuleImportMap,
+    visited: &mut HashSet<CanonicalPath>,
+) {
+    if !visited.insert(dir.identity()) {
+        return;
+    }
+    let entries = match dir.entries() {
         Ok(entries) => entries,
         Err(_) => return,
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-    paths.sort();
+    let paths = entries;
 
     for path in paths {
         if path.is_dir() {
-            discover_imports_recursive(&path, result);
-        } else if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
+            discover_imports_recursive(&path, result, visited);
+        } else if path.display().extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = path.read_to_string()
         {
             let ctx = ProviderContext::default();
-            if let Ok(parsed) = parser::parse_file(&content, &path, &ctx) {
-                let caller_dir = path.parent().unwrap_or(dir);
+            if let Ok(parsed) =
+                parser::parse_file(&content, &PathBuf::from(path.display().to_string()), &ctx)
+            {
+                let caller_dir = path.parent().unwrap_or_else(|| dir.clone());
                 for import in &parsed.uses {
-                    let module_path = caller_dir.join(&import.path);
-                    // Resolve to canonical directory (strip .crn extension, handle dirs)
+                    let Ok(module_path) = caller_dir.join(&import.path) else {
+                        continue;
+                    };
                     let module_dir = if module_path.is_dir() {
                         module_path
-                    } else if module_path.extension().is_some_and(|ext| ext == "crn") {
-                        module_path.parent().unwrap_or(&module_path).to_path_buf()
+                    } else if module_path
+                        .display()
+                        .extension()
+                        .is_some_and(|ext| ext == "crn")
+                    {
+                        module_path.parent().unwrap_or(module_path)
                     } else {
-                        // Try with .crn extension
-                        let with_ext = module_path.with_extension("crn");
+                        let Ok(with_ext) = module_path.with_extension("crn") else {
+                            continue;
+                        };
                         if with_ext.exists() {
-                            with_ext.parent().unwrap_or(&module_path).to_path_buf()
+                            with_ext.parent().unwrap_or(module_path)
                         } else {
-                            // Might be a directory module
                             module_path
                         }
                     };
-                    // Canonicalize to resolve .. and symlinks
-                    let module_dir = module_dir.canonicalize().unwrap_or(module_dir);
-                    let caller_dir = caller_dir
-                        .canonicalize()
-                        .unwrap_or(caller_dir.to_path_buf());
-                    result.entry(module_dir).or_default().insert(caller_dir);
+                    result
+                        .entry(PathIdentity::from(module_dir.identity()))
+                        .or_default()
+                        .insert(PathIdentity::from(caller_dir.identity()));
                 }
             }
         }
@@ -176,7 +204,6 @@ fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, BTreeSet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     use tempfile::TempDir;
 
     #[test]
@@ -478,7 +505,7 @@ mod tests {
 
         let import_map = discover_import_map(dir.path());
 
-        let module_canonical = module.canonicalize().unwrap();
+        let module_canonical = PathIdentity::new(&module);
         assert!(
             import_map.contains_key(&module_canonical),
             "import_map should contain module dir. Keys: {:?}",
@@ -486,7 +513,7 @@ mod tests {
         );
 
         let callers = &import_map[&module_canonical];
-        let caller_canonical = caller.canonicalize().unwrap();
+        let caller_canonical = PathIdentity::new(&caller);
         assert!(
             callers.contains(&caller_canonical),
             "callers should contain the caller dir. Got: {:?}",
@@ -510,11 +537,11 @@ mod tests {
             fs::write(caller.join("a_import.crn"), import).unwrap();
         }
 
-        let import_map: HashMap<PathBuf, BTreeSet<PathBuf>> = discover_import_map(dir.path());
-        let module = module.canonicalize().unwrap();
-        let expected: BTreeSet<PathBuf> = ["alpha", "middle", "zeta"]
+        let import_map = discover_import_map(dir.path());
+        let module = PathIdentity::new(&module);
+        let expected: BTreeSet<PathIdentity> = ["alpha", "middle", "zeta"]
             .into_iter()
-            .map(|name| callers_root.join(name).canonicalize().unwrap())
+            .map(|name| PathIdentity::new(callers_root.join(name)))
             .collect();
 
         assert_eq!(import_map[&module], expected);
@@ -525,5 +552,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let import_map = discover_import_map(dir.path());
         assert!(import_map.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_import_map_deduplicates_symlink_callers() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        fs::create_dir_all(real.join("module")).unwrap();
+        fs::write(
+            real.join("main.crn"),
+            "let m = use { source = './module' }\n",
+        )
+        .unwrap();
+        fs::write(
+            real.join("module/main.crn"),
+            "arguments { value: String }\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let imports = discover_import_map(temp.path());
+        let callers = &imports[&PathIdentity::new(real.join("module"))];
+        assert_eq!(callers.len(), 1);
+        assert!(callers.contains(&PathIdentity::new(&link)));
+        assert!(callers.contains(&PathIdentity::new(&real)));
     }
 }

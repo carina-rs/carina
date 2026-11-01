@@ -1,3 +1,5 @@
+#[cfg(test)]
+use carina_core::config_loader::get_base_dir;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -13,7 +15,7 @@ use std::time::Instant;
 use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::config_loader::load_configuration_with_config;
 use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::deps::{
     DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, UnresolvedResource,
@@ -131,20 +133,24 @@ pub async fn run_destroy(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let loaded = load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
-    let base_dir = get_base_dir(path);
+    super::apply::symlink_retarget_test_barrier("CARINA_TEST_DESTROY_CONFIG_HANDSHAKE_DIR").await;
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
     let verified_backend = verify_for_mutation(
+        base_dir,
         path,
         validated_config.resources().backend.as_ref(),
         DriftCommand::Destroy,
@@ -344,7 +350,7 @@ async fn run_destroy_locked_owned(
     lock: StateLock,
     refresh: bool,
     force: bool,
-    base_dir: &std::path::Path,
+    base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
@@ -749,7 +755,7 @@ async fn run_destroy_locked_owned(
         for error in identifier_errors {
             error_plan.add_error(error);
         }
-        render_plan_errors_and_abort(&error_plan, base_dir)?;
+        render_plan_errors_and_abort(&error_plan, &std::path::PathBuf::from(base_dir.display().to_string()))?;
     }
 
     let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
@@ -1494,7 +1500,7 @@ async fn run_destroy_locked(
     lock: StateLock,
     refresh: bool,
     force: bool,
-    base_dir: &Path,
+    base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
@@ -1556,7 +1562,7 @@ async fn run_destroy_locked_with_ctx(
     lock: StateLock,
     refresh: bool,
     force: bool,
-    base_dir: &Path,
+    base_dir: &carina_core::paths::ResolvedPath,
     provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
@@ -2508,7 +2514,7 @@ mod tests {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
@@ -2547,7 +2553,7 @@ mod tests {
             StateLock::disabled_for_test(),
             false,
             true,
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
@@ -2590,7 +2596,7 @@ mod tests {
             StateLock::disabled_for_test(),
             false,
             true,
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
@@ -2635,7 +2641,7 @@ mod tests {
             StateLock::held(lock),
             false,
             true,
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &ProviderContext::default(),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
@@ -2672,7 +2678,7 @@ mod tests {
             StateLock::disabled_for_test(),
             false,
             true,
-            &downstream,
+            &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
             &ProviderContext::default(),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
@@ -2704,7 +2710,7 @@ mod tests {
             StateLock::disabled_for_test(),
             false,
             true,
-            &base_dir,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
             &ProviderContext::default(),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
@@ -2726,7 +2732,7 @@ mod tests {
             StateLock::disabled_for_test(),
             false,
             true,
-            &base_dir,
+            &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
             &ProviderContext::default(),
             NonZeroUsize::new(1).unwrap(),
             ShutdownToken::running(),
@@ -2856,17 +2862,26 @@ mod tests {
             .with_existing_resources(["slow"])
             .with_delayed_delete("slow", Duration::from_millis(75));
         let loaded = load_configuration_with_config(
-            fixture.config_path(),
+            &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
             fixture.provider_context(),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("fixture must load");
         let parsed = loaded.parsed;
         let base_dir = get_base_dir(fixture.config_path());
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
-            .expect("mock provider must load");
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+        )
+        .expect("mock provider must load");
         let validated_config = providers
-            .validate_evaluated_config(parsed, base_dir, true, &loaded.duplicate_declarations)
+            .validate_evaluated_config(
+                parsed,
+                &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+                true,
+                &loaded.duplicate_declarations,
+            )
             .expect("fixture must validate");
         let lock = LockInfo::for_test_with_timeout("destroy", Duration::from_millis(15));
         let backend = fixture.lock_loss_backend_handle();
@@ -2879,7 +2894,7 @@ mod tests {
             StateLock::held(lock),
             false,
             false,
-            base_dir,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
             fixture.provider_context(),
             NonZeroUsize::new(1).unwrap(),
             fixture.cancel_token(),

@@ -17,8 +17,11 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("tests/fixtures/wait/cert_issued");
 
-    let parsed = parse_directory(&dir, &ProviderContext::default())
-        .expect("parse_directory should succeed for valid fixture");
+    let parsed = parse_directory(
+        &carina_core::paths::ResolvedPath::new(&dir).unwrap(),
+        &ProviderContext::default(),
+    )
+    .expect("parse_directory should succeed for valid fixture");
 
     // The wait binding lives in wait.crn; cert / validation_record are
     // in main.crn. Cross-file visibility is the load-bearing assertion.

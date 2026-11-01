@@ -487,7 +487,7 @@ mod tests {
         ).unwrap();
         let expanded = crate::module_resolver::resolve_modules_providerless(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .unwrap()
         .into_expanded(&SchemaRegistry::new())
@@ -606,7 +606,7 @@ mod tests {
         .expect("deferred unbound loop parses");
         let parsed = crate::module_resolver::resolve_modules_providerless(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded(&crate::schema::SchemaRegistry::new())
@@ -669,7 +669,7 @@ mod tests {
         .expect("deferred unbound enum loop parses");
         let parsed = crate::module_resolver::resolve_modules_providerless(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded(&crate::schema::SchemaRegistry::new())
@@ -755,7 +755,7 @@ mod tests {
         .expect("deferred unbound loop parses");
         let parsed = crate::module_resolver::resolve_modules_providerless(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded(&crate::schema::SchemaRegistry::new())

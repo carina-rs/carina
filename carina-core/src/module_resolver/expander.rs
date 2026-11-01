@@ -99,7 +99,7 @@ fn intra_module_binding_names(module: &ParsedFile) -> HashSet<RelativeBindingNam
 struct ModuleExpansionSource<'a> {
     module: Option<&'a ParsedFile>,
     source: Option<&'a str>,
-    directory: Option<&'a std::path::Path>,
+    directory: Option<&'a crate::paths::ResolvedPath>,
     scope: Option<&'a ModuleInstanceScope>,
     parent_call_path: Option<&'a crate::resource::ExpandedCompositionCallPath>,
 }
@@ -651,20 +651,11 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // arguments with caller-expanded values, and rejects every other
         // relative name.
         let intra_module_bindings = intra_module_binding_names(module);
-        let module_directory = expansion_source
-            .directory
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| {
-                module_source.as_deref().map(|source| {
-                    let source = std::path::Path::new(source);
-                    let path = if source.is_absolute() {
-                        source.to_path_buf()
-                    } else {
-                        self.base_dir.join(source)
-                    };
-                    path.canonicalize().unwrap_or(path)
-                })
-            });
+        let module_directory = match (expansion_source.directory, module_source.as_deref()) {
+            (Some(directory), _) => Some(directory.clone()),
+            (None, Some(source)) => Some(self.io_base_dir.join(source)?),
+            (None, None) => None,
+        };
         let expanded_call = crate::resource::ExpandedCompositionCall {
             id: call.id().clone(),
             module_name: call.module_name.clone(),
@@ -732,7 +723,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 resolve_nested_module_call(nested_call, &module_scope_resolver)
                     .map_err(contextualize_access_error)?;
             let (child_module, child_source, child_directory) =
-                self.nested_module_definition(module, module_directory.as_deref(), nested_call)?;
+                self.nested_module_definition(module, module_directory.as_ref(), nested_call)?;
             let expanded = self
                 .expand_module_call_inner(
                     nested_call,
@@ -1061,26 +1052,32 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     fn nested_module_definition<'a>(
         &'a self,
         owner: &ParsedFile,
-        owner_directory: Option<&std::path::Path>,
+        owner_directory: Option<&crate::paths::ResolvedPath>,
         call: &ModuleCall,
-    ) -> Result<(&'a ParsedFile, String, std::path::PathBuf), ModuleError> {
+    ) -> Result<(&'a ParsedFile, String, crate::paths::ResolvedPath), ModuleError> {
         let import = owner
             .uses
             .iter()
             .find(|import| import.alias == call.module_name)
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
         let source = std::path::Path::new(&import.path);
-        let directory = if source.is_absolute() {
-            source.to_path_buf()
+        let display_directory = if source.is_absolute() {
+            crate::paths::DisplayPath::new(source)?
         } else {
-            owner_directory.unwrap_or(&self.base_dir).join(source)
+            owner_directory
+                .map(|directory| directory.display())
+                .unwrap_or(self.io_base_dir.display())
+                .join(source)
         };
-        let canonical = directory.canonicalize()?;
+        let directory = self
+            .module_locations
+            .get(&display_directory)
+            .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
         let module = self
             .module_cache
-            .get(&canonical)
+            .get(&directory.identity())
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
-        Ok((module, import.path.clone(), canonical))
+        Ok((module, import.path.clone(), directory.clone()))
     }
 
     /// Unit tests exercise isolated expansion mechanics with synthetic module
@@ -4994,7 +4991,9 @@ mod tests {
         let expanded_call = call
             .clone()
             .resolve_bindings(&mut |binding| crate::resource::RootScope::new().resolve(binding));
-        let mut resolver = ModuleResolver::new(std::path::Path::new("."));
+        let mut resolver = ModuleResolver::new(
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+        );
         resolver
             .imported_modules
             .insert("outer".to_string(), module);

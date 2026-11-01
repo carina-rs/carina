@@ -5330,7 +5330,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
     .expect("parsed file should be valid");
     let parsed = crate::module_resolver::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("plan fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())

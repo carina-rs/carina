@@ -17,6 +17,7 @@
 //!   path from the issue's first comment is intentionally out of scope
 //!   and tracked as a separate follow-up issue.
 
+#[cfg(test)]
 use std::path::Path;
 
 use colored::Colorize;
@@ -77,7 +78,7 @@ pub enum MigrationOutcome {
 async fn perform_state_migration(
     backends: &MigrationBackends,
     force: bool,
-    project_dir: &Path,
+    project_dir: &carina_core::paths::ResolvedPath,
 ) -> Result<StateFile, AppError> {
     // `carina init --migrate-state` copies the source state into the
     // target backend verbatim. The pending schema-migration marker is
@@ -96,7 +97,7 @@ async fn perform_state_migration(
                 "The locked backend holds no state. There is nothing to migrate; \
                  re-run `{}` (without --migrate-state) to adopt the new \
                  backend, or revert the backend configuration.",
-                ProjectCommand::new("init", project_dir)
+                ProjectCommand::for_display_path("init", project_dir.display())
             ))
         })?;
 
@@ -160,7 +161,7 @@ async fn perform_state_migration(
 /// then rewrites the lock. A no-op (returns [`MigrationOutcome::NotNeeded`])
 /// when they already match.
 pub async fn run_init_migrate_state(
-    project_dir: &Path,
+    project_dir: &carina_core::paths::ResolvedPath,
     backend_config: Option<&carina_core::parser::BackendConfig>,
     force: bool,
 ) -> Result<MigrationOutcome, AppError> {
@@ -169,7 +170,7 @@ pub async fn run_init_migrate_state(
             return Err(AppError::Config(format!(
                 "No backend lock found. Run `{}` (without \
                  --migrate-state) to initialize the project first.",
-                ProjectCommand::new("init", project_dir)
+                ProjectCommand::for_display_path("init", project_dir.display())
             )));
         }
         BackendDriftStatus::Unchanged => return Ok(MigrationOutcome::NotNeeded),
@@ -211,6 +212,7 @@ pub async fn run_init_migrate_state(
     // Deleting the source first, as an earlier revision did, could
     // instead strand the project: a crash between the delete and the
     // lock rewrite would point the lock at a now-missing source.)
+    super::apply::symlink_retarget_test_barrier("CARINA_TEST_MIGRATE_COMMIT_HANDSHAKE_DIR").await;
     drift
         .configured()
         .save(project_dir)
@@ -223,11 +225,12 @@ pub async fn run_init_migrate_state(
     // fatal: the migration already committed, so a leftover old file is
     // harmless and the next run is a no-op.
     let source = if let Some(StateBackendConfig::Local(local_settings)) = backends.source_config() {
-        let path = anchored_local_path(local_settings, project_dir);
+        let path = anchored_local_path(local_settings, project_dir)
+            .map_err(|error| AppError::Config(error.to_string()))?;
         if !path.exists() {
             SourceDisposition::Deleted
         } else {
-            match std::fs::remove_file(&path) {
+            match path.remove() {
                 Ok(()) => {
                     println!("  {} deleted source local state file", "✓".green());
                     SourceDisposition::Deleted
@@ -298,7 +301,7 @@ mod tests {
     }
 
     async fn migration_backends(
-        project_dir: &Path,
+        project_dir: &carina_core::paths::ResolvedPath,
         source_path: &Path,
         target_path: &Path,
     ) -> MigrationBackends {
@@ -323,11 +326,20 @@ mod tests {
         let src = local_backend_for_test(src_path.clone());
         let dst = local_backend_for_test(dst_path.clone());
         src.write_state(&state_with("lin-1", 3)).await.unwrap();
-        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
+        let backends = migration_backends(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &src_path,
+            &dst_path,
+        )
+        .await;
 
-        let state = perform_state_migration(&backends, false, tmp.path())
-            .await
-            .unwrap();
+        let state = perform_state_migration(
+            &backends,
+            false,
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(state.resources().len(), 3);
 
         let migrated = dst.read_state().await.unwrap().unwrap().into_state();
@@ -344,11 +356,20 @@ mod tests {
         let dst = local_backend_for_test(dst_path.clone());
         src.write_state(&state_with("lin-src", 1)).await.unwrap();
         dst.write_state(&state_with("lin-dst", 2)).await.unwrap();
-        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
+        let backends = migration_backends(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &src_path,
+            &dst_path,
+        )
+        .await;
 
-        let err = perform_state_migration(&backends, false, tmp.path())
-            .await
-            .unwrap_err();
+        let err = perform_state_migration(
+            &backends,
+            false,
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(&err, AppError::Config(m) if m.contains("already contains state")),
             "got: {err:?}"
@@ -367,11 +388,20 @@ mod tests {
         let dst = local_backend_for_test(dst_path.clone());
         src.write_state(&state_with("lin-src", 1)).await.unwrap();
         dst.write_state(&state_with("lin-dst", 2)).await.unwrap();
-        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
+        let backends = migration_backends(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &src_path,
+            &dst_path,
+        )
+        .await;
 
-        perform_state_migration(&backends, true, tmp.path())
-            .await
-            .unwrap();
+        perform_state_migration(
+            &backends,
+            true,
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .await
+        .unwrap();
         let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(dst_state.lineage, "lin-src");
         assert_eq!(dst_state.resources().len(), 1);
@@ -398,10 +428,19 @@ mod tests {
             .await
             .unwrap();
 
-        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
-        perform_state_migration(&backends, true, tmp.path())
-            .await
-            .unwrap();
+        let backends = migration_backends(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &src_path,
+            &dst_path,
+        )
+        .await;
+        perform_state_migration(
+            &backends,
+            true,
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .await
+        .unwrap();
 
         let migrated = local_backend_for_test(dst_path)
             .read_state()
@@ -419,11 +458,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src_path = tmp.path().join("a.json");
         let dst_path = tmp.path().join("b.json");
-        let backends = migration_backends(tmp.path(), &src_path, &dst_path).await;
+        let backends = migration_backends(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            &src_path,
+            &dst_path,
+        )
+        .await;
 
-        let err = perform_state_migration(&backends, false, tmp.path())
-            .await
-            .unwrap_err();
+        let err = perform_state_migration(
+            &backends,
+            false,
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(&err, AppError::Config(m) if m.contains("no state")),
             "got: {err:?}"
@@ -434,10 +482,16 @@ mod tests {
     async fn not_needed_when_lock_matches_configured_local() {
         let tmp = tempfile::tempdir().unwrap();
         // Lock = local_default; configured = None (also local default).
-        BackendLock::local_default().save(tmp.path()).unwrap();
-        let outcome = run_init_migrate_state(tmp.path(), None, false)
-            .await
+        BackendLock::local_default()
+            .save(&carina_core::paths::ResolvedPath::new(tmp.path()).unwrap())
             .unwrap();
+        let outcome = run_init_migrate_state(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, MigrationOutcome::NotNeeded);
     }
 
@@ -446,7 +500,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
         // Locked = local default (carina.state.json under base_dir).
-        BackendLock::local_default().save(base).unwrap();
+        BackendLock::local_default()
+            .save(&carina_core::paths::ResolvedPath::new(base).unwrap())
+            .unwrap();
         let src_path = base.join(LocalBackend::DEFAULT_STATE_FILE);
         local_backend_for_test(src_path.clone())
             .write_state(&state_with("lin-x", 2))
@@ -471,9 +527,13 @@ mod tests {
             attribute_spans: HashMap::new(),
         };
 
-        let outcome = run_init_migrate_state(base, Some(&cfg), false)
-            .await
-            .unwrap();
+        let outcome = run_init_migrate_state(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            Some(&cfg),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             MigrationOutcome::Migrated {
@@ -494,9 +554,13 @@ mod tests {
         assert_eq!(migrated.resources().len(), 2);
 
         // Lock now reflects the configured backend ⇒ a second run is a no-op.
-        let second = run_init_migrate_state(base, Some(&cfg), false)
-            .await
-            .unwrap();
+        let second = run_init_migrate_state(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            Some(&cfg),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(second, MigrationOutcome::NotNeeded);
     }
 
@@ -511,7 +575,9 @@ mod tests {
     async fn lock_is_committed_before_source_removal() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        BackendLock::local_default().save(base).unwrap();
+        BackendLock::local_default()
+            .save(&carina_core::paths::ResolvedPath::new(base).unwrap())
+            .unwrap();
         local_backend_for_test(base.join(LocalBackend::DEFAULT_STATE_FILE))
             .write_state(&state_with("lin-z", 1))
             .await
@@ -532,12 +598,18 @@ mod tests {
             attribute_spans: HashMap::new(),
         };
 
-        run_init_migrate_state(base, Some(&cfg), false)
-            .await
-            .unwrap();
+        run_init_migrate_state(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            Some(&cfg),
+            false,
+        )
+        .await
+        .unwrap();
 
         // The lock on disk is the *configured* lock: the commit happened.
-        let on_disk = BackendLock::load(base).unwrap().unwrap();
+        let on_disk = BackendLock::load(&carina_core::paths::ResolvedPath::new(base).unwrap())
+            .unwrap()
+            .unwrap();
         let expected = BackendLock::for_config(Some(&cfg)).unwrap();
         assert_eq!(
             on_disk, expected,
@@ -547,9 +619,13 @@ mod tests {
         // Source is gone; a re-run must NOT wedge — it sees the
         // committed lock and is a clean no-op.
         assert!(!base.join(LocalBackend::DEFAULT_STATE_FILE).exists());
-        let again = run_init_migrate_state(base, Some(&cfg), false)
-            .await
-            .unwrap();
+        let again = run_init_migrate_state(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            Some(&cfg),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(again, MigrationOutcome::NotNeeded);
     }
 }

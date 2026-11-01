@@ -92,7 +92,8 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     write_upstream(&upstream);
     write_downstream(&downstream, "../mgmt");
 
-    let config = load_configuration(&downstream).expect("load_configuration");
+    let config = load_configuration(&carina_core::paths::ResolvedPath::new(&downstream).unwrap())
+        .expect("load_configuration");
 
     // Sanity: pre-resolve, the ref survives nested inside `assume_role`.
     let pc_pre = config

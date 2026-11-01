@@ -4,7 +4,10 @@ fn validate_backend(source: &str) -> Vec<String> {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), "\n").unwrap();
     std::fs::write(fixture.path().join("backend.crn"), source).unwrap();
-    carina_cli::commands::validate::validate_with_factories(fixture.path(), Vec::new())
+    carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        Vec::new(),
+    )
 }
 
 #[test]
@@ -123,8 +126,10 @@ fn validate_module_backend_reports_only_the_structural_error() {
     )
     .unwrap();
 
-    let diagnostics =
-        carina_cli::commands::validate::validate_with_factories(fixture.path(), Vec::new());
+    let diagnostics = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        Vec::new(),
+    );
 
     assert_eq!(
         diagnostics,

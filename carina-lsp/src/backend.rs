@@ -1,9 +1,10 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::ProviderContext;
+use carina_core::paths::PathIdentity;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::{CompletionValue, SchemaRegistry, collect_all_block_names};
 use carina_provider_resolver::{LegacyLockEntryError, ProviderArtifactFingerprint};
@@ -189,10 +190,10 @@ const PROVIDER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_se
 struct ProviderStates {
     /// Directory → ProviderState. Each directory with provider declarations
     /// gets its own state with its own schemas.
-    by_dir: HashMap<PathBuf, ProviderState>,
+    by_dir: HashMap<PathIdentity, ProviderState>,
     /// Reverse import map: module directory → sorted set of caller directories.
     /// Used to resolve providers for module files that don't declare their own.
-    import_map: HashMap<PathBuf, BTreeSet<PathBuf>>,
+    import_map: workspace::ModuleImportMap,
     /// Fallback state for files that don't belong to any config directory.
     empty: ProviderState,
 }
@@ -216,29 +217,20 @@ impl ProviderStates {
         // not file_path.parent() — the config dir might be the directory itself.
         let mut dir = Some(file_path);
         while let Some(d) = dir {
-            if let Some(state) = self.by_dir.get(d) {
-                return state;
-            }
-            // Try canonical path in case the by_dir key is different
-            if let Ok(canonical) = d.canonicalize()
-                && canonical != d
-                && let Some(state) = self.by_dir.get(&canonical)
-            {
+            if let Some(state) = self.by_dir.get(&PathIdentity::new(d)) {
                 return state;
             }
             dir = d.parent();
         }
 
         // Check import map for module files
-        let canonical = file_path.canonicalize().unwrap_or(file_path.to_path_buf());
+        let canonical = PathIdentity::new(file_path);
         if let Some(callers) = self.import_map.get(&canonical) {
             for caller_dir in callers {
-                let mut dir = Some(caller_dir.as_path());
-                while let Some(d) = dir {
-                    if let Some(state) = self.by_dir.get(d) {
+                for identity in caller_dir.ancestors() {
+                    if let Some(state) = self.by_dir.get(&identity) {
                         return state;
                     }
-                    dir = d.parent();
                 }
             }
         }
@@ -745,7 +737,16 @@ async fn load_schemas_impl(
         return;
     };
 
-    let dir_providers = workspace::discover_providers_by_dir(&workspace_root);
+    let mut dir_providers = HashMap::new();
+    for (dir, configs) in workspace::discover_providers_by_dir(&workspace_root) {
+        let entry = dir_providers
+            .entry(PathIdentity::new(&dir))
+            .or_insert_with(|| (dir.clone(), configs.clone()));
+        // Discovery visits aliases separately; retain one stable display spelling.
+        if dir < entry.0 {
+            *entry = (dir, configs);
+        }
+    }
     let import_map = workspace::discover_import_map(&workspace_root);
 
     // Drain the current states up-front so matching per-dir entries can
@@ -786,18 +787,18 @@ async fn load_schemas_impl(
     // the `.crn`-save → save-save-save loop in #2136.
     let mut any_work = false;
 
-    for (dir, configs) in &dir_providers {
+    for (identity, (dir, configs)) in dir_providers {
         let dir_configs: Vec<(PathBuf, workspace::DiscoveredProviderConfig)> =
             configs.iter().map(|c| (dir.clone(), c.clone())).collect();
 
         // Reuse the existing state when its cached configs are still the
         // current truth. Skips the WASM parse and all downstream schema /
         // completion / diagnostic scaffolding.
-        if let Some(existing) = old_states.remove(dir)
+        if let Some(existing) = old_states.remove(&identity)
             && configs_match(&existing.configs, &dir_configs)
         {
             total_schemas += existing.schema_count();
-            states.by_dir.insert(dir.clone(), existing);
+            states.by_dir.insert(identity, existing);
             continue;
         }
 
@@ -835,7 +836,7 @@ async fn load_schemas_impl(
             dir_fingerprint,
         );
         total_schemas += state.schema_count();
-        states.by_dir.insert(dir.clone(), state);
+        states.by_dir.insert(identity, state);
     }
 
     // `old_states` was drained by `remove()` above; anything left is a
@@ -885,7 +886,8 @@ fn configs_match(
         && a.iter()
             .zip(b)
             .all(|((a_dir, a_config), (b_dir, b_config))| {
-                a_dir == b_dir && a_config.comparison_key() == b_config.comparison_key()
+                PathIdentity::new(a_dir) == PathIdentity::new(b_dir)
+                    && a_config.comparison_key() == b_config.comparison_key()
             })
 }
 
@@ -1475,20 +1477,22 @@ let duplicate = mock.test.resource {
         std::fs::create_dir_all(&first_caller).unwrap();
         std::fs::create_dir_all(&last_caller).unwrap();
         std::fs::create_dir_all(&module).unwrap();
-        let first_caller = first_caller.canonicalize().unwrap();
-        let last_caller = last_caller.canonicalize().unwrap();
-        let module = module.canonicalize().unwrap();
 
         let mut states = ProviderStates::new();
+        states.by_dir.insert(
+            PathIdentity::new(&first_caller),
+            provider_state("first_rule"),
+        );
         states
             .by_dir
-            .insert(first_caller.clone(), provider_state("first_rule"));
-        states
-            .by_dir
-            .insert(last_caller.clone(), provider_state("last_rule"));
-        states
-            .import_map
-            .insert(module.clone(), BTreeSet::from([last_caller, first_caller]));
+            .insert(PathIdentity::new(&last_caller), provider_state("last_rule"));
+        states.import_map.insert(
+            PathIdentity::new(&module),
+            std::collections::BTreeSet::from([
+                PathIdentity::new(&last_caller),
+                PathIdentity::new(&first_caller),
+            ]),
+        );
 
         let state = states.state_for_path(&module);
         let block_names = collect_all_block_names(&state.schemas);
@@ -1720,6 +1724,54 @@ mod reload_skip_tests {
     // FactoryBuilder rebuild. `configs_match` is the gate that keeps
     // `load_schemas_impl` from re-running the expensive WASM parse when
     // the on-disk provider config didn't actually change.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_provider_directories_reuse_factories_on_reload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("providers.crn"), "provider mock {}\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builder: FactoryBuilder = Arc::new({
+            let builds = Arc::clone(&builds);
+            move |configs| {
+                assert_eq!(configs.len(), 1);
+                builds.fetch_add(1, Ordering::SeqCst);
+                (vec![], HashMap::new(), vec![])
+            }
+        });
+        let (service, socket) = tower_lsp::LspService::new(|client| {
+            Backend::new(client, ProviderContext::default(), Some(builder))
+        });
+        drop(socket);
+        let backend = service.inner();
+        backend
+            .workspace_root
+            .set(Some(temp.path().to_path_buf()))
+            .unwrap();
+        backend.load_schemas().await;
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "aliases must load once");
+        let schemas = Arc::clone(&backend.providers.read().await.state_for_path(&real).schemas);
+        backend.load_schemas().await;
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "reload must reuse the factory"
+        );
+        assert!(Arc::ptr_eq(
+            &schemas,
+            &backend.providers.read().await.state_for_path(&link).schemas,
+        ));
+        // A new preferred alias changes display spelling, not configuration.
+        std::os::unix::fs::symlink(&real, temp.path().join("alias")).unwrap();
+        backend.load_schemas().await;
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn configs_match_returns_true_for_identical_lists() {
         let dir = std::path::PathBuf::from("/tmp/x");

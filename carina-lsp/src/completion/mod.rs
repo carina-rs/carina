@@ -78,6 +78,8 @@ impl CompletionProvider {
         position: Position,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
+        let root = base_path.and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
+        let base_path = root.as_ref();
         let text = doc.text();
         let provider_ctx = doc.provider_context();
 
@@ -706,7 +708,7 @@ impl CompletionProvider {
         field_name: &str,
         text: &str,
         current_binding: Option<&str>,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
         let mut field_is_enum = false;
@@ -925,7 +927,7 @@ fn extract_for_iterable_partial(prefix: &str) -> Option<String> {
 fn detect_upstream_state_dot(
     text: &str,
     position: Position,
-    base_path: Option<&std::path::Path>,
+    base_path: Option<&carina_core::paths::ResolvedPath>,
 ) -> Option<(String, String, String)> {
     let line_idx = position.line as usize;
     let current_line = text.lines().nth(line_idx)?;
@@ -950,7 +952,7 @@ fn detect_upstream_state_dot(
 fn detect_upstream_state_depth2_dot(
     text: &str,
     position: Position,
-    base_path: Option<&std::path::Path>,
+    base_path: Option<&carina_core::paths::ResolvedPath>,
 ) -> Option<UpstreamDepth2Match> {
     let line_idx = position.line as usize;
     let current_line = text.lines().nth(line_idx)?;
@@ -1098,7 +1100,7 @@ fn range_for_partial(position: Position, partial: &str) -> Range {
 /// binding isn't declared as an `upstream_state` anywhere visible.
 fn resolve_upstream_state_source(
     text: &str,
-    base_path: Option<&std::path::Path>,
+    base_path: Option<&carina_core::paths::ResolvedPath>,
     binding: &str,
 ) -> Option<String> {
     let mut src_buf = String::new();

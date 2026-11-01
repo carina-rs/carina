@@ -137,7 +137,7 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
     .expect("valid loop fixture");
     crate::module_resolver::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        Path::new("."),
+        &crate::paths::ResolvedPath::new(Path::new(".")).unwrap(),
     )
     .expect("loop fixture crosses the module-resolution seam")
     .into_expanded(&crate::schema::SchemaRegistry::new())
@@ -1671,7 +1671,7 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
     .expect("the parser must preserve the authored use for typed validation");
     let parsed = crate::module_resolver::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("the fixture crosses module resolution before readiness validation");
     let error = crate::validation::resolve_bare_binding_uses(
@@ -9108,14 +9108,17 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
     )
     .expect("write loop fixture");
     let parsed = crate::config_loader::parse_directory(
-        fixture.path(),
+        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &crate::parser::ProviderContext::default(),
     )
     .expect("directory parses");
-    let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
-        .expect("directory fixture crosses the module-resolution seam")
-        .into_expanded(&crate::schema::SchemaRegistry::new())
-        .expect("directory fixture contains no parser placeholders");
+    let mut parsed = crate::module_resolver::resolve_modules_providerless(
+        parsed,
+        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
+    )
+    .expect("directory fixture crosses the module-resolution seam")
+    .into_expanded(&crate::schema::SchemaRegistry::new())
+    .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
     let error =

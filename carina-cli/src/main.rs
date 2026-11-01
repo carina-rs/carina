@@ -6,6 +6,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
 use colored::Colorize;
 
+use carina_core::paths::ResolvedPath;
+
 use carina_cli::commands;
 use carina_cli::commands::apply::{run_apply, run_apply_from_plan};
 use carina_cli::commands::destroy::run_destroy;
@@ -300,18 +302,22 @@ enum SkillsCommands {
     Status,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApplyInput<'a> {
-    Project(&'a Path),
-    SavedPlan(&'a Path),
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApplyInput {
+    Project(ResolvedPath),
+    SavedPlan(ResolvedPath),
 }
 
 #[allow(clippy::result_large_err)]
-fn classify_apply_input(path: &Path) -> Result<ApplyInput<'_>, error::AppError> {
-    match path.metadata() {
-        Ok(metadata) if metadata.is_dir() => Ok(ApplyInput::Project(path)),
-        Ok(_) => Ok(ApplyInput::SavedPlan(path)),
-        Err(error) if error.kind() == ErrorKind::NotFound => match path.symlink_metadata() {
+fn classify_apply_input(path: &Path) -> Result<ApplyInput, error::AppError> {
+    let input = ResolvedPath::new(path).map_err(|error| error::AppError::ApplyInputInspection {
+        path: path.to_path_buf(),
+        error,
+    })?;
+    match input.metadata() {
+        Ok(metadata) if metadata.is_dir() => Ok(ApplyInput::Project(input)),
+        Ok(_) => Ok(ApplyInput::SavedPlan(input)),
+        Err(error) if error.kind() == ErrorKind::NotFound => match input.symlink_metadata() {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Err(error::AppError::ApplyInputDanglingSymlink {
                     path: path.to_path_buf(),
@@ -490,7 +496,8 @@ async fn main() {
                         Ok(ApplyInput::SavedPlan(plan_path)) => {
                             run_apply_from_plan(
                                 &user_dirs,
-                                plan_path,
+                                &plan_path,
+                                &path,
                                 auto_approve,
                                 lock,
                                 parallelism,
@@ -502,7 +509,8 @@ async fn main() {
                         }
                         Ok(ApplyInput::Project(project_path)) => run_apply(
                             &user_dirs,
-                            project_path,
+                            &project_path,
+                            &path,
                             auto_approve,
                             lock,
                             parallelism,
@@ -511,7 +519,7 @@ async fn main() {
                             shutdown.clone(),
                         )
                         .await
-                        .map_err(|error| error.with_project_dir(project_path)),
+                        .map_err(|error| error.with_project_dir(&path)),
                         Err(error) => Err(error),
                     }
                 }
@@ -793,6 +801,51 @@ mod cli_version_tests;
 #[cfg(test)]
 mod error_format_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_input_symlink_retarget_keeps_classified_project_pinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(original.join("main.crn"), "original").unwrap();
+        std::fs::write(replacement.join("main.crn"), "replacement").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+
+        let ApplyInput::Project(project) = classify_apply_input(&alias).unwrap() else {
+            panic!("directory input must be a project");
+        };
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+
+        assert_eq!(
+            project.join("main.crn").unwrap().read_to_string().unwrap(),
+            "original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_input_symlink_retarget_keeps_classified_saved_plan_pinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original.plan");
+        let replacement = temp.path().join("replacement.plan");
+        let alias = temp.path().join("alias.plan");
+        std::fs::write(&original, "original").unwrap();
+        std::fs::write(&replacement, "replacement").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+
+        let ApplyInput::SavedPlan(plan) = classify_apply_input(&alias).unwrap() else {
+            panic!("file input must be a saved plan");
+        };
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+
+        assert_eq!(plan.read_to_string().unwrap(), "original");
+    }
 
     fn binding_use_app_error() -> error::AppError {
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};

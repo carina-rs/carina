@@ -86,7 +86,10 @@ fn write_fixture(files: &[(&str, &str)]) -> TempDir {
 }
 
 fn validate(fixture: &TempDir) -> Vec<String> {
-    carina_cli::commands::validate::validate_with_factories(fixture.path(), factories())
+    carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        factories(),
+    )
 }
 
 fn duplicate_errors(diagnostics: &[String]) -> Vec<&str> {
@@ -234,7 +237,10 @@ fn module_sibling_files_cannot_redeclare_an_attribute() {
     )
     .expect("caller");
 
-    let diagnostics = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diagnostics = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert_eq!(
         duplicate_errors(&diagnostics),
@@ -261,7 +267,10 @@ fn module_argument_and_internal_binding_share_one_namespace_across_files() {
     )
     .expect("caller");
 
-    let diagnostics = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diagnostics = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert_eq!(
         diagnostics,

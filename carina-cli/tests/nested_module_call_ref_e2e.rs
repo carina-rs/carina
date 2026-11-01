@@ -273,7 +273,10 @@ fn validate_resolves_intra_module_ref_to_module_call_binding() {
     let fixture = write_fixture();
     let caller = fixture.path().join("caller");
 
-    let diags = carina_cli::commands::validate::validate_with_factories(&caller, factories());
+    let diags = carina_cli::commands::validate::validate_with_factories(
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
+        factories(),
+    );
 
     assert!(
         !diags.iter().any(|d| d.contains("unknown binding")),

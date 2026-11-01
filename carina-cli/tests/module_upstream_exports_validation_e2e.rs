@@ -69,7 +69,10 @@ let instance = component { }
     }
 
     fn validate(&self) -> Vec<String> {
-        carina_cli::commands::validate::validate_with_factories(&self.caller, Vec::new())
+        carina_cli::commands::validate::validate_with_factories(
+            &carina_core::paths::ResolvedPath::new(&self.caller).unwrap(),
+            Vec::new(),
+        )
     }
 }
 

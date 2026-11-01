@@ -315,7 +315,7 @@ pub struct DiagnosticEngine {
 impl DiagnosticEngine {
     fn resolve_diagnostic_upstream_exports<B: BindingAddress>(
         &self,
-        base: &Path,
+        base: &carina_core::paths::ResolvedPath,
         upstream_states: &[carina_core::parser::UpstreamState<B>],
     ) -> (
         carina_core::upstream_exports::UpstreamExports<B>,
@@ -475,10 +475,10 @@ impl DiagnosticEngine {
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let source = DiagnosticSource::new(doc, &text);
-        let base_path = current_file_path.map(|path| {
-            path.parent()
-                .expect("a current file path must have a parent directory")
-        });
+        let pinned_base = current_file_path
+            .and_then(|path| path.parent())
+            .and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
+        let base_path = pinned_base.as_ref();
         let current_file_name = current_file_path.map(|path| {
             path.file_name()
                 .expect("a current file path must name a file")
@@ -659,13 +659,17 @@ impl DiagnosticEngine {
                         checks::MergedModuleResolution::ConstraintFailed { .. }
                         | checks::MergedModuleResolution::Unowned { .. } => None,
                     });
-            diagnostics.extend(self.loop_anonymous_identity_diagnostics(
-                doc,
-                &current_file,
-                &directory,
-                expanded_identity_graph,
-                base_path,
-            ));
+            diagnostics.extend(
+                self.loop_anonymous_identity_diagnostics(
+                    doc,
+                    &current_file,
+                    &directory,
+                    expanded_identity_graph,
+                    base_path
+                        .map(|base| std::path::PathBuf::from(base.display().to_string()))
+                        .as_deref(),
+                ),
+            );
         }
         let upstream_resolution = match (base_path, merged) {
             (Some(base), Some(merged)) => {
@@ -1098,13 +1102,14 @@ impl DiagnosticEngine {
                     },
                     None => &[],
                 };
+            let pinned_base = base_path.cloned();
             let authored_findings = match &self.provider_context {
                 DiagnosticProviderContext::Loaded(provider_context) => {
                     carina_core::validation::check_module_calls(
                         carina_core::validation::ModuleCallCheckInput {
                             authored: parsed,
                             semantic: merged,
-                            base_dir: base_path,
+                            base_dir: pinned_base.as_ref(),
                             imported_signatures: &module_signatures,
                             provider_context,
                             schemas: &self.schemas,
@@ -1120,7 +1125,7 @@ impl DiagnosticEngine {
                         carina_core::validation::ModuleCallCheckInput {
                             authored: parsed,
                             semantic: merged,
-                            base_dir: base_path,
+                            base_dir: pinned_base.as_ref(),
                             imported_signatures: &module_signatures,
                             provider_context,
                             schemas: &self.schemas,

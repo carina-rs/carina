@@ -282,7 +282,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     .expect("parse anonymous deferred-for target");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
         carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("resolve anonymous deferred-for target");
     let target = parsed
@@ -412,7 +412,7 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
     .expect("parse anonymous-loop fixture");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
         carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("resolve anonymous-loop fixture")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())

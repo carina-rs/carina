@@ -13,6 +13,7 @@ use tempfile::TempDir;
 fn carina(project: &std::path::Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carina"));
     cmd.current_dir(project)
+        .env("PWD", project)
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
         .env(
@@ -111,7 +112,7 @@ fn write_drift_project(project: &std::path::Path, include_resource: bool) {
     )
     .unwrap();
     local_backend_lock("legacy/state.json")
-        .save(project)
+        .save(&carina_core::paths::ResolvedPath::new(project).unwrap())
         .unwrap();
 }
 
@@ -119,7 +120,9 @@ fn write_clean_fixture(include_resource: bool) -> TempDir {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path();
     write_project(project, "state.json", include_resource);
-    local_backend_lock("state.json").save(project).unwrap();
+    local_backend_lock("state.json")
+        .save(&carina_core::paths::ResolvedPath::new(project).unwrap())
+        .unwrap();
     tmp
 }
 
@@ -197,7 +200,9 @@ fn write_upstream_drift_fixture() -> (TempDir, std::path::PathBuf, std::path::Pa
         serde_json::to_string_pretty(&upstream_state).unwrap(),
     )
     .unwrap();
-    local_backend_lock("state-a.json").save(&upstream).unwrap();
+    local_backend_lock("state-a.json")
+        .save(&carina_core::paths::ResolvedPath::new(&upstream).unwrap())
+        .unwrap();
 
     fs::write(
         downstream.join("backend.crn"),
@@ -217,7 +222,7 @@ let from_upstream = mock.test.resource {
     )
     .unwrap();
     local_backend_lock("downstream.state.json")
-        .save(&downstream)
+        .save(&carina_core::paths::ResolvedPath::new(&downstream).unwrap())
         .unwrap();
 
     (tmp, upstream, downstream)
@@ -302,7 +307,9 @@ mod backend_drift_gate {
             project.join("state.json").exists(),
             "state must be migrated to the configured backend path",
         );
-        let lock = BackendLock::load(project).unwrap().unwrap();
+        let lock = BackendLock::load(&carina_core::paths::ResolvedPath::new(project).unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(lock, local_backend_lock("state.json"));
     }
 
@@ -519,7 +526,7 @@ mod backend_drift_gate {
 
     #[test]
     fn downstream_plan_warns_once_and_reads_upstream_locked_backend() {
-        let (_tmp, upstream, downstream) = write_upstream_drift_fixture();
+        let (_tmp, _upstream, downstream) = write_upstream_drift_fixture();
         let output = carina(&downstream, &["plan", "--json", "--refresh=false", "."]);
 
         assert!(
@@ -545,7 +552,7 @@ mod backend_drift_gate {
             "downstream plan must resolve the export stored in U's locked old backend",
         );
 
-        let upstream = upstream.canonicalize().unwrap();
+        let upstream = std::path::absolute(downstream.join("../upstream")).unwrap();
         let warning = format!(
             "upstream_state source {} has a pending backend migration; reading its OLD backend",
             upstream.display()
@@ -567,7 +574,7 @@ mod backend_drift_gate {
 
     #[test]
     fn saved_plan_apply_warns_once_when_it_resolves_same_drifted_upstream_twice() {
-        let (_tmp, upstream, downstream) = write_upstream_drift_fixture();
+        let (_tmp, _upstream, downstream) = write_upstream_drift_fixture();
         let plan = carina(
             &downstream,
             &["plan", "--refresh=false", "--out", "plan.json", "."],
@@ -590,7 +597,7 @@ mod backend_drift_gate {
             stderr(&output),
         );
 
-        let upstream = upstream.canonicalize().unwrap();
+        let upstream = std::path::absolute(downstream.join("../upstream")).unwrap();
         let warning = format!(
             "upstream_state source {} has a pending backend migration; reading its OLD backend",
             upstream.display()
@@ -605,8 +612,8 @@ mod backend_drift_gate {
 
     #[test]
     fn downstream_plan_corrupt_upstream_lock_names_source_and_lock_path() {
-        let (_tmp, upstream, downstream) = write_upstream_drift_fixture();
-        let upstream = upstream.canonicalize().unwrap();
+        let (_tmp, _upstream, downstream) = write_upstream_drift_fixture();
+        let upstream = std::path::absolute(downstream.join("../upstream")).unwrap();
         let lock_path = upstream.join("carina-backend.lock");
         fs::write(&lock_path, "{ definitely not valid json").unwrap();
 
@@ -866,7 +873,7 @@ mod backend_drift_gate {
         .unwrap();
         fs::write(project.join("main.crn"), "exports {\n}\n").unwrap();
         s3_backend_lock("old-bucket", "state.json")
-            .save(project)
+            .save(&carina_core::paths::ResolvedPath::new(project).unwrap())
             .unwrap();
 
         let output = carina(

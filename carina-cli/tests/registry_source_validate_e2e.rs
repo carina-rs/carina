@@ -40,10 +40,17 @@ fn directory_validate_loads_registry_source_from_lock_and_cache() {
     let ProviderSource::Remote(remote_source) = parsed_source else {
         panic!("registry source must parse as remote")
     };
-    let artifact = cache_path_wasm(project.path(), &remote_source.source_key(), version);
+    let artifact = cache_path_wasm(
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        &remote_source.source_key(),
+        version,
+    );
     fs::create_dir_all(artifact.parent().unwrap()).expect("create provider cache");
     fs::write(&artifact, b"not a wasm component").expect("write invalid WASM fixture");
-    let sha256 = carina_provider_resolver::sha256_file(&artifact).unwrap();
+    let sha256 = carina_provider_resolver::sha256_file(
+        &carina_core::paths::ResolvedPath::new(&artifact).unwrap(),
+    )
+    .unwrap();
 
     let mut lock = LockFile::default();
     lock.upsert(LockEntry {
@@ -64,6 +71,7 @@ fn directory_validate_loads_registry_source_from_lock_and_cache() {
     let output = Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(["validate", "."])
         .current_dir(project.path())
+        .env("PWD", project.path())
         .env("NO_COLOR", "1")
         .env("CARINA_TRUST_RECORD_DIR", trust.path())
         .output()
@@ -104,7 +112,11 @@ fn directory_validate_rejects_allowlisted_registry_source_without_trust_record()
     let ProviderSource::Remote(remote_source) = parsed_source else {
         panic!("registry source must parse as remote")
     };
-    let artifact = cache_path_wasm(project.path(), &remote_source.source_key(), version);
+    let artifact = cache_path_wasm(
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        &remote_source.source_key(),
+        version,
+    );
     fs::create_dir_all(artifact.parent().unwrap()).expect("create provider cache");
     fs::write(&artifact, b"not a wasm component").expect("write invalid WASM fixture");
     let mut lock = LockFile::default();
@@ -115,7 +127,10 @@ fn directory_validate_rejects_allowlisted_registry_source_without_trust_record()
             version: version.into(),
             constraint: Some(version.into()),
         },
-        sha256: carina_provider_resolver::sha256_file(&artifact).unwrap(),
+        sha256: carina_provider_resolver::sha256_file(
+            &carina_core::paths::ResolvedPath::new(&artifact).unwrap(),
+        )
+        .unwrap(),
         registry: None,
     });
     lock.save(&project.path().join("carina-providers.lock"))
@@ -124,6 +139,7 @@ fn directory_validate_rejects_allowlisted_registry_source_without_trust_record()
     let output = Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(["validate", "."])
         .current_dir(project.path())
+        .env("PWD", project.path())
         .env("NO_COLOR", "1")
         .env("CARINA_TRUST_RECORD_DIR", trust.path())
         .output()
@@ -168,10 +184,17 @@ fn directory_validate_rejects_artifact_that_mismatches_lock_sha256() {
     let ProviderSource::Remote(remote_source) = parsed_source else {
         panic!("registry source must parse as remote")
     };
-    let artifact = cache_path_wasm(project.path(), &remote_source.source_key(), version);
+    let artifact = cache_path_wasm(
+        &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        &remote_source.source_key(),
+        version,
+    );
     fs::create_dir_all(artifact.parent().unwrap()).expect("create provider cache");
     fs::write(&artifact, b"mismatched provider bytes").expect("write provider artifact");
-    let actual_sha256 = carina_provider_resolver::sha256_file(&artifact).unwrap();
+    let actual_sha256 = carina_provider_resolver::sha256_file(
+        &carina_core::paths::ResolvedPath::new(&artifact).unwrap(),
+    )
+    .unwrap();
 
     let mut lock = LockFile::default();
     lock.upsert(LockEntry {
@@ -190,6 +213,7 @@ fn directory_validate_rejects_artifact_that_mismatches_lock_sha256() {
     let output = Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(["validate", "."])
         .current_dir(project.path())
+        .env("PWD", project.path())
         .env("NO_COLOR", "1")
         .output()
         .expect("run carina validate");
@@ -210,9 +234,7 @@ fn directory_validate_rejects_artifact_that_mismatches_lock_sha256() {
         "{rendered}"
     );
     assert!(
-        rendered.contains(
-            "Run `carina init` to discard the mismatched copy, then run it again to download a verified one."
-        ),
+        rendered.contains(&format!("Run `{}` to discard the mismatched copy, then run it again to download a verified one.", carina_core::hint::ProjectCommand::new("init", project.path()))),
         "{rendered}"
     );
     assert!(

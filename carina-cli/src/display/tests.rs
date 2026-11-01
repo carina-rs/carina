@@ -916,7 +916,7 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
     .expect("unbound loop parses");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
         carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect("root bindings resolve")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())

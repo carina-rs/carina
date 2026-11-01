@@ -1,7 +1,6 @@
 pub(crate) mod saved_plan;
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,13 +13,14 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{
     LivePreDataSourceReadInputs, ResolvedBindings, SavedPreApplyInputs, WaitAliasSpec,
 };
-use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::config_loader::load_configuration_with_config;
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::{
     AcceptedRequest, ExecutionCheckpointSink, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
+use carina_core::paths::ResolvedPath;
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
@@ -732,9 +732,9 @@ async fn execute_rehydrated_saved_plan(
 async fn verify_upstream_snapshot(
     sources: &[crate::commands::plan::UpstreamSource],
     snapshot: &HashMap<String, HashMap<String, Value>>,
+    project_dir: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
-    let project_dir = apply_target.source_dir();
     let upstream_states: Vec<ExpandedUpstreamState> = sources
         .iter()
         .map(|s| ExpandedUpstreamState {
@@ -1475,7 +1475,8 @@ fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_apply(
     user_dirs: &carina_core::UserDirs,
-    path: &Path,
+    project: &ResolvedPath,
+    project_argument: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -1485,7 +1486,8 @@ pub async fn run_apply(
 ) -> Result<(), AppError> {
     run_apply_with_observer_factory(
         user_dirs,
-        path,
+        project,
+        project_argument,
         auto_approve,
         lock,
         parallelism,
@@ -1501,7 +1503,8 @@ pub async fn run_apply(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_with_observer_factory(
     user_dirs: &carina_core::UserDirs,
-    path: &Path,
+    project: &ResolvedPath,
+    project_argument: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -1510,8 +1513,9 @@ async fn run_apply_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
+    let path = project_argument;
     let loaded = load_configuration_with_config(
-        path,
+        project,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
@@ -1520,7 +1524,7 @@ async fn run_apply_with_observer_factory(
     let parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
 
-    let base_dir = get_base_dir(path);
+    let base_dir = project;
     let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
     let mut validated_config = providers.validate_config_pair(
         parsed,
@@ -1534,6 +1538,7 @@ async fn run_apply_with_observer_factory(
     // branch; ordinary apply reaches backend verification without touching
     // upstream state and resolves once in the lock-held path.
     let verified_backend = verify_for_mutation(
+        base_dir,
         path,
         validated_config.resources().parsed().backend.as_ref(),
         DriftCommand::Apply,
@@ -1634,9 +1639,12 @@ async fn run_apply_with_observer_factory(
                         .resource_definition(&bucket_name)
                         .ok_or("Backend does not support resource definition generation")?;
 
+                    let target_file = project
+                        .join(&target_file)
+                        .map_err(|error| AppError::Config(error.to_string()))?;
                     // Read existing content if file exists, then append
                     let mut content = if target_file.exists() {
-                        fs::read_to_string(&target_file).map_err(|e| {
+                        target_file.read_to_string().map_err(|e| {
                             format!("Failed to read {}: {}", target_file.display(), e)
                         })?
                     } else {
@@ -1644,7 +1652,8 @@ async fn run_apply_with_observer_factory(
                     };
                     content.push_str(&resource_code);
 
-                    fs::write(&target_file, &content)
+                    target_file
+                        .atomic_replace(content.as_bytes())
                         .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
                     println!(
                         "  {} Added resource definition to {}",
@@ -1665,7 +1674,7 @@ async fn run_apply_with_observer_factory(
                     // resource pairing; replace only the resolved snapshot so
                     // the lock-held path sees the injected bucket row.
                     validated_config = reload_apply_configuration_after_bootstrap(
-                        path,
+                        project,
                         base_dir,
                         provider_context,
                         validated_config,
@@ -1735,6 +1744,8 @@ async fn run_apply_with_observer_factory(
         StateLock::disabled_by_cli_flag()
     };
 
+    symlink_retarget_test_barrier("CARINA_TEST_APPLY_LOCK_HANDSHAKE_DIR").await;
+
     // All code after lock acquisition observes the shared cancellation token.
     // A lock that survives execution is released after cancellation; proven
     // heartbeat loss returns without a capability that could be released.
@@ -1743,7 +1754,7 @@ async fn run_apply_with_observer_factory(
         auto_approve,
         Arc::clone(&backend),
         state_lock,
-        path,
+        project,
         provider_context,
         cancel.clone(),
         observer_factory,
@@ -1759,9 +1770,23 @@ async fn run_apply_with_observer_factory(
     Ok(())
 }
 
+/// Deterministic test rendezvous, following plan's state-drift handshake.
+/// Unset in normal runs; bounded so a failed test cannot strand the process.
+pub(crate) async fn symlink_retarget_test_barrier(variable: &str) {
+    let Some(directory) = std::env::var_os(variable) else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let _ = std::fs::write(directory.join("ready"), b"");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !directory.join("proceed").exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 fn reload_apply_configuration_after_bootstrap(
-    path: &Path,
-    base_dir: &Path,
+    path: &ResolvedPath,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     validated_config: ValidatedConfig,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
@@ -1783,7 +1808,7 @@ fn reload_apply_configuration_after_bootstrap(
 
 async fn load_apply_provider_inputs<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
@@ -1886,13 +1911,15 @@ async fn run_apply_locked_owned(
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
     lock: StateLock,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
+    let project_label = std::path::PathBuf::from(project_dir.display().to_string());
+    let project_display = project_label.as_path();
     // Read current state from backend. carina#3315: if `check_and_migrate`
     // lifted an older on-disk schema in memory, persist the upgrade
     // under the current lock before any short-circuit path can return
@@ -1931,7 +1958,7 @@ async fn run_apply_locked_owned(
                 check_legacy_name_overrides(
                     state,
                     accept_legacy_name_overrides,
-                    ApplyTarget::Project(project_dir),
+                    ApplyTarget::Project(project_display),
                 )?;
             }
 
@@ -2141,7 +2168,7 @@ async fn run_apply_locked_owned(
             } = match post_expansion {
                 crate::wiring::PostExpansionOutcome::Planned(planned) => planned,
                 crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
-                    return Err(diagnostics.render_and_abort(project_dir));
+                    return Err(diagnostics.render_and_abort(project_display));
                 }
             };
             let crate::wiring::PostExpansionArtifacts {
@@ -2156,7 +2183,7 @@ async fn run_apply_locked_owned(
                 prev_explicit,
                 wait_aliases,
             } = artifacts;
-            render_plan_errors_and_abort(&plan, project_dir)?;
+            render_plan_errors_and_abort(&plan, project_display)?;
             #[cfg(any(test, feature = "test-utils"))]
             capture_live_apply_plan_for_test(&plan)?;
             let crate::wiring::PostExpansionApplyResources {
@@ -2372,7 +2399,7 @@ async fn run_apply_locked_owned(
             // `ProviderNormalizer`; the same object is passed in both positions
             // so apply re-normalizes with exactly the plan-time normalizer
             // (carina#3060). They must stay the same object.
-            let observer = observer_factory(&plan, project_dir);
+            let observer = observer_factory(&plan, project_display);
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_resources.clone(),
@@ -2630,12 +2657,14 @@ async fn run_apply_locked_canonical(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let project =
+        ResolvedPath::new(project_dir).map_err(|error| AppError::Config(error.to_string()))?;
     let outcome = run_apply_locked_owned(
         validated_config,
         auto_approve,
         Arc::clone(&backend),
         lock,
-        project_dir,
+        &project,
         provider_context,
         cancel.clone(),
         observer_factory,
@@ -2790,7 +2819,7 @@ async fn prepare_saved_plan_secret_candidates(
     mut validated_config: ValidatedConfig,
     pending_plan: &SchemaCheckedPendingPlanFile,
     state_file: &Option<StateFile>,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     apply_target: ApplyTarget<'_>,
 ) -> Result<PreparedSavedPlanSecretCandidates, AppError> {
@@ -2864,8 +2893,11 @@ async fn prepare_saved_plan_secret_candidates(
         .await
         .map_err(AppError::Provider)?;
 
-    let candidates =
-        SavedPlanSecretCandidates::from_expansion(validated_expansion, provider_inputs);
+    let candidates = SavedPlanSecretCandidates::from_expansion(
+        validated_expansion,
+        provider_inputs,
+        base_dir.clone(),
+    );
 
     Ok(PreparedSavedPlanSecretCandidates {
         candidates,
@@ -2882,6 +2914,7 @@ fn rehydrate_desired_plan_file(
         plan_file,
         candidates.parsed(),
         candidates.provider_inputs(),
+        &candidates.source,
         apply_target,
     )
 }
@@ -2890,6 +2923,7 @@ fn rehydrate_desired_plan_file_from_parts(
     plan_file: &mut ReloadedPlanFile,
     parsed: &carina_core::parser::ExpandedInferredFile,
     provider_inputs: &ResolvedProviderInputs,
+    source: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     let mut resource_candidates = HashMap::new();
@@ -2929,10 +2963,8 @@ fn rehydrate_desired_plan_file_from_parts(
         carina_core::value::rehydrate_resource_secrets,
     )?;
 
-    let mut composition_source_identities = CompositionSourceIdentityResolver::new(
-        carina_core::config_loader::get_base_dir(apply_target.source_dir()),
-    )
-    .map_err(AppError::from)?;
+    let mut composition_source_identities =
+        CompositionSourceIdentityResolver::new(source).map_err(AppError::from)?;
     plan_file
         .rehydrate_composition_secrets(
             &parsed.compositions,
@@ -2943,7 +2975,10 @@ fn rehydrate_desired_plan_file_from_parts(
                 let call_chain = origin_id
                     .calls()
                     .map(|call| {
-                        let source_file = call.source_file().to_string_lossy();
+                        let source_file = composition_source_identities
+                            .display_source_file(call)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| call.source_root_relative_location());
                         format!(
                             "{}:{}:{}",
                             source_file.escape_debug(),
@@ -3004,7 +3039,8 @@ fn rehydrate_desired_plan_file_from_parts(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_apply_from_plan(
     user_dirs: &carina_core::UserDirs,
-    plan_path: &Path,
+    plan: &ResolvedPath,
+    plan_argument: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -3014,7 +3050,8 @@ pub async fn run_apply_from_plan(
 ) -> Result<(), AppError> {
     run_apply_from_plan_with_observer_factory(
         user_dirs,
-        plan_path,
+        plan,
+        plan_argument,
         auto_approve,
         lock,
         parallelism,
@@ -3030,7 +3067,8 @@ pub async fn run_apply_from_plan(
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_with_observer_factory(
     user_dirs: &carina_core::UserDirs,
-    plan_path: &Path,
+    plan: &ResolvedPath,
+    plan_argument: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -3039,7 +3077,8 @@ async fn run_apply_from_plan_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_, SavedModuleSource>,
 ) -> Result<(), AppError> {
-    let bytes = fs::read(plan_path).map_err(|error| AppError::PlanFileRead {
+    let plan_path = plan_argument;
+    let bytes = plan.read().map_err(|error| AppError::PlanFileRead {
         path: plan_path.to_path_buf(),
         error,
     })?;
@@ -3075,7 +3114,8 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 38
+    // Validate version compatibility before decoding the payload. Format 39
+    // pins the source locator to its planned canonical identity. Format 38
     // retains authored lifecycle values, default origins, and loop call sites;
     // earlier binaries could silently discard safety directives. Format 37
     // requires a relative diagnostic file (or null) and line on each deferred-for
@@ -3173,7 +3213,7 @@ async fn run_apply_from_plan_with_observer_factory(
         Ok::<PlanFile, PlanFileJsonError>(plan_file)
     })()
     .map_err(|error| AppError::corrupt_plan_file(plan_path.to_path_buf(), replan_command, error))?;
-    let source_path = std::path::PathBuf::from(&plan_file.source_path);
+    let source_path = std::path::PathBuf::from(plan_file.source_path.to_string());
     let apply_target = ApplyTarget::SavedPlan {
         plan_file: plan_path,
         source_dir: &source_path,
@@ -3184,6 +3224,29 @@ async fn run_apply_from_plan_with_observer_factory(
     plan_file
         .validate_replace_display()
         .map_err(AppError::Config)?;
+
+    let source = ResolvedPath::new(&source_path)
+        .and_then(|source| {
+            source.metadata()?;
+            Ok(source)
+        })
+        .map_err(|source| {
+            AppError::SavedPlanSourceResolution(Box::new(
+                crate::error::SavedPlanSourceResolutionError {
+                    source_path: plan_file.source_path.clone(),
+                    replan_command: saved_plan_replan_command(plan_path, &source_path),
+                    source,
+                },
+            ))
+        })?;
+    if source.identity() != plan_file.source_identity {
+        return Err(AppError::SavedPlanSourceChanged {
+            source_path: plan_file.source_path.clone(),
+            replan_command: saved_plan_replan_command(plan_path, &source_path),
+        });
+    }
+
+    symlink_retarget_test_barrier("CARINA_TEST_SAVED_PLAN_SOURCE_HANDSHAKE_DIR").await;
 
     let current_version = env!("CARGO_PKG_VERSION");
     if plan_file.carina_version != current_version {
@@ -3206,7 +3269,7 @@ async fn run_apply_from_plan_with_observer_factory(
         .cyan()
     );
 
-    let base_dir = get_base_dir(&source_path);
+    let base_dir = &source;
     let inspected_plan = InspectedPlanFile::inspect(plan_file);
     // Load exactly once from the saved plan's provider configs: this is the
     // provider instance that will execute. Complete its diagnostics before
@@ -3224,7 +3287,7 @@ async fn run_apply_from_plan_with_observer_factory(
     // outlive unrelated validation errors in the source configuration (R5),
     // while a valid backend edit must still require migration or replanning.
     let loaded_current_config = load_configuration_with_config(
-        &source_path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     );
@@ -3273,7 +3336,8 @@ async fn run_apply_from_plan_with_observer_factory(
         Some(current_backend) => current_backend,
         None => inspected_plan.backend_config(),
     };
-    let verified_backend = verify_for_mutation(&source_path, backend_config, DriftCommand::Apply)?;
+    let verified_backend =
+        verify_for_mutation(base_dir, &source_path, backend_config, DriftCommand::Apply)?;
     // Gate order is deliberate: provider load diagnostics were completed
     // above; configuration-vs-lock drift is checked next, then the saved-plan
     // backend is compared with the current configuration, and only after both
@@ -3319,6 +3383,7 @@ async fn run_apply_from_plan_with_observer_factory(
         Arc::clone(&backend),
         state_lock,
         apply_target,
+        base_dir,
         cancel.clone(),
         observer_factory,
         parallelism,
@@ -3343,6 +3408,7 @@ async fn run_apply_from_plan_locked_owned(
     backend: Arc<dyn StateBackend>,
     lock: StateLock,
     apply_target: ApplyTarget<'_>,
+    source: &ResolvedPath,
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_, SavedModuleSource>,
     parallelism: NonZeroUsize,
@@ -3416,7 +3482,7 @@ async fn run_apply_from_plan_locked_owned(
     }
 
     let inspected_plan = try_with_lock!(
-        inspected_plan.reload_in_flight_from_locked_state(state_file.as_ref(), project_dir)
+        inspected_plan.reload_in_flight_from_locked_state(state_file.as_ref(), source)
     );
 
     // A typed `read` address plus an identifier-less row shape distinguishes
@@ -3462,7 +3528,7 @@ async fn run_apply_from_plan_locked_owned(
                         validated_config,
                         &pending,
                         &state_file,
-                        project_dir,
+                        source,
                         provider_context,
                         apply_target,
                     )
@@ -3714,6 +3780,7 @@ async fn run_apply_from_plan_locked_owned(
                 verify_upstream_snapshot(
                     rehydrated_plan_file.upstream_sources(),
                     &upstream_snapshot,
+                    source,
                     apply_target,
                 )
                 .await?;
@@ -3948,14 +4015,20 @@ async fn run_apply_from_plan_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let source = ResolvedPath::new(apply_target.source_dir())
+        .map_err(|error| AppError::Config(error.to_string()))?;
     let inspected_plan = match ProviderLoad::load(
         user_dirs,
         inspected_plan.provider_configs().as_provider_configs(),
-        apply_target.source_dir(),
+        &carina_core::paths::ResolvedPath::new(apply_target.source_dir()).unwrap(),
     )
     .and_then(ProviderLoad::into_complete)
     .and_then(|providers| {
-        ProviderBoundPlanFile::for_test(inspected_plan, providers, apply_target.source_dir())
+        ProviderBoundPlanFile::for_test(
+            inspected_plan,
+            providers,
+            &carina_core::paths::ResolvedPath::new(apply_target.source_dir()).unwrap(),
+        )
     }) {
         Ok(inspected_plan) => inspected_plan,
         Err(error) => {
@@ -3977,6 +4050,7 @@ async fn run_apply_from_plan_locked(
         Arc::clone(&backend),
         lock,
         apply_target,
+        &source,
         cancel.clone(),
         observer_factory,
         parallelism,

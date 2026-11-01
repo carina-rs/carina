@@ -11,6 +11,29 @@ use carina_state::BackendError;
 
 use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 
+#[derive(Debug)]
+pub struct SavedPlanSourceResolutionError {
+    pub source_path: carina_core::paths::DisplayPath,
+    pub replan_command: String,
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for SavedPlanSourceResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to resolve saved plan source directory {}. Re-run `{}`.",
+            self.source_path, self.replan_command,
+        )
+    }
+}
+
+impl std::error::Error for SavedPlanSourceResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Final endpoint/kind summary retaining typed causes for programmatic use.
 /// Full cause chains have already been streamed through the failure sink.
 #[derive(Debug, Clone)]
@@ -91,16 +114,14 @@ impl LocatedResourceStateEncodingError {
 /// the CLI boundary.
 #[derive(Debug)]
 pub struct ProjectBackendError {
-    project_dir: PathBuf,
+    project_dir: carina_core::paths::DisplayPath,
     source: BackendError,
 }
 
 impl ProjectBackendError {
-    fn new(source: BackendError, project_dir: &Path) -> Self {
+    fn new(source: BackendError, project_dir: carina_core::paths::DisplayPath) -> Self {
         Self {
-            project_dir: project_dir
-                .canonicalize()
-                .unwrap_or_else(|_| project_dir.to_path_buf()),
+            project_dir,
             source,
         }
     }
@@ -114,7 +135,8 @@ impl ProjectBackendError {
 impl std::fmt::Display for ProjectBackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(error) = self.source.invalid_resource_identity() {
-            let plan_command = ProjectCommand::new("plan", &self.project_dir).to_string();
+            let plan_command =
+                ProjectCommand::for_display_path("plan", &self.project_dir).to_string();
             f.write_str(&error.render_with_plan_command(&plan_command))
         } else {
             std::fmt::Display::fmt(&self.source, f)
@@ -392,16 +414,14 @@ impl std::error::Error for SavedPlanDirectiveChangesMismatchError {}
 /// state was being resolved.
 #[derive(Debug)]
 pub struct UpstreamStateSourceError {
-    source_dir: PathBuf,
+    source_dir: carina_core::paths::DisplayPath,
     source: Box<AppError>,
 }
 
 impl UpstreamStateSourceError {
-    fn new(source: AppError, source_dir: &Path) -> Self {
+    fn new(source: AppError, source_dir: carina_core::paths::DisplayPath) -> Self {
         Self {
-            source_dir: source_dir
-                .canonicalize()
-                .unwrap_or_else(|_| source_dir.to_path_buf()),
+            source_dir,
             source: Box::new(source),
         }
     }
@@ -412,8 +432,7 @@ impl std::fmt::Display for UpstreamStateSourceError {
         write!(
             f,
             "upstream_state source {}: {}",
-            self.source_dir.display(),
-            self.source
+            self.source_dir, self.source
         )
     }
 }
@@ -1256,6 +1275,18 @@ pub enum AppError {
     #[error(transparent)]
     CorruptPlanFile(Box<CorruptPlanFileError>),
 
+    /// The saved display locator now selects a different filesystem identity.
+    #[error(
+        "The source directory resolves to a different location than when the plan was made: {source_path}. Re-run `{replan_command}`."
+    )]
+    SavedPlanSourceChanged {
+        source_path: carina_core::paths::DisplayPath,
+        replan_command: String,
+    },
+
+    #[error(transparent)]
+    SavedPlanSourceResolution(Box<SavedPlanSourceResolutionError>),
+
     /// A saved plan was computed against different provider schemas.
     #[error("{0}")]
     SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError),
@@ -1336,14 +1367,25 @@ impl AppError {
     pub fn with_project_dir(self, project_dir: &Path) -> Self {
         match self {
             Self::Backend(source) if source.invalid_resource_identity().is_some() => {
-                Self::ProjectBackend(Box::new(ProjectBackendError::new(source, project_dir)))
+                match carina_core::paths::DisplayPath::new(project_dir) {
+                    Ok(project_dir) => Self::ProjectBackend(Box::new(ProjectBackendError::new(
+                        source,
+                        project_dir,
+                    ))),
+                    Err(_) => Self::Backend(source),
+                }
             }
             other => other,
         }
     }
 
     pub(crate) fn with_upstream_state_source(self, source_dir: &Path) -> Self {
-        Self::UpstreamStateSource(Box::new(UpstreamStateSourceError::new(self, source_dir)))
+        match carina_core::paths::DisplayPath::new(source_dir) {
+            Ok(source_dir) => {
+                Self::UpstreamStateSource(Box::new(UpstreamStateSourceError::new(self, source_dir)))
+            }
+            Err(_) => self,
+        }
     }
 
     pub fn from_resource_preparation(
@@ -1505,9 +1547,10 @@ mod tests {
     fn composition_source_identity_preserves_typed_io_source_without_repeating_it() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing = temp.path().join("missing-source-root");
-        let identity_error =
-            carina_core::resource::CompositionSourceIdentityResolver::new(&missing)
-                .expect_err("missing source root must fail canonicalization");
+        let identity_error = carina_core::resource::CompositionSourceIdentityResolver::new(
+            &carina_core::paths::ResolvedPath::new(&missing).unwrap(),
+        )
+        .expect_err("missing source root must fail canonicalization");
         let app_error = AppError::from(identity_error);
 
         assert!(
@@ -1534,6 +1577,27 @@ mod tests {
         assert!(
             found_io_error,
             "composition identity chain lost the io error: {app_error:?}",
+        );
+    }
+
+    #[test]
+    fn saved_plan_source_resolution_renders_io_cause_once() {
+        let error = AppError::SavedPlanSourceResolution(Box::new(SavedPlanSourceResolutionError {
+            source_path: carina_core::paths::DisplayPath::new("missing-project").unwrap(),
+            replan_command: "carina plan --out plan.json missing-project".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing saved source"),
+        }));
+        assert!(!error.to_string().contains("missing saved source"));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<std::io::Error>()
+        );
+        assert_eq!(
+            format_error_with_source_chain(&error)
+                .matches("missing saved source")
+                .count(),
+            1
         );
     }
 
@@ -1878,6 +1942,21 @@ mod tests {
     fn implements_std_error() {
         let app_err = AppError::Validation("test".to_string());
         let _: &dyn std::error::Error = &app_err;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upstream_error_preserves_symlink_source_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = AppError::Config("invalid backend".into())
+            .with_upstream_state_source(&link)
+            .to_string();
+        assert!(error.contains(&link.display().to_string()), "{error}");
+        assert!(!error.contains(&real.display().to_string()), "{error}");
     }
 
     // -- account-guard formatter tests (#2407) --

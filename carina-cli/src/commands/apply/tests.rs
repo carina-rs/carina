@@ -1,5 +1,6 @@
 use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
+use carina_core::config_loader::get_base_dir;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::{Effect, UnresolvedSavedEffect};
 use carina_core::provider::{
@@ -82,7 +83,7 @@ fn validate_with_test_factories(
         carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed.clone());
     crate::commands::validate_and_resolve_errors(
         &parsed,
-        base_dir,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
         &providers,
         skip_resource_validation,
         duplicate_declarations,
@@ -110,7 +111,7 @@ where
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     carina_core::module_resolver::resolve_modules_with_providerless_config(
         carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
-        &base_dir,
+        &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
         &carina_core::parser::ProviderContext::default(),
         &carina_core::schema::SchemaRegistry::new(),
     )
@@ -274,9 +275,12 @@ fn mock_http_test_egress(
     );
     std::fs::write(lock_dir.join("carina-providers.lock"), lock)
         .expect("write mock HTTP egress consent");
-    carina_provider_resolver::load_locked_egress(lock_dir, load)
-        .expect("load mock HTTP egress consent")
-        .expect("mock HTTP egress consent must match the fixture")
+    carina_provider_resolver::load_locked_egress(
+        &carina_core::paths::ResolvedPath::new(lock_dir).unwrap(),
+        load,
+    )
+    .expect("load mock HTTP egress consent")
+    .expect("mock HTTP egress consent must match the fixture")
 }
 
 fn spawn_mock_http_server(
@@ -994,7 +998,7 @@ for account_id in orgs.accounts {
     .expect("parse saved-plan loop provenance fixture");
     let parsed = carina_core::module_resolver::resolve_modules_providerless(
         carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        Path::new("."),
+        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
     )
     .expect("cross the deferred-body resolution seam")
     .into_expanded(&carina_core::schema::SchemaRegistry::new())
@@ -1054,7 +1058,8 @@ for account_id in orgs.accounts {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-30T00:00:00Z".to_string(),
-        source_path: "infra".to_string(),
+        source_path: carina_core::paths::DisplayPath::new("infra").unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
@@ -1176,7 +1181,8 @@ async fn run_saved_plan_schema_fingerprint_case(
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-27T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
@@ -1345,7 +1351,8 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-28T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
@@ -1384,11 +1391,14 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         >(Vec::new(), &[])
         .into_complete()
         .expect("test provider load is complete"),
-        Path::new("."),
+        &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
     )
     .expect("placeholder-free plan must bind its provider load");
     let reloaded = bound
-        .reload_in_flight_from_locked_state(None, Path::new("."))
+        .reload_in_flight_from_locked_state(
+            None,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        )
         .expect("current-state snapshot should reload");
     let ReloadedProviderBoundPlanFile::Verified { plan, providers } = reloaded else {
         panic!("placeholder-free plan changed typestate during reload")
@@ -1594,8 +1604,10 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     ));
     saved.binding = None;
     saved.call_path = crate::test_composition_call_path_in(&saved_source);
-    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
-        .expect("create composition source identity resolver");
+    let mut source_identities = CompositionSourceIdentityResolver::new(
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+    )
+    .expect("create composition source identity resolver");
     let saved = saved
         .into_saved_with_resolver(&mut source_identities)
         .expect("save anonymous composition");
@@ -1613,7 +1625,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     parsed.compositions = vec![current];
     let provider_inputs = load_and_resolve_provider_configs(
         &parsed,
-        tmp.path(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &ProviderContext::default(),
         UpstreamMissingStatePolicy::Strict,
         ProviderUpstreamScope::All,
@@ -1625,7 +1637,8 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
-        source_path: tmp.path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(tmp.path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
@@ -1657,6 +1670,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         &mut plan_file,
         candidates.parsed(),
         candidates.provider_inputs(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -1672,8 +1686,8 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         "a saved source path injected a terminal escape byte",
     );
     assert!(
-        rendered.contains(r"saved\u{1b}[31m.crn"),
-        "the escaped source path was not retained in the moved-call diagnostic",
+        rendered.contains(r"<source root>/saved\u{1b}[31m.crn"),
+        "the escaped source-root-relative path must be retained in the moved-call diagnostic",
     );
 
     std::fs::remove_file(&current_source).expect("remove current composition source");
@@ -1681,6 +1695,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         &mut plan_file,
         candidates.parsed(),
         candidates.provider_inputs(),
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         ApplyTarget::SavedPlan {
             plan_file: Path::new("plan.json"),
             source_dir: tmp.path(),
@@ -1706,8 +1721,10 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
 
     let mut composition = saved_module_composition(string_value("public"), "rejected");
     composition.call_path = crate::test_composition_call_path_in(&source_file);
-    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
-        .expect("create composition source identity resolver");
+    let mut source_identities = CompositionSourceIdentityResolver::new(
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+    )
+    .expect("create composition source identity resolver");
     let saved = composition
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
@@ -1715,7 +1732,8 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
-        source_path: tmp.path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(tmp.path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
@@ -1759,6 +1777,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
 
         let error = run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -1843,7 +1862,8 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
-        source_path: tmp.path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(tmp.path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
         state_lineage: Some(lineage.to_string()),
         state_serial: Some(7),
         provider_configs: saved_provider_configs(vec![ProviderConfig {
@@ -2029,7 +2049,8 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
-        source_path: project.path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(project.path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(project.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![provider_config]),
@@ -2059,7 +2080,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         .join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
     let lock_path = state_path.with_extension("lock");
     carina_state::BackendLock::local_default()
-        .save(project.path())
+        .save(&carina_core::paths::ResolvedPath::new(project.path()).unwrap())
         .unwrap();
     let backend = crate::commands::local_backend_for_test(state_path);
     let held_lock = backend.acquire_lock("test").await.unwrap();
@@ -2067,6 +2088,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
 
     let error = run_apply_from_plan(
         &user_dirs,
+        &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
         &plan_path,
         true,
         true,
@@ -2124,7 +2146,8 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
-        source_path: project.path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(project.path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(project.path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: deserialize_saved_provider_configs(provider_configs),
@@ -2218,6 +2241,7 @@ let secret_resource = mock.test.resource {{
     let load_count = crate::wiring::track_provider_loads_for_test();
     run_apply_from_plan(
         &user_dirs,
+        &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
         &plan_path,
         true,
         false,
@@ -2241,9 +2265,13 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
         crate::provider_upstream_test_support::provider_upstream_fixture();
     let expanded = resolve_file_for_test(parsed);
-    let inputs = load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
-        .await
-        .expect("bootstrap provider inputs must resolve");
+    let inputs = load_apply_provider_inputs(
+        &expanded,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        &ProviderContext::default(),
+    )
+    .await
+    .expect("bootstrap provider inputs must resolve");
     let received_role_arn = Arc::new(Mutex::new(None));
     let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
         (),
@@ -2274,11 +2302,16 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider default-tags fixture has no parser placeholders");
 
-    let error =
-        match load_apply_provider_inputs(&parsed, &base_dir, &ProviderContext::default()).await {
-            Ok(_) => panic!("apply must load every declared upstream strictly"),
-            Err(error) => error,
-        };
+    let error = match load_apply_provider_inputs(
+        &parsed,
+        &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
+        &ProviderContext::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("apply must load every declared upstream strictly"),
+        Err(error) => error,
+    };
 
     let message = error.to_string();
     assert!(message.contains("upstream_state 'mgmt'"), "{message}");
@@ -2309,6 +2342,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
 
     let error = run_apply_with_observer_factory(
         &user_dirs,
+        &ResolvedPath::new(&downstream).unwrap(),
         &downstream,
         true,
         false,
@@ -2366,23 +2400,31 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     };
     write_upstream("arn:aws:iam::111111111111:role/old");
     let loaded = load_configuration_with_config(
-        &downstream,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::default(),
         &SchemaRegistry::new(),
     )
     .unwrap();
     let parsed = loaded.parsed;
-    let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &downstream).unwrap();
+    let providers = ProviderLoad::load(
+        &user_dirs,
+        &parsed.providers,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+    )
+    .unwrap();
     let unresolved_parsed = loaded.unresolved_parsed;
     let wiring = ValidatedWiring::from_load_for_test(providers);
     let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
     let expanded = resolve_module_file_for_test(parsed.clone().into_parsed())
         .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider upstream fixture has no parser placeholders");
-    let stale_inputs =
-        load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
-            .await
-            .unwrap();
+    let stale_inputs = load_apply_provider_inputs(
+        &expanded,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        &ProviderContext::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         stale_inputs.configs().as_provider_configs()[0]
             .attributes
@@ -2394,8 +2436,8 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
     write_upstream("arn:aws:iam::222222222222:role/new");
     let reloaded = reload_apply_configuration_after_bootstrap(
-        &downstream,
-        &downstream,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::default(),
         validated_config,
         unresolved_parsed,
@@ -2465,13 +2507,17 @@ inner { x = a }
     .expect("outer module");
     std::fs::write(inner.join("main.crn"), "arguments { x: Int }\n").expect("inner module");
     let loaded = load_configuration_with_config(
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &ProviderContext::default(),
         &SchemaRegistry::new(),
     )
     .expect("load unresolved bootstrap snapshot");
-    let providers =
-        ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
+    let providers = ProviderLoad::load(
+        &user_dirs,
+        &loaded.parsed.providers,
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+    )
+    .unwrap();
     let wiring = ValidatedWiring::from_load_for_test(providers);
     // The reload API consumes the previous validation owner only for its
     // provider wiring. This fixture is intentionally invalid before reload,
@@ -2480,8 +2526,8 @@ inner { x = a }
     let unresolved = loaded.unresolved_parsed;
 
     let error = reload_apply_configuration_after_bootstrap(
-        fixture.path(),
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &ProviderContext::default(),
         validated_config,
         unresolved,
@@ -2553,13 +2599,17 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
     for nested in [false, true] {
         let fixture = write_module_output_mismatch_fixture(nested);
         let loaded = load_configuration_with_config(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &ProviderContext::default(),
             &SchemaRegistry::new(),
         )
         .expect("load unresolved bootstrap snapshot");
-        let providers =
-            ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &loaded.parsed.providers,
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        )
+        .unwrap();
         let wiring = ValidatedWiring::from_load_for_test(providers);
         // The reload API consumes the previous validation owner only for its
         // provider wiring. This fixture is intentionally invalid before
@@ -2567,8 +2617,8 @@ fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
         let validated_config = validated_reload_owner_for_test(&wiring);
         let unresolved = loaded.unresolved_parsed;
         let error = reload_apply_configuration_after_bootstrap(
-            fixture.path(),
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &ProviderContext::default(),
             validated_config,
             unresolved,
@@ -3322,7 +3372,7 @@ async fn run_apply_cascade_fixture(
         &[],
     );
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -3664,7 +3714,7 @@ fn load_and_resolve_module_data_source_fixture(
     carina_core::config_loader::UnresolvedConfigSnapshot,
 ) {
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -3680,7 +3730,7 @@ fn load_and_resolve_module_data_source_fixture(
     let parsed = providers
         .validation_report(
             &loaded.parsed,
-            get_base_dir(fixture.config_path()),
+            &carina_core::paths::ResolvedPath::new(get_base_dir(fixture.config_path())).unwrap(),
             false,
             &loaded.duplicate_declarations,
         )
@@ -3842,7 +3892,7 @@ let lookup = read mock.iam.Roles {{
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyTimeReadShared::default();
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -4160,7 +4210,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-07-02T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs,
@@ -4279,8 +4330,10 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let composition =
         saved_module_composition(root_resource_ref("producer", "identifier"), "bad-id");
-    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
-        .expect("create composition source identity resolver");
+    let mut source_identities = CompositionSourceIdentityResolver::new(
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+    )
+    .expect("create composition source identity resolver");
     let saved_composition = composition
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
@@ -4295,7 +4348,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
@@ -4379,8 +4433,10 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
-        .expect("create composition source identity resolver");
+    let mut source_identities = CompositionSourceIdentityResolver::new(
+        &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+    )
+    .expect("create composition source identity resolver");
     let saved_composition = saved_module_composition(string_value("bad"), "bad")
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
@@ -4388,7 +4444,8 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(Vec::new()),
@@ -4450,7 +4507,8 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: deserialize_saved_provider_configs(vec![ProviderConfig {
@@ -4539,7 +4597,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     )
     .expect("write provider config");
     let parsed = carina_core::config_loader::load_configuration_with_config(
-        &downstream,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -4547,7 +4605,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     .parsed;
     let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
         parsed,
-        &downstream,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::default(),
         &SchemaRegistry::new(),
     )
@@ -4556,7 +4614,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
         &parsed,
-        &downstream,
+        &carina_core::paths::ResolvedPath::new(&downstream).unwrap(),
         &ProviderContext::default(),
         UpstreamMissingStatePolicy::Lenient,
         ProviderUpstreamScope::All,
@@ -4573,7 +4631,8 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: carina_core::parser::SavedProviderConfigs::from(plan_inputs.configs()),
@@ -4853,6 +4912,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
         &user_dirs,
+        &ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.config_path(),
         true,
         true,
@@ -4907,7 +4967,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
         fixture.config_path().join("source-apply-mock-state.json"),
     );
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -4915,13 +4975,17 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
-        .expect("mock provider must load");
+    let providers = ProviderLoad::load(
+        &user_dirs,
+        &parsed.providers,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+    )
+    .expect("mock provider must load");
     let validated_config = providers
         .validate_config_pair(
             parsed,
             unresolved_parsed,
-            base_dir,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
             false,
             &loaded.duplicate_declarations,
         )
@@ -4981,7 +5045,8 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-21T00:00:00Z".to_string(),
-        source_path: fixture.config_path().display().to_string(),
+        source_path: carina_core::paths::DisplayPath::new(fixture.config_path()).unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(fixture.config_path()).unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![ProviderConfig {
@@ -5055,6 +5120,7 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
         &user_dirs,
+        &ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.config_path(),
         true,
         true,
@@ -5100,8 +5166,10 @@ async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
     let shutdown = fixture.cancel_token();
     let observer_factory = fixture.observer_factory();
 
+    let project = ResolvedPath::new(fixture.config_path()).unwrap();
     let apply = run_apply_with_observer_factory(
         &user_dirs,
+        &project,
         fixture.config_path(),
         true,
         true,
@@ -5148,7 +5216,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     let fixture = ApplyCancellationFixture::new()
         .with_resources_and_exports(["a", "b"], &[("ax", "a.name"), ("bx", "b.id")]);
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -5221,7 +5289,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
     let fixture = fixture.with_raw_config(crn);
 
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -5316,7 +5384,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
     let ctx = wiring.context();
 
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -5384,7 +5452,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let ctx = wiring.context();
 
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -5612,7 +5680,7 @@ awscc.ec2.Subnet {{
     let ctx = wiring.context();
 
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -5704,7 +5772,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     let fixture = fixture.with_raw_config(crn);
 
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -5758,7 +5826,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     );
 
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -5859,7 +5927,7 @@ let nat = mock.ec2.NatGateway {{
     let ctx = wiring.context();
     let load = || {
         let loaded = load_configuration_with_config(
-            fixture.config_path(),
+            &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
             fixture.provider_context(),
             &SchemaRegistry::new(),
         )
@@ -6032,7 +6100,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let ctx = wiring.context();
     let load = || {
         let loaded = load_configuration_with_config(
-            fixture.config_path(),
+            &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
             fixture.provider_context(),
             &SchemaRegistry::new(),
         )
@@ -6199,7 +6267,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let ctx = wiring.context();
     let load = || {
         let loaded = load_configuration_with_config(
-            fixture.config_path(),
+            &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
             fixture.provider_context(),
             &SchemaRegistry::new(),
         )
@@ -6476,7 +6544,7 @@ let consumer = mock.iam.Role {{
     let fixture = fixture.with_raw_config(crn);
 
     let loaded = load_configuration_with_config(
-        fixture.config_path(),
+        &carina_core::paths::ResolvedPath::new(fixture.config_path()).unwrap(),
         fixture.provider_context(),
         &SchemaRegistry::new(),
     )
@@ -9397,7 +9465,7 @@ mod apply_deferred_for_parity {
         .expect("parse");
         carina_core::module_resolver::resolve_modules_providerless(
             carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .expect("cross the deferred-body resolution seam")
     }
@@ -9743,7 +9811,9 @@ mod apply_deferred_for_parity {
 mod saved_plan_version_tests {
 
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 37 requires deferred
+    //! `carina plan` is the supported migration. Version 39 pins the source
+    //! locator to its canonical identity. Version 38 retains authored
+    //! directives and default origins. Version 37 requires deferred
     //! diagnostic locations. Version 36 adds typed
     //! deferred-for templates and stage-specific placeholder types. Version 35
     //! stores tri-state prevent-destroy directives and the approved state-only
@@ -9769,6 +9839,74 @@ mod saved_plan_version_tests {
         ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir, saved_provider_configs,
     };
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_plan_rejects_repointed_source_symlink_with_display_path() {
+        let user_dirs = carina_core::TestUserDirs::new();
+        let (dir, plan_path, mut json) = replacement_plan_json();
+        let real1 = dir.path().join("real1");
+        let real2 = dir.path().join("real2");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real1).unwrap();
+        std::fs::create_dir(&real2).unwrap();
+        std::os::unix::fs::symlink(&real1, &link).unwrap();
+        json["source_path"] = serde_json::json!(link);
+        json["source_identity"] =
+            serde_json::json!(carina_core::paths::CanonicalPath::new(&link).unwrap());
+        std::fs::write(&plan_path, serde_json::to_vec(&json).unwrap()).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&real2, &link).unwrap();
+
+        let error = crate::commands::apply::run_apply_from_plan(
+            &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, crate::error::AppError::SavedPlanSourceChanged { .. }),
+            "{error:?}"
+        );
+        let message = crate::error::format_error_with_source_chain(&error);
+        assert!(
+            message.contains(
+                "source directory resolves to a different location than when the plan was made"
+            ),
+            "{message}"
+        );
+        assert!(message.contains(&link.display().to_string()), "{message}");
+        assert!(!message.contains(&real1.display().to_string()), "{message}");
+        assert!(!message.contains(&real2.display().to_string()), "{message}");
+        assert!(message.contains("Re-run `carina plan"), "{message}");
+    }
+
+    #[test]
+    fn source_identity_requires_plan_format_39() {
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 39);
+    }
+
+    #[tokio::test]
+    async fn format_38_saved_plan_is_rejected_before_source_identity_decode() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        json["version"] = serde_json::json!(38);
+        json.as_object_mut().unwrap().remove("source_identity");
+        let message =
+            rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
+                .await;
+        assert!(
+            message.contains("Unsupported plan file version: 38 (expected 39)"),
+            "{message}"
+        );
+        assert!(!message.contains("corrupted"), "{message}");
+    }
+
     #[tokio::test]
     async fn format_28_saved_plan_is_rejected_before_deferred_payload_decode() {
         let user_dirs = carina_core::TestUserDirs::new();
@@ -9793,6 +9931,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -9828,6 +9967,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -9851,7 +9991,7 @@ mod saved_plan_version_tests {
         );
     }
 
-    /// v37 and older could discard authored safety directives; reject their
+    /// v38 and older lack the canonical source identity; reject their
     /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
@@ -9859,12 +9999,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            38,
-            "carina#4072 requires format 38 to reject fail-open directive plans",
+            39,
+            "carina#4202 requires format 39 to pin the planned source identity",
         );
-        let previous = 37;
+        let previous = 38;
 
-        for older_version in [previous, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -9877,6 +10017,7 @@ mod saved_plan_version_tests {
 
             let error = crate::commands::apply::run_apply_from_plan(
                 &user_dirs,
+                &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
                 &plan_path,
                 true,
                 false,
@@ -9915,6 +10056,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -9970,6 +10112,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10012,6 +10155,7 @@ mod saved_plan_version_tests {
 
         let result = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10071,6 +10215,7 @@ mod saved_plan_version_tests {
 
         let result = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10133,6 +10278,7 @@ mod saved_plan_version_tests {
 
         let result = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10223,6 +10369,7 @@ mod saved_plan_version_tests {
 
         let result = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10295,6 +10442,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10353,6 +10501,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10410,6 +10559,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10467,6 +10617,7 @@ mod saved_plan_version_tests {
 
         let error = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10538,6 +10689,7 @@ mod saved_plan_version_tests {
 
         let result = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10603,6 +10755,7 @@ mod saved_plan_version_tests {
 
         let result = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
             &plan_path,
             true,
             false,
@@ -10697,7 +10850,8 @@ mod saved_plan_version_tests {
             version: crate::commands::plan::PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-07-02T00:00:00Z".to_string(),
-            source_path: "missing.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new(dir.path()).unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(dir.path()).unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(Vec::new()),
@@ -10769,6 +10923,7 @@ mod saved_plan_version_tests {
 
         let result = crate::commands::apply::run_apply_from_plan(
             &user_dirs,
+            &carina_core::paths::ResolvedPath::new(plan_path).unwrap(),
             plan_path,
             true,
             false,

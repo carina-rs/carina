@@ -321,7 +321,7 @@ fn apply_path_propagates_module_wait_binding() {
 
     // --- exactly run_apply's load+resolve+expand sequence ---
     let loaded = load_configuration_with_config(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         &provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )
@@ -337,7 +337,7 @@ fn apply_path_propagates_module_wait_binding() {
 
     let parsed = carina_cli::commands::validate_and_resolve_with_config(
         &parsed,
-        base_dir,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
         &providers,
         // `skip_resource_validation = true` is a real apply-path mode
         // (run_apply's backend-seed re-load uses it,
@@ -444,7 +444,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
     let caller = fixture("caller");
     let provider_context = ProviderContext::default();
     let loaded = load_configuration_with_config(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         &provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )
@@ -459,7 +459,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
     );
     let parsed = carina_cli::commands::validate_and_resolve_with_config(
         &parsed,
-        base_dir,
+        &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
         &providers,
         false,
         &[],
@@ -515,7 +515,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let provider_context = ProviderContext::default();
 
     let loaded = load_configuration_with_config(
-        &caller,
+        &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
         &provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )
@@ -530,7 +530,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &parsed.providers,
     );
     let wiring = providers
-        .validate_evaluated_config(parsed, base_dir, true, &[])
+        .validate_evaluated_config(
+            parsed,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+            true,
+            &[],
+        )
         .expect("expand stage must succeed");
 
     let ctx = wiring.context();

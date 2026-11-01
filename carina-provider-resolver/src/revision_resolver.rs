@@ -1,5 +1,6 @@
 //! Resolve provider binaries from GitHub Actions CI artifacts by git revision.
 
+use carina_core::paths::ResolvedPath;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -504,8 +505,8 @@ mod revision_artifact_selection {
     }
 
     impl RevisionArtifactPinState {
-        fn expired_artifact_remedy(self, project_dir: &Path) -> String {
-            let init = ProjectCommand::new("init", project_dir);
+        fn expired_artifact_remedy(self, project_dir: &ResolvedPath) -> String {
+            let init = ProjectCommand::for_display_path("init", project_dir.display());
             match self {
                 Self::Pinned => format!(
                     "If the rebuilt artifact differs from the pinned sha256, remove this provider's \
@@ -664,7 +665,7 @@ mod revision_artifact_selection {
         run_ids: &[WorkflowRunId],
         source: &GithubSource,
         sha: &CommitSha,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
         pin_state: RevisionArtifactPinState,
         mut fetch: F,
         mut download: D,
@@ -789,7 +790,7 @@ mod revision_artifact_selection {
         run_ids: &[WorkflowRunId],
         source: &GithubSource,
         sha: &CommitSha,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
         recovery: RevisionArtifactRecovery,
         fetch: F,
         download: D,
@@ -899,7 +900,7 @@ struct RevisionArtifactLocation<'a> {
     user_dirs: &'a UserDirs,
     source: &'a GithubSource,
     sha: &'a CommitSha,
-    project_dir: &'a Path,
+    project_dir: &'a ResolvedPath,
 }
 
 impl<'a> RevisionArtifactLocation<'a> {
@@ -907,7 +908,7 @@ impl<'a> RevisionArtifactLocation<'a> {
         user_dirs: &'a UserDirs,
         source: &'a GithubSource,
         sha: &'a CommitSha,
-        project_dir: &'a Path,
+        project_dir: &'a ResolvedPath,
     ) -> Self {
         Self {
             user_dirs,
@@ -1109,9 +1110,13 @@ fn stage_selected_artifact<'lock>(
 
 /// Cache path for revision-based providers.
 /// Uses `rev-{sha_prefix}` as the version directory.
-pub fn cache_path_revision(base_dir: &Path, source: &GithubSource, sha: &CommitSha) -> PathBuf {
+pub fn cache_path_revision(
+    base_dir: &ResolvedPath,
+    source: &GithubSource,
+    sha: &CommitSha,
+) -> PathBuf {
     let sha_prefix = sha.short();
-    base_dir
+    PathBuf::from(base_dir.display().to_string())
         .join(".carina")
         .join("providers")
         .join(source.to_string())
@@ -1141,77 +1146,63 @@ mod revision_artifact_cache {
         Metadata(io::Error),
         Artifact(E),
     }
-
-    /// Unverified revision cache metadata read alongside a cached WASM path.
     pub(super) struct CachedRevisionArtifact {
         artifact_id: ArtifactId,
-        path: PathBuf,
+        path: ResolvedPath,
     }
-
     impl CachedRevisionArtifact {
         pub(super) fn artifact_id(&self) -> ArtifactId {
             self.artifact_id
         }
-
-        pub(super) fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &ResolvedPath {
             &self.path
         }
     }
-
-    fn sidecar_path(wasm_path: &Path) -> PathBuf {
-        let mut sidecar = wasm_path.as_os_str().to_os_string();
-        sidecar.push(".artifact-id");
-        PathBuf::from(sidecar)
+    fn sidecar_path(wasm_path: &ResolvedPath) -> io::Result<ResolvedPath> {
+        let mut name = wasm_path
+            .display()
+            .file_name()
+            .unwrap_or_default()
+            .to_os_string();
+        name.push(".artifact-id");
+        wasm_path
+            .parent()
+            .ok_or_else(|| io::Error::other("cache artifact has no parent"))?
+            .join(name)
     }
-
-    fn read_artifact_id(wasm_path: &Path) -> Option<ArtifactId> {
-        let file = std::fs::File::open(sidecar_path(wasm_path)).ok()?;
+    fn read_artifact_id(wasm_path: &ResolvedPath) -> Option<ArtifactId> {
+        let file = sidecar_path(wasm_path).ok()?.open_read().ok()?;
         let mut value = String::new();
         file.take(64).read_to_string(&mut value).ok()?;
         serde_json::from_str(value.trim()).ok()
     }
-
     pub(super) fn read(
-        wasm_path: &Path,
+        wasm_path: &ResolvedPath,
         fallback_artifact_id: ArtifactId,
     ) -> Option<CachedRevisionArtifact> {
         wasm_path.exists().then(|| CachedRevisionArtifact {
             artifact_id: read_artifact_id(wasm_path).unwrap_or(fallback_artifact_id),
-            path: wasm_path.to_path_buf(),
+            path: wasm_path.clone(),
         })
     }
-
-    fn write(wasm_path: &Path, artifact_id: ArtifactId) -> io::Result<()> {
-        let sidecar = sidecar_path(wasm_path);
-        let parent = sidecar.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cache metadata path {} has no parent", sidecar.display()),
-            )
-        })?;
-        std::fs::create_dir_all(parent)?;
-        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-        writeln!(staged, "{artifact_id}")?;
-        staged.as_file().sync_all()?;
-        staged.persist(&sidecar).map_err(|error| error.error)?;
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
+    fn write(wasm_path: &ResolvedPath, artifact_id: ArtifactId) -> io::Result<()> {
+        let sidecar = sidecar_path(wasm_path)?;
+        if let Some(parent) = sidecar.parent() {
+            parent.create_dir_all()?;
         }
-        Ok(())
+        sidecar.atomic_replace(format!("{artifact_id}\n").as_bytes())
     }
-
     pub(super) fn publish<T, E>(
-        wasm_path: &Path,
+        wasm_path: &ResolvedPath,
         artifact_id: ArtifactId,
         publish_artifact: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, PublishError<E>> {
         write(wasm_path, artifact_id).map_err(PublishError::Metadata)?;
         publish_artifact().map_err(PublishError::Artifact)
     }
-
-    pub(super) fn remove(wasm_path: &Path) -> io::Result<()> {
-        for path in [sidecar_path(wasm_path), wasm_path.to_path_buf()] {
-            match std::fs::remove_file(path) {
+    pub(super) fn remove(wasm_path: &ResolvedPath) -> io::Result<()> {
+        for path in [sidecar_path(wasm_path)?, wasm_path.clone()] {
+            match path.remove() {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -1345,10 +1336,15 @@ mod verified_revision_artifact {
         cached: &CachedRevisionArtifact,
         lock_entry: &crate::provider_resolver::LockEntry<R>,
         name: &str,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<VerifiedRevisionArtifact, VerifiedArtifactError> {
         let artifact = VerifiedArtifact::from_existing(lock_entry, name, project_dir)?;
-        if artifact.path().as_path() != cached.path() {
+        if project_dir
+            .join(artifact.path().as_path())
+            .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?
+            .identity()
+            != cached.path().identity()
+        {
             return Err(VerifiedArtifactError::Other(format!(
                 "Cached revision artifact path {} does not match lock-selected path {}",
                 cached.path().display(),
@@ -1369,7 +1365,11 @@ mod verified_revision_artifact {
         lock_entry: &crate::provider_resolver::LockEntry<R>,
         name: &str,
     ) -> Result<VerifiedRevisionArtifact, VerifiedArtifactError> {
-        revision_artifact_cache::publish(destination.as_path(), cached.artifact_id(), || {
+        let target = install_lock
+            .project_dir()
+            .join(destination.as_path())
+            .map_err(|error| VerifiedArtifactError::Other(error.to_string()))?;
+        revision_artifact_cache::publish(&target, cached.artifact_id(), || {
             crate::install_lock::install_project_artifact_from_global_cache(
                 install_lock,
                 cached.path(),
@@ -1422,7 +1422,11 @@ mod verified_revision_artifact {
         name: &str,
         unchanged_revision: bool,
     ) -> Result<PublishedRevisionArtifact, String> {
-        revision_artifact_cache::publish(destination.as_path(), selected.artifact_id(), || {
+        let target = install_lock
+            .project_dir()
+            .join(destination.as_path())
+            .map_err(|error| error.to_string())?;
+        revision_artifact_cache::publish(&target, selected.artifact_id(), || {
             let staged = stage_selected_artifact(install_lock, destination, selected)?;
             let downloaded = if unchanged_revision {
                 crate::verified_artifact::publish_unchanged_revision_download(staged, pin)
@@ -1508,11 +1512,12 @@ fn revision_cache_metadata_error(wasm_path: &Path, error: io::Error) -> String {
 }
 
 fn install_global_revision_artifact(
-    source: &Path,
+    source: &ResolvedPath,
     destination: &GlobalArtifactPath,
     artifact_id: ArtifactId,
 ) -> Result<(), String> {
-    revision_artifact_cache::publish(destination.as_path(), artifact_id, || {
+    let target = ResolvedPath::new(destination.as_path()).map_err(|error| error.to_string())?;
+    revision_artifact_cache::publish(&target, artifact_id, || {
         install_global_artifact_atomically(source, destination)
     })
     .map_err(|error| match error {
@@ -1520,7 +1525,7 @@ fn install_global_revision_artifact(
             revision_cache_metadata_error(destination.as_path(), error)
         }
         revision_artifact_cache::PublishError::Artifact(error) => {
-            let cleanup = revision_artifact_cache::remove(destination.as_path());
+            let cleanup = revision_artifact_cache::remove(&target);
             match cleanup {
                 Ok(()) => format!(
                     "Failed to install global revision cache artifact {}: {error}. The incomplete cache entry was removed.",
@@ -1676,14 +1681,19 @@ where
     let wasm_path = WasmArtifactPath::new(cache_path_revision(base_dir, source, &sha), name)?;
     if mode != LockMode::Upgrade
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
-        && let Some(cached) = revision_artifact_cache::read(wasm_path.as_path(), pin.artifact_id)
+        && let Some(cached) = base_dir
+            .join(wasm_path.as_path())
+            .ok()
+            .and_then(|path| revision_artifact_cache::read(&path, pin.artifact_id))
     {
         let pin = pin.clone();
         let verified =
             match verified_revision_artifact::from_existing(&cached, lock_entry, name, base_dir) {
                 Ok(verified) => verified,
                 Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
-                    let removal = revision_artifact_cache::remove(wasm_path.as_path());
+                    let removal = base_dir
+                        .join(wasm_path.as_path())
+                        .and_then(|path| revision_artifact_cache::remove(&path));
                     return Err((*mismatch).after_cache_removal(wasm_path.as_path(), removal));
                 }
                 Err(VerifiedArtifactError::Other(message)) => return Err(message),
@@ -1701,7 +1711,9 @@ where
     if mode != LockMode::Upgrade
         && let Some((lock_entry, pin)) = artifact_pin.pinned(user_dirs)
         && let Some(global_wasm) = global_cache_path_revision(user_dirs, source, &sha)
-        && let Some(cached) = revision_artifact_cache::read(global_wasm.as_path(), pin.artifact_id)
+        && let Some(cached) = ResolvedPath::new(global_wasm.as_path())
+            .ok()
+            .and_then(|path| revision_artifact_cache::read(&path, pin.artifact_id))
     {
         let pin = pin.clone();
         let verified = match verified_revision_artifact::install_project_artifact_from_global_cache(
@@ -1713,7 +1725,8 @@ where
         ) {
             Ok(verified) => verified,
             Err(VerifiedArtifactError::ChecksumMismatch(mismatch)) => {
-                let removal = revision_artifact_cache::remove(global_wasm.as_path());
+                let removal = ResolvedPath::new(global_wasm.as_path())
+                    .and_then(|path| revision_artifact_cache::remove(&path));
                 return Err((*mismatch).after_cache_removal(global_wasm.as_path(), removal));
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
@@ -1804,15 +1817,21 @@ where
     // Save to global cache
     if let Some(global_wasm) = global_cache_path_revision(user_dirs, source, &sha) {
         install_global_revision_artifact(
-            installed_path.as_path(),
+            &base_dir
+                .join(installed_path.as_path())
+                .map_err(|error| error.to_string())?,
             &global_wasm,
             verified.artifact_id(),
         )?;
     }
 
     if let Some(recovery) = selected.recovery()
-        && let Some(notice) =
-            revision_artifact_recovery_notice(recovery, selected.artifact_id(), mode, base_dir)
+        && let Some(notice) = revision_artifact_recovery_notice(
+            recovery,
+            selected.artifact_id(),
+            mode,
+            &PathBuf::from(base_dir.display().to_string()),
+        )
     {
         eprintln!("{notice}");
     }
@@ -1860,8 +1879,12 @@ mod tests {
     }
 
     fn write_revision_cache_metadata_for_test(wasm_path: &Path, artifact_id: ArtifactId) {
-        revision_artifact_cache::publish(wasm_path, artifact_id, || Ok::<(), io::Error>(()))
-            .unwrap();
+        revision_artifact_cache::publish(
+            &carina_core::paths::ResolvedPath::new(wasm_path).unwrap(),
+            artifact_id,
+            || Ok::<(), io::Error>(()),
+        )
+        .unwrap();
     }
 
     fn trust_record_files(root: &Path) -> Vec<PathBuf> {
@@ -1908,6 +1931,38 @@ mod tests {
         serde_json::from_value(serde_json::json!(value)).unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn revision_cache_symlink_retarget_reads_pinned_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        let alias = temp.path().join("alias");
+        for (directory, id) in [(&original, 7), (&replacement, 9)] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::write(directory.join("provider.wasm"), b"provider").unwrap();
+            std::fs::write(
+                directory.join("provider.wasm.artifact-id"),
+                format!("{id}\n"),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let root = ResolvedPath::new(&alias).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        let cached = revision_artifact_cache::read(
+            &root.join("provider.wasm").unwrap(),
+            test_artifact_id(1),
+        )
+        .unwrap();
+        assert_eq!(cached.artifact_id(), test_artifact_id(7));
+        assert_eq!(
+            root.join("provider.wasm").unwrap().read().unwrap(),
+            b"provider"
+        );
+    }
+
     #[test]
     fn invalid_config_revision_is_rejected_before_any_github_request() {
         let source = github_source("carina-rs", "provider");
@@ -1929,7 +1984,11 @@ mod tests {
         let base = Path::new("/tmp/project");
         let sha = commit_sha("abc123def456789012345678901234567890abcd");
         let source = github_source("carina-rs", "carina-provider-awscc");
-        let path = cache_path_revision(base, &source, &sha);
+        let path = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(base).unwrap(),
+            &source,
+            &sha,
+        );
         assert_eq!(
             path,
             PathBuf::from(
@@ -1948,7 +2007,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().join("infra/foo");
         let source = test_source();
-        let artifact_path = cache_path_revision(&project_dir, &source, &test_sha());
+        let artifact_path = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            &source,
+            &test_sha(),
+        );
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, b"actual").unwrap();
         let lock_entry: LockEntry<RegistryLock> = LockEntry {
@@ -1962,9 +2025,13 @@ mod tests {
             sha256: "expected".into(),
             registry: None::<RegistryLock>,
         };
-        let nested = VerifiedArtifact::from_existing(&lock_entry, "aws", &project_dir)
-            .unwrap_err()
-            .to_string();
+        let nested = VerifiedArtifact::from_existing(
+            &lock_entry,
+            "aws",
+            &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             nested.contains(&format!(
                 "Run `carina init {}` to discard the mismatched copy, then run it again to download a verified one.",
@@ -1992,7 +2059,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let wasm_path = cache_path_revision(dir.path(), &source, &test_sha());
+        let wasm_path = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         std::fs::write(&wasm_path, b"tampered provider").unwrap();
         write_revision_cache_metadata_for_test(&wasm_path, test_artifact_id(42));
@@ -2010,7 +2081,10 @@ mod tests {
             registry: None,
         });
 
-        let install_lock = ProviderInstallLock::acquire(dir.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock_file = install_lock.guard_lock_file_for_test(lock_file);
         let result = resolve_provider_by_revision(
             &user_dirs,
@@ -2044,11 +2118,18 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let source = test_source();
         let destination = WasmArtifactPath::new(
-            cache_path_revision(project.path(), &source, &test_sha()),
+            cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha(),
+            ),
             "aws",
         )
         .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut staged = StagedArtifact::for_project(&install_lock, &destination).unwrap();
         staged
             .write_all(b"unexpected revision origin bytes")
@@ -2096,7 +2177,8 @@ mod tests {
         let cached_bytes = b"tampered global revision provider";
         let expected_file = project.path().join("expected.wasm");
         std::fs::write(&expected_file, locked_bytes).unwrap();
-        let expected_sha256 = sha256_file(&expected_file).unwrap();
+        let expected_sha256 =
+            sha256_file(&carina_core::paths::ResolvedPath::new(&expected_file).unwrap()).unwrap();
         crate::verified_artifact::record_test_github_origin_download(
             &user_dirs,
             &source.source_key(),
@@ -2124,9 +2206,18 @@ mod tests {
         std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
         write_revision_cache_metadata_for_test(global_wasm.as_path(), test_artifact_id(42));
         let global_sidecar = revision_sidecar_path(global_wasm.as_path());
-        let project_wasm = cache_path_revision(project.path(), &source, &test_sha());
-        let actual_sha256 = sha256_file(global_wasm.as_path()).unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let project_wasm = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
+        let actual_sha256 =
+            sha256_file(&carina_core::paths::ResolvedPath::new(global_wasm.as_path()).unwrap())
+                .unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let result = resolve_provider_by_revision(
@@ -2183,7 +2274,9 @@ mod tests {
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         std::fs::write(global_wasm.as_path(), cached_bytes).unwrap();
         write_revision_cache_metadata_for_test(global_wasm.as_path(), test_artifact_id(42));
-        let sha256 = sha256_file(global_wasm.as_path()).unwrap();
+        let sha256 =
+            sha256_file(&carina_core::paths::ResolvedPath::new(global_wasm.as_path()).unwrap())
+                .unwrap();
         crate::verified_artifact::record_test_github_origin_download(
             &user_dirs,
             &source.source_key(),
@@ -2206,7 +2299,10 @@ mod tests {
         let lock_path = crate::provider_resolver::provider_lock_path(project.path());
         lock_file.save(&lock_path).unwrap();
         let lock_before = std::fs::read(&lock_path).unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let (resolved, resolved_sha) = resolve_provider_by_revision(
@@ -2253,7 +2349,10 @@ mod tests {
         let sidecar = revision_sidecar_path(global_wasm.as_path());
         std::fs::create_dir(&sidecar).unwrap();
 
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded =
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
         let result = resolve_provider_by_revision_with(
@@ -2304,11 +2403,18 @@ mod tests {
             registry: None,
         });
         record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
-        let wasm_path = cache_path_revision(project.path(), &source, &test_sha());
+        let wasm_path = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         let sidecar = revision_sidecar_path(&wasm_path);
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         std::fs::create_dir(&sidecar).unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
@@ -2354,11 +2460,15 @@ mod tests {
         let global = user_dirs.plugin_cache_dir();
         std::fs::create_dir_all(global).unwrap();
         let source = test_source();
-        let wasm_path = cache_path_revision(project.path(), &source, &test_sha());
+        let wasm_path = cache_path_revision(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            &source,
+            &test_sha(),
+        );
         std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
         std::fs::write(&wasm_path, b"bytes left by the previous cache entry").unwrap();
         let publish_error = revision_artifact_cache::publish(
-            &wasm_path,
+            &carina_core::paths::ResolvedPath::new(&wasm_path).unwrap(),
             test_artifact_id(99),
             || -> Result<(), io::Error> {
                 Err(io::Error::other("simulated byte publication failure"))
@@ -2384,7 +2494,10 @@ mod tests {
             registry: None,
         });
         record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
@@ -2774,7 +2887,10 @@ mod tests {
             )
             .bytes(zip_url, artifact_zip(&[("provider.wasm", wasm)]));
         let api = GithubApi::new(&http, Some("token"));
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded =
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
 
@@ -2825,8 +2941,11 @@ mod tests {
         std::fs::create_dir_all(global_wasm.as_path().parent().unwrap()).unwrap();
         std::fs::write(global_wasm.as_path(), wasm).unwrap();
         write_revision_cache_metadata_for_test(global_wasm.as_path(), test_artifact_id(42));
-        let cached =
-            revision_artifact_cache::read(global_wasm.as_path(), test_artifact_id(42)).unwrap();
+        let cached = revision_artifact_cache::read(
+            &carina_core::paths::ResolvedPath::new(global_wasm.as_path()).unwrap(),
+            test_artifact_id(42),
+        )
+        .unwrap();
         let lock_entry: LockEntry<RegistryLock> = LockEntry {
             name: "aws".into(),
             source: source.to_string(),
@@ -2838,10 +2957,19 @@ mod tests {
             sha256: sha256_bytes(wasm),
             registry: None,
         };
-        let destination =
-            WasmArtifactPath::new(cache_path_revision(project.path(), &source, &sha), "aws")
-                .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let destination = WasmArtifactPath::new(
+            cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &sha,
+            ),
+            "aws",
+        )
+        .unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let installed = verified_revision_artifact::install_project_artifact_from_global_cache(
             &cached,
             &install_lock,
@@ -2878,7 +3006,10 @@ mod tests {
                 ),
             );
         let api = GithubApi::new(&http, Some("token"));
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded =
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
 
@@ -2951,7 +3082,10 @@ mod tests {
                 artifact_zip(&[("provider.wasm", b"ineligible provider")]),
             );
         let api = GithubApi::new(&http, Some("token"));
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded =
             install_lock.guard_lock_file_for_test(crate::provider_resolver::LockFile::default());
 
@@ -3023,7 +3157,10 @@ sha256 = "{}"
             ),
         )
         .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock_file = install_lock.load_lock_file().unwrap().unwrap();
         let listed_shas = RefCell::new(Vec::new());
 
@@ -3096,7 +3233,10 @@ sha256 = "{}"
             ),
         )
         .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut lock_file = install_lock.load_lock_file().unwrap().unwrap();
         let resolved_ref = Cell::new(false);
 
@@ -3135,7 +3275,14 @@ sha256 = "{}"
             ),
             "{error}"
         );
-        assert!(!cache_path_revision(project.path(), &test_source(), &test_sha()).exists());
+        assert!(
+            !cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &test_source(),
+                &test_sha()
+            )
+            .exists()
+        );
     }
 
     #[test]
@@ -3145,7 +3292,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| Ok(vec![artifact("build-output", 42, false)]),
             |artifact_id| {
@@ -3165,7 +3312,7 @@ sha256 = "{}"
             &[workflow_run_id(200), workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |run_id| match run_id.get() {
                 200 => Ok(vec![artifact("docs", 1, false)]),
@@ -3222,7 +3369,7 @@ sha256 = "{}"
             &[workflow_run_id(7)],
             &source,
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |run_id| fetch_run_artifacts(&repo, run_id, &api),
             |artifact_id| download_artifact_zip(&repo, artifact_id, &api),
@@ -3246,7 +3393,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| {
                 Ok(vec![
@@ -3272,7 +3419,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| {
                 Ok(vec![
@@ -3299,7 +3446,7 @@ sha256 = "{}"
             &[workflow_run_id(200), workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |run_id| match run_id.get() {
                 200 => Ok(vec![artifact("newer-build", 2, false)]),
@@ -3326,7 +3473,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| Ok(vec![artifact("build-output", 42, false)]),
             |_| Ok(zip.clone()),
@@ -3358,7 +3505,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| Ok(vec![artifact("build-output", 1, false)]),
             |_| Ok(zip.clone()),
@@ -3411,7 +3558,7 @@ sha256 = "{}"
             &[workflow_run_id(7)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |run_id| fetch_run_artifacts(&repo, run_id, &api),
             |artifact_id| download_artifact_zip(&repo, artifact_id, &api),
@@ -3437,7 +3584,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            project_dir,
+            &carina_core::paths::ResolvedPath::new(project_dir).unwrap(),
             RevisionArtifactPinState::Pinned,
             |_| {
                 Ok(vec![
@@ -3460,7 +3607,10 @@ sha256 = "{}"
                 "All artifacts in successful workflow runs for {}@{} have expired: first-build, second-build. Re-run CI for this commit or push a new commit (or point `revision` at one). If the rebuilt artifact differs from the pinned sha256, remove this provider's entry from carina-providers.lock and run `{}`.",
                 test_source(),
                 test_sha(),
-                ProjectCommand::new("init", project_dir),
+                ProjectCommand::for_display_path(
+                    "init",
+                    ResolvedPath::new(project_dir).unwrap().display()
+                ),
             )
         );
     }
@@ -3484,7 +3634,7 @@ sha256 = "{}"
                 &user_dirs,
                 &source,
                 &test_sha(),
-                Path::new("infra/project"),
+                &carina_core::paths::ResolvedPath::new(Path::new("infra/project")).unwrap(),
             ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
@@ -3498,7 +3648,13 @@ sha256 = "{}"
 
         assert!(error.contains("expired-build"), "{error}");
         assert!(!error.contains("pinned sha256"), "{error}");
-        assert!(error.contains("carina init infra/project"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "carina init {}",
+                carina_core::paths::DisplayPath::new("infra/project").unwrap()
+            )),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3519,7 +3675,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &source,
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| Ok(vec![artifact("provider-build", 42, false)]),
             |artifact_id| download_artifact_zip(&repo, artifact_id, &api),
@@ -3535,7 +3691,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| {
                 Ok(vec![
@@ -3564,7 +3720,7 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &test_source(),
             &test_sha(),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
             RevisionArtifactPinState::Unpinned,
             |_| Ok(vec![artifact("provider-build", 1, false)]),
             |_| Ok(zip.clone()),
@@ -3615,7 +3771,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || {
                 listed_runs.set(true);
@@ -3662,7 +3823,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> {
                 panic!("missing replay metadata must not force run discovery")
@@ -3706,7 +3872,10 @@ sha256 = "{}"
         let lock_model_before = lock_file.to_toml_string().unwrap();
         lock_file.save(&lock_path).unwrap();
         let lock_before = std::fs::read(&lock_path).unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.load_lock_file().unwrap().unwrap();
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with(
@@ -3793,7 +3962,10 @@ sha256 = "{}"
             registry: None,
         });
         record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         resolve_provider_by_revision_with(
@@ -3992,7 +4164,7 @@ sha256 = "{}"
                     &user_dirs,
                     &test_source(),
                     &test_sha(),
-                    Path::new("."),
+                    &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
                 ),
                 LockMode::Normal,
                 || Ok(vec![workflow_run_id(100)]),
@@ -4023,11 +4195,18 @@ sha256 = "{}"
             let project = tempfile::tempdir().unwrap();
             let source = test_source();
             let destination = WasmArtifactPath::new(
-                cache_path_revision(project.path(), &source, &test_sha()),
+                cache_path_revision(
+                    &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                    &source,
+                    &test_sha(),
+                ),
                 "aws",
             )
             .unwrap();
-            let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+            let install_lock = ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            )
+            .unwrap();
             let (verified, verified_pin) = match verified_revision_artifact::publish_download(
                 &user_dirs,
                 &selected,
@@ -4090,7 +4269,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -4136,7 +4320,12 @@ sha256 = "{}"
 
         let error = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> {
                 panic!("metadata failure must not enter recovery")
@@ -4187,7 +4376,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(7)]),
             |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -4239,7 +4433,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(7)]),
             |_| Ok(vec![artifact("same-build", 42, false)]),
@@ -4327,7 +4526,10 @@ sha256 = "{}"
                 artifact_zip(&[("provider.wasm", wasm)]),
             );
         let api = GithubApi::new(&http, Some("token"));
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with_api(
@@ -4387,7 +4589,12 @@ sha256 = "{}"
         );
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &source, &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &source,
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("replacement-build", 99, false)]),
@@ -4401,11 +4608,18 @@ sha256 = "{}"
         .unwrap();
         let project = tempfile::tempdir().unwrap();
         let destination = WasmArtifactPath::new(
-            cache_path_revision(project.path(), &source, &test_sha()),
+            cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha(),
+            ),
             "aws",
         )
         .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let staged = stage_selected_artifact(&install_lock, &destination, &selected).unwrap();
 
         let error = publish_revision_download(staged, pin)
@@ -4445,7 +4659,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| {
@@ -4511,7 +4730,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &source, &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &source,
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(7)]),
             |run_id| fetch_run_artifacts(&repo, run_id, &api),
@@ -4564,7 +4788,12 @@ sha256 = "{}"
 
         let error = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || Ok(vec![workflow_run_id(100)]),
             |_| Ok(vec![artifact("still-current", 42, false)]),
@@ -4697,7 +4926,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Normal,
             || -> Result<Vec<WorkflowRunId>, String> { panic!("locked replay must not list runs") },
             |_| panic!("locked replay must not fetch run artifacts"),
@@ -4708,11 +4942,18 @@ sha256 = "{}"
         let project = tempfile::tempdir().unwrap();
         let source = test_source();
         let destination = WasmArtifactPath::new(
-            cache_path_revision(project.path(), &source, &test_sha()),
+            cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha(),
+            ),
             "aws",
         )
         .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let staged = stage_selected_artifact(&install_lock, &destination, &selected).unwrap();
         let error = publish_revision_download(staged, pin)
             .expect_err("locked replay must be hash checked at publish time");
@@ -4751,7 +4992,12 @@ sha256 = "{}"
 
         let selected = resolve_revision_artifact(
             &pin,
-            RevisionArtifactLocation::new(&user_dirs, &test_source(), &test_sha(), Path::new(".")),
+            RevisionArtifactLocation::new(
+                &user_dirs,
+                &test_source(),
+                &test_sha(),
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+            ),
             LockMode::Upgrade,
             || {
                 listed_runs.set(true);
@@ -4773,11 +5019,18 @@ sha256 = "{}"
         let project = tempfile::tempdir().unwrap();
         let source = test_source();
         let destination = WasmArtifactPath::new(
-            cache_path_revision(project.path(), &source, &test_sha()),
+            cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha(),
+            ),
             "aws",
         )
         .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let staged = stage_selected_artifact(&install_lock, &destination, &selected).unwrap();
         assert!(matches!(
             publish_unchanged_revision_download(staged, pin).unwrap(),
@@ -4814,18 +5067,25 @@ sha256 = "{}"
             &[workflow_run_id(100)],
             &source,
             &test_sha(),
-            project.path(),
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             RevisionArtifactPinState::Pinned,
             |_| Ok(vec![artifact("rebuilt", 99, false)]),
             |_| Ok(artifact_zip(&[("provider.wasm", b"changed provider")])),
         )
         .unwrap();
         let destination = WasmArtifactPath::new(
-            cache_path_revision(project.path(), &source, &test_sha()),
+            cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha(),
+            ),
             "aws",
         )
         .unwrap();
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let staged = stage_selected_artifact(&install_lock, &destination, &selected).unwrap();
 
         let error = publish_unchanged_revision_download(staged, pin)
@@ -4858,7 +5118,10 @@ sha256 = "{}"
             registry: None,
         });
         record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
@@ -4887,7 +5150,14 @@ sha256 = "{}"
             error.contains("artifact for an unchanged commit changed"),
             "{error}"
         );
-        assert!(!cache_path_revision(project.path(), &source, &test_sha()).exists());
+        assert!(
+            !cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha()
+            )
+            .exists()
+        );
     }
 
     #[test]
@@ -4911,7 +5181,10 @@ sha256 = "{}"
                 registry: None,
             });
             record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
-            let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+            let install_lock = ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+            )
+            .unwrap();
             let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
             let error = resolve_provider_by_revision_with(
@@ -4964,7 +5237,10 @@ sha256 = "{}"
             registry: None,
         });
         record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let error = resolve_provider_by_revision_with(
@@ -4993,7 +5269,14 @@ sha256 = "{}"
             error.contains("artifact for an unchanged commit changed"),
             "{error}"
         );
-        assert!(!cache_path_revision(project.path(), &source, &test_sha()).exists());
+        assert!(
+            !cache_path_revision(
+                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+                &source,
+                &test_sha()
+            )
+            .exists()
+        );
     }
 
     #[test]
@@ -5017,7 +5300,10 @@ sha256 = "{}"
             registry: None,
         });
         record_revision_lock_trust(&user_dirs, &lock_file, &source, &test_sha());
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with(
@@ -5076,7 +5362,10 @@ sha256 = "{}"
             sha256: sha256_bytes(b"old provider"),
             registry: None,
         });
-        let install_lock = ProviderInstallLock::acquire(project.path()).unwrap();
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
 
         let (installed, resolved_sha) = resolve_provider_by_revision_with(

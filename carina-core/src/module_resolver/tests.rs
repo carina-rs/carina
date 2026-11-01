@@ -55,7 +55,7 @@ fn resolve_modules(
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     super::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        base_dir,
+        &crate::paths::ResolvedPath::new(base_dir).unwrap(),
     )
 }
 
@@ -67,7 +67,7 @@ fn resolve_modules_with_config(
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     super::resolve_modules_with_providerless_config(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        base_dir,
+        &crate::paths::ResolvedPath::new(base_dir).unwrap(),
         config,
         schemas,
     )
@@ -1007,7 +1007,7 @@ let forwarded = inner { flag = flag }
     let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
     let result = super::resolve_modules_with_providerless_diagnostics(
         &parsed,
-        &outer_dir,
+        &crate::paths::ResolvedPath::new(&outer_dir).unwrap(),
         &ProviderContext::default(),
         &crate::schema::SchemaRegistry::new(),
         &[],
@@ -1094,16 +1094,74 @@ let disabled = chooser { flag = false }
             composition.binding.as_ref().map(|binding| binding.as_str()) == Some("enabled.selected")
         })
         .expect("selected nested module composition");
-    let expected_leaf_dir = leaf_dir.canonicalize().unwrap();
+    let expected_leaf_dir = crate::paths::CanonicalPath::new(&leaf_dir).unwrap();
     assert_eq!(
-        selected_call
-            .call_path()
-            .immediate()
-            .module_directory
-            .as_deref(),
-        Some(expected_leaf_dir.as_path()),
+        crate::paths::CanonicalPath::new(
+            selected_call
+                .call_path()
+                .immediate()
+                .module_directory
+                .as_ref()
+                .unwrap()
+                .display()
+                .to_string()
+        )
+        .unwrap(),
+        expected_leaf_dir,
         "a retained conditional call must keep the directory where its import was prepared",
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_module_directory_preserves_symlink_source_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    let link = temp.path().join("link");
+    fs::create_dir_all(real.join("wrapper")).unwrap();
+    fs::create_dir_all(real.join("leaf")).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    fs::write(
+        real.join("wrapper/main.crn"),
+        r#"
+arguments { label: String }
+let leaf = use { source = "../leaf" }
+let selected = leaf { label = label }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        real.join("leaf/main.crn"),
+        r#"
+arguments { label: String }
+let item = mock.test.Thing { value = label }
+"#,
+    )
+    .unwrap();
+    let source = r#"
+let wrapper = use { source = "./wrapper" }
+let nested = wrapper { label = "hello" }
+"#;
+    let path = link.join("main.crn");
+    fs::write(&path, source).unwrap();
+    let parsed = crate::parser::parse_file(source, &path, &ProviderContext::default()).unwrap();
+    let expanded = resolve_modules(parsed, &link).unwrap();
+    let selected = expanded
+        .compositions
+        .iter()
+        .find(|composition| {
+            composition.binding.as_ref().map(|binding| binding.as_str()) == Some("nested.selected")
+        })
+        .unwrap();
+    let directory = selected
+        .call_path()
+        .immediate()
+        .module_directory
+        .as_ref()
+        .unwrap();
+    let text = directory.display().to_string();
+    assert!(text.contains(&link.display().to_string()), "{text}");
+    assert!(!text.contains(&real.display().to_string()), "{text}");
 }
 
 #[test]
@@ -2203,7 +2261,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
 #[test]
 fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "policy_module".to_string(),
             create_test_module_with_anonymous_resource(),
@@ -2243,7 +2301,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
 #[test]
 fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
     let resolver = {
-        let mut resolver = ModuleResolver::new(".");
+        let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         resolver.imported_modules.insert(
             "policy_module".to_string(),
             create_test_module_with_anonymous_resource(),
@@ -2281,7 +2339,7 @@ fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
 #[test]
 fn test_expand_module_call() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("test_module".to_string(), create_test_module());
         r
@@ -2396,7 +2454,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
 #[test]
 fn test_expand_module_call_preserves_provider_instance_on_id() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "registry".to_string(),
             create_module_with_named_provider_instance(),
@@ -2594,7 +2652,7 @@ fn create_module_with_intra_refs() -> ParsedFile {
 #[test]
 fn test_multiple_module_instances_no_collision() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("net".to_string(), create_module_with_intra_refs());
         r
@@ -2753,7 +2811,7 @@ fn create_module_with_attributes() -> ParsedFile {
 #[test]
 fn test_expand_module_call_creates_composition() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("web_tier".to_string(), create_module_with_attributes());
         r
@@ -2815,7 +2873,7 @@ fn test_expand_module_call_creates_composition() {
 #[test]
 fn test_expand_module_call_populates_compositions_slice() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("web_tier".to_string(), create_module_with_attributes());
         r
@@ -2854,7 +2912,7 @@ fn test_expand_module_call_populates_compositions_slice() {
 #[test]
 fn test_expand_module_call_populates_expansion_trace_single_level() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("web_tier".to_string(), create_module_with_attributes());
         r
@@ -2900,7 +2958,7 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
 #[test]
 fn test_expand_module_call_records_use_source_path_on_call_site() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("web_tier".to_string(), create_module_with_attributes());
         // Simulates what `process_imports` records for
@@ -2939,7 +2997,7 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
 #[test]
 fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("web_tier".to_string(), create_module_with_attributes());
         // Deliberately no `module_paths` entry.
@@ -3078,7 +3136,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("svc".to_string(), module);
         r
     };
@@ -3156,7 +3214,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
 #[test]
 fn test_expand_module_call_without_binding_still_records_boundary_composition() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("web_tier".to_string(), create_module_with_attributes());
         r
@@ -3370,7 +3428,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
     .expect("permissive resolution must retain the failed built-in");
 
     let resolver = {
-        let mut resolver = ModuleResolver::new(".");
+        let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         resolver.imported_modules.insert("m".to_string(), module);
         resolver
     };
@@ -3989,7 +4047,7 @@ thing { name = 'unchanged-but-different' }
 #[test]
 fn test_missing_required_argument() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("test_module".to_string(), create_test_module());
         r
@@ -4011,7 +4069,7 @@ fn test_missing_required_argument() {
 #[test]
 fn test_expand_module_call_uses_dot_path_addressing() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("test_module".to_string(), create_test_module());
         r
@@ -4047,7 +4105,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
 #[test]
 fn test_module_dot_path_bindings_and_refs() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("net".to_string(), create_module_with_intra_refs());
         r
@@ -4151,7 +4209,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("net".to_string(), module);
         r
     };
@@ -4213,7 +4271,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
 #[test]
 fn test_module_composition_dot_path_refs() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("web_tier".to_string(), create_module_with_attributes());
         r
@@ -4282,7 +4340,7 @@ fn test_substitute_arguments_interpolation() {
 #[test]
 fn test_unknown_argument_rejected() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("test_module".to_string(), create_test_module());
         r
@@ -4481,7 +4539,7 @@ fn create_module_with_interpolation() -> ParsedFile {
 #[test]
 fn test_expand_module_call_with_interpolation() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("vpc_mod".to_string(), create_module_with_interpolation());
         r
@@ -4766,7 +4824,7 @@ fn test_nested_module_cycle_detection() {
 
 fn expand_module_call_with_cidr_function_argument(cidr: Value) -> ExpandedValue {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("vpc_mod".to_string(), create_module_with_interpolation());
         r
@@ -4846,7 +4904,7 @@ fn test_load_module_missing_path_cleans_resolving_set() {
     let tmp_dir = std::env::temp_dir().join("carina_test_missing_path_cleanup");
     let _ = fs::create_dir_all(&tmp_dir);
 
-    let mut resolver = ModuleResolver::new(&tmp_dir);
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(&tmp_dir).unwrap());
 
     let err = resolver
         .load_module("nonexistent")
@@ -4879,7 +4937,7 @@ fn test_load_module_parse_error_cleans_resolving_set() {
     )
     .unwrap();
 
-    let mut resolver = ModuleResolver::new(&tmp_root);
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(&tmp_root).unwrap());
 
     // First attempt: parse error on a directory module with a bad .crn file.
     let result = resolver.load_module("bad_module");
@@ -4946,7 +5004,8 @@ fn test_load_module_rejects_state_blocks() {
         .expect("module arguments");
         fs::write(module_dir.join("state.crn"), state_block).expect("module state block");
 
-        let mut resolver = ModuleResolver::new(tmp.path());
+        let mut resolver =
+            ModuleResolver::new(&crate::paths::ResolvedPath::new(tmp.path()).unwrap());
         let err = resolver
             .load_module("module")
             .expect_err("state block inside a module must be rejected");
@@ -4979,7 +5038,7 @@ fn test_load_module_rejects_backend_and_cleans_resolving_set() {
     )
     .expect("module backend");
 
-    let mut resolver = ModuleResolver::new(tmp.path());
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(tmp.path()).unwrap());
     for attempt in 1..=2 {
         let err = resolver
             .load_module("module")
@@ -5012,7 +5071,7 @@ fn test_load_module_rejects_upstream_state_and_cleans_resolving_set() {
     )
     .expect("module upstream_state");
 
-    let mut resolver = ModuleResolver::new(tmp.path());
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(tmp.path()).unwrap());
     for attempt in 1..=2 {
         let err = resolver
             .load_module("module")
@@ -5045,7 +5104,7 @@ fn test_load_module_rejects_exports_and_cleans_resolving_set() {
     )
     .expect("module exports");
 
-    let mut resolver = ModuleResolver::new(tmp.path());
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(tmp.path()).unwrap());
     for attempt in 1..=2 {
         let err = resolver
             .load_module("module")
@@ -5072,7 +5131,7 @@ fn test_load_module_rejects_file_path() {
     fs::create_dir_all(&tmp_root).unwrap();
     fs::write(tmp_root.join("single.crn"), "arguments {\n  x: String\n}\n").unwrap();
 
-    let mut resolver = ModuleResolver::new(&tmp_root);
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(&tmp_root).unwrap());
     let err = resolver
         .load_module("single.crn")
         .expect_err("a single .crn file must not be loadable as a module");
@@ -5138,7 +5197,7 @@ fn create_module_with_port_validation() -> ParsedFile {
 #[test]
 fn test_argument_validation_passes_with_valid_value() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "web_server".to_string(),
             create_module_with_port_validation(),
@@ -5180,7 +5239,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
         Some("port must not be empty".to_string()),
     )];
     let resolver = {
-        let mut resolver = ModuleResolver::new(".");
+        let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         resolver
             .imported_modules
             .insert("web_server".to_string(), module);
@@ -5314,7 +5373,7 @@ let root = outer { outer_port = producer.port }
         expansion_trace: crate::resource::ExpansionTrace::new(),
     };
     let resolver = {
-        let mut resolver = ModuleResolver::new(".");
+        let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         resolver.imported_modules.insert("outer".to_string(), outer);
         resolver
     };
@@ -5357,7 +5416,7 @@ let root = outer { outer_port = producer.port }
 #[test]
 fn test_argument_validation_passes_with_default_value() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "web_server".to_string(),
             create_module_with_port_validation(),
@@ -5378,7 +5437,7 @@ fn test_argument_validation_passes_with_default_value() {
 #[test]
 fn test_argument_validation_fails_with_invalid_value() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "web_server".to_string(),
             create_module_with_port_validation(),
@@ -5418,7 +5477,7 @@ fn test_argument_validation_fails_with_invalid_value() {
 #[test]
 fn test_argument_validation_fails_with_negative_value() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "web_server".to_string(),
             create_module_with_port_validation(),
@@ -5439,7 +5498,7 @@ fn test_argument_validation_fails_with_negative_value() {
 #[test]
 fn test_argument_validation_fails_too_large() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "web_server".to_string(),
             create_module_with_port_validation(),
@@ -5504,7 +5563,7 @@ fn test_argument_validation_no_message_uses_default() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("counter".to_string(), module);
         r
     };
@@ -5573,7 +5632,7 @@ fn test_argument_validation_len_with_list() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("tagged".to_string(), module);
         r
     };
@@ -5672,7 +5731,7 @@ fn test_require_block_passes() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("web".to_string(), module);
         r
     };
@@ -5750,7 +5809,7 @@ fn test_require_block_fails_with_not_expr() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("web".to_string(), module);
         r
     };
@@ -5827,7 +5886,7 @@ fn test_require_block_len_function() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("alb".to_string(), module);
         r
     };
@@ -5922,7 +5981,7 @@ fn test_require_block_multiple_constraints() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("asg".to_string(), module);
         r
     };
@@ -5980,7 +6039,7 @@ fn test_require_block_multiple_constraints() {
 #[test]
 fn test_argument_type_mismatch_int_for_string() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("test_module".to_string(), create_test_module());
         r
@@ -6014,7 +6073,7 @@ fn test_argument_type_mismatch_int_for_string() {
 #[test]
 fn test_argument_type_mismatch_string_for_bool() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules
             .insert("test_module".to_string(), create_test_module());
         r
@@ -6097,7 +6156,11 @@ fn test_argument_type_custom_validator() {
 
     let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
+        let mut r = ModuleResolver::with_config_and_schemas(
+            &crate::paths::ResolvedPath::new(".").unwrap(),
+            &config,
+            &schemas,
+        );
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -6184,7 +6247,11 @@ fn test_argument_type_list_of_custom_type() {
 
     let schemas = crate::schema::SchemaRegistry::new();
     let resolver = {
-        let mut r = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
+        let mut r = ModuleResolver::with_config_and_schemas(
+            &crate::paths::ResolvedPath::new(".").unwrap(),
+            &config,
+            &schemas,
+        );
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -6248,7 +6315,7 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
     )
     .unwrap();
 
-    let parsed = load_module(&tmp_dir)
+    let parsed = load_module(&crate::paths::ResolvedPath::new(&tmp_dir).unwrap())
         .expect("expected module to load because arguments.crn declares an argument");
 
     assert_eq!(
@@ -7073,7 +7140,8 @@ fn test_load_module_directory_merge_order_is_deterministic() {
     )
     .unwrap();
 
-    let parsed = load_module(&tmp_dir).expect("module should load");
+    let parsed = load_module(&crate::paths::ResolvedPath::new(&tmp_dir).unwrap())
+        .expect("module should load");
     let names: Vec<&str> = parsed.arguments.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(
         names,
@@ -7878,7 +7946,7 @@ fn create_module_with_environment_union() -> ParsedFile {
 #[test]
 fn caller_side_typo_against_string_literal_union_is_rejected() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "env_module".to_string(),
             create_module_with_environment_union(),
@@ -7911,7 +7979,7 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
 #[test]
 fn caller_side_value_in_string_literal_union_is_accepted() {
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert(
             "env_module".to_string(),
             create_module_with_environment_union(),
@@ -7947,7 +8015,7 @@ arguments {
         &ProviderContext::default(),
     )
     .expect("module argument type should parse");
-    let mut resolver = ModuleResolver::new(".");
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
     resolver
         .imported_modules
         .insert("env_module".to_string(), module);
@@ -8181,7 +8249,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("registry".to_string(), module);
         r
     };
@@ -8295,7 +8363,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
         )));
 
     let resolver = {
-        let mut resolver = ModuleResolver::new(".");
+        let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         resolver
             .imported_modules
             .insert("assignments".to_string(), module);
@@ -8379,7 +8447,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     };
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("net".to_string(), module);
         r
     };
@@ -8583,7 +8651,7 @@ let resources = for item in itmes {
 "#;
     fs::write(&source_file, source).expect("write undefined iterable fixture");
     let loaded = crate::config_loader::load_configuration_with_config(
-        fixture.path(),
+        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &ProviderContext::default(),
         &crate::schema::SchemaRegistry::new(),
     )
@@ -8597,7 +8665,7 @@ let resources = for item in itmes {
 
     let error = super::resolve_modules_with_providerless_config(
         loaded.parsed,
-        fixture.path(),
+        &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &ProviderContext::default(),
         &crate::schema::SchemaRegistry::new(),
     )
@@ -8634,7 +8702,7 @@ let second = for item in secnd_items {
 
     let error = super::resolve_modules_providerless(
         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-        std::path::Path::new("."),
+        &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
     )
     .expect_err("finalization must reject both undefined iterables");
     let message = error.display_relative_to(std::path::Path::new("."));
@@ -8945,7 +9013,7 @@ fn argument_type_list_accepts_resource_ref() {
     }];
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -8984,7 +9052,7 @@ fn argument_type_map_accepts_resource_ref() {
     }];
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -9024,7 +9092,7 @@ fn argument_type_struct_accepts_resource_ref() {
     }];
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
+        let mut r = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         r.imported_modules.insert("test_module".to_string(), module);
         r
     };
@@ -9059,7 +9127,7 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
     }];
 
     let resolver = {
-        let mut resolver = ModuleResolver::new(".");
+        let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
         resolver
             .imported_modules
             .insert("test_module".to_string(), module);
@@ -9199,7 +9267,8 @@ fn module_argument_type_error_with_config(
     }];
 
     let resolver = {
-        let mut resolver = ModuleResolver::with_config(".", config);
+        let mut resolver =
+            ModuleResolver::with_config(&crate::paths::ResolvedPath::new(".").unwrap(), config);
         resolver
             .imported_modules
             .insert("web_tier".to_string(), module);
@@ -9365,7 +9434,7 @@ fn binding_ref_argument_defers_to_binding_index() {
         description: None,
         validations: Vec::new(),
     }];
-    let mut resolver = ModuleResolver::new(".");
+    let mut resolver = ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap());
     resolver
         .imported_modules
         .insert("inner".to_string(), module);
@@ -9396,7 +9465,8 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
     .unwrap();
     std::fs::write(&exports_path, "exports {\n  result: String = 'value'\n}\n").unwrap();
 
-    let parsed = load_directory_module(temp.path()).expect("directory module");
+    let parsed = load_directory_module(&crate::paths::ResolvedPath::new(temp.path()).unwrap())
+        .expect("directory module");
     let attribute = &parsed.attribute_params[0];
     assert_eq!(attribute.source_file(), attributes_path.as_path());
     assert_eq!(attribute.source_span().start_line(), 2);

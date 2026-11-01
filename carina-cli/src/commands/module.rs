@@ -36,8 +36,11 @@ pub fn run_module_command(
 }
 
 fn run_module_list(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let config = config_loader::load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
@@ -64,16 +67,18 @@ fn run_module_info(
     tui: bool,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    if path.is_file() {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    if project.is_file() {
         return Err(AppError::Config(format!(
             "expected directory, got file: {}",
             path.display()
         )));
     }
 
-    let parsed = module_resolver::load_module_from_directory(path)?;
+    let parsed = module_resolver::load_module_from_directory(&project)?;
 
-    let module_name = module_resolver::derive_module_name(path);
+    let module_name = module_resolver::derive_module_name(&project);
 
     // Build and display the file signature (module or root config)
     let signature = carina_core::module::FileSignature::from_parsed_file_with_name(

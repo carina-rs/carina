@@ -347,7 +347,7 @@ mod tests {
         .expect("unbound deferred loop parses");
         let parsed = crate::module_resolver::resolve_modules_providerless(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .expect("deferred fixture crosses the module-resolution seam")
         .into_expanded(&crate::schema::SchemaRegistry::new())

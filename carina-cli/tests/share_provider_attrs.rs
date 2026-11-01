@@ -23,7 +23,8 @@ fn share_provider_attrs_resolves_default_tags() {
     .iter()
     .collect();
 
-    let config = load_configuration(&fixture).expect("load_configuration");
+    let config = load_configuration(&carina_core::paths::ResolvedPath::new(&fixture).unwrap())
+        .expect("load_configuration");
     let user_root = tempfile::tempdir().expect("create isolated user directory");
     let user_dirs = carina_core::UserDirs::under(user_root.path());
 
@@ -34,7 +35,7 @@ fn share_provider_attrs_resolves_default_tags() {
     let parsed = carina_cli::commands::validate_and_resolve_with_provider_load_for_test(
         &user_dirs,
         &config.parsed,
-        &fixture,
+        &carina_core::paths::ResolvedPath::new(&fixture).unwrap(),
         true,
         &config.duplicate_declarations,
     )

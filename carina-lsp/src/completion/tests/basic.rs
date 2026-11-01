@@ -2715,7 +2715,7 @@ fn directives_provider_value_completion_lists_named_instances() {
     // If this assertion ever fires the LSP completion can't possibly
     // see them either — that's the path we're actually trying to test.
     let parsed = carina_core::config_loader::parse_directory(
-        base_path,
+        &carina_core::paths::ResolvedPath::new(base_path).unwrap(),
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("parse_directory should accept the fixture");

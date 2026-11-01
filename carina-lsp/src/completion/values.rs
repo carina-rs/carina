@@ -1,5 +1,6 @@
 //! Attribute, value, and type-specific completions.
 
+#[cfg(test)]
 use std::path::Path;
 
 use tower_lsp::lsp_types::{
@@ -8,6 +9,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
+use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{
     CompiledAttributeType as AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema,
@@ -24,6 +26,21 @@ use super::{AttributeValueTarget, CompletionProvider, DslSource};
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
 /// Safety cap on the number of suggestions returned.
 const UPSTREAM_SOURCE_MAX_ITEMS: usize = 100;
+
+fn upstream_source_search_roots(
+    base: &ResolvedPath,
+) -> impl Iterator<Item = (usize, ResolvedPath)> + '_ {
+    let count = base
+        .identity()
+        .ancestors()
+        .skip(1)
+        .take(UPSTREAM_SOURCE_MAX_UP)
+        .count();
+    (1..=count).scan(base.clone(), |current, depth| {
+        *current = current.join("..").ok()?;
+        Some((depth, current.clone()))
+    })
+}
 
 #[derive(Clone, Copy)]
 enum UpstreamCompletionStaticType<'a> {
@@ -318,7 +335,7 @@ impl CompletionProvider {
         text: &str,
         current_binding: Option<&str>,
         position: Position,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &carina_core::parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
@@ -1072,7 +1089,7 @@ impl CompletionProvider {
     pub(super) fn directives_provider_completions(
         &self,
         provider_ctx: &carina_core::parser::ProviderContext,
-        base_path: Option<&std::path::Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let bindings = collect_named_provider_instance_bindings(provider_ctx, base_path);
         bindings
@@ -1102,7 +1119,7 @@ impl CompletionProvider {
         text: &str,
         current_binding: Option<&str>,
         position: Position,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let already_present = self.depends_on_elements_before_cursor(text, position);
 
@@ -1224,7 +1241,7 @@ impl CompletionProvider {
     pub(super) fn in_scope_binding_completions(
         &self,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
         mode: InScopeBindingMode<'_>,
     ) -> Vec<CompletionItem> {
         let mut src_buf = String::new();
@@ -1312,7 +1329,7 @@ impl CompletionProvider {
         &self,
         items: &mut Vec<CompletionItem>,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) {
         let mut storage = String::new();
         let src = DslSource::resolve_directory(text, base_path, &mut storage);
@@ -1329,7 +1346,7 @@ impl CompletionProvider {
         partial: &str,
         source: &str,
         position: Position,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
         else {
@@ -1387,7 +1404,7 @@ impl CompletionProvider {
         partial: &str,
         source: &str,
         position: Position,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let Some(keys) = resolve_upstream_export_keys(binding, source, base_path, &self.schemas)
         else {
@@ -1515,31 +1532,28 @@ impl CompletionProvider {
         &self,
         partial_path: &str,
         position: Position,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let Some(base) = base_path else {
             return vec![];
         };
-        let base_abs = canonical_or_self(base);
+        let base_abs = base;
 
         // Skip the directory that is the current project itself; everything else
         // we emit at most once, preferring the nearest ancestor encoding.
-        let mut seen_targets: std::collections::HashSet<std::path::PathBuf> =
+        let mut seen_targets: std::collections::HashSet<CanonicalPath> =
             std::collections::HashSet::new();
-        seen_targets.insert(base_abs.clone());
+        seen_targets.insert(base_abs.identity());
         let mut suggestions: Vec<String> = Vec::new();
 
-        let mut current = base_abs;
-        for depth in 1..=UPSTREAM_SOURCE_MAX_UP {
-            let Some(parent) = current.parent().map(Path::to_path_buf) else {
-                break;
-            };
+        for (depth, parent) in upstream_source_search_roots(base_abs) {
+            // Let filesystem traversal interpret `..` after symlinks so every
+            // suggested relative source actually resolves from the project.
             find_carina_projects_under(&parent, depth, &mut seen_targets, &mut suggestions);
             if suggestions.len() >= UPSTREAM_SOURCE_MAX_ITEMS {
                 suggestions.truncate(UPSTREAM_SOURCE_MAX_ITEMS);
                 break;
             }
-            current = parent;
         }
 
         // Truncated by ancestor discovery order (nearest first), then sorted for display.
@@ -1604,7 +1618,7 @@ impl CompletionProvider {
         type_expr_text: &str,
         in_nested: bool,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let Some(annotation) = parse_exports_type_text(type_expr_text) else {
             return Vec::new();
@@ -1667,7 +1681,7 @@ impl CompletionProvider {
         attr_type: &AttributeType,
         attr_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
@@ -1700,7 +1714,7 @@ impl CompletionProvider {
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -1750,7 +1764,7 @@ impl CompletionProvider {
         &self,
         target: TypeInSchema<'_, carina_core::schema::Compiled>,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -1797,7 +1811,7 @@ impl CompletionProvider {
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
-        base_path: Option<&Path>,
+        base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -2188,7 +2202,7 @@ impl CompletionProvider {
 fn resolve_upstream_export_keys(
     binding: &str,
     source: &str,
-    base_path: Option<&Path>,
+    base_path: Option<&carina_core::paths::ResolvedPath>,
     schemas: &carina_core::schema::SchemaRegistry,
 ) -> Option<carina_core::upstream_exports::UpstreamExportEntries> {
     let base = base_path?;
@@ -2222,7 +2236,7 @@ fn resolve_upstream_export_keys(
 fn resolve_upstream_exports_cached<'a>(
     binding: &str,
     source: &str,
-    base_path: Option<&Path>,
+    base_path: Option<&carina_core::paths::ResolvedPath>,
     schemas: &carina_core::schema::SchemaRegistry,
     cache: &'a mut std::collections::HashMap<
         String,
@@ -2251,7 +2265,7 @@ fn resolve_upstream_exports_cached<'a>(
 fn infer_for_binding_type(
     binding: &super::top_level::ForScopeBinding,
     upstream_sources: &std::collections::HashMap<String, String>,
-    base_path: Option<&Path>,
+    base_path: Option<&carina_core::paths::ResolvedPath>,
     schemas: &carina_core::schema::SchemaRegistry,
     exports_cache: &mut std::collections::HashMap<
         String,
@@ -2476,20 +2490,19 @@ fn strip_generic<'a>(prefix: &str, text: &'a str) -> Option<&'a str> {
 /// the base itself); entries already in `seen` are skipped so a sibling never
 /// reappears via a longer ancestor route.
 fn find_carina_projects_under(
-    ancestor: &Path,
+    ancestor: &ResolvedPath,
     up_depth: usize,
-    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    seen: &mut std::collections::HashSet<CanonicalPath>,
     out: &mut Vec<String>,
 ) {
-    let Ok(entries) = std::fs::read_dir(ancestor) else {
+    let Ok(entries) = ancestor.entries() else {
         return;
     };
-    for entry in entries.flatten() {
-        let child = entry.path();
+    for child in entries {
         let Some(child_name) = visible_dir_name(&child) else {
             continue;
         };
-        let child_abs = canonical_or_self(&child);
+        let child_abs = child.identity();
         if dir_has_crn_file(&child) {
             if seen.insert(child_abs) {
                 out.push(join_relative(up_depth, &[&child_name]));
@@ -2499,15 +2512,14 @@ fn find_carina_projects_under(
         if up_depth < 2 {
             continue;
         }
-        let Ok(grandchildren) = std::fs::read_dir(&child) else {
+        let Ok(grandchildren) = child.entries() else {
             continue;
         };
-        for grand in grandchildren.flatten() {
-            let grand_path = grand.path();
+        for grand_path in grandchildren {
             let Some(grand_name) = visible_dir_name(&grand_path) else {
                 continue;
             };
-            let grand_abs = canonical_or_self(&grand_path);
+            let grand_abs = grand_path.identity();
             if dir_has_crn_file(&grand_path) && seen.insert(grand_abs) {
                 out.push(join_relative(up_depth, &[&child_name, &grand_name]));
             }
@@ -2516,25 +2528,16 @@ fn find_carina_projects_under(
 }
 
 /// `Some(name)` if `path` is a directory with a non-hidden name, else `None`.
-fn visible_dir_name(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
+fn visible_dir_name(path: &ResolvedPath) -> Option<String> {
+    let name = path.display().file_name()?.to_str()?;
     if name.starts_with('.') || !path.is_dir() {
         return None;
     }
     Some(name.to_string())
 }
 
-fn canonical_or_self(p: &Path) -> std::path::PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
-
-fn dir_has_crn_file(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .any(|e| e.path().extension().is_some_and(|ext| ext == "crn"))
+fn dir_has_crn_file(dir: &ResolvedPath) -> bool {
+    dir.crn_files().is_ok_and(|files| !files.is_empty())
 }
 
 fn join_relative(up_depth: usize, parts: &[&str]) -> String {
@@ -2561,15 +2564,15 @@ fn join_relative(up_depth: usize, parts: &[&str]) -> String {
 /// `None` for root configs and would miss the bindings entirely.
 fn collect_named_provider_instance_bindings(
     provider_ctx: &carina_core::parser::ProviderContext,
-    base_path: Option<&Path>,
+    base_path: Option<&carina_core::paths::ResolvedPath>,
 ) -> Vec<String> {
     let Some(base) = base_path else {
         return Vec::new();
     };
     let dir = if base.is_file() {
-        base.parent().unwrap_or(base).to_path_buf()
+        base.parent().unwrap_or_else(|| base.clone())
     } else {
-        base.to_path_buf()
+        base.clone()
     };
     let parsed = match carina_core::config_loader::parse_directory(&dir, provider_ctx) {
         Ok(p) => p,
@@ -2643,5 +2646,35 @@ mod return_type_fits_tests {
             &attr_type,
             &mut budget,
         ));
+    }
+}
+
+#[cfg(test)]
+mod source_search_tests {
+    use super::*;
+
+    #[test]
+    fn upstream_source_search_stops_at_filesystem_root() {
+        assert_eq!(
+            upstream_source_search_roots(
+                &carina_core::paths::ResolvedPath::new(Path::new(std::path::MAIN_SEPARATOR_STR))
+                    .unwrap()
+            )
+            .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upstream_source_search_stops_at_symlink_to_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert_eq!(
+            upstream_source_search_roots(&carina_core::paths::ResolvedPath::new(&link).unwrap())
+                .count(),
+            0
+        );
     }
 }

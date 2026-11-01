@@ -1,3 +1,4 @@
+use carina_core::paths::ResolvedPath;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -36,6 +37,7 @@ impl CanonicalSource {
             ProviderLoadSource::LocalFile {
                 path: _,
                 canonical_source,
+                ..
             } => CanonicalSourceKind::File(canonical_source.clone()),
             ProviderLoadSource::Remote { source } => CanonicalSourceKind::Remote(source.clone()),
         };
@@ -49,7 +51,7 @@ impl CanonicalSource {
         }
     }
 
-    pub(crate) fn from_lock_source(source: &str, project_dir: &Path) -> Option<Self> {
+    pub(crate) fn from_lock_source(source: &str, project_dir: &ResolvedPath) -> Option<Self> {
         match source
             .parse::<carina_core::provider_source::ProviderSource>()
             .ok()?
@@ -76,66 +78,35 @@ impl fmt::Display for CanonicalSource {
 }
 
 pub(crate) fn canonical_project_relative_path(
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
     source_path: &Path,
 ) -> io::Result<PathBuf> {
-    let project_dir = normalize_path(&std::path::absolute(project_dir)?);
-    let source_path = normalize_path(&std::path::absolute(source_path)?);
-    relative_path(&project_dir, &source_path).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "file provider and project directory are on different filesystem roots",
-        )
-    })
+    // Authored file:// paths retain their existing process-CWD semantics.
+    let label = carina_core::paths::DisplayPath::new(source_path)?;
+    let source = project_dir.join_display(&label)?;
+    canonical_source_relative_to(project_dir, &source)
 }
 
-fn relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
-    let base = base.components().collect::<Vec<_>>();
-    let target = target.components().collect::<Vec<_>>();
-    let common = base
-        .iter()
-        .zip(&target)
-        .take_while(|(left, right)| left == right)
-        .count();
-    if common == 0 {
-        return None;
-    }
-
-    let mut relative = PathBuf::new();
-    for component in &base[common..] {
-        if matches!(component, std::path::Component::Normal(_)) {
-            relative.push("..");
-        }
-    }
-    for component in &target[common..] {
-        relative.push(component.as_os_str());
-    }
-    if relative.as_os_str().is_empty() {
-        relative.push(".");
-    }
-    Some(relative)
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => match normalized.components().next_back() {
-                Some(std::path::Component::Normal(_)) => {
-                    normalized.pop();
-                }
-                Some(std::path::Component::ParentDir) | None => normalized.push(".."),
-                Some(std::path::Component::RootDir | std::path::Component::Prefix(_)) => {}
-                Some(std::path::Component::CurDir) => unreachable!(),
-            },
-            std::path::Component::Normal(component) => normalized.push(component),
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                normalized.push(component.as_os_str());
+fn canonical_source_relative_to(
+    project_dir: &ResolvedPath,
+    source: &ResolvedPath,
+) -> io::Result<PathBuf> {
+    source
+        .identity()
+        .relative_identity(&project_dir.identity())
+        .map(|path| {
+            if path.is_empty() {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(path)
             }
-        }
-    }
-    normalized
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file provider and project directory are on different filesystem roots",
+            )
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,13 +375,13 @@ impl LockedEgress {
         source: CanonicalSource,
         sha256: Sha256,
         record: EgressLockRecord,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Self {
         Self {
             source,
             sha256,
             record,
-            project_dir: project_dir.to_path_buf(),
+            project_dir: PathBuf::from(project_dir.display().to_string()),
         }
     }
 
@@ -700,7 +671,7 @@ impl AcceptedEgressSources {
     pub fn parse_os(
         cli_values: &[String],
         env_value: Option<&OsStr>,
-        project_dir: &Path,
+        project_dir: &ResolvedPath,
     ) -> Result<Self, AcceptedEgressSourceError> {
         let mut sources = BTreeSet::new();
         for value in cli_values {
@@ -750,25 +721,25 @@ pub(crate) fn prompt_for_explicit_consent(
 
 fn normalize_accepted_source(
     value: &str,
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
 ) -> Result<String, AcceptedEgressSourceError> {
     let file_path = value.strip_prefix("file://");
     let path_value = file_path.unwrap_or(value);
     let path = Path::new(path_value);
     if file_path.is_some() || path.is_absolute() {
-        let resolved = if file_path.is_some() && path.is_relative() {
-            project_dir.join(path)
+        // Consent selectors, unlike authored sources, are project-relative.
+        let canonical = if file_path.is_some() && path.is_relative() {
+            project_dir
+                .join(path)
+                .and_then(|source| canonical_source_relative_to(project_dir, &source))
         } else {
-            path.to_path_buf()
-        };
-        let canonical =
-            canonical_project_relative_path(project_dir, &resolved).map_err(|source| {
-                AcceptedEgressSourceError::Canonicalize {
-                    value: value.to_string(),
-                    path: path.to_path_buf(),
-                    source,
-                }
-            })?;
+            canonical_project_relative_path(project_dir, path)
+        }
+        .map_err(|source| AcceptedEgressSourceError::Canonicalize {
+            value: value.to_string(),
+            path: path.to_path_buf(),
+            source,
+        })?;
         return Ok(format!("file://{}", canonical.display()));
     }
 
@@ -1092,7 +1063,7 @@ mod tests {
             first.source().clone(),
             first.sha256().clone(),
             EgressLockRecord::explicit(first.patterns().clone()),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         );
 
         assert!(matches!(
@@ -1114,7 +1085,7 @@ mod tests {
             declaration.source().clone(),
             declaration.sha256().clone(),
             EgressLockRecord::carina_rs_signed(declaration.patterns().clone()),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         );
 
         assert!(signed.is_none());
@@ -1133,7 +1104,7 @@ mod tests {
             declaration.source().clone(),
             declaration.sha256().clone(),
             EgressLockRecord::carina_rs_signed(declaration.patterns().clone()),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         );
 
         let consented =
@@ -1156,7 +1127,7 @@ mod tests {
             first.source().clone(),
             first.sha256().clone(),
             EgressLockRecord::explicit(first.patterns().clone()),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         );
 
         let consented = ConsentedEgress::from_lock(Some(&locked), rebuilt, None).unwrap();
@@ -1176,7 +1147,7 @@ mod tests {
             first.source().clone(),
             first.sha256().clone(),
             EgressLockRecord::explicit(first.patterns().clone()),
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         );
 
         assert!(ConsentedEgress::from_lock(Some(&locked), changed, None).is_err());
@@ -1187,7 +1158,7 @@ mod tests {
         let accepted = AcceptedEgressSources::parse_os(
             &["Registry.Carina-RS.dev/example/cloudflare".into()],
             None,
-            Path::new("."),
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .unwrap();
         let parsed = "example/cloudflare"
@@ -1203,8 +1174,12 @@ mod tests {
 
         assert!(accepted.accepts(&source).is_some());
         assert!(
-            !AcceptedEgressSources::parse_os(&["configured_name".into()], None, Path::new("."))
-                .is_ok_and(|accepted| accepted.accepts(&source).is_some())
+            !AcceptedEgressSources::parse_os(
+                &["configured_name".into()],
+                None,
+                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap()
+            )
+            .is_ok_and(|accepted| accepted.accepts(&source).is_some())
         );
     }
 
@@ -1220,16 +1195,24 @@ mod tests {
             first.display(),
             second.display()
         ));
-        let accepted = AcceptedEgressSources::parse_os(&[], Some(&env), directory.path()).unwrap();
+        let accepted = AcceptedEgressSources::parse_os(
+            &[],
+            Some(&env),
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        )
+        .unwrap();
         let first = CanonicalSource(CanonicalSourceKind::File(PathBuf::from("first.wasm")));
         let second = CanonicalSource(CanonicalSourceKind::File(PathBuf::from("second.wasm")));
 
         assert!(accepted.accepts(&first).is_some());
         assert!(accepted.accepts(&second).is_some());
 
-        let project_relative =
-            AcceptedEgressSources::parse_os(&["file://first.wasm".into()], None, directory.path())
-                .unwrap();
+        let project_relative = AcceptedEgressSources::parse_os(
+            &["file://first.wasm".into()],
+            None,
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        )
+        .unwrap();
         assert!(project_relative.accepts(&first).is_some());
     }
 
@@ -1242,7 +1225,7 @@ mod tests {
         let accepted = AcceptedEgressSources::parse_os(
             &[format!("file://{}", file.display())],
             None,
-            directory.path(),
+            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
         )
         .unwrap();
         assert!(accepted.accepts(&source).is_some());
@@ -1284,9 +1267,12 @@ mod tests {
     #[test]
     fn invalid_accepted_source_does_not_render_control_characters_or_value_twice() {
         let value = "not-a-source\u{1b}\u{7}".to_string();
-        let error =
-            AcceptedEgressSources::parse_os(std::slice::from_ref(&value), None, Path::new("."))
-                .unwrap_err();
+        let error = AcceptedEgressSources::parse_os(
+            std::slice::from_ref(&value),
+            None,
+            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
+        )
+        .unwrap_err();
         let rendered = error.to_string();
 
         assert!(!rendered.contains('\u{1b}'), "{rendered:?}");

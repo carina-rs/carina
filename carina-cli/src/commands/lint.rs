@@ -1,12 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use colored::Colorize;
 
-use carina_core::config_loader::{
-    find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
-};
+use carina_core::config_loader::{find_crn_files_in_dir, load_configuration_with_config};
 use carina_core::lint::{
     TagKeyEntry, collect_all_tag_keys, find_duplicate_attrs, find_list_literal_attrs,
     find_mixed_tag_key_styles, find_non_snake_case_bindings, find_pipe_preferred_direct_calls,
@@ -50,7 +47,7 @@ fn mixed_tag_key_style_warnings_for_population<E, D, B: carina_core::resource::B
         D,
         B,
     >,
-    base_dir: &Path,
+    base_dir: &carina_core::paths::ResolvedPath,
 ) -> Vec<LintWarning> {
     let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
     mixed_tag_key_style_warnings(&tag_keys)
@@ -87,7 +84,7 @@ impl LintFile {
     fn mixed_tag_key_style_warnings(
         &self,
         root_inputs: &[(PathBuf, String)],
-        base_dir: &Path,
+        base_dir: &carina_core::paths::ResolvedPath,
     ) -> Vec<LintWarning> {
         match self {
             Self::Blocked(parsed) => {
@@ -139,15 +136,17 @@ pub fn run_lint(
     path: &Path,
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let base_dir = &project;
     let loaded = load_configuration_with_config(
-        path,
+        base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let parsed = loaded.parsed;
 
-    let base_dir = get_base_dir(path);
     let module_walk = ModuleWalk::load(&parsed, base_dir);
     let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
     module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
@@ -194,7 +193,7 @@ pub fn run_lint(
         LintFile::Resolved(resolution.map_err(|e| {
             format!(
                 "Module resolution error: {}",
-                e.display_relative_to(base_dir)
+                e.display_relative_to(&PathBuf::from(base_dir.display().to_string()))
             )
         })?)
     } else {
@@ -203,12 +202,13 @@ pub fn run_lint(
 
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = {
-        let files = find_crn_files_in_dir(path)?;
+        let files = find_crn_files_in_dir(base_dir)?;
         let mut texts = Vec::new();
         for file in files {
-            let content = fs::read_to_string(&file)
+            let content = file
+                .read_to_string()
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            texts.push((file, content));
+            texts.push((PathBuf::from(file.display().to_string()), content));
         }
         texts
     };
@@ -263,8 +263,14 @@ pub fn run_lint(
         for duplicate in &module.loaded().duplicate_declarations {
             let file = duplicate
                 .first_file()
-                .map(|relative| module.module_path().join(relative))
-                .unwrap_or_else(|| module.module_path().to_path_buf());
+                .map(|relative| {
+                    std::path::PathBuf::from(
+                        module.module_path().display().join(relative).to_string(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(module.module_path().display().to_string())
+                });
             warnings.push(LintWarning {
                 file,
                 line: 1,
@@ -467,8 +473,11 @@ attributes {
         );
         let root_inputs = vec![(root_file, root_source.to_string())];
 
-        let warnings =
-            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
+        let warnings = mixed_tag_key_style_warnings_for_population(
+            &root_inputs,
+            &parsed,
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
 
         assert_eq!(warnings.len(), 2);
         assert!(warnings.iter().all(|warning| warning.file == module_file));
@@ -495,8 +504,11 @@ attributes {
             (db_file.clone(), db_source.to_string()),
         ];
 
-        let warnings =
-            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
+        let warnings = mixed_tag_key_style_warnings_for_population(
+            &root_inputs,
+            &parsed,
+            &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
+        );
 
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].file, db_file);

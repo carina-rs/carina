@@ -77,8 +77,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_38_for_resolved_directive_templates() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 38);
+fn saved_plan_version_is_39_for_pinned_source_identity() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 39);
 }
 
 #[test]
@@ -93,7 +93,7 @@ test.Target { resource_type = VPC }
     .unwrap();
     let bootstrap_schemas = SchemaRegistry::new();
     let loaded = carina_core::config_loader::load_configuration_with_config(
-        fixture.path(),
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &ProviderContext::default(),
         &bootstrap_schemas,
     )
@@ -129,7 +129,12 @@ test.Target { resource_type = VPC }
     );
 
     let error = providers
-        .validate_evaluated_config(loaded.parsed, fixture.path(), true, &[])
+        .validate_evaluated_config(
+            loaded.parsed,
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            true,
+            &[],
+        )
         .expect_err("skip_resource_validation must not mint ValidationReady for a pending slot");
     let rendered = crate::error::format_error_with_source_chain(&error);
     assert!(
@@ -860,7 +865,8 @@ fn plan_file_serde_round_trip() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "0.1.0".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
-            source_path: "example.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("example.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: Some("test-lineage".to_string()),
             state_serial: Some(1),
             provider_configs: saved_provider_configs(vec![ProviderConfig {
@@ -950,7 +956,10 @@ fn plan_file_serde_round_trip() {
 
     assert_eq!(deserialized.version, PlanFile::CURRENT_VERSION);
     assert_eq!(deserialized.carina_version, "0.1.0");
-    assert_eq!(deserialized.source_path, "example.crn");
+    assert_eq!(
+        deserialized.source_path,
+        carina_core::paths::DisplayPath::new("example.crn").unwrap()
+    );
     assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
     assert_eq!(deserialized.state_serial, Some(1));
     assert_eq!(deserialized.provider_configs.as_provider_configs().len(), 1);
@@ -2682,12 +2691,16 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::for_test("state-refresh");
-    let providers =
-        ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
+    let providers = ProviderLoad::load(
+        &user_dirs,
+        &parsed.providers,
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+    )
+    .unwrap();
     let validated_config = providers
         .validate_evaluated_config(
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             true,
             &[],
         )
@@ -2696,7 +2709,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         validated_config,
         &backend,
         StateLockRef::Held(&lock),
-        std::path::Path::new("."),
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
     )
@@ -2737,12 +2750,16 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
     let backend = RefreshTestBackend::new(state);
     let parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
-    let providers =
-        ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
+    let providers = ProviderLoad::load(
+        &user_dirs,
+        &parsed.providers,
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+    )
+    .unwrap();
     let validated_config = providers
         .validate_evaluated_config(
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             true,
             &[],
         )
@@ -2752,7 +2769,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         validated_config,
         &backend,
         StateLockRef::Held(&lock),
-        std::path::Path::new("."),
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
     )
@@ -2811,12 +2828,16 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let backend = RefreshTestBackend::new(state);
     let parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
-    let providers =
-        ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
+    let providers = ProviderLoad::load(
+        &user_dirs,
+        &parsed.providers,
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
+    )
+    .unwrap();
     let validated_config = providers
         .validate_evaluated_config(
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
-            std::path::Path::new("."),
+            &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             true,
             &[],
         )
@@ -2826,7 +2847,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         validated_config,
         &backend,
         StateLockRef::Held(&lock),
-        std::path::Path::new("."),
+        &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
     )
@@ -3788,7 +3809,8 @@ fn plan_file_serialization_redacts_secrets() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "0.1.0".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
-            source_path: "example.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("example.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
@@ -3846,7 +3868,8 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
@@ -3888,7 +3911,8 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
@@ -3956,7 +3980,8 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-30T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
@@ -4234,7 +4259,8 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
-        source_path: "main.crn".to_string(),
+        source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+        source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
         state_lineage: None,
         state_serial: None,
         provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test("mock")]),
@@ -4354,7 +4380,8 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
-            source_path: "main.crn".to_string(),
+            source_path: carina_core::paths::DisplayPath::new("main.crn").unwrap(),
+            source_identity: carina_core::paths::CanonicalPath::new(".").unwrap(),
             state_lineage: None,
             state_serial: None,
             provider_configs: saved_provider_configs(vec![provider_config_for_evidence_test(
@@ -4597,7 +4624,7 @@ fn builtin_mock_recording_context() -> ValidatedConfig<()> {
 }
 
 #[test]
-fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
+fn recorded_builtin_only_plan_round_trips_with_current_format_top_level_keys() {
     let mut contents = plan_file_contents_with_unchanged_managed_wait_target();
     contents.provider_configs = saved_provider_configs(vec![builtin_mock_provider_config()]);
     let recorded = contents
@@ -4609,6 +4636,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
     );
 
     let encoded = serde_json::to_value(&recorded).expect("recorded plan serializes");
+    assert_eq!(encoded["version"], PlanFile::CURRENT_VERSION);
     let actual_keys = encoded
         .as_object()
         .expect("saved plan is a top-level object")
@@ -4630,6 +4658,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
         "provider_scopes",
         "schema_fingerprints",
         "sorted_resources",
+        "source_identity",
         "source_path",
         "state_lineage",
         "state_serial",
@@ -4675,6 +4704,7 @@ fn recorded_builtin_only_plan_round_trips_with_format_35_top_level_keys() {
             "carina_version",
             "timestamp",
             "source_path",
+            "source_identity",
             "state_lineage",
             "state_serial",
             "provider_configs",

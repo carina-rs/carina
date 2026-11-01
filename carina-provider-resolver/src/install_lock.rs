@@ -1,14 +1,13 @@
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Component, Path, PathBuf};
 
 use carina_core::UserDirs;
-use tempfile::NamedTempFile;
+use carina_core::paths::{DisplayPath, ResolvedPath};
 
 use crate::provider_resolver::{
-    LockEntry, LockFile, LockFileError, LockFileMigration, RegistrySequenceNotice,
-    WasmArtifactPath, provider_lock_path, resolve_lock_file_save_path, resolve_parent, sha256_file,
+    LockEntry, LockFile, LockFileError, LockFileMigration, RegistrySequenceNotice, WasmArtifactPath,
 };
 use crate::verified_artifact::{VerifiedArtifact, VerifiedArtifactError, publish_cached};
 
@@ -17,7 +16,7 @@ const PROVIDER_INSTALL_LOCK_FILE_NAME: &str = "provider-install.lock";
 /// Exclusive ownership of provider installation and lock-file mutation for one project.
 pub struct ProviderInstallLock {
     _guard_file: File,
-    project_dir: PathBuf,
+    project_dir: ResolvedPath,
 }
 
 /// Provider lock state loaded, or defaulted, while its project's install lock is held.
@@ -44,7 +43,7 @@ impl<'lock> GuardedLockFile<'lock> {
     }
 
     /// Return the project directory protected by this lock file's install lock.
-    pub fn project_dir(&self) -> &Path {
+    pub fn project_dir(&self) -> &ResolvedPath {
         self.install_lock.project_dir()
     }
 
@@ -78,7 +77,10 @@ impl<'lock> GuardedLockFile<'lock> {
     pub fn save(&mut self) -> io::Result<()> {
         save_lock_file_to_path(
             &self.lock_file,
-            &provider_lock_path(self.install_lock.project_dir()),
+            &self
+                .install_lock
+                .project_dir()
+                .join(crate::provider_resolver::PROVIDER_LOCK_FILE_NAME)?,
         )?;
         for notice in self.pending_registry_sequence_notices.drain(..) {
             eprintln!("{notice}");
@@ -119,8 +121,8 @@ impl ProviderInstallLock {
     /// This lock is not re-entrant. Acquiring it a second time for the same
     /// project in the same process while the first value is alive blocks
     /// forever because `flock` applies to each open file description.
-    pub fn acquire(project_dir: &Path) -> io::Result<Self> {
-        let metadata = fs::metadata(project_dir).map_err(|error| {
+    pub fn acquire(project_dir: &ResolvedPath) -> io::Result<Self> {
+        let metadata = project_dir.metadata().map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -136,19 +138,14 @@ impl ProviderInstallLock {
             ));
         }
 
-        let carina_dir = project_dir.join(".carina");
-        match fs::create_dir(&carina_dir) {
+        let carina_dir = project_dir.join(".carina")?;
+        match carina_dir.create_dir() {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
-        let guard_path = carina_dir.join(PROVIDER_INSTALL_LOCK_FILE_NAME);
-        let guard_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&guard_path)?;
+        let guard_path = carina_dir.join(PROVIDER_INSTALL_LOCK_FILE_NAME)?;
+        let guard_file = guard_path.open_lock()?;
 
         match guard_file.try_lock() {
             Ok(()) => {}
@@ -164,11 +161,11 @@ impl ProviderInstallLock {
 
         Ok(Self {
             _guard_file: guard_file,
-            project_dir: project_dir.to_path_buf(),
+            project_dir: project_dir.clone(),
         })
     }
 
-    pub fn project_dir(&self) -> &Path {
+    pub fn project_dir(&self) -> &ResolvedPath {
         &self.project_dir
     }
 
@@ -209,27 +206,7 @@ impl ProviderInstallLock {
 
     pub(crate) fn remove_project_artifact(&self, artifact: &WasmArtifactPath) -> io::Result<()> {
         validate_project_target(self, artifact.as_path())?;
-        fs::remove_file(artifact.as_path())
-    }
-}
-
-enum ArtifactTarget<'a> {
-    Project {
-        _install_lock: &'a ProviderInstallLock,
-        path: PathBuf,
-    },
-    Global(PathBuf),
-}
-
-impl ArtifactTarget<'_> {
-    fn path(&self) -> &Path {
-        match self {
-            Self::Project {
-                _install_lock: _,
-                path,
-            }
-            | Self::Global(path) => path,
-        }
+        project_artifact(self, artifact)?.remove()
     }
 }
 
@@ -238,41 +215,9 @@ impl ArtifactTarget<'_> {
 /// The destination is private and publication consumes the stage, so callers can
 /// only make bytes visible through the atomic rename implemented here.
 pub(crate) struct StagedArtifact<'a> {
-    file: StagedFile,
+    file: carina_core::paths::StagedFile,
     install_lock: &'a ProviderInstallLock,
     destination: WasmArtifactPath,
-}
-
-struct StagedFile {
-    file: NamedTempFile,
-    needs_data_sync: bool,
-}
-
-impl StagedFile {
-    fn writable(file: NamedTempFile) -> Self {
-        Self {
-            file,
-            needs_data_sync: true,
-        }
-    }
-
-    fn hard_link(file: NamedTempFile) -> Self {
-        Self {
-            file,
-            needs_data_sync: false,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        self.file.path()
-    }
-
-    fn sync_data_if_needed(&self) -> io::Result<()> {
-        if self.needs_data_sync {
-            self.file.as_file().sync_all()?;
-        }
-        Ok(())
-    }
 }
 
 pub(crate) struct GlobalArtifactPath(PathBuf);
@@ -305,94 +250,67 @@ impl<'a> StagedArtifact<'a> {
         install_lock: &'a ProviderInstallLock,
         destination: &WasmArtifactPath,
     ) -> io::Result<Self> {
-        validate_project_target(install_lock, destination.as_path())?;
-        let parent = resolve_parent(destination.as_path());
-        fs::create_dir_all(parent)?;
-
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::PermissionsExt;
-
-            tempfile::Builder::new()
-                .permissions(fs::Permissions::from_mode(0o666))
-                .tempfile_in(parent)?
-        };
-
-        #[cfg(not(unix))]
-        let file = NamedTempFile::new_in(parent)?;
-
+        let target = project_artifact(install_lock, destination)?;
+        if let Some(parent) = target.parent() {
+            parent.create_dir_all()?;
+        }
         Ok(Self {
-            file: StagedFile::writable(file),
+            file: target.stage()?,
             install_lock,
             destination: destination.clone(),
         })
     }
-
     fn from_source_for_project(
         install_lock: &'a ProviderInstallLock,
-        source: &Path,
+        source: &ResolvedPath,
         destination: &WasmArtifactPath,
     ) -> io::Result<Self> {
-        validate_project_target(install_lock, destination.as_path())?;
-        let parent = resolve_parent(destination.as_path());
-        fs::create_dir_all(parent)?;
-        let file = stage_artifact_with(source, parent, |source, temporary_path| {
-            fs::hard_link(source, temporary_path)
-        })?;
-        Ok(Self {
-            file,
-            install_lock,
-            destination: destination.clone(),
-        })
+        let mut staged = Self::for_project(install_lock, destination)?;
+        staged.write_all(&source.read()?)?;
+        Ok(staged)
     }
-
-    pub(crate) fn path(&self) -> &Path {
-        self.file.path()
+    pub(crate) fn read_bytes(&mut self) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        self.file.rewind()?;
+        let mut bytes = Vec::new();
+        self.file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
-
     pub(crate) fn destination(&self) -> &WasmArtifactPath {
         &self.destination
     }
-
-    pub(crate) fn project_dir(&self) -> &Path {
+    pub(crate) fn project_dir(&self) -> &ResolvedPath {
         self.install_lock.project_dir()
     }
-
     pub(crate) fn publish(self) -> io::Result<()> {
-        self.file.sync_data_if_needed()?;
-        let parent = resolve_parent(self.destination.as_path()).to_path_buf();
-        publish_staged_file(self.file.file, self.destination.as_path())?;
-        sync_parent_directory(&parent);
-        Ok(())
+        self.file.publish()
     }
 }
-
 impl Write for StagedArtifact<'_> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.file.file.write(buffer)
+        self.file.write(buffer)
     }
-
     fn flush(&mut self) -> io::Result<()> {
-        self.file.file.flush()
+        self.file.flush()
     }
 }
 
 pub(crate) fn install_project_artifact_atomically(
     install_lock: &ProviderInstallLock,
-    source: &Path,
+    source: &ResolvedPath,
     destination: &WasmArtifactPath,
 ) -> io::Result<String> {
-    let target = ArtifactTarget::Project {
-        _install_lock: install_lock,
-        path: destination.as_path().to_path_buf(),
-    };
-    validate_project_target(install_lock, target.path())?;
-    install_artifact_atomically(source, target)
+    use sha2::{Digest, Sha256};
+    let bytes = source.read()?;
+    let mut staged = StagedArtifact::for_project(install_lock, destination)?;
+    staged.write_all(&bytes)?;
+    staged.publish()?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 pub(crate) fn install_project_artifact_from_global_cache<R>(
     install_lock: &ProviderInstallLock,
-    source: &Path,
+    source: &ResolvedPath,
     destination: &WasmArtifactPath,
     lock_entry: &LockEntry<R>,
     provider_name: &str,
@@ -405,218 +323,86 @@ pub(crate) fn install_project_artifact_from_global_cache<R>(
 }
 
 pub(crate) fn install_global_artifact_atomically(
-    source: &Path,
+    source: &ResolvedPath,
     destination: &GlobalArtifactPath,
 ) -> io::Result<()> {
-    install_artifact_atomically(
-        source,
-        ArtifactTarget::Global(destination.as_path().to_path_buf()),
-    )
-    .map(|_| ())
+    let target = ResolvedPath::new(destination.as_path())?;
+    if let Some(parent) = target.parent() {
+        parent.create_dir_all()?;
+    }
+    target.atomic_replace(&source.read()?)
 }
 
 fn validate_project_target(
     install_lock: &ProviderInstallLock,
     destination: &Path,
 ) -> io::Result<()> {
-    let provider_cache = install_lock.project_dir().join(".carina").join("providers");
-    if destination
-        .strip_prefix(&provider_cache)
-        .is_ok_and(|relative| {
-            !relative.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
+    let cache = install_lock
+        .project_dir()
+        .display()
+        .join(".carina/providers");
+    let label = DisplayPath::new(destination)?;
+    if label.relative_to(&cache).is_some_and(|relative| {
+        !Path::new(&relative).components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
         })
-    {
+    }) {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "project provider artifact {} is outside {}",
-                destination.display(),
-                provider_cache.display()
-            ),
+            format!("project provider artifact {label} is outside {cache}"),
         ))
     }
 }
 
-fn install_artifact_atomically(source: &Path, target: ArtifactTarget<'_>) -> io::Result<String> {
-    install_artifact_atomically_with(source, target, |source, destination| {
-        fs::hard_link(source, destination)
-    })
+fn project_artifact(
+    install_lock: &ProviderInstallLock,
+    artifact: &WasmArtifactPath,
+) -> io::Result<ResolvedPath> {
+    validate_project_target(install_lock, artifact.as_path())?;
+    install_lock.project_dir().join(artifact.as_path())
 }
 
-fn install_artifact_atomically_with(
-    source: &Path,
-    target: ArtifactTarget<'_>,
-    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
-) -> io::Result<String> {
-    let parent = resolve_parent(target.path()).to_path_buf();
-    fs::create_dir_all(&parent)?;
-
-    if is_same_file(source, target.path())? {
-        return sha256_file(source);
-    }
-
-    let stage = stage_artifact_with(source, &parent, link)?;
-    stage.sync_data_if_needed()?;
-    let hash = sha256_file(stage.path())?;
-    publish_staged_file(stage.file, target.path())?;
-    sync_parent_directory(&parent);
-    Ok(hash)
+fn locate_lock_file_error(location: &DisplayPath, operation: &str, cause: io::Error) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        format!("Failed to {operation} provider lock file at {location}: {cause}"),
+    )
 }
 
-fn publish_staged_file(stage: NamedTempFile, destination: &Path) -> io::Result<()> {
-    let staged_path = stage.path().to_path_buf();
-    stage.persist(destination).map_err(|error| error.error)?;
-    match is_same_file(&staged_path, destination) {
-        Ok(true) => match fs::remove_file(staged_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        },
-        Ok(false) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    Ok(())
-}
-
-fn stage_artifact_with(
-    source: &Path,
-    parent: &Path,
-    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
-) -> io::Result<StagedFile> {
-    let placeholder = NamedTempFile::new_in(parent)?;
-    let temporary_path = placeholder.into_temp_path();
-    fs::remove_file(&temporary_path)?;
-
-    match link(source, &temporary_path) {
-        Ok(()) => {
-            let file = File::open(&temporary_path)?;
-            Ok(StagedFile::hard_link(NamedTempFile::from_parts(
-                file,
-                temporary_path,
-            )))
-        }
-        Err(link_error) => {
-            drop(temporary_path);
-            (|| -> io::Result<StagedFile> {
-                let mut stage = NamedTempFile::new_in(parent)?;
-                let mut source_file = File::open(source)?;
-                let source_permissions = source_file.metadata()?.permissions();
-                io::copy(&mut source_file, &mut stage)?;
-                stage.as_file().set_permissions(source_permissions)?;
-                Ok(StagedFile::writable(stage))
-            })()
-            .map_err(|copy_error| {
-                io::Error::new(
-                    copy_error.kind(),
-                    format!(
-                        "hard link failed: {link_error}; staged copy fallback failed: {copy_error}"
-                    ),
-                )
-            })
-        }
-    }
-}
-
-#[cfg(unix)]
-fn is_same_file(source: &Path, destination: &Path) -> io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let source = fs::symlink_metadata(source)?;
-    let destination = match fs::symlink_metadata(destination) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    Ok(source.dev() == destination.dev() && source.ino() == destination.ino())
-}
-
-#[cfg(not(unix))]
-fn is_same_file(_source: &Path, _destination: &Path) -> io::Result<bool> {
-    Ok(false)
-}
-
-fn sync_parent_directory(parent: &Path) {
-    if let Ok(parent_dir) = File::open(parent) {
-        let _ = parent_dir.sync_all();
-    }
-}
-
-fn save_lock_file_to_path(lock_file: &LockFile, path: &Path) -> io::Result<()> {
-    // rename replaces a symlink itself, unlike fs::write. Resolve the target
-    // first so every durability and replacement operation occurs in the target
-    // directory while the caller's symlink remains intact.
-    // It requires delete/replace permission for the target name, so a
-    // deny-delete ACL intentionally makes save fail: no atomic replacement
-    // can leave that name untouched.
-    let path = resolve_lock_file_save_path(path)?;
-    let parent = resolve_parent(&path);
+fn save_lock_file_to_path(lock_file: &LockFile, path: &ResolvedPath) -> io::Result<()> {
     let content = lock_file
         .to_toml_string()
         .map_err(|error| io::Error::other(format!("Failed to serialize lock file: {error}")))?;
-
-    #[cfg(unix)]
-    let mut temp_file = {
-        use std::os::unix::fs::PermissionsExt;
-
-        let existing_permissions = match fs::metadata(&path) {
-            Ok(metadata) => Some(metadata.permissions()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        let mut builder = tempfile::Builder::new();
-        builder.permissions(fs::Permissions::from_mode(0o666));
-        let temp_file = builder.tempfile_in(parent)?;
-        if let Some(permissions) = existing_permissions {
-            temp_file.as_file().set_permissions(permissions)?;
-        }
-        temp_file
-    };
-
-    #[cfg(not(unix))]
-    let mut temp_file = NamedTempFile::new_in(parent)?;
-
-    if let Err(error) = temp_file.write_all(content.as_bytes()) {
-        let _ = temp_file.close();
-        return Err(error);
-    }
-    if let Err(error) = temp_file.as_file().sync_all() {
-        let _ = temp_file.close();
-        return Err(error);
-    }
-
-    let (temp_handle, temp_path) = match temp_file.keep() {
-        Ok(parts) => parts,
-        Err(error) => {
-            let source = error.error;
-            let _ = error.file.close();
-            return Err(source);
-        }
-    };
-    drop(temp_handle);
+    let mut staged = path
+        .stage()
+        .map_err(|error| locate_lock_file_error(path.display(), "stage", error))?;
+    staged
+        .write_all(content.as_bytes())
+        .map_err(|error| locate_lock_file_error(path.display(), "write staged", error))?;
+    staged
+        .sync_all()
+        .map_err(|error| locate_lock_file_error(path.display(), "sync staged", error))?;
     #[cfg(test)]
-    let rename_result = crate::provider_resolver::rename_lock_file_for_test(&temp_path, &path);
-    #[cfg(not(test))]
-    let rename_result = fs::rename(&temp_path, &path);
-    if let Err(error) = rename_result {
-        let _ = fs::remove_file(temp_path);
-        return Err(error);
+    if let Some(result) = crate::provider_resolver::replace_lock_file_for_test(&mut staged, path) {
+        result.map_err(|error| locate_lock_file_error(path.display(), "replace", error))?;
     }
-
-    sync_parent_directory(parent);
-    Ok(())
+    staged
+        .publish()
+        .map_err(|error| locate_lock_file_error(path.display(), "replace", error))
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn save_lock_file_fixture(lock_file: &LockFile, path: &Path) -> io::Result<()> {
-    save_lock_file_to_path(lock_file, path)
+    let display = DisplayPath::new(path)?;
+    let target = ResolvedPath::new(path).map_err(|error| {
+        locate_lock_file_error(&display, "resolve replacement target for", error)
+    })?;
+    save_lock_file_to_path(lock_file, &target)
 }
 
 #[cfg(test)]
@@ -626,23 +412,127 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    #[test]
+    fn lock_file_error_preserves_operation_and_internal_detail() {
+        let temp = tempfile::tempdir().unwrap();
+        let location =
+            carina_core::paths::DisplayPath::new(temp.path().join("alias.lock")).unwrap();
+        for (operation, detail) in [
+            (
+                "resolve replacement target for",
+                "too many symbolic links in replacement target",
+            ),
+            ("write staged", "injected staged write failure"),
+            ("sync staged", "injected staged sync failure"),
+            ("replace", "injected lock-file rename failure"),
+        ] {
+            let error =
+                super::locate_lock_file_error(&location, operation, io::Error::other(detail));
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                format!("Failed to {operation} provider lock file at {location}: {detail}"),
+            );
+        }
+    }
+
+    #[test]
+    fn lock_file_replacement_error_uses_display_path_and_preserves_os_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let target =
+            carina_core::paths::ResolvedPath::new(temp.path().join("missing/alias.lock")).unwrap();
+        let error =
+            super::save_lock_file_to_path(&super::LockFile::default(), &target).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains(&target.display().to_string()));
+        assert!(error.to_string().contains("stage provider lock file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_error_preserves_symlink_location_before_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        fs::write(real.join("blocked"), b"not a directory").unwrap();
+        let path = link.join("blocked/carina-providers.lock");
+        let error = super::LockFile::default().save(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "Failed to resolve replacement target for provider lock file at {}:",
+                path.display()
+            )),
+            "{message}",
+        );
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(!message.contains(&real.display().to_string()), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_staging_error_preserves_symlink_location() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &link).unwrap();
+        fs::write(real.join("target.lock"), "").unwrap();
+        let alias = link.join("carina-providers.lock");
+        symlink("target.lock", &alias).unwrap();
+        let permissions = fs::metadata(&real).unwrap().permissions();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o555)).unwrap();
+        // Privileged processes can bypass directory permissions.
+        if fs::write(real.join("write-probe"), "").is_ok() {
+            fs::set_permissions(&real, permissions).unwrap();
+            return;
+        }
+        let result = super::LockFile::default().save(&alias);
+        fs::set_permissions(&real, permissions).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(
+            display.starts_with(&format!(
+                "Failed to stage provider lock file at {}:",
+                alias.display()
+            )),
+            "{display}"
+        );
+        assert!(display.contains(&alias.display().to_string()), "{display}");
+        assert!(!display.contains(&real.display().to_string()), "{display}");
+        assert!(!debug.contains(&real.display().to_string()), "{debug}");
+        assert_eq!(fs::read_to_string(real.join("target.lock")).unwrap(), "");
+    }
+
     use super::{
-        ArtifactTarget, ProviderInstallLock, install_artifact_atomically_with,
-        install_project_artifact_atomically, validate_project_target,
+        ProviderInstallLock, install_project_artifact_atomically, validate_project_target,
     };
     use crate::provider_resolver::WasmArtifactPath;
 
     #[test]
     fn provider_install_lock_serializes_acquisitions() {
         let project = tempfile::tempdir().unwrap();
-        let first = ProviderInstallLock::acquire(project.path()).unwrap();
+        let first = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let project_dir = project.path().to_path_buf();
         let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
 
         let waiter = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let second = ProviderInstallLock::acquire(&project_dir).unwrap();
+            let second = ProviderInstallLock::acquire(
+                &carina_core::paths::ResolvedPath::new(&project_dir).unwrap(),
+            )
+            .unwrap();
             acquired_tx.send(()).unwrap();
             drop(second);
         });
@@ -663,7 +553,10 @@ mod tests {
     #[test]
     fn atomic_installer_replaces_existing_artifact_without_temp_residue() {
         let project = tempfile::tempdir().unwrap();
-        let guard = ProviderInstallLock::acquire(project.path()).unwrap();
+        let guard = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let cache_dir = project.path().join(".carina/providers/test/1.0.0");
         fs::create_dir_all(&cache_dir).unwrap();
         let source = project.path().join("replacement.wasm");
@@ -671,7 +564,12 @@ mod tests {
         let destination = WasmArtifactPath::new(cache_dir.join("test.wasm"), "test").unwrap();
         fs::write(destination.as_path(), b"old artifact").unwrap();
 
-        install_project_artifact_atomically(&guard, &source, &destination).unwrap();
+        install_project_artifact_atomically(
+            &guard,
+            &carina_core::paths::ResolvedPath::new(&source).unwrap(),
+            &destination,
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read(destination.as_path()).unwrap(),
@@ -685,59 +583,75 @@ mod tests {
     }
 
     #[test]
-    fn atomic_installer_falls_back_to_staged_copy_when_hard_link_fails() {
+    fn atomic_installer_read_failure_preserves_existing_artifact() {
         let project = tempfile::tempdir().unwrap();
-        let guard = ProviderInstallLock::acquire(project.path()).unwrap();
-        let cache_dir = project.path().join(".carina/providers/test/1.0.0");
-        fs::create_dir_all(&cache_dir).unwrap();
-        let source = project.path().join("source.wasm");
-        fs::write(&source, b"provider wasm").unwrap();
-        let destination = cache_dir.join("test.wasm");
-        let target = ArtifactTarget::Project {
-            _install_lock: &guard,
-            path: destination.clone(),
-        };
-
-        install_artifact_atomically_with(&source, target, |_, _| {
-            Err(io::Error::other("injected hard-link failure"))
-        })
-        .unwrap();
-
-        assert_eq!(fs::read(&destination).unwrap(), b"provider wasm");
-        let entries = fs::read_dir(&cache_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect::<Vec<_>>();
-        assert_eq!(entries, vec![destination]);
-    }
-
-    #[test]
-    fn atomic_installer_reports_hard_link_and_copy_failures() {
-        let project = tempfile::tempdir().unwrap();
-        let guard = ProviderInstallLock::acquire(project.path()).unwrap();
-        let source = project.path().join("source-directory");
-        fs::create_dir(&source).unwrap();
-        let target = ArtifactTarget::Project {
-            _install_lock: &guard,
-            path: project
+        let root = carina_core::paths::ResolvedPath::new(project.path()).unwrap();
+        let guard = ProviderInstallLock::acquire(&root).unwrap();
+        let cache = root.join(".carina/providers/test/1.0.0").unwrap();
+        cache.create_dir_all().unwrap();
+        let destination = WasmArtifactPath::new(
+            project
                 .path()
                 .join(".carina/providers/test/1.0.0/test.wasm"),
-        };
+            "test",
+        )
+        .unwrap();
+        cache
+            .join("test.wasm")
+            .unwrap()
+            .atomic_replace(b"old artifact")
+            .unwrap();
+        let source = root.join("missing.wasm").unwrap();
+        let error = install_project_artifact_atomically(&guard, &source, &destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            cache.join("test.wasm").unwrap().read().unwrap(),
+            b"old artifact"
+        );
+        assert_eq!(cache.entries().unwrap().len(), 1);
+    }
 
-        let error = install_artifact_atomically_with(&source, target, |_, _| {
-            Err(io::Error::other("injected hard-link failure"))
-        })
-        .expect_err("copying a directory as an artifact must fail");
-
-        let message = error.to_string();
-        assert!(message.contains("injected hard-link failure"), "{message}");
-        assert!(message.contains("staged copy fallback failed"), "{message}");
+    #[cfg(unix)]
+    #[test]
+    fn provider_install_lock_symlink_retarget_pins_lock_and_artifact_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let replacement = temp.path().join("replacement");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&original).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        fs::write(original.join("source.wasm"), b"original provider").unwrap();
+        fs::write(replacement.join("source.wasm"), b"replacement provider").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let root = carina_core::paths::ResolvedPath::new(&alias).unwrap();
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&replacement, &alias).unwrap();
+        let guard = ProviderInstallLock::acquire(&root).unwrap();
+        let source = root.join("source.wasm").unwrap();
+        let destination = WasmArtifactPath::new(
+            alias.join(".carina/providers/file/source/source.wasm"),
+            "test",
+        )
+        .unwrap();
+        install_project_artifact_atomically(&guard, &source, &destination).unwrap();
+        guard.load_lock_file_or_default().unwrap().save().unwrap();
+        assert!(original.join(".carina/provider-install.lock").exists());
+        assert!(original.join("carina-providers.lock").exists());
+        assert_eq!(
+            fs::read(original.join(".carina/providers/file/source/source.wasm")).unwrap(),
+            b"original provider"
+        );
+        assert!(!replacement.join(".carina").exists());
+        assert!(!replacement.join("carina-providers.lock").exists());
     }
 
     #[test]
     fn project_target_rejects_parent_components_below_cache_prefix() {
         let project = tempfile::tempdir().unwrap();
-        let guard = ProviderInstallLock::acquire(project.path()).unwrap();
+        let guard = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let destination = project
             .path()
             .join(".carina/providers/source/../../outside.wasm");
@@ -754,7 +668,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let project = tempfile::tempdir().unwrap();
-        let guard = ProviderInstallLock::acquire(project.path()).unwrap();
+        let guard = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
+        )
+        .unwrap();
         let cache_dir = project.path().join(".carina/providers/test/1.0.0");
         fs::create_dir_all(&cache_dir).unwrap();
         let probe_path = cache_dir.join("probe.wasm");

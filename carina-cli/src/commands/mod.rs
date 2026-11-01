@@ -16,8 +16,9 @@ pub mod state;
 pub(crate) mod state_output;
 pub mod validate;
 
+use carina_core::paths::{CanonicalPath, ResolvedPath};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use carina_core::config_loader::{DuplicateDeclaration, UnresolvedConfigSnapshot};
@@ -89,7 +90,7 @@ pub(crate) enum ReadBackendWarningPolicy<'a> {
     /// A top-level command reading the current project's state.
     CommandBoundary { project_dir: &'a Path },
     /// An `upstream_state` read, deduplicated by canonical source directory.
-    UpstreamSource { source_dir: &'a Path },
+    UpstreamSource { source_dir: &'a ResolvedPath },
 }
 
 /// Resolve the backend for a read-only state operation.
@@ -99,7 +100,7 @@ pub(crate) enum ReadBackendWarningPolicy<'a> {
 /// [`ResolvedReadBackend`] points at the locked old backend. A warning policy
 /// is mandatory and is applied before the readable backend is returned.
 pub(crate) async fn resolve_backend_for_read<P: PlaceholderKind, B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     command_path: &Path,
     backend_config: Option<&BackendConfig<P, B>>,
     lock_requirement: BackendLockRequirement,
@@ -121,7 +122,8 @@ pub(crate) async fn resolve_backend_for_read<P: PlaceholderKind, B: BindingAddre
 }
 
 pub fn verify_for_mutation<P: PlaceholderKind, B: BindingAddress>(
-    project_dir: &Path,
+    project_dir: &ResolvedPath,
+    command_path: &Path,
     backend_config: Option<&BackendConfig<P, B>>,
     command: DriftCommand,
 ) -> Result<VerifiedMutationBackendSelection, AppError> {
@@ -129,19 +131,19 @@ pub fn verify_for_mutation<P: PlaceholderKind, B: BindingAddress>(
         MutationBackendSelection::MissingLock { path } => Err(AppError::Config(format!(
             "Backend lock file not found at {}. Run `{}` to initialize the project.",
             path.display(),
-            ProjectCommand::new("init", project_dir)
+            ProjectCommand::new("init", command_path)
         ))),
         MutationBackendSelection::Verified(selection) => Ok(selection),
         MutationBackendSelection::Drifted(drift) => Err(AppError::Config(drift_error_message(
             command,
             drift.existing(),
             drift.configured(),
-            project_dir,
+            command_path,
         ))),
     }
 }
 
-static WARNED_UPSTREAM_BACKEND_DRIFT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static WARNED_UPSTREAM_BACKEND_DRIFT: OnceLock<Mutex<HashSet<CanonicalPath>>> = OnceLock::new();
 
 fn emit_read_backend_drift_warning(drift: &BackendDrift, policy: ReadBackendWarningPolicy<'_>) {
     let warning = match policy {
@@ -153,12 +155,15 @@ fn emit_read_backend_drift_warning(drift: &BackendDrift, policy: ReadBackendWarn
             let mut warned = warned
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !warned.insert(source_dir.to_path_buf()) {
+            if !warned.insert(source_dir.identity()) {
                 return;
             }
             drop(warned);
 
-            upstream_backend_drift_warning(drift, source_dir)
+            upstream_backend_drift_warning(
+                drift,
+                std::path::Path::new(&source_dir.display().to_string()),
+            )
         }
     };
 
@@ -233,15 +238,18 @@ pub fn missing_provider_source_message(name: &str) -> String {
 /// Called after state is successfully written to ensure the lock
 /// exists for future backend-change detection.
 pub fn ensure_backend_lock<P: PlaceholderKind, B: BindingAddress>(
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     backend_config: Option<&BackendConfig<P, B>>,
 ) -> Result<(), AppError> {
-    let lock_path = BackendLock::lock_path(base_dir);
+    let resolved = base_dir.clone();
+    let lock_path = resolved
+        .join(carina_state::backend_lock::LOCK_FILE)
+        .map_err(|error| AppError::Config(error.to_string()))?;
     if lock_path.exists() {
         return Ok(());
     }
     BackendLock::for_config(backend_config)?
-        .save(base_dir)
+        .save(&resolved)
         .map_err(AppError::Backend)
 }
 
@@ -293,7 +301,7 @@ pub(crate) fn duplicate_declaration_errors(
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_with_config(
     parsed: &carina_core::config_loader::InferredRootDirectory,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     providers: &ProviderLoad,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
@@ -314,7 +322,7 @@ pub fn validate_and_resolve_with_config(
 pub fn validate_and_resolve_with_provider_load_for_test(
     user_dirs: &carina_core::UserDirs,
     parsed: &carina_core::config_loader::InferredRootDirectory,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
@@ -345,7 +353,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
 #[cfg(any(test, feature = "test-utils"))]
 pub fn validate_and_resolve_errors(
     parsed: &carina_core::config_loader::InferredRootDirectory,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     providers: &ProviderLoad,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
@@ -448,8 +456,11 @@ fn extend_module_call_errors(
 fn extend_module_resolution_errors(
     errors: &mut Vec<AppError>,
     residuals: &[carina_core::module_resolver::ResidualModuleResolutionError],
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
 ) {
+    let base_dir = base_dir.clone();
+    let base_label = std::path::PathBuf::from(base_dir.display().to_string());
+    let base_dir = base_label.as_path();
     for residual in residuals {
         let message = if residual.is_constraint() {
             residual.display_relative_to(base_dir)
@@ -486,13 +497,15 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
 pub(crate) fn validate_and_resolve_errors_inner(
     access: &crate::wiring::ValidationPipelineAccess,
     mut parsed: carina_core::config_loader::InferredRootDirectory,
-    base_dir: &Path,
+    base_dir: &ResolvedPath,
     ctx: &WiringContext,
     load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
 ) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
+    let resolved_base = base_dir.clone();
+    let base_dir = &resolved_base;
     // Binding-use validation is a production-readiness invariant, not a
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
@@ -1055,7 +1068,7 @@ mod tests {
         fn(
             &crate::wiring::ValidationPipelineAccess,
             carina_core::config_loader::InferredRootDirectory,
-            &Path,
+            &ResolvedPath,
             &WiringContext,
             &HashMap<String, String>,
             bool,
@@ -1110,7 +1123,11 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let config = s3_backend_config("my-bucket", "us-east-1");
 
-            let status = crate::commands::inspect_backend_drift(tmp.path(), Some(&config)).unwrap();
+            let status = crate::commands::inspect_backend_drift(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                Some(&config),
+            )
+            .unwrap();
 
             assert_eq!(status, BackendDriftStatus::Fresh);
         }
@@ -1119,9 +1136,17 @@ mod tests {
         fn inspect_returns_unchanged_when_config_matches_lock() {
             let tmp = tempfile::tempdir().unwrap();
             let config = s3_backend_config("my-bucket", "us-east-1");
-            ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
+            ensure_backend_lock(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                Some(&config),
+            )
+            .unwrap();
 
-            let status = crate::commands::inspect_backend_drift(tmp.path(), Some(&config)).unwrap();
+            let status = crate::commands::inspect_backend_drift(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                Some(&config),
+            )
+            .unwrap();
 
             assert_eq!(status, BackendDriftStatus::Unchanged);
         }
@@ -1131,9 +1156,17 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let old = s3_backend_config("old-bucket", "us-east-1");
             let new = s3_backend_config("new-bucket", "us-east-1");
-            ensure_backend_lock(tmp.path(), Some(&old)).unwrap();
+            ensure_backend_lock(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                Some(&old),
+            )
+            .unwrap();
 
-            let status = crate::commands::inspect_backend_drift(tmp.path(), Some(&new)).unwrap();
+            let status = crate::commands::inspect_backend_drift(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                Some(&new),
+            )
+            .unwrap();
             let existing = BackendLock::for_config(Some(&old)).unwrap();
             let configured = BackendLock::for_config(Some(&new)).unwrap();
 
@@ -1148,8 +1181,11 @@ mod tests {
         fn inspect_returns_fresh_with_no_backend_and_no_lock() {
             let tmp = tempfile::tempdir().unwrap();
 
-            let status =
-                crate::commands::inspect_backend_drift(tmp.path(), None::<&BackendConfig>).unwrap();
+            let status = crate::commands::inspect_backend_drift(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                None::<&BackendConfig>,
+            )
+            .unwrap();
 
             assert_eq!(status, BackendDriftStatus::Fresh);
         }
@@ -1158,10 +1194,17 @@ mod tests {
         fn inspect_returns_drifted_when_lock_is_remote_and_config_is_local() {
             let tmp = tempfile::tempdir().unwrap();
             let remote = s3_backend_config("my-bucket", "us-east-1");
-            ensure_backend_lock(tmp.path(), Some(&remote)).unwrap();
+            ensure_backend_lock(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                Some(&remote),
+            )
+            .unwrap();
 
-            let status =
-                crate::commands::inspect_backend_drift(tmp.path(), None::<&BackendConfig>).unwrap();
+            let status = crate::commands::inspect_backend_drift(
+                &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+                None::<&BackendConfig>,
+            )
+            .unwrap();
             let existing = BackendLock::for_config(Some(&remote)).unwrap();
             let configured = BackendLock::for_config(None::<&BackendConfig>).unwrap();
 
@@ -1233,7 +1276,11 @@ mod tests {
     fn ensure_backend_lock_creates_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let config = s3_backend_config("my-bucket", "us-east-1");
-        ensure_backend_lock(tmp.path(), Some(&config)).unwrap();
+        ensure_backend_lock(
+            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
+            Some(&config),
+        )
+        .unwrap();
         assert!(tmp.path().join("carina-backend.lock").exists());
     }
 
@@ -1257,11 +1304,22 @@ mod tests {
         let mut parsed = empty_parsed_file();
         parsed.backend = raw.backend;
         let base = tempfile::tempdir().unwrap();
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+        )
+        .unwrap();
 
         let parsed =
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
-        let errors = validate_and_resolve_errors(&parsed, base.path(), &providers, false, &[]);
+        let errors = validate_and_resolve_errors(
+            &parsed,
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+            &providers,
+            false,
+            &[],
+        );
 
         assert!(errors.iter().any(|error| {
             matches!(
@@ -1301,11 +1359,22 @@ mod tests {
             binding: None,
         });
 
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+        )
+        .unwrap();
         let parsed =
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
-        let error = validate_and_resolve_with_config(&parsed, base.path(), &providers, false, &[])
-            .unwrap_err();
+        let error = validate_and_resolve_with_config(
+            &parsed,
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+            &providers,
+            false,
+            &[],
+        )
+        .unwrap_err();
         let message = error.to_string();
 
         assert!(
@@ -1339,10 +1408,21 @@ mod tests {
             binding: None,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+        )
+        .unwrap();
         let parsed =
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
-        let result = validate_and_resolve_with_config(&parsed, base_dir, &providers, false, &[]);
+        let result = validate_and_resolve_with_config(
+            &parsed,
+            &carina_core::paths::ResolvedPath::new(base_dir).unwrap(),
+            &providers,
+            false,
+            &[],
+        );
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -1383,19 +1463,24 @@ exports {
         .unwrap();
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
-            &base,
+            &carina_core::paths::ResolvedPath::new(&base).unwrap(),
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
         let duplicate_declarations = loaded.duplicate_declarations;
         let parsed = loaded.parsed;
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, &base).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(&base).unwrap(),
+        )
+        .unwrap();
 
         // With full validation, the typo is rejected.
         let err = validate_and_resolve_with_config(
             &parsed,
-            &base,
+            &carina_core::paths::ResolvedPath::new(&base).unwrap(),
             &providers,
             false,
             &duplicate_declarations,
@@ -1407,7 +1492,7 @@ exports {
         // through despite the typo.
         let result = validate_and_resolve_with_config(
             &parsed,
-            &base,
+            &carina_core::paths::ResolvedPath::new(&base).unwrap(),
             &providers,
             true,
             &duplicate_declarations,
@@ -1430,18 +1515,22 @@ exports {
         .unwrap();
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
-            base.path(),
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
         let parsed = loaded.parsed;
-        let providers =
-            ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).expect("providers");
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+        )
+        .expect("providers");
 
         let recovery_errors = validate_and_resolve_errors(
             &parsed,
-            base.path(),
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
             &providers,
             true,
             &loaded.duplicate_declarations,
@@ -1483,17 +1572,21 @@ attributes { loaded: Bool = true }
         std::fs::write(source.join("main.crn"), "attributes { value: Int = 1 }\n").unwrap();
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load fixture");
-        let providers =
-            ProviderLoad::load(&user_dirs, &loaded.parsed.providers, fixture.path()).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &loaded.parsed.providers,
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        )
+        .unwrap();
 
         let full_errors = validate_and_resolve_errors(
             &loaded.parsed,
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &providers,
             false,
             &loaded.duplicate_declarations,
@@ -1507,7 +1600,7 @@ attributes { loaded: Bool = true }
 
         let skip_errors = validate_and_resolve_errors(
             &loaded.parsed,
-            fixture.path(),
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &providers,
             true,
             &loaded.duplicate_declarations,
@@ -1597,18 +1690,23 @@ child { values = [source] }
         .unwrap();
 
         let loaded = carina_core::config_loader::load_configuration_with_config(
-            base.path(),
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
             &ProviderContext::default(),
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
         let duplicate_declarations = loaded.duplicate_declarations;
         let parsed = loaded.parsed;
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base.path()).unwrap();
+        let providers = ProviderLoad::load(
+            &user_dirs,
+            &parsed.providers,
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
+        )
+        .unwrap();
 
         let err = validate_and_resolve_with_config(
             &parsed,
-            base.path(),
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
             &providers,
             false,
             &duplicate_declarations,
@@ -1618,7 +1716,7 @@ child { values = [source] }
 
         let result = validate_and_resolve_with_config(
             &parsed,
-            base.path(),
+            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
             &providers,
             true,
             &duplicate_declarations,
@@ -1760,9 +1858,14 @@ child { values = [source] }
             &awscc.providers,
         );
         let awscc = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(awscc);
-        let awscc =
-            validate_and_resolve_with_config(&awscc, base_dir.path(), &providers, false, &[])
-                .expect("awscc spelling must validate");
+        let awscc = validate_and_resolve_with_config(
+            &awscc,
+            &carina_core::paths::ResolvedPath::new(base_dir.path()).unwrap(),
+            &providers,
+            false,
+            &[],
+        )
+        .expect("awscc spelling must validate");
 
         let providers = ProviderLoad::for_test_with_provider_phase(
             crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
@@ -1773,8 +1876,14 @@ child { values = [source] }
             &aws.providers,
         );
         let aws = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(aws);
-        let aws = validate_and_resolve_with_config(&aws, base_dir.path(), &providers, false, &[])
-            .expect("aws spelling must validate");
+        let aws = validate_and_resolve_with_config(
+            &aws,
+            &carina_core::paths::ResolvedPath::new(base_dir.path()).unwrap(),
+            &providers,
+            false,
+            &[],
+        )
+        .expect("aws spelling must validate");
 
         assert_eq!(
             awscc.resources[0]
