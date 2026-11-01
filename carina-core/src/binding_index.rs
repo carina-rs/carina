@@ -293,7 +293,7 @@ impl ResolvedRefType {
     /// diagnostics.
     pub fn is_assignable_to_sink(&self, sink: TypeInSchema<'_>) -> Result<(), RefTypeMismatch> {
         let authoritative = self.authoritative.constraint().type_in_schema();
-        if !authoritative.is_assignable_to(sink) {
+        if authoritative.assignment_to(sink).is_mismatch() {
             return Err(RefTypeMismatch {
                 actual: authoritative.resolved_type_name(),
                 declared: None,
@@ -302,7 +302,7 @@ impl ResolvedRefType {
 
         for evidence in &self.evidence {
             let evidence = evidence.type_in_schema();
-            if !evidence.is_assignable_to(sink) {
+            if evidence.assignment_to(sink).is_mismatch() {
                 return Err(RefTypeMismatch {
                     actual: evidence.resolved_type_name(),
                     declared: self
@@ -717,8 +717,26 @@ impl<'a> BindingIndex<'a> {
         self.entries.get(name)
     }
 
-    pub(crate) fn schema_registry(&self) -> &'a SchemaRegistry {
-        self.schemas
+    fn lift_declared_type(&self, ty: &crate::parser::TypeExpr) -> Option<AttributeType> {
+        match self.resolve_declared_type(ty) {
+            Ok(resolved) => crate::validation::lift_type_expr(&resolved),
+            // Conflicting declarations cannot supply a sound constraint;
+            // authoritative declaration resolution owns their diagnostic.
+            Err(
+                crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { .. }
+                | crate::static_type::StaticTypeResolutionError::UnknownCustomType { .. }
+                | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion {
+                    ..
+                },
+            ) => None,
+        }
+    }
+
+    pub(crate) fn resolve_declared_type(
+        &self,
+        ty: &crate::parser::TypeExpr,
+    ) -> Result<crate::parser::TypeExpr, crate::static_type::StaticTypeResolutionError> {
+        crate::parser::resolve_type_expr_from_schemas(ty, self.schemas)
     }
 
     pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction> {
@@ -835,10 +853,8 @@ impl<'a> BindingIndex<'a> {
 
                     match attribute.declared_type() {
                         Some(crate::static_type::StaticType::Known(resolved)) => {
-                            let Some(declared) = crate::validation::lift_type_expr(
-                                resolved.type_expr(),
-                                self.schemas,
-                            ) else {
+                            let Some(declared) = self.lift_declared_type(resolved.type_expr())
+                            else {
                                 visiting.remove(&key);
                                 return RefType::Unchecked;
                             };
@@ -929,8 +945,7 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr, self.schemas)
-                    else {
+                    let Some(declared) = self.lift_declared_type(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -968,8 +983,7 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     }
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr, self.schemas)
-                    else {
+                    let Some(declared) = self.lift_declared_type(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -1039,8 +1053,7 @@ impl<'a> BindingIndex<'a> {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
-                    let Some(declared) = crate::validation::lift_type_expr(type_expr, self.schemas)
-                    else {
+                    let Some(declared) = self.lift_declared_type(type_expr) else {
                         visiting.remove(&key);
                         return RefType::Unchecked;
                     };
@@ -3153,6 +3166,7 @@ let vpc = aws.ec2.Vpc {
                     owned: crate::parser::OwnedTypeIdentity::provider(
                         "aws",
                         crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                        crate::schema::RefinedScalarKind::String,
                     ),
                 }),
             },
@@ -3167,6 +3181,7 @@ let vpc = aws.ec2.Vpc {
                             "ec2.SecurityGroup",
                             "Id",
                         ),
+                        crate::schema::RefinedScalarKind::String,
                     ),
                 }),
             },
@@ -3328,23 +3343,19 @@ let vpc = aws.ec2.Vpc {
         let RefType::Typed(vpc) = index.ref_type("vpc") else {
             panic!("Ref-typed module argument must resolve to a resource handle");
         };
-        let same = crate::validation::lift_type_expr(
-            &TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
-            &SchemaRegistry::new(),
-        )
+        let same = crate::validation::lift_type_expr(&TypeExpr::Ref(ResourceTypePath::new(
+            "aws", "ec2.Vpc",
+        )))
         .expect("Ref must be liftable");
-        let different = crate::validation::lift_type_expr(
-            &TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Subnet")),
-            &SchemaRegistry::new(),
-        )
+        let different = crate::validation::lift_type_expr(&TypeExpr::Ref(ResourceTypePath::new(
+            "aws",
+            "ec2.Subnet",
+        )))
         .expect("Ref must be liftable");
-        let literal_union = crate::validation::lift_type_expr(
-            &TypeExpr::Union(vec![
-                TypeExpr::StringLiteral("dev".to_string()),
-                TypeExpr::StringLiteral("prod".to_string()),
-            ]),
-            &SchemaRegistry::new(),
-        )
+        let literal_union = crate::validation::lift_type_expr(&TypeExpr::Union(vec![
+            TypeExpr::StringLiteral("dev".to_string()),
+            TypeExpr::StringLiteral("prod".to_string()),
+        ]))
         .expect("literal union must be liftable");
 
         for accepted in [AttributeType::string(), same] {
@@ -3404,6 +3415,7 @@ let vpc = aws.ec2.Vpc {
                                     crate::schema::TypeIdentity::from_schema_type(
                                         "aws", "ec2.Vpc", "Id",
                                     ),
+                                    crate::schema::RefinedScalarKind::String,
                                 ),
                             },
                         )),

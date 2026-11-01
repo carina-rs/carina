@@ -463,9 +463,7 @@ impl CompletionProvider {
         // shared value-completion entry point so module-call values
         // get the same coverage as `exports {}` values (built-ins,
         // binding refs, and structural type candidates).
-        if let Some(attr_type) =
-            carina_core::validation::lift_type_expr(&resolved_type, &self.schemas)
-        {
+        if let Some(attr_type) = carina_core::validation::lift_type_expr(&resolved_type) {
             // Synthetic `attr_type` is built directly from a `TypeExpr`,
             // which never lowers to `AttributeType::Ref`; an empty map is
             // sufficient for compatibility checks that still accept defs.
@@ -487,6 +485,7 @@ impl CompletionProvider {
             parser::TypeExpr::Float => "float".to_string(),
             parser::TypeExpr::Duration => "duration".to_string(),
             parser::TypeExpr::Simple(name) => name.clone(),
+            parser::TypeExpr::UnloadedSchemaType(unloaded) => unloaded.identity().to_string(),
             parser::TypeExpr::List(inner) => format!("list({})", self.format_type_expr(inner)),
             parser::TypeExpr::Map(inner) => format!("map({})", self.format_type_expr(inner)),
             parser::TypeExpr::Ref(resource_path) => {
@@ -996,6 +995,7 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
                 | parser::TypeExpr::Float
                 | parser::TypeExpr::Duration
                 | parser::TypeExpr::Simple(_)
+                | parser::TypeExpr::UnloadedSchemaType(_)
                 | parser::TypeExpr::List(_)
                 | parser::TypeExpr::Map(_)
                 | parser::TypeExpr::Ref(_)
@@ -1011,6 +1011,7 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
         | parser::TypeExpr::Float
         | parser::TypeExpr::Duration
         | parser::TypeExpr::Simple(_)
+        | parser::TypeExpr::UnloadedSchemaType(_)
         | parser::TypeExpr::List(_)
         | parser::TypeExpr::Map(_)
         | parser::TypeExpr::Ref(_)

@@ -1486,6 +1486,7 @@ mod provider_config_tests {
                 SchemaTypeOwner::Provider("awscc".to_string()),
             ])
             .expect("two owners are non-empty"),
+            crate::schema::RefinedScalarKind::String,
         );
         let value = Value::Concrete(ConcreteValue::String("arn:accepted".into()));
 
@@ -1545,6 +1546,7 @@ mod provider_config_tests {
                 SchemaTypeOwner::Provider("one".to_string()),
             ])
             .expect("two owners are non-empty"),
+            crate::schema::RefinedScalarKind::String,
         );
         let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
 
@@ -1596,7 +1598,11 @@ mod provider_config_tests {
                 seen_values: None,
             })]);
         let validator = test_custom_type_validator(factories);
-        let owned = OwnedTypeIdentity::provider("owner", identity);
+        let owned = OwnedTypeIdentity::provider(
+            "owner",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        );
         let value = Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.COMMON"));
 
         validator(CustomTypeValidationTarget::Annotation(&owned), &value)

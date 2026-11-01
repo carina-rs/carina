@@ -2528,6 +2528,7 @@ fn string_list_inner_type<'a>(
             return None;
         }
         let result = match resolved.shape_ref_free().ok()? {
+            crate::schema::Shape::UnloadedSchemaType(_) => None,
             crate::schema::Shape::List {
                 element_type: inner,
                 ..

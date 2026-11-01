@@ -1768,6 +1768,7 @@ mod tests {
             owned: crate::parser::OwnedTypeIdentity::provider(
                 "aws",
                 crate::schema::TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                crate::schema::RefinedScalarKind::String,
             ),
         };
         let argument: LiveCompositionArgument = LiveCompositionArgument::from_value(

@@ -662,6 +662,7 @@ impl UpstreamForIterableShapeError {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -788,6 +789,7 @@ pub fn check_upstream_state_for_iterable_shapes<E, D: crate::parser::DeferredFor
                 | TypeExpr::Float
                 | TypeExpr::Duration
                 | TypeExpr::Simple(_)
+                | TypeExpr::UnloadedSchemaType(_)
                 | TypeExpr::Ref(_)
                 | TypeExpr::DottedUnresolved(_)
                 | TypeExpr::SchemaType { .. }
@@ -888,6 +890,7 @@ impl UpstreamAttributeAccessShapeError {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -1114,6 +1117,7 @@ impl UpstreamSubscriptShapeError {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -1258,6 +1262,7 @@ fn visit_subscript_access(
                 | TypeExpr::Float
                 | TypeExpr::Duration
                 | TypeExpr::Simple(_)
+                | TypeExpr::UnloadedSchemaType(_)
                 | TypeExpr::Ref(_)
                 | TypeExpr::DottedUnresolved(_)
                 | TypeExpr::SchemaType { .. }
@@ -4172,7 +4177,11 @@ mod tests {
         );
 
         let identity = crate::schema::TypeIdentity::from_schema_type("test", "types", "Identifier");
-        let owned = crate::parser::OwnedTypeIdentity::provider("test", identity);
+        let owned = crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        );
         let config = LoadedProviderContext::for_test(ProviderContext {
             custom_types: crate::parser::ProviderCustomTypes::loaded(
                 std::collections::HashSet::from([owned.clone()]),

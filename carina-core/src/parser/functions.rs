@@ -558,7 +558,7 @@ pub(crate) fn validate_builtin_custom_type<P: PlaceholderKind>(
 /// use carina_core::resource::{ConcreteValue, Value};
 /// use carina_core::schema::TypeIdentity;
 ///
-/// let owned = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Id"));
+/// let owned = OwnedTypeIdentity::provider("test", TypeIdentity::bare("Id"), carina_core::schema::RefinedScalarKind::String);
 /// let value = Value::Concrete(ConcreteValue::String("id".into()));
 /// let _ = validate_schema_custom_type(&owned, &value, &ProviderContext::default());
 /// ```

@@ -9,7 +9,9 @@ use tower_lsp::lsp_types::{
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::resource::EnumValueResolver;
-use carina_core::schema::{AttributeType, EffectiveType, Shape, TypeIdentity, TypeInSchema};
+use carina_core::schema::{
+    AttributeType, EffectiveType, SchemaRegistry, Shape, TypeIdentity, TypeInSchema,
+};
 use carina_core::static_type::{
     ConsumerExportStaticType, ConsumerInferredUncheckedReason, InferenceError, NotInferableReason,
     StaticType, UnnameableInConsumer,
@@ -63,7 +65,7 @@ impl StructuralTypeForCompletion<TypeExpr> {
         &self,
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
-        schemas: &carina_core::schema::SchemaRegistry,
+        schemas: &SchemaRegistry,
     ) -> bool {
         match self {
             Self::Known(type_expr) => {
@@ -119,7 +121,7 @@ impl<'a> UpstreamCompletionStaticType<'a> {
         self,
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
-        schemas: &carina_core::schema::SchemaRegistry,
+        schemas: &SchemaRegistry,
     ) -> bool {
         match self {
             Self::Known(type_expr) => {
@@ -194,19 +196,24 @@ impl<'a> UpstreamCompletionStaticType<'a> {
     }
 }
 
-/// Treat non-liftable boundary declarations as unchecked; otherwise compare
-/// the declared source to the schema sink through the shared directional
-/// `AttributeType` relation.
+/// Resolve authored declarations with the available schema evidence, then
+/// exclude proven mismatches through the shared directional relation. Missing
+/// scalar evidence remains unchecked while nominal mismatches are decidable.
 fn type_expr_source_is_assignable_to(
     source: &TypeExpr,
     sink: &AttributeType,
     sink_defs: &std::collections::BTreeMap<String, AttributeType>,
-    schemas: &carina_core::schema::SchemaRegistry,
+    schemas: &SchemaRegistry,
 ) -> bool {
-    let Some(source) = carina_core::validation::lift_type_expr(source, schemas) else {
+    let Ok(source) = carina_core::parser::resolve_type_expr_from_schemas(source, schemas) else {
         return true;
     };
-    TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
+    let Some(source) = carina_core::validation::lift_type_expr(&source) else {
+        return true;
+    };
+    !TypeInSchema::schemaless(&source)
+        .assignment_to(sink.in_schema(sink_defs))
+        .is_mismatch()
 }
 
 /// Context when the user has typed `binding_name.` after `=`.
@@ -507,7 +514,10 @@ impl CompletionProvider {
                     .into_iter()
                     .filter_map(|(name, type_hint)| {
                         carina_core::parser::parse_type_expr_str(&type_hint, provider_ctx)
-                            .map(|t| (name, t))
+                            .and_then(|ty| {
+                                carina_core::validation::resolve_type_expr(&ty, provider_ctx).ok()
+                            })
+                            .map(|ty| (name, ty))
                     })
                     .collect();
                 let structural_resources = EnumValueResolver::with_defs(attr_type, target_defs)
@@ -746,6 +756,7 @@ impl CompletionProvider {
     /// has a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
         match attr_type.shape_ref_free() {
+            Ok(Shape::UnloadedSchemaType(unloaded)) => Some(&unloaded.identity().kind),
             Ok(Shape::String {
                 identity: Some(id), ..
             })
@@ -778,6 +789,7 @@ impl CompletionProvider {
             return Vec::new();
         };
         match shape {
+            Shape::UnloadedSchemaType(_) => Vec::new(),
             Shape::Bool => {
                 vec![
                     CompletionItem {
@@ -1018,6 +1030,7 @@ impl CompletionProvider {
                 return;
             }
             match value_type.shape() {
+                Shape::UnloadedSchemaType(_) => {}
                 Shape::List { .. } => {
                     if let Some(element) = value_type.list_element() {
                         push_nested_paths(element, prefix, depth + 1, labels);
@@ -1479,6 +1492,7 @@ impl CompletionProvider {
             | carina_core::parser::TypeExpr::Float
             | carina_core::parser::TypeExpr::Duration
             | carina_core::parser::TypeExpr::Simple(_)
+            | carina_core::parser::TypeExpr::UnloadedSchemaType(_)
             | carina_core::parser::TypeExpr::List(_)
             | carina_core::parser::TypeExpr::Ref(_)
             | carina_core::parser::TypeExpr::DottedUnresolved(_)
@@ -1609,16 +1623,18 @@ impl CompletionProvider {
     /// since an unknown type offers no basis for suggestion.
     pub(super) fn exports_value_completions(
         &self,
+        provider_ctx: &carina_core::parser::ProviderContext,
         type_expr_text: &str,
         in_nested: bool,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
-        let Some(annotation) = parse_exports_type_text(type_expr_text) else {
+        let Some(annotation) = parse_exports_type_text(type_expr_text, provider_ctx) else {
             return Vec::new();
         };
         let effective = if in_nested {
             match annotation.shape_ref_free() {
+                Ok(Shape::UnloadedSchemaType(_)) => return Vec::new(),
                 Ok(
                     Shape::List {
                         element_type: inner,
@@ -2325,6 +2341,7 @@ fn infer_for_binding_type(
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -2371,6 +2388,7 @@ fn return_type_fits(
         return false;
     };
     match shape {
+        Shape::UnloadedSchemaType(_) => false,
         Shape::Union => {
             let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
                 return false;
@@ -2404,72 +2422,15 @@ fn return_type_fits(
     }
 }
 
-/// Parse the raw text of an `exports` entry's type annotation into an
-/// `AttributeType` good enough to drive value-position completion
-/// filtering. Accepts the shapes the DSL grammar produces at this
-/// surface:
-///
-/// * primitive names (`string`, `int`, `float`, `bool`)
-/// * `list(T)` / `map(T)` with recursive inner parsing
-/// * a bare identifier interpreted as a custom semantic subtype — the
-///   name is PascalCase'd (`aws_account_id` → `AwsAccountId`) and
-///   stored as `Custom { semantic_name: Some(PascalCase), base: String }`
-///   so `is_assignable_to` matches schemas that declare the same
-///   semantic name.
-///
-/// Namespaced identifiers (`aws.vpc.VpcId`) are **not** parsed today —
-/// they fall into `None` and the caller silently drops to the empty
-/// completion set. Add a dotted-path branch when a real corpus shows
-/// users reaching for that shape in `exports` annotations.
-///
-/// Returns `None` for anything we don't understand; the caller falls
-/// back to the empty completion set rather than dumping everything.
-fn parse_exports_type_text(text: &str) -> Option<AttributeType> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if let Some(inner) = strip_generic("list", text) {
-        return parse_exports_type_text(inner).map(AttributeType::list);
-    }
-    if let Some(inner) = strip_generic("map", text) {
-        let inner_ty = parse_exports_type_text(inner)?;
-        return Some(AttributeType::map_with_key(
-            AttributeType::string(),
-            inner_ty,
-        ));
-    }
-    match text {
-        // Post-Phase C, primitive types are PascalCase. Accept only the new
-        // spellings at the surface.
-        "String" => Some(AttributeType::string()),
-        "Int" => Some(AttributeType::int()),
-        "Float" => Some(AttributeType::float()),
-        "Bool" => Some(AttributeType::bool()),
-        // Custom types also ship in PascalCase now (e.g. `AwsAccountId`,
-        // `Ipv4Cidr`). Carry the PascalCase form as a bare identity.
-        name if name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-            && name.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            Some(AttributeType::refined_string(
-                Some(carina_core::schema::TypeIdentity::bare(name)),
-                None,
-                None,
-                None,
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// `list(...)` / `map(...)` wrapper stripper. Returns the inner text
-/// between balanced parens, `None` for any other shape.
-fn strip_generic<'a>(prefix: &str, text: &'a str) -> Option<&'a str> {
-    let rest = text.strip_prefix(prefix)?;
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('(')?;
-    let rest = rest.strip_suffix(')')?;
-    Some(rest)
+/// Resolve and lift an exports annotation using the provider catalog rather
+/// than guessing a scalar kind from the spelling of a custom name.
+fn parse_exports_type_text(
+    text: &str,
+    provider_ctx: &carina_core::parser::ProviderContext,
+) -> Option<AttributeType> {
+    let parsed = carina_core::parser::parse_type_expr_str(text, provider_ctx)?;
+    let resolved = carina_core::validation::resolve_type_expr(&parsed, provider_ctx).ok()?;
+    carina_core::validation::lift_type_expr(&resolved)
 }
 
 /// Scan `ancestor` for directories that look like carina projects.
@@ -2596,6 +2557,50 @@ fn collect_named_provider_instance_bindings(
 #[cfg(test)]
 mod return_type_fits_tests {
     use super::*;
+
+    #[test]
+    fn unloaded_module_export_candidates_use_nominal_identity() {
+        let context = carina_core::parser::ProviderContext::default();
+        let nominal = |name: &str| {
+            let parsed = carina_core::parser::parse_type_expr_str(name, &context).unwrap();
+            let resolved = carina_core::validation::resolve_type_expr(&parsed, &context).unwrap();
+            carina_core::validation::lift_type_expr(&resolved).unwrap()
+        };
+        // Module loading preserves authored Simple syntax until resolution.
+        let source = carina_core::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
+        let defs = std::collections::BTreeMap::new();
+        let schemas = SchemaRegistry::new();
+        assert!(type_expr_source_is_assignable_to(
+            &source,
+            &nominal("KmsKeyArn"),
+            &defs,
+            &schemas
+        ));
+        assert!(!type_expr_source_is_assignable_to(
+            &source,
+            &nominal("Arn"),
+            &defs,
+            &schemas
+        ));
+        assert!(type_expr_source_is_assignable_to(
+            &source,
+            &AttributeType::string(),
+            &defs,
+            &schemas
+        ));
+        assert!(!type_expr_source_is_assignable_to(
+            &source,
+            &nominal("PositiveInt"),
+            &defs,
+            &schemas
+        ));
+        assert!(!type_expr_source_is_assignable_to(
+            &TypeExpr::String,
+            &nominal("KmsKeyArn"),
+            &defs,
+            &schemas
+        ));
+    }
 
     fn unnameable_reason() -> UnnameableInConsumer {
         let declared =

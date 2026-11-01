@@ -596,6 +596,11 @@ fn require_proven_integer_operand(
                 ..
             }),
         ) => Err(error),
+        Err(
+            error @ InferenceIssue::NotInferable(NotInferableReason::CustomTypeSchemaUnavailable {
+                ..
+            }),
+        ) => Err(error),
         Err(error) => Err(InferenceError::InvalidIntegerArithmeticOperand {
             op,
             side,
@@ -617,7 +622,20 @@ fn require_integer_arithmetic_operands(
         (crate::integer_arithmetic::IntegerOperandSide::Left, lhs),
         (crate::integer_arithmetic::IntegerOperandSide::Right, rhs),
     ] {
-        if inferred_scalar_kind(operand, schemas) != Some(crate::schema::RefinedScalarKind::Int) {
+        let operand =
+            crate::parser::resolve_type_expr_from_schemas(operand, schemas).map_err(|error| {
+                InferenceIssue::from(InferenceError::UnknownType {
+                    reason: error.to_string(),
+                })
+            })?;
+        if let TypeExpr::UnloadedSchemaType(unloaded) = &operand {
+            return Err(InferenceIssue::NotInferable(
+                NotInferableReason::CustomTypeSchemaUnavailable {
+                    identity: unloaded.identity().clone(),
+                },
+            ));
+        }
+        if inferred_scalar_kind(&operand) != Some(crate::schema::RefinedScalarKind::Int) {
             return Err(InferenceError::InvalidIntegerArithmeticOperand {
                 op,
                 side,
@@ -630,26 +648,22 @@ fn require_integer_arithmetic_operands(
     Ok(TypeExpr::Int)
 }
 
-fn inferred_scalar_kind(
-    inferred: &TypeExpr,
-    schemas: &SchemaRegistry,
-) -> Option<crate::schema::RefinedScalarKind> {
+fn inferred_scalar_kind(inferred: &TypeExpr) -> Option<crate::schema::RefinedScalarKind> {
     use crate::schema::RefinedScalarKind;
 
     match inferred {
+        TypeExpr::UnloadedSchemaType(_) => {
+            unreachable!("unloaded schemas defer before requiring a scalar kind")
+        }
         TypeExpr::String | TypeExpr::StringLiteral(_) => Some(RefinedScalarKind::String),
         TypeExpr::Int => Some(RefinedScalarKind::Int),
         TypeExpr::Float => Some(RefinedScalarKind::Float),
-        TypeExpr::SchemaType { owned } => {
-            let mut kinds = owned
-                .provider_names()
-                .map(|owner| schemas.identified_scalar_kind(owner, owned.identity()));
-            let first = kinds.next()??;
-            kinds.all(|kind| kind == Some(first)).then_some(first)
-        }
+        TypeExpr::SchemaType { owned } => Some(owned.scalar_kind()),
+        TypeExpr::Simple(name) => crate::parser::builtin_bare_custom_types()
+            .get(name)
+            .and_then(crate::provider::identified_custom_type_scalar_kind),
         TypeExpr::Bool
         | TypeExpr::Duration
-        | TypeExpr::Simple(_)
         | TypeExpr::List(_)
         | TypeExpr::Map(_)
         | TypeExpr::Ref(_)
@@ -917,6 +931,9 @@ pub(super) fn attribute_type_to_type_expr(
     schema_owner: &str,
 ) -> TypeExpr {
     let scalar_identity = match attr_type.kind() {
+        AttrTypeKind::UnloadedSchemaType(unloaded) => {
+            return TypeExpr::UnloadedSchemaType(unloaded.clone());
+        }
         AttrTypeKind::String { binding, .. }
         | AttrTypeKind::Int { binding, .. }
         | AttrTypeKind::Float { binding, .. } => binding.identity(),
@@ -933,11 +950,19 @@ pub(super) fn attribute_type_to_type_expr(
     };
     if let Some(id) = scalar_identity {
         return TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(schema_owner, id.clone()),
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                schema_owner,
+                id.clone(),
+                crate::provider::identified_custom_type_scalar_kind(attr_type)
+                    .expect("identified scalar declaration has a scalar kind"),
+            ),
         };
     }
 
     match attr_type.kind() {
+        AttrTypeKind::UnloadedSchemaType(unloaded) => {
+            TypeExpr::UnloadedSchemaType(unloaded.clone())
+        }
         AttrTypeKind::String { .. } => TypeExpr::String,
         AttrTypeKind::ResourceHandle {
             provider,
@@ -968,7 +993,12 @@ pub(super) fn attribute_type_to_type_expr(
             to_dsl,
             ..
         } if values.is_none() && (validate.is_some() || to_dsl.is_some()) => TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(schema_owner, identity.clone()),
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                schema_owner,
+                identity.clone(),
+                crate::provider::identified_custom_type_scalar_kind(attr_type)
+                    .expect("identified enum declaration has a scalar base"),
+            ),
         },
         AttrTypeKind::Enum { .. } => TypeExpr::String,
         AttrTypeKind::List {
@@ -1256,7 +1286,8 @@ pub fn retry_unchecked_export_inference<'a, D>(
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(
                     NotInferableReason::NonInferableBinding { .. }
-                    | NotInferableReason::SchemaUnavailable { .. },
+                    | NotInferableReason::SchemaUnavailable { .. }
+                    | NotInferableReason::CustomTypeSchemaUnavailable { .. },
                 ),
             )) => true,
             ExportStaticType::Declared(_type_expr) => false,
@@ -1421,12 +1452,12 @@ mod tests {
             schema.validate().expect("clock schema must be valid"),
         );
 
-        let infer_argument_arithmetic = |name: &str, identity: TypeIdentity| {
+        let infer_argument_arithmetic = |name: &str, identity: TypeIdentity, kind| {
             let bindings = InferenceBindings::from([(
                 name.to_string(),
                 InferenceBinding::Argument {
                     type_expr: TypeExpr::SchemaType {
-                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity),
+                        owned: crate::parser::OwnedTypeIdentity::provider("test", identity, kind),
                     },
                 },
             )]);
@@ -1446,12 +1477,16 @@ mod tests {
         };
 
         assert_eq!(
-            infer_argument_arithmetic("port", port_identity),
+            infer_argument_arithmetic("port", port_identity, crate::schema::RefinedScalarKind::Int),
             Ok(TypeExpr::Int),
             "an identity-bound refined Int argument remains an Int operand",
         );
         assert!(matches!(
-            infer_argument_arithmetic("label", label_identity),
+            infer_argument_arithmetic(
+                "label",
+                label_identity,
+                crate::schema::RefinedScalarKind::String
+            ),
             Err(InferenceIssue::Failed(
                 InferenceError::InvalidIntegerArithmeticOperand {
                     side: crate::integer_arithmetic::IntegerOperandSide::Left,
@@ -1474,7 +1509,11 @@ mod tests {
 
     fn owned_vpc_id_type() -> TypeExpr {
         TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider("awscc", TypeIdentity::bare("VpcId")),
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "awscc",
+                TypeIdentity::bare("VpcId"),
+                crate::schema::RefinedScalarKind::String,
+            ),
         }
     }
 
@@ -1790,6 +1829,7 @@ mod tests {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "aws",
                     TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
+                    crate::schema::RefinedScalarKind::String
                 ),
             }
         );

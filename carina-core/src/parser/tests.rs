@@ -2189,6 +2189,92 @@ fn struct_type_expr_display_renders_with_braces() {
 }
 
 #[test]
+fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
+    use crate::schema::RefinedScalarKind;
+
+    for kind in [
+        RefinedScalarKind::String,
+        RefinedScalarKind::Int,
+        RefinedScalarKind::Float,
+    ] {
+        let original = TypeExpr::SchemaType {
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::from_dotted("test.counter.Count"),
+                kind,
+            ),
+        };
+        let wire = serde_json::to_value(&original).unwrap();
+        assert_eq!(
+            wire["SchemaType"]["owned"]["scalar_kind"],
+            serde_json::to_value(kind).unwrap()
+        );
+        let decoded: TypeExpr = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, original);
+        let lifted = crate::validation::lift_type_expr(&decoded).expect("decoded kind must lift");
+        assert_eq!(
+            crate::provider::identified_custom_type_scalar_kind(&lifted),
+            Some(kind)
+        );
+    }
+}
+
+#[test]
+fn legacy_schema_type_serde_requires_resolution_and_retains_declared_int_kind() {
+    use crate::parser::OwnedTypeIdentity;
+    use crate::schema::RefinedScalarKind;
+
+    for identity in [
+        TypeIdentity::bare("Count"),
+        TypeIdentity::from_dotted("test.counter.Count"),
+    ] {
+        let owned = OwnedTypeIdentity::provider("test", identity, RefinedScalarKind::Int);
+        let original = TypeExpr::SchemaType {
+            owned: owned.clone(),
+        };
+        let mut wire = serde_json::to_value(&original).unwrap();
+        wire["SchemaType"]["owned"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scalar_kind");
+        let nested_wire = serde_json::json!({"List": wire});
+        let decoded: TypeExpr = serde_json::from_value(nested_wire).unwrap();
+        let TypeExpr::List(inner) = &decoded else {
+            panic!("legacy list must decode")
+        };
+        assert!(!matches!(inner.as_ref(), TypeExpr::SchemaType { .. }));
+        let context = ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::from([owned]),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..ProviderContext::default()
+        };
+        let resolved = crate::validation::resolve_type_expr(&decoded, &context).unwrap();
+        assert_eq!(resolved, TypeExpr::List(Box::new(original)));
+        let lifted = crate::validation::lift_type_expr(&resolved).unwrap();
+        assert!(lifted.to_string().contains("Count"));
+    }
+}
+
+#[test]
+fn schema_type_serde_rejects_empty_owners_with_or_without_scalar_kind() {
+    for scalar_kind in [Some(serde_json::json!("Int")), None] {
+        let mut owned = serde_json::json!({
+            "owners": [],
+            "identity": TypeIdentity::from_dotted("test.counter.Count"),
+        });
+        if let Some(kind) = scalar_kind {
+            owned["scalar_kind"] = kind;
+        }
+        assert!(
+            serde_json::from_value::<TypeExpr>(serde_json::json!({"SchemaType": {"owned": owned}}))
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn struct_type_expr_roundtrips_through_serde_json() {
     let t = TypeExpr::Struct {
         fields: vec![
@@ -10226,6 +10312,7 @@ fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
                 identity.clone(),
+                crate::schema::RefinedScalarKind::String,
             )]),
             Box::new(|_target, _value| {
                 panic!("an unresolved Simple node must not enter provider routing")
@@ -10315,6 +10402,7 @@ fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
     let owned = crate::parser::OwnedTypeIdentity::provider(
         "test",
         TypeIdentity::from_dotted("test.Widget.Id"),
+        crate::schema::RefinedScalarKind::String,
     );
 
     validate_schema_custom_type(
@@ -10333,6 +10421,7 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
                 identity.clone(),
+                crate::schema::RefinedScalarKind::String,
             )]),
             Box::new(|_target, _value| panic!("secret plaintext reached provider validation")),
         ),
@@ -10340,7 +10429,11 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     });
 
     validate_schema_custom_type(
-        &crate::parser::OwnedTypeIdentity::provider("test", identity),
+        &crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        ),
         &Value::<NoPlaceholder>::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("do-not-leak".into()),
         )))),
@@ -10351,40 +10444,51 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
 
 #[test]
 fn provider_context_validator_receives_canonical_numeric_text() {
+    use crate::schema::RefinedScalarKind;
     use std::sync::{Arc, Mutex};
 
     let identity = TypeIdentity::bare("NumericBridge");
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let observed = Arc::clone(&seen);
-    let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
-        custom_types: crate::parser::ProviderCustomTypes::loaded(
-            std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
-                "test",
-                identity.clone(),
-            )]),
-            Box::new(move |_owned, value| {
-                let observed_value = match value {
-                    Value::Concrete(ConcreteValue::Int(value)) => format!("int:{value}"),
-                    Value::Concrete(ConcreteValue::Float(value)) => format!("float:{value}"),
-                    Value::Concrete(ConcreteValue::String(value)) => {
-                        format!("string:{}", value.expose_plaintext())
-                    }
-                    other => format!("unexpected:{other:?}"),
-                };
-                observed.lock().unwrap().push(observed_value);
-                Ok(())
-            }),
+    for (kind, value) in [
+        (
+            RefinedScalarKind::Int,
+            Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(-42)),
         ),
-        ..ProviderContext::default()
-    });
-
-    for value in [
-        Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(-42)),
-        Value::Concrete(ConcreteValue::Float(1.25)),
-        Value::Concrete(ConcreteValue::String("literal".into())),
+        (
+            RefinedScalarKind::Float,
+            Value::Concrete(ConcreteValue::Float(1.25)),
+        ),
+        (
+            RefinedScalarKind::String,
+            Value::Concrete(ConcreteValue::String("literal".into())),
+        ),
     ] {
+        let observed = Arc::clone(&seen);
+        let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                    "test",
+                    identity.clone(),
+                    kind,
+                )]),
+                Box::new(move |_owned, value| {
+                    let observed_value = match value {
+                        Value::Concrete(ConcreteValue::Int(value)) => format!("int:{value}"),
+                        Value::Concrete(ConcreteValue::Float(value)) => format!("float:{value}"),
+                        Value::Concrete(ConcreteValue::String(value)) => {
+                            format!("string:{}", value.expose_plaintext())
+                        }
+                        other => format!("unexpected:{other:?}"),
+                    };
+                    observed.lock().unwrap().push(observed_value);
+                    Ok(())
+                }),
+            ),
+            ..ProviderContext::default()
+        });
+
         validate_schema_custom_type(
-            &crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+            &crate::parser::OwnedTypeIdentity::provider("test", identity.clone(), kind),
             &value,
             &config,
         )
@@ -10446,8 +10550,16 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
     let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             std::collections::HashSet::from([
-                crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
-                crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "one",
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::Int,
+                ),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "two",
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::Int,
+                ),
             ]),
             Box::new(move |target, value| {
                 let owner = match target {
@@ -10479,20 +10591,32 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
     });
 
     validate_schema_custom_type(
-        &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
+        &crate::parser::OwnedTypeIdentity::provider(
+            "one",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::Int,
+        ),
         &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(5)),
         &config,
     )
     .expect("owner one must get its own verdict");
     validate_schema_custom_type(
-        &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+        &crate::parser::OwnedTypeIdentity::provider(
+            "two",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::Int,
+        ),
         &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(7)),
         &config,
     )
     .expect("owner two must get its own verdict");
     assert!(
         validate_schema_custom_type(
-            &crate::parser::OwnedTypeIdentity::provider("one", identity.clone()),
+            &crate::parser::OwnedTypeIdentity::provider(
+                "one",
+                identity.clone(),
+                crate::schema::RefinedScalarKind::Int
+            ),
             &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(7)),
             &config,
         )
@@ -10500,7 +10624,11 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
     );
     assert!(
         validate_schema_custom_type(
-            &crate::parser::OwnedTypeIdentity::provider("two", identity.clone()),
+            &crate::parser::OwnedTypeIdentity::provider(
+                "two",
+                identity.clone(),
+                crate::schema::RefinedScalarKind::Int
+            ),
             &Value::<NoPlaceholder>::Concrete(ConcreteValue::Int(5)),
             &config,
         )
@@ -10521,6 +10649,7 @@ fn parse_custom_validator_rejects_invalid() {
             std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
                 identity.clone(),
+                crate::schema::RefinedScalarKind::String,
             )]),
             Box::new(move |target, value| {
                 if target.identity() != &validator_identity {
@@ -10548,7 +10677,11 @@ fn parse_custom_validator_rejects_invalid() {
 
     // Test validate_custom_type directly since the grammar may not accept
     // arbitrary type names. This verifies the custom validator is called.
-    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity);
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        identity,
+        crate::schema::RefinedScalarKind::String,
+    );
     let valid_result = validate_schema_custom_type(
         &owned,
         &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("valid-data".into())),
@@ -10629,6 +10762,7 @@ fn parse_schema_type_display() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "awscc",
             TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     assert_eq!(t.to_string(), "awscc.ec2.VpcId");

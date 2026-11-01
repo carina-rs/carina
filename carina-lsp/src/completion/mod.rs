@@ -140,7 +140,13 @@ impl CompletionProvider {
             CompletionContext::AfterEqualsInExports {
                 type_expr_text,
                 in_nested,
-            } => self.exports_value_completions(&type_expr_text, in_nested, &text, base_path),
+            } => self.exports_value_completions(
+                provider_ctx,
+                &type_expr_text,
+                in_nested,
+                &text,
+                base_path,
+            ),
             CompletionContext::AfterEqualsInModuleCall {
                 module_name,
                 arg_name,

@@ -12,6 +12,107 @@ use super::expressions::string_literal::parse_string_literal;
 use super::util::{pascal_to_snake, snake_to_pascal};
 use super::{ProviderContext, Rule, first_inner, next_pair};
 
+/// Nominal evidence retained while provider schemas are unavailable.
+///
+/// The private identity can only be constructed by the resolution seam below,
+/// after checking the provider catalog. It carries no scalar-kind claim.
+/// Assignment to another identified type uses the shared directional identity
+/// relation; identity-free scalar and literal checks require the missing schema.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct UnloadedSchemaType(TypeIdentity);
+
+impl UnloadedSchemaType {
+    pub fn identity(&self) -> &TypeIdentity {
+        &self.0
+    }
+}
+
+/// Resolve an identity using the catalog, retaining only nominal evidence
+/// when that catalog is not loaded. This is the sole constructor of
+/// `UnloadedSchemaType`, including for deserialized annotations.
+pub(crate) fn resolve_custom_type_identity(
+    identity: &TypeIdentity,
+    config: &ProviderContext,
+) -> Result<Option<TypeExpr>, StaticTypeResolutionError> {
+    let snake = pascal_to_snake(&identity.kind);
+    if crate::schema::builtin_type_registry().contains_key(identity) {
+        return Ok(Some(TypeExpr::Simple(snake)));
+    }
+    let matches = config
+        .known_custom_types()
+        .iter()
+        .filter(|owned| owned.identity() == identity)
+        .collect::<Vec<_>>();
+    if let Some(resolved) = merge_custom_type_candidates(&matches)? {
+        return Ok(Some(resolved));
+    }
+    if !config.custom_types_loaded() {
+        return Ok(Some(TypeExpr::UnloadedSchemaType(UnloadedSchemaType(
+            identity.clone(),
+        ))));
+    }
+    Ok(None)
+}
+
+/// Resolve annotations when the caller has resource schemas but no provider
+/// catalog. Use declarations actually present in those schemas; an absent
+/// declaration still has only unloaded-catalog nominal evidence.
+pub fn resolve_type_expr_from_schemas(
+    ty: &TypeExpr,
+    schemas: &crate::schema::SchemaRegistry,
+) -> Result<TypeExpr, StaticTypeResolutionError> {
+    let identity = match ty {
+        TypeExpr::Simple(name) if !builtin_bare_custom_types().contains_key(name) => {
+            TypeIdentity::bare(snake_to_pascal(name))
+        }
+        TypeExpr::UnloadedSchemaType(unloaded) => unloaded.identity().clone(),
+        TypeExpr::List(inner) => {
+            return resolve_type_expr_from_schemas(inner, schemas)
+                .map(|inner| TypeExpr::List(Box::new(inner)));
+        }
+        TypeExpr::Map(inner) => {
+            return resolve_type_expr_from_schemas(inner, schemas)
+                .map(|inner| TypeExpr::Map(Box::new(inner)));
+        }
+        TypeExpr::Struct { fields } => {
+            return fields
+                .iter()
+                .map(|(name, field)| {
+                    resolve_type_expr_from_schemas(field, schemas)
+                        .map(|field| (name.clone(), field))
+                })
+                .collect::<Result<_, _>>()
+                .map(|fields| TypeExpr::Struct { fields });
+        }
+        TypeExpr::Union(members) => {
+            return members
+                .iter()
+                .map(|member| resolve_type_expr_from_schemas(member, schemas))
+                .collect::<Result<_, _>>()
+                .map(TypeExpr::Union);
+        }
+        TypeExpr::String
+        | TypeExpr::Bool
+        | TypeExpr::Int
+        | TypeExpr::Float
+        | TypeExpr::Duration
+        | TypeExpr::Simple(_)
+        | TypeExpr::SchemaType { .. }
+        | TypeExpr::Ref(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::StringLiteral(_) => return Ok(ty.clone()),
+    };
+    let candidates = schemas.known_custom_type_declarations(&identity);
+    if let Some(resolved) = merge_custom_type_candidates(&candidates.iter().collect::<Vec<_>>())? {
+        return Ok(resolved);
+    }
+    // This entry point has no loaded provider catalog. Reuse its resolution
+    // seam, which alone can construct the private unloaded-schema payload.
+    resolve_custom_type_identity(&identity, &ProviderContext::default())
+        .map(|resolved| resolved.expect("an unloaded catalog retains nominal evidence"))
+}
+
 /// Parse a standalone type-expression text snippet (e.g. `"String"`,
 /// `"List(Int)"`, `"'dev' | 'prod'"`) into a [`TypeExpr`].
 ///
@@ -102,29 +203,38 @@ pub fn builtin_bare_custom_types()
 pub(crate) fn resolve_known_bare_custom_type(
     snake: &str,
     config: &ProviderContext,
-) -> Option<TypeExpr> {
+) -> Result<Option<TypeExpr>, StaticTypeResolutionError> {
     if builtin_bare_custom_types().contains_key(snake) {
-        return Some(TypeExpr::Simple(snake.to_string()));
+        return Ok(Some(TypeExpr::Simple(snake.to_string())));
     }
-    let pascal = snake_to_pascal(snake);
-    let matches = config
-        .known_custom_types()
-        .iter()
-        .filter(|owned| {
-            owned.identity().provider.is_none()
-                && owned.identity().segments.is_empty()
-                && owned.identity().kind == pascal
-        })
-        .collect::<Vec<_>>();
-    let first = matches.first()?;
-    let owners = matches
-        .iter()
-        .skip(1)
-        .fold(first.owners().clone(), |owners, owned| {
-            owners.union(owned.owners())
-        });
-    let owned = crate::parser::OwnedTypeIdentity::with_owners(first.identity().clone(), owners);
-    Some(TypeExpr::SchemaType { owned })
+    resolve_custom_type_identity(&TypeIdentity::bare(snake_to_pascal(snake)), config)
+}
+
+/// Join owners only after their declarations agree on the scalar kind.
+pub(crate) fn merge_custom_type_candidates(
+    matches: &[&super::OwnedTypeIdentity],
+) -> Result<Option<TypeExpr>, StaticTypeResolutionError> {
+    let Some(first) = matches.first() else {
+        return Ok(None);
+    };
+    let mut owners = first.owners().clone();
+    for owned in &matches[1..] {
+        if owned.scalar_kind() != first.scalar_kind() {
+            return Err(StaticTypeResolutionError::ConflictingScalarKinds {
+                name: first.authored_name(),
+                first_kind: first.scalar_kind(),
+                second_kind: owned.scalar_kind(),
+            });
+        }
+        owners = owners.union(owned.owners());
+    }
+    Ok(Some(TypeExpr::SchemaType {
+        owned: super::OwnedTypeIdentity::with_owners(
+            first.identity().clone(),
+            owners,
+            first.scalar_kind(),
+        ),
+    }))
 }
 
 fn custom_type_suggestion_key(id: &TypeIdentity) -> String {
@@ -243,11 +353,16 @@ fn parse_type_expr_atom(
                     // typos and renamed-then-removed types went unnoticed.
                     if config.custom_types_loaded() {
                         return match resolve_known_bare_custom_type(&snake, config) {
-                            Some(resolved) => Ok(resolved),
-                            None => Err(ParseError::unresolved_declaration_type(
+                            Ok(Some(resolved)) => Ok(resolved),
+                            Ok(None) => Err(ParseError::unresolved_declaration_type(
                                 other,
                                 type_span,
                                 unknown_custom_type_message(other, config),
+                            )),
+                            Err(error) => Err(ParseError::unresolved_declaration_type(
+                                other,
+                                type_span,
+                                error.to_string(),
                             )),
                         };
                     }
@@ -475,7 +590,11 @@ mod tests {
         use crate::schema::TypeIdentity;
 
         let ctx = loaded_context(std::collections::HashSet::from([
-            crate::parser::OwnedTypeIdentity::provider("test", TypeIdentity::bare("EmailAddress")),
+            crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                TypeIdentity::bare("EmailAddress"),
+                crate::schema::RefinedScalarKind::String,
+            ),
         ]));
         assert!(matches!(
             parse_type_expr_str("EmailAddress", &ctx),

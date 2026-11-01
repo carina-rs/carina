@@ -183,7 +183,14 @@ impl fmt::Display for TypeExprValueError {
                 error,
             } => {
                 write_path(f, path)?;
-                write!(f, "expected {expected}, got {actual}: {error}")
+                write!(f, "expected {expected}, got {actual}: {error}")?;
+                if matches!(
+                    error.as_ref(),
+                    crate::parser::CustomTypeValidationError::ProvidersNotLoaded
+                ) {
+                    f.write_str("; value validation requires an owner-qualified schema type")?;
+                }
+                Ok(())
             }
         }
     }
@@ -258,6 +265,24 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
     inference: TypecheckInference<'_, P>,
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> Result<(), TypeExprValueError> {
+    if let TypeExpr::UnloadedSchemaType(_) = expected {
+        let resolved = super::resolve_type_expr(expected, config)
+            .map_err(|error| validation_mismatch(expected, value, error.to_string()))?;
+        return match resolved {
+            TypeExpr::UnloadedSchemaType(_) => Err(custom_type_validation_mismatch(
+                expected,
+                value,
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+            )),
+            resolved => check_type_expr_value_inner_with_mode(
+                &resolved,
+                value,
+                config,
+                inference,
+                provider_custom_types,
+            ),
+        };
+    }
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             for branch in &deferred.values()[1..] {
@@ -280,6 +305,7 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::List(_)
             | TypeExpr::Map(_)
             | TypeExpr::Ref(_)
@@ -327,7 +353,8 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
                 | Err(crate::static_type::InferenceIssue::NotInferable(
                     crate::static_type::NotInferableReason::MissingValue
                     | crate::static_type::NotInferableReason::NonInferableBinding { .. }
-                    | crate::static_type::NotInferableReason::SchemaUnavailable { .. },
+                    | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
+                    | crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
                 )) => Ok(()),
             };
         }
@@ -346,6 +373,9 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
                 Err(crate::static_type::InferenceIssue::Failed(error)) => {
                     Err(TypeExprValueError::InvalidAccess { error })
                 }
+                Err(crate::static_type::InferenceIssue::NotInferable(
+                    crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
+                )) if inferred_type_fits(expected, &TypeExpr::Int) => Ok(()),
                 Err(crate::static_type::InferenceIssue::NotInferable(_)) => {
                     Err(mismatch(expected, value))
                 }
@@ -389,6 +419,11 @@ fn check_type_expr_value_inner_with_mode<P: PlaceholderKind>(
     }
 
     match expected {
+        TypeExpr::UnloadedSchemaType(_) => Err(custom_type_validation_mismatch(
+            expected,
+            value,
+            crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+        )),
         TypeExpr::String => match value {
             Value::Concrete(ConcreteValue::String(_) | ConcreteValue::CanonicalEnum(_)) => Ok(()),
             Value::Concrete(ConcreteValue::EnumIdentifier(identifier))
@@ -665,14 +700,11 @@ fn accepts_interpolation(expected: &TypeExpr) -> bool {
 }
 
 fn is_string_shaped(type_expr: &TypeExpr) -> bool {
-    matches!(
-        type_expr,
-        TypeExpr::String
-            | TypeExpr::Simple(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-    )
+    match type_expr {
+        TypeExpr::UnloadedSchemaType(_) => false,
+        TypeExpr::Ref(_) => true,
+        _ => type_expr.is_string_shaped(),
+    }
 }
 
 fn is_qualified_enum_identifier(identifier: &str) -> bool {
@@ -684,6 +716,19 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
         return true;
     }
     match (expected, actual) {
+        (TypeExpr::UnloadedSchemaType(_), _) | (_, TypeExpr::UnloadedSchemaType(_)) => {
+            let assignment = match (
+                super::lift_type_expr(actual),
+                super::lift_type_expr(expected),
+            ) {
+                (Some(actual), Some(expected)) => crate::schema::TypeInSchema::schemaless(&actual)
+                    .assignment_to(crate::schema::TypeInSchema::schemaless(&expected)),
+                (None, _) | (_, None) => crate::schema::TypeAssignability::Unchecked(
+                    crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+                ),
+            };
+            !assignment.is_mismatch()
+        }
         (TypeExpr::Float, TypeExpr::Int) => true,
         (
             TypeExpr::SchemaType {
@@ -838,10 +883,15 @@ mod tests {
                     SchemaTypeOwner::Provider("awscc".to_string()),
                 ])
                 .expect("two annotation owners are non-empty"),
+                crate::schema::RefinedScalarKind::String,
             ),
         };
         let actual = TypeExpr::SchemaType {
-            owned: OwnedTypeIdentity::provider("aws", identity),
+            owned: OwnedTypeIdentity::provider(
+                "aws",
+                identity,
+                crate::schema::RefinedScalarKind::String,
+            ),
         };
 
         assert!(
@@ -938,6 +988,7 @@ mod tests {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
+                    crate::schema::RefinedScalarKind::String,
                 ),
             },
             TypeExpr::Struct {
@@ -982,6 +1033,7 @@ mod tests {
             owned: crate::parser::OwnedTypeIdentity::provider(
                 "mock",
                 TypeIdentity::bare("AccountId"),
+                crate::schema::RefinedScalarKind::String,
             ),
         }
     }
@@ -1177,6 +1229,7 @@ mod tests {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
+                    crate::schema::RefinedScalarKind::String,
                 ),
             },
             TypeExpr::Struct { fields: Vec::new() },
@@ -1220,6 +1273,7 @@ mod tests {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2", "VpcId"),
+                    crate::schema::RefinedScalarKind::String,
                 ),
             },
             TypeExpr::Union(vec![
@@ -1251,7 +1305,11 @@ mod tests {
     fn schema_and_reference_types_accept_string_values_and_schema_validates() {
         let identity = TypeIdentity::from_schema_type("test", "network", "Id");
         let schema_type = TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity.clone(),
+                crate::schema::RefinedScalarKind::String,
+            ),
         };
         let checked_identity = identity.clone();
         let config = ProviderContext {
@@ -1372,7 +1430,11 @@ mod tests {
             ..ProviderContext::default()
         };
         let schema_type = TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider("test", identity),
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity,
+                crate::schema::RefinedScalarKind::String,
+            ),
         };
         let value = Value::Concrete(ConcreteValue::enum_identifier("test.widget.Mode.dsl_value"));
 
@@ -1409,6 +1471,7 @@ mod tests {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "test",
                     TypeIdentity::from_schema_type("test", "widget", "PositiveInt"),
+                    crate::schema::RefinedScalarKind::Int,
                 ),
             },
         ] {
@@ -1467,6 +1530,7 @@ mod tests {
                 std::collections::HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                     "one",
                     identity.clone(),
+                    crate::schema::RefinedScalarKind::Int,
                 )]),
                 Box::new(move |target, value| {
                     declaration
@@ -1479,7 +1543,11 @@ mod tests {
             ..ProviderContext::default()
         };
         let ty = |provider: &str| TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(provider, identity.clone()),
+            owned: crate::parser::OwnedTypeIdentity::provider(
+                provider,
+                identity.clone(),
+                crate::schema::RefinedScalarKind::Int,
+            ),
         };
 
         check_with_config(&ty("one"), &Value::Concrete(ConcreteValue::Int(5)), &config)
@@ -1515,8 +1583,13 @@ mod tests {
                     crate::parser::OwnedTypeIdentity::provider(
                         "bare-provider",
                         bare_identity.clone(),
+                        crate::schema::RefinedScalarKind::String,
                     ),
-                    crate::parser::OwnedTypeIdentity::provider("test", schema_identity.clone()),
+                    crate::parser::OwnedTypeIdentity::provider(
+                        "test",
+                        schema_identity.clone(),
+                        crate::schema::RefinedScalarKind::String,
+                    ),
                 ]),
                 Box::new(move |target, value| {
                     let owned = match target {
@@ -1565,10 +1638,18 @@ mod tests {
 
         for expected in [
             TypeExpr::SchemaType {
-                owned: crate::parser::OwnedTypeIdentity::provider("bare-provider", bare_identity),
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "bare-provider",
+                    bare_identity,
+                    crate::schema::RefinedScalarKind::String,
+                ),
             },
             TypeExpr::SchemaType {
-                owned: crate::parser::OwnedTypeIdentity::provider("test", schema_identity.clone()),
+                owned: crate::parser::OwnedTypeIdentity::provider(
+                    "test",
+                    schema_identity.clone(),
+                    crate::schema::RefinedScalarKind::String,
+                ),
             },
         ] {
             check_with_config(&expected, &value, &config)

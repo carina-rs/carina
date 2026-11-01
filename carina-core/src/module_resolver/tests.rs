@@ -4499,7 +4499,11 @@ fn test_argument_type_mismatch_string_for_bool() {
 fn test_argument_type_custom_validator() {
     // Create a loaded ProviderContext with a custom "arn" validator
     let identity = TypeIdentity::bare("Arn");
-    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        identity.clone(),
+        crate::schema::RefinedScalarKind::String,
+    );
     let validator_identity = identity.clone();
     let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -4582,7 +4586,11 @@ fn test_argument_type_custom_validator() {
 #[test]
 fn test_argument_type_list_of_custom_type() {
     let identity = TypeIdentity::bare("Arn");
-    let owned = crate::parser::OwnedTypeIdentity::provider("test", identity.clone());
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        identity.clone(),
+        crate::schema::RefinedScalarKind::String,
+    );
     let validator_identity = identity.clone();
     let config = LoadedProviderContext::for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
@@ -7862,8 +7870,16 @@ fn resolved_module_signature_groups_all_owners_of_a_dotted_annotation() {
     let context = ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             HashSet::from([
-                crate::parser::OwnedTypeIdentity::provider("aws", identity.clone()),
-                crate::parser::OwnedTypeIdentity::provider("awscc", identity),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "aws",
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::String,
+                ),
+                crate::parser::OwnedTypeIdentity::provider(
+                    "awscc",
+                    identity,
+                    crate::schema::RefinedScalarKind::String,
+                ),
             ]),
             Box::new(|target, _value| {
                 Err(

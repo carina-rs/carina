@@ -201,11 +201,13 @@ use crate::value::{
     CanonicalState, CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value,
 };
 
+mod assignability;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 
+pub use assignability::TypeAssignability;
 pub use carina_provider_protocol::types::{
     DslTransform, ReferenceForm, ReferenceTemplate, ReferenceTemplateError,
 };
@@ -533,6 +535,9 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind>(
         return;
     }
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => errors.push(TypeError::from(
+            crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
+        )),
         AttrTypeKind::String { binding, .. }
         | AttrTypeKind::Int { binding, .. }
         | AttrTypeKind::Float { binding, .. } => {
@@ -1198,6 +1203,11 @@ pub struct TypeInSchema<'a> {
 /// `Ref`-peeled view) or the constructor methods on [`AttributeType`].
 #[derive(Clone)]
 pub(crate) enum AttrTypeKind {
+    /// Boundary-only nominal evidence; its private payload is constructed only
+    /// by provider type resolution when the schema catalog is not loaded.
+    /// Directional identity checks remain decidable; scalar-dependent checks
+    /// explicitly defer with `ProvidersNotLoaded`.
+    UnloadedSchemaType(crate::parser::UnloadedSchemaType),
     /// String
     String {
         binding: RefinementBinding,
@@ -1313,6 +1323,8 @@ pub(crate) enum AttrTypeKind {
 /// enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
 pub enum Shape<'a> {
+    /// Nominal evidence whose scalar kind requires provider schemas.
+    UnloadedSchemaType(&'a crate::parser::UnloadedSchemaType),
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1396,6 +1408,10 @@ impl ShapeWalkBudget {
 impl fmt::Debug for Shape<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Shape::UnloadedSchemaType(unloaded) => f
+                .debug_tuple("Shape::UnloadedSchemaType")
+                .field(unloaded)
+                .finish(),
             Shape::String {
                 identity,
                 pattern,
@@ -1485,6 +1501,8 @@ impl fmt::Debug for Shape<'_> {
 /// against the source enum and the compiler will surface the omission.
 #[derive(Clone, Copy)]
 pub enum RawShape<'a> {
+    /// Boundary-only nominal evidence without a loaded scalar declaration.
+    UnloadedSchemaType(&'a crate::parser::UnloadedSchemaType),
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
@@ -1546,6 +1564,10 @@ pub enum RawShape<'a> {
 impl fmt::Debug for RawShape<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RawShape::UnloadedSchemaType(unloaded) => f
+                .debug_tuple("RawShape::UnloadedSchemaType")
+                .field(unloaded)
+                .finish(),
             RawShape::String {
                 identity,
                 pattern,
@@ -2040,6 +2062,10 @@ impl Schema {
             return;
         };
         match &attr.kind {
+            AttrTypeKind::UnloadedSchemaType(_) => out.push((
+                path.clone(),
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into(),
+            )),
             AttrTypeKind::Struct {
                 name,
                 fields,
@@ -2353,6 +2379,9 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind>(
         return validate_attr_with_defs_and_ancestry(attr, default, defs, ancestry);
     }
     match &attr.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => {
+            Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
+        }
         AttrTypeKind::Ref(_) => {
             let resolution = resolve_refs_on_path(attr, defs, visited_refs)
                 .map_err(RefResolutionFailure::into_validation_error)?;
@@ -2513,6 +2542,9 @@ impl fmt::Debug for AttributeType {
     // variant matches what `#[derive(Debug)]` would produce.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
+            AttrTypeKind::UnloadedSchemaType(unloaded) => {
+                f.debug_tuple("UnloadedSchemaType").field(unloaded).finish()
+            }
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -2901,6 +2933,7 @@ impl AttributeType {
 
     fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
         match &resolved.kind {
+            AttrTypeKind::UnloadedSchemaType(unloaded) => Shape::UnloadedSchemaType(unloaded),
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -2991,6 +3024,7 @@ impl AttributeType {
     /// carina#3349 bug class at the walk-site.
     pub fn raw_shape<'a>(&'a self) -> RawShape<'a> {
         match &self.kind {
+            AttrTypeKind::UnloadedSchemaType(unloaded) => RawShape::UnloadedSchemaType(unloaded),
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -3428,6 +3462,7 @@ impl AttributeType {
 
     pub fn enum_parts(&self) -> Option<EnumParts<'_>> {
         match &self.kind {
+            AttrTypeKind::UnloadedSchemaType(_) => None,
             AttrTypeKind::Enum {
                 identity,
                 values,
@@ -3497,6 +3532,9 @@ impl AttributeType {
             return Ok(());
         };
         match &self.kind {
+            AttrTypeKind::UnloadedSchemaType(_) => {
+                Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
+            }
             AttrTypeKind::Enum {
                 identity,
                 values,
@@ -3560,6 +3598,9 @@ impl AttributeType {
         value: ConcreteValueRef<'_, P>,
     ) -> Result<(), TypeError> {
         match (&self.kind, value) {
+            (AttrTypeKind::UnloadedSchemaType(_), _) => {
+                Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
+            }
             (
                 AttrTypeKind::String {
                     binding,
@@ -3784,6 +3825,7 @@ impl AttributeType {
 
     pub fn type_name(&self) -> String {
         match &self.kind {
+            AttrTypeKind::UnloadedSchemaType(unloaded) => unloaded.identity().to_string(),
             AttrTypeKind::Bool => "Bool".to_string(),
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
@@ -3831,6 +3873,7 @@ impl AttributeType {
     /// are considered compatible with each other.
     pub fn is_string_based_custom(&self) -> bool {
         match &self.kind {
+            AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::String {
                 binding,
                 pattern,
@@ -3910,6 +3953,10 @@ impl TypeInSchema<'_> {
     /// class that #2218 closed. Rule 10's no-evidence exception is limited to
     /// identity-less sinks and does not weaken those comparisons.
     pub fn is_assignable_to(self, sink: TypeInSchema<'_>) -> bool {
+        matches!(self.assignment_to(sink), TypeAssignability::Assignable)
+    }
+
+    fn is_assignable_to_known(self, sink: TypeInSchema<'_>) -> bool {
         let mut source_visited_refs = Vec::new();
         let mut sink_visited_refs = Vec::new();
         self.is_assignable_to_on_paths(sink, &mut source_visited_refs, &mut sink_visited_refs)
@@ -3944,6 +3991,7 @@ impl<'source> TypeInSchema<'source> {
         };
         let resolved = resolution.attr;
         let name = match &resolved.kind {
+            AttrTypeKind::UnloadedSchemaType(unloaded) => unloaded.identity().to_string(),
             AttrTypeKind::List {
                 element_type: inner,
                 ..
@@ -4033,6 +4081,7 @@ impl<'source> TypeInSchema<'source> {
             });
         }
         match (&self.attr.kind, &sink.attr.kind) {
+            (UnloadedSchemaType(_), _) | (_, UnloadedSchemaType(_)) => false,
             (
                 ResourceHandle {
                     provider: source_provider,
@@ -4645,6 +4694,22 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind>(
 ) -> Option<Fit<'a>> {
     use AttrTypeKind as AT;
 
+    match &attr.kind {
+        AT::UnloadedSchemaType(_) => return None,
+        AT::String { .. }
+        | AT::ResourceHandle { .. }
+        | AT::StringLiteralSet { .. }
+        | AT::Int { .. }
+        | AT::Float { .. }
+        | AT::Bool
+        | AT::Duration
+        | AT::Enum { .. }
+        | AT::List { .. }
+        | AT::Map { .. }
+        | AT::Struct { .. }
+        | AT::Union(_)
+        | AT::Ref(_) => {}
+    }
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         let inner =
             fit_value_to_resolved_type_on_path(attr, inner, defs, ancestry, purpose, visited_refs)?;
@@ -4675,6 +4740,7 @@ pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind>(
 
     if matches!(value, Value::Deferred(DeferredValue::IntegerArithmetic(_))) {
         return match &attr.kind {
+            AT::UnloadedSchemaType(_) => None,
             AT::Int { .. } => Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred)),
             AT::Float { .. } => Some(Fit::with_kind(
                 FitExactness::COERCIBLE,
@@ -5093,6 +5159,7 @@ fn union_member_judgement_on_path<'a, P: PlaceholderKind>(
     };
     let member = resolution.attr;
     let judgement = match (&member.kind, value) {
+        (AT::UnloadedSchemaType(_), _) => UnionMemberJudgement::no_match(),
         // Map↔Struct: preserve the original flat rank. Field recognition is
         // diagnostic identity, not a numeric ordering bonus.
         (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => UnionMemberJudgement {
@@ -8306,6 +8373,7 @@ fn type_contains_struct(
         return false;
     };
     match &resolution.attr.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::Struct { .. } => true,
         AttrTypeKind::List { element_type, .. } => type_contains_struct(element_type, defs, budget),
         AttrTypeKind::Map { value, .. } => type_contains_struct(value, defs, budget),
@@ -8337,6 +8405,7 @@ fn collect_effective_field_candidates<'a>(
         return;
     }
     match attr_type.shape_with_defs(defs) {
+        Shape::UnloadedSchemaType(_) => {}
         Shape::Struct { name: _ } => {
             let Some(fields) = struct_fields_with_defs(attr_type, defs) else {
                 return;
@@ -8968,6 +9037,7 @@ fn identified_declaration_kind(
     attribute_type: &AttributeType,
 ) -> Option<IdentifiedDeclarationKind> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::String {
             identity: Some(_identity),
             pattern: _pattern,
@@ -9032,6 +9102,7 @@ fn identified_declaration_kind(
 
 fn identified_declaration_scalar_kind(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::String {
             identity: Some(_identity),
             pattern: _pattern,
@@ -9099,6 +9170,7 @@ fn visit_identified_declarations(
     visitor: &mut dyn FnMut(&TypeIdentity, &AttributeType),
 ) {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {}
         RawShape::String {
             identity: Some(identity),
             pattern: _,
@@ -9224,6 +9296,7 @@ fn validate_identified_scalar_kind_consistency(
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
     let identified = match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::String {
             identity: Some(identity),
             ..
@@ -9333,6 +9406,7 @@ fn validate_identified_scalar_kind_consistency(
     }
 
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {}
         RawShape::List { element_type, .. } => validate_identified_scalar_kind_consistency(
             element_type,
             location.with_suffix(".element"),
@@ -9385,6 +9459,7 @@ fn validate_identified_scalar_kind_consistency(
 
 fn scalar_kind_for_schema_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::String { .. } => Some(RefinedScalarKind::String),
         RawShape::Int { .. } => Some(RefinedScalarKind::Int),
         RawShape::Float { .. } => Some(RefinedScalarKind::Float),
@@ -9613,6 +9688,11 @@ fn validate_type_definition(
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => push_schema_issue(
+            issues,
+            &location,
+            "provider schema contains a type whose schema is not loaded".to_string(),
+        ),
         AttrTypeKind::Ref(name) => {
             let Some(definition) = defs.get(name) else {
                 push_schema_issue(
@@ -9841,6 +9921,7 @@ fn type_write_only_analysis<'schema>(
     ref_chain: &mut Vec<&'schema str>,
 ) -> WriteOnlyTypeAnalysis {
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => WriteOnlyTypeAnalysis::default(),
         AttrTypeKind::Ref(name) => {
             if ref_chain.contains(&name.as_str()) {
                 return WriteOnlyTypeAnalysis::default();
@@ -10025,6 +10106,7 @@ fn project_write_only_leaves<'schema>(
     }
 
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => {}
         AttrTypeKind::Ref(name) => {
             if ref_chain.contains(&name.as_str()) {
                 return;
@@ -10147,6 +10229,7 @@ fn strip_write_only_leaves_from_value<'schema>(
     }
 
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => value.clone(),
         AttrTypeKind::Ref(name) => {
             if ref_chain.contains(&name.as_str()) {
                 return value.clone();
@@ -10640,6 +10723,7 @@ impl ResourceSchema {
         out: &mut Vec<String>,
     ) {
         match self.shape_of(attr_type) {
+            Shape::UnloadedSchemaType(_) => {}
             Shape::Enum {
                 identity, values, ..
             } => {
@@ -11122,6 +11206,7 @@ fn collect_block_names_from_type(
     result: &mut HashMap<String, String>,
 ) {
     match &attr_type.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => {}
         AttrTypeKind::Ref(name) => {
             if visited_definitions.insert((name.clone(), ancestry))
                 && let Some(definition) = defs.get(name)
@@ -12230,8 +12315,10 @@ pub mod types {
     }
 }
 
-/// Primitive shape attached to a core-owned identified refinement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Primitive shape attached to an identified refinement.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum RefinedScalarKind {
     String,
     Int,
@@ -12300,6 +12387,7 @@ fn same_builtin_declaration(declaration: &AttributeType, builtin: &AttributeType
             .is_some_and(|(actual, expected)| Arc::ptr_eq(actual, expected))
     };
     match (declaration.raw_shape(), builtin.raw_shape()) {
+        (RawShape::UnloadedSchemaType(_), _) | (_, RawShape::UnloadedSchemaType(_)) => false,
         (
             RawShape::String {
                 pattern: a_pattern,
@@ -12362,6 +12450,9 @@ pub fn builtin_validator_registry()
         let mut validators = HashMap::new();
         for attr_type in builtin_type_registry().values() {
             let (kind, binding) = match &attr_type.kind {
+                AttrTypeKind::UnloadedSchemaType(_) => {
+                    unreachable!("built-ins carry scalar declarations")
+                }
                 AttrTypeKind::String { binding, .. } => (RefinedScalarKind::String, binding),
                 AttrTypeKind::Int { binding, .. } => (RefinedScalarKind::Int, binding),
                 AttrTypeKind::Float { binding, .. } => (RefinedScalarKind::Float, binding),
@@ -13159,7 +13250,6 @@ pub struct SchemaRegistry {
     data_sources: HashMap<(String, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
     witness_backed_reference_forms: HashSet<String>,
-    identified_scalar_kinds: BTreeMap<(String, TypeIdentity), RefinedScalarKind>,
 }
 
 /// Failure to combine owner-bound schema registry declarations.
@@ -13190,6 +13280,36 @@ impl fmt::Display for SchemaRegistryError {
 impl std::error::Error for SchemaRegistryError {}
 
 impl SchemaRegistry {
+    /// Owner-bearing scalar declarations observed in admitted resource
+    /// schemas. This is evidence for a particular identity, not a complete
+    /// provider catalog: config-only declarations may be absent here.
+    pub(crate) fn known_custom_type_declarations(
+        &self,
+        identity: &TypeIdentity,
+    ) -> Vec<crate::parser::OwnedTypeIdentity> {
+        let mut declarations = std::collections::BTreeSet::new();
+        for (owner, _, _, schema) in self.iter() {
+            let mut collect = |candidate: &TypeIdentity, declaration: &AttributeType| {
+                if candidate == identity {
+                    let kind = identified_declaration_scalar_kind(declaration)
+                        .expect("admitted identified declarations carry scalar kinds");
+                    declarations.insert(crate::parser::OwnedTypeIdentity::provider(
+                        owner,
+                        candidate.clone(),
+                        kind,
+                    ));
+                }
+            };
+            for attribute in schema.effective_attributes() {
+                visit_identified_declarations(attribute.field_type(), &mut collect);
+            }
+            for definition in schema.parts().defs.values() {
+                visit_identified_declarations(definition, &mut collect);
+            }
+        }
+        declarations.into_iter().collect()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -13200,15 +13320,6 @@ impl SchemaRegistry {
     #[doc(hidden)]
     pub fn insert(&mut self, provider: impl Into<String>, schema: ValidatedResourceSchema) {
         let provider = provider.into();
-        for (identity, declaration) in identified_declarations_from_witnesses(
-            std::slice::from_ref(&schema),
-            &ValidatedConfigSchema::default(),
-        ) {
-            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
-                self.identified_scalar_kinds
-                    .insert((provider.clone(), identity), kind);
-            }
-        }
         self.reference_forms.entry(provider.clone()).or_default();
         let key = (provider, schema.as_schema().resource_type.clone());
         match schema.as_schema().kind {
@@ -13243,12 +13354,6 @@ impl SchemaRegistry {
         self.reference_forms
             .insert(provider.clone(), incoming.clone());
         self.witness_backed_reference_forms.insert(provider.clone());
-        for (identity, declaration) in witness.identified_declarations() {
-            if let Some(kind) = identified_declaration_scalar_kind(&declaration) {
-                self.identified_scalar_kinds
-                    .insert((provider.clone(), identity), kind);
-            }
-        }
         for schema in witness.resources() {
             let key = (provider.clone(), schema.as_schema().resource_type.clone());
             match schema.as_schema().kind {
@@ -13272,7 +13377,6 @@ impl SchemaRegistry {
             data_sources,
             reference_forms,
             witness_backed_reference_forms,
-            identified_scalar_kinds,
         } = other;
         for (owner, incoming) in &reference_forms {
             if witness_backed_reference_forms.contains(owner)
@@ -13297,18 +13401,7 @@ impl SchemaRegistry {
                 self.reference_forms.entry(owner).or_insert(forms);
             }
         }
-        self.identified_scalar_kinds.extend(identified_scalar_kinds);
         Ok(())
-    }
-
-    pub(crate) fn identified_scalar_kind(
-        &self,
-        owner: &str,
-        identity: &TypeIdentity,
-    ) -> Option<RefinedScalarKind> {
-        self.identified_scalar_kinds
-            .get(&(owner.to_string(), identity.clone()))
-            .copied()
     }
 
     /// Look up a schema by explicit `(provider, resource_type, kind)`.

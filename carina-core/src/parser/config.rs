@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::resource::Value;
-use crate::schema::{AttributeType, SchemaRegistry, TypeIdentity};
+use crate::schema::{AttributeType, RefinedScalarKind, SchemaRegistry, TypeIdentity};
 
 /// Schema provenance for an identified refined type.
 ///
@@ -71,25 +71,40 @@ impl<'de> serde::Deserialize<'de> for NonEmptySchemaTypeOwners {
 ///
 /// A bare [`TypeIdentity`] is descriptive metadata, not routing authority.
 /// Pairing it with its schema owner prevents two factories that expose the
-/// same identity from competing in an identity-only map.
+/// same identity from competing in an identity-only map. The declared scalar
+/// kind travels with the identity so consumers do not need its schema to lift it.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct OwnedTypeIdentity {
     owners: NonEmptySchemaTypeOwners,
     identity: TypeIdentity,
+    scalar_kind: RefinedScalarKind,
 }
 
 impl OwnedTypeIdentity {
-    pub fn provider(owner: impl Into<String>, identity: TypeIdentity) -> Self {
+    pub fn provider(
+        owner: impl Into<String>,
+        identity: TypeIdentity,
+        scalar_kind: RefinedScalarKind,
+    ) -> Self {
         Self {
             owners: NonEmptySchemaTypeOwners::singleton(SchemaTypeOwner::Provider(owner.into())),
             identity,
+            scalar_kind,
         }
     }
 
-    pub fn with_owners(identity: TypeIdentity, owners: NonEmptySchemaTypeOwners) -> Self {
-        Self { owners, identity }
+    pub fn with_owners(
+        identity: TypeIdentity,
+        owners: NonEmptySchemaTypeOwners,
+        scalar_kind: RefinedScalarKind,
+    ) -> Self {
+        Self {
+            owners,
+            identity,
+            scalar_kind,
+        }
     }
 
     pub fn owners(&self) -> &NonEmptySchemaTypeOwners {
@@ -104,6 +119,10 @@ impl OwnedTypeIdentity {
 
     pub fn identity(&self) -> &TypeIdentity {
         &self.identity
+    }
+
+    pub fn scalar_kind(&self) -> RefinedScalarKind {
+        self.scalar_kind
     }
 
     /// Render the type's authored semantic name.

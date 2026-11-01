@@ -898,6 +898,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }
@@ -916,6 +917,7 @@ impl ModuleSignature {
             | TypeExpr::List(_)
             | TypeExpr::Map(_)
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::Struct { .. }
             | TypeExpr::StringLiteral(_)
@@ -1404,6 +1406,7 @@ impl ModuleSignature {
             | TypeExpr::Float
             | TypeExpr::Duration
             | TypeExpr::Simple(_)
+            | TypeExpr::UnloadedSchemaType(_)
             | TypeExpr::SchemaType { .. }
             | TypeExpr::StringLiteral(_)
             | TypeExpr::Union(_) => format!("{}{}{}", c.green, type_expr, c.reset),

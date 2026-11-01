@@ -7256,6 +7256,7 @@ fn append_schema_pairing_hashes(
         return;
     }
     match attr_type.shape_with_defs(defs) {
+        Shape::UnloadedSchemaType(_) => {}
         Shape::String {
             identity, to_dsl, ..
         } => {

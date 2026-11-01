@@ -634,6 +634,7 @@ fn collect_enum_provider_namespaces(
     use carina_core::schema::RawShape;
 
     match attr_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {}
         RawShape::Enum { identity, .. } => {
             if let Some(provider) = &identity.provider {
                 namespaces.insert(provider.clone());
@@ -2768,6 +2769,11 @@ impl DiagnosticEngine {
     /// Check if a TypeExpr contains unknown type names.
     fn check_unknown_type_names(&self, type_expr: &TypeExpr) -> Option<String> {
         match type_expr {
+            TypeExpr::UnloadedSchemaType(_) => {
+                carina_core::validation::resolve_type_expr(type_expr, &self.provider_context)
+                    .err()
+                    .map(|error| error.to_string())
+            }
             TypeExpr::Simple(name) => {
                 if carina_core::parser::builtin_bare_custom_types().contains_key(name) {
                     return None;

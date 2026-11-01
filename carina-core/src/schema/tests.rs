@@ -7474,25 +7474,6 @@ fn assignability_rule_8_rejects_unproven_refined_sources() {
 fn lifted_type_expr_finite_universe_is_reflexive() {
     use crate::parser::{ResourceTypePath, TypeExpr};
 
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "aws",
-        ResourceSchema::new("ec2.Vpc")
-            .attribute(
-                AttributeSchema::optional(
-                    "id",
-                    AttributeType::refined_string(
-                        Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
-                        None,
-                        None,
-                        None,
-                    ),
-                )
-                .build(),
-            )
-            .validate()
-            .unwrap(),
-    );
     let liftable = vec![
         ("String", TypeExpr::String),
         ("Int", TypeExpr::Int),
@@ -7505,6 +7486,7 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "aws",
                     TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+                    crate::schema::RefinedScalarKind::String,
                 ),
             },
         ),
@@ -7547,7 +7529,7 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
     ];
 
     for (name, type_expr) in liftable {
-        let lifted = crate::validation::lift_type_expr(&type_expr, &schemas)
+        let lifted = crate::validation::lift_type_expr(&type_expr)
             .unwrap_or_else(|| panic!("liftable TypeExpr {name} unexpectedly lifted to None"));
         assert!(
             assignable(&lifted, &lifted),
@@ -7558,6 +7540,7 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
 
 fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
     match &attr.kind {
+        AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::String {
             binding: RefinementBinding::MetadataOnly(None),
             pattern: None,

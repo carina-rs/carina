@@ -6205,6 +6205,8 @@ impl CanonicalCustomTypeValue {
 /// validator's canonical text representation.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CustomTypeCanonicalizationError {
+    #[error("provider custom types are not loaded")]
+    ProvidersNotLoaded,
     #[error(
         "custom-type canonicalization requires an identified scalar declaration, got {type_name}"
     )]
@@ -6237,6 +6239,9 @@ pub enum CustomTypeCanonicalizationError {
 impl CustomTypeCanonicalizationError {
     pub(crate) fn into_type_error(self) -> crate::schema::TypeError {
         match self {
+            Self::ProvidersNotLoaded => {
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into()
+            }
             Self::EnumResolution { error, .. } => *error,
             Self::ConcreteKindMismatch {
                 identity,
@@ -6259,6 +6264,7 @@ impl CustomTypeCanonicalizationError {
 /// Return the identity carried by an identified scalar or enum declaration.
 pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option<&TypeIdentity> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         RawShape::String { identity, .. }
         | RawShape::Int { identity, .. }
         | RawShape::Float { identity, .. } => identity,
@@ -6280,6 +6286,7 @@ pub fn identified_custom_type_scalar_kind(
     attribute_type: &AttributeType,
 ) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::String {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::String),
@@ -6305,6 +6312,7 @@ pub fn identified_custom_type_scalar_kind(
 
 fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::String { .. } => Some(RefinedScalarKind::String),
         RawShape::Int { .. } => Some(RefinedScalarKind::Int),
         RawShape::Float { .. } => Some(RefinedScalarKind::Float),
@@ -6329,6 +6337,22 @@ pub fn canonicalize_custom_type_value(
     declared_type: &AttributeType,
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, CustomTypeCanonicalizationError> {
+    match declared_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {
+            return Err(CustomTypeCanonicalizationError::ProvidersNotLoaded);
+        }
+        RawShape::String { .. }
+        | RawShape::Int { .. }
+        | RawShape::Float { .. }
+        | RawShape::Bool
+        | RawShape::Duration
+        | RawShape::Enum { .. }
+        | RawShape::List { .. }
+        | RawShape::Map { .. }
+        | RawShape::Struct { .. }
+        | RawShape::Union(_)
+        | RawShape::Ref(_) => {}
+    }
     let identity = identified_custom_type_identity(declared_type).ok_or_else(|| {
         CustomTypeCanonicalizationError::UnidentifiedDeclaration {
             type_name: declared_type.type_name(),
@@ -6341,6 +6365,9 @@ pub fn canonicalize_custom_type_value(
         }
     })?;
     match (declared_type.raw_shape(), value) {
+        (RawShape::UnloadedSchemaType(_), _) => {
+            Err(CustomTypeCanonicalizationError::ProvidersNotLoaded)
+        }
         (
             RawShape::String {
                 identity: _,
@@ -6832,6 +6859,7 @@ fn collect_type_names_from_type(
     use crate::schema::RawShape;
 
     match attr_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => {}
         RawShape::String {
             identity: Some(id), ..
         }
@@ -6885,6 +6913,7 @@ fn local_custom_validator(
     attribute_type: &AttributeType,
 ) -> Option<&crate::schema::CustomValidator> {
     match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(_) => None,
         RawShape::String { validate, .. }
         | RawShape::Int { validate, .. }
         | RawShape::Float { validate, .. }
@@ -7258,23 +7287,29 @@ where
     }
 
     fn known_custom_types(&self) -> BTreeSet<crate::parser::OwnedTypeIdentity> {
-        let mut owners_by_identity =
-            BTreeMap::<TypeIdentity, crate::parser::NonEmptySchemaTypeOwners>::new();
+        // Keep incompatible kinds separate so annotation resolution can reject
+        // a cross-provider conflict before constructing a SchemaType.
+        let mut owners_by_identity = BTreeMap::<
+            (TypeIdentity, RefinedScalarKind),
+            crate::parser::NonEmptySchemaTypeOwners,
+        >::new();
         for (owner, indexed) in &self.index {
             let owner_set = crate::parser::NonEmptySchemaTypeOwners::singleton(
                 crate::parser::SchemaTypeOwner::Provider(owner.clone()),
             );
-            for identity in indexed.declarations.keys() {
+            for (identity, declarations) in &indexed.declarations {
+                let kind = identified_custom_type_scalar_kind(&declarations[0])
+                    .expect("validated identified declarations have a scalar kind");
                 owners_by_identity
-                    .entry(identity.clone())
+                    .entry((identity.clone(), kind))
                     .and_modify(|owners| *owners = owners.union(&owner_set))
                     .or_insert_with(|| owner_set.clone());
             }
         }
         owners_by_identity
             .into_iter()
-            .map(|(identity, owners)| {
-                crate::parser::OwnedTypeIdentity::with_owners(identity, owners)
+            .map(|((identity, kind), owners)| {
+                crate::parser::OwnedTypeIdentity::with_owners(identity, owners, kind)
             })
             .collect()
     }
@@ -8034,6 +8069,66 @@ mod tests {
     }
 
     #[test]
+    fn provider_custom_type_index_retains_scalar_kinds_for_resolution() {
+        use crate::parser::{
+            OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, ResourceTypePath, TypeExpr,
+        };
+        use crate::static_type::StaticTypeResolutionError;
+
+        let identity = TypeIdentity::from_dotted("shared.counter.Count");
+        let snapshots = [
+            ("one", RefinedScalarKind::Int),
+            ("two", RefinedScalarKind::Int),
+            ("three", RefinedScalarKind::Float),
+        ]
+        .map(|(owner, kind)| ProviderFactorySchemaSnapshot {
+            name: owner.into(),
+            witness: ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "count".into(),
+                    kind.identified_type(identity.clone()),
+                )]))
+                .unwrap(),
+                Default::default(),
+            )
+            .unwrap(),
+        });
+        let factories: &[Box<dyn ProviderFactory>] = &[];
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories,
+            build_owner_custom_type_index(&snapshots),
+        );
+        let known = resolver.known_custom_types();
+        assert_eq!(known.len(), 2, "only owners with the same kind are grouped");
+        let int_type = known
+            .iter()
+            .find(|owned| owned.scalar_kind() == RefinedScalarKind::Int)
+            .unwrap();
+        assert!(int_type.provider_names().eq(["one", "two"]));
+        assert!(known.contains(&OwnedTypeIdentity::provider(
+            "three",
+            identity,
+            RefinedScalarKind::Float
+        )));
+
+        let context = ProviderContext {
+            custom_types: ProviderCustomTypes::loaded(
+                known.into_iter().collect(),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..ProviderContext::default()
+        };
+        assert!(matches!(
+            crate::validation::resolve_type_expr(
+                &TypeExpr::DottedUnresolved(ResourceTypePath::new("shared", "counter.Count")),
+                &context
+            ),
+            Err(StaticTypeResolutionError::ConflictingScalarKinds { .. })
+        ));
+    }
+
+    #[test]
     fn loaded_custom_types_derive_known_config_identities_and_resolver_from_factories() {
         let identity = TypeIdentity::new(Some("test"), ["config"], "Endpoint");
         let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> =
@@ -8045,13 +8140,18 @@ mod tests {
                 .known()
                 .contains(&crate::parser::OwnedTypeIdentity::provider(
                     "config-owner",
-                    identity.clone()
+                    identity.clone(),
+                    crate::schema::RefinedScalarKind::String
                 ))
         );
         crate::parser::CustomTypeResolver::validate(
             &custom_types,
             crate::parser::CustomTypeValidationTarget::Annotation(
-                &crate::parser::OwnedTypeIdentity::provider("config-owner", identity),
+                &crate::parser::OwnedTypeIdentity::provider(
+                    "config-owner",
+                    identity,
+                    crate::schema::RefinedScalarKind::String,
+                ),
             ),
             &Value::Concrete(ConcreteValue::String("https://example.test".into())),
         )
@@ -8147,6 +8247,7 @@ mod tests {
             &crate::parser::OwnedTypeIdentity::provider(
                 "snapshot",
                 TypeIdentity::new(Some("test"), ["item"], "Identifier"),
+                crate::schema::RefinedScalarKind::String
             )
         ));
     }

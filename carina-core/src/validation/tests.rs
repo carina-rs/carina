@@ -760,7 +760,11 @@ fn string_refinement_fixture() -> (LoadedProviderContext, SchemaRegistry) {
                 .validate()
                 .unwrap(),
         );
-        known.insert(crate::parser::OwnedTypeIdentity::provider(owner, identity));
+        known.insert(crate::parser::OwnedTypeIdentity::provider(
+            owner,
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        ));
     }
     (context_with_accepting_custom_type_resolver(known), schemas)
 }
@@ -771,9 +775,9 @@ fn lifted_source_is_assignable_to_schema(
     sink: &AttributeType,
     sink_defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    let (context, schemas) = string_refinement_fixture();
+    let (context, _) = string_refinement_fixture();
     let resolved = resolve_type_expr(type_expr, &context).expect("fixture annotation must resolve");
-    let source = lift_type_expr(&resolved, &schemas).expect("fixture declaration must lift");
+    let source = lift_type_expr(&resolved).expect("fixture declaration must lift");
     crate::schema::TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
 }
 
@@ -784,9 +788,9 @@ fn schema_source_is_assignable_to_lifted_sink(
     source_defs: &std::collections::BTreeMap<String, AttributeType>,
     type_expr: &TypeExpr,
 ) -> bool {
-    let (context, schemas) = string_refinement_fixture();
+    let (context, _) = string_refinement_fixture();
     let resolved = resolve_type_expr(type_expr, &context).expect("fixture annotation must resolve");
-    let sink = lift_type_expr(&resolved, &schemas).expect("fixture declaration must lift");
+    let sink = lift_type_expr(&resolved).expect("fixture declaration must lift");
     source
         .in_schema(source_defs)
         .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
@@ -809,6 +813,7 @@ fn context_with_iam_policy_arn_validator() -> LoadedProviderContext {
             HashSet::from([crate::parser::OwnedTypeIdentity::provider(
                 "test",
                 identity.clone(),
+                crate::schema::RefinedScalarKind::String,
             )]),
             Box::new(move |target, value| {
                 if target.identity() != &identity {
@@ -879,6 +884,7 @@ fn iam_policy_arn_type_expr() -> TypeExpr {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "test",
             TypeIdentity::bare("IamPolicyArn"),
+            crate::schema::RefinedScalarKind::String,
         ),
     }
 }
@@ -886,7 +892,11 @@ fn iam_policy_arn_type_expr() -> TypeExpr {
 fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> BindingUseReport {
     let identity = TypeIdentity::new(Some("test"), ["counter"], "Count");
     let provider_context = context_with_accepting_custom_type_resolver(HashSet::from([
-        crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+        crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::Int,
+        ),
     ]));
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -966,10 +976,265 @@ fn provider_int_module_argument_rejects_string_sink_statically() {
 }
 
 #[test]
+fn resolve_type_expr_rejects_conflicting_owner_scalar_kinds() {
+    use crate::parser::OwnedTypeIdentity;
+    use crate::schema::RefinedScalarKind;
+    use crate::static_type::StaticTypeResolutionError;
+
+    for (identity, annotation) in [
+        (
+            TypeIdentity::bare("Count"),
+            TypeExpr::Simple("count".into()),
+        ),
+        (
+            TypeIdentity::from_dotted("test.counter.Count"),
+            TypeExpr::DottedUnresolved(crate::parser::ResourceTypePath::new(
+                "test",
+                "counter.Count",
+            )),
+        ),
+    ] {
+        let context = context_with_known_custom_types(HashSet::from([
+            OwnedTypeIdentity::provider("one", identity.clone(), RefinedScalarKind::Int),
+            OwnedTypeIdentity::provider("two", identity, RefinedScalarKind::String),
+        ]));
+        assert!(matches!(
+            resolve_type_expr(&annotation, &context),
+            Err(StaticTypeResolutionError::ConflictingScalarKinds { .. })
+        ));
+        if matches!(annotation, TypeExpr::Simple(_)) {
+            assert!(
+                crate::parser::parse_type_expr_str(&annotation.to_string(), &context).is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn lift_schema_type_preserves_int_kind_without_registry() {
+    let identity = TypeIdentity::new(Some("test"), ["counter"], "Count");
+    let type_expr = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::Int,
+        ),
+    };
+    let lifted =
+        lift_type_expr(&type_expr).expect("an identified Int must lift without a schema registry");
+    let expected = AttributeType::refined_int(Some(identity), None);
+    assert!(
+        crate::schema::TypeInSchema::schemaless(&lifted)
+            .is_assignable_to(crate::schema::TypeInSchema::schemaless(&expected))
+    );
+    assert!(matches!(
+        lifted.raw_shape(),
+        crate::schema::RawShape::Int { .. }
+    ));
+}
+
+#[test]
+fn lift_unloaded_schema_nominals_preserves_identity_without_guessing_kind() {
+    let context = ProviderContext::default();
+    let nominal = crate::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
+    let same = crate::parser::parse_type_expr_str("KmsKeyArn", &context).unwrap();
+    let different = crate::parser::parse_type_expr_str("Arn", &context).unwrap();
+    let nominal = resolve_type_expr(&nominal, &context).unwrap();
+    let same = resolve_type_expr(&same, &context).unwrap();
+    let different = resolve_type_expr(&different, &context).unwrap();
+    let source = lift_type_expr(&nominal).expect("unloaded nominal must retain its identity");
+    let same = lift_type_expr(&same).unwrap();
+    let different = lift_type_expr(&different).unwrap();
+    let source = crate::schema::TypeInSchema::schemaless(&source);
+    assert!(source.is_assignable_to(crate::schema::TypeInSchema::schemaless(&same)));
+    assert_eq!(
+        source.assignment_to(crate::schema::TypeInSchema::schemaless(&different)),
+        crate::schema::TypeAssignability::Mismatch
+    );
+    for sink in [AttributeType::string(), AttributeType::int()] {
+        assert_eq!(
+            crate::schema::TypeInSchema::schemaless(&sink).assignment_to(source),
+            crate::schema::TypeAssignability::Mismatch
+        );
+        assert!(matches!(
+            source.assignment_to(crate::schema::TypeInSchema::schemaless(&sink)),
+            crate::schema::TypeAssignability::Unchecked(
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded
+            )
+        ));
+    }
+}
+
+#[test]
+fn unloaded_schema_nominals_compare_whole_identity_and_round_trip() {
+    let nominal = |identity: TypeIdentity| {
+        crate::parser::resolve_custom_type_identity(&identity, &ProviderContext::default())
+            .unwrap()
+            .unwrap()
+    };
+    let original = nominal(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn"));
+    let decoded: TypeExpr =
+        serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+    assert_eq!(decoded, original);
+    let source = lift_type_expr(&original).unwrap();
+    let source = crate::schema::TypeInSchema::schemaless(&source);
+    for (identity, assignable) in [
+        (TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn"), true),
+        (
+            TypeIdentity::new(Some("gcp"), ["iam", "Role"], "Arn"),
+            false,
+        ),
+        (
+            TypeIdentity::new(Some("aws"), ["acm", "Certificate"], "Arn"),
+            false,
+        ),
+        (
+            TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn"),
+            true,
+        ),
+        (TypeIdentity::bare("Arn"), true),
+    ] {
+        let sink = lift_type_expr(&nominal(identity)).unwrap();
+        let result = source.assignment_to(crate::schema::TypeInSchema::schemaless(&sink));
+        assert_eq!(
+            result,
+            if assignable {
+                crate::schema::TypeAssignability::Assignable
+            } else {
+                crate::schema::TypeAssignability::Mismatch
+            }
+        );
+    }
+}
+
+#[test]
+fn unloaded_schema_nominals_use_identity_relation_with_loaded_types() {
+    use crate::schema::{TypeAssignability, TypeInSchema};
+
+    let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
+    let nominal =
+        crate::parser::resolve_custom_type_identity(&identity, &ProviderContext::default())
+            .unwrap()
+            .unwrap();
+    let unloaded = lift_type_expr(&nominal).unwrap();
+    let unloaded = TypeInSchema::schemaless(&unloaded);
+    // No scalar kind is required to compare the same nominal identity.
+    for loaded in [
+        AttributeType::refined_string(Some(identity.clone()), None, None, None),
+        AttributeType::refined_int(Some(identity.clone()), None),
+        AttributeType::enum_(identity.clone(), None, Vec::new(), None, None),
+    ] {
+        let loaded = TypeInSchema::schemaless(&loaded);
+        assert_eq!(
+            unloaded.assignment_to(loaded),
+            TypeAssignability::Assignable
+        );
+        assert_eq!(
+            loaded.assignment_to(unloaded),
+            TypeAssignability::Assignable
+        );
+    }
+    let wider = AttributeType::refined_string(Some(TypeIdentity::bare("Arn")), None, None, None);
+    let wider = TypeInSchema::schemaless(&wider);
+    assert_eq!(unloaded.assignment_to(wider), TypeAssignability::Assignable);
+    assert_eq!(wider.assignment_to(unloaded), TypeAssignability::Mismatch);
+    let other = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
+    let other = TypeInSchema::schemaless(&other);
+    assert_eq!(unloaded.assignment_to(other), TypeAssignability::Mismatch);
+    assert_eq!(other.assignment_to(unloaded), TypeAssignability::Mismatch);
+
+    let nominal = crate::parser::resolve_custom_type_identity(
+        &TypeIdentity::new(Some("test"), ["Counter"], "PositiveInt"),
+        &ProviderContext::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let unloaded = lift_type_expr(&nominal).unwrap();
+    let unloaded = TypeInSchema::schemaless(&unloaded);
+    let builtin = crate::schema::types::positive_int();
+    let builtin = TypeInSchema::schemaless(&builtin);
+    assert_eq!(
+        unloaded.assignment_to(builtin),
+        TypeAssignability::Assignable
+    );
+    assert_eq!(builtin.assignment_to(unloaded), TypeAssignability::Mismatch);
+}
+
+#[test]
+fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
+    let context = ProviderContext::default();
+    let parsed = crate::parser::parse(
+        "arguments { count: Count }\nattributes { next: Int = (count + 1) * 2 }",
+        &context,
+    )
+    .unwrap();
+    validate_resource_ref_types_for_test(&parsed, &SchemaRegistry::new())
+        .expect("unloaded operand kinds defer while retaining the Int result shape");
+    let ty = resolve_type_expr(&TypeExpr::Simple("count".into()), &context).unwrap();
+    let value: Value = Value::Concrete(ConcreteValue::Int(3));
+    assert!(matches!(
+        resolve_parameter_type_for_check(&ty, &context).unwrap(),
+        Some(ResolvedParameterType::Value(TypeExpr::UnloadedSchemaType(
+            _
+        )))
+    ));
+    let error = typecheck::check_type_expr_value_with_context(
+        &ty,
+        &value,
+        &context,
+        typecheck::TypecheckInference::Unavailable,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, typecheck::TypeExprValueError::CustomTypeValidation { error, .. }
+        if matches!(*error, crate::parser::CustomTypeValidationError::ProvidersNotLoaded))
+    );
+    let lifted = lift_type_expr(&ty).unwrap();
+    assert!(matches!(
+        crate::provider::canonicalize_custom_type_value(
+            &lifted,
+            &RuntimeValue::Concrete(RuntimeConcreteValue::Int(3))
+        ),
+        Err(crate::provider::CustomTypeCanonicalizationError::ProvidersNotLoaded)
+    ));
+    assert!(matches!(
+        crate::protocol_convert::attribute_type_to_protocol(&lifted),
+        Err(
+            crate::protocol_convert::ProtocolConvertError::NonWireAttributeType {
+                kind: "UnloadedSchemaType"
+            }
+        )
+    ));
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        TypeIdentity::bare("Count"),
+        crate::schema::RefinedScalarKind::Int,
+    );
+    let loaded = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([owned.clone()]),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..ProviderContext::default()
+    };
+    assert_eq!(
+        resolve_type_expr(&ty, &loaded).unwrap(),
+        TypeExpr::SchemaType { owned }
+    );
+    assert!(
+        resolve_type_expr(
+            &resolve_type_expr(&TypeExpr::Simple("typo".into()), &context).unwrap(),
+            &loaded,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn lift_type_expr_preserves_every_builtin_scalar_kind() {
     for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
         let expr = TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind));
-        let lifted = lift_type_expr(&expr, &SchemaRegistry::new()).unwrap();
+        let lifted = lift_type_expr(&expr).unwrap();
         let expected = match kind {
             crate::schema::RefinedScalarKind::String => AttributeType::string(),
             crate::schema::RefinedScalarKind::Int => AttributeType::int(),
@@ -989,6 +1254,7 @@ fn lift_type_expr_maps_schema_identity_directionally() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "aws",
             TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let vpc_id = AttributeType::refined_string(
@@ -1026,8 +1292,7 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
         TypeExpr::String,
         TypeExpr::Int,
     ])))));
-    let lifted = lift_type_expr(&structured, &SchemaRegistry::new())
-        .expect("container types must lift recursively");
+    let lifted = lift_type_expr(&structured).expect("container types must lift recursively");
     let expected = AttributeType::list(AttributeType::map(AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::int(),
@@ -1043,8 +1308,7 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
         TypeExpr::Ref(resource_ref.clone()),
         TypeExpr::DottedUnresolved(resource_ref),
     ] {
-        let handle = lift_type_expr(&type_expr, &SchemaRegistry::new())
-            .expect("resource paths lift to typed handles");
+        let handle = lift_type_expr(&type_expr).expect("resource paths lift to typed handles");
         assert!(
             crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
                 crate::schema::TypeInSchema::schemaless(&AttributeType::string())
@@ -1056,11 +1320,8 @@ fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
             )
         );
     }
-    let literal = lift_type_expr(
-        &TypeExpr::StringLiteral("x".to_string()),
-        &SchemaRegistry::new(),
-    )
-    .expect("string literals lift to a closed string set");
+    let literal = lift_type_expr(&TypeExpr::StringLiteral("x".to_string()))
+        .expect("string literals lift to a closed string set");
     assert!(
         crate::schema::TypeInSchema::schemaless(&literal).is_assignable_to(
             crate::schema::TypeInSchema::schemaless(&AttributeType::string())
@@ -3732,6 +3993,7 @@ fn rendered_typecheck_result_schema_type_accepts_string() {
     let owned = crate::parser::OwnedTypeIdentity::provider(
         "awscc",
         TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+        crate::schema::RefinedScalarKind::String,
     );
     let schema_type = TypeExpr::SchemaType {
         owned: owned.clone(),
@@ -3751,6 +4013,7 @@ fn rendered_typecheck_result_schema_type_rejects_bool() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "awscc",
             TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let result = rendered_typecheck_result(
@@ -3768,6 +4031,7 @@ fn rendered_typecheck_result_schema_type_rejects_int() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "awscc",
             TypeIdentity::from_schema_type("awscc", "ec2", "VpcId"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let result = rendered_typecheck_result(
@@ -4843,7 +5107,11 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
 
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let schema_type = TypeExpr::SchemaType {
-        owned: crate::parser::OwnedTypeIdentity::provider("test", identity.clone()),
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::String,
+        ),
     };
     let enum_type = AttributeType::enum_(
         identity.clone(),
@@ -4857,7 +5125,11 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
     let declaration = enum_type.clone();
     let config = loaded_context_for_test(ProviderContext {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
-            HashSet::from([crate::parser::OwnedTypeIdentity::provider("test", identity)]),
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "test",
+                identity,
+                crate::schema::RefinedScalarKind::String,
+            )]),
             Box::new(move |target, value| {
                 let canonical =
                     crate::provider::canonicalize_custom_type_value(&declaration, value)
@@ -5173,6 +5445,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let mut source = make_composition("inner", &[]);
@@ -5230,6 +5503,7 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let mut source = make_composition("source", &[]);
@@ -5319,6 +5593,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let mut parsed = empty_parsed();
@@ -5367,6 +5642,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "aws",
             TypeIdentity::from_schema_type("aws", "ec2.SecurityGroup", "Id"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let mut parsed = empty_parsed();
@@ -5436,6 +5712,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
         owned: crate::parser::OwnedTypeIdentity::provider(
             "aws",
             TypeIdentity::from_schema_type("aws", path, "Id"),
+            crate::schema::RefinedScalarKind::String,
         ),
     };
     let mut source = make_composition("source", &[]);
@@ -5543,6 +5820,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
                     owned: crate::parser::OwnedTypeIdentity::provider(
                         "aws",
                         TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id"),
+                        crate::schema::RefinedScalarKind::String,
                     ),
                 }))),
                 default: None,
@@ -6067,6 +6345,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
                 owned: crate::parser::OwnedTypeIdentity::provider(
                     "mock",
                     TypeIdentity::bare("RecoveryProbe"),
+                    crate::schema::RefinedScalarKind::String,
                 ),
             },
         ))),
@@ -7448,7 +7727,11 @@ fn mode_known() -> HashSet<String> {
 fn mode_context() -> LoadedProviderContext {
     let identity = crate::schema::enum_identity("Mode", Some("test.r"));
     context_with_accepting_custom_type_resolver(HashSet::from([
-        crate::parser::OwnedTypeIdentity::provider("test", identity),
+        crate::parser::OwnedTypeIdentity::provider(
+            "test",
+            identity,
+            crate::schema::RefinedScalarKind::String,
+        ),
     ]))
 }
 
@@ -8437,7 +8720,8 @@ fn resolve_type_expr_keeps_schema_owner_separate_from_identity_namespace() {
     use crate::parser::{OwnedTypeIdentity, ResourceTypePath, TypeExpr};
 
     let identity = TypeIdentity::new(Some("aws"), ["ec2"], "VpcId");
-    let owned = OwnedTypeIdentity::provider("awscc", identity);
+    let owned =
+        OwnedTypeIdentity::provider("awscc", identity, crate::schema::RefinedScalarKind::String);
     let ctx = context_with_known_custom_types(HashSet::from([owned.clone()]));
 
     let resolved = resolve_type_expr(
@@ -8456,8 +8740,12 @@ fn resolve_type_expr_keeps_every_owner_of_the_same_semantic_identity() {
 
     let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
     let ctx = context_with_known_custom_types(HashSet::from([
-        OwnedTypeIdentity::provider("aws", identity.clone()),
-        OwnedTypeIdentity::provider("awscc", identity),
+        OwnedTypeIdentity::provider(
+            "aws",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::String,
+        ),
+        OwnedTypeIdentity::provider("awscc", identity, crate::schema::RefinedScalarKind::String),
     ]));
 
     let resolved = resolve_type_expr(
@@ -8479,8 +8767,12 @@ fn consumer_export_resolution_retains_a_multi_owner_identity() {
 
     let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
     let ctx = context_with_known_custom_types(HashSet::from([
-        OwnedTypeIdentity::provider("aws", identity.clone()),
-        OwnedTypeIdentity::provider("awscc", identity),
+        OwnedTypeIdentity::provider(
+            "aws",
+            identity.clone(),
+            crate::schema::RefinedScalarKind::String,
+        ),
+        OwnedTypeIdentity::provider("awscc", identity, crate::schema::RefinedScalarKind::String),
     ]));
     let parsed = crate::parser::parse(
         "exports {\n  roles: list(aws.iam.Role.Arn) = [\"arn:one\"]\n}\n",
@@ -8507,7 +8799,11 @@ fn consumer_export_resolution_retains_a_multi_owner_identity() {
 fn resolve_type_expr_promotes_a_bare_provider_type_to_an_owned_key() {
     use crate::parser::{OwnedTypeIdentity, TypeExpr};
 
-    let owned = OwnedTypeIdentity::provider("awscc", TypeIdentity::bare("VpcId"));
+    let owned = OwnedTypeIdentity::provider(
+        "awscc",
+        TypeIdentity::bare("VpcId"),
+        crate::schema::RefinedScalarKind::String,
+    );
     let ctx = context_with_known_custom_types(HashSet::from([owned.clone()]));
 
     let resolved = resolve_type_expr(&TypeExpr::Simple("vpc_id".to_string()), &ctx)

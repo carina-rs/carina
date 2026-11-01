@@ -6009,6 +6009,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             owned: carina_core::parser::OwnedTypeIdentity::provider(
                 "aws",
                 carina_core::schema::TypeIdentity::from_schema_type("aws", path, "Id"),
+                carina_core::schema::RefinedScalarKind::String,
             ),
         }
     }

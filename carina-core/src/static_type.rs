@@ -59,6 +59,12 @@ pub enum StaticTypeResolutionError {
     UnknownCustomType { name: String },
     #[error("unknown custom type '{name}'; suggestion: use '{suggestion}'")]
     UnknownCustomTypeWithSuggestion { name: String, suggestion: String },
+    #[error("custom type '{name}' has conflicting scalar kinds: {first_kind} and {second_kind}")]
+    ConflictingScalarKinds {
+        name: String,
+        first_kind: crate::schema::RefinedScalarKind,
+        second_kind: crate::schema::RefinedScalarKind,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +126,10 @@ pub enum NotInferableReason {
     NonInferableBinding { binding: String },
     #[error("schema is unavailable for binding `{binding}`")]
     SchemaUnavailable { binding: String },
+    #[error("provider schema is unavailable for type `{identity}`")]
+    CustomTypeSchemaUnavailable {
+        identity: crate::schema::TypeIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

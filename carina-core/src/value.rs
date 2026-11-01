@@ -5124,6 +5124,7 @@ fn is_string_or_list_of_strings(
             return false;
         };
         match &member.as_attr().kind {
+            AttrTypeKind::UnloadedSchemaType(_) => return false,
             AttrTypeKind::String { .. } => has_string = true,
             AttrTypeKind::List {
                 element_type: inner,
@@ -5821,6 +5822,7 @@ fn type_contains_enum(
             return false;
         }
         let contains = match &resolved.kind {
+            AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::Enum { .. } => true,
             AttrTypeKind::List { element_type, .. } => walk(element_type, defs, visited),
             AttrTypeKind::Map { key, value } => {
@@ -5942,6 +5944,11 @@ fn canonicalize_without_fit<'a, H: PlaceholderKind, P: CanonicalizationErrorPoli
     }
 
     match (value, shape) {
+        (value, crate::schema::Shape::UnloadedSchemaType(_)) => error_policy
+            .canonicalization_failed(
+                value,
+                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into(),
+            ),
         (
             Value::Concrete(ConcreteValue::List(items)),
             crate::schema::Shape::List {
