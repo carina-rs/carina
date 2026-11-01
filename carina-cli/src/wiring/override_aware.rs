@@ -97,8 +97,7 @@ impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
 {
     pub(crate) fn into_expanded_for_test(
         self,
-    ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::LeftoverPlaceholders>
-    {
+    ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::ExpansionError> {
         let Self {
             parsed,
             unresolved,
@@ -106,16 +105,15 @@ impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
         } = self;
         let unresolved = unresolved
             .into_iter()
-            .map(Resource::into_expanded)
-            .collect::<Result<_, _>>()
-            .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
+            .map(|resource| resource.into_expanded(&carina_core::schema::SchemaRegistry::new()))
+            .collect::<Result<_, _>>()?;
         let prefix_fallbacks = prefix_fallbacks
             .into_iter()
             .map(|attributes| carina_core::resource::into_expanded_value_map(attributes, None))
             .collect::<Result<_, _>>()
             .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
         Ok(CanonicalResourcePair {
-            parsed: parsed.into_expanded()?,
+            parsed: parsed.into_expanded(&carina_core::schema::SchemaRegistry::new())?,
             unresolved,
             prefix_fallbacks,
         })

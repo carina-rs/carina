@@ -6183,7 +6183,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
                 Value::Concrete(ConcreteValue::String(identifier.into())),
             )
             .resolve_root(&RootScope::new())
-            .into_expanded()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
             .expect("resource fixture contains no parser placeholder");
         ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[resource],
@@ -8543,6 +8543,7 @@ fn module_reference_coverage_uses_typed_call_identity_not_display_text() {
                 kind: kind.clone(),
             },
             display_path: ModuleCallDiagnosticPath::Authored(path.clone()),
+            declared_constraint: false,
         }));
     let resolver_error = ModuleCallRefError {
         call_label: "child".to_string(),

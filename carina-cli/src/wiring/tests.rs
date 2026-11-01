@@ -53,7 +53,9 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
         &SchemaRegistry::new(),
     )
     .unwrap();
-    let mut parsed = parsed.into_expanded().unwrap();
+    let mut parsed = parsed
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .unwrap();
     parsed.warnings = vec![
         carina_core::parser::ParseWarning {
             file: Some(source.display().to_string()),
@@ -796,7 +798,7 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
     assert_eq!(parsed.state_blocks.len(), 1, "fixture must parse one move");
     let provider_configs = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("anonymous move fixture has no parser placeholders");
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         vec![Box::new(RawEnumStateFactory)],
@@ -1124,7 +1126,7 @@ query {}
     )
     .expect("anonymous calls must expand");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("anonymous module-call fixture has no parser placeholders");
 
     assert_eq!(
@@ -1216,7 +1218,7 @@ outer {{}}
     )
     .expect("nested calls must expand");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("nested module-call fixture has no parser placeholders");
 
     let outer = parsed
@@ -2038,7 +2040,7 @@ fn resolved_provider_configs_from_resolved<
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let parsed = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider config must contain no parser placeholders");
     let remote = remote
         .iter()
@@ -2564,7 +2566,7 @@ where
 {
     let parsed = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider config must contain no parser placeholders");
     carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
@@ -4824,7 +4826,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("moved-block fixture has no parser placeholders");
 
     let from = ResourceId::with_provider_identity("awscc", "s3.Bucket", "old_bucket", None);
@@ -4895,7 +4897,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("in-flight moved-block fixture has no parser placeholders");
     let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
     let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
@@ -4986,7 +4988,7 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("orphan moved-block fixture has no parser placeholders");
 
     let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
@@ -5869,7 +5871,7 @@ moved {
     let parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("moved collision fixture has no parser placeholders");
     let state_file = Some(bucket_state_file(&["live"]));
     let StateBlockResolution {
@@ -5941,7 +5943,7 @@ removed {
     let parsed = parse(source, &ProviderContext::default()).expect("parse removed fixture");
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("removed collision fixture has no parser placeholders");
     let state_file = {
         let mut sf = StateFile::new();
@@ -6078,7 +6080,7 @@ fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("deposed moved-block fixture has no parser placeholders");
     let from = bucket_id("old_bucket");
     let to = bucket_id("new_bucket");
@@ -6949,7 +6951,7 @@ fn legacy_loop_detector_resolves_ref_only_ambiguity_through_state_view() {
     );
     let providers = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let mut parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("legacy-loop fixture has no parser placeholders");
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let canonical = canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas())
@@ -7064,7 +7066,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
 
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("prelude plan fixture has no parser placeholders");
     let mut resolved_resources = expanded.resources.clone(); // allow: direct — fixture test inspection
     let canonical =
@@ -7275,7 +7277,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     );
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("late deferred-loop fixture has no parser placeholders");
 
     let anonymous_loop = expanded
@@ -7897,7 +7899,7 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
         .expect("anonymous destination assigned")
         .to_string();
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("legacy-loop fixture has no leftover parser placeholders");
 
     let exact_legacy = ResourceState::try_applied(
@@ -8490,7 +8492,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .clone();
     let expanded_provider_configs = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("cascade fixture has no leftover parser placeholders")
         .providers;
     let state_subnet_identity = concrete_subnet_identity(ctx, &expanded_provider_configs);
@@ -8706,7 +8708,7 @@ moved {{
     let parsed = parse(&source, &ProviderContext::default()).expect("parse fixture");
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("five-move fixture has no parser placeholders");
     let StateBlockResolution {
         claims: state_block_claims,
@@ -10013,7 +10015,7 @@ fn assert_two_loop_identity_aggregate(error: AppError) {
 fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut parsed = two_anonymous_loop_collision_file()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("identity fixture has no leftover parser placeholders");
 
     let error = <carina_core::parser::ExpandedParsedFile as DeferredExpansionTarget<
@@ -10046,7 +10048,7 @@ fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_error
 fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
     let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let parsed = two_anonymous_loop_collision_file()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("identity fixture has no leftover parser placeholders");
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(parsed.resources, ctx.schemas()),
@@ -10415,7 +10417,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("deferred map loop parses")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("deferred map-loop fixture has no parser placeholders");
     let children = carina_core::parser::expand_deferred_children(
         &parsed.deferred_for_expressions()[0],
@@ -10875,7 +10877,10 @@ let records = for (_, opt) in cert.domain_validation_options {{
 "#,
     );
     let parsed = parse(&source, &ProviderContext::default()).expect("parse state-block fixture");
-    let expanded = parsed.clone().into_expanded().unwrap();
+    let expanded = parsed
+        .clone()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .unwrap();
     assert_eq!(expanded.deferred_for_expressions().len(), 1);
 
     let mut state_file = StateFile::new();
@@ -11125,7 +11130,7 @@ mod expand_same_config_deferred_for_tests {
             "fixture should carry the single-quoted interpolation-like warning"
         );
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("warning fixture has no leftover parser placeholders");
 
         let out = expand_same_config_deferred_for(
@@ -11155,7 +11160,7 @@ mod expand_same_config_deferred_for_tests {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
         let parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let mut parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("warning fixture has no leftover parser placeholders");
         let state_file = None;
         let schemas = SchemaRegistry::new();
@@ -11291,7 +11296,7 @@ mod expand_same_config_deferred_for_tests {
         );
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11364,7 +11369,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11416,7 +11421,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11453,7 +11458,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11498,7 +11503,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let pre_order: Vec<String> = sorted.iter().map(|r| r.id.to_string()).collect();
@@ -11556,7 +11561,7 @@ mod expand_same_config_deferred_for_tests {
         // stay in residual (carina#3128 placeholder), NOT mis-expand.
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty_states: HashMap<ResourceId, State> = HashMap::new();
@@ -11621,7 +11626,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(src, &ProviderContext::default()).expect("parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("upstream deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11708,7 +11713,7 @@ mod expand_same_config_deferred_for_tests {
         )]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("chained deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11816,7 +11821,7 @@ mod expand_same_config_deferred_for_tests {
         )]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("moved-target fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11938,7 +11943,7 @@ mod expand_same_config_deferred_for_tests {
         ]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("multi-child deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -12063,7 +12068,7 @@ mod expand_same_config_deferred_for_tests {
         ]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("already-refreshed fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 

@@ -40,6 +40,7 @@ fn assert_module_prefixed_addresses(addresses: BTreeSet<String>) {
 
 #[test]
 fn current_state_binding_addresses_and_resolved_dependencies_round_trip() {
+    assert_eq!(StateFile::CURRENT_VERSION, 21);
     let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v21.state.json");
     let original: Value = serde_json::from_str(fixture).expect("fixture must contain valid JSON");
     let decoded: StateFile = check_and_migrate(fixture)
@@ -59,7 +60,7 @@ fn current_state_binding_addresses_and_resolved_dependencies_round_trip() {
 
 #[test]
 fn current_saved_plan_binding_addresses_and_resolved_dependencies_round_trip() {
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v38.plan.json");
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v39.plan.json");
     assert_json_value_round_trip::<PlanFile>(fixture);
 
     let decoded: PlanFile = serde_json::from_str(fixture).expect("fixture must deserialize");
@@ -76,6 +77,88 @@ fn current_saved_plan_binding_addresses_and_resolved_dependencies_round_trip() {
         .collect();
 
     assert_module_prefixed_addresses(addresses);
+}
+
+#[test]
+fn main_v38_saved_plans_require_regeneration_before_payload_decode() {
+    for (name, fixture) in [
+        (
+            "carina.v38.plan.json",
+            include_str!("fixtures/module_binding_wire_compat/carina.v38.plan.json"),
+        ),
+        (
+            "carina.update-delete.v38.plan.json",
+            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v38.plan.json"),
+        ),
+    ] {
+        let wire: Value = serde_json::from_str(fixture).unwrap();
+        assert_eq!(wire["version"], 38);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(name);
+        std::fs::write(&path, fixture).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(directory.path())
+            .env("NO_COLOR", "1")
+            .args(["apply", "--auto-approve", "--lock=false"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "old plan must not apply");
+        assert!(
+            stderr.contains("Unsupported plan file version: 38 (expected 39)")
+                && stderr.contains("plan --out"),
+            "version rejection must precede typed payload decoding: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn v39_plans_accept_resolved_scalar_template_directives() {
+    use carina_core::resource::LoopDirective;
+
+    assert_eq!(PlanFile::CURRENT_VERSION, 39);
+    for fixture in [
+        include_str!("fixtures/module_binding_wire_compat/carina.v39.plan.json"),
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v39.plan.json"),
+    ] {
+        // Format 39 retains the scalar loop-directive encoding accepted by
+        // main format 38 alongside complete dependency addresses.
+        let mut wire: Value = serde_json::from_str(fixture).unwrap();
+        wire["version"] = serde_json::json!(PlanFile::CURRENT_VERSION);
+        let plan: PlanFile = serde_json::from_value(wire.clone()).unwrap();
+        let mut templates = 0;
+        for effect in plan.plan.effects() {
+            let template = match effect {
+                UnresolvedSavedEffect::DeferredCreate(payload) => &payload.template,
+                UnresolvedSavedEffect::DeferredReplace(payload) => &payload.template,
+                UnresolvedSavedEffect::Read { .. }
+                | UnresolvedSavedEffect::Create(_)
+                | UnresolvedSavedEffect::ResumeCreate { .. }
+                | UnresolvedSavedEffect::Update { .. }
+                | UnresolvedSavedEffect::Delete { .. }
+                | UnresolvedSavedEffect::Import { .. }
+                | UnresolvedSavedEffect::Remove { .. }
+                | UnresolvedSavedEffect::Move { .. }
+                | UnresolvedSavedEffect::ReleaseListKeys { .. }
+                | UnresolvedSavedEffect::Wait { .. } => continue,
+            };
+            templates += 1;
+            assert!(matches!(
+                template.template_resource().directives().force_delete,
+                LoopDirective::Resolved(_)
+            ));
+            assert!(matches!(
+                template
+                    .template_resource()
+                    .directives()
+                    .create_before_destroy,
+                LoopDirective::Resolved(_)
+            ));
+        }
+        assert_eq!(templates, 2);
+        assert_eq!(serde_json::to_value(plan).unwrap(), wire);
+    }
 }
 
 fn json_dependency_identities(value: &Value) -> BTreeSet<String> {
@@ -104,16 +187,16 @@ fn json_dependency_identities(value: &Value) -> BTreeSet<String> {
 fn current_deferred_effects_keep_bound_wire_ids_and_typed_template_addresses() {
     for (fixture, variant) in [
         (
-            include_str!("fixtures/module_binding_wire_compat/carina.v38.plan.json"),
+            include_str!("fixtures/module_binding_wire_compat/carina.v39.plan.json"),
             "DeferredCreate",
         ),
         (
-            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v38.plan.json"),
+            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v39.plan.json"),
             "DeferredReplace",
         ),
     ] {
         let round_tripped = assert_json_value_round_trip::<PlanFile>(fixture);
-        assert_eq!(round_tripped["version"], 38);
+        assert_eq!(round_tripped["version"], 39);
         let deferred = round_tripped["plan"]["effects"]
             .as_array()
             .expect("saved effects")
@@ -153,7 +236,7 @@ fn current_deferred_effects_keep_bound_wire_ids_and_typed_template_addresses() {
 #[test]
 fn current_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
     let fixture =
-        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v38.plan.json");
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v39.plan.json");
     let round_tripped = assert_json_value_round_trip::<PlanFile>(fixture);
 
     let wait_bindings = round_tripped["wait_bindings"]

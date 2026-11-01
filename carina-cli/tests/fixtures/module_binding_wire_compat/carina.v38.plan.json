@@ -42,13 +42,13 @@
               }
             },
             "binding": "direct.lookup",
+            "dependency_bindings": [],
             "module_source": {
               "Module": {
                 "name": "app_module",
                 "instance": "direct"
               }
-            },
-            "dependencies": null
+            }
           }
         }
       },
@@ -73,13 +73,13 @@
               }
             },
             "binding": "looped[0].lookup",
+            "dependency_bindings": [],
             "module_source": {
               "Module": {
                 "name": "app_module",
                 "instance": "looped[0]"
               }
-            },
-            "dependencies": null
+            }
           }
         }
       },
@@ -104,8 +104,8 @@
           },
           "prefixes": {},
           "binding": "root",
-          "module_source": null,
-          "dependencies": null
+          "dependency_bindings": [],
+          "module_source": null
         }
       },
       {
@@ -129,13 +129,13 @@
           },
           "prefixes": {},
           "binding": "direct.deferred_source",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
               "instance": "direct"
             }
-          },
-          "dependencies": null
+          }
         }
       },
       {
@@ -159,13 +159,13 @@
           },
           "prefixes": {},
           "binding": "direct.seed",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
               "instance": "direct"
             }
-          },
-          "dependencies": null
+          }
         }
       },
       {
@@ -190,41 +190,21 @@
             "create_before_destroy": false,
             "prevent_destroy": {
               "kind": "unspecified"
-            }
+            },
+            "depends_on": [
+              "direct.seed",
+              "root"
+            ]
           },
           "prefixes": {},
           "binding": "direct.consumer",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
               "instance": "direct"
             }
-          },
-          "dependencies": null,
-          "explicit_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "direct.seed"
-            },
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "root"
-            }
-          ],
-          "persisted_explicit_destroy_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "direct.seed"
-            },
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "root"
-            }
-          ]
+          }
         }
       },
       {
@@ -244,10 +224,14 @@
             "create_before_destroy": false,
             "prevent_destroy": {
               "kind": "unspecified"
-            }
+            },
+            "depends_on": [
+              "direct.consumer"
+            ]
           },
           "prefixes": {},
           "binding": "direct.nested.leaf",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
@@ -255,22 +239,7 @@
               "scope_key": "direct.nested",
               "scope_description": "module instance 'direct.nested'"
             }
-          },
-          "dependencies": null,
-          "explicit_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "direct.consumer"
-            }
-          ],
-          "persisted_explicit_destroy_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "direct.consumer"
-            }
-          ]
+          }
         }
       },
       {
@@ -294,13 +263,13 @@
           },
           "prefixes": {},
           "binding": "looped[0].deferred_source",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
               "instance": "looped[0]"
             }
-          },
-          "dependencies": null
+          }
         }
       },
       {
@@ -324,13 +293,13 @@
           },
           "prefixes": {},
           "binding": "looped[0].seed",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
               "instance": "looped[0]"
             }
-          },
-          "dependencies": null
+          }
         }
       },
       {
@@ -355,41 +324,21 @@
             "create_before_destroy": false,
             "prevent_destroy": {
               "kind": "unspecified"
-            }
+            },
+            "depends_on": [
+              "looped[0].seed",
+              "root"
+            ]
           },
           "prefixes": {},
           "binding": "looped[0].consumer",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
               "instance": "looped[0]"
             }
-          },
-          "dependencies": null,
-          "explicit_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "looped[0].seed"
-            },
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "root"
-            }
-          ],
-          "persisted_explicit_destroy_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "looped[0].seed"
-            },
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "root"
-            }
-          ]
+          }
         }
       },
       {
@@ -409,10 +358,14 @@
             "create_before_destroy": false,
             "prevent_destroy": {
               "kind": "unspecified"
-            }
+            },
+            "depends_on": [
+              "looped[0].consumer"
+            ]
           },
           "prefixes": {},
           "binding": "looped[0].nested.leaf",
+          "dependency_bindings": [],
           "module_source": {
             "Module": {
               "name": "app_module",
@@ -420,22 +373,7 @@
               "scope_key": "looped[0].nested",
               "scope_description": "module instance 'looped[0].nested'"
             }
-          },
-          "dependencies": null,
-          "explicit_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "looped[0].consumer"
-            }
-          ],
-          "persisted_explicit_destroy_dependencies": [
-            {
-              "provider": "mock",
-              "resource_type": "test.resource",
-              "identity": "looped[0].consumer"
-            }
-          ]
+          }
         }
       },
       {
@@ -516,42 +454,14 @@
               },
               "prefixes": {},
               "binding": "direct.children[?]",
+              "dependency_bindings": [],
               "module_source": {
                 "Module": {
                   "name": "app_module",
                   "instance": "direct"
                 }
-              },
-              "dependencies": null
+              }
             }
-          },
-          "dependency_template": {
-            "value": [
-              {
-                "provider": "mock",
-                "resource_type": "test.resource",
-                "identity": "direct.deferred_source"
-              }
-            ],
-            "explicit": [],
-            "persisted_value": [
-              {
-                "provider": "mock",
-                "resource_type": "test.resource",
-                "identity": "direct.deferred_source"
-              }
-            ],
-            "persisted_explicit": [],
-            "reads": [
-              {
-                "id": {
-                  "provider": "mock",
-                  "resource_type": "test.resource",
-                  "identity": "direct.deferred_source"
-                },
-                "read": "Unknown"
-              }
-            ]
           }
         }
       },
@@ -633,42 +543,14 @@
               },
               "prefixes": {},
               "binding": "looped[0].children[?]",
+              "dependency_bindings": [],
               "module_source": {
                 "Module": {
                   "name": "app_module",
                   "instance": "looped[0]"
                 }
-              },
-              "dependencies": null
+              }
             }
-          },
-          "dependency_template": {
-            "value": [
-              {
-                "provider": "mock",
-                "resource_type": "test.resource",
-                "identity": "looped[0].deferred_source"
-              }
-            ],
-            "explicit": [],
-            "persisted_value": [
-              {
-                "provider": "mock",
-                "resource_type": "test.resource",
-                "identity": "looped[0].deferred_source"
-              }
-            ],
-            "persisted_explicit": [],
-            "reads": [
-              {
-                "id": {
-                  "provider": "mock",
-                  "resource_type": "test.resource",
-                  "identity": "looped[0].deferred_source"
-                },
-                "read": "Unknown"
-              }
-            ]
           }
         }
       }
@@ -695,8 +577,8 @@
       },
       "prefixes": {},
       "binding": "root",
-      "module_source": null,
-      "dependencies": null
+      "dependency_bindings": [],
+      "module_source": null
     },
     {
       "id": {
@@ -718,13 +600,13 @@
       },
       "prefixes": {},
       "binding": "direct.deferred_source",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -746,13 +628,13 @@
       },
       "prefixes": {},
       "binding": "direct.seed",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -775,17 +657,21 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "direct.seed",
+          "root"
+        ]
       },
       "prefixes": {},
       "binding": "direct.consumer",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -803,10 +689,14 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "direct.consumer"
+        ]
       },
       "prefixes": {},
       "binding": "direct.nested.leaf",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
@@ -814,8 +704,7 @@
           "scope_key": "direct.nested",
           "scope_description": "module instance 'direct.nested'"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -837,13 +726,13 @@
       },
       "prefixes": {},
       "binding": "looped[0].deferred_source",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -865,13 +754,13 @@
       },
       "prefixes": {},
       "binding": "looped[0].seed",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -894,17 +783,21 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "looped[0].seed",
+          "root"
+        ]
       },
       "prefixes": {},
       "binding": "looped[0].consumer",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -922,10 +815,14 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "looped[0].consumer"
+        ]
       },
       "prefixes": {},
       "binding": "looped[0].nested.leaf",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
@@ -933,8 +830,7 @@
           "scope_key": "looped[0].nested",
           "scope_description": "module instance 'looped[0].nested'"
         }
-      },
-      "dependencies": null
+      }
     }
   ],
   "unresolved_resources": [
@@ -958,8 +854,8 @@
       },
       "prefixes": {},
       "binding": "root",
-      "module_source": null,
-      "dependencies": null
+      "dependency_bindings": [],
+      "module_source": null
     },
     {
       "id": {
@@ -981,13 +877,13 @@
       },
       "prefixes": {},
       "binding": "direct.deferred_source",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1009,13 +905,13 @@
       },
       "prefixes": {},
       "binding": "direct.seed",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1038,17 +934,21 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "direct.seed",
+          "root"
+        ]
       },
       "prefixes": {},
       "binding": "direct.consumer",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1066,10 +966,14 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "direct.consumer"
+        ]
       },
       "prefixes": {},
       "binding": "direct.nested.leaf",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
@@ -1077,8 +981,7 @@
           "scope_key": "direct.nested",
           "scope_description": "module instance 'direct.nested'"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1100,13 +1003,13 @@
       },
       "prefixes": {},
       "binding": "looped[0].deferred_source",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1128,13 +1031,13 @@
       },
       "prefixes": {},
       "binding": "looped[0].seed",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1157,17 +1060,21 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "looped[0].seed",
+          "root"
+        ]
       },
       "prefixes": {},
       "binding": "looped[0].consumer",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1185,10 +1092,14 @@
         "create_before_destroy": false,
         "prevent_destroy": {
           "kind": "unspecified"
-        }
+        },
+        "depends_on": [
+          "looped[0].consumer"
+        ]
       },
       "prefixes": {},
       "binding": "looped[0].nested.leaf",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
@@ -1196,8 +1107,7 @@
           "scope_key": "looped[0].nested",
           "scope_description": "module instance 'looped[0].nested'"
         }
-      },
-      "dependencies": null
+      }
     }
   ],
   "compositions": [
@@ -1432,13 +1342,13 @@
         }
       },
       "binding": "direct.lookup",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1459,13 +1369,13 @@
         }
       },
       "binding": "looped[0].lookup",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     }
   ],
   "data_source_origins": [
@@ -1488,13 +1398,13 @@
         }
       },
       "binding": "direct.lookup",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "direct"
         }
-      },
-      "dependencies": null
+      }
     },
     {
       "id": {
@@ -1515,13 +1425,13 @@
         }
       },
       "binding": "looped[0].lookup",
+      "dependency_bindings": [],
       "module_source": {
         "Module": {
           "name": "app_module",
           "instance": "looped[0]"
         }
-      },
-      "dependencies": null
+      }
     }
   ],
   "data_source_values": [
@@ -1818,62 +1728,5 @@
         "kind": "unavailable"
       }
     }
-  ],
-  "sorted_value_destroy_dependencies": [
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    [],
-    []
-  ],
-  "sorted_explicit_destroy_dependencies": [
-    [],
-    [],
-    [],
-    [
-      {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.seed"
-      },
-      {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "root"
-      }
-    ],
-    [
-      {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "direct.consumer"
-      }
-    ],
-    [],
-    [],
-    [
-      {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "looped[0].seed"
-      },
-      {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "root"
-      }
-    ],
-    [
-      {
-        "provider": "mock",
-        "resource_type": "test.resource",
-        "identity": "looped[0].consumer"
-      }
-    ]
-  ],
-  "legacy_dependency_classification": null
+  ]
 }

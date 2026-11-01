@@ -2010,9 +2010,9 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v16");
+            .expect_err("a validated schema must always be projectable to protocol v17");
 
-        assert!(error.to_string().contains("protocol v16"), "{error}");
+        assert!(error.to_string().contains("protocol v17"), "{error}");
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

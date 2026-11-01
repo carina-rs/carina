@@ -292,7 +292,6 @@ const LEGACY_ENUM_KEY: &str = "Enum";
 #[derive(Clone, Copy)]
 enum JsonEncoding {
     /// Provider/function JSON: preserve user keys and send enum API values.
-    #[cfg(any(test, feature = "test-utils"))]
     Ordinary,
     /// State/export JSON: reserve `$` keys and retain canonical enum identity.
     Persisted,
@@ -303,7 +302,6 @@ enum JsonEncoding {
 impl JsonEncoding {
     fn context(self) -> SerializationContext {
         match self {
-            #[cfg(any(test, feature = "test-utils"))]
             Self::Ordinary => SerializationContext::ValueToJson,
             Self::Persisted => SerializationContext::StateWriteback,
             Self::LegacySecretMaterial => SerializationContext::SecretRedaction,
@@ -702,7 +700,6 @@ fn value_to_json_inner(
             Ok(serde_json::Value::String(s.to_string()))
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => match encoding {
-            #[cfg(any(test, feature = "test-utils"))]
             JsonEncoding::Ordinary => Ok(serde_json::Value::String(c.api_value().to_string())),
             JsonEncoding::Persisted => Ok(canonical_enum_to_json(c, PERSISTED_ENUM_KEY)),
             JsonEncoding::LegacySecretMaterial => Ok(canonical_enum_to_json(c, LEGACY_ENUM_KEY)),
@@ -5745,7 +5742,7 @@ fn canonicalize_resolved_value_for_purpose<
         purpose,
         visited_refs,
     ) {
-        canonicalize_with_fit(value, fit, defs, purpose, error_policy)
+        canonicalize_with_fit(value, &fit, defs, purpose, error_policy)
     } else {
         canonicalize_without_fit(
             value,
@@ -5759,12 +5756,28 @@ fn canonicalize_resolved_value_for_purpose<
     }
 }
 
+/// Encode a successful fit through the same canonicalization used by values.
+/// Address-bearing or unresolved values cannot form an ordinary JSON key.
+pub(crate) fn canonical_json_with_fit<H: PlaceholderKind, B: BindingAddress>(
+    value: Value<H, B>,
+    fit: &crate::schema::Fit<'_>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+    purpose: CanonicalizationPurpose<'_>,
+) -> Option<serde_json::Value> {
+    let canonical = canonicalize_with_fit(value, fit, defs, purpose, RejectEnumResolutionErrors)
+        .ok()?
+        .try_map_placeholder::<crate::resource::NoPlaceholder, ()>(&mut |_| Err(()))
+        .ok()?
+        .try_into_address_free_absolute()?;
+    value_to_json_inner(&canonical, None, false, JsonEncoding::Ordinary, false).ok()
+}
+
 /// Consume a successful fit witness without re-validating any selected Union
 /// member or re-resolving any enum. The value and witness have identical tree
 /// shapes by construction.
 fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: CanonicalizationErrorPolicy>(
     value: Value<H, B>,
-    fit: crate::schema::Fit<'_>,
+    fit: &crate::schema::Fit<'_>,
     defs: &std::collections::BTreeMap<String, AttributeType>,
     purpose: CanonicalizationPurpose<'_>,
     error_policy: P,
@@ -5774,9 +5787,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
         return Ok(canonicalize_to_string_list(value));
     }
 
-    match (value, fit.kind) {
+    match (value, &fit.kind) {
         (Value::Deferred(DeferredValue::Secret(value)), crate::schema::FitKind::Secret(fit)) => {
-            canonicalize_with_fit(*value, *fit, defs, purpose, error_policy)
+            canonicalize_with_fit(*value, fit, defs, purpose, error_policy)
                 .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
                 .map_err(|error| error_policy.mask_secret(error))
         }
@@ -5787,9 +5800,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 default: default_fit,
             },
         ) => {
-            let value = canonicalize_with_fit(*value, *value_fit, defs, purpose, error_policy)?;
+            let value = canonicalize_with_fit(*value, value_fit, defs, purpose, error_policy)?;
             let default =
-                canonicalize_with_fit(*default, *default_fit, defs, purpose, error_policy)?;
+                canonicalize_with_fit(*default, default_fit, defs, purpose, error_policy)?;
             Ok(Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(value),
                 default: Box::new(default),
@@ -5801,7 +5814,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
             // consuming both here makes the single selection decision
             // explicit and prevents a second member lookup.
             let _chosen_member = member;
-            canonicalize_with_fit(value, *fit, defs, purpose, error_policy)
+            canonicalize_with_fit(value, fit, defs, purpose, error_policy)
         }
         (
             _,
@@ -5809,7 +5822,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 canonical,
                 rewrite: true,
             },
-        ) => Ok(Value::Concrete(ConcreteValue::CanonicalEnum(canonical))),
+        ) => Ok(Value::Concrete(ConcreteValue::CanonicalEnum(
+            canonical.clone(),
+        ))),
         (value, crate::schema::FitKind::Enum { rewrite: false, .. }) => Ok(value),
         (Value::Concrete(ConcreteValue::List(items)), crate::schema::FitKind::List(fits)) => {
             debug_assert_eq!(items.len(), fits.len());
@@ -5866,7 +5881,7 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                 .map(|((key, value), fit)| {
                     let canonical_key = fit.canonical_key.clone().unwrap_or_else(|| key.clone());
                     let value =
-                        canonicalize_with_fit(value, fit.value, defs, purpose, error_policy)
+                        canonicalize_with_fit(value, &fit.value, defs, purpose, error_policy)
                             .map_err(|error| error_policy.at_map_value(key.clone(), error))?;
                     Ok((key, canonical_key, value))
                 })
@@ -6972,7 +6987,31 @@ mod tests {
         }
     }
 
-    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {}
+    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {
+        type DirectiveBool<B: crate::resource::BindingAddress> = bool;
+        type DirectivePreventDestroy<B: crate::resource::BindingAddress> =
+            crate::resource::PreventDestroy;
+        fn rebind_directives<
+            B: crate::resource::BindingAddress,
+            C: crate::resource::BindingAddress,
+        >(
+            directives: crate::resource::Directives<B, Self>,
+            resolve: &mut impl FnMut(B) -> C,
+        ) -> crate::resource::Directives<C, Self> {
+            crate::resource::directive_expr::rebind_resolved_directives(directives, resolve)
+        }
+
+        fn map_absolute_directive_values(
+            _directives: &mut crate::resource::Directives<
+                crate::resource::AbsoluteBindingAddress,
+                Self,
+            >,
+            _map: &mut impl FnMut(
+                &crate::resource::AbsoluteBindingAddress,
+            ) -> crate::resource::AbsoluteBindingAddress,
+        ) {
+        }
+    }
 
     #[test]
     fn placeholder_secret_material_uses_structured_serde_not_display_wording() {
@@ -12731,6 +12770,44 @@ mod tests {
                 "sts:AssumeRole".into()
             ])))
         );
+    }
+
+    #[test]
+    fn canonicalize_float_preserves_integer_and_display() {
+        let attr = AttributeType::float();
+        let defs = crate::schema::empty_defs_for_schema_walks();
+        for n in [1, 9_007_199_254_740_993] {
+            for purpose in [
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+                CanonicalizationPurpose::ProviderConfig {
+                    provider_name: "mock",
+                },
+                CanonicalizationPurpose::State,
+                CanonicalizationPurpose::WaitRhs,
+            ] {
+                let value: Value = Value::Concrete(ConcreteValue::Int(n));
+                let fit = crate::schema::fit_value_to_resolved_type_on_path(
+                    &attr,
+                    &value,
+                    defs,
+                    crate::schema::FieldAncestry::WRITABLE,
+                    purpose,
+                    &mut Vec::new(),
+                )
+                .expect("integers fit Float attributes");
+                let canonical = canonicalize_with_fit(
+                    value.clone(),
+                    &fit,
+                    defs,
+                    purpose,
+                    RejectEnumResolutionErrors,
+                )
+                .unwrap();
+                assert_eq!(canonical, value);
+                assert_eq!(render_value(&canonical).plain(), n.to_string());
+            }
+        }
     }
 
     #[test]

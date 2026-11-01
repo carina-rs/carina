@@ -1444,7 +1444,7 @@ mod tests {
         let mut parsed =
             carina_core::module_resolver::resolve_modules_providerless(parsed, fixture.path())
                 .expect("cross the deferred-body resolution seam")
-                .into_expanded()
+                .into_expanded(&carina_core::schema::SchemaRegistry::new())
                 .expect("deferred loop fixture must contain no parser placeholders");
         let template = parsed
             .deferred_for_expressions_mut()

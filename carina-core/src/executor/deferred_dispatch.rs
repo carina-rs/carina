@@ -55,6 +55,9 @@ pub enum DeferredCreateFailure {
     ValueAccess {
         error: DeferredForExpansionError,
     },
+    Directives {
+        error: crate::resource::DirectiveResolutionErrors,
+    },
     ResolveResource {
         error: ResolvedResourceError,
     },
@@ -195,6 +198,9 @@ impl std::fmt::Display for DeferredCreateFailure {
             DeferredCreateFailure::ValueAccess { error: _error } => {
                 formatter.write_str("deferred-for value resolution failed")
             }
+            DeferredCreateFailure::Directives { error: _error } => {
+                formatter.write_str("deferred-for directive resolution failed")
+            }
             DeferredCreateFailure::ResolveResource { error: _error } => {
                 formatter.write_str("deferred-for resource resolution failed")
             }
@@ -238,6 +244,7 @@ impl std::error::Error for DeferredCreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ValueAccess { error } => Some(error),
+            Self::Directives { error } => Some(error),
             Self::ResolveResource { error } => Some(error),
             Self::ProviderConfig { error } => Some(error),
             Self::EnumCanonicalization { error } => Some(error),
@@ -334,6 +341,9 @@ pub(super) fn materialize_deferred_create<
             }
             error @ DeferredForExpansionError::Resolution { .. } => {
                 DeferredCreateFailure::ValueAccess { error }
+            }
+            DeferredForExpansionError::Directives(error) => {
+                DeferredCreateFailure::Directives { error }
             }
         },
     )?;
@@ -490,6 +500,49 @@ mod tests {
     }
 
     #[test]
+    fn deferred_directive_failures_keep_their_label_and_typed_source() {
+        let parsed = crate::parser::parse(
+            "let up = upstream_state { source = '../upstream' }\nlet children = for flag in up.flags { mock.test.Child { name = 'child' directives { force_delete = flag } } }\n",
+            &crate::parser::ProviderContext::default(),
+        ).unwrap();
+        let expanded = crate::module_resolver::resolve_modules_providerless(
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            std::path::Path::new("."),
+        )
+        .unwrap()
+        .into_expanded(&SchemaRegistry::new())
+        .unwrap();
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "up",
+            HashMap::from([(
+                "flags".to_owned(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("invalid".into()),
+                )])),
+            )]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let error =
+            materialize_for_test(&expanded.deferred_for_expressions()[0], &bindings).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "deferred-for directive resolution failed"
+        );
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(
+            source
+                .downcast_ref::<crate::resource::DirectiveResolutionErrors>()
+                .is_some()
+        );
+        assert!(
+            source.to_string().contains("force_delete")
+                && source.to_string().contains("got String")
+        );
+    }
+
+    #[test]
     fn apply_time_coalesced_iterable_uses_present_value() {
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
@@ -576,7 +629,7 @@ mod tests {
             std::path::Path::new("."),
         )
         .expect("deferred fixture crosses the module-resolution seam")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();
@@ -639,7 +692,7 @@ mod tests {
             std::path::Path::new("."),
         )
         .expect("deferred fixture crosses the module-resolution seam")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = &parsed.deferred_for_expressions()[0];
         let iterable = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -725,7 +778,7 @@ mod tests {
             std::path::Path::new("."),
         )
         .expect("deferred fixture crosses the module-resolution seam")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("deferred-loop fixture contains no parser placeholders");
         let template = &parsed.deferred_for_expressions()[0];
         let mut bindings = ResolvedBindings::default();

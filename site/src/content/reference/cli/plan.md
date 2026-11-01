@@ -32,7 +32,8 @@ Display the plan in an interactive TUI (terminal user interface) mode. Allows na
 
 Save the plan to a JSON file for later use with `carina apply`. The saved plan includes the effects, resource definitions, provider configurations, state metadata for drift detection, and the identity (SHA-256, source and version) and schema fingerprints of the providers it was computed with. Re-run `carina plan --out` after re-installing or upgrading a provider: `carina apply` rejects a saved plan whose providers no longer match (see [Applying a Saved Plan](/reference/cli/apply/#applying-a-saved-plan)).
 
-Saved-plan format 38 supersedes format 37 and records complete resolved
+Saved-plan format 39 supersedes format 38, retains its lifecycle directive
+values and per-element loop expressions, and records complete resolved
 dependency addresses and the legacy dependency migration classification used
 by planning. Applying it replays that classification against locked state
 before writing state v21. Older saved plans are rejected; regenerate them with

@@ -94,9 +94,11 @@ pub use config::{
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};
 pub use deferred_if::{DeferredIfBody, DeferredIfCondition, DeferredStructuralIf, DeferredValueIf};
 pub use entry::{
-    AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse_file, parse_file_and_resolve,
-    top_level_anonymous_resource_spans, top_level_backend_block_spans,
-    top_level_exports_block_spans, top_level_state_block_spans, top_level_upstream_state_spans,
+    AnonymousResourceSourceSpan, AttributeValueSourceSpans, LetBindingSourceSpans, SourceSpanIndex,
+    TopLevelBlockSourceSpan, attribute_value_source_span, attribute_value_source_spans, parse_file,
+    parse_file_and_resolve, top_level_anonymous_resource_spans, top_level_backend_block_spans,
+    top_level_exports_block_spans, top_level_let_binding_spans, top_level_state_block_spans,
+    top_level_upstream_state_spans,
 };
 pub(crate) use entry::{
     BindingSeed, parse_with_directory_context, top_level_argument_names,
@@ -110,8 +112,8 @@ pub(crate) use entry::{
 };
 pub use error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
-    NON_LITERAL_PREVENT_DESTROY_WARNING_MESSAGE, ParseError, ParseWarning, ParseWarningSpan,
-    SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE, UnresolvedTypeToken, WarningKind,
+    ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
+    UnresolvedTypeToken, WarningKind,
 };
 pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,
@@ -163,3 +165,5 @@ pub(crate) use static_eval::{
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use ast::resolve_loop_directive_value;

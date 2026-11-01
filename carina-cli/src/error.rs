@@ -1174,6 +1174,10 @@ pub enum AppError {
     #[error("{}", .0.located())]
     LeftoverPlaceholders(carina_core::resource::LeftoverPlaceholders),
 
+    /// Lifecycle directive values must be concrete before consumers see them.
+    #[error("{}", .0.located())]
+    Expansion(carina_core::resource::ExpansionError),
+
     /// One core-owned module-call finding at its parser-authored location.
     #[error(transparent)]
     ModuleCall(Box<carina_core::validation::ModuleCallFinding>),
@@ -1428,6 +1432,12 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 impl From<carina_core::resource::ResolvedResourceError> for AppError {
     fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
         Self::ResolvedResource(Box::new(error))
+    }
+}
+
+impl From<carina_core::resource::ExpansionError> for AppError {
+    fn from(error: carina_core::resource::ExpansionError) -> Self {
+        Self::Expansion(error)
     }
 }
 

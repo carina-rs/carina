@@ -16,7 +16,9 @@ use carina_core::schema::{
     EffectiveType, FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema,
 };
 
-use super::{DiagnosticEngine, build_enum_diagnostic_from_error, carina_diagnostic};
+use super::{
+    DiagnosticEngine, DiagnosticSource, build_schema_diagnostic_from_error, carina_diagnostic,
+};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -29,42 +31,112 @@ impl DiagnosticEngine {
     /// validator (#2214).
     ///
     /// `effective_type` carries both the resource definition map and the
-    /// selected attribute path's input ancestry.
-    pub(super) fn validate_struct_value(
+    /// selected attribute path's input ancestry. The boolean records whether
+    /// a duplicate diagnostic was emitted, for whole-resource deduplication.
+    pub(super) fn validate_container_value(
         &self,
-        doc: &Document,
+        source: &DiagnosticSource<'_>,
         attr_name: &str,
         value: &Value,
         effective_type: &EffectiveType<'_>,
         value_range: Option<Range>,
-    ) -> Vec<Diagnostic> {
+        scope: Option<(u32, u32)>,
+    ) -> (Vec<Diagnostic>, bool) {
+        let doc = source.doc;
         let errors = effective_type.validate_collect(value);
         let mut diagnostics = Vec::new();
+        let mut reported_duplicate = false;
         for (path, err) in errors {
-            if let Some((line, col, end_col)) = self.range_for_path(doc, attr_name, &path) {
+            let is_duplicate = super::is_duplicate_list_error(&err);
+            let ends_in_index = matches!(path.steps().last(), Some(FieldPathStep::Index(_)));
+            let element_range = if is_duplicate || ends_in_index {
+                self.value_range_for_path(source, attr_name, &path, scope, is_duplicate)
+            } else {
+                None
+            };
+            let range = element_range.or_else(|| {
+                self.range_for_path(doc, attr_name, &path, scope)
+                    .map(|(line, col, end_col)| {
+                        Range::new(
+                            tower_lsp::lsp_types::Position::new(line, col),
+                            tower_lsp::lsp_types::Position::new(line, end_col),
+                        )
+                    })
+            });
+            if let Some(range) = range {
                 if path.is_empty() {
                     let tagged = err.clone().with_attribute(attr_name);
-                    if let Some(diagnostic) = build_enum_diagnostic_from_error(&tagged, value_range)
+                    if let Some(diagnostic) =
+                        build_schema_diagnostic_from_error(&tagged, value_range)
                     {
                         diagnostics.push(diagnostic);
+                        reported_duplicate |= is_duplicate;
                         continue;
                     }
                 }
-                let err = if matches!(&err, TypeError::FieldGroupViolation { .. }) {
-                    err.with_attribute(attr_name)
+                let is_item_error = path
+                    .steps()
+                    .iter()
+                    .any(|step| matches!(step, FieldPathStep::Index(_)));
+                // Preserve the full leaf path for struct item errors and for
+                // computed lists, which have no authored element span.
+                // Duplicate and field-group messages already carry their paths.
+                let attribute = if is_item_error
+                    && !is_duplicate
+                    && !matches!(&err, TypeError::FieldGroupViolation { path: _, group: _ })
+                {
+                    format!("{attr_name}{path}")
+                } else {
+                    attr_name.to_string()
+                };
+                let err = if is_item_error
+                    || matches!(&err, TypeError::FieldGroupViolation { path: _, group: _ })
+                {
+                    err.with_attribute(&attribute)
                 } else {
                     err
                 };
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    end_col,
+                diagnostics.push(super::carina_diagnostic_range(
+                    range,
                     severity_for_validation_error(&err),
-                    err.to_string(),
+                    if is_item_error && err.attribute_name().is_none() {
+                        format!("{err} for '{attribute}'")
+                    } else {
+                        err.to_string()
+                    },
                 ));
+                reported_duplicate |= is_duplicate;
             }
         }
-        diagnostics
+        (diagnostics, reported_duplicate)
+    }
+
+    fn value_range_for_path(
+        &self,
+        source: &DiagnosticSource<'_>,
+        attr_name: &str,
+        path: &FieldPath,
+        scope: Option<(u32, u32)>,
+        is_duplicate: bool,
+    ) -> Option<Range> {
+        let spans = source
+            .spans()
+            .attribute_value_source_spans(attr_name, path, scope)?;
+        let span = if is_duplicate {
+            spans.value
+        } else {
+            spans.block_header.unwrap_or(spans.value)
+        };
+        Some(Range::new(
+            tower_lsp::lsp_types::Position::new(
+                (span.start_line() - 1) as u32,
+                (span.start_column() - 1) as u32,
+            ),
+            tower_lsp::lsp_types::Position::new(
+                (span.end_line() - 1) as u32,
+                (span.end_column() - 1) as u32,
+            ),
+        ))
     }
 
     /// Walk a [`FieldPath`] across the source `doc` and return the
@@ -76,15 +148,18 @@ impl DiagnosticEngine {
         doc: &Document,
         attr_name: &str,
         path: &FieldPath,
+        scope: Option<(u32, u32)>,
     ) -> Option<(u32, u32, u32)> {
         let steps = path.steps();
         if steps.is_empty() {
             return self
-                .find_attribute_position(doc, attr_name, None)
+                .find_attribute_position(doc, attr_name, scope)
                 .or_else(|| {
                     self.find_all_block_positions(doc, attr_name)
-                        .first()
-                        .copied()
+                        .into_iter()
+                        .find(|(line, _)| {
+                            scope.is_none_or(|(start, end)| *line >= start && *line < end)
+                        })
                 })
                 .map(|(line, col)| (line, col, col + attr_name.len() as u32));
         }
@@ -100,16 +175,22 @@ impl DiagnosticEngine {
 
         let Some(FieldPathStep::Field(first_name)) = name_steps.first() else {
             // Path ends with an index — anchor on the block header itself.
-            let positions = self.find_all_block_positions(doc, attr_name);
+            let positions: Vec<_> = self
+                .find_all_block_positions(doc, attr_name)
+                .into_iter()
+                .filter(|(line, _)| scope.is_none_or(|(start, end)| *line >= start && *line < end))
+                .collect();
             return positions
                 .get(block_index)
-                .map(|(line, col)| (*line, *col, *col + attr_name.len() as u32));
+                .copied()
+                .or_else(|| self.find_attribute_position(doc, attr_name, scope))
+                .map(|(line, col)| (line, col, col + attr_name.len() as u32));
         };
 
         // The first name lookup goes through the LSP's existing
         // nested-block scanner, which already handles repeated blocks
         // and assignment-style `attr = { ... }`.
-        let positions = self.find_all_nested_field_positions(doc, attr_name, first_name);
+        let positions = self.find_all_nested_field_positions(doc, attr_name, first_name, scope);
         let Some(Some((mut line, mut col))) = positions.get(block_index).copied() else {
             return None;
         };
@@ -117,13 +198,13 @@ impl DiagnosticEngine {
         // For deeper paths (struct nested inside struct), descend by
         // re-using the same scanner with the previous field name as
         // the block name. This is approximate — LSP-side struct path
-        // resolution is best-effort — but matches what the legacy
-        // `validate_struct_value` was already doing.
+        // resolution is best-effort — but matches the legacy
+        // struct-validation behavior.
         let mut current_block = first_name.as_str();
         for step in name_steps.iter().skip(1) {
             if let FieldPathStep::Field(child) = step {
                 let nested_positions =
-                    self.find_all_nested_field_positions(doc, current_block, child);
+                    self.find_all_nested_field_positions(doc, current_block, child, scope);
                 if let Some(Some((nl, nc))) = nested_positions.first().copied() {
                     line = nl;
                     col = nc;
@@ -260,6 +341,7 @@ impl DiagnosticEngine {
         doc: &Document,
         block_name: &str,
         field_name: &str,
+        scope: Option<(u32, u32)>,
     ) -> Vec<Option<(u32, u32)>> {
         let text = doc.text();
         let mut positions = Vec::new();
@@ -268,6 +350,11 @@ impl DiagnosticEngine {
         let mut found_in_current_block: Option<(u32, u32)> = None;
 
         for (line_idx, line) in text.lines().enumerate() {
+            if scope
+                .is_some_and(|(start, end)| (line_idx as u32) < start || (line_idx as u32) >= end)
+            {
+                continue;
+            }
             let trimmed = line.trim();
 
             // Look for "block_name {" (without "=") or "block_name = {" (with "=")
@@ -326,9 +413,14 @@ impl DiagnosticEngine {
 
 fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
     match error {
-        TypeError::ReadOnlyAttribute { .. } | TypeError::FieldGroupViolation { .. } => {
-            DiagnosticSeverity::ERROR
-        }
+        TypeError::ReadOnlyAttribute { name: _ }
+        | TypeError::FieldGroupViolation { path: _, group: _ }
+        | TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _,
+        } => DiagnosticSeverity::ERROR,
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
         | TypeError::MapValueError { inner, .. }

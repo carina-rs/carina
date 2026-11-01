@@ -102,7 +102,7 @@ fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFi
     .expect("parse should succeed");
     carina_core::module_resolver::resolve_modules_providerless(parsed, root.path())
         .expect("module-resolution boundary should succeed")
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("canonicalization fixture contains no parser placeholders")
 }
 

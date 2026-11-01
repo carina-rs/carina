@@ -4,6 +4,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,30 @@ use carina_core::resource::{
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
+
+/// One syntax-span parse shared by all checks in an analysis. Delay it until
+/// a check needs a binding or attribute span, including duplicate bindings.
+struct DiagnosticSource<'a> {
+    doc: &'a Document,
+    text: &'a str,
+    spans: OnceCell<carina_core::parser::SourceSpanIndex>,
+}
+
+impl<'a> DiagnosticSource<'a> {
+    fn new(doc: &'a Document, text: &'a str) -> Self {
+        Self {
+            doc,
+            text,
+            spans: OnceCell::new(),
+        }
+    }
+
+    fn spans(&self) -> &carina_core::parser::SourceSpanIndex {
+        self.spans.get_or_init(|| {
+            carina_core::parser::SourceSpanIndex::parse(self.text).unwrap_or_default()
+        })
+    }
+}
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     let text = doc.text();
@@ -92,7 +117,7 @@ fn render_module_call_findings(
                 let message = finding.message().to_string();
                 if let Some(type_error) = finding.message().type_error()
                     && let Some(mut diagnostic) =
-                        build_enum_diagnostic_from_error(type_error, Some(range))
+                        build_schema_diagnostic_from_error(type_error, Some(range))
                 {
                     diagnostic.severity = Some(severity);
                     diagnostic.message = message;
@@ -449,6 +474,7 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
+        let source = DiagnosticSource::new(doc, &text);
         let base_path = current_file_path.map(|path| {
             path.parent()
                 .expect("a current file path must have a parent directory")
@@ -551,7 +577,7 @@ impl DiagnosticEngine {
         }
         if let Some(result) = merged_result.as_ref() {
             diagnostics.extend(self.duplicate_declaration_diagnostics(
-                doc,
+                &source,
                 current_file_name,
                 &result.directory.duplicate_declarations,
             ));
@@ -566,7 +592,7 @@ impl DiagnosticEngine {
                 parsed,
             );
             diagnostics.extend(self.duplicate_declaration_diagnostics(
-                doc,
+                &source,
                 current_file_name,
                 &duplicates,
             ));
@@ -868,6 +894,44 @@ impl DiagnosticEngine {
                         checks::MergedModuleResolution::ConstraintFailed { .. }
                         | checks::MergedModuleResolution::Unowned { .. } => None,
                     });
+            let directive_boundary =
+                if carina_core::validation::is_module_definition(merged.unwrap_or(parsed)) {
+                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+                } else {
+                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+                };
+            let directive_errors = if let Some(graph) = expanded_graph {
+                graph.directive_resolution_errors(directive_boundary, &self.schemas)
+            } else {
+                merged
+                    .unwrap_or(parsed)
+                    .directive_resolution_errors(directive_boundary, &self.schemas)
+            };
+            let mut directive_sites = HashSet::new();
+            for error in directive_errors {
+                let Some(range) = error.source_in_file(doc.source_file()) else {
+                    continue;
+                };
+                if !directive_sites.insert((error.resource().to_owned(), error.diagnostic_key())) {
+                    continue;
+                }
+                let (Some(start_line), Some(start_column), Some(end_line), Some(end_column)) = (
+                    range.start_line().checked_sub(1),
+                    range.start_column().checked_sub(1),
+                    range.end_line().checked_sub(1),
+                    range.end_column().checked_sub(1),
+                ) else {
+                    continue;
+                };
+                diagnostics.push(carina_diagnostic_range(
+                    Range::new(
+                        Position::new(start_line as u32, start_column as u32),
+                        Position::new(end_line as u32, end_column as u32),
+                    ),
+                    DiagnosticSeverity::ERROR,
+                    error.message(),
+                ));
+            }
             let pre_expansion_input = merged.unwrap_or(parsed);
             let semantic_view =
                 checks::SemanticView::for_analysis(parsed, merged, base_path.is_some());
@@ -991,7 +1055,7 @@ impl DiagnosticEngine {
                 let severity = DiagnosticSeverity::ERROR;
                 if let Some(type_error) = finding.error.type_error()
                     && let Some(mut diagnostic) =
-                        build_enum_diagnostic_from_error(type_error, Some(range))
+                        build_schema_diagnostic_from_error(type_error, Some(range))
                 {
                     diagnostic.severity = Some(severity);
                     diagnostics.push(diagnostic);
@@ -1177,6 +1241,24 @@ impl DiagnosticEngine {
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
+                let authored_binding_scope = match rref {
+                    ResourceRef::Deferred {
+                        resource: _resource,
+                        deferred: _deferred,
+                    } => None,
+                    ResourceRef::Resource(_)
+                    | ResourceRef::LiveComposition(_)
+                    | ResourceRef::DataSource(_) => rref
+                        .binding()
+                        .and_then(|binding| source.spans().let_binding_spans().get(binding))
+                        .map(|spans| {
+                            let span = spans.statement;
+                            (
+                                span.start_line().saturating_sub(1) as u32,
+                                span.end_line() as u32,
+                            )
+                        }),
+                };
                 let authored_direct_start = match rref {
                     ResourceRef::Resource(resource) if resource.binding.is_none() => {
                         anonymous_resource_lines
@@ -1194,13 +1276,15 @@ impl DiagnosticEngine {
                 // Source-range hint for attribute position lookups. Without
                 // this, a `for`-body diagnostic like `mode = "aaa"` would
                 // anchor on the first top-level `mode =` in the file.
-                let scope = resource_source_range(
-                    doc,
-                    ctx,
-                    provider,
-                    &resource_id.resource_type,
-                    authored_direct_start,
-                );
+                let scope = authored_binding_scope.or_else(|| {
+                    resource_source_range(
+                        doc,
+                        ctx,
+                        provider,
+                        &resource_id.resource_type,
+                        authored_direct_start,
+                    )
+                });
 
                 if resource_schema().is_none() {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
@@ -1369,6 +1453,7 @@ impl DiagnosticEngine {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
+                    let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let attr_value = if contains_function_call(authored_attr_value) {
                             resolved_resource_attributes
@@ -1425,32 +1510,9 @@ impl DiagnosticEngine {
                             continue;
                         }
 
-                        // Check for unknown attributes
+                        // Core's resource validator owns unknown attributes and
+                        // their spelling suggestions. Nothing else applies here.
                         if !schema.attributes().contains_key(canonical_name) {
-                            if let Some((line, col)) =
-                                self.find_attribute_position(doc, attr_name, scope)
-                            {
-                                // Check if there's a similar attribute (e.g., vpc -> vpc_id)
-                                let suggestion = if schema
-                                    .attributes()
-                                    .contains_key(&format!("{}_id", attr_name))
-                                {
-                                    format!(". Did you mean '{}_id'?", attr_name)
-                                } else {
-                                    String::new()
-                                };
-
-                                diagnostics.push(carina_diagnostic(
-                                    line,
-                                    col,
-                                    col + attr_name.len() as u32,
-                                    DiagnosticSeverity::WARNING,
-                                    format!(
-                                        "Unknown attribute '{}' for resource type '{}'{}",
-                                        attr_name, resource_id.resource_type, suggestion
-                                    ),
-                                ));
-                            }
                             continue;
                         }
 
@@ -1557,6 +1619,24 @@ impl DiagnosticEngine {
                             // the type system).
                             let attr_shape = effective_type.shape();
                             let contains_struct = effective_type.contains_struct();
+                            let mut diagnose_schema_error = |error: TypeError| {
+                                let tagged = error.with_attribute(attr_name);
+                                let range = self.find_attribute_validation_range(
+                                    doc, attr_name, scope, &tagged,
+                                );
+                                if let Some(diagnostic) =
+                                    build_schema_diagnostic_from_error(&tagged, range)
+                                {
+                                    if is_duplicate_list_error(&tagged) {
+                                        reported_attribute_diagnostics
+                                            .insert(canonical_name.to_string());
+                                    }
+                                    diagnostics.push(diagnostic);
+                                    None
+                                } else {
+                                    Some(tagged.to_string())
+                                }
+                            };
                             let type_error = match (attr_shape, typecheck_value) {
                                 // Bool type should not receive String
                                 (
@@ -1702,18 +1782,12 @@ impl DiagnosticEngine {
                                     },
                                     _value,
                                 ) => None,
-                                // Validate List item types (non-Struct items only;
-                                // List<Struct> is handled by validate_struct_value below).
-                                // Use `Shape` on the inner so a
-                                // `List<Ref<Struct>>` correctly defers to
-                                // the struct-validation pass (carina#3349).
+                                // Lists use the path-tagged collector below, including
+                                // nested lists whose leaf error needs every index.
                                 (
                                     carina_core::schema::Shape::List { .. },
                                     Value::Concrete(ConcreteValue::List(_)),
-                                ) if !contains_struct => effective_attribute
-                                    .validate(attr_value)
-                                    .err()
-                                    .map(|e| e.with_attribute(attr_name).to_string()),
+                                ) => None,
                                 // Validate Map value types
                                 (
                                     carina_core::schema::Shape::Map { .. },
@@ -1736,19 +1810,12 @@ impl DiagnosticEngine {
                                                 | Value::Deferred(DeferredValue::Coalesce { .. })
                                         ) =>
                                 {
-                                    effective_attribute.validate(value).err().and_then(|error| {
-                                        let tagged = error.with_attribute(attr_name);
-                                        if let Some(diagnostic) = build_enum_diagnostic_from_error(
-                                            &tagged,
-                                            self.find_attribute_value_range(doc, attr_name, scope),
-                                        ) {
-                                            diagnostics.push(diagnostic);
-                                            None
-                                        } else {
-                                            Some(tagged.to_string())
-                                        }
-                                    })
+                                    effective_attribute
+                                        .validate(value)
+                                        .err()
+                                        .and_then(&mut diagnose_schema_error)
                                 }
+
                                 _ => None,
                             };
                             if let Some(message) = type_error {
@@ -1771,7 +1838,7 @@ impl DiagnosticEngine {
                                 }
                             }
 
-                            // Struct field validation. The wrapper borrows
+                            // Container validation. The wrapper borrows
                             // the schema's `AttributeType` directly so we
                             // don't deep-clone the field set on every
                             // keystroke (LSP `analyze` is on
@@ -1784,14 +1851,35 @@ impl DiagnosticEngine {
                             // struct-field validation. Same bug class as
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
-                            if contains_struct {
-                                diagnostics.extend(self.validate_struct_value(
-                                    doc,
-                                    attr_name,
+                            if contains_struct
+                                || (matches!(
+                                    effective_type.shape(),
+                                    carina_core::schema::Shape::List {
+                                        element_type: _,
+                                        ordered: _,
+                                        constraints: _
+                                    }
+                                ) && matches!(
                                     attr_value,
-                                    &effective_type,
-                                    self.find_attribute_value_range(doc, attr_name, scope),
-                                ));
+                                    Value::Concrete(
+                                        ConcreteValue::List(_) | ConcreteValue::StringList(_)
+                                    )
+                                ))
+                            {
+                                let (nested_diagnostics, reported_duplicate) = self
+                                    .validate_container_value(
+                                        &source,
+                                        attr_name,
+                                        attr_value,
+                                        &effective_type,
+                                        self.find_attribute_value_range(doc, attr_name, scope),
+                                        scope,
+                                    );
+                                if reported_duplicate {
+                                    reported_attribute_diagnostics
+                                        .insert(canonical_name.to_string());
+                                }
+                                diagnostics.extend(nested_diagnostics);
                             }
                         }
                     }
@@ -1834,11 +1922,21 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             let deferred_attribute = error.attribute_name();
-                            if deferred_attribute.is_some_and(|attribute| {
+                            // Unknown names are invalid even while their values
+                            // are deferred; core is their only diagnostic owner.
+                            if !matches!(
+                                &error,
+                                TypeError::UnknownAttribute {
+                                    name: _,
+                                    suggestion: _
+                                }
+                            ) && deferred_attribute.is_some_and(|attribute| {
                                 matches!(
                                     resource_attributes.get(attribute),
-                                    Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-                                        | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
+                                    Some(Value::Deferred(DeferredValue::ResourceRef { path: _ }))
+                                        | Some(Value::Deferred(DeferredValue::BindingRef {
+                                            binding: _
+                                        }))
                                 )
                             }) {
                                 continue;
@@ -1856,7 +1954,22 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             let is_masked_secret_error = error.to_string().contains("(secret)");
+                            // Statically evaluated expressions may first become known
+                            // in this pass. Suppress list refinements only when
+                            // the attribute pass emitted them.
+                            if is_duplicate_list_error(&error)
+                                && error.attribute_name().is_some_and(|attribute| {
+                                    let canonical = bn_map
+                                        .get(attribute)
+                                        .map(String::as_str)
+                                        .unwrap_or(attribute);
+                                    reported_attribute_diagnostics.contains(canonical)
+                                })
+                            {
+                                continue;
+                            }
                             if !is_masked_secret_error
+                                && !is_duplicate_list_error(&error)
                                 && matches!(
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
@@ -1876,33 +1989,40 @@ impl DiagnosticEngine {
                             // Structured type errors carry the authored attribute through
                             // container wrappers; fall back to the resource only when the
                             // error genuinely has no attribute provenance.
+                            let block_header_range = error
+                                .attribute_name()
+                                .and_then(|attr| {
+                                    source.spans().attribute_value_source_spans(
+                                        attr,
+                                        &carina_core::schema::FieldPath::new(),
+                                        scope,
+                                    )
+                                })
+                                .and_then(|spans| spans.block_header)
+                                .and_then(|span| parser_span_range(doc, span));
                             let position = error
                                 .attribute_name()
                                 .and_then(|attr| self.find_attribute_position(doc, attr, scope));
-                            let position = position.or_else(|| {
-                                self.find_resource_type_position(
-                                    doc,
-                                    provider,
-                                    &resource_id.resource_type,
-                                )
-                            });
-                            if let Some((line, col)) = position {
-                                diagnostics.push(carina_diagnostic_range(
-                                    Range {
-                                        start: Position {
-                                            line,
-                                            character: col,
-                                        },
-                                        end: Position {
-                                            line,
-                                            character: col
-                                                + doc
-                                                    .text()
-                                                    .lines()
-                                                    .nth(line as usize)
-                                                    .map_or(0, |l| l.trim_end().len() as u32),
-                                        },
+                            let position = position.or_else(|| scope.map(|(start, _)| (start, 0)));
+                            let range = block_header_range.or_else(|| {
+                                position.map(|(line, col)| Range {
+                                    start: Position {
+                                        line,
+                                        character: col,
                                     },
+                                    end: Position {
+                                        line,
+                                        character: doc
+                                            .text()
+                                            .lines()
+                                            .nth(line as usize)
+                                            .map_or(col, |l| l.trim_end().chars().count() as u32),
+                                    },
+                                })
+                            });
+                            if let Some(range) = range {
+                                diagnostics.push(carina_diagnostic_range(
+                                    range,
                                     DiagnosticSeverity::ERROR,
                                     error.to_string(),
                                 ));
@@ -1974,7 +2094,7 @@ impl DiagnosticEngine {
                 .unwrap_or_default(),
                 (None, Some(_)) => Vec::new(),
             };
-            diagnostics.extend(self.unused_binding_diagnostics(doc, unused_binding_names));
+            diagnostics.extend(self.unused_binding_diagnostics(&source, unused_binding_names));
 
             // Surface unused-for-binding warnings (recorded in parsed.warnings by
             // the parser) as LSP diagnostics. Other ParseWarnings (e.g. the
@@ -1982,9 +2102,6 @@ impl DiagnosticEngine {
             // context meant for CLI output only and are not elevated here.
             diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
             diagnostics.extend(self.check_single_quoted_interpolation_warnings(parsed));
-            let prevent_destroy_warnings = merged_current_file.unwrap_or(parsed);
-            diagnostics
-                .extend(self.check_non_literal_prevent_destroy_warnings(prevent_destroy_warnings));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(doc, parsed, &binding_index));
@@ -2111,31 +2228,6 @@ impl DiagnosticEngine {
             .collect()
     }
 
-    fn check_non_literal_prevent_destroy_warnings(&self, parsed: &ParsedFile) -> Vec<Diagnostic> {
-        parsed
-            .warnings
-            .iter()
-            .filter(|warning| warning.kind == WarningKind::NonLiteralPreventDestroy)
-            .filter_map(|warning| {
-                let span = warning.span.as_ref()?;
-                Some(carina_diagnostic_range(
-                    Range::new(
-                        Position::new(
-                            span.start_line.checked_sub(1)? as u32,
-                            span.start_column.checked_sub(1)? as u32,
-                        ),
-                        Position::new(
-                            span.end_line.checked_sub(1)? as u32,
-                            span.end_column.checked_sub(1)? as u32,
-                        ),
-                    ),
-                    DiagnosticSeverity::WARNING,
-                    warning.message.clone(),
-                ))
-            })
-            .collect()
-    }
-
     /// Check for non-snake_case binding names (info-level).
     fn check_non_snake_case_bindings(&self, doc: &Document) -> Vec<Diagnostic> {
         let text = doc.text();
@@ -2225,6 +2317,30 @@ impl DiagnosticEngine {
             }
         }
         None
+    }
+
+    /// A duplicate-list diagnostic can anchor at the attribute when no single
+    /// value token exists. Enum quick fixes still require a replaceable value.
+    fn find_attribute_validation_range(
+        &self,
+        doc: &Document,
+        attr_name: &str,
+        scope: Option<(u32, u32)>,
+        error: &TypeError,
+    ) -> Option<Range> {
+        self.find_attribute_value_range(doc, attr_name, scope)
+            .or_else(|| {
+                if !is_duplicate_list_error(error) {
+                    return None;
+                }
+                self.find_attribute_position(doc, attr_name, scope)
+                    .map(|(line, col)| {
+                        Range::new(
+                            Position::new(line, col),
+                            Position::new(line, col + attr_name.len() as u32),
+                        )
+                    })
+            })
     }
 
     /// Locate the value side of `attr_name = <value>` and return the
@@ -2370,9 +2486,10 @@ impl DiagnosticEngine {
 ///
 /// - For `Deferred(for_expr)` the scope starts at the `for` line and ends
 ///   at the closing brace of the for expression.
-/// - For an authored anonymous `Direct` resource, the parser-derived start
-///   line selects that exact declaration. Other direct resources fall back to
-///   locating the `provider.resource_type` token.
+/// - For an authored anonymous `Direct` resource, its parser-backed start line
+///   selects that exact declaration. Let-bound resources use their complete
+///   parser span before this helper is called. Other direct resources fall
+///   back to locating the `provider.resource_type` token.
 ///
 /// Returns `None` when the block can't be located (e.g., during partial
 /// parses). Callers that fall back to `None` get document-wide search —
@@ -2489,15 +2606,98 @@ fn build_enum_diagnostic(
     } else {
         tagged
     };
-    build_enum_diagnostic_from_error(&reshaped, value_range)
+    build_schema_diagnostic_from_error(&reshaped, value_range)
 }
 
-pub(super) fn build_enum_diagnostic_from_error(
+fn is_duplicate_list_error(error: &TypeError) -> bool {
+    match error {
+        TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _,
+        } => true,
+        TypeError::ListItemError { inner, index: _ }
+        | TypeError::MapKeyError { inner, key: _ }
+        | TypeError::MapValueError { inner, key: _ }
+        | TypeError::StructFieldError { inner, field: _ } => is_duplicate_list_error(inner),
+        TypeError::TypeMismatch {
+            expected: _,
+            got: _,
+        }
+        | TypeError::BindingShadowsEnumMember(_)
+        | TypeError::InvalidEnumVariant {
+            value: _,
+            value_kind: _,
+            attribute: _,
+            type_name: _,
+            expected: _,
+        }
+        | TypeError::PatternMismatch {
+            value: _,
+            pattern: _,
+            attribute: _,
+            type_name: _,
+        }
+        | TypeError::LengthOutOfRange {
+            value: _,
+            length: _,
+            min: _,
+            max: _,
+            attribute: _,
+            type_name: _,
+        }
+        | TypeError::StringLiteralExpectedEnum {
+            user_typed: _,
+            attribute: _,
+            type_name: _,
+            expected: _,
+            extra_message: _,
+        }
+        | TypeError::ValidationFailed { message: _ }
+        | TypeError::CustomTypeValidation {
+            error: _,
+            attribute: _,
+        }
+        | TypeError::ResourceValidationFailed {
+            message: _,
+            attribute: _,
+        }
+        | TypeError::MissingRequired { name: _ }
+        | TypeError::FieldGroupViolation { path: _, group: _ }
+        | TypeError::ReadOnlyAttribute { name: _ }
+        | TypeError::UnknownAttribute {
+            name: _,
+            suggestion: _,
+        }
+        | TypeError::UnknownStructField {
+            struct_name: _,
+            field: _,
+            suggestion: _,
+        }
+        | TypeError::UnionStructMismatch {
+            reason: _,
+            supplied_fields: _,
+            alternatives: _,
+        }
+        | TypeError::UnionAlternativesMismatch { failures: _ }
+        | TypeError::BlockSyntaxNotAllowed { attribute: _ } => false,
+    }
+}
+
+pub(super) fn build_schema_diagnostic_from_error(
     error: &carina_core::schema::TypeError,
     value_range: Option<tower_lsp::lsp_types::Range>,
 ) -> Option<Diagnostic> {
-    let data = crate::code_action::enum_diagnostic_data_for_error(error)?;
     let range = value_range?;
+    if is_duplicate_list_error(error) {
+        return Some(carina_diagnostic_range(
+            range,
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
+        ));
+    }
+    let data = crate::code_action::enum_diagnostic_data_for_error(error)?;
     Some(Diagnostic {
         range,
         severity: Some(DiagnosticSeverity::WARNING),

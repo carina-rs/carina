@@ -579,7 +579,7 @@ pub enum ResolveFileError {
     #[error(transparent)]
     BindingUse(#[from] BindingUseReport),
     #[error(transparent)]
-    LeftoverPlaceholders(#[from] crate::resource::LeftoverPlaceholders),
+    Expansion(#[from] crate::resource::ExpansionError),
 }
 
 impl BindingUseReport {
@@ -1471,7 +1471,7 @@ pub fn resolve_bare_binding_uses<
     }
 
     Ok(ResolvedFile {
-        inner: file.into_expanded()?,
+        inner: file.into_expanded(schemas)?,
     })
 }
 
