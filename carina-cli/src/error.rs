@@ -689,6 +689,21 @@ impl std::error::Error for CorruptPlanFileError {
     }
 }
 
+/// Semantic evidence failure with file and recovery context. Boxing this
+/// wrapper keeps AppError compact while its source remains the original type.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Invalid saved plan '{}'. {}",
+    path.display(),
+    plan_file_recreation_guidance(replan_command.as_deref())
+)]
+pub struct SavedPlanProviderEvidenceError {
+    path: PathBuf,
+    replan_command: Option<String>,
+    #[source]
+    source: crate::commands::plan::ProviderEvidenceError,
+}
+
 /// Render a provider initialization error as user-facing text.
 ///
 /// Detects the carina-provider-aws / carina-provider-awscc account
@@ -1260,6 +1275,10 @@ pub enum AppError {
     #[error(transparent)]
     CorruptPlanFile(Box<CorruptPlanFileError>),
 
+    /// A decoded saved plan carries inconsistent semantic provider evidence.
+    #[error(transparent)]
+    SavedPlanProviderEvidence(Box<SavedPlanProviderEvidenceError>),
+
     /// A saved plan was computed against different provider schemas.
     #[error("{0}")]
     SavedPlanSchemaMismatch(SavedPlanSchemaMismatchError),
@@ -1297,6 +1316,18 @@ impl From<crate::commands::init::InitError> for AppError {
 }
 
 impl AppError {
+    pub(crate) fn invalid_saved_plan_provider_evidence(
+        path: PathBuf,
+        replan_command: Option<String>,
+        source: crate::commands::plan::ProviderEvidenceError,
+    ) -> Self {
+        Self::SavedPlanProviderEvidence(Box::new(SavedPlanProviderEvidenceError {
+            path,
+            replan_command,
+            source,
+        }))
+    }
+
     pub(crate) fn corrupt_plan_file(
         path: PathBuf,
         replan_command: Option<String>,
@@ -1837,6 +1868,30 @@ mod tests {
 
         assert_eq!(app_err.to_string().matches("denied").count(), 1);
         assert!(std::error::Error::source(&app_err).is_none());
+    }
+
+    #[test]
+    fn saved_plan_provider_evidence_retains_its_typed_source() {
+        use crate::commands::plan::ProviderEvidenceError;
+
+        let error = AppError::invalid_saved_plan_provider_evidence(
+            PathBuf::from("reviewed-plan.json"),
+            Some("carina plan --out reviewed-plan.json .".to_string()),
+            ProviderEvidenceError::MissingProviderArtifact {
+                provider: "mock".to_string(),
+            },
+        );
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ProviderEvidenceError>())
+            .expect("semantic provider evidence must retain its original typed cause");
+        assert!(
+            matches!(source, ProviderEvidenceError::MissingProviderArtifact { provider } if provider == "mock")
+        );
+        let rendered = format_error_with_source_chain(&error);
+        assert!(rendered.contains("Invalid saved plan 'reviewed-plan.json'"));
+        assert!(rendered.contains("invalid saved-plan provider evidence"));
+        assert!(rendered.contains("carina plan --out"));
+        assert!(!rendered.contains("Failed to parse"));
     }
 
     #[test]

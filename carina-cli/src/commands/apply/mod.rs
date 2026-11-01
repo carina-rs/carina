@@ -46,10 +46,11 @@ use carina_core::parser::{
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityData, ProviderUpstreamScope,
-    ReloadedCompositionRehydrationError, ReloadedPlanFile, ResolvedProviderInputs,
-    SavedDataSourceValue, UpstreamMissingStatePolicy, collect_historical_display_attributes,
-    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
+    CheckExportsPreApplyInput, PlanFile, PlanFileDecodeError, PreparedPlanIdentityData,
+    ProviderUpstreamScope, ReloadedCompositionRehydrationError, ReloadedPlanFile,
+    ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
+    collect_historical_display_attributes, load_and_resolve_provider_configs,
+    prepare_plan_identity_and_provider_inputs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -77,8 +78,7 @@ use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::{
-    AppError, PlanFileJsonError, SavedPlanDirectiveChangesMismatchError,
-    SavedPlanSecretVerificationError,
+    AppError, SavedPlanDirectiveChangesMismatchError, SavedPlanSecretVerificationError,
 };
 use crate::plan_summary::PlanChangeSummary;
 use crate::wiring::{
@@ -3259,14 +3259,18 @@ async fn run_apply_from_plan_with_observer_factory(
         });
     }
 
-    let plan_file: PlanFile = (|| {
-        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-        let plan_file = serde_path_to_error::deserialize(&mut deserializer)
-            .map_err(PlanFileJsonError::from_path_error)?;
-        deserializer.end().map_err(PlanFileJsonError::at_root)?;
-        Ok::<PlanFile, PlanFileJsonError>(plan_file)
-    })()
-    .map_err(|error| AppError::corrupt_plan_file(plan_path.to_path_buf(), replan_command, error))?;
+    let plan_file = PlanFile::decode_json(&bytes).map_err(|error| match error {
+        PlanFileDecodeError::Json(error) => {
+            AppError::corrupt_plan_file(plan_path.to_path_buf(), replan_command, error)
+        }
+        PlanFileDecodeError::ProviderEvidence(error) => {
+            AppError::invalid_saved_plan_provider_evidence(
+                plan_path.to_path_buf(),
+                replan_command,
+                *error,
+            )
+        }
+    })?;
     let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let apply_target = ApplyTarget::SavedPlan {
         plan_file: plan_path,

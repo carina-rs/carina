@@ -56,7 +56,7 @@ use crate::commands::shared::progress::ProgressSink;
 pub use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 use crate::commands::shared::state_writeback::persisted_directive_changes;
 use crate::display::{format_persisted_directive_changes, print_plan};
-use crate::error::{AppError, LockedStateReloadError};
+use crate::error::{AppError, LockedStateReloadError, PlanFileJsonError};
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
 #[cfg(test)]
@@ -1050,6 +1050,26 @@ pub struct PlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PlanFileDecodeError {
+    #[error(transparent)]
+    Json(#[from] PlanFileJsonError),
+    #[error(transparent)]
+    ProviderEvidence(Box<ProviderEvidenceError>),
+}
+
+impl PlanFile {
+    /// Finish structural decoding, including the end of input, before checking
+    /// semantic evidence. Keep semantic failures out of the serde error channel.
+    pub(crate) fn decode_json(bytes: &[u8]) -> Result<Self, PlanFileDecodeError> {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let wire: PlanFileWire = serde_path_to_error::deserialize(&mut deserializer)
+            .map_err(PlanFileJsonError::from_path_error)?;
+        deserializer.end().map_err(PlanFileJsonError::at_root)?;
+        Self::try_from(wire).map_err(|error| PlanFileDecodeError::ProviderEvidence(Box::new(error)))
+    }
 }
 
 /// Private current-format wire representation.

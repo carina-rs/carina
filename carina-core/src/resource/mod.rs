@@ -866,6 +866,7 @@ pub struct ResolvedResource<S = ModuleSource> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+#[serde(from = "SchemaUnresolvedResource<S>")]
 struct ResolvedResourceWire<S> {
     #[serde(flatten)]
     resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
@@ -893,6 +894,7 @@ struct ResolvedResourceWire<S> {
 /// authored `ignore_changes` paths still await fingerprint-checked schemas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
+#[serde(from = "ResourceWithDependenciesWire<S>")]
 pub struct SchemaUnresolvedResource<S = SavedModuleSource> {
     #[serde(flatten)]
     resource: Resource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
@@ -914,6 +916,107 @@ pub struct SchemaUnresolvedResource<S = SavedModuleSource> {
     persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencyReads::is_empty")]
     value_dependency_reads: ResolvedDependencyReads,
+}
+
+/// Decode resource fields directly so serde's caller can retain their paths.
+/// A flattened Resource buffers its fields before decoding them, which loses
+/// locations such as `Create.binding` when a checked address rejects a value.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "S: Deserialize<'de>"))]
+struct ResourceWithDependenciesWire<S> {
+    id: ResourceId,
+    attributes: IndexMap<String, Value>,
+    #[serde(default)]
+    directives: Directives,
+    #[serde(default)]
+    prefixes: HashMap<String, String>,
+    #[serde(default)]
+    binding: Option<AbsoluteBindingAddress>,
+    dependencies: (),
+    #[serde(default)]
+    module_source: Option<S>,
+    #[serde(default)]
+    default_tag_keys: DefaultTagKeys,
+    #[serde(default)]
+    loop_provenance: LoopProvenance,
+    #[serde(default)]
+    value_dependencies: ResolvedDependencies,
+    #[serde(default)]
+    explicit_dependencies: ResolvedDependencies,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_value_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_persisted_destroy_dependencies"
+    )]
+    persisted_explicit_destroy_dependencies: PersistedDestroyDependencies,
+    #[serde(default)]
+    value_dependency_reads: ResolvedDependencyReads,
+}
+
+impl<S> From<ResourceWithDependenciesWire<S>> for SchemaUnresolvedResource<S> {
+    fn from(wire: ResourceWithDependenciesWire<S>) -> Self {
+        let ResourceWithDependenciesWire {
+            id,
+            attributes,
+            directives,
+            prefixes,
+            binding,
+            dependencies,
+            module_source,
+            default_tag_keys,
+            loop_provenance,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        } = wire;
+        Self {
+            resource: Resource {
+                id,
+                attributes,
+                directives,
+                resolved_ignore_changes: ResolvedIgnoreChanges::default(),
+                prefixes,
+                binding,
+                dependencies,
+                module_source,
+                default_tag_keys,
+                loop_provenance,
+                quoted_string_attrs: HashSet::new(),
+            },
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        }
+    }
+}
+
+impl<S> From<SchemaUnresolvedResource<S>> for ResolvedResourceWire<S> {
+    fn from(resource: SchemaUnresolvedResource<S>) -> Self {
+        let SchemaUnresolvedResource {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        } = resource;
+        Self {
+            resource,
+            value_dependencies,
+            explicit_dependencies,
+            persisted_value_destroy_dependencies,
+            persisted_explicit_destroy_dependencies,
+            value_dependency_reads,
+        }
+    }
 }
 
 impl<S> From<ResolvedResource<S>> for SchemaUnresolvedResource<S> {

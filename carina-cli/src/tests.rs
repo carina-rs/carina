@@ -4583,6 +4583,51 @@ fn plan_file_decode_accepts_base_mock_provider_evidence() {
 }
 
 #[test]
+fn saved_plan_json_decode_keeps_provider_evidence_error_typed() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["schema_fingerprints"]["providers"]["mock"]["schemas"] = json!([]);
+    let bytes = serde_json::to_vec(&encoded).expect("encode invalid evidence");
+    let error = PlanFile::decode_json(&bytes).expect_err("empty inventory is semantic failure");
+    let crate::commands::plan::PlanFileDecodeError::ProviderEvidence(error) = error else {
+        panic!("semantic evidence must not become a JSON error: {error:?}");
+    };
+    assert!(matches!(
+        *error,
+        crate::commands::plan::ProviderEvidenceError::EmptySchemaInventory { ref provider }
+            if provider == "mock"
+    ));
+}
+
+#[test]
+fn saved_plan_json_decode_precedes_provider_evidence_validation() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["schema_fingerprints"]["providers"]["mock"]["schemas"] = json!([]);
+    encoded["sorted_resources"][0]["binding"] = json!("");
+    let bytes = serde_json::to_vec(&encoded).expect("encode malformed plan");
+    let error = PlanFile::decode_json(&bytes).expect_err("structural decoding must fail first");
+    let crate::commands::plan::PlanFileDecodeError::Json(error) = error else {
+        panic!("malformed payload must precede semantic validation: {error:?}");
+    };
+    assert_eq!(error.json_path(), "sorted_resources[0].binding");
+    assert_eq!(error.classify(), serde_json::error::Category::Data);
+}
+
+#[test]
+fn saved_plan_json_decode_checks_end_before_provider_evidence_validation() {
+    let mut encoded = encoded_plan_with_mock_provider_evidence();
+    encoded["schema_fingerprints"]["providers"]["mock"]["schemas"] = json!([]);
+    let mut bytes = serde_json::to_vec(&encoded).expect("encode invalid evidence");
+    bytes.extend_from_slice(b" true");
+
+    let error = PlanFile::decode_json(&bytes).expect_err("trailing JSON must fail first");
+    let crate::commands::plan::PlanFileDecodeError::Json(error) = error else {
+        panic!("end-of-input must precede semantic validation: {error:?}");
+    };
+    assert_eq!(error.json_path(), ".");
+    assert_eq!(error.classify(), serde_json::error::Category::Syntax);
+}
+
+#[test]
 fn plan_file_decode_rejects_loop_placeholder_outside_template() {
     let mut encoded = encoded_plan_with_mock_provider_evidence();
     encoded["sorted_resources"][0]["attributes"]["leaked"] =
