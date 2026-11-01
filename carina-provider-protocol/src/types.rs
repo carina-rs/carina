@@ -2245,7 +2245,8 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_v14_state_json_bytes() {
+    fn ordered_maps_preserve_v15_state_json_bytes() {
+        assert_eq!(crate::PROTOCOL_VERSION, 15);
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),

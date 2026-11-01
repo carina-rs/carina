@@ -1,10 +1,11 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
@@ -24,7 +25,10 @@ use carina_core::resource::{
 };
 use carina_core::schema::{AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
-use carina_plugin_host::{GuestCallBudget, WasmProviderFactory};
+use carina_plugin_host::{
+    AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
+    GuestCallBudget, WasmProviderFactory, WasmProviderLoadError,
+};
 use carina_provider_resolver::{
     LockFile, ProviderLoadIdentity, ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
 };
@@ -43,6 +47,10 @@ fn mock_http_load(bytes: &[u8]) -> VerifiedLoad {
 
 fn mock_http_load_with_class(bytes: &[u8], class: ProviderTrustClass) -> VerifiedLoad {
     VerifiedLoad::for_test(bytes, ProviderLoadIdentity::for_test("mock_http", class))
+}
+
+fn mock_http_aws_load_with_class(bytes: &[u8], class: ProviderTrustClass) -> VerifiedLoad {
+    VerifiedLoad::for_test(bytes, ProviderLoadIdentity::for_test("aws", class))
 }
 
 fn mock_identifier() -> AppliedIdentifier {
@@ -229,6 +237,34 @@ fn http_wasm_path() -> Option<PathBuf> {
     None
 }
 
+fn aws_http_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in &[
+        "carina_provider_mock_http_aws.wasm",
+        "carina-provider-mock-http-aws.wasm",
+    ] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn aws_http_unused_wasm_path() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in &[
+        "carina_provider_mock_http_aws_unused.wasm",
+        "carina-provider-mock-http-aws-unused.wasm",
+    ] {
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 macro_rules! skip_if_no_wasm {
     () => {
         match wasm_path() {
@@ -259,6 +295,109 @@ macro_rules! skip_if_no_http_wasm {
     };
 }
 
+macro_rules! skip_if_no_aws_http_wasm {
+    () => {
+        match aws_http_wasm_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: AWS HTTP probe WASM binary not found. Build with: \
+                     cargo build -p carina-provider-mock-http --target wasm32-wasip2"
+                );
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! skip_if_no_aws_http_unused_wasm {
+    () => {
+        match aws_http_unused_wasm_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: unused-credentials AWS HTTP probe WASM binary not found. Build with: \
+                     cargo build -p carina-provider-mock-http --bin \
+                     carina-provider-mock-http-aws-unused --target wasm32-wasip2"
+                );
+                return;
+            }
+        }
+    };
+}
+
+struct FixedAwsCredentialSource(Result<AwsCredentials, AwsCredentialError>);
+
+impl AwsCredentialSource for FixedAwsCredentialSource {
+    fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>> {
+        let result = self.0.clone();
+        Box::pin(async move { result })
+    }
+}
+
+struct SequenceAwsCredentialSource {
+    results: Mutex<VecDeque<Result<AwsCredentials, AwsCredentialError>>>,
+}
+
+impl SequenceAwsCredentialSource {
+    fn new(results: impl IntoIterator<Item = Result<AwsCredentials, AwsCredentialError>>) -> Self {
+        Self {
+            results: Mutex::new(results.into_iter().collect()),
+        }
+    }
+}
+
+impl AwsCredentialSource for SequenceAwsCredentialSource {
+    fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>> {
+        let result = self
+            .results
+            .lock()
+            .expect("credential response queue must not be poisoned")
+            .pop_front()
+            .expect("credential response queue must contain one result per guest call");
+        Box::pin(async move { result })
+    }
+}
+
+struct FixedAwsCredentialProvisioner(Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>);
+
+impl AwsCredentialProvisioner for FixedAwsCredentialProvisioner {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+        let result = self.0.clone();
+        Box::pin(async move { result })
+    }
+}
+
+struct CountingAwsCredentialProvisioner {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AwsCredentialProvisioner for CountingAwsCredentialProvisioner {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(AwsCredentialError::ProviderFailed(
+                "non-AWS loads must not provision credentials".to_string(),
+            ))
+        })
+    }
+}
+
+fn test_aws_credentials(access_key_id: &str) -> AwsCredentials {
+    AwsCredentials::new(
+        access_key_id,
+        "host-secret-sentinel",
+        Some("host-session-sentinel".to_string()),
+        None,
+    )
+}
+
+fn default_aws_provisioner() -> FixedAwsCredentialProvisioner {
+    FixedAwsCredentialProvisioner(Ok(Arc::new(FixedAwsCredentialSource(Ok(
+        test_aws_credentials("AKIADEFAULT"),
+    )))))
+}
+
 /// Build a `WasmProviderFactory` using a per-test temporary cache directory.
 ///
 /// Tests in this binary run in parallel; if they all shared
@@ -271,13 +410,35 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read WASM provider");
     let load = mock_load(&wasm_bytes);
     let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
         cache.path(),
         locked_egress.as_ref(),
+        &aws,
     )
     .await
     .expect("Failed to load WASM provider");
+    (factory, cache)
+}
+
+async fn load_aws_http_factory(
+    wasm: &std::path::Path,
+    credentials: Arc<dyn AwsCredentialSource>,
+) -> (WasmProviderFactory, tempfile::TempDir) {
+    let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
+    let wasm_bytes = std::fs::read(wasm).expect("Failed to read AWS HTTP probe WASM provider");
+    let load = mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = FixedAwsCredentialProvisioner(Ok(credentials));
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await
+    .expect("Failed to load AWS HTTP probe WASM provider");
     (factory, cache)
 }
 
@@ -289,14 +450,24 @@ async fn load_http_factory_with_class(
     wasm: &std::path::Path,
     class: ProviderTrustClass,
 ) -> (WasmProviderFactory, tempfile::TempDir) {
+    load_http_factory_with_name_and_class(wasm, "mock_http", class).await
+}
+
+async fn load_http_factory_with_name_and_class(
+    wasm: &std::path::Path,
+    name: &str,
+    class: ProviderTrustClass,
+) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
-    let load = mock_http_load_with_class(&wasm_bytes, class);
+    let load = VerifiedLoad::for_test(&wasm_bytes, ProviderLoadIdentity::for_test(name, class));
     let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
         cache.path(),
         locked_egress.as_ref(),
+        &aws,
     )
     .await
     .expect("Failed to load HTTP probe WASM provider");
@@ -350,6 +521,23 @@ async fn load_schema_http_factory(
     (factory, cache)
 }
 
+fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDataSource {
+    let resource = DataSource::with_provider("aws", "test.aws_credentials", "credentials", None);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    carina_core::executor::prepare_provider_ready_data_source(resource, &preparation)
+        .expect("credential probe data source should pass the checked host boundary")
+}
+
 fn resource_with_int_attribute(
     resource_type: &str,
     identity: &str,
@@ -392,13 +580,18 @@ fn resource_with_provider_string_attribute(
 }
 
 fn http_send_phase_resource(identity: &str, url: &str, method: &str, body: &str) -> Resource {
-    let mut resource = resource_with_provider_string_attribute(
-        "mock_http",
-        "test.send_phase",
-        identity,
-        "url",
-        url,
-    );
+    http_send_phase_resource_with_provider("mock_http", identity, url, method, body)
+}
+
+fn http_send_phase_resource_with_provider(
+    provider: &str,
+    identity: &str,
+    url: &str,
+    method: &str,
+    body: &str,
+) -> Resource {
+    let mut resource =
+        resource_with_provider_string_attribute(provider, "test.send_phase", identity, "url", url);
     resource.attributes.insert(
         "method".to_string(),
         Value::Concrete(ConcreteValue::String(method.to_string().into())),
@@ -753,6 +946,250 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn schema_only_loads_an_aws_world_without_a_credential_source() {
+    let path = skip_if_no_aws_http_wasm!();
+    let cache = tempfile::tempdir().expect("create schema-only cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
+        mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
+        cache.path(),
+    )
+    .await
+    .expect("schema-only loading must link the failing credential import");
+
+    assert_eq!(factory.name(), "aws");
+    assert!(
+        factory
+            .schemas()
+            .iter()
+            .any(|schema| schema.parts().resource_type == "test.aws_credentials")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_kind_runtime_rejects_an_http_world_before_provisioning_credentials() {
+    let path = skip_if_no_http_wasm!();
+    let cache = tempfile::tempdir().expect("create AWS-kind cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read HTTP-world WASM provider");
+    let load = mock_http_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let aws = CountingAwsCredentialProvisioner {
+        calls: Arc::clone(&calls),
+    };
+
+    let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("an AWS-kind runtime must reject a component built with the HTTP world"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        WasmProviderLoadError::AwsCredentialsImportMissing
+    ));
+    assert_eq!(
+        error.to_string(),
+        "an AWS-kind provider must be built with the `aws` world (`export_provider!(T, aws, egress: [..])`)"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_world_without_credential_calls_loads_as_aws_kind_at_runtime() {
+    let path = skip_if_no_aws_http_unused_wasm!();
+    let cache = tempfile::tempdir().expect("create unused-credentials AWS-world cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read unused-credentials AWS-world WASM provider");
+    let load = VerifiedLoad::for_test(
+        &wasm_bytes,
+        ProviderLoadIdentity::for_test("mock_http_aws_unused", ProviderTrustClass::Aws),
+    );
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = default_aws_provisioner();
+
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await
+    .expect("the AWS world must retain its credential import even when guest code never calls it");
+
+    assert_eq!(factory.name(), "mock_http_aws_unused");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_world_provision_failure_remains_a_typed_load_error() {
+    let path = skip_if_no_aws_http_wasm!();
+    let cache = tempfile::tempdir().expect("create AWS-world cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read AWS-world WASM provider");
+    let load = mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = FixedAwsCredentialProvisioner(Err(AwsCredentialError::NotFound(
+        "host provisioning failure sentinel".to_string(),
+    )));
+
+    let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(WasmProviderLoadError::AwsCredentials(
+            AwsCredentialError::NotFound(ref message)
+        )) if message == "host provisioning failure sentinel"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_aws_kinds_never_provision_and_cannot_instantiate_an_aws_world() {
+    let path = skip_if_no_aws_http_wasm!();
+    let wasm_bytes = std::fs::read(path).expect("read AWS HTTP probe WASM provider");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let aws = CountingAwsCredentialProvisioner {
+        calls: Arc::clone(&calls),
+    };
+
+    for class in [ProviderTrustClass::GitHub, ProviderTrustClass::Untrusted] {
+        let cache = tempfile::tempdir().expect("create non-AWS cache tempdir");
+        let load = mock_http_aws_load_with_class(&wasm_bytes, class);
+        let locked_egress = explicit_test_egress(&load, cache.path());
+        let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            load,
+            cache.path(),
+            locked_egress.as_ref(),
+            &aws,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a non-AWS runtime must reject the AWS credential import"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            WasmProviderLoadError::AwsCredentialsRequired
+        ));
+        assert_eq!(
+            error.to_string(),
+            "this provider requires AWS credentials, which only an AWS-kind provider can receive"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_credential_import_returns_the_sources_credentials() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(FixedAwsCredentialSource(Ok(AwsCredentials::new(
+        "AKIAFROMHOST",
+        "host-secret-sentinel",
+        Some("host-session-sentinel".to_string()),
+        None,
+    ))));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let state = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("the guest should receive host credentials");
+
+    assert_eq!(
+        state.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "AKIAFROMHOST".into()
+        )))
+    );
+    assert_eq!(
+        state.attributes.get("has_session_token"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_credential_source_error_reaches_the_guest_as_a_wit_error() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(FixedAwsCredentialSource(Err(AwsCredentialError::NotFound(
+        "credential-source-not-found-sentinel".to_string(),
+    ))));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let error = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect_err("the guest should surface the typed source failure");
+
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .contains("credential-source-not-found-sentinel"),
+        "unexpected guest error: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_guest_call_asks_the_host_source() {
+    let path = skip_if_no_aws_http_wasm!();
+    let source = Arc::new(SequenceAwsCredentialSource::new([
+        Ok(AwsCredentials::new("AKIAFIRST", "first-secret", None, None)),
+        Ok(AwsCredentials::new(
+            "AKIASECOND",
+            "second-secret",
+            None,
+            None,
+        )),
+    ]));
+    let (factory, _cache) = load_aws_http_factory(&path, source).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("AWS credential probe should initialize");
+
+    let first = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("first guest credential request should succeed");
+    let second = provider
+        .provider()
+        .read_data_source(&aws_credential_probe_data_source())
+        .await
+        .expect("second guest credential request should succeed");
+
+    assert_eq!(
+        first.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String("AKIAFIRST".into())))
+    );
+    assert_eq!(
+        second.attributes.get("access_key_id"),
+        Some(&Value::Concrete(ConcreteValue::String("AKIASECOND".into())))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn initialized_reference_scope_is_kept_per_provider_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -909,11 +1346,16 @@ async fn schema_only_instance_denies_even_a_declared_host() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_kinds_do_not_inherit_amazonaws_egress() {
-    let path = skip_if_no_http_wasm!();
-    for class in [
-        ProviderTrustClass::Aws,
-        ProviderTrustClass::GitHub,
-        ProviderTrustClass::Untrusted,
+    let http_path = skip_if_no_http_wasm!();
+    let aws_path = skip_if_no_aws_http_wasm!();
+    for (class, path, provider_name) in [
+        (ProviderTrustClass::Aws, aws_path.as_path(), "aws"),
+        (ProviderTrustClass::GitHub, http_path.as_path(), "mock_http"),
+        (
+            ProviderTrustClass::Untrusted,
+            http_path.as_path(),
+            "mock_http",
+        ),
     ] {
         let socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
             socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
@@ -926,19 +1368,21 @@ async fn provider_kinds_do_not_inherit_amazonaws_egress() {
             }
         };
         let address = socket.local_addr().expect("reserved socket has an address");
-        let (factory, _cache) = load_http_factory_with_class(&path, class).await;
+        let (factory, _cache) =
+            load_http_factory_with_name_and_class(path, provider_name, class).await;
         let factory = factory.with_http_test_route("sts.amazonaws.com", address);
         let provider = factory
             .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
             .await
             .expect("provider should initialize");
         let id = ResourceId::with_provider_identity(
-            "mock_http",
+            provider_name,
             "test.send_phase",
             "amazonaws-denied",
             None,
         );
-        let resource = http_send_phase_resource(
+        let resource = http_send_phase_resource_with_provider(
+            provider_name,
             "amazonaws-denied",
             &format!("http://sts.amazonaws.com:{}/", address.port()),
             "POST",
@@ -1050,16 +1494,16 @@ async fn untrusted_metadata_denial_is_immediate_and_poisons_the_provider_instanc
     );
     assert!(
         rendered.contains("mock_http")
-            && rendered.contains("untrusted")
             && rendered.contains("169.254.169.254")
-            && rendered.contains("--trust-local-provider")
-            && rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
+            && rendered.contains("instance-metadata address")
             && rendered.contains("create call"),
         "unexpected metadata denial: {rendered}"
     );
     assert!(
         !rendered.contains("WASM guest trapped")
             && !rendered.contains("timed out")
+            && !rendered.contains("--trust-local-provider")
+            && !rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
             && !rendered.contains('\n'),
         "the denial must retain its dedicated non-timeout diagnostic: {rendered}"
     );
@@ -1132,17 +1576,18 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
             && rendered.contains("create call:")
             && rendered.contains("provider 'mock_http'")
             && rendered.contains("file:///test-providers/mock_http.wasm")
-            && rendered.contains(
-                "is untrusted, so it gets no credentials and no instance-metadata access"
-            )
             && rendered.contains("request to resolved-metadata.invalid was denied")
-            && rendered.contains("--trust-local-provider"),
+            && rendered.contains(
+                "instance-metadata address 169.254.169.254 is withheld from every provider"
+            ),
         "unexpected post-resolution metadata denial: {rendered}"
     );
     assert!(
         !rendered.contains("not_sent")
             && !rendered.contains("WASM guest trapped")
             && !rendered.contains("timed out")
+            && !rendered.contains("--trust-local-provider")
+            && !rendered.contains("CARINA_TRUST_LOCAL_PROVIDER")
             && !rendered.contains('\n'),
         "the post-resolution denial must remain an outer typed trap: {rendered}"
     );
@@ -2787,7 +3232,7 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     );
     resource.set_attr(
         "create_pending_polls",
-        // The slow initial call reaches the operation deadline. Protocol v14
+        // The slow initial call reaches the operation deadline. Protocol v15
         // still grants exactly one final poll, so keep the mock pending after
         // that poll to verify that the initial call consumed the budget.
         Value::Concrete(ConcreteValue::Int(2)),

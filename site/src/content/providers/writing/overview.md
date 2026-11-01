@@ -9,12 +9,13 @@ This section covers writing a provider, building it, and using it from a local f
 
 ## What a provider is
 
-A provider is a [WebAssembly component](https://component-model.bytecodealliance.org/) built for the `wasm32-wasip2` target. Carina (the host) loads it into a sandbox and calls it through the interface defined in [carina-plugin-wit](https://github.com/carina-rs/carina-plugin-wit). It exports one of two WIT worlds:
+A provider is a [WebAssembly component](https://component-model.bytecodealliance.org/) built for the `wasm32-wasip2` target. Carina (the host) loads it into a sandbox and calls it through the interface defined in [carina-plugin-wit](https://github.com/carina-rs/carina-plugin-wit). It exports one of three WIT worlds:
 
 | World | Use it when |
 |-------|-------------|
 | `carina-provider` | The provider needs no network access. |
 | `carina-provider-with-http` | The provider calls an HTTP API through `wasi:http` and declares the hosts it may reach. |
+| `carina-provider-aws` | An AWS-kind provider needs `wasi:http` plus host-resolved AWS base credentials. |
 
 You do not write WIT bindings by hand. The `carina-plugin-sdk` crate defines a `CarinaProvider` trait, and its `export_provider!` macro generates the bindings and connects them to your implementation. The SDK re-exports the request and schema types from `carina-provider-protocol`.
 
@@ -36,7 +37,19 @@ The HTTP form embeds a versioned `carina:egress` custom section in the component
 - `*.example.com` matches one label, such as `api.example.com`, but not `v1.api.example.com`.
 - `**.example.com` matches one or more labels at any depth below `example.com`. It does not match `example.com` itself.
 
-Wildcards are allowed only as the complete leftmost label and cannot sit directly above a public suffix. IP literals, localhost, metadata and link-local names, non-ASCII labels, empty labels, and labels longer than 63 bytes are rejected. DNS resolution is checked separately: loopback, unspecified, and link-local addresses are always denied; metadata is withheld except for a provider kind's own endpoints (currently AWS IMDS and ECS endpoints for AWS-kind providers); and Alibaba or Azure metadata is always withheld. Private IPv4, IPv6, and CGNAT addresses are denied except for AWS-kind providers, which need them for VPC interface endpoints and PrivateLink.
+Wildcards are allowed only as the complete leftmost label and cannot sit directly above a public suffix. IP literals, localhost, metadata and link-local names, non-ASCII labels, empty labels, and labels longer than 63 bytes are rejected. DNS resolution is checked separately: loopback, unspecified, link-local, and cloud metadata addresses are always denied. Private IPv4, IPv6, and CGNAT addresses are denied except for AWS-kind providers, which need them for VPC interface endpoints and PrivateLink.
+
+An AWS provider uses the same egress declaration but selects the AWS world:
+
+```rust
+carina_plugin_sdk::export_provider!(
+    MyAwsProvider,
+    aws,
+    egress: ["**.amazonaws.com", "**.amazonaws.com.cn"],
+);
+```
+
+Call `carina_plugin_sdk::aws_credentials::current()` to obtain the current base credentials. The SDK-side type exposes accessors but redacts secret fields from `Debug`. Native builds return a typed error so provider unit tests still compile. At runtime, only a component loaded with the AWS trust kind can link this import. Schema-only loading links the import without resolving credentials and returns `ProviderFailed` if the provider calls it while schemas are loading. See [AWS Credentials](/guides/aws-credentials/) for the user-facing chain and refresh behavior.
 
 In native provider tests, validate declaration patterns with `carina_plugin_sdk::protocol::HostPattern::parse`.
 
@@ -114,18 +127,18 @@ Create results go through a typestate in the SDK, so a provider must say what it
 A provider runs with no filesystem access. It sees only these environment variables:
 
 - `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
-- AWS credential and region variables, only when this user's `carina init` downloaded the exact artifact from the origin for `carina-rs/aws` or `carina-rs/awscc` (including their official GitHub sources) and recorded its source and SHA-256 in the user's trust directory, or for a matching local build explicitly granted the `aws` kind.
+- `AWS_REGION`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL`, only for an AWS-kind provider. AWS credential variables are never passed; the AWS world receives credentials through its typed import.
 - `GITHUB_TOKEN`, only when the same user-owned record exists for the exact `carina-rs/github` artifact (including its official GitHub source), or for a matching local build explicitly granted the `github` kind.
 
 For a remote provider, the host hashes the bytes being loaded and looks for that SHA-256 and canonical source in a user-owned record under `~/.carina/trust/`. It then applies the fixed official-source allow-list. Registry records are written only after the registry signature verifies, and a signer recorded for the source must belong to `carina-rs`. A `carina-providers.lock` file or `.carina/` directory shipped in a repository cannot create this record and does not grant credentials. This also applies in CI: restoring `.carina/` without the trust directory makes official providers fail before their WebAssembly code runs, so the job must run `carina init` or persist the trust directory (`CARINA_TRUST_RECORD_DIR` can relocate it). An absent, unreadable, malformed, or non-`carina-rs` record produces an error that tells the user to run `carina init`.
 
 A local `file://` build receives no credential partition unless its canonical source path is granted with `--trust-local-provider <PATH=KIND>` or `CARINA_TRUST_LOCAL_PROVIDER`; Carina checks that the bytes being loaded still match that source file. A stale entry in `CARINA_TRUST_LOCAL_PROVIDER` makes provider-loading commands fail until it is fixed or removed. Declare other settings as attributes of the `provider` block, and tell users to pass secrets with `secret(env('NAME'))` rather than writing them into `.crn` files: `env` reads the value from the environment, and `secret` keeps it out of plan output and saved plan files.
 
-The same user trust record controls metadata access. Only a recorded artifact from an allow-listed AWS source can reach the EC2 or ECS metadata addresses and read role credentials from them.
+Cloud metadata addresses are withheld from every provider kind. The host may use ECS or EC2 metadata as part of its own AWS SDK credential chain, but those endpoints and credentials are never exposed through guest networking or environment variables.
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 14, and the host also requires at least 14. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0 and v0.7.1 all speak version 12; version 14 will ship in the next release after v0.9.0.
+The provider protocol is versioned. The current development version is 15, and the host also requires at least 15. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

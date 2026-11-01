@@ -129,7 +129,7 @@ provider aws {
 }
 ```
 
-Local components receive no AWS credentials and cannot reach the EC2 or ECS metadata service by default. To grant those capabilities to this exact build for one command, pass its absolute source path and the `aws` kind:
+Local components cannot import host-resolved AWS credentials by default, and no guest can reach the EC2 or ECS metadata service. To grant the typed AWS credential capability to this exact build for one command, pass its absolute source path and the `aws` kind:
 
 ```bash
 carina init

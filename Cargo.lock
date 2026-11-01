@@ -1053,6 +1053,7 @@ dependencies = [
  "base64 0.22.1",
  "carina-cli",
  "carina-core",
+ "carina-credentials-aws",
  "carina-lsp",
  "carina-plugin-host",
  "carina-provider-mock",
@@ -1116,6 +1117,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "carina-credentials-aws"
+version = "0.9.0"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "carina-plugin-host",
+ "log",
+ "rustls 0.23.36",
+ "rustls-native-certs",
+ "sha1",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

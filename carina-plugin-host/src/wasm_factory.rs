@@ -8,6 +8,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::SystemTime;
 
 use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
@@ -67,6 +68,113 @@ pub use guest_store::GuestCallBudget;
 #[cfg(not(any(test, feature = "test-utils")))]
 use guest_store::GuestCallBudget;
 use guest_store::{EPOCH_TICK_INTERVAL, GuestStore, HostState, WallBudgetExceeded};
+
+/// Base AWS credentials resolved by the host for an AWS-kind guest.
+///
+/// Secret fields are held in a private redacting type and are never included
+/// in this value's `Debug` output.
+#[derive(Clone)]
+pub struct AwsCredentials {
+    access_key_id: String,
+    secret_access_key: SecretString,
+    session_token: Option<SecretString>,
+    expires_at: Option<SystemTime>,
+}
+
+impl AwsCredentials {
+    pub fn new(
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        session_token: Option<String>,
+        expires_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key: SecretString(secret_access_key.into()),
+            session_token: session_token.map(SecretString),
+            expires_at,
+        }
+    }
+
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    pub fn secret_access_key(&self) -> &str {
+        self.secret_access_key.expose()
+    }
+
+    pub fn session_token(&self) -> Option<&str> {
+        self.session_token.as_ref().map(SecretString::expose)
+    }
+
+    pub fn expires_at(&self) -> Option<SystemTime> {
+        self.expires_at
+    }
+}
+
+impl fmt::Debug for AwsCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AwsCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &self.secret_access_key)
+            .field("session_token", &self.session_token)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct SecretString(String);
+
+impl SecretString {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// Failure to obtain the host's current base AWS credentials.
+///
+/// Implementations must ensure payloads are free of access keys, secret keys,
+/// session tokens, and other secret material.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AwsCredentialError {
+    NotFound(String),
+    ProviderFailed(String),
+}
+
+impl fmt::Display for AwsCredentialError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(message) | Self::ProviderFailed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AwsCredentialError {}
+
+/// Refreshing source of base credentials for AWS-kind runtime guests.
+///
+/// Error payloads must be rendered without secret material.
+pub trait AwsCredentialSource: Send + Sync + 'static {
+    fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>>;
+}
+
+/// Supplies the run-scoped credential source for an AWS-kind runtime load.
+///
+/// The host calls this only after resolver-owned trust has classified the
+/// verified artifact as AWS. Implementations may lazily construct the source
+/// and preflight it before returning.
+pub trait AwsCredentialProvisioner: Send + Sync {
+    fn provision(&self) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>>;
+}
 
 /// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
 /// the async `BoxFuture` shape used by `Provider`, preserving its typed cause.
@@ -239,6 +347,7 @@ pub const WASI_HTTP_HOST_VERSION: &str = "0.2.6";
 /// The `wasmtime-wasi-http` crate release whose WIT was inspected when
 /// [`WASI_HTTP_HOST_VERSION`] was set.
 const WASMTIME_WASI_HTTP_CRATE_VERSION_WITH_KNOWN_WIT: &str = "43.0.0";
+const AWS_CREDENTIALS_INTERFACE: &str = "carina:provider/aws-credentials";
 
 #[derive(Debug)]
 struct WasiHttpImport {
@@ -276,6 +385,15 @@ impl ComponentImports {
 
     fn is_empty(&self) -> bool {
         self.names.is_empty()
+    }
+
+    fn imports_aws_credentials(&self) -> bool {
+        self.iter().any(|name| {
+            name == AWS_CREDENTIALS_INTERFACE
+                || name
+                    .strip_prefix(AWS_CREDENTIALS_INTERFACE)
+                    .is_some_and(|suffix| suffix.starts_with('@'))
+        })
     }
 }
 
@@ -622,6 +740,12 @@ pub enum WasmProviderLoadError {
         configured: String,
         reported: String,
     },
+    /// Host-side AWS credential provisioning failed before guest instantiation.
+    AwsCredentials(AwsCredentialError),
+    /// An AWS-kind runtime component did not import the AWS credential interface.
+    AwsCredentialsImportMissing,
+    /// A non-AWS runtime component imported the AWS credential interface.
+    AwsCredentialsRequired,
     /// A provider metadata export trapped or returned malformed data.
     Metadata {
         context: String,
@@ -646,6 +770,13 @@ impl fmt::Display for WasmProviderLoadError {
                 f,
                 "configured provider name '{configured}' does not match artifact-reported name '{reported}'"
             ),
+            WasmProviderLoadError::AwsCredentials(error) => error.fmt(f),
+            WasmProviderLoadError::AwsCredentialsImportMissing => f.write_str(
+                "an AWS-kind provider must be built with the `aws` world (`export_provider!(T, aws, egress: [..])`)",
+            ),
+            WasmProviderLoadError::AwsCredentialsRequired => f.write_str(
+                "this provider requires AWS credentials, which only an AWS-kind provider can receive",
+            ),
             WasmProviderLoadError::Metadata { context, source } => {
                 write!(f, "{context}: {source}")
             }
@@ -663,6 +794,9 @@ impl std::error::Error for WasmProviderLoadError {
             Self::PrecompiledDeserialization(_)
             | Self::Instantiation(_)
             | Self::ProviderNameMismatch { .. }
+            | Self::AwsCredentials(_)
+            | Self::AwsCredentialsImportMissing
+            | Self::AwsCredentialsRequired
             | Self::Metadata { .. }
             | Self::Other(_) => None,
         }
@@ -714,6 +848,12 @@ impl From<carina_provider_resolver::LockedEgressLoadError> for WasmProviderLoadE
 impl From<carina_provider_resolver::EgressConsentError> for WasmProviderLoadError {
     fn from(error: carina_provider_resolver::EgressConsentError) -> Self {
         Self::EgressConsent(error)
+    }
+}
+
+impl From<AwsCredentialError> for WasmProviderLoadError {
+    fn from(error: AwsCredentialError) -> Self {
+        Self::AwsCredentials(error)
     }
 }
 
@@ -904,8 +1044,16 @@ fn write_error_chain_inline(f: &mut fmt::Formatter<'_>, error: &wasmtime::Error)
 enum GuestNetwork {
     SchemaOnly,
     Runtime {
-        kind: ProviderKind,
+        capabilities: RuntimeCapabilities,
         egress: ConsentedEgress,
+    },
+}
+
+enum GuestNetworkRequest<'a> {
+    SchemaOnly,
+    Runtime {
+        egress: ConsentedEgress,
+        aws: &'a dyn AwsCredentialProvisioner,
     },
 }
 
@@ -913,7 +1061,20 @@ impl GuestNetwork {
     fn kind(&self) -> Option<ProviderKind> {
         match self {
             Self::SchemaOnly => None,
-            Self::Runtime { kind, egress: _ } => Some(*kind),
+            Self::Runtime {
+                capabilities,
+                egress: _,
+            } => Some(capabilities.kind()),
+        }
+    }
+
+    fn runtime_capabilities(&self) -> Option<&RuntimeCapabilities> {
+        match self {
+            Self::SchemaOnly => None,
+            Self::Runtime {
+                capabilities,
+                egress: _,
+            } => Some(capabilities),
         }
     }
 }
@@ -948,13 +1109,6 @@ fn test_explicit_egress(declaration: &VerifiedEgressDeclaration) -> LockedEgress
         .expect("lock has consent for the declaration source")
 }
 
-/// Metadata service addresses owned by the AWS provider kind.
-const AWS_METADATA_ENDPOINTS: [IpAddr; 3] = [
-    IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
-    IpAddr::V4(Ipv4Addr::new(169, 254, 170, 2)),
-    IpAddr::V6(Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)),
-];
-
 /// Every metadata address withheld from ordinary resolved destinations.
 ///
 /// Alibaba and Azure metadata are deliberately not owned by any
@@ -966,11 +1120,6 @@ const METADATA_ENDPOINTS: [IpAddr; 5] = [
     IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200)),
     IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16)),
 ];
-
-/// Connect timeout used when probing and capping metadata endpoint requests.
-/// On EC2, IMDS responds in <10ms. A 1-second timeout lets non-EC2 environments
-/// fail fast instead of hanging for the SDK's default timeout.
-const METADATA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maximum duration applied independently to each capped phase of an
 /// outbound guest HTTP request (connect, first byte, and between bytes).
@@ -1042,7 +1191,7 @@ impl fmt::Display for DestinationDenied {
             DestinationDenied::MetadataWithheld(address) => {
                 write!(
                     f,
-                    "instance-metadata address {address} is not available to this provider"
+                    "instance-metadata address {address} is withheld from every provider"
                 )
             }
             DestinationDenied::LoopbackAddressDenied(address) => {
@@ -1089,37 +1238,6 @@ impl EgressDenied {
 impl fmt::Display for EgressDenied {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.kind, &self.label.source, &self.reason) {
-            (
-                Some(ProviderKind::Untrusted),
-                ProviderLoadSource::LocalFile {
-                    path,
-                    canonical_source: _,
-                },
-                DestinationDenied::MetadataWithheld(address),
-            ) if AWS_METADATA_ENDPOINTS.contains(address) => write!(
-                formatter,
-                "provider '{}' ({}) is untrusted, so it gets no credentials and no \
-                 instance-metadata access; its request to {} was denied. Grant this local build \
-                 with --trust-local-provider {}=aws (or \
-                 CARINA_TRUST_LOCAL_PROVIDER={}=aws); if it is already granted, re-run `carina \
-                 init` so the installed bytes match the granted file",
-                self.label.name,
-                self.label.source,
-                self.destination,
-                path.display(),
-                path.display(),
-            ),
-            (
-                Some(ProviderKind::Untrusted),
-                ProviderLoadSource::Remote { source: _ },
-                DestinationDenied::MetadataWithheld(address),
-            ) if AWS_METADATA_ENDPOINTS.contains(address) => write!(
-                formatter,
-                "provider '{}' ({}) is untrusted, so it gets no credentials and no \
-                 instance-metadata access; its request to {} was denied because its source is \
-                 not a verified carina-rs provider",
-                self.label.name, self.label.source, self.destination,
-            ),
             (
                 None
                 | Some(ProviderKind::Aws)
@@ -1174,14 +1292,8 @@ impl std::error::Error for EgressDeniedCall {}
 /// Its fields are private so only [`check_host`] can create it. Resolution is
 /// still required before this value can become a [`VettedDestination`].
 struct AllowedHost {
-    kind: Option<ProviderKind>,
-    target: AllowedHostTarget,
-}
-
-#[derive(Debug)]
-enum AllowedHostTarget {
-    Name(String),
-    Literal(IpAddr),
+    private_address_policy: Option<PrivateAddressPolicy>,
+    host: String,
 }
 
 /// The only destination type accepted by the TCP connection handler.
@@ -1193,7 +1305,6 @@ struct VettedDestination {
     host: String,
     first: SocketAddr,
     rest: Vec<SocketAddr>,
-    is_metadata: bool,
 }
 
 impl VettedDestination {
@@ -1202,15 +1313,10 @@ impl VettedDestination {
     /// no bypass constructor.
     #[cfg(any(test, feature = "test-utils"))]
     fn from_http_test_route(allowed_host: AllowedHost, destination: HttpTestDestination) -> Self {
-        let host = match allowed_host.target {
-            AllowedHostTarget::Name(host) => host,
-            AllowedHostTarget::Literal(address) => address.to_string(),
-        };
         Self {
-            host,
+            host: allowed_host.host,
             first: destination.address(),
             rest: Vec::new(),
-            is_metadata: false,
         }
     }
 }
@@ -1369,25 +1475,16 @@ impl ResolvedAddressClass {
     }
 }
 
-fn provider_permits_metadata(kind: Option<ProviderKind>, canonical_address: IpAddr) -> bool {
-    match kind {
-        Some(kind) => kind.metadata_endpoints().contains(&canonical_address),
-        None => false,
-    }
-}
-
 fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, DestinationDenied> {
-    let kind = network.kind();
+    let private_address_policy = network
+        .runtime_capabilities()
+        .map(RuntimeCapabilities::private_address_policy);
     let target = match ip_literal(host) {
         Some(address) => {
             let canonical_address = canonical_policy_address(address);
             match ResolvedAddressClass::classify(canonical_address) {
                 ResolvedAddressClass::Metadata => {
-                    if provider_permits_metadata(kind, canonical_address) {
-                        AllowedHostTarget::Literal(canonical_address)
-                    } else {
-                        return Err(DestinationDenied::MetadataWithheld(canonical_address));
-                    }
+                    return Err(DestinationDenied::MetadataWithheld(canonical_address));
                 }
                 ResolvedAddressClass::Loopback
                 | ResolvedAddressClass::Unspecified
@@ -1400,16 +1497,23 @@ fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, Destina
         }
         None => match network {
             GuestNetwork::SchemaOnly => return Err(DestinationDenied::HostNotAllowed),
-            GuestNetwork::Runtime { kind: _, egress } if egress.allows(host) => {
-                AllowedHostTarget::Name(host.to_string())
-            }
-            GuestNetwork::Runtime { kind: _, egress: _ } => {
+            GuestNetwork::Runtime {
+                capabilities: _,
+                egress,
+            } if egress.allows(host) => host.to_string(),
+            GuestNetwork::Runtime {
+                capabilities: _,
+                egress: _,
+            } => {
                 return Err(DestinationDenied::HostNotAllowed);
             }
         },
     };
 
-    Ok(AllowedHost { kind, target })
+    Ok(AllowedHost {
+        private_address_policy,
+        host: target,
+    })
 }
 
 fn vet_resolved_destination(
@@ -1417,24 +1521,16 @@ fn vet_resolved_destination(
     first: SocketAddr,
     rest: &[SocketAddr],
 ) -> Result<VettedDestination, (DestinationDenied, String)> {
-    let AllowedHost { kind, target } = allowed_host;
-    let host = match target {
-        AllowedHostTarget::Name(host) => host,
-        AllowedHostTarget::Literal(address) => address.to_string(),
-    };
-    let private_address_policy = match kind {
-        Some(kind) => kind.private_address_policy(),
-        None => PrivateAddressPolicy::Deny,
-    };
-    let mut destination_is_metadata = false;
+    let AllowedHost {
+        private_address_policy,
+        host,
+    } = allowed_host;
+    let private_address_policy = private_address_policy.unwrap_or(PrivateAddressPolicy::Deny);
     for address in std::iter::once(&first).chain(rest) {
         let canonical_ip = canonical_policy_address(address.ip());
         match ResolvedAddressClass::classify(canonical_ip) {
             ResolvedAddressClass::Metadata => {
-                if !provider_permits_metadata(kind, canonical_ip) {
-                    return Err((DestinationDenied::MetadataWithheld(canonical_ip), host));
-                }
-                destination_is_metadata = true;
+                return Err((DestinationDenied::MetadataWithheld(canonical_ip), host));
             }
             ResolvedAddressClass::Loopback => {
                 return Err((DestinationDenied::LoopbackAddressDenied(canonical_ip), host));
@@ -1465,7 +1561,6 @@ fn vet_resolved_destination(
         host,
         first,
         rest: rest.to_vec(),
-        is_metadata: destination_is_metadata,
     })
 }
 
@@ -1483,66 +1578,6 @@ fn check_destination(
     let allowed_host = check_host(network, host)?;
     vet_resolved_destination(allowed_host, *first, rest)
         .map_err(|(reason, _denied_destination)| reason)
-}
-
-/// Memoizes metadata endpoint availability for a single probe owner.
-struct MetadataProbe {
-    cache: OnceLock<bool>,
-    #[cfg(test)]
-    probes: AtomicUsize,
-}
-
-impl MetadataProbe {
-    const fn new() -> Self {
-        Self {
-            cache: OnceLock::new(),
-            #[cfg(test)]
-            probes: AtomicUsize::new(0),
-        }
-    }
-
-    fn is_available(&self) -> bool {
-        *self.cache.get_or_init(|| {
-            #[cfg(test)]
-            self.probes.fetch_add(1, Ordering::Relaxed);
-
-            probe_metadata_endpoints()
-        })
-    }
-
-    #[cfg(test)]
-    fn probe_count(&self) -> usize {
-        self.probes.load(Ordering::Relaxed)
-    }
-}
-
-static METADATA_PROBE: MetadataProbe = MetadataProbe::new();
-
-/// Probe metadata endpoints and return true if any is reachable.
-///
-/// Uses parallel TCP connect attempts with a 1-second timeout.
-/// Memoization is owned by [`MetadataProbe`].
-fn probe_metadata_endpoints() -> bool {
-    use std::net::{SocketAddr, TcpStream};
-
-    std::thread::scope(|s| {
-        let handles: Vec<_> = AWS_METADATA_ENDPOINTS
-            .iter()
-            .map(|address| {
-                s.spawn(move || {
-                    let addr = SocketAddr::new(*address, 80);
-                    TcpStream::connect_timeout(&addr, METADATA_PROBE_TIMEOUT).is_ok()
-                })
-            })
-            .collect();
-        handles.into_iter().any(|h| h.join().unwrap_or(false))
-    })
-}
-
-/// Returns `true` if any metadata endpoint is reachable.
-/// Result is cached for the lifetime of the process.
-fn is_metadata_available() -> bool {
-    METADATA_PROBE.is_available()
 }
 
 type ResolveFuture =
@@ -1575,9 +1610,6 @@ fn dns_error_code() -> wasmtime_wasi_http::p2::bindings::http::types::ErrorCode 
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to this
 /// store's consented declaration and typed resolved-address policy.
-///
-/// Metadata requests are capped at [`METADATA_PROBE_TIMEOUT`] so that non-EC2/ECS
-/// environments fail fast rather than waiting for the SDK's default timeout.
 struct AllowListHttpHooks {
     label: Arc<ProviderLabel>,
     network: GuestNetwork,
@@ -1667,31 +1699,27 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                     return Ok::<_, ErrorCode>(resolution);
                 }
 
-                let addresses = match &allowed_host.target {
-                    AllowedHostTarget::Name(host) => tokio::time::timeout(
-                        config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
-                        resolver.resolve(host.clone(), port),
-                    )
-                    .await
-                    .map_err(|_| {
-                        log::warn!(
-                            "WASM plugin HTTP request timed out resolving host {:?}",
-                            host,
-                        );
-                        ErrorCode::ConnectionTimeout
-                    })?
-                    .map_err(|error| {
-                        log::warn!(
-                            "WASM plugin HTTP request failed to resolve host {:?}: {}",
-                            host,
-                            error,
-                        );
-                        dns_error_code()
-                    })?,
-                    AllowedHostTarget::Literal(address) => {
-                        vec![SocketAddr::new(*address, port)]
-                    }
-                };
+                let host = &allowed_host.host;
+                let addresses = tokio::time::timeout(
+                    config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
+                    resolver.resolve(host.clone(), port),
+                )
+                .await
+                .map_err(|_| {
+                    log::warn!(
+                        "WASM plugin HTTP request timed out resolving host {:?}",
+                        host,
+                    );
+                    ErrorCode::ConnectionTimeout
+                })?
+                .map_err(|error| {
+                    log::warn!(
+                        "WASM plugin HTTP request failed to resolve host {:?}: {}",
+                        host,
+                        error,
+                    );
+                    dns_error_code()
+                })?;
                 Ok::<_, ErrorCode>(ResolvedAddresses::Standard(addresses))
             }
             .await;
@@ -1718,21 +1746,14 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 Ok(Err(error)) => Ok(Err(error)),
                 Ok(Ok(vetted)) => {
                     if let Some(pending) = pending_egress.take() {
-                        if vetted.is_metadata {
-                            pending.not_dispatched();
-                        } else {
-                            pending.dispatched();
-                        }
+                        pending.dispatched();
                     }
                     let mut config = config;
-                    let cap = if vetted.is_metadata {
-                        METADATA_PROBE_TIMEOUT
-                    } else {
-                        HTTP_API_REQUEST_TIMEOUT
-                    };
-                    config.connect_timeout = config.connect_timeout.min(cap);
-                    config.first_byte_timeout = config.first_byte_timeout.min(cap);
-                    config.between_bytes_timeout = config.between_bytes_timeout.min(cap);
+                    config.connect_timeout = config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT);
+                    config.first_byte_timeout =
+                        config.first_byte_timeout.min(HTTP_API_REQUEST_TIMEOUT);
+                    config.between_bytes_timeout =
+                        config.between_bytes_timeout.min(HTTP_API_REQUEST_TIMEOUT);
 
                     Ok(send_request_handler(request, config, vetted, trace).await)
                 }
@@ -1815,12 +1836,7 @@ async fn send_request_handler(
 
     let trace_request = trace.then(|| (request.method().to_string(), request.uri().to_string()));
 
-    let VettedDestination {
-        host,
-        first,
-        rest,
-        is_metadata: _,
-    } = destination;
+    let VettedDestination { host, first, rest } = destination;
     let tcp_stream = timeout(connect_timeout, async move {
         let mut last_error = match TcpStream::connect(first).await {
             Ok(stream) => return Ok(stream),
@@ -2015,6 +2031,23 @@ pub(crate) mod version_checked_bindings {
         });
     }
 
+    mod aws {
+        wasmtime::component::bindgen!({
+            path: "../carina-plugin-wit/wit",
+            world: "carina-provider-aws",
+            require_store_data_send: true,
+            imports: { default: async },
+            exports: { default: async },
+            with: {
+                "carina:provider/types": super::basic::carina::provider::types,
+                "carina:provider/provider": super::basic::exports::carina::provider::provider,
+                "wasi:http": wasmtime_wasi_http::p2::bindings::http,
+                "wasi:io": wasmtime_wasi::p2::bindings::io,
+            },
+        });
+    }
+
+    pub(crate) use aws::carina::provider::aws_credentials;
     pub(crate) use basic::carina::provider::types as wit_types;
     pub(crate) use basic::exports::carina::provider::provider::PlanOp as WitPlanOp;
 
@@ -2650,6 +2683,89 @@ pub(crate) mod version_checked_bindings {
 
 use version_checked_bindings::WasmBindings;
 
+impl version_checked_bindings::aws_credentials::Host for HostState {
+    async fn current_credentials(
+        &mut self,
+    ) -> Result<
+        version_checked_bindings::aws_credentials::AwsCredentials,
+        version_checked_bindings::aws_credentials::AwsCredentialError,
+    > {
+        use version_checked_bindings::aws_credentials::{
+            AwsCredentialError as WitError, AwsCredentials as WitCredentials,
+        };
+
+        let source = match self.network() {
+            GuestNetwork::SchemaOnly => {
+                return Err(WitError::ProviderFailed(
+                    "credentials are not available while loading schemas".to_string(),
+                ));
+            }
+            GuestNetwork::Runtime {
+                capabilities: RuntimeCapabilities::Aws { credentials },
+                egress: _,
+            } => Arc::clone(credentials),
+            GuestNetwork::Runtime {
+                capabilities: RuntimeCapabilities::GitHub | RuntimeCapabilities::Untrusted,
+                egress: _,
+            } => {
+                return Err(WitError::ProviderFailed(
+                    "AWS credentials are not available to this provider kind".to_string(),
+                ));
+            }
+        };
+
+        source
+            .current()
+            .await
+            .and_then(|credentials| {
+                let expires_at = credentials
+                    .expires_at()
+                    .map(|expires_at| {
+                        expires_at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_secs())
+                            .map_err(|_| {
+                                AwsCredentialError::ProviderFailed(
+                                    "AWS credential expiry predates the Unix epoch".to_string(),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Ok(WitCredentials {
+                    access_key_id: credentials.access_key_id().to_string(),
+                    secret_access_key: credentials.secret_access_key().to_string(),
+                    session_token: credentials.session_token().map(ToString::to_string),
+                    expires_at,
+                })
+            })
+            .map_err(|error| match error {
+                AwsCredentialError::NotFound(message) => WitError::NotFound(message),
+                AwsCredentialError::ProviderFailed(message) => WitError::ProviderFailed(message),
+            })
+    }
+}
+
+fn add_aws_credentials_to_linker(
+    linker: &mut Linker<HostState>,
+    network: &GuestNetwork,
+) -> wasmtime::Result<()> {
+    let should_link = matches!(
+        network,
+        GuestNetwork::SchemaOnly
+            | GuestNetwork::Runtime {
+                capabilities: RuntimeCapabilities::Aws { credentials: _ },
+                egress: _,
+            }
+    );
+    if should_link {
+        version_checked_bindings::aws_credentials::add_to_linker::<
+            _,
+            wasmtime::component::HasSelf<_>,
+        >(linker, |state| state)?;
+    }
+    Ok(())
+}
+
 /// Build `StoreLimits` used for every WASM plugin store.
 ///
 /// * 256 MB max linear memory – the AWSCC provider uses ~45 MB for
@@ -2715,12 +2831,17 @@ async fn create_instance(
     network: GuestNetwork,
     budget: GuestCallBudget,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
-    let mut store = GuestStore::new(engine, label, network, None, build_store_limits(), budget);
-
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
         WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
     })?;
+    add_aws_credentials_to_linker(&mut linker, &network).map_err(|error| {
+        WasmBindingCreationError::Instantiation(
+            error.context("Failed to add AWS credentials to linker"),
+        )
+    })?;
+
+    let mut store = GuestStore::new(engine, label, network, None, build_store_limits(), budget);
 
     let bindings = WasmBindings::instantiate_basic(&mut store, component, &linker)
         .await
@@ -2744,21 +2865,10 @@ const SHARED_ENV_ALLOWLIST: &[&str] = &[
     "CARINA_WASI_HTTP_TRACE",
 ];
 
-/// Environment variables exposed only to the AWS providers (`aws`,
-/// `awscc`). These are exactly the AWS SDK's auto-discovered credential
-/// and region inputs; the SDK's own chain (`aws_config::defaults().load()`)
-/// reads them — the host merely makes them visible inside the sandbox.
-const AWS_ENV_ALLOWLIST: &[&str] = &[
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_ENDPOINT_URL",
-    "AWS_EC2_METADATA_DISABLED",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-];
+/// Region and endpoint variables exposed only to the AWS providers (`aws`,
+/// `awscc`). Credential discovery runs in the host and no credential-source
+/// configuration crosses into the guest environment.
+const AWS_ENV_ALLOWLIST: &[&str] = &["AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL"];
 
 /// Environment variables exposed only to the GitHub provider.
 const GITHUB_ENV_ALLOWLIST: &[&str] = &["GITHUB_TOKEN"];
@@ -2789,19 +2899,74 @@ impl ConfiguredProvider {
     }
 }
 
+async fn runtime_network(
+    configured: &ConfiguredProvider,
+    component_imports: &ComponentImports,
+    egress: ConsentedEgress,
+    aws: &dyn AwsCredentialProvisioner,
+) -> Result<GuestNetwork, WasmProviderLoadError> {
+    let imports_aws_credentials = component_imports.imports_aws_credentials();
+    match configured.kind {
+        ProviderKind::Aws if !imports_aws_credentials => {
+            return Err(WasmProviderLoadError::AwsCredentialsImportMissing);
+        }
+        ProviderKind::GitHub | ProviderKind::Untrusted if imports_aws_credentials => {
+            return Err(WasmProviderLoadError::AwsCredentialsRequired);
+        }
+        ProviderKind::Aws | ProviderKind::GitHub | ProviderKind::Untrusted => {}
+    }
+
+    let capabilities = match configured.kind {
+        ProviderKind::Aws => RuntimeCapabilities::Aws {
+            credentials: aws.provision().await?,
+        },
+        ProviderKind::GitHub => RuntimeCapabilities::GitHub,
+        ProviderKind::Untrusted => RuntimeCapabilities::Untrusted,
+    };
+    Ok(GuestNetwork::Runtime {
+        capabilities,
+        egress,
+    })
+}
+
 /// A provider kind whose credential, metadata, and private-address partitions
 /// the host knows about. It is classified only from the resolver-owned
 /// verified-source identity, never from configured or guest-reported names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderKind {
-    /// AWS native-SDK and Cloud Control providers; both consume the AWS
-    /// SDK's auto-discovered credential/region env inputs.
+    /// AWS native-SDK and Cloud Control providers. Their guests receive only
+    /// region and endpoint configuration; credentials come from the typed
+    /// host import.
     Aws,
     /// The GitHub provider.
     GitHub,
     /// Any provider the host has no credential partition for (e.g. the mock
     /// provider). Receives the shared group only.
     Untrusted,
+}
+
+/// Runtime-only capabilities granted according to resolver-owned provider
+/// trust. The AWS variant cannot be constructed without a credential source.
+#[derive(Clone)]
+pub(crate) enum RuntimeCapabilities {
+    Aws {
+        credentials: Arc<dyn AwsCredentialSource>,
+    },
+    GitHub,
+    Untrusted,
+}
+
+impl fmt::Debug for RuntimeCapabilities {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Aws { credentials: _ } => formatter
+                .debug_struct("Aws")
+                .field("credentials", &"<credential source>")
+                .finish(),
+            Self::GitHub => formatter.write_str("GitHub"),
+            Self::Untrusted => formatter.write_str("Untrusted"),
+        }
+    }
 }
 
 /// Whether a provider kind may connect to a resolved private address.
@@ -2811,38 +2976,32 @@ enum PrivateAddressPolicy {
     Deny,
 }
 
-impl ProviderKind {
+impl RuntimeCapabilities {
+    fn kind(&self) -> ProviderKind {
+        match self {
+            Self::Aws { credentials: _ } => ProviderKind::Aws,
+            Self::GitHub => ProviderKind::GitHub,
+            Self::Untrusted => ProviderKind::Untrusted,
+        }
+    }
+
     /// The credential env-var partition for this kind. Exhaustive by
     /// construction — a new `ProviderKind` variant will not compile until
     /// its partition is decided here.
-    fn credential_partition(self) -> &'static [&'static str] {
+    fn credential_partition(&self) -> &'static [&'static str] {
         match self {
-            ProviderKind::Aws => AWS_ENV_ALLOWLIST,
-            ProviderKind::GitHub => GITHUB_ENV_ALLOWLIST,
-            ProviderKind::Untrusted => &[],
+            Self::Aws { credentials: _ } => AWS_ENV_ALLOWLIST,
+            Self::GitHub => GITHUB_ENV_ALLOWLIST,
+            Self::Untrusted => &[],
         }
     }
 
-    /// Metadata endpoints reachable by this kind. This match is deliberately
-    /// adjacent to [`Self::credential_partition`] and
-    /// [`Self::private_address_policy`] so adding a kind cannot compile without
-    /// deciding all network-bearing capabilities.
-    fn metadata_endpoints(self) -> &'static [IpAddr] {
+    /// Private-address policy for this kind. Metadata is withheld
+    /// unconditionally before this kind-specific policy is considered.
+    fn private_address_policy(&self) -> PrivateAddressPolicy {
         match self {
-            ProviderKind::Aws => &AWS_METADATA_ENDPOINTS,
-            ProviderKind::GitHub => &[],
-            ProviderKind::Untrusted => &[],
-        }
-    }
-
-    /// Private-address policy for this kind. This match stays next to the
-    /// credential and metadata partitions so a new kind must decide every
-    /// network-bearing capability in one place.
-    fn private_address_policy(self) -> PrivateAddressPolicy {
-        match self {
-            ProviderKind::Aws => PrivateAddressPolicy::Allow,
-            ProviderKind::GitHub => PrivateAddressPolicy::Deny,
-            ProviderKind::Untrusted => PrivateAddressPolicy::Deny,
+            Self::Aws { credentials: _ } => PrivateAddressPolicy::Allow,
+            Self::GitHub | Self::Untrusted => PrivateAddressPolicy::Deny,
         }
     }
 }
@@ -2854,10 +3013,10 @@ impl ProviderKind {
 /// `None` is the kind-less info/schemas instance, which calls neither
 /// `initialize` nor any credentialed operation and therefore gets the shared
 /// group only.
-fn env_keys_for_kind(kind: Option<ProviderKind>) -> Vec<&'static str> {
+fn env_keys_for_capabilities(capabilities: Option<&RuntimeCapabilities>) -> Vec<&'static str> {
     let mut keys: Vec<&'static str> = SHARED_ENV_ALLOWLIST.to_vec();
-    if let Some(kind) = kind {
-        keys.extend_from_slice(kind.credential_partition());
+    if let Some(capabilities) = capabilities {
+        keys.extend_from_slice(capabilities.credential_partition());
     }
     keys
 }
@@ -2865,38 +3024,22 @@ fn env_keys_for_kind(kind: Option<ProviderKind>) -> Vec<&'static str> {
 /// Build a WASI context that only exposes the env vars allowlisted for
 /// `provider_kind` (its credential partition plus the shared group).
 ///
-/// See [`env_keys_for_kind`] for the partitioning rule.
-fn build_sandboxed_wasi_ctx(provider_kind: Option<ProviderKind>) -> WasiCtx {
-    build_sandboxed_wasi_ctx_with(
-        provider_kind,
-        |key| std::env::var(key).ok(),
-        is_metadata_available,
-    )
+/// See [`env_keys_for_capabilities`] for the partitioning rule.
+fn build_sandboxed_wasi_ctx(capabilities: Option<&RuntimeCapabilities>) -> WasiCtx {
+    build_sandboxed_wasi_ctx_with(capabilities, |key| std::env::var(key).ok())
 }
 
 fn build_sandboxed_wasi_ctx_with(
-    provider_kind: Option<ProviderKind>,
+    capabilities: Option<&RuntimeCapabilities>,
     mut env_value: impl FnMut(&str) -> Option<String>,
-    metadata_available: impl FnOnce() -> bool,
 ) -> WasiCtx {
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stderr();
-    let keys = env_keys_for_kind(provider_kind);
-    let mut metadata_disabled_is_set = false;
+    let keys = env_keys_for_capabilities(capabilities);
     for key in &keys {
         if let Some(val) = env_value(key) {
             builder.env(key, &val);
-            metadata_disabled_is_set |= *key == "AWS_EC2_METADATA_DISABLED";
         }
-    }
-    // Auto-disable IMDS if metadata endpoints are unreachable, unless the
-    // user has explicitly set the variable. Only relevant for the AWS
-    // partition, which is the only one carrying AWS_EC2_METADATA_DISABLED.
-    if keys.contains(&"AWS_EC2_METADATA_DISABLED")
-        && !metadata_disabled_is_set
-        && !metadata_available()
-    {
-        builder.env("AWS_EC2_METADATA_DISABLED", "true");
     }
     builder.build()
 }
@@ -2909,6 +3052,19 @@ async fn create_instance_with_http(
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
 ) -> Result<(GuestStore, WasmBindings), WasmBindingCreationError> {
+    let mut linker = Linker::new(engine);
+    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
+    })?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(error.context("Failed to add wasi:http to linker"))
+    })?;
+    add_aws_credentials_to_linker(&mut linker, &network).map_err(|error| {
+        WasmBindingCreationError::Instantiation(
+            error.context("Failed to add AWS credentials to linker"),
+        )
+    })?;
+
     let mut store = GuestStore::new_with_http_test_route(
         engine,
         label,
@@ -2918,14 +3074,6 @@ async fn create_instance_with_http(
         budget,
         http_test_route,
     );
-
-    let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
-    })?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| {
-        WasmBindingCreationError::Instantiation(error.context("Failed to add wasi:http to linker"))
-    })?;
 
     let bindings = WasmBindings::instantiate_http(&mut store, component, &linker)
         .await
@@ -4260,9 +4408,16 @@ impl WasmProviderFactory {
         component: Component,
         epoch_ticker: EpochTicker,
         configured: ConfiguredProvider,
-        runtime_network: GuestNetwork,
+        network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
+        let component_imports = ComponentImports::from_component(&engine, &component);
+        let runtime_network = match network_request {
+            GuestNetworkRequest::SchemaOnly => GuestNetwork::SchemaOnly,
+            GuestNetworkRequest::Runtime { egress, aws } => {
+                runtime_network(&configured, &component_imports, egress, aws).await?
+            }
+        };
         let mut rebuild = RebuildContext::new(
             engine.clone(),
             component.clone(),
@@ -4339,7 +4494,7 @@ impl WasmProviderFactory {
                 wasm_bytes.as_bytes(),
                 &cache_dir,
                 configured,
-                GuestNetwork::SchemaOnly,
+                GuestNetworkRequest::SchemaOnly,
             )
             .await
         });
@@ -4357,7 +4512,7 @@ impl WasmProviderFactory {
             load.bytes().as_bytes(),
             cache_dir,
             configured,
-            GuestNetwork::SchemaOnly,
+            GuestNetworkRequest::SchemaOnly,
         )
         .await
     }
@@ -4368,22 +4523,19 @@ impl WasmProviderFactory {
         load: VerifiedLoad,
         user_dirs: &UserDirs,
         locked_egress: Option<&LockedEgress>,
+        aws: &dyn AwsCredentialProvisioner,
     ) -> Result<Self, WasmProviderLoadError> {
         let declaration = VerifiedEgressDeclaration::read(&load)?;
         let egress =
             ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
         let configured = ConfiguredProvider::new(load.identity());
-        let runtime_network = GuestNetwork::Runtime {
-            kind: configured.kind,
-            egress,
-        };
         let wasm_bytes = load.bytes().clone();
         let cache_dir = user_dirs.compiled_wasm_cache_dir().to_path_buf();
         Self::from_bytes_with_cache_dir_configured(
             wasm_bytes.as_bytes(),
             &cache_dir,
             configured,
-            runtime_network,
+            GuestNetworkRequest::Runtime { egress, aws },
         )
         .await
     }
@@ -4394,20 +4546,17 @@ impl WasmProviderFactory {
         load: VerifiedLoad,
         cache_dir: &Path,
         locked_egress: Option<&LockedEgress>,
+        aws: &dyn AwsCredentialProvisioner,
     ) -> Result<Self, WasmProviderLoadError> {
         let declaration = VerifiedEgressDeclaration::read(&load)?;
         let egress =
             ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
         let configured = ConfiguredProvider::new(load.identity());
-        let runtime_network = GuestNetwork::Runtime {
-            kind: configured.kind,
-            egress,
-        };
         Self::from_bytes_with_cache_dir_configured(
             load.bytes().as_bytes(),
             cache_dir,
             configured,
-            runtime_network,
+            GuestNetworkRequest::Runtime { egress, aws },
         )
         .await
     }
@@ -4416,7 +4565,7 @@ impl WasmProviderFactory {
         wasm_bytes: &[u8],
         cache_dir: &Path,
         configured: ConfiguredProvider,
-        runtime_network: GuestNetwork,
+        network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
         let cwasm_name = Self::cache_key(wasm_bytes);
         let cwasm_path = cache_dir.join(&cwasm_name);
@@ -4428,7 +4577,7 @@ impl WasmProviderFactory {
             && let Err(error) = Self::precompile(wasm_bytes, &cwasm_path)
         {
             eprintln!("Failed to write precompile cache, loading directly: {error}");
-            return Self::new_uncached_configured(wasm_bytes, configured, runtime_network).await;
+            return Self::new_uncached_configured(wasm_bytes, configured, network_request).await;
         }
 
         let engine = Self::create_engine()?;
@@ -4456,7 +4605,7 @@ impl WasmProviderFactory {
         };
 
         let epoch_ticker = EpochTicker::start(engine.clone());
-        Self::bring_up_component(engine, component, epoch_ticker, configured, runtime_network).await
+        Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
     }
 
     /// Load provider bytes without any precompile caching.
@@ -4464,22 +4613,18 @@ impl WasmProviderFactory {
     async fn new_uncached(
         wasm_bytes: &[u8],
         identity: ProviderLoadIdentity,
+        aws: &dyn AwsCredentialProvisioner,
     ) -> Result<Self, WasmProviderLoadError> {
         let load = VerifiedLoad::for_test(wasm_bytes, identity);
         let declaration = VerifiedEgressDeclaration::read(&load)?;
         let locked_egress = test_explicit_egress(&declaration);
-        let runtime_network = GuestNetwork::Runtime {
-            kind: ConfiguredProvider::new(load.identity()).kind,
-            egress: ConsentedEgress::from_lock(
-                Some(&locked_egress),
-                declaration,
-                load.carina_rs_signed(),
-            )?,
-        };
+        let configured = ConfiguredProvider::new(load.identity());
+        let egress =
+            ConsentedEgress::from_lock(Some(&locked_egress), declaration, load.carina_rs_signed())?;
         Self::new_uncached_configured(
             load.bytes().as_bytes(),
-            ConfiguredProvider::new(load.identity()),
-            runtime_network,
+            configured,
+            GuestNetworkRequest::Runtime { egress, aws },
         )
         .await
     }
@@ -4487,13 +4632,13 @@ impl WasmProviderFactory {
     async fn new_uncached_configured(
         wasm_bytes: &[u8],
         configured: ConfiguredProvider,
-        runtime_network: GuestNetwork,
+        network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
         let engine = Self::create_engine()?;
         let component = Self::load_component_from_bytes(&engine, wasm_bytes)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
-        Self::bring_up_component(engine, component, epoch_ticker, configured, runtime_network).await
+        Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
     }
 
     /// Precompile provider bytes and save the result to a .cwasm file.
@@ -4563,7 +4708,7 @@ impl WasmProviderFactory {
             component,
             epoch_ticker,
             ConfiguredProvider::new(&identity),
-            GuestNetwork::SchemaOnly,
+            GuestNetworkRequest::SchemaOnly,
         )
         .await
     }
@@ -4585,8 +4730,11 @@ impl WasmProviderFactory {
             GuestNetwork::SchemaOnly => {
                 return Err(WasmProviderInstanceError::MissingEgressConsent);
             }
-            GuestNetwork::Runtime { kind, egress } => GuestNetwork::Runtime {
-                kind: *kind,
+            GuestNetwork::Runtime {
+                capabilities,
+                egress,
+            } => GuestNetwork::Runtime {
+                capabilities: capabilities.clone(),
                 egress: egress.clone(),
             },
         };
@@ -7441,6 +7589,47 @@ mod tests {
     use wasmtime::component::ResourceTable;
     use wasmtime_wasi::WasiCtxView;
 
+    struct UnusedAwsCredentialSource;
+
+    impl AwsCredentialSource for UnusedAwsCredentialSource {
+        fn current(&self) -> BoxFuture<'_, Result<AwsCredentials, AwsCredentialError>> {
+            Box::pin(async {
+                panic!("this source is only a capability marker for network policy tests")
+            })
+        }
+    }
+
+    struct UnusedAwsCredentialProvisioner;
+
+    impl AwsCredentialProvisioner for UnusedAwsCredentialProvisioner {
+        fn provision(
+            &self,
+        ) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+            let source: Arc<dyn AwsCredentialSource> = Arc::new(UnusedAwsCredentialSource);
+            Box::pin(async move { Ok(source) })
+        }
+    }
+
+    struct FailingAwsCredentialProvisioner;
+
+    impl AwsCredentialProvisioner for FailingAwsCredentialProvisioner {
+        fn provision(
+            &self,
+        ) -> BoxFuture<'_, Result<Arc<dyn AwsCredentialSource>, AwsCredentialError>> {
+            Box::pin(async {
+                Err(AwsCredentialError::NotFound(
+                    "host provisioning failed before instantiation".to_string(),
+                ))
+            })
+        }
+    }
+
+    fn aws_capabilities() -> RuntimeCapabilities {
+        RuntimeCapabilities::Aws {
+            credentials: Arc::new(UnusedAwsCredentialSource),
+        }
+    }
+
     fn test_load_identity(name: &str) -> ProviderLoadIdentity {
         ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
     }
@@ -7494,7 +7683,15 @@ mod tests {
         let egress =
             ConsentedEgress::from_lock(Some(&locked), declaration, load.carina_rs_signed())
                 .unwrap();
-        GuestNetwork::Runtime { kind, egress }
+        let capabilities = match kind {
+            ProviderKind::Aws => aws_capabilities(),
+            ProviderKind::GitHub => RuntimeCapabilities::GitHub,
+            ProviderKind::Untrusted => RuntimeCapabilities::Untrusted,
+        };
+        GuestNetwork::Runtime {
+            capabilities,
+            egress,
+        }
     }
 
     fn amazonaws_network(kind: ProviderKind) -> GuestNetwork {
@@ -7532,6 +7729,7 @@ mod tests {
             second,
             cache.path(),
             Some(&first_lock),
+            &UnusedAwsCredentialProvisioner,
         )
         .await;
 
@@ -7541,6 +7739,50 @@ mod tests {
                 carina_provider_resolver::EgressConsentError::DeclarationMismatch
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn aws_runtime_without_credential_import_stops_before_provisioning() {
+        let declaration_json = serde_json::json!({
+            "version": 1,
+            "hosts": [],
+        })
+        .to_string();
+        let mut component = EncoderComponent::new();
+        component.section(&CustomSection {
+            name: Cow::Borrowed("carina:egress"),
+            data: Cow::Owned(declaration_json.into_bytes()),
+        });
+        let load = VerifiedLoad::for_test(
+            component.finish(),
+            ProviderLoadIdentity::for_test("aws", ProviderTrustClass::Aws),
+        );
+        let declaration = VerifiedEgressDeclaration::read(&load).unwrap();
+        let locked = test_explicit_egress(&declaration);
+        let cache = tempfile::tempdir().unwrap();
+
+        let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+            load,
+            cache.path(),
+            Some(&locked),
+            &FailingAwsCredentialProvisioner,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WasmProviderLoadError::AwsCredentialsImportMissing)
+        ));
+    }
+
+    #[test]
+    fn aws_credential_load_error_is_a_terminal_diagnostic() {
+        let error = WasmProviderLoadError::AwsCredentials(AwsCredentialError::NotFound(
+            "credential diagnostic".to_string(),
+        ));
+
+        assert_eq!(error.to_string(), "credential diagnostic");
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     async fn rebuildable_state_test_factory() -> Option<WasmProviderFactory> {
@@ -7558,9 +7800,13 @@ mod tests {
         };
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
         Some(
-            WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
-                .await
-                .expect("mock WASM provider should load"),
+            WasmProviderFactory::new_uncached(
+                &wasm_bytes,
+                test_load_identity("mock"),
+                &UnusedAwsCredentialProvisioner,
+            )
+            .await
+            .expect("mock WASM provider should load"),
         )
     }
 
@@ -7590,7 +7836,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v14_wit_surface_compiles() {
+    fn protocol_v15_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();
@@ -7599,6 +7845,8 @@ mod tests {
         assert_type::<wit_types::Observation>();
         assert_type::<wit_types::SentAttributes>();
         assert_type::<wit_types::PendingCreate>();
+        assert_type::<wit_types::PendingOperation>();
+        assert_type::<wit_types::PendingDelete>();
         assert_type::<wit_types::PendingPhase>();
         assert_type::<wit_types::PollFinality>();
         assert_type::<wit_types::PollRequest>();
@@ -7610,6 +7858,8 @@ mod tests {
         assert_type::<wit_types::ResumeInFlight>();
         assert_type::<wit_types::ResumeStep>();
         assert_type::<wit_types::ResumeVerdict>();
+        assert_type::<version_checked_bindings::aws_credentials::AwsCredentials>();
+        assert_type::<version_checked_bindings::aws_credentials::AwsCredentialError>();
     }
 
     fn test_string_value(value: &str) -> Value {
@@ -9039,7 +9289,8 @@ mod tests {
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
         let error = match WasmProviderFactory::new_uncached(
             &wasm_bytes,
-            ProviderLoadIdentity::for_test("aws", ProviderTrustClass::Aws),
+            ProviderLoadIdentity::for_test("aws", ProviderTrustClass::Untrusted),
+            &UnusedAwsCredentialProvisioner,
         )
         .await
         {
@@ -9074,9 +9325,13 @@ mod tests {
         };
 
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
-            .await
-            .expect("mock WASM provider should load");
+        let factory = WasmProviderFactory::new_uncached(
+            &wasm_bytes,
+            test_load_identity("mock"),
+            &UnusedAwsCredentialProvisioner,
+        )
+        .await
+        .expect("mock WASM provider should load");
         let instance = factory
             .get_or_create_shared_instance(None, &IndexMap::new())
             .await
@@ -9337,39 +9592,91 @@ mod tests {
     }
 
     #[test]
-    fn test_aws_partition_contains_required_vars() {
-        // The AWS providers (aws, awscc) receive the AWS SDK's
-        // auto-discovered credential/region inputs.
-        let keys = env_keys_for_kind(Some(ProviderKind::Aws));
-        assert!(keys.contains(&"AWS_ACCESS_KEY_ID"));
-        assert!(keys.contains(&"AWS_SECRET_ACCESS_KEY"));
-        assert!(keys.contains(&"AWS_SESSION_TOKEN"));
+    fn aws_partition_contains_region_but_no_credential_inputs() {
+        let capabilities = aws_capabilities();
+        let keys = env_keys_for_capabilities(Some(&capabilities));
         assert!(keys.contains(&"AWS_REGION"));
         assert!(keys.contains(&"AWS_DEFAULT_REGION"));
         assert!(keys.contains(&"AWS_ENDPOINT_URL"));
-        assert!(keys.contains(&"AWS_EC2_METADATA_DISABLED"));
-        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
-        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
-        // awscc shares the same AWS partition.
-        assert!(env_keys_for_kind(Some(ProviderKind::Aws)).contains(&"AWS_ACCESS_KEY_ID"));
+        for credential_input in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_EC2_METADATA_DISABLED",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ] {
+            assert!(
+                !keys.contains(&credential_input),
+                "{credential_input} leaked into the AWS guest"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_credentials_debug_redacts_secret_material() {
+        let credentials = AwsCredentials::new(
+            "AKIAEXAMPLE",
+            "secret-debug-sentinel",
+            Some("session-debug-sentinel".to_string()),
+            None,
+        );
+
+        let rendered = format!("{credentials:?}");
+        assert!(rendered.contains("AKIAEXAMPLE"));
+        assert!(!rendered.contains("secret-debug-sentinel"));
+        assert!(!rendered.contains("session-debug-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn schema_only_credential_stub_returns_the_pinned_typed_error() {
+        let config = wasmtime::Config::new();
+        let engine = Engine::new(&config).expect("test engine should be valid");
+        let mut store = GuestStore::new(
+            &engine,
+            local_provider_label("schema-only-aws"),
+            GuestNetwork::SchemaOnly,
+            None,
+            build_store_limits(),
+            GuestCallBudget::PRODUCTION,
+        );
+
+        let result = store
+            .call(|store| {
+                <HostState as version_checked_bindings::aws_credentials::Host>::current_credentials(
+                    store.data_mut(),
+                )
+            })
+            .await
+            .expect("the schema-only credential import must fail promptly");
+
+        assert!(matches!(
+            result,
+            Err(version_checked_bindings::aws_credentials::AwsCredentialError::ProviderFailed(
+                ref message
+            )) if message == "credentials are not available while loading schemas"
+        ));
     }
 
     #[test]
     fn test_shared_vars_reach_every_kind() {
         // Provider-agnostic utility vars reach every guest, including
         // the kind-less (info/schemas) instance.
-        for kind in [
-            Some(ProviderKind::Aws),
-            Some(ProviderKind::GitHub),
-            Some(ProviderKind::Untrusted),
+        for capabilities in [
+            Some(aws_capabilities()),
+            Some(RuntimeCapabilities::GitHub),
+            Some(RuntimeCapabilities::Untrusted),
             None,
         ] {
-            let keys = env_keys_for_kind(kind);
-            assert!(keys.contains(&"HOME"), "HOME missing for {kind:?}");
-            assert!(keys.contains(&"RUST_LOG"), "RUST_LOG missing for {kind:?}");
+            let keys = env_keys_for_capabilities(capabilities.as_ref());
+            assert!(keys.contains(&"HOME"), "HOME missing for {capabilities:?}");
+            assert!(
+                keys.contains(&"RUST_LOG"),
+                "RUST_LOG missing for {capabilities:?}"
+            );
             assert!(
                 keys.contains(&"CARINA_WASI_HTTP_TRACE"),
-                "CARINA_WASI_HTTP_TRACE missing for {kind:?}"
+                "CARINA_WASI_HTTP_TRACE missing for {capabilities:?}"
             );
         }
     }
@@ -9377,19 +9684,21 @@ mod tests {
     #[test]
     fn test_github_token_is_partitioned_to_github_only() {
         // GITHUB_TOKEN reaches the github guest...
-        assert!(env_keys_for_kind(Some(ProviderKind::GitHub)).contains(&"GITHUB_TOKEN"));
+        assert!(
+            env_keys_for_capabilities(Some(&RuntimeCapabilities::GitHub)).contains(&"GITHUB_TOKEN")
+        );
         // ...and NEVER the aws / awscc guests (the partition is a real
         // isolation boundary, not a flat global list).
-        assert!(!env_keys_for_kind(Some(ProviderKind::Aws)).contains(&"GITHUB_TOKEN"));
+        assert!(!env_keys_for_capabilities(Some(&aws_capabilities())).contains(&"GITHUB_TOKEN"));
         // ...and not the kind-less info/schemas instance either.
-        assert!(!env_keys_for_kind(None).contains(&"GITHUB_TOKEN"));
+        assert!(!env_keys_for_capabilities(None).contains(&"GITHUB_TOKEN"));
     }
 
     #[test]
     fn test_aws_creds_never_reach_github_guest() {
         // Symmetric isolation: AWS credentials must not leak into the
         // github guest.
-        let github = env_keys_for_kind(Some(ProviderKind::GitHub));
+        let github = env_keys_for_capabilities(Some(&RuntimeCapabilities::GitHub));
         assert!(!github.contains(&"AWS_ACCESS_KEY_ID"));
         assert!(!github.contains(&"AWS_SECRET_ACCESS_KEY"));
         assert!(!github.contains(&"AWS_SESSION_TOKEN"));
@@ -9398,17 +9707,17 @@ mod tests {
     #[test]
     fn test_no_partition_leaks_sensitive_unrelated_vars() {
         // Common sensitive/unrelated variables are in NO partition.
-        for kind in [
-            Some(ProviderKind::Aws),
-            Some(ProviderKind::GitHub),
-            Some(ProviderKind::Untrusted),
+        for capabilities in [
+            Some(aws_capabilities()),
+            Some(RuntimeCapabilities::GitHub),
+            Some(RuntimeCapabilities::Untrusted),
             None,
         ] {
-            let keys = env_keys_for_kind(kind);
+            let keys = env_keys_for_capabilities(capabilities.as_ref());
             for forbidden in ["PATH", "SHELL", "USER", "SSH_AUTH_SOCK", "DATABASE_URL"] {
                 assert!(
                     !keys.contains(&forbidden),
-                    "{forbidden} leaked into {kind:?} partition"
+                    "{forbidden} leaked into {capabilities:?} partition"
                 );
             }
         }
@@ -9423,11 +9732,11 @@ mod tests {
             ProviderTrustClass::Untrusted,
         ));
         assert_eq!(configured.kind, ProviderKind::Untrusted);
-        let keys = env_keys_for_kind(Some(ProviderKind::Untrusted));
+        let capabilities = RuntimeCapabilities::Untrusted;
+        let keys = env_keys_for_capabilities(Some(&capabilities));
         assert!(keys.contains(&"HOME"));
         assert!(!keys.contains(&"AWS_ACCESS_KEY_ID"));
         assert!(!keys.contains(&"GITHUB_TOKEN"));
-        assert!(configured.kind.metadata_endpoints().is_empty());
     }
 
     #[test]
@@ -9472,7 +9781,7 @@ mod tests {
     }
 
     #[test]
-    fn initialized_instance_wasi_ctx_uses_configured_kind() {
+    fn initialized_instance_wasi_ctx_uses_runtime_capabilities() {
         use wasmtime_wasi::p2::bindings::cli::environment::Host as _;
 
         struct TestWasiState {
@@ -9489,12 +9798,10 @@ mod tests {
             }
         }
 
-        fn guest_env_keys(configured: &ConfiguredProvider) -> HashSet<String> {
-            let ctx = build_sandboxed_wasi_ctx_with(
-                Some(configured.kind),
-                |_| Some("test-value".to_string()),
-                || panic!("an explicit AWS_EC2_METADATA_DISABLED value skips the probe"),
-            );
+        fn guest_env_keys(capabilities: &RuntimeCapabilities) -> HashSet<String> {
+            let ctx = build_sandboxed_wasi_ctx_with(Some(capabilities), |_| {
+                Some("test-value".to_string())
+            });
             let mut state = TestWasiState {
                 ctx,
                 table: ResourceTable::new(),
@@ -9508,50 +9815,50 @@ mod tests {
                 .collect()
         }
 
-        let aws = ConfiguredProvider::new(&ProviderLoadIdentity::for_test(
-            "aws",
-            ProviderTrustClass::Aws,
-        ));
-        let untrusted = ConfiguredProvider::new(&ProviderLoadIdentity::for_test(
-            "aws",
-            ProviderTrustClass::Untrusted,
-        ));
+        let aws = aws_capabilities();
+        let untrusted = RuntimeCapabilities::Untrusted;
 
-        assert!(guest_env_keys(&aws).contains("AWS_ACCESS_KEY_ID"));
+        assert!(guest_env_keys(&aws).contains("AWS_REGION"));
+        assert!(!guest_env_keys(&aws).contains("AWS_ACCESS_KEY_ID"));
         assert!(!guest_env_keys(&untrusted).contains("AWS_ACCESS_KEY_ID"));
     }
 
     #[test]
     fn test_other_kind_has_empty_credential_partition() {
         // The fail-closed kind carries no credentials — only the shared
-        // group reaches it (asserted via env_keys_for_kind above).
-        assert!(ProviderKind::Untrusted.credential_partition().is_empty());
-        assert!(ProviderKind::Untrusted.metadata_endpoints().is_empty());
+        // group reaches it (asserted via env_keys_for_capabilities above).
+        assert!(
+            RuntimeCapabilities::Untrusted
+                .credential_partition()
+                .is_empty()
+        );
         assert_eq!(
-            ProviderKind::Untrusted.private_address_policy(),
+            RuntimeCapabilities::Untrusted.private_address_policy(),
             PrivateAddressPolicy::Deny
         );
         assert_eq!(
-            ProviderKind::GitHub.private_address_policy(),
+            RuntimeCapabilities::GitHub.private_address_policy(),
             PrivateAddressPolicy::Deny
         );
         assert_eq!(
-            ProviderKind::Aws.private_address_policy(),
+            aws_capabilities().private_address_policy(),
             PrivateAddressPolicy::Allow
         );
     }
 
     #[test]
-    fn test_imds_var_only_in_aws_partition() {
-        // AWS_EC2_METADATA_DISABLED gates the IMDS auto-disable probe in
-        // build_sandboxed_wasi_ctx; that probe must run only for the AWS
-        // partition. Pin the gate condition: the var is present for aws,
-        // absent for github / None.
-        assert!(env_keys_for_kind(Some(ProviderKind::Aws)).contains(&"AWS_EC2_METADATA_DISABLED"));
-        assert!(
-            !env_keys_for_kind(Some(ProviderKind::GitHub)).contains(&"AWS_EC2_METADATA_DISABLED")
-        );
-        assert!(!env_keys_for_kind(None).contains(&"AWS_EC2_METADATA_DISABLED"));
+    fn imds_disable_var_is_never_exposed_to_guests() {
+        for capabilities in [
+            Some(aws_capabilities()),
+            Some(RuntimeCapabilities::GitHub),
+            Some(RuntimeCapabilities::Untrusted),
+            None,
+        ] {
+            assert!(
+                !env_keys_for_capabilities(capabilities.as_ref())
+                    .contains(&"AWS_EC2_METADATA_DISABLED")
+            );
+        }
     }
 
     #[test]
@@ -9559,7 +9866,8 @@ mod tests {
         // Verify that building the sandboxed context succeeds even when
         // allowlisted variables are not set in the environment.
         // This confirms the `if let Ok(val)` guard handles missing vars.
-        let _ctx = build_sandboxed_wasi_ctx(Some(ProviderKind::Aws));
+        let capabilities = aws_capabilities();
+        let _ctx = build_sandboxed_wasi_ctx(Some(&capabilities));
         let _ctx_none = build_sandboxed_wasi_ctx(None);
     }
 
@@ -9721,7 +10029,7 @@ mod tests {
     }
 
     #[test]
-    fn egress_denied_display_explains_local_untrusted_metadata_policy_and_grant() {
+    fn metadata_denial_never_offers_a_local_aws_grant() {
         let error = EgressDenied::new(
             Arc::new(ProviderLabel {
                 name: "mock_http".to_string(),
@@ -9737,18 +10045,17 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "provider 'mock_http' (file:///opt/providers/mock_http.wasm) is untrusted, so it gets \
-             no credentials and no instance-metadata access; its request to 169.254.169.254 was \
-             denied. Grant this local build with --trust-local-provider \
-             /opt/providers/mock_http.wasm=aws (or \
-             CARINA_TRUST_LOCAL_PROVIDER=/opt/providers/mock_http.wasm=aws); if it is already \
-             granted, re-run `carina init` so the installed bytes match the granted file"
+            "provider 'mock_http' (file:///opt/providers/mock_http.wasm) request to \
+             169.254.169.254 was denied: instance-metadata address 169.254.169.254 is withheld \
+             from every provider"
         );
+        assert!(!error.to_string().contains("--trust-local-provider"));
+        assert!(!error.to_string().contains("CARINA_TRUST_LOCAL_PROVIDER"));
         assert!(!error.to_string().contains('\n'));
     }
 
     #[test]
-    fn egress_denied_display_explains_remote_untrusted_metadata_policy_without_local_hint() {
+    fn metadata_denial_for_remote_provider_has_no_trust_hint() {
         let error = EgressDenied::new(
             remote_provider_label("widget", "github.com/example/provider-widget"),
             Some(ProviderKind::Untrusted),
@@ -9759,9 +10066,8 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "provider 'widget' (github.com/example/provider-widget) is untrusted, so it gets no \
-             credentials and no instance-metadata access; its request to 169.254.169.254 was \
-             denied because its source is not a verified carina-rs provider"
+            "provider 'widget' (github.com/example/provider-widget) request to 169.254.169.254 was \
+             denied: instance-metadata address 169.254.169.254 is withheld from every provider"
         );
         assert!(!rendered.contains("--trust-local-provider"));
         assert!(!rendered.contains("CARINA_TRUST_LOCAL_PROVIDER"));
@@ -9781,7 +10087,7 @@ mod tests {
 
         assert!(
             rendered.contains(
-                "instance-metadata address 100.100.100.200 is not available to this provider"
+                "instance-metadata address 100.100.100.200 is withheld from every provider"
             ),
             "{rendered}"
         );
@@ -9816,7 +10122,7 @@ mod tests {
             ),
             (
                 DestinationDenied::MetadataWithheld(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
-                "instance-metadata address 169.254.169.254 is not available to this provider",
+                "instance-metadata address 169.254.169.254 is withheld from every provider",
             ),
         ];
 
@@ -9856,10 +10162,15 @@ mod tests {
         kind: ProviderKind,
         address: IpAddr,
     ) -> Result<VettedDestination, DestinationDenied> {
+        let capabilities = match kind {
+            ProviderKind::Aws => aws_capabilities(),
+            ProviderKind::GitHub => RuntimeCapabilities::GitHub,
+            ProviderKind::Untrusted => RuntimeCapabilities::Untrusted,
+        };
         vet_resolved_destination(
             AllowedHost {
-                kind: Some(kind),
-                target: AllowedHostTarget::Name("x.amazonaws.com".to_string()),
+                private_address_policy: Some(capabilities.private_address_policy()),
+                host: "x.amazonaws.com".to_string(),
             },
             SocketAddr::new(address, 443),
             &[],
@@ -9874,14 +10185,14 @@ mod tests {
                 "AWS metadata v4",
                 "169.254.169.254".parse().unwrap(),
                 ResolvedAddressClass::Metadata,
-                true,
+                false,
                 false,
             ),
             (
                 "AWS metadata v6",
                 "fd00:ec2::254".parse().unwrap(),
                 ResolvedAddressClass::Metadata,
-                true,
+                false,
                 false,
             ),
             (
@@ -9986,7 +10297,7 @@ mod tests {
                 "IPv4-mapped AWS metadata",
                 "::ffff:169.254.169.254".parse().unwrap(),
                 ResolvedAddressClass::Metadata,
-                true,
+                false,
                 false,
             ),
             (
@@ -10000,14 +10311,14 @@ mod tests {
                 "NAT64 AWS metadata",
                 "64:ff9b::a9fe:a9fe".parse().unwrap(),
                 ResolvedAddressClass::Metadata,
-                true,
+                false,
                 false,
             ),
             (
                 "local-use NAT64 AWS metadata",
                 "64:ff9b:1::a9fe:a9fe".parse().unwrap(),
                 ResolvedAddressClass::Metadata,
-                true,
+                false,
                 false,
             ),
             (
@@ -10195,20 +10506,20 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(uri.host(), Some("[fd00:ec2::254]"));
-        assert!(check_host(&amazonaws_network(ProviderKind::Aws), uri.host().unwrap()).is_ok());
-        assert!(
-            check_host(
-                &amazonaws_network(ProviderKind::GitHub),
-                uri.host().unwrap()
-            )
-            .is_err()
-        );
+        for kind in [
+            ProviderKind::Aws,
+            ProviderKind::GitHub,
+            ProviderKind::Untrusted,
+        ] {
+            assert!(matches!(
+                check_host(&amazonaws_network(kind), uri.host().unwrap()),
+                Err(DestinationDenied::MetadataWithheld(_))
+            ));
+        }
     }
 
-    #[tokio::test]
-    async fn ip_literal_resolution_does_not_use_dns() {
-        use wasmtime_wasi::p2::Pollable;
-
+    #[test]
+    fn metadata_ip_literals_are_denied_without_dns() {
         let calls = Arc::new(AtomicUsize::new(0));
         for uri in [
             "http://169.254.169.254:0/latest/meta-data/",
@@ -10232,39 +10543,25 @@ mod tests {
                 between_bytes_timeout: std::time::Duration::ZERO,
             };
 
-            let mut response =
+            let error =
                 wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
-                    .expect("an AWS metadata literal should pass the host policy");
-            response.ready().await;
-            let _ = response.unwrap_ready();
+                    .expect_err("an AWS metadata literal must be withheld");
+            let trap = error
+                .downcast()
+                .expect_err("metadata withholding must trap before a request task starts");
+            assert!(
+                trap.downcast_ref::<EgressDenied>()
+                    .is_some_and(|denial| matches!(
+                        denial.reason,
+                        DestinationDenied::MetadataWithheld(_)
+                    ))
+            );
         }
 
         assert_eq!(
             calls.load(Ordering::Relaxed),
             0,
             "the hook must not send IP literals through the DNS resolver"
-        );
-    }
-
-    #[test]
-    fn test_imds_connect_timeout_is_short() {
-        // IMDS timeout should be short enough for non-EC2 environments
-        assert!(METADATA_PROBE_TIMEOUT <= std::time::Duration::from_secs(2));
-        assert!(METADATA_PROBE_TIMEOUT >= std::time::Duration::from_secs(1));
-    }
-
-    #[test]
-    fn test_metadata_probe_completes_within_timeout() {
-        // Verify that the probe completes within a reasonable time.
-        // On EC2/ECS the probe returns true (metadata is available).
-        // On local/CI-without-metadata the probe returns false.
-        // Either result is valid; we only check that it doesn't hang.
-        let start = std::time::Instant::now();
-        let _result = probe_metadata_endpoints();
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "probe took too long: {elapsed:?}"
         );
     }
 
@@ -10280,15 +10577,6 @@ mod tests {
             ResolvedAddressClass::classify(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 1))),
             ResolvedAddressClass::LinkLocal
         );
-        assert!(!AWS_METADATA_ENDPOINTS.contains(&IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200))));
-        assert!(!AWS_METADATA_ENDPOINTS.contains(&IpAddr::V4(Ipv4Addr::new(168, 63, 129, 16))));
-    }
-
-    #[test]
-    fn test_ecs_env_vars_in_aws_partition() {
-        let keys = env_keys_for_kind(Some(ProviderKind::Aws));
-        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"));
-        assert!(keys.contains(&"AWS_CONTAINER_CREDENTIALS_FULL_URI"));
     }
 
     struct StubResolver {
@@ -10431,50 +10719,6 @@ mod tests {
             DestinationDenied::MetadataWithheld(address)
                 if address == IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))
         ));
-    }
-
-    #[tokio::test]
-    async fn metadata_request_then_guest_trap_is_untracked() {
-        use wasmtime_wasi::p2::Pollable;
-
-        let id = ResourceId::with_provider_identity(
-            "aws",
-            "test.metadata_probe",
-            "metadata-then-trap",
-            None,
-        );
-        let started = CreateAttempt::for_test(id).start_guest_call();
-        let mut hooks = AllowListHttpHooks::with_resolver(
-            local_provider_label("aws"),
-            amazonaws_network(ProviderKind::Aws),
-            Arc::new(NeverResolver),
-        );
-        hooks.call_egress = Some(started.egress_recorder());
-        let request = hyper::Request::builder()
-            .uri("http://169.254.169.254/latest/meta-data/")
-            .body(empty_outgoing_body())
-            .unwrap();
-
-        let mut response = wasmtime_wasi_http::p2::WasiHttpHooks::send_request(
-            &mut hooks,
-            request,
-            test_outgoing_request_config(false),
-        )
-        .expect("AWS metadata requests pass host policy");
-        response.ready().await;
-        drop(response.unwrap_ready());
-
-        let failure = started
-            .finish()
-            .failed(ProviderError::internal(
-                "guest trapped after credential fetch",
-            ))
-            .await
-            .classify();
-        let CreateFailureKind::Untracked(error) = failure.into_kind() else {
-            panic!("a credential fetch must not make a later guest trap outcome-unknown")
-        };
-        assert_eq!(error.to_string(), "guest trapped after credential fetch");
     }
 
     #[test]
@@ -10689,8 +10933,8 @@ mod tests {
             };
         let destination = VettedDestination::from_http_test_route(
             AllowedHost {
-                kind: Some(ProviderKind::Untrusted),
-                target: AllowedHostTarget::Name("phase-test.invalid".to_string()),
+                private_address_policy: Some(PrivateAddressPolicy::Deny),
+                host: "phase-test.invalid".to_string(),
             },
             test_destination,
         );
@@ -10815,19 +11059,9 @@ mod tests {
         server.join().unwrap();
 
         let follow_up: hyper::Uri = location.parse().unwrap();
-        let follow_up_address = SocketAddr::new(METADATA_ENDPOINTS[0], 80);
-        let aws_network = amazonaws_network(ProviderKind::Aws);
-        assert!(
-            check_destination(
-                &aws_network,
-                follow_up.host().unwrap(),
-                &[follow_up_address]
-            )
-            .is_ok(),
-            "AWS must pass the metadata policy stage"
-        );
         let resolver_calls = Arc::new(AtomicUsize::new(0));
         for kind in [
+            Some(ProviderKind::Aws),
             Some(ProviderKind::GitHub),
             Some(ProviderKind::Untrusted),
             None,
@@ -10869,23 +11103,6 @@ mod tests {
             );
         }
         assert_eq!(resolver_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn test_metadata_probe_result_is_cached() {
-        let first = is_metadata_available();
-        let second = is_metadata_available();
-        assert_eq!(first, second);
-
-        let probe = MetadataProbe::new();
-        let local_first = probe.is_available();
-        let local_second = probe.is_available();
-        assert_eq!(
-            probe.probe_count(),
-            1,
-            "test-local MetadataProbe memoization must run exactly one endpoint probe for two calls"
-        );
-        assert_eq!(local_first, local_second);
     }
 
     #[test]
@@ -10957,12 +11174,6 @@ mod tests {
                 "compute budget too long to be useful"
             );
         }
-    }
-
-    #[test]
-    fn test_http_api_request_timeout_is_longer_than_metadata() {
-        // API requests need more time than metadata probes.
-        assert!(HTTP_API_REQUEST_TIMEOUT > METADATA_PROBE_TIMEOUT);
     }
 
     #[test]
@@ -11911,9 +12122,13 @@ mod tests {
         };
 
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
-        let factory = WasmProviderFactory::new_uncached(&wasm_bytes, test_load_identity("mock"))
-            .await
-            .expect("mock WASM provider should load");
+        let factory = WasmProviderFactory::new_uncached(
+            &wasm_bytes,
+            test_load_identity("mock"),
+            &UnusedAwsCredentialProvisioner,
+        )
+        .await
+        .expect("mock WASM provider should load");
         let instance = factory
             .get_or_create_shared_instance(None, &IndexMap::new())
             .await

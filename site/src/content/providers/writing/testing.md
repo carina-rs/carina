@@ -291,7 +291,7 @@ Updates, attribute removal and replacement need more than one configuration. Kee
 
 Run acceptance tests in an account that holds nothing else, and make the script destroy what it created even when a step fails or the run is interrupted. A test that leaves resources behind costs money and can break the next run. Point `source` at the build under test with a `file://` URL, which step 1 installs, and use a release build of `carina`: loading a component in a debug build is slow.
 
-A local build receives no AWS credentials or metadata access by default. For an AWS or AWSCC acceptance run, set `CARINA_TRUST_LOCAL_PROVIDER=/absolute/path/to/provider.wasm=aws` for every `apply`, `plan` and `destroy` command, or pass the equivalent repeatable `--trust-local-provider` flag to each command. The environment variable separates multiple entries with `:` on Unix and `;` on Windows. Re-run `carina init` after rebuilding so the installed bytes still match the granted source file.
+A local build cannot link the host AWS credential import by default, and metadata is unavailable to every guest. For an AWS or AWSCC acceptance run, set `CARINA_TRUST_LOCAL_PROVIDER=/absolute/path/to/provider.wasm=aws` for every `apply`, `plan` and `destroy` command, or pass the equivalent repeatable `--trust-local-provider` flag to each command. The environment variable separates multiple entries with `:` on Unix and `;` on Windows. Re-run `carina init` after rebuilding so the installed bytes still match the granted source file.
 
 ## Next steps
 
