@@ -1,6 +1,7 @@
 use super::*;
 use crate::explicit::ExplicitFields;
 use crate::parser::SourceSpan;
+use crate::schema::PatternResourceSchema;
 
 type Value = ExpandedValue;
 type ConcreteValue = ExpandedConcreteValue;
@@ -840,7 +841,7 @@ fn resolved_resource_error_preserves_typed_ignore_errors() {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "",
-        crate::schema::ResourceSchema::new("Widget")
+        PatternResourceSchema::new("Widget")
             .validate()
             .expect("valid test schema"),
     );
@@ -2137,8 +2138,9 @@ fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
     let attr_type = AttributeType::struct_(
         "Credential",
         vec![
-            crate::schema::StructField::optional("credential", AttributeType::string()).build(),
-            crate::schema::StructField::optional("label", AttributeType::string()).build(),
+            crate::schema::CompiledStructField::optional("credential", AttributeType::string())
+                .build(),
+            crate::schema::CompiledStructField::optional("label", AttributeType::string()).build(),
         ],
     );
     let defs = crate::schema::empty_defs_for_schema_walks();
@@ -2215,7 +2217,10 @@ fn list_element_with_persisted_secret_hash_pairs_uniquely() {
     };
     let item_type = AttributeType::struct_(
         "Credential",
-        vec![crate::schema::StructField::optional("credential", AttributeType::string()).build()],
+        vec![
+            crate::schema::CompiledStructField::optional("credential", AttributeType::string())
+                .build(),
+        ],
     );
 
     assert_eq!(

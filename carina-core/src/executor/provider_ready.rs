@@ -31,7 +31,9 @@ use crate::resource::{
     RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
     SavedComposition, Value,
 };
-use crate::schema::{ResourceSchema, SchemaKind, SchemaRegistry, TypeError};
+use crate::schema::{
+    CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
+};
 use crate::value::SerializationError;
 
 /// An immutable value that passed the provider-boundary constraint gate.
@@ -962,6 +964,8 @@ fn unwrap_secret(value: Value) -> Value {
 
 #[cfg(test)]
 mod provider_config_tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -974,8 +978,7 @@ mod provider_config_tests {
     use crate::provider::{ProviderError, ProviderResult};
     use crate::resource::{ConcreteValue, ParsedIgnorePath, ParsedIgnorePathSegment};
     use crate::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, RootlessType, TypeIdentity,
-        legacy_validator,
+        CompiledAttributeType as AttributeType, RootlessType, TypeIdentity, legacy_validator,
     };
 
     #[tokio::test]
@@ -993,8 +996,11 @@ mod provider_config_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            ResourceSchema::new("widget")
-                .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            PatternResourceSchema::new("widget")
+                .attribute(
+                    PatternAttributeSchema::optional("comment", PatternAttributeType::string())
+                        .build(),
+                )
                 .default_prevent_destroy()
                 .validate()
                 .expect("valid test schema"),
@@ -1025,7 +1031,7 @@ mod provider_config_tests {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "test",
-            ResourceSchema::new("widget")
+            PatternResourceSchema::new("widget")
                 .default_prevent_destroy()
                 .validate()
                 .expect("valid test schema"),
@@ -1093,7 +1099,7 @@ mod provider_config_tests {
         fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
             crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "region".to_string(),
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     crate::schema::TypeIdentity::new(Some("test"), Vec::<String>::new(), "Region"),
                     Some(vec!["ap-northeast-1".to_string()]),
                     vec![("ap-northeast-1".to_string(), "ap_northeast_1".to_string())],
@@ -1158,10 +1164,20 @@ mod provider_config_tests {
         Timeout(&'static str),
     }
 
+    fn admit_declaration(declaration: crate::schema::AttributeType) -> AttributeType {
+        crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+            "value".to_string(),
+            declaration,
+        )]))
+        .unwrap()
+        .parts()["value"]
+            .clone()
+    }
+
     struct RoutingFactory {
         name: &'static str,
-        declaration: AttributeType,
-        sibling_declaration: Option<AttributeType>,
+        declaration: crate::schema::AttributeType,
+        sibling_declaration: Option<crate::schema::AttributeType>,
         accepted: Option<&'static str>,
         validate_calls: Arc<AtomicUsize>,
         seen_values: Option<Arc<Mutex<Vec<String>>>>,
@@ -1231,12 +1247,12 @@ mod provider_config_tests {
         }
 
         fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
-            let mut schema = ResourceSchema::new(format!("test.{}", self.name)).attribute(
-                crate::schema::AttributeSchema::optional("value", self.declaration.clone()).build(),
+            let mut schema = PatternResourceSchema::new(format!("test.{}", self.name)).attribute(
+                PatternAttributeSchema::optional("value", self.declaration.clone()).build(),
             );
             if let Some(sibling) = &self.sibling_declaration {
                 schema = schema.attribute(
-                    crate::schema::AttributeSchema::optional("sibling", sibling.clone()).build(),
+                    PatternAttributeSchema::optional("sibling", sibling.clone()).build(),
                 );
             }
             vec![
@@ -1289,7 +1305,7 @@ mod provider_config_tests {
         let owner_calls = Arc::new(AtomicUsize::new(0));
         let other_calls = Arc::new(AtomicUsize::new(0));
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let declaration = AttributeType::refined_string(Some(identity), None, None, None);
+        let declaration = PatternAttributeType::refined_string(Some(identity), None, None, None);
         let factories: Vec<Box<dyn ProviderFactory>> = vec![
             Box::new(RoutingFactory {
                 name: "owner",
@@ -1314,26 +1330,26 @@ mod provider_config_tests {
         let other_lookup = test_lookup_for_owner(&resolver, &registry, "other");
 
         owner_lookup(
-            &declaration,
+            &admit_declaration(declaration.clone()),
             &Value::Concrete(ConcreteValue::String("owner-value".into())),
         )
         .expect("the owner must apply its own verdict");
         assert!(
             owner_lookup(
-                &declaration,
+                &admit_declaration(declaration.clone()),
                 &Value::Concrete(ConcreteValue::String("other-value".into())),
             )
             .is_err(),
             "the owner's verdict must not be replaced by the colliding factory"
         );
         other_lookup(
-            &declaration,
+            &admit_declaration(declaration.clone()),
             &Value::Concrete(ConcreteValue::String("other-value".into())),
         )
         .expect("the other factory must apply its own verdict");
         assert!(
             other_lookup(
-                &declaration,
+                &admit_declaration(declaration.clone()),
                 &Value::Concrete(ConcreteValue::String("owner-value".into())),
             )
             .is_err(),
@@ -1347,23 +1363,22 @@ mod provider_config_tests {
     #[test]
     fn resource_lookup_rejects_an_unknown_schema_owner() {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let declaration =
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
         let factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
         let resolver = test_schema_path_resolver(&factories);
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "missing",
-            ResourceSchema::new("test.missing")
-                .attribute(
-                    crate::schema::AttributeSchema::optional("value", declaration.clone()).build(),
-                )
+            PatternResourceSchema::new("test.missing")
+                .attribute(PatternAttributeSchema::optional("value", declaration.clone()).build())
                 .validate()
                 .expect("missing-owner fixture schema must validate"),
         );
         let lookup = test_lookup_for_owner(&resolver, &registry, "missing");
 
         let error = lookup(
-            &declaration,
+            &admit_declaration(declaration.clone()),
             &Value::Concrete(ConcreteValue::String("value".into())),
         )
         .expect_err("an owner absent from the factory index must not disable validation");
@@ -1385,22 +1400,21 @@ mod provider_config_tests {
     #[test]
     fn unloaded_provider_context_never_approves_an_identified_declaration() {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let declaration =
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
         let context = crate::parser::ProviderContext::default();
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "missing",
-            ResourceSchema::new("test.missing")
-                .attribute(
-                    crate::schema::AttributeSchema::optional("value", declaration.clone()).build(),
-                )
+            PatternResourceSchema::new("test.missing")
+                .attribute(PatternAttributeSchema::optional("value", declaration.clone()).build())
                 .validate()
                 .expect("unloaded-owner fixture schema must validate"),
         );
         let lookup = test_lookup_for_owner(context.custom_type_resolver(), &registry, "missing");
 
         let error = lookup(
-            &declaration,
+            &admit_declaration(declaration.clone()),
             &Value::Concrete(ConcreteValue::String("value".into())),
         )
         .expect_err("an unloaded context must not turn a custom declaration into success");
@@ -1446,7 +1460,8 @@ mod provider_config_tests {
         use crate::parser::{NonEmptySchemaTypeOwners, OwnedTypeIdentity, SchemaTypeOwner};
 
         let identity = TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn");
-        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let declaration =
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None);
         let factories: std::sync::Arc<Vec<Box<dyn ProviderFactory>>> = std::sync::Arc::new(vec![
             Box::new(RoutingFactory {
                 name: "aws",
@@ -1492,14 +1507,14 @@ mod provider_config_tests {
         };
 
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Mode");
-        let first = AttributeType::enum_(
+        let first = PatternAttributeType::enum_(
             identity.clone(),
             Some(vec!["COMMON".to_string()]),
             Vec::new(),
             None,
             None,
         );
-        let second = AttributeType::enum_(
+        let second = PatternAttributeType::enum_(
             identity.clone(),
             Some(vec!["COMMON".to_string(), "OTHER".to_string()]),
             Vec::new(),
@@ -1559,14 +1574,14 @@ mod provider_config_tests {
         use crate::parser::{CustomTypeValidationTarget, OwnedTypeIdentity};
 
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Mode");
-        let first = AttributeType::enum_(
+        let first = PatternAttributeType::enum_(
             identity.clone(),
             Some(vec!["COMMON".to_string()]),
             Vec::new(),
             None,
             None,
         );
-        let sibling = AttributeType::enum_(
+        let sibling = PatternAttributeType::enum_(
             identity.clone(),
             Some(vec!["COMMON".to_string(), "OTHER".to_string()]),
             Vec::new(),
@@ -1593,7 +1608,7 @@ mod provider_config_tests {
     #[test]
     fn declaration_local_schema_failure_remains_typed() {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let declaration = AttributeType::refined_string(
+        let declaration = PatternAttributeType::refined_string(
             Some(identity.clone()),
             Some("^accepted$".to_string()),
             None,
@@ -1609,6 +1624,7 @@ mod provider_config_tests {
                 seen_values: None,
             })]);
         let validator = test_custom_type_validator(factories);
+        let declaration = admit_declaration(declaration);
         let declaration = crate::parser::IdentifiedCustomTypeDeclaration::new(&declaration)
             .expect("fixture declaration is identified");
 
@@ -1636,13 +1652,13 @@ mod provider_config_tests {
     #[test]
     fn resource_lookup_validates_only_the_exact_declared_type() {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let own_declaration = AttributeType::refined_string(
+        let own_declaration = PatternAttributeType::refined_string(
             Some(identity.clone()),
             Some("^own$".to_string()),
             None,
             None,
         );
-        let sibling_declaration = AttributeType::refined_string(
+        let sibling_declaration = PatternAttributeType::refined_string(
             Some(identity),
             Some("^sibling$".to_string()),
             None,
@@ -1661,7 +1677,7 @@ mod provider_config_tests {
         let registry = test_schema_registry(&factories);
         let resolver = test_schema_path_resolver(&factories);
         test_lookup_for_owner(&resolver, &registry, "owner")(
-            &own_declaration,
+            &admit_declaration(own_declaration.clone()),
             &Value::Concrete(ConcreteValue::String("own".into())),
         )
         .expect("a sibling declaration with the same identity must not constrain this attribute");
@@ -1672,14 +1688,14 @@ mod provider_config_tests {
     #[test]
     fn same_identity_enum_spelling_resolves_in_the_owning_schema() {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Mode");
-        let owner_type = AttributeType::enum_(
+        let owner_type = PatternAttributeType::enum_(
             identity.clone(),
             Some(vec!["OWNER_API".to_string()]),
             vec![("OWNER_API".to_string(), "owner".to_string())],
             None,
             None,
         );
-        let other_type = AttributeType::enum_(
+        let other_type = PatternAttributeType::enum_(
             identity,
             Some(vec!["OTHER_API".to_string()]),
             vec![("OTHER_API".to_string(), "other".to_string())],
@@ -1710,12 +1726,12 @@ mod provider_config_tests {
         let registry = test_schema_registry(&factories);
         let resolver = test_schema_path_resolver(&factories);
         test_lookup_for_owner(&resolver, &registry, "owner")(
-            &owner_type,
+            &admit_declaration(owner_type.clone()),
             &Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.owner")),
         )
         .expect("the owner alias must resolve to the owner's API spelling");
         test_lookup_for_owner(&resolver, &registry, "other")(
-            &other_type,
+            &admit_declaration(other_type.clone()),
             &Value::Concrete(ConcreteValue::enum_identifier("shared.Mode.other")),
         )
         .expect("the other alias must resolve to the other API spelling");
@@ -1730,7 +1746,7 @@ mod provider_config_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let factory = RoutingFactory {
             name: "owner",
-            declaration: AttributeType::refined_int(Some(identity.clone()), None),
+            declaration: PatternAttributeType::refined_int(Some(identity.clone()), None),
             sibling_declaration: None,
             accepted: None,
             validate_calls: Arc::clone(&calls),
@@ -1739,8 +1755,10 @@ mod provider_config_tests {
 
         let error = crate::provider::validate_custom_type_with_factory(
             &factory,
-            crate::parser::IdentifiedCustomTypeDeclaration::new(&factory.declaration)
-                .expect("fixture declaration is identified"),
+            crate::parser::IdentifiedCustomTypeDeclaration::new(&admit_declaration(
+                factory.declaration.clone(),
+            ))
+            .expect("fixture declaration is identified"),
             &Value::Concrete(ConcreteValue::String("5".into())),
         )
         .expect_err("an Int declaration must not accept bridge-shaped String input");
@@ -1756,7 +1774,7 @@ mod provider_config_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen_values = Arc::new(Mutex::new(Vec::new()));
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Number");
-        let declaration = AttributeType::refined_float(Some(identity), None);
+        let declaration = PatternAttributeType::refined_float(Some(identity), None);
         let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
             name: "owner",
             declaration: declaration.clone(),
@@ -1774,7 +1792,8 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::Int(-61)),
             Value::Concrete(ConcreteValue::Float(1.25)),
         ] {
-            lookup(&declaration, &value).expect("numeric scalar must bridge");
+            lookup(&admit_declaration(declaration.clone()), &value)
+                .expect("numeric scalar must bridge");
         }
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -1786,7 +1805,7 @@ mod provider_config_tests {
         let owner_calls = Arc::new(AtomicUsize::new(0));
         let other_calls = Arc::new(AtomicUsize::new(0));
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let declaration = AttributeType::refined_string(Some(identity), None, None, None);
+        let declaration = PatternAttributeType::refined_string(Some(identity), None, None, None);
         let factories: Vec<Box<dyn ProviderFactory>> = vec![
             Box::new(RoutingFactory {
                 name: "owner",
@@ -1819,12 +1838,18 @@ mod provider_config_tests {
         let resolver = test_schema_path_resolver(&factories);
         let lookup = test_lookup_for_owner(&resolver, &registry, "owner");
 
-        RootlessType::new(decoded)
-            .validate_with_lookup(
-                &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("value".into())),
-                &lookup,
-            )
-            .expect("the owning bridge validator must accept the value");
+        crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+            "decoded".to_string(),
+            decoded,
+        )]))
+        .unwrap()
+        .rootless_type("decoded")
+        .unwrap()
+        .validate_with_lookup(
+            &Value::<NoPlaceholder>::Concrete(ConcreteValue::String("value".into())),
+            &lookup,
+        )
+        .expect("the owning bridge validator must accept the value");
 
         assert_eq!(owner_calls.load(Ordering::SeqCst), 1);
         assert_eq!(other_calls.load(Ordering::SeqCst), 0);
@@ -1837,7 +1862,7 @@ mod provider_config_tests {
         let other_calls = Arc::new(AtomicUsize::new(0));
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
         let calls = Arc::clone(&native_calls);
-        let native_type = AttributeType::refined_string_with_validator(
+        let native_type = PatternAttributeType::refined_string_with_validator(
             identity.clone(),
             None,
             None,
@@ -1850,7 +1875,7 @@ mod provider_config_tests {
         let factories: Vec<Box<dyn ProviderFactory>> = vec![
             Box::new(RoutingFactory {
                 name: "owner",
-                declaration: AttributeType::refined_string(
+                declaration: PatternAttributeType::refined_string(
                     Some(identity.clone()),
                     None,
                     None,
@@ -1863,7 +1888,7 @@ mod provider_config_tests {
             }),
             Box::new(RoutingFactory {
                 name: "other",
-                declaration: AttributeType::refined_string(Some(identity), None, None, None),
+                declaration: PatternAttributeType::refined_string(Some(identity), None, None, None),
                 sibling_declaration: None,
                 accepted: None,
                 validate_calls: Arc::clone(&other_calls),
@@ -1902,7 +1927,7 @@ mod provider_config_tests {
         fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
             crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "endpoint".to_string(),
-                AttributeType::refined_string(
+                PatternAttributeType::refined_string(
                     Some(TypeIdentity::new(
                         Some("shared"),
                         Vec::<String>::new(),
@@ -2030,7 +2055,12 @@ mod provider_config_tests {
         fn provider_config_attribute_types(&self) -> crate::schema::ValidatedConfigSchema {
             crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
                 "region".to_string(),
-                AttributeType::refined_string(None, Some(r"^good-[a-z]+$".to_string()), None, None),
+                PatternAttributeType::refined_string(
+                    None,
+                    Some(r"^good-[a-z]+$".to_string()),
+                    None,
+                    None,
+                ),
             )]))
             .expect("test provider config schema must be valid")
         }

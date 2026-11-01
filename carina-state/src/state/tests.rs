@@ -2,6 +2,9 @@ use super::*;
 use carina_core::resource::{
     DeferredValue, PendingReRead, ReReadReason, absolute_binding_address_for_test,
 };
+use carina_core::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -25,7 +28,7 @@ fn resource_state_from_provider_state_for_resource_and_schema_for_test<S: Clone>
     resource: &carina_core::resource::ResolvedResource<S>,
     state: &State,
     existing: Option<&ResourceState>,
-    schema: Option<&carina_core::schema::ResourceSchema>,
+    schema: Option<&carina_core::schema::CompiledResourceSchema>,
     row_basis: RowBasis<'_>,
     preferred_hashes: Option<&PersistedAttributes>,
 ) -> Result<ResourceState, ResourceStateEncodingError> {
@@ -44,7 +47,7 @@ fn resource_state_from_observation_for_test<S: Clone>(
     resource: &carina_core::resource::ResolvedResource<S>,
     created: &ObservedCreate,
     existing: Option<&ResourceState>,
-    schema: Option<&carina_core::schema::ResourceSchema>,
+    schema: Option<&carina_core::schema::CompiledResourceSchema>,
     preferred_hashes: Option<&PersistedAttributes>,
 ) -> Result<ResourceState, ResourceStateEncodingError> {
     ResourceState::from_observation(
@@ -62,7 +65,7 @@ fn diff(
     current: &State,
     saved_attrs: &carina_core::provider::LiftedSavedAttrs,
     prev_explicit: Option<&carina_core::explicit::ExplicitFields>,
-    schema: Option<&carina_core::schema::ResourceSchema>,
+    schema: Option<&carina_core::schema::CompiledResourceSchema>,
 ) -> carina_core::differ::Diff {
     carina_core::differ::diff(
         desired,
@@ -1234,17 +1237,17 @@ fn resource_state_identity_is_typed_and_serializes_as_a_plain_string() {
 #[test]
 fn release_list_keys_only_demotes_matching_authoring_entries() {
     use carina_core::effect::{Effect, ReleasedListKey, ReleasedListKeys};
-    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
 
-    let schema = ResourceSchema::new("test.KeyedSettings")
+    let schema = PatternResourceSchema::new("test.KeyedSettings")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "settings",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Setting",
                     vec![
-                        StructField::required("key", AttributeType::string()).build(),
-                        StructField::required("value", AttributeType::string()).build(),
+                        PatternStructField::required("key", PatternAttributeType::string()).build(),
+                        PatternStructField::required("value", PatternAttributeType::string())
+                            .build(),
                     ],
                 )),
             )
@@ -2436,7 +2439,9 @@ fn test_from_provider_state_repairs_unrecorded_from_desired_resource() {
 #[test]
 fn test_from_provider_state_carry_prior_seeds_unrecorded_from_desired_without_provider_promotion() {
     use carina_core::differ::Diff;
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
 
     let resource = Resource::with_provider("mock", "test.Resource", "main", None)
         .with_attribute("name", Value::Concrete(ConcreteValue::String("x".into())));
@@ -3172,7 +3177,10 @@ fn carried_whole_value_keeps_remaining_pending_removal_after_partial_success() {
 #[test]
 fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
     use carina_core::differ::Diff;
-    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+        CompiledStructField as StructField,
+    };
 
     let authored_rules = vec![list_rule(80, Some("web")), list_rule(80, None)];
     let provider_rules: Vec<_> = authored_rules
@@ -3320,7 +3328,10 @@ fn carried_whole_value_clears_when_readded_field_has_a_unique_pair() {
 #[test]
 fn carried_legacy_list_mixed_refresh_rebuilds_alignment_and_plans_clean() {
     use carina_core::differ::Diff;
-    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+        CompiledStructField as StructField,
+    };
 
     let authored_rules = vec![list_rule(80, Some("web")), list_rule(443, None)];
     let provider_rules: Vec<_> = authored_rules
@@ -3479,7 +3490,10 @@ fn test_from_provider_state_replaces_prior_authored_keys_after_all_attributes_ar
     use carina_core::differ::Diff;
     use carina_core::explicit::ExplicitFields;
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+        CompiledResourceSchema as ResourceSchema,
+    };
 
     let resource = Resource::with_provider("awscc", "ec2.InternetGateway", "igw", None);
     let provider_state = ProviderState {
@@ -4997,8 +5011,6 @@ fn orphan_provider_refresh_never_promotes_provider_keys_into_authoring_metadata(
 
 #[test]
 fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
-    use carina_core::schema::{AttributeSchema, AttributeType};
-
     let legacy_keys = [
         "_binding",
         "_dependency_bindings",
@@ -5059,8 +5071,10 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     let mut schemas = carina_core::schema::SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Resource")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        PatternResourceSchema::new("test.Resource")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
             .validate()
             .expect("legacy fixture schema is valid"),
     );
@@ -6338,7 +6352,7 @@ fn state_file_serializes_current_exports_version_after_reload() {
 #[test]
 fn persisted_exports_encoding_golden() {
     use carina_core::resource::EnumValueResolver;
-    use carina_core::schema::{AttributeType, TypeIdentity};
+    use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
     use std::collections::BTreeMap;
 
     fn encode(value: Value) -> serde_json::Value {
@@ -6678,7 +6692,9 @@ fn typed_data_source_cleanup_preserves_managed_row_with_identifier() {
 #[test]
 fn accepted_create_records_write_only_attributes() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
 
     // Simulate a VPC resource with a write-only attribute (ipv4_netmask_length)
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
@@ -6801,7 +6817,9 @@ fn desired_redacted_secret_is_rejected_consistently_when_provider_omits_attribut
 #[test]
 fn accepted_write_only_rejects_desired_redacted_secret() {
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
     use carina_core::value::SerializationError;
 
     let historical = persisted_attributes_from_state_json(&HashMap::from([(
@@ -6848,7 +6866,9 @@ fn accepted_write_only_rejects_desired_redacted_secret() {
 #[test]
 fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
 
     // Resource without write-only attribute specified
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
@@ -6899,7 +6919,9 @@ fn accepted_create_does_not_record_write_only_attribute_absent_from_desired() {
 #[test]
 fn accepted_write_only_does_not_overwrite_protected_provider_value() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
 
     // Resource with a write-only attribute
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
@@ -7188,7 +7210,9 @@ fn with_attributes_from_state_keeps_raw_legacy_shaped_text_plain() {
 #[test]
 fn accepted_write_only_keeps_raw_legacy_shaped_text_plain() {
     use carina_core::resource::{ConcreteValue, Resource, State, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
 
     let marker = format!("{LEGACY_SECRET_PREFIX}{}", "ab".repeat(32));
     let resource = Resource::with_provider("mock", "test.resource", "plain", None).with_attribute(
@@ -7223,7 +7247,10 @@ fn nested_write_only_state_fixture(
     secret: &str,
 ) -> (carina_core::resource::Resource, ResourceSchema) {
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+        CompiledStructField as StructField,
+    };
 
     let config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
@@ -7358,7 +7385,10 @@ fn nested_write_only_record_lifecycle_hashes_sent_secrets_and_clears_on_remove()
 #[test]
 fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+        CompiledStructField as StructField,
+    };
 
     let config = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::Map(IndexMap::from([
@@ -7692,9 +7722,7 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
         Sent,
     };
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
-    use carina_core::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-    };
+    use carina_core::schema::SchemaRegistry;
 
     let issuer = || Value::Concrete(ConcreteValue::String("https://issuer.example.com".into()));
     let action = |config| {
@@ -7736,32 +7764,41 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
         let resource =
             Resource::with_provider("mock", "elasticloadbalancingv2.Listener", identity, None)
                 .with_attribute("default_actions", desired_actions);
-        let schema = ResourceSchema::new("elasticloadbalancingv2.Listener").attribute(
-            AttributeSchema::optional(
-                "default_actions",
-                AttributeType::list(AttributeType::struct_(
-                    "Action",
-                    vec![
-                        StructField::optional(
-                            "authenticate_oidc_config",
-                            AttributeType::struct_(
-                                "AuthenticateOidcConfig",
-                                vec![
-                                    StructField::optional("issuer", AttributeType::string())
+        let schema = PatternResourceSchema::new("elasticloadbalancingv2.Listener")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "default_actions",
+                    PatternAttributeType::list(PatternAttributeType::struct_(
+                        "Action",
+                        vec![
+                            PatternStructField::optional(
+                                "authenticate_oidc_config",
+                                PatternAttributeType::struct_(
+                                    "AuthenticateOidcConfig",
+                                    vec![
+                                        PatternStructField::optional(
+                                            "issuer",
+                                            PatternAttributeType::string(),
+                                        )
                                         .build(),
-                                    StructField::optional("client_secret", AttributeType::string())
+                                        PatternStructField::optional(
+                                            "client_secret",
+                                            PatternAttributeType::string(),
+                                        )
                                         .write_only()
                                         .build(),
-                                ],
-                            ),
-                        )
-                        .build(),
-                    ],
-                )),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .create_only()
+                .build(),
             )
-            .create_only()
-            .build(),
-        );
+            .validate()
+            .expect("test schema must be valid");
         let identifier = AppliedIdentifier::new(format!("{identity}-id")).unwrap();
         let observed_actions = action(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "issuer".to_string(),
@@ -7828,7 +7865,7 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
             &resolved(&resource),
             &created,
             None,
-            Some(&schema),
+            Some(schema.as_schema()),
             None,
         )
         .expect("observed create must be persistable");
@@ -7862,13 +7899,7 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
             .upsert_resource(row.clone())
             .expect("observed row has a unique address");
         let mut schemas = SchemaRegistry::new();
-        schemas.insert(
-            "mock",
-            schema
-                .clone()
-                .validate()
-                .expect("test schema must be valid"),
-        );
+        schemas.insert("mock", schema.clone());
         let saved = state_file.build_saved_attrs().lift(&schemas);
 
         assert!(
@@ -7878,7 +7909,7 @@ fn observed_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappe
                     &current,
                     &saved,
                     Some(&row.explicit),
-                    Some(&schema),
+                    Some(schema.as_schema()),
                 ),
                 Diff::NoChange(_)
             ),
@@ -7968,7 +7999,9 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
 #[test]
 fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
@@ -8018,7 +8051,9 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
 #[test]
 fn accepted_update_ignores_sent_non_write_only_key_absent_from_writeback_resource() {
     use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    };
 
     let resource = Resource::with_provider("mock", "test.Resource", "main", None).with_attribute(
         "password",
@@ -8088,7 +8123,10 @@ fn orphan_refresh_without_schema_carries_recorded_write_only_value() {
 #[test]
 fn orphan_refresh_drops_provider_echoed_write_only_value_absent_from_previous() {
     use carina_core::resource::{ConcreteValue, ResourceId, State as ProviderState, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use carina_core::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+        CompiledResourceSchema as ResourceSchema,
+    };
 
     let id = ResourceId::with_provider_identity("mock", "test.Resource", "orphan", None);
     let existing = ResourceState::try_applied("test.Resource", "orphan", "mock", "resource-id")
@@ -8128,7 +8166,7 @@ fn orphan_refresh_drops_provider_echoed_write_only_value_absent_from_previous() 
 #[test]
 fn managed_refresh_infers_legacy_unlisted_write_only_values_from_schema() {
     use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
-    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use carina_core::schema::SchemaRegistry;
 
     let id = ResourceId::with_provider_identity("mock", "test.resource", "main", None);
     let row = ResourceState::try_applied("test.resource", "main", "mock", "provider-id")
@@ -8142,9 +8180,9 @@ fn managed_refresh_infers_legacy_unlisted_write_only_values_from_schema() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.resource")
+        PatternResourceSchema::new("test.resource")
             .attribute(
-                AttributeSchema::optional("password", AttributeType::string())
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
                     .write_only()
                     .build(),
             )

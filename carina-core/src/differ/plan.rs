@@ -23,8 +23,8 @@ use crate::resource::{
     plan_input_desired_resources,
 };
 use crate::schema::{
-    AttrTypeKind, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec,
-    WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
+    AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;

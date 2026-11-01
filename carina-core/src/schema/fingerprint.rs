@@ -10,10 +10,11 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, FieldGroup, FieldGroupKind,
-    IdentityMode, InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
-    ResourceSchema, ResourceValidation, SchemaKind, StructField, TypeIdentity, UniqueNameSpec,
-    ValidatorType,
+    AttrTypeKind, CompiledAttributeSchema as AttributeSchema,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
+    InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation,
+    SchemaKind, TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
@@ -582,6 +583,8 @@ fn encode_json(encoder: &mut CanonicalEncoder, value: &serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+
     use super::*;
     use crate::schema::ReferenceTemplate;
 
@@ -640,11 +643,11 @@ mod tests {
     #[test]
     fn owner_reference_forms_change_the_resource_fingerprint() {
         let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
-        let schema = ResourceSchema::new("aws.lambda.Function")
+        let schema = PatternResourceSchema::new("aws.lambda.Function")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "name",
-                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
                 )
                 .build(),
             )

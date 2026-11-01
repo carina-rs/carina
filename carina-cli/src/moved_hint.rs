@@ -469,6 +469,10 @@ fn render_identity_literal(identity: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
+    };
+
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
@@ -481,9 +485,7 @@ mod tests {
         EnumValueResolver, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
         ResourceIdentity, State, Value,
     };
-    use carina_core::schema::{
-        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
-    };
+    use carina_core::schema::{SchemaRegistry, TypeIdentity};
 
     use super::{
         MovedBlockHint, MovedBlockHints,
@@ -529,13 +531,14 @@ mod tests {
     }
 
     fn schemas(create_only: bool) -> SchemaRegistry {
-        let attribute = AttributeSchema::optional(CREATE_ONLY_ATTRIBUTE, AttributeType::string());
+        let attribute =
+            PatternAttributeSchema::optional(CREATE_ONLY_ATTRIBUTE, PatternAttributeType::string());
         let attribute = if create_only {
             attribute.create_only().build()
         } else {
             attribute.build()
         };
-        let schema = ResourceSchema::new(RESOURCE_TYPE)
+        let schema = PatternResourceSchema::new(RESOURCE_TYPE)
             .attribute(attribute)
             .validate()
             .expect("test schema must validate");
@@ -726,14 +729,18 @@ mod tests {
         prior_attributes.insert("type".to_string(), concrete_string("CNAME"));
 
         let enum_identity = TypeIdentity::new(Some(PROVIDER), ["route53", "RecordSet"], "Type");
-        let enum_type = AttributeType::enum_(
+        let enum_type = PatternAttributeType::enum_(
             enum_identity,
             Some(vec!["CNAME".to_string()]),
             vec![("CNAME".to_string(), "cname".to_string())],
             None,
             None,
         );
-        let canonical = EnumValueResolver::new(&enum_type)
+        let compiled = carina_core::schema::ValidatedConfigSchema::validate(
+            std::collections::BTreeMap::from([("value".to_string(), enum_type.clone())]),
+        )
+        .unwrap();
+        let canonical = EnumValueResolver::new(&compiled.parts()["value"])
             .resolve_state_text("CNAME")
             .expect("CNAME is a declared enum API value");
         let desired = Resource::from_id(id("validation_records[0]", None).into_inner())
@@ -743,9 +750,9 @@ mod tests {
             );
         plan.add(Effect::Create(ResolvedResource::new(desired)));
 
-        let schema = ResourceSchema::new(RESOURCE_TYPE)
+        let schema = PatternResourceSchema::new(RESOURCE_TYPE)
             .attribute(
-                AttributeSchema::optional("type", enum_type)
+                PatternAttributeSchema::optional("type", enum_type)
                     .create_only()
                     .build(),
             )
@@ -792,11 +799,11 @@ mod tests {
         );
         plan.add(Effect::Create(ResolvedResource::new(desired)));
 
-        let schema = ResourceSchema::new(RESOURCE_TYPE)
+        let schema = PatternResourceSchema::new(RESOURCE_TYPE)
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "zones",
-                    AttributeType::unordered_list(AttributeType::string()),
+                    PatternAttributeType::unordered_list(PatternAttributeType::string()),
                 )
                 .create_only()
                 .build(),
@@ -837,14 +844,17 @@ mod tests {
             .with_attribute("name", concrete_string("new-provider-name"));
         plan.add(Effect::Create(ResolvedResource::new(desired)));
 
-        let schema = ResourceSchema::new(RESOURCE_TYPE)
+        let schema = PatternResourceSchema::new(RESOURCE_TYPE)
             .attribute(
-                AttributeSchema::optional(CREATE_ONLY_ATTRIBUTE, AttributeType::string())
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    CREATE_ONLY_ATTRIBUTE,
+                    PatternAttributeType::string(),
+                )
+                .create_only()
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -880,9 +890,9 @@ mod tests {
             .with_attribute("name", concrete_string("record.example.com"));
         plan.add(Effect::Create(ResolvedResource::new(desired)));
 
-        let schema = ResourceSchema::new(RESOURCE_TYPE)
+        let schema = PatternResourceSchema::new(RESOURCE_TYPE)
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )

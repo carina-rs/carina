@@ -23,7 +23,7 @@ use carina_core::resource::{
     ProviderResource, RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource,
     ResourceId, State, Value, absolute_binding_address_for_test,
 };
-use carina_core::schema::{AttributeType, TypeIdentity};
+use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{
     AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
@@ -193,11 +193,11 @@ async fn update_request_for_test(
     let mut schemas = carina_core::schema::SchemaRegistry::new();
     schemas.insert(
         resource.id.provider.clone(),
-        carina_core::schema::ResourceSchema::new(resource.id.resource_type.clone())
+        carina_core::schema::PatternResourceSchema::new(resource.id.resource_type.clone())
             .attribute(
-                carina_core::schema::AttributeSchema::optional(
+                carina_core::schema::PatternAttributeSchema::optional(
                     "reassert_token",
-                    carina_core::schema::AttributeType::string(),
+                    carina_core::schema::PatternAttributeType::string(),
                 )
                 .write_only()
                 .build(),

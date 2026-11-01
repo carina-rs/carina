@@ -4,11 +4,12 @@
 //! which peels them through the enclosing definition map. [`super::RawShape`]
 //! remains the documented escape hatch for structural declaration relays.
 
+use super::{Draft, PatternAttributeType, PatternForm};
 use std::collections::BTreeMap;
 
-use super::{AttributeType, ResolvedAttrType};
+use super::ResolvedAttrType;
 #[cfg(test)]
-use super::{RefPathResolution, select_union_member_on_path};
+use super::{Compiled, RefPathResolution, select_union_member_on_path};
 #[cfg(test)]
 use crate::resource::Value;
 
@@ -18,19 +19,23 @@ use crate::resource::Value;
 /// iteration to semantic consumers; they use [`UnionMembers`]. Structural
 /// relays can deliberately obtain the declaration through [`super::RawShape`].
 #[derive(Clone)]
-pub(crate) struct UnionMemberTypes(Vec<AttributeType>);
+pub(crate) struct UnionMemberTypes<R: PatternForm = Draft>(Vec<PatternAttributeType<R>>);
 
-impl UnionMemberTypes {
-    pub(super) fn new(members: Vec<AttributeType>) -> Self {
+impl<R: PatternForm> UnionMemberTypes<R> {
+    pub(super) fn new(members: Vec<PatternAttributeType<R>>) -> Self {
         Self(members)
     }
 
-    pub(super) fn as_raw_slice(&self) -> &[AttributeType] {
+    pub(super) fn into_raw_vec(self) -> Vec<PatternAttributeType<R>> {
+        self.0
+    }
+
+    pub(super) fn as_raw_slice(&self) -> &[PatternAttributeType<R>] {
         &self.0
     }
 }
 
-impl std::fmt::Debug for UnionMemberTypes {
+impl<R: PatternForm> std::fmt::Debug for UnionMemberTypes<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -51,23 +56,23 @@ impl std::fmt::Debug for UnionMemberTypes {
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct UnionMembers<'a> {
-    members: &'a [AttributeType],
-    defs: &'a BTreeMap<String, AttributeType>,
+pub struct UnionMembers<'a, R: PatternForm = Draft> {
+    members: &'a [PatternAttributeType<R>],
+    defs: &'a BTreeMap<String, PatternAttributeType<R>>,
     visited_refs: Vec<&'a str>,
 }
 
-impl<'a> UnionMembers<'a> {
+impl<'a, R: PatternForm> UnionMembers<'a, R> {
     pub(super) fn new_after_union(
-        members: &'a [AttributeType],
-        defs: &'a BTreeMap<String, AttributeType>,
+        members: &'a [PatternAttributeType<R>],
+        defs: &'a BTreeMap<String, PatternAttributeType<R>>,
     ) -> Self {
         Self::new_after_union_on_path(members, defs, Vec::new())
     }
 
     pub(super) fn new_after_union_on_path(
-        members: &'a [AttributeType],
-        defs: &'a BTreeMap<String, AttributeType>,
+        members: &'a [PatternAttributeType<R>],
+        defs: &'a BTreeMap<String, PatternAttributeType<R>>,
         visited_refs: Vec<&'a str>,
     ) -> Self {
         Self {
@@ -94,7 +99,7 @@ impl<'a> UnionMembers<'a> {
     /// Each sibling starts from the view's retained path; consumers performing
     /// a non-consuming recursive selection use [`Self::select_on_path`]
     /// instead so only the chosen sibling extends that path.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<ResolvedUnionMember<'a>>> + '_ {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<ResolvedUnionMember<'a, R>>> + '_ {
         self.members.iter().map(move |member| {
             let mut visited_refs = self.visited_refs.clone();
             super::resolve_refs_on_path(member, self.defs, &mut visited_refs)
@@ -114,7 +119,7 @@ impl<'a> UnionMembers<'a> {
     pub(crate) fn any_on_path(
         &self,
         visited_refs: &mut Vec<&'a str>,
-        mut predicate: impl FnMut(ResolvedUnionMember<'a>, &mut Vec<&'a str>) -> bool,
+        mut predicate: impl FnMut(ResolvedUnionMember<'a, R>, &mut Vec<&'a str>) -> bool,
     ) -> bool {
         let restore_len = visited_refs.len();
         for name in &self.visited_refs {
@@ -147,8 +152,8 @@ impl<'a> UnionMembers<'a> {
     pub(crate) fn find_on_path(
         &self,
         visited_refs: &mut Vec<&'a str>,
-        mut predicate: impl FnMut(ResolvedUnionMember<'a>, &mut Vec<&'a str>) -> bool,
-    ) -> Option<ResolvedUnionMember<'a>> {
+        mut predicate: impl FnMut(ResolvedUnionMember<'a, R>, &mut Vec<&'a str>) -> bool,
+    ) -> Option<ResolvedUnionMember<'a, R>> {
         let restore_len = visited_refs.len();
         for name in &self.visited_refs {
             if !visited_refs.contains(name) {
@@ -175,7 +180,10 @@ impl<'a> UnionMembers<'a> {
         let resolution = super::resolve_refs_on_path(selected, self.defs, visited_refs).ok()?;
         Some(ResolvedUnionMember::new(resolution.attr))
     }
+}
 
+#[cfg(test)]
+impl<'a> UnionMembers<'a, Compiled> {
     /// Select the best member from those that accept the complete value under
     /// validation. Exact wire kind wins, then declaration order. Only the
     /// chosen member's Ref names remain on the caller's current non-consuming
@@ -185,7 +193,7 @@ impl<'a> UnionMembers<'a> {
         &self,
         value: &Value,
         visited_refs: &mut Vec<&'a str>,
-    ) -> Option<ResolvedUnionMember<'a>> {
+    ) -> Option<ResolvedUnionMember<'a, Compiled>> {
         let projected = value.as_concrete()?;
         let restore_len = visited_refs.len();
         for name in &self.visited_refs {
@@ -196,7 +204,7 @@ impl<'a> UnionMembers<'a> {
         let expected = self
             .members
             .iter()
-            .map(AttributeType::type_name)
+            .map(PatternAttributeType::type_name)
             .collect::<Vec<_>>()
             .join(" | ");
         let Ok(selected) = select_union_member_on_path(
@@ -223,15 +231,15 @@ impl<'a> UnionMembers<'a> {
 
 /// One Union member whose top-level Ref chain is proven peeled.
 #[derive(Debug, Clone, Copy)]
-pub struct ResolvedUnionMember<'a>(ResolvedAttrType<'a>);
+pub struct ResolvedUnionMember<'a, R: PatternForm = Draft>(ResolvedAttrType<'a, R>);
 
-impl<'a> ResolvedUnionMember<'a> {
-    fn new(attr: &'a AttributeType) -> Self {
+impl<'a, R: PatternForm> ResolvedUnionMember<'a, R> {
+    fn new(attr: &'a PatternAttributeType<R>) -> Self {
         Self(ResolvedAttrType::new_after_peel(attr))
     }
 
     /// Borrow the member after its top-level Ref chain has been peeled.
-    pub fn as_attr(self) -> &'a AttributeType {
+    pub fn as_attr(self) -> &'a PatternAttributeType<R> {
         self.0.as_attr()
     }
 }
