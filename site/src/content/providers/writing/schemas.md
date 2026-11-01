@@ -217,10 +217,10 @@ wait-condition right-hand sides are not checked for uniqueness. List length
 constraints still apply in all these cases. `list()` and `unordered_list()`
 allow duplicates.
 
-Protocol v17 requires every list schema JSON record to carry `elements` as
+Since protocol v17, every list schema JSON record must carry `elements` as
 `"allow_duplicates"` or `"unique"`, including ordinary lists. There is no
-default at decode. Rebuild providers against the updated SDK before loading
-them with the current v18 host.
+default at decode. Rebuild providers against the current SDK before loading
+them with the current host.
 
 Struct fields use the same three constructors as attributes, `StructField::optional`, `StructField::required` and `StructField::provider_populated`:
 
@@ -492,7 +492,7 @@ Carina then rejects deletion and replacement unless the user sets
 `prevent_destroy` to a value that resolves to `false`, for example
 `directives { prevent_destroy = false }`. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
-severe consequences. The required boolean is transported in protocol-v16
+severe consequences. The required boolean is transported in protocol-v19
 schema JSON; an older provider that omits it fails during schema loading.
 
 A module argument default that resolves to `false` cannot disable this schema

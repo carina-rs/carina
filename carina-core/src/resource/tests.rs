@@ -22,6 +22,36 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
 }
 
+#[test]
+fn desired_leaf_deferral_keeps_containers_structural() {
+    let reference = Value::root_resource_ref("peer", "id", vec![]);
+    let unknown = Value::Deferred(DeferredValue::Unknown(
+        ApplyTimeUnknown::UpstreamAllExports {
+            binding: absolute_binding("peer"),
+        },
+    ));
+    let known = Value::Concrete(ConcreteValue::String("known".into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(known.clone())));
+    for value in [reference, unknown, secret] {
+        assert!(is_deferred_desired_leaf(&value));
+        let list = Value::Concrete(ConcreteValue::List(vec![known.clone(), value]));
+        assert!(!is_deferred_desired_leaf(&list));
+        let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("known".into(), known.clone()),
+            ("nested".into(), list),
+        ])));
+        assert!(!is_deferred_desired_leaf(&map));
+    }
+    for value in [
+        known.clone(),
+        Value::Concrete(ConcreteValue::List(vec![known.clone()])),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([("key".into(), known)]))),
+        Value::Concrete(ConcreteValue::StringList(vec!["known".into()])),
+    ] {
+        assert!(!is_deferred_desired_leaf(&value));
+    }
+}
+
 fn module_argument_diagnostic_at(
     file: &str,
     line: usize,

@@ -10563,7 +10563,7 @@ fn validate_type_definition(
                     fields.iter().find(|field| field.name == name).map(|field| {
                         FieldGroupMemberAdmission {
                             input_mode: field.declared_input_mode,
-                            // StructField has no default in the core or v16
+                            // StructField has no default in the core or current
                             // protocol grammar. Keeping this explicit makes a
                             // future addition inherit the shared rejection.
                             has_default: false,

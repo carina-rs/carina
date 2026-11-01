@@ -8,6 +8,13 @@ pub use carina_provider_protocol::types;
 
 pub mod aws_credentials;
 
+mod desired;
+pub use desired::{
+    DeferredLeaf, DesiredEditError, DesiredInputs, DesiredList, DesiredMap, DesiredNormalization,
+    DesiredNormalizationError, DesiredResource, DesiredScalar, DesiredValue, DesiredValueMut,
+    DesiredView, NativeDesiredNormalization, NormalizedResource,
+};
+
 #[cfg(target_arch = "wasm32")]
 #[doc(hidden)]
 pub mod __private;
@@ -80,7 +87,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-16 JSON.
+/// Failure while projecting validated SDK schemas onto version-19 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -183,7 +190,7 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-16
+/// The validated provider schemas determine the scalar kind. The version-19
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
@@ -1155,215 +1162,6 @@ impl<'de> serde::Deserialize<'de> for Never {
     }
 }
 
-/// The state of one top-level desired resource attribute at normalization time.
-///
-/// The host holds unresolved attributes back from the WASM value boundary. A
-/// provider must therefore distinguish an attribute the user omitted from one
-/// whose value exists but cannot be observed until its dependency resolves.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DesiredAttribute<T> {
-    Known(T),
-    Absent,
-    Deferred,
-}
-
-/// A desired resource decoded from the WASM normalization boundary.
-///
-/// Attribute storage and the host's deferred-name set stay private so callers
-/// cannot accidentally interpret a missing map entry as user-authored
-/// absence. Use [`DesiredResource::attribute`] or
-/// [`DesiredResource::attribute_mut`] for one attribute, or
-/// [`DesiredResource::attributes`] to walk every known and deferred attribute.
-#[derive(Debug)]
-pub struct DesiredResource {
-    resource: Resource,
-    deferred: std::collections::BTreeSet<String>,
-}
-
-/// A desired resource whose normalization is complete.
-///
-/// This type is intentionally opaque. Provider implementations can create it
-/// only by calling [`DesiredResource::finish`]; the SDK's guest glue is solely
-/// responsible for encoding it onto the WASM boundary.
-///
-/// ```compile_fail
-/// use carina_plugin_sdk::{NormalizedResource, types::Resource};
-///
-/// fn expose_raw(normalized: NormalizedResource) -> Resource {
-///     let NormalizedResource { resource } = normalized;
-///     resource
-/// }
-/// ```
-#[derive(Debug)]
-pub struct NormalizedResource {
-    // Guest encoding exists only for WASM builds; host-only SDK builds still
-    // need this opaque return type in the public trait signature.
-    #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
-    resource: Resource,
-}
-
-/// An attempted insertion targeted an attribute that was not absent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DesiredAttributeError {
-    /// The name already has a known value.
-    Known { name: String },
-    /// The host is withholding the name's unresolved value.
-    Deferred { name: String },
-}
-
-impl std::fmt::Display for DesiredAttributeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Known { name } => write!(
-                formatter,
-                "attribute '{name}' is known; insert_absent requires an absent attribute"
-            ),
-            Self::Deferred { name } => write!(
-                formatter,
-                "attribute '{name}' is deferred; insert_absent requires an absent attribute"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DesiredAttributeError {}
-
-/// Invalid `desired-resource` input received from the WASM host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DesiredResourceDecodeError {
-    DuplicateDeferredAttribute { name: String },
-    DeferredAttributePresent { name: String },
-}
-
-impl std::fmt::Display for DesiredResourceDecodeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DuplicateDeferredAttribute { name } => {
-                write!(
-                    formatter,
-                    "deferred attribute name '{name}' appears more than once"
-                )
-            }
-            Self::DeferredAttributePresent { name } => write!(
-                formatter,
-                "attribute '{name}' is both present in the resource and marked deferred"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for DesiredResourceDecodeError {}
-
-impl DesiredResource {
-    #[cfg(any(target_arch = "wasm32", test))]
-    fn decode(
-        resource: Resource,
-        deferred: Vec<String>,
-    ) -> Result<Self, DesiredResourceDecodeError> {
-        let mut deferred_names = std::collections::BTreeSet::new();
-        for name in deferred {
-            if !deferred_names.insert(name.clone()) {
-                return Err(DesiredResourceDecodeError::DuplicateDeferredAttribute { name });
-            }
-        }
-        if let Some(name) = deferred_names
-            .iter()
-            .find(|name| resource.attributes.contains_key(name.as_str()))
-        {
-            return Err(DesiredResourceDecodeError::DeferredAttributePresent {
-                name: name.clone(),
-            });
-        }
-        Ok(Self {
-            resource,
-            deferred: deferred_names,
-        })
-    }
-
-    /// Resource identity used for provider dispatch and diagnostics.
-    pub fn id(&self) -> &ResourceId {
-        &self.resource.id
-    }
-
-    /// Query one top-level attribute without conflating absence and deferral.
-    pub fn attribute(&self, name: &str) -> DesiredAttribute<&Value> {
-        if self.deferred.contains(name) {
-            DesiredAttribute::Deferred
-        } else {
-            self.resource
-                .attributes
-                .get(name)
-                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
-        }
-    }
-
-    /// Mutably query one known top-level attribute.
-    ///
-    /// Deferred and absent attributes cannot be synthesized through this
-    /// method; both remain explicit enum variants.
-    pub fn attribute_mut(&mut self, name: &str) -> DesiredAttribute<&mut Value> {
-        if self.deferred.contains(name) {
-            DesiredAttribute::Deferred
-        } else {
-            self.resource
-                .attributes
-                .get_mut(name)
-                .map_or(DesiredAttribute::Absent, DesiredAttribute::Known)
-        }
-    }
-
-    /// Iterate over every known and deferred top-level attribute.
-    ///
-    /// Absent attributes have no name to yield. Each deferred name is emitted
-    /// explicitly as [`DesiredAttribute::Deferred`].
-    pub fn attributes(&self) -> impl Iterator<Item = (&str, DesiredAttribute<&Value>)> {
-        let known = self
-            .resource
-            .attributes
-            .iter()
-            .map(|(name, value)| (name.as_str(), DesiredAttribute::Known(value)));
-        let deferred = self
-            .deferred
-            .iter()
-            .map(|name| (name.as_str(), DesiredAttribute::Deferred));
-        known.chain(deferred)
-    }
-
-    /// Insert a top-level attribute only when it is truly absent.
-    ///
-    /// Known and deferred names produce distinct typed errors. In particular,
-    /// a deferred name cannot be replaced while its value is withheld by the
-    /// host.
-    pub fn insert_absent(
-        &mut self,
-        name: impl Into<String>,
-        value: Value,
-    ) -> Result<(), DesiredAttributeError> {
-        use std::collections::btree_map::Entry;
-
-        let name = name.into();
-        if self.deferred.contains(&name) {
-            return Err(DesiredAttributeError::Deferred { name });
-        }
-        match self.resource.attributes.entry(name) {
-            Entry::Vacant(entry) => {
-                entry.insert(value);
-                Ok(())
-            }
-            Entry::Occupied(entry) => Err(DesiredAttributeError::Known {
-                name: entry.key().clone(),
-            }),
-        }
-    }
-
-    /// Finish normalization and seal the resource for the SDK's guest glue.
-    pub fn finish(self) -> NormalizedResource {
-        NormalizedResource {
-            resource: self.resource,
-        }
-    }
-}
-
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
@@ -1598,20 +1396,50 @@ pub trait CarinaProvider {
         vec![]
     }
 
-    /// Normalize desired resources (optional).
+    /// Normalize desired resources through a structural [`DesiredView`].
     ///
-    /// Every attribute lookup is a three-way query: [`DesiredAttribute::Known`],
-    /// [`DesiredAttribute::Absent`], or [`DesiredAttribute::Deferred`], because
-    /// the host temporarily withholds unresolved values from WASM. Use
-    /// [`DesiredResource::attributes`] for a generic walk,
-    /// [`DesiredResource::attribute_mut`] to edit known values, and
-    /// [`DesiredResource::insert_absent`] to add a value only when it is truly
-    /// absent. Return each resource by calling [`DesiredResource::finish`].
+    /// Consume each [`DesiredResource`] with [`DesiredResource::into_normalization`],
+    /// edit known leaves through [`DesiredNormalization::view`], and return its
+    /// checked [`DesiredNormalization::finish`]. Lists/maps remain visible beside
+    /// opaque secret/reference/unknown leaves. Every deferred leaf must survive
+    /// exactly once within its original resource and top-level attribute.
+    /// Validate cross-field inputs with [`DesiredView::inputs`] here, or
+    /// [`DesiredInputs::from_core`] during native create/update validation.
+    /// That projection keeps secrets/references deferred; CRUD bodies still get
+    /// real secret values. Move nodes with [`DesiredMap::remove`] followed by
+    /// [`DesiredMap::insert_absent`], or reorder with [`DesiredList::move_within`].
+    /// Each deferred leaf must remain in its original top-level attribute.
+    ///
+    /// Both routes call the same function and propagate errors with `?`. Native
+    /// builders/finish return core provider errors with the original resource id
+    /// and provider instance; the typed normalization error remains accessible
+    /// through `detail().cause()`. Guest errors use the protocol error type.
+    ///
+    /// ```
+    /// use carina_plugin_sdk::{DesiredResource, DesiredView, NativeDesiredNormalization,
+    ///     NormalizedResource, types::ProviderError};
+    /// use carina_plugin_sdk::core::{provider::ProviderResult, resource::ProviderResource};
+    /// # fn shared(_: &mut DesiredView<'_>) {}
+    /// fn native(resource: &mut ProviderResource) -> ProviderResult<()> {
+    ///     let mut desired = NativeDesiredNormalization::from_core(resource)?;
+    ///     shared(&mut desired.view());
+    ///     desired.finish()?;
+    ///     Ok(())
+    /// }
+    /// fn wasm(resource: DesiredResource) -> Result<NormalizedResource, ProviderError> {
+    ///     let mut desired = resource.into_normalization()?;
+    ///     shared(&mut desired.view());
+    ///     Ok(desired.finish()?)
+    /// }
+    /// ```
     fn normalize_desired(
         &self,
         resources: Vec<DesiredResource>,
     ) -> Result<Vec<NormalizedResource>, ProviderError> {
-        Ok(resources.into_iter().map(DesiredResource::finish).collect())
+        resources
+            .into_iter()
+            .map(|resource| resource.finish().map_err(Into::into))
+            .collect()
     }
 
     /// Normalize read-back state (optional).
@@ -2112,6 +1940,18 @@ mod tests {
         }
     }
 
+    fn crud_resource(attributes: BTreeMap<String, Value>) -> types::Resource {
+        types::Resource {
+            id: types::ResourceId {
+                provider: "test".into(),
+                resource_type: "test.Widget".into(),
+                identity: "example".into(),
+            },
+            attributes,
+            directives: types::Directives::default(),
+        }
+    }
+
     fn continuation_error() -> ProviderError {
         ProviderError {
             kind: types::ProviderErrorKind::Internal,
@@ -2271,7 +2111,7 @@ mod tests {
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
         };
-        let resource = desired_resource(BTreeMap::new());
+        let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
         let request = CreateRequest { resource };
         let poll_request = PollRequest {
@@ -2320,7 +2160,7 @@ mod tests {
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
         };
-        let resource = desired_resource(BTreeMap::new());
+        let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
         let verdict = dispatch_poll_create(
             &provider,
@@ -2356,7 +2196,7 @@ mod tests {
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
         };
-        let resource = desired_resource(BTreeMap::new());
+        let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
         let verdict = dispatch_resume_create(
             &provider,
@@ -2391,7 +2231,7 @@ mod tests {
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
         };
-        let resource = desired_resource(BTreeMap::new());
+        let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
         let identifier = AppliedIdentifier::new("created-id").unwrap();
         let sent = Sent::only(["name"]);
@@ -2429,7 +2269,7 @@ mod tests {
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
         };
-        let resource = desired_resource(BTreeMap::new());
+        let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
         let identifier = AppliedIdentifier::new("created-id").unwrap();
         let verdict = dispatch_resume_create(
@@ -2516,7 +2356,7 @@ mod tests {
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
         };
-        let resource = desired_resource(BTreeMap::new());
+        let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
         let sent = Sent::only(["name"]);
         for (progress, token) in matching_create_continuations() {
@@ -2552,7 +2392,7 @@ mod tests {
             forms: ReferenceForms::new(),
             reference_form_calls: Cell::new(0),
         };
-        let resource = desired_resource(BTreeMap::new());
+        let resource = crud_resource(BTreeMap::new());
         let id = resource.id.clone();
         for (progress, token) in matching_create_continuations() {
             let verdict = dispatch_resume_create(
@@ -2583,150 +2423,6 @@ mod tests {
         for encoded in ["null", "{}", "0", "\"token\""] {
             assert!(serde_json::from_str::<Never>(encoded).is_err());
         }
-    }
-
-    fn desired_resource(attributes: BTreeMap<String, Value>) -> Resource {
-        Resource {
-            id: ResourceId {
-                provider: "test".to_string(),
-                resource_type: "test.Widget".to_string(),
-                identity: "example".to_string(),
-            },
-            attributes,
-            directives: types::Directives::default(),
-        }
-    }
-
-    #[test]
-    fn desired_resource_exposes_known_absent_and_deferred_attributes() {
-        let mut desired = DesiredResource::decode(
-            desired_resource(BTreeMap::from([(
-                "known".to_string(),
-                Value::String("before".to_string()),
-            )])),
-            vec!["deferred".to_string()],
-        )
-        .expect("valid desired resource");
-
-        assert!(matches!(
-            desired.attribute("known"),
-            DesiredAttribute::Known(Value::String(value)) if value == "before"
-        ));
-        assert!(matches!(
-            desired.attribute("absent"),
-            DesiredAttribute::Absent
-        ));
-        assert!(matches!(
-            desired.attribute("deferred"),
-            DesiredAttribute::Deferred
-        ));
-
-        match desired.attribute_mut("known") {
-            DesiredAttribute::Known(value) => *value = Value::String("after".to_string()),
-            DesiredAttribute::Absent | DesiredAttribute::Deferred => {
-                panic!("known attribute must remain mutable")
-            }
-        }
-        assert!(matches!(
-            desired.attribute_mut("deferred"),
-            DesiredAttribute::Deferred
-        ));
-
-        let normalized = desired.finish();
-        assert_eq!(
-            normalized.resource.attributes.get("known"),
-            Some(&Value::String("after".to_string()))
-        );
-        assert!(!normalized.resource.attributes.contains_key("deferred"));
-    }
-
-    #[test]
-    fn desired_resource_iteration_and_absent_insertion_preserve_three_way_state() {
-        let mut desired = DesiredResource::decode(
-            desired_resource(BTreeMap::from([(
-                "known".to_string(),
-                Value::String("configured".to_string()),
-            )])),
-            vec!["deferred".to_string()],
-        )
-        .expect("valid desired resource");
-
-        let states = desired
-            .attributes()
-            .map(|(name, attribute)| {
-                let state = match attribute {
-                    DesiredAttribute::Known(_) => "known",
-                    DesiredAttribute::Deferred => "deferred",
-                    DesiredAttribute::Absent => unreachable!("absent names are not iterable"),
-                };
-                (name, state)
-            })
-            .collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            states,
-            BTreeMap::from([("deferred", "deferred"), ("known", "known")])
-        );
-
-        let deferred_error = desired
-            .insert_absent("deferred", Value::String("replacement".to_string()))
-            .expect_err("a deferred attribute is not absent");
-        assert_eq!(
-            deferred_error,
-            DesiredAttributeError::Deferred {
-                name: "deferred".to_string()
-            }
-        );
-
-        let known_error = desired
-            .insert_absent("known", Value::String("replacement".to_string()))
-            .expect_err("a known attribute is not absent");
-        assert_eq!(
-            known_error,
-            DesiredAttributeError::Known {
-                name: "known".to_string()
-            }
-        );
-
-        desired
-            .insert_absent("absent", Value::String("default".to_string()))
-            .expect("an absent attribute accepts a default");
-        assert!(matches!(
-            desired.attribute("absent"),
-            DesiredAttribute::Known(Value::String(value)) if value == "default"
-        ));
-    }
-
-    #[test]
-    fn desired_resource_rejects_duplicate_deferred_names() {
-        let error = DesiredResource::decode(
-            desired_resource(BTreeMap::new()),
-            vec!["pending".to_string(), "pending".to_string()],
-        )
-        .expect_err("duplicate deferred names must be rejected");
-
-        assert!(matches!(
-            error,
-            DesiredResourceDecodeError::DuplicateDeferredAttribute { name }
-                if name == "pending"
-        ));
-    }
-
-    #[test]
-    fn desired_resource_rejects_present_deferred_attribute() {
-        let error = DesiredResource::decode(
-            desired_resource(BTreeMap::from([(
-                "pending".to_string(),
-                Value::String("guest-visible".to_string()),
-            )])),
-            vec!["pending".to_string()],
-        )
-        .expect_err("an attribute cannot be both present and deferred");
-
-        assert!(matches!(
-            error,
-            DesiredResourceDecodeError::DeferredAttributePresent { name }
-                if name == "pending"
-        ));
     }
 
     #[test]

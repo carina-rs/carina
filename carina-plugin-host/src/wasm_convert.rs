@@ -274,14 +274,11 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// Returns `Err(SerializationError)` for an unresolved `EnumIdentifier` and
 /// for `Value::Deferred(DeferredValue::Unknown)`,
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
-/// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. The scoped transport wrapper in
-/// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
-/// attributes before conversion, reports their top-level names through the
-/// WIT `desired-resource.deferred` field, and restores their values after the
-/// guest call. Reaching any of these arms is therefore a producer-side bug —
-/// the diagnostic identifies which variant leaked. See RFC #2371 stage 2
-/// (#2378) for `Unknown` and #2387 for `ResourceRef` / `Interpolation` /
-/// `FunctionCall`.
+/// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. Desired
+/// normalization uses a separate structural `desired-value` codec,
+/// projecting deferred leaves to opaque slots before the guest call. These
+/// ordinary-value encoders are used by CRUD/configuration and do not interpret
+/// normalization markers.
 ///
 /// `Value::Deferred(DeferredValue::Secret(inner))` is encoded as the `secret-val` WIT variant
 /// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
@@ -4790,6 +4787,77 @@ mod tests {
         assert_eq!(id.resource_type, "s3.Bucket");
         assert_eq!(id.identity_str(), None);
         assert_eq!(id.provider_instance, None);
+    }
+
+    #[test]
+    fn create_and_update_wire_values_keep_plaintext_secrets() {
+        let secret = |text: &str| {
+            CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+                ConcreteValue::String(text.to_string().into()),
+            ))))
+        };
+        let top = secret("top-plaintext");
+        let nested = CoreValue::Concrete(ConcreteValue::Map(
+            [(
+                "items".to_string(),
+                CoreValue::Concrete(ConcreteValue::List(vec![secret("nested-plaintext")])),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        let resource = CoreResource::new("test", "secret-boundaries")
+            .with_attribute("top", top.clone())
+            .with_attribute("nested", nested.clone());
+        // These are the value encoders called by the create/update request encoders.
+        let create = core_to_wit_resource(&resource).unwrap();
+        let update = core_to_wit_update_patch(&CoreUpdatePatch {
+            ops: vec![
+                CorePatchOp::Add {
+                    key: "top".into(),
+                    value: top.clone(),
+                },
+                CorePatchOp::Replace {
+                    key: "nested".into(),
+                    value: nested,
+                },
+                CorePatchOp::Reassert {
+                    key: "top".into(),
+                    value: top,
+                },
+            ],
+        })
+        .unwrap();
+        let update_values: Vec<_> = update
+            .ops
+            .iter()
+            .map(|op| match op {
+                wit::PatchOp::Add(value)
+                | wit::PatchOp::Replace(value)
+                | wit::PatchOp::Reassert(value) => (value.key.clone(), value.value.clone()),
+                wit::PatchOp::Remove(_) => panic!("the secret patch contains only values"),
+            })
+            .collect();
+        assert_eq!(create.attributes.len(), 2);
+        assert_eq!(update_values.len(), 3);
+        for attributes in [&create.attributes, &update_values] {
+            for (name, value) in attributes {
+                match (name.as_str(), value) {
+                    ("top", wit::Value::SecretVal(json)) => {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                            serde_json::json!("top-plaintext")
+                        );
+                    }
+                    ("nested", wit::Value::MapVal(json)) => {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                            serde_json::json!({"items": ["nested-plaintext"]})
+                        );
+                    }
+                    _ => panic!("CRUD must preserve real secret wire values"),
+                }
+            }
+        }
     }
 
     #[tokio::test]
