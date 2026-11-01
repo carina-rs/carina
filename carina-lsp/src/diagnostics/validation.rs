@@ -47,7 +47,7 @@ impl DiagnosticEngine {
             let is_duplicate = super::is_duplicate_list_error(&err);
             let ends_in_index = matches!(path.steps().last(), Some(FieldPathStep::Index(_)));
             let element_range = if is_duplicate || ends_in_index {
-                self.value_range_for_path(doc, attr_name, &path, scope)
+                self.value_range_for_path(doc, attr_name, &path, scope, is_duplicate)
             } else {
                 None
             };
@@ -114,10 +114,16 @@ impl DiagnosticEngine {
         attr_name: &str,
         path: &FieldPath,
         scope: Option<(u32, u32)>,
+        is_duplicate: bool,
     ) -> Option<Range> {
-        let span =
-            carina_core::parser::attribute_value_source_span(&doc.text(), attr_name, path, scope)
+        let spans =
+            carina_core::parser::attribute_value_source_spans(&doc.text(), attr_name, path, scope)
                 .ok()??;
+        let span = if is_duplicate {
+            spans.value
+        } else {
+            spans.block_header.unwrap_or(spans.value)
+        };
         Some(Range::new(
             tower_lsp::lsp_types::Position::new(
                 (span.start_line() - 1) as u32,

@@ -81,6 +81,14 @@ pub struct AnonymousResourceSourceSpan {
     pub span: TopLevelBlockSourceSpan,
 }
 
+/// Parser-backed spans for an attribute value or a literal descendant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttributeValueSourceSpans {
+    pub value: super::SourceSpan,
+    /// Present when the selected element uses nested block syntax.
+    pub block_header: Option<super::SourceSpan>,
+}
+
 impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
@@ -225,6 +233,19 @@ pub fn attribute_value_source_span(
     path: &crate::schema::FieldPath,
     scope: Option<(u32, u32)>,
 ) -> Result<Option<super::SourceSpan>, ParseError> {
+    Ok(attribute_value_source_spans(input, attribute, path, scope)?.map(|spans| spans.value))
+}
+
+/// Locate a value and, for nested block syntax, its header independently.
+///
+/// This lets diagnostics select the block header while whole-value errors
+/// such as duplicate elements retain the complete authored element span.
+pub fn attribute_value_source_spans(
+    input: &str,
+    attribute: &str,
+    path: &crate::schema::FieldPath,
+    scope: Option<(u32, u32)>,
+) -> Result<Option<AttributeValueSourceSpans>, ParseError> {
     use crate::schema::FieldPathStep;
     use pest::iterators::Pair;
 
@@ -321,7 +342,16 @@ pub fn attribute_value_source_span(
     } else {
         descend(first, path.steps())
     };
-    Ok(selected.map(|pair| super::SourceSpan::from_pest(&pair, &file)))
+    Ok(selected.map(|pair| AttributeValueSourceSpans {
+        value: super::SourceSpan::from_pest(&pair, &file),
+        block_header: if pair.as_rule() == Rule::nested_block {
+            pair.into_inner()
+                .next()
+                .map(|name| super::SourceSpan::from_pest(&name, &file))
+        } else {
+            None
+        },
+    }))
 }
 
 /// Return keyword spans for state blocks parsed as top-level statements.
@@ -384,6 +414,43 @@ pub fn top_level_upstream_state_spans(
         }
         pair_contains_rule(statement, Rule::upstream_state_expr).then_some("let")
     })
+}
+
+/// Return complete statement spans keyed by top-level `let` binding name.
+///
+/// Only direct children of the file participate, so local bindings and binding
+/// text inside strings cannot change a resource's diagnostic scope.
+pub fn top_level_let_binding_spans(
+    input: &str,
+) -> Result<HashMap<String, super::SourceSpan>, ParseError> {
+    let file = super::preprocess_file(input)?;
+    let mut spans = HashMap::new();
+    for pair in file.parse()? {
+        if pair.as_rule() != Rule::file {
+            continue;
+        }
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            let Some(binding) = statement.into_inner().next() else {
+                continue;
+            };
+            if binding.as_rule() != Rule::let_binding {
+                continue;
+            }
+            let Some(name) = binding.clone().into_inner().next() else {
+                continue;
+            };
+            if name.as_rule() == Rule::identifier {
+                spans.insert(
+                    name.as_str().to_string(),
+                    super::SourceSpan::from_pest(&binding, &file),
+                );
+            }
+        }
+    }
+    Ok(spans)
 }
 
 /// Return type-name spans for authored top-level anonymous resources.
@@ -1464,6 +1531,49 @@ pub(crate) fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_let_binding_spans_exclude_locals_and_restore_heredoc_positions() {
+        let binding = "let b = mock.test.Resource {\n  name = \"b\"\n  tags_list = [\"ok\", 5]\n}";
+        let source = format!(
+            "let text = <<EOT\nlet b = fake {{\n}}\nEOT\n\
+             for x in [\"p\"] {{\n  let b = x\n  mock.test.Other {{ name = b }}\n}}\n\
+             if true {{\n  let local_only = \"q\"\n  mock.test.Other {{ name = local_only }}\n}}\n\
+             {binding} # trailing trivia\nlet _ = \"discarded\"\n"
+        );
+        let spans = top_level_let_binding_spans(&source).unwrap();
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+        assert!(spans.contains_key("text"));
+        let span = spans.get("b").unwrap();
+        assert_eq!(span.start_line(), 13);
+        assert_eq!(span.end_line(), 16);
+        assert_eq!(&source[span.start_byte()..span.end_byte()], binding);
+    }
+
+    #[test]
+    fn attribute_value_spans_distinguish_block_headers_from_inline_items() {
+        let path = crate::schema::FieldPath::new().push_index(0);
+        for (body, block_header) in [
+            ("rules {\n  label = \"block\"\n}", Some("rules")),
+            ("rules = [{\n  label = \"inline\"\n}]", None),
+        ] {
+            let source = format!("mock.test.Resource {{\n{body}\n}}\n");
+            let spans = attribute_value_source_spans(&source, "rules", &path, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                spans
+                    .block_header
+                    .map(|span| &source[span.start_byte()..span.end_byte()]),
+                block_header,
+            );
+            assert!(spans.value.end_line() > spans.value.start_line());
+            assert_eq!(
+                attribute_value_source_span(&source, "rules", &path, None).unwrap(),
+                Some(spans.value),
+            );
+        }
+    }
 
     #[test]
     fn top_level_span_api_preserves_unterminated_heredoc_line() {

@@ -16,6 +16,20 @@ fn unique_list_declaration_scope_fixture(
     second_body: &str,
     let_bound: bool,
 ) -> (String, Vec<Diagnostic>) {
+    let source = if let_bound {
+        format!(
+            "let a = mock.test.UniqueLists {{ name = \"a\" }}\nlet b = mock.test.UniqueLists {{ name = \"b\"\n  {second_body}\n}}\n"
+        )
+    } else {
+        format!(
+            "mock.test.UniqueLists {{\n  name = \"first\"\n  tags_list = [\"ok\"]\n  modes = [allow]\n  values = [\"first\"]\n}}\nmock.test.UniqueLists {{\n  name = \"second\"\n  {second_body}\n}}\n"
+        )
+    };
+    let diagnostics = unique_list_source_diagnostics(&source);
+    (source, diagnostics)
+}
+
+fn unique_list_source_diagnostics(source: &str) -> Vec<Diagnostic> {
     use carina_core::schema::{
         AttributeSchema, AttributeType, ListElements, ResourceSchema, StructField,
     };
@@ -109,21 +123,227 @@ fn unique_list_declaration_scope_fixture(
             .validate()
             .unwrap(),
     );
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Other")
+            .with_unique_name_attribute("name")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
     let engine = custom_engine(schemas);
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
-    let source = if let_bound {
-        format!(
-            "let a = mock.test.UniqueLists {{ name = \"a\" }}\nlet b = mock.test.UniqueLists {{ name = \"b\"\n  {second_body}\n}}\n"
-        )
-    } else {
-        format!(
-            "mock.test.UniqueLists {{\n  name = \"first\"\n  tags_list = [\"ok\"]\n  modes = [allow]\n  values = [\"first\"]\n}}\nmock.test.UniqueLists {{\n  name = \"second\"\n  {second_body}\n}}\n"
-        )
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    analyze_with_buffer(&engine, directory.path(), "main.crn", source)
+}
+
+#[test]
+fn round6_let_scope_ignores_for_local_binding() {
+    let source = concat!(
+        "for x in [\"p\"] {\n",
+        "  let b = x\n",
+        "  mock.test.Other { name = b }\n",
+        "}\n",
+        "let b = mock.test.UniqueLists { name = \"b\"\n",
+        "  tags_list = [\"ok\", 5]\n",
+        "}\n",
+    );
+    let diagnostics = unique_list_source_diagnostics(source);
+    let error = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(5, 21), Position::new(5, 22)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round6_let_scope_ignores_if_local_binding() {
+    let source = concat!(
+        "if true {\n",
+        "  let b = \"p\"\n",
+        "  mock.test.Other { name = b }\n",
+        "}\n",
+        "let b = mock.test.UniqueLists { name = \"b\"\n",
+        "  tags_list = [\"ok\", 5]\n",
+        "}\n",
+    );
+    let diagnostics = unique_list_source_diagnostics(source);
+    let error = only_message_diagnostic(&diagnostics, "expected String");
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(5, 21), Position::new(5, 22)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+}
+
+#[test]
+fn round6_let_scope_ignores_multiline_string_binding_text() {
+    for prefix in [
+        "let text = \"\nlet b = mock.test.Other {\n  name = example\n}\n\"\n",
+        "let text = <<EOT\nlet b = mock.test.Other {\n  name = example\n}\nEOT\n",
+    ] {
+        let source = format!(
+            "{prefix}let b = mock.test.UniqueLists {{ name = \"b\"\n  tags_list = [\"ok\", 5]\n}}\n"
+        );
+        let diagnostics = unique_list_source_diagnostics(&source);
+        let error = only_message_diagnostic(&diagnostics, "expected String");
+        assert_eq!(
+            error.range,
+            Range::new(Position::new(6, 21), Position::new(6, 22)),
+            "{source}: {diagnostics:#?}"
+        );
+        assert_eq!(error.severity, Some(DiagnosticSeverity::WARNING));
+    }
+}
+
+#[test]
+fn round6_unknown_attribute_has_one_core_suggestion_for_anonymous_resource() {
+    assert_unknown_attribute_suggestion(false);
+}
+
+#[test]
+fn round6_unknown_attribute_has_one_core_suggestion_for_let_bound_resource() {
+    assert_unknown_attribute_suggestion(true);
+}
+
+fn assert_unknown_attribute_suggestion(let_bound: bool) {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("tag_list = true", let_bound);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    let line = if let_bound { 2 } else { 8 };
+    assert_eq!(
+        error.range.start,
+        Position::new(line, 2),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.range.end.line, line, "{diagnostics:#?}");
+    assert_eq!(
+        error.message, "Unknown attribute 'tag_list', did you mean 'tags_list'?",
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round6_unknown_attribute_with_resource_reference_keeps_core_suggestion() {
+    for header in ["mock.test.UniqueLists", "let b = mock.test.UniqueLists"] {
+        let source = format!(
+            "let a = mock.test.Other {{ name = \"a\" }}\n{header} {{ name = \"b\"\n  tag_list = a.name\n}}\n"
+        );
+        let diagnostics = unique_list_source_diagnostics(&source);
+        let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
+        assert_eq!(
+            error.message, "Unknown attribute 'tag_list', did you mean 'tags_list'?",
+            "{diagnostics:#?}"
+        );
+        assert_eq!(error.range.start, Position::new(2, 2), "{diagnostics:#?}");
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    }
+}
+
+#[test]
+fn round6_block_unknown_attribute_falls_back_to_its_anonymous_resource_header() {
+    assert_block_unknown_attribute_fallback(false);
+}
+
+#[test]
+fn round6_block_unknown_attribute_falls_back_to_its_let_bound_resource_header() {
+    assert_block_unknown_attribute_fallback(true);
+}
+
+fn assert_block_unknown_attribute_fallback(let_bound: bool) {
+    let (_, diagnostics) = unique_list_declaration_scope_fixture("typo { }", let_bound);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute 'typo'");
+    let header_line = if let_bound { 1 } else { 6 };
+    assert_eq!(
+        error.range.start,
+        Position::new(header_line, 0),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.range.end.line, header_line, "{diagnostics:#?}");
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round6_indexed_field_group_block_uses_its_header_range() {
+    let diagnostics =
+        indexed_field_group_diagnostics("rules {\n    allow = \"yes\"\n    deny = \"no\"\n  }");
+    let error = only_message_diagnostic(&diagnostics, "rules[0]: exactly one of");
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(3, 2), Position::new(3, 7)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn round6_indexed_field_group_inline_items_keep_element_ranges() {
+    let diagnostics = indexed_field_group_diagnostics("rules = [\n    {},\n    {}\n  ]");
+    for (index, line) in [(0, 4), (1, 5)] {
+        let error =
+            only_message_diagnostic(&diagnostics, &format!("rules[{index}]: exactly one of"));
+        assert_eq!(
+            error.range,
+            Range::new(Position::new(line, 4), Position::new(line, 6)),
+            "{diagnostics:#?}"
+        );
+        assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    }
+}
+
+fn indexed_field_group_diagnostics(body: &str) -> Vec<Diagnostic> {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, FieldGroup, FieldGroupKind, ResourceSchema, StructField,
     };
+    let rule = AttributeType::struct_with_field_groups(
+        "Rule",
+        vec![
+            StructField::optional("allow", AttributeType::string()).build(),
+            StructField::optional("deny", AttributeType::string()).build(),
+        ],
+        vec![FieldGroup::new(FieldGroupKind::ExactlyOne, ["allow", "deny"]).unwrap()],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.FieldGroups")
+            .with_unique_name_attribute("name")
+            .with_def("Rule", rule)
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "rules",
+                    AttributeType::list(AttributeType::ref_("Rule")),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let source = format!(
+        "let a = mock.test.FieldGroups {{ name = \"a\" }}\nlet b = mock.test.FieldGroups {{\n  name = \"b\"\n  {body}\n}}\n"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
     std::fs::write(directory.path().join("main.crn"), &source).unwrap();
-    let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
-    (source, diagnostics)
+    analyze_with_buffer(
+        &custom_engine(schemas),
+        directory.path(),
+        "main.crn",
+        &source,
+    )
 }
 
 #[test]

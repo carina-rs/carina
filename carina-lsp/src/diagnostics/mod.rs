@@ -1128,6 +1128,8 @@ impl DiagnosticEngine {
                 .as_ref()
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             let mut anonymous_resource_lines = HashMap::<(String, String), VecDeque<u32>>::new();
+            let let_binding_spans =
+                carina_core::parser::top_level_let_binding_spans(&doc.text()).unwrap_or_default();
             if let Ok(spans) = carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
             {
                 for authored in spans {
@@ -1176,33 +1178,38 @@ impl DiagnosticEngine {
                 };
                 let provider = &resource_id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
+                let authored_binding_scope = match rref {
+                    ResourceRef::Deferred { .. } => None,
+                    _ => rref
+                        .binding()
+                        .and_then(|binding| let_binding_spans.get(binding))
+                        .map(|span| {
+                            (
+                                span.start_line().saturating_sub(1) as u32,
+                                span.end_line() as u32,
+                            )
+                        }),
+                };
                 let authored_direct_start = match rref {
                     ResourceRef::Resource(resource) if resource.binding.is_none() => {
                         anonymous_resource_lines
                             .get_mut(&(provider.to_string(), resource_id.resource_type.clone()))
                             .and_then(VecDeque::pop_front)
                     }
-                    ResourceRef::Resource(_)
-                    | ResourceRef::LiveComposition(_)
-                    | ResourceRef::DataSource(_) => rref.binding().and_then(|binding| {
-                        self.find_let_binding_position(&doc.text(), binding)
-                            .map(|(line, _)| line)
-                    }),
-                    ResourceRef::Deferred {
-                        resource: _resource,
-                        deferred: _deferred,
-                    } => None,
+                    _ => None,
                 };
                 // Source-range hint for attribute position lookups. Without
                 // this, a `for`-body diagnostic like `mode = "aaa"` would
                 // anchor on the first top-level `mode =` in the file.
-                let scope = resource_source_range(
-                    doc,
-                    ctx,
-                    provider,
-                    &resource_id.resource_type,
-                    authored_direct_start,
-                );
+                let scope = authored_binding_scope.or_else(|| {
+                    resource_source_range(
+                        doc,
+                        ctx,
+                        provider,
+                        &resource_id.resource_type,
+                        authored_direct_start,
+                    )
+                });
 
                 if resource_schema().is_none() {
                     let provider_loaded = self.provider_names.contains(&provider.to_string());
@@ -1428,33 +1435,9 @@ impl DiagnosticEngine {
                             continue;
                         }
 
-                        // Check for unknown attributes
+                        // Core's resource validator owns unknown attributes and
+                        // their spelling suggestions. Nothing else applies here.
                         if !schema.attributes().contains_key(canonical_name) {
-                            if let Some((line, col)) =
-                                self.find_attribute_position(doc, attr_name, scope)
-                            {
-                                // Check if there's a similar attribute (e.g., vpc -> vpc_id)
-                                let suggestion = if schema
-                                    .attributes()
-                                    .contains_key(&format!("{}_id", attr_name))
-                                {
-                                    format!(". Did you mean '{}_id'?", attr_name)
-                                } else {
-                                    String::new()
-                                };
-
-                                diagnostics.push(carina_diagnostic(
-                                    line,
-                                    col,
-                                    col + attr_name.len() as u32,
-                                    DiagnosticSeverity::ERROR,
-                                    format!(
-                                        "Unknown attribute '{}' for resource type '{}'{}",
-                                        attr_name, resource_id.resource_type, suggestion
-                                    ),
-                                ));
-                                reported_attribute_diagnostics.insert(canonical_name.to_string());
-                            }
                             continue;
                         }
 
@@ -1860,13 +1843,19 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             let deferred_attribute = error.attribute_name();
-                            if deferred_attribute.is_some_and(|attribute| {
-                                matches!(
-                                    resource_attributes.get(attribute),
-                                    Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
-                                        | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
-                                )
-                            }) {
+                            // Unknown names are invalid even while their values
+                            // are deferred; core is their only diagnostic owner.
+                            if !matches!(&error, TypeError::UnknownAttribute { .. })
+                                && deferred_attribute.is_some_and(|attribute| {
+                                    matches!(
+                                        resource_attributes.get(attribute),
+                                        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+                                            | Some(Value::Deferred(
+                                                DeferredValue::BindingRef { .. }
+                                            ))
+                                    )
+                                })
+                            {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
@@ -1883,10 +1872,9 @@ impl DiagnosticEngine {
                             }
                             let is_masked_secret_error = error.to_string().contains("(secret)");
                             // Statically evaluated expressions may first become known
-                            // in this pass. Suppress list refinements and unknown
-                            // attributes only when the attribute pass emitted them.
-                            if (is_duplicate_list_error(&error)
-                                || matches!(&error, TypeError::UnknownAttribute { .. }))
+                            // in this pass. Suppress list refinements only when
+                            // the attribute pass emitted them.
+                            if is_duplicate_list_error(&error)
                                 && error.attribute_name().is_some_and(|attribute| {
                                     let canonical = bn_map
                                         .get(attribute)
@@ -1921,13 +1909,7 @@ impl DiagnosticEngine {
                             let position = error
                                 .attribute_name()
                                 .and_then(|attr| self.find_attribute_position(doc, attr, scope));
-                            let position = position.or_else(|| {
-                                self.find_resource_type_position(
-                                    doc,
-                                    provider,
-                                    &resource_id.resource_type,
-                                )
-                            });
+                            let position = position.or_else(|| scope.map(|(start, _)| (start, 0)));
                             if let Some((line, col)) = position {
                                 diagnostics.push(carina_diagnostic_range(
                                     Range {
@@ -2436,10 +2418,10 @@ impl DiagnosticEngine {
 ///
 /// - For `Deferred(for_expr)` the scope starts at the `for` line and ends
 ///   at the closing brace of the for expression.
-/// - For an authored `Direct` resource, the start line of its anonymous
-///   declaration or its own `let` binding selects that exact declaration.
-///   Other direct resources fall back to locating the `provider.resource_type`
-///   token.
+/// - For an authored anonymous `Direct` resource, its parser-backed start line
+///   selects that exact declaration. Let-bound resources use their complete
+///   parser span before this helper is called. Other direct resources fall
+///   back to locating the `provider.resource_type` token.
 ///
 /// Returns `None` when the block can't be located (e.g., during partial
 /// parses). Callers that fall back to `None` get document-wide search —
