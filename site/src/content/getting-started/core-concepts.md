@@ -173,10 +173,17 @@ Available directives:
 |--------|---------|--------|
 | `force_delete` | `false` | Force-delete the resource (e.g., non-empty S3 buckets) |
 | `create_before_destroy` | `false` | Create the replacement before destroying the old resource |
-| `prevent_destroy` | resource schema (normally `false`) | Block any plan that would destroy this resource; literal `false` opts out of a schema default |
+| `prevent_destroy` | resource schema (normally `false`) | Block any plan that would destroy this resource; an explicit `false` can opt out of schema-default protection |
 | `depends_on` | `[]` | Explicit ordering edges to sibling `let` bindings |
 | `provider` | (kind default) | Route this resource to a named provider instance — see [Named provider instances](/reference/dsl/syntax#named-provider-instances) |
 | `ignore_changes` | `[]` | Let another system own selected authored attribute paths after creation |
+
+Boolean directives resolve after module arguments and loop variables are
+substituted. For schema-protected resource types, a `false` supplied by an
+omitted module argument's default cannot disable protection; the caller must
+pass that value explicitly. A defaulted iterable contributes its origin only
+when the directive reads a loop variable. Literal `prevent_destroy = false`
+stays explicit inside loops and conditional resource bodies.
 
 For syntax, validation rules, and lifecycle semantics, see the
 [directives reference](/reference/dsl/directives/).

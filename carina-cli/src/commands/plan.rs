@@ -50,11 +50,10 @@ use carina_state::{ResolvedReadBackend, ResourceState, StateFile};
 
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
-use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::ProgressSink;
 pub use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 use crate::commands::shared::state_writeback::persisted_directive_changes;
-use crate::display::{format_persisted_directive_changes, print_plan};
+use crate::display::format_persisted_directive_changes;
 use crate::error::{AppError, LockedStateReloadError};
 #[cfg(test)]
 use crate::plan_image::PlanImageError;
@@ -672,6 +671,10 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 38 resolves authored lifecycle directives and retains loop
+    /// expressions, default origins, and call-site diagnostics in templates.
+    /// Earlier plans could have silently discarded safety directives.
+    ///
     /// Plan format 37 requires relative diagnostic files (or null) and line
     /// numbers on every deferred-for template.
     ///
@@ -1980,7 +1983,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 37;
+    pub const CURRENT_VERSION: u32 = 38;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -3005,6 +3008,458 @@ mod historical_display_tests {
     use carina_core::resource::{DeferredValue, ResolvedResource};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
+    struct CountingReferences {
+        inner: carina_provider_mock::MockProvider,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl carina_core::provider::Provider for CountingReferences {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn resolve_references<'a>(
+            &'a self,
+            requests: &'a [carina_core::references::ReferenceRequest],
+        ) -> carina_core::provider::BoxFuture<
+            'a,
+            carina_core::provider::ProviderResult<
+                Vec<
+                    Result<
+                        carina_core::references::ReferenceOutcome,
+                        carina_core::references::ReferenceError,
+                    >,
+                >,
+            >,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.resolve_references(requests)
+        }
+        fn read(
+            &self,
+            _: &ResourceId,
+            _: &carina_core::provider::AppliedIdentifier,
+            _: carina_core::provider::ReadRequest,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<carina_core::provider::ReadOutcome>,
+        > {
+            unreachable!()
+        }
+        fn read_data_source(
+            &self,
+            _: &carina_core::provider::ProviderReadyDataSource,
+        ) -> carina_core::provider::BoxFuture<'_, carina_core::provider::ProviderResult<State>>
+        {
+            unreachable!()
+        }
+        fn create(
+            &self,
+            _: &ResourceId,
+            _: carina_core::provider::CreateRequest,
+            _: carina_core::provider::CreateAttempt,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
+            unreachable!()
+        }
+        fn resume_create(
+            &self,
+            _: carina_core::provider::ResumeCreateRequest,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            unreachable!()
+        }
+        fn update(
+            &self,
+            _: &ResourceId,
+            _: &carina_core::provider::AppliedIdentifier,
+            _: carina_core::provider::UpdateRequest,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<carina_core::provider::UpdateOutcome>,
+        > {
+            unreachable!()
+        }
+        fn delete(
+            &self,
+            _: &ResourceId,
+            _: &carina_core::provider::AppliedIdentifier,
+            _: carina_core::provider::DeleteRequest,
+        ) -> carina_core::provider::BoxFuture<'_, carina_core::provider::ProviderResult<()>>
+        {
+            unreachable!()
+        }
+        fn required_permissions(
+            &self,
+            _: &ResourceId,
+            _: carina_core::effect::PlanOp,
+        ) -> carina_core::provider::ProviderResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct HistoricalOperandFixture {
+        plan: Plan,
+        schemas: SchemaRegistry,
+        provider: ProviderRouter,
+        managed: HashMap<ResourceId, Current>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl HistoricalOperandFixture {
+        fn new() -> Self {
+            use carina_core::provider::InitializedProvider;
+            let string = |raw: &str| Value::Concrete(ConcreteValue::String(raw.into()));
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                ResourceSchema::new("test.reference")
+                    .attribute(
+                        AttributeSchema::optional("name", AttributeType::string())
+                            .create_only()
+                            .build(),
+                    )
+                    .attribute(
+                        AttributeSchema::optional(
+                            "key",
+                            AttributeType::reference(
+                                carina_provider_mock::references::identity(),
+                                None,
+                                None,
+                            ),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let runtime = crate::test_support::TestCommandRuntime::with_mock(
+                carina_provider_mock::MockBehavior::default().with_reference_table(
+                    serde_json::from_value(serde_json::json!({
+                        "alias/shared": {"Ok": {"Resolved": "key/shared"}},
+                        "alias/historical": {"Err": {"AccessDenied": {
+                            "kind": "api_error", "message": "historical row lookup denied"
+                        }}}
+                    }))
+                    .unwrap(),
+                ),
+                carina_provider_mock::MockScope::memory(),
+            );
+            let mut provider = ProviderRouter::new();
+            provider.add_provider(
+                "mock".into(),
+                InitializedProvider::unavailable(Box::new(CountingReferences {
+                    calls: calls.clone(),
+                    inner: runtime.builtin_mock().unwrap().create_provider(),
+                })),
+            );
+            let target = Resource::with_provider("mock", "test.reference", "example", None)
+                .with_attribute("name", string("new"))
+                .with_attribute("key", string("alias/shared"));
+            let id = target.id.clone();
+            let planning = State::existing(
+                id.clone(),
+                HashMap::from([
+                    ("name".into(), string("old")),
+                    ("key".into(), string("alias/shared")),
+                ]),
+            )
+            .with_identifier("reference-123");
+            let current = carina_core::resource::into_plan_input_current_map(
+                HashMap::from([(id.clone(), Current::from_state(planning))]),
+                &schemas,
+                std::slice::from_ref(&target),
+            );
+            let desired =
+                ResolvedResource::collect_resolved_with_schemas([target], &schemas).unwrap();
+            let plan = carina_core::differ::create_plan(
+                &desired,
+                &[],
+                &provider,
+                carina_core::differ::PlanPriorStates::new(
+                    &current,
+                    &carina_core::differ::Orphans::new(),
+                ),
+                &HashMap::new(),
+                &schemas,
+                &crate::empty_lifted_saved_attrs(),
+                &HashMap::new(),
+                &[],
+                &carina_core::references::prepare_empty_for_tests(),
+            )
+            .unwrap();
+            assert_eq!(plan.replace_display_info().count(), 1);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            // The historical display operand differs from the planning snapshot,
+            // as in the moved replacement regression above. Only rendering can
+            // compare this pair; the differ compared identical raw references.
+            let historical = State::existing(
+                id.clone(),
+                HashMap::from([
+                    ("name".into(), string("old")),
+                    ("key".into(), string("alias/historical")),
+                ]),
+            )
+            .with_identifier("reference-123");
+            Self {
+                plan,
+                schemas,
+                provider,
+                managed: HashMap::from([(id, Current::from_state(historical))]),
+                calls,
+            }
+        }
+
+        async fn prepare(
+            &self,
+            plan: Plan,
+            request: crate::wiring::RowRequest,
+        ) -> Result<crate::wiring::PlanOutcome, AppError> {
+            crate::wiring::prepare_plan_outcome(
+                plan,
+                carina_core::references::prepare_empty_for_tests(),
+                &mut carina_core::references::ReferencePreparation::default(),
+                request,
+                &self.managed,
+                None,
+                &self.schemas,
+                &HashMap::new(),
+                &self.provider,
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn json_and_no_detail_requests_skip_historical_only_reference_calls() {
+        let fixture = HistoricalOperandFixture::new();
+        for request in [
+            plan_row_request(DetailLevel::Full, false, true),
+            plan_row_request(DetailLevel::None, false, false),
+            crate::wiring::RowRequest::None, // Artifact-only planning.
+        ] {
+            let outcome = fixture
+                .prepare(fixture.plan.clone(), request)
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered { .. })
+            ));
+            assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        let error = fixture
+            .prepare(
+                fixture.plan.clone(),
+                plan_row_request(DetailLevel::Full, false, false),
+            )
+            .await
+            .expect_err("text display must consult the historical-only operand");
+        assert!(
+            error.to_string().contains("historical row lookup denied"),
+            "{error}"
+        );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            plan_row_request(DetailLevel::None, true, false),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full)
+        ));
+    }
+
+    #[tokio::test]
+    async fn plan_errors_are_rendered_before_a_failing_historical_row_lookup() {
+        let fixture = HistoricalOperandFixture::new();
+        let mut plan = fixture.plan.clone();
+        let expected = carina_core::plan::PlanError::new(
+            plan.effects()[0].resource_id().clone(),
+            carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
+        );
+        plan.add_error(expected.clone());
+        let outcome = fixture
+            .prepare(plan, plan_row_request(DetailLevel::Full, false, false))
+            .await
+            .unwrap();
+        let crate::wiring::PlanOutcome::Diagnostics(diagnostics) = outcome else {
+            panic!("plan errors must select the diagnostics-only outcome");
+        };
+        assert_eq!(diagnostics.errors(), &[expected]);
+        assert_eq!(
+            diagnostics
+                .render_and_abort(crate::output_style::ColorMode::Plain, Path::new("."))
+                .to_string(),
+            "plan failed with 1 error(s)"
+        );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let error = fixture
+            .prepare(
+                fixture.plan.clone(),
+                plan_row_request(DetailLevel::Full, false, false),
+            )
+            .await
+            .expect_err("the same plan without diagnostics must attempt row preparation");
+        assert!(
+            error.to_string().contains("historical row lookup denied"),
+            "{error}"
+        );
+        assert_eq!(fixture.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn moved_replacement_renders_the_persisted_display_view_instead_of_planning_history() {
+        use carina_core::provider::{InitializedProvider, RawSavedAttrs};
+        use carina_core::references::ReferencePreparation;
+        use carina_core::resource::{ResolvedResourceId, into_plan_input_current_map};
+
+        let string = |raw: &str| Value::Concrete(ConcreteValue::String(raw.into()));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.reference")
+                .attribute(
+                    AttributeSchema::optional(
+                        "key",
+                        AttributeType::reference(
+                            carina_provider_mock::references::identity(),
+                            None,
+                            None,
+                        ),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let runtime = crate::test_support::TestCommandRuntime::with_mock(
+            carina_provider_mock::MockBehavior::default().with_reference_table(
+                serde_json::from_value(serde_json::json!({
+                    "alias/new": {"Ok": {"Resolved": "key/new"}},
+                    "key/planning": {"Ok": {"Resolved": "key/planning"}},
+                    "key/display": {"Ok": {"Resolved": "key/display"}}
+                }))
+                .unwrap(),
+            ),
+            carina_provider_mock::MockScope::memory(),
+        );
+        let mut provider = ProviderRouter::new();
+        provider.add_provider(
+            "mock".into(),
+            InitializedProvider::unavailable(Box::new(
+                runtime.builtin_mock().unwrap().create_provider(),
+            )),
+        );
+        let target = Resource::with_provider("mock", "test.reference", "new", None)
+            .with_attribute("key", string("alias/new"));
+        let id = target.id.clone();
+        let origin = ResourceId::with_provider_identity("mock", "test.reference", "old", None);
+        let planning = State::existing(
+            id.clone(),
+            HashMap::from([("key".into(), string("key/planning"))]),
+        )
+        .with_identifier("reference-123");
+        let refreshed = State::existing(
+            id.clone(),
+            HashMap::from([("key".into(), string("key/display"))]),
+        )
+        .with_identifier("reference-123");
+        let current = into_plan_input_current_map(
+            HashMap::from([(id.clone(), Current::from_state(planning))]),
+            &schemas,
+            std::slice::from_ref(&target),
+        );
+        let desired = ResolvedResource::collect_resolved_with_schemas([target], &schemas).unwrap();
+        let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+            id.clone(),
+            HashMap::from([("key".into(), string("key/planning"))]),
+        )]))
+        .lift(&schemas);
+        let mut preparation = ReferencePreparation::default();
+        let references = preparation
+            .prepare(&desired, &current, &schemas, &saved, &provider)
+            .await
+            .unwrap();
+        let mut plan = carina_core::differ::create_plan(
+            &desired,
+            &[],
+            &provider,
+            carina_core::differ::PlanPriorStates::new(
+                &current,
+                &carina_core::differ::Orphans::new(),
+            ),
+            &HashMap::new(),
+            &schemas,
+            &saved,
+            &HashMap::new(),
+            &[],
+            &references,
+        )
+        .unwrap();
+        plan.add(Effect::Move {
+            from: ResolvedResourceId::new(origin),
+            to: ResolvedResourceId::new(id.clone()),
+            origin: None,
+        });
+        let mut persisted = StateFile::new();
+        persisted
+            .upsert_resource(
+                ResourceState::try_applied("test.reference", "old", "mock", "reference-123")
+                    .unwrap()
+                    .with_attribute("key", serde_json::json!("key/display")),
+            )
+            .unwrap();
+        let historical = collect_historical_display_attributes(
+            &plan,
+            &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
+            Some(&persisted),
+        );
+        // Neither frontend may compare again: this router has no provider.
+        let no_provider = ProviderRouter::new();
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
+        );
+        for detail in [crate::DetailLevel::Full, crate::DetailLevel::Explicit] {
+            let display = preparation
+                .display(
+                    plan.clone(),
+                    &references,
+                    historical.clone(),
+                    detail.to_core(),
+                    &schemas,
+                    &HashMap::new(),
+                    &provider,
+                )
+                .await
+                .unwrap();
+            let output = crate::display::format_prepared_plan(
+                runtime.color_mode(),
+                &display.value,
+                &summary,
+                Some(&schemas),
+                &HashMap::from([(
+                    id.clone(),
+                    ResourceId::with_provider_identity("mock", "test.reference", "old", None),
+                )]),
+                None,
+                None,
+                &no_provider,
+            )
+            .expect("CLI display must record the exact historical operands it renders");
+            assert!(output.contains("key/display"), "{output}");
+            assert!(!output.contains("key/planning"), "{output}");
+            if detail == crate::DetailLevel::Full {
+                carina_tui::App::from_display(display.value.view(), &schemas, None, &no_provider)
+                    .expect("TUI must also reuse the final clean-pass rows");
+            }
+        }
+    }
+
     #[test]
     fn production_historical_display_combines_desired_and_persisted_secret_shapes() {
         const PLAINTEXT: &str = "hunter2";
@@ -3049,8 +3504,17 @@ mod historical_display_tests {
         );
         let (schemas, provider) =
             carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
-        let app = carina_tui::App::new(&plan, &schemas, &historical, None, &provider)
-            .expect("detail-row fixture must have an initialized provider route");
+        let app = carina_tui::App::new(
+            &plan,
+            &schemas,
+            &historical,
+            None,
+            &provider,
+            carina_core::detail_rows::DetailComparisons::Planning(
+                &carina_core::references::prepare_empty_for_tests(),
+            ),
+        )
+        .expect("detail-row fixture must have an initialized provider route");
         let rendered = format!("{:?}", app.nodes[0].detail_rows);
 
         assert!(
@@ -4647,6 +5111,18 @@ async fn drift_detection_test_barrier(runtime: &crate::runtime::CommandRuntime) 
     }
 }
 
+fn plan_row_request(detail: DetailLevel, tui: bool, json: bool) -> crate::wiring::RowRequest {
+    if json || (!tui && detail == DetailLevel::None) {
+        crate::wiring::RowRequest::None
+    } else {
+        crate::wiring::RowRequest::Render(if tui {
+            carina_core::detail_rows::DetailLevel::Full
+        } else {
+            detail.to_core()
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_plan(
     runtime: &crate::runtime::CommandRuntime,
@@ -4850,6 +5326,7 @@ pub async fn run_plan(
         provider_inputs.remote_bindings(),
         &state_block_claims,
         &resolved_state_block_targets,
+        plan_row_request(detail, tui, json),
     )
     .await?;
     let ctx_wiring = validated_plan.context();
@@ -4890,7 +5367,12 @@ pub async fn run_plan(
         }
     }
 
-    render_plan_errors_and_abort(color_mode, &ctx.plan, path)?;
+    let planned = match &ctx.plan {
+        crate::wiring::PlanOutcome::Planned(planned) => planned,
+        crate::wiring::PlanOutcome::Diagnostics(diagnostics) => {
+            return Err(diagnostics.render_and_abort(color_mode, path));
+        }
+    };
 
     let iam_preflight_result = if check_iam {
         let result = crate::commands::iam_preflight::run_iam_preflight(
@@ -4908,10 +5390,6 @@ pub async fn run_plan(
         && iam_preflight_result
             .as_ref()
             .is_some_and(crate::commands::iam_preflight::should_fail_strict);
-
-    // Build display-safe historical attributes from current and persisted state.
-    let historical_display =
-        collect_historical_display_attributes(&ctx.plan, &ctx.managed_current, state_file.as_ref());
 
     // Resolve exports against the same pre-apply binding view used for their
     // display and reject secrets that were hidden behind references during
@@ -4995,15 +5473,35 @@ pub async fn run_plan(
         if let Some(result) = iam_preflight_result.as_ref() {
             crate::commands::iam_preflight::emit_warnings(color_mode, result);
         }
-    } else if tui {
-        carina_tui::run(
-            &ctx.plan,
-            ctx_wiring.schemas(),
-            &historical_display,
-            Some(&ctx.prev_explicit),
-            &ctx.provider,
-        )?;
-        if !directive_changes.is_empty() {
+    } else {
+        match planned {
+            crate::wiring::PlannedPlan::Rendered { display, .. } if tui => {
+                carina_tui::run(
+                    display.view(),
+                    ctx_wiring.schemas(),
+                    Some(&ctx.prev_explicit),
+                    &ctx.provider,
+                )?;
+            }
+            crate::wiring::PlannedPlan::Rendered { .. }
+            | crate::wiring::PlannedPlan::Unrendered { .. } => {
+                crate::display::print_planned_plan(
+                    color_mode,
+                    planned,
+                    &summary,
+                    Some(ctx_wiring.schemas()),
+                    &ctx.moved_origins,
+                    Some(&ctx.prev_explicit),
+                    Some(&ctx.expansion_trace),
+                    &ctx.provider,
+                )?;
+            }
+        }
+        if let Some(note) = drift_note.as_ref().filter(|_| !tui) {
+            println!();
+            println!("{}", note.yellow(color_mode));
+        }
+        if tui && !directive_changes.is_empty() {
             eprint!(
                 "{}",
                 format_persisted_directive_changes(color_mode, &directive_changes)
@@ -5011,28 +5509,11 @@ pub async fn run_plan(
         }
         moved_hints.eprint(color_mode);
         if let Some(result) = iam_preflight_result.as_ref() {
-            crate::commands::iam_preflight::emit_warnings(color_mode, result);
-        }
-    } else {
-        print_plan(
-            color_mode,
-            &ctx.plan,
-            &summary,
-            detail,
-            &historical_display,
-            Some(ctx_wiring.schemas()),
-            &ctx.moved_origins,
-            Some(&ctx.prev_explicit),
-            Some(&ctx.expansion_trace),
-            &ctx.provider,
-        )?;
-        if let Some(note) = drift_note.as_ref() {
-            println!();
-            println!("{}", note.yellow(color_mode));
-        }
-        moved_hints.eprint(color_mode);
-        if let Some(result) = iam_preflight_result.as_ref() {
-            crate::commands::iam_preflight::print_warnings(color_mode, result);
+            if tui {
+                crate::commands::iam_preflight::emit_warnings(color_mode, result);
+            } else {
+                crate::commands::iam_preflight::print_warnings(color_mode, result);
+            }
         }
     }
 
@@ -6005,7 +6486,7 @@ mod load_upstream_states_tests {
         let (_temp, downstream, parsed) =
             crate::provider_upstream_test_support::provider_upstream_fixture();
         let mut parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("provider upstream fixture has no parser placeholders");
         parsed.providers[0].attributes.insert(
             "role_arn".to_string(),
@@ -6131,7 +6612,7 @@ mod load_upstream_states_tests {
             &ProviderContext::default(),
         )
         .unwrap()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("backend lock fixture has no parser placeholders")
         .backend
         .unwrap();
@@ -6573,7 +7054,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .expect("load config")
         .parsed
         .into_parsed()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("exports-only fixture has no parser placeholders");
         let mut guard = seed_cycle_guard(&dir_b);
         let bindings = load_upstream_states(
@@ -6857,7 +7338,10 @@ mod run_plan_out_tests {
         });
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
-            plan,
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan,
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
             provider: ProviderRouter::new(),
             sorted_resources: ResolvedResource::collect_resolved([
                 created.clone(),
@@ -7254,7 +7738,10 @@ mod run_plan_out_tests {
         parsed.data_sources = vec![parsed_data_source];
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
-            plan: Plan::new(),
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Plan::new(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
             unresolved_resources: Vec::new(),
@@ -7344,7 +7831,10 @@ mod run_plan_out_tests {
         };
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
-            plan: Plan::new(),
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Plan::new(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
             unresolved_resources: Vec::new(),
@@ -7402,7 +7892,10 @@ mod run_plan_out_tests {
             carina_core::resource::ConcreteValue::String("upstream-secret".into()),
         ))));
         let ctx = crate::wiring::PlanContext {
-            plan: Plan::new(),
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Plan::new(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
             unresolved_resources: Vec::new(),
@@ -7473,7 +7966,10 @@ mod run_plan_out_tests {
         )
         .unwrap();
         let ctx = crate::wiring::PlanContext {
-            plan: Plan::new(),
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Plan::new(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
             unresolved_resources: Vec::new(),

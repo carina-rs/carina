@@ -572,7 +572,7 @@ pub enum ResolveFileError {
     #[error(transparent)]
     BindingUse(#[from] BindingUseReport),
     #[error(transparent)]
-    LeftoverPlaceholders(#[from] crate::resource::LeftoverPlaceholders),
+    Expansion(#[from] crate::resource::ExpansionError),
 }
 
 impl BindingUseReport {
@@ -1429,7 +1429,7 @@ pub fn resolve_bare_binding_uses<
     }
 
     Ok(ResolvedFile {
-        inner: file.into_expanded()?,
+        inner: file.into_expanded(schemas)?,
     })
 }
 
@@ -4709,7 +4709,7 @@ fn is_string_compatible_type_on_path<'a>(
         .shape_ref_free()
         .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
     {
-        Shape::String { .. } | Shape::Enum { .. } => true,
+        Shape::Reference { .. } | Shape::String { .. } | Shape::Enum { .. } => true,
         Shape::Union => {
             let members = crate::schema::union_members_with_defs(resolved_attr, defs)
                 .expect("Shape::Union must expose union members internally");
@@ -7550,9 +7550,7 @@ where
         for value in attrs.values() {
             collect_dependencies(value, &mut referenced);
         }
-        // `LiveComposition` has no directives — `directives()` is `None`
-        // for that arm, so the depends_on walk is simply skipped.
-        for dep in rref.directives().into_iter().flat_map(|d| &d.depends_on) {
+        for dep in rref.directive_dependencies() {
             referenced.insert(dep.clone());
         }
     }

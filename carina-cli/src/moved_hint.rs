@@ -366,7 +366,7 @@ struct DestroyCandidate<'a> {
 struct CreateCandidate<'schema> {
     id: ResolvedResourceId,
     schema: &'schema ValidatedResourceSchema,
-    comparison: carina_core::differ::ComparisonContext<'schema>,
+    comparison: carina_core::differ::ObservationComparison<'schema>,
     create_only_values: DesiredCreateOnlyValues,
 }
 
@@ -410,7 +410,7 @@ fn create_candidate<'schema, S>(
     Ok(Some(CreateCandidate {
         id: created.resolved_id(),
         schema,
-        comparison: *comparison.context(),
+        comparison: comparison.context().observation(),
         create_only_values,
     }))
 }

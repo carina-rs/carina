@@ -236,9 +236,19 @@ fn fixture_schemas() -> Vec<(String, ValidatedResourceSchema)> {
         .collect()
 }
 
+/// Comparison evidence for fixture renderers that build rows on demand.
+pub struct FixtureReferences(carina_core::references::ResolvedReferences);
+
+impl FixtureReferences {
+    pub fn for_display(&self) -> carina_core::detail_rows::DetailComparisons<'_> {
+        carina_core::detail_rows::DetailComparisons::Planning(&self.0)
+    }
+}
+
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
+    pub references: FixtureReferences,
     pub moved_hints: MovedBlockHints,
     /// Resolved desired resources, including unchanged resources omitted from
     /// `plan.effects()`. Plan-image tests use these to retain only unchanged
@@ -659,16 +669,17 @@ where
                     resolved_state_block_targets: &resolved_state_block_targets,
                     preparation_errors: None,
                 },
+                crate::wiring::RowRequest::None,
             ),
         )
         .expect("fixture post-expansion plan construction must succeed")
     };
     Ok(match post_expansion {
         crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
+            let (artifacts, plan) = diagnostics.into_parts();
             let crate::wiring::PostExpansionArtifacts {
                 expanded_resources: validated_expansion,
                 residual_deferred_for,
-                plan,
                 compositions,
                 data_sources: _,
                 managed_current,
@@ -676,12 +687,14 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
-            } = diagnostics.into_artifacts();
+            } = artifacts;
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
+            let references = FixtureReferences(carina_core::references::prepare_empty_for_tests());
             FixturePlan {
                 plan,
+                references,
                 moved_hints,
                 // Error plans abort before resolved-resource and export consumers.
                 desired_resources: Vec::new(),
@@ -705,6 +718,7 @@ where
             }
         }
         crate::wiring::PostExpansionOutcome::Planned(crate::wiring::PostExpansionPlan {
+            plan,
             artifacts,
             resources:
                 crate::wiring::PostExpansionResolvedResources {
@@ -715,7 +729,6 @@ where
             let crate::wiring::PostExpansionArtifacts {
                 expanded_resources: validated_expansion,
                 residual_deferred_for,
-                plan,
                 compositions,
                 data_sources: _,
                 managed_current,
@@ -724,6 +737,15 @@ where
                 prev_explicit,
                 wait_aliases: _,
             } = artifacts;
+            let (plan, references) = match plan {
+                crate::wiring::PlannedPlan::Unrendered { plan, references } => {
+                    (plan, FixtureReferences(references))
+                }
+                crate::wiring::PlannedPlan::Rendered {
+                    display,
+                    references,
+                } => (display.plan().clone(), FixtureReferences(references)),
+            };
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
@@ -749,6 +771,7 @@ where
 
             FixturePlan {
                 plan,
+                references,
                 moved_hints,
                 desired_resources: resolved_resources,
                 unresolved_resources,
@@ -937,10 +960,6 @@ impl ProviderFactory for FixtureProviderConfigFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -992,10 +1011,6 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test".to_string()
     }
 
     fn create_provider(
@@ -1058,10 +1073,6 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
     }
 
     fn create_provider(
@@ -1143,10 +1154,6 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1219,10 +1226,6 @@ impl ProviderFactory for PlanImageFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1285,10 +1288,6 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1348,10 +1347,6 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -1423,10 +1418,6 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -1482,10 +1473,6 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        "test".to_string()
     }
 
     fn create_provider(

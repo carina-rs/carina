@@ -130,7 +130,7 @@ where
         carina_core::parser::IntoExpandedExportParam<carina_core::resource::AbsoluteBindingAddress>,
 {
     resolve_module_file_for_test(parsed)
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test fixture must contain no parser placeholders")
 }
 
@@ -588,6 +588,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         &crate::empty_lifted_saved_attrs(),
         &HashMap::new(),
         &[],
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("create-only behavior change must plan a replacement");
     assert!(
@@ -878,7 +879,7 @@ fn resolved_provider_configs(
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let parsed = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider configuration must contain no parser placeholders");
     carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
@@ -902,7 +903,7 @@ fn expanded_provider_configs(
 ) -> Vec<carina_core::parser::ExpandedProviderConfig> {
     parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider configs must contain no parser placeholders")
         .providers
 }
@@ -1001,7 +1002,7 @@ for account_id in orgs.accounts {
         Path::new("."),
     )
     .expect("cross the deferred-body resolution seam")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan loop fixture must contain only loop slots");
 
     let mut deferred = parsed.deferred_for_expressions().to_vec().into_iter();
@@ -2034,10 +2035,6 @@ impl ProviderFactory for FailBCreateFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -2367,7 +2364,7 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
     let (_temp, base_dir, parsed) =
         crate::provider_upstream_test_support::provider_default_tags_missing_upstream_fixture();
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider default-tags fixture has no parser placeholders");
 
     let error = match load_apply_provider_inputs(
@@ -2479,7 +2476,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let wiring = ValidatedWiring::from_load_for_test(providers);
     let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
     let expanded = resolve_module_file_for_test(parsed.clone().into_parsed())
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider upstream fixture has no parser placeholders");
     let stale_inputs = load_apply_provider_inputs(
         &user_dirs,
@@ -2808,10 +2805,6 @@ impl ProviderFactory for ApplyTimeReadFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "test-region".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -3017,10 +3010,6 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -3830,7 +3819,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     );
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("module data-source fixture has no parser placeholders");
     let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
         &expanded,
@@ -3848,6 +3837,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("module data-source plan should build");
@@ -4652,7 +4642,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         &SchemaRegistry::new(),
     )
     .expect("test fixture crosses module resolution")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
         fixture.runtime(),
@@ -5910,6 +5900,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("post-apply plan should succeed");
@@ -6027,6 +6018,7 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after create should succeed");
@@ -6086,6 +6078,7 @@ let nat = mock.ec2.NatGateway {{
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after sibling update should succeed");
@@ -6214,6 +6207,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("retry plan should succeed");
@@ -6356,6 +6350,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("the removal plan should succeed");
@@ -6437,6 +6432,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("retry plan should succeed");
@@ -6512,6 +6508,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &HashMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::wiring::ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan after the successful retry should succeed");
@@ -7991,7 +7988,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     //
     // This tests the scenario from issue #1499 where plan-verify fails
     // because the block_name attribute shows as an addition.
-    use carina_core::differ::diff;
+    use carina_core::differ::diff_for_test as diff;
     use carina_core::schema::StructField;
 
     let schema = ResourceSchema::new("awscc.iam.role")
@@ -8096,8 +8093,10 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
         &saved,
         Some(&prev_explicit),
         Some(schema.as_schema()),
-        &carina_core::differ::exact_comparison_context_for_tests(),
-    );
+        &carina_core::differ::exact_comparison_schema_for_tests(),
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
 
     assert!(
         matches!(d, carina_core::differ::Diff::NoChange(_)),
@@ -9664,7 +9663,7 @@ mod apply_deferred_for_parity {
         let parsed = parse_resolved(src);
         let states = dvo_state(&parsed);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let schemas = comparison_schemas();
@@ -9734,7 +9733,7 @@ mod apply_deferred_for_parity {
         "#;
         let parsed = parse_resolved(src);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty: HashMap<ResourceId, State> = HashMap::new();
@@ -9794,7 +9793,7 @@ mod apply_deferred_for_parity {
         let parsed = parse_resolved(&src);
         let states = dvo_state(&parsed);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let mut schemas = carina_core::schema::SchemaRegistry::new();
@@ -10004,18 +10003,20 @@ mod saved_plan_version_tests {
         );
     }
 
+    /// v37 and older could discard authored safety directives; reject their
+    /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
         let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            37,
-            "carina#4174 requires saved-plan format 37 for diagnostic locations",
+            38,
+            "carina#4072 requires format 38 to reject fail-open directive plans",
         );
-        let previous = 36;
+        let previous = 37;
 
-        for older_version in [previous, 35, 34, 33, 32] {
+        for older_version in [previous, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

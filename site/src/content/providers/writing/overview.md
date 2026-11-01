@@ -140,7 +140,7 @@ Each method consumes its handle. The `u32` is the poll delay in seconds.
 
 A provider runs with no filesystem access. It sees only these environment variables:
 
-- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's headers to stderr, including authorization headers, so do not use it with real credentials or in shared logs.
+- `HOME`, `RUST_LOG` and `CARINA_WASI_HTTP_TRACE`, for every provider. Setting `CARINA_WASI_HTTP_TRACE=1` prints every request's header names to stderr, shows values only for a fixed allowlist of non-credential headers (`host`, `content-type`, `content-length`, `transfer-encoding`, `expect`, `user-agent`, `x-amz-date`), redacts all other header values, and removes userinfo, fragments and query values from URIs.
 - `AWS_REGION`, `AWS_DEFAULT_REGION`, and `AWS_ENDPOINT_URL`, only for an AWS-kind provider. AWS credential variables are never passed; the AWS world receives credentials through its typed import.
 - `GITHUB_TOKEN`, only when the same user-owned record exists for the exact `carina-rs/github` artifact (including its official GitHub source), or for a matching local build explicitly granted the `github` kind.
 
@@ -152,7 +152,7 @@ Cloud metadata addresses are withheld from every provider kind. The host may use
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 16, and the host also requires at least 16. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release. Protocol 16 changes the schema identity field to a required mode and uses declared identity hashing, so providers built for versions 14 or 15 must be rebuilt.
+The provider protocol is versioned. The current development version is 19, and the host also requires at least 19. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.9.0, v0.8.0, and v0.7.1 all speak version 12; versions after 12 are development-only until the next release. Protocol 19 adds per-leaf deferred handles for desired normalization; providers built for earlier development versions must be rebuilt.
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 

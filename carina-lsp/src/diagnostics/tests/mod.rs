@@ -89,13 +89,6 @@ impl ProviderFactory for RegionConfigFactory {
         Ok(())
     }
 
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -228,13 +221,6 @@ impl ProviderFactory for SuspendedValidationFactory {
         }
     }
 
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -331,13 +317,6 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
                 "expected canonical enum API spelling",
             ))
         }
-    }
-
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
     }
 
     fn create_provider(
@@ -447,13 +426,6 @@ impl ProviderFactory for SharedRoleArnFactory {
             })
     }
 
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -549,13 +521,6 @@ impl ProviderFactory for BareTypeFactory {
         Err(carina_core::provider::ProviderError::invalid_input(
             "bare token rejected by its owner",
         ))
-    }
-
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
     }
 
     fn create_provider(
@@ -901,13 +866,6 @@ impl ProviderFactory for SchemaFixtureFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(
-        &self,
-        _attributes: &indexmap::IndexMap<String, carina_core::resource::Value>,
-    ) -> String {
-        String::new()
     }
 
     fn create_provider(

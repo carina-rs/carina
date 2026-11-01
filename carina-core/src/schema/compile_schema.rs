@@ -20,6 +20,29 @@ impl PatternAttributeType<Draft> {
         issues: &mut Vec<SchemaDefinitionIssue>,
     ) -> Option<CompiledAttributeType> {
         let kind = match self.kind {
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            } => AttrTypeKind::Reference {
+                identity,
+                pattern: match pattern {
+                    Some(pattern) => match CompiledPattern::try_new(&pattern) {
+                        Ok(pattern) => Some(pattern),
+                        Err(error) => {
+                            issues.push(SchemaDefinitionIssue {
+                                path: location.to_string(),
+                                location,
+                                message: error.to_string(),
+                                pattern_error: Some(error),
+                            });
+                            return None;
+                        }
+                    },
+                    None => None,
+                },
+                length,
+            },
             AttrTypeKind::String {
                 binding,
                 pattern,

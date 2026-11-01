@@ -26,9 +26,7 @@
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -56,9 +54,6 @@ impl ProviderFactory for AwsccTestFactory {
         _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
     fn create_provider(
         &self,
@@ -321,7 +316,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     )
     .expect("module expansion should succeed");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("module expansion must substitute every parser placeholder");
 
     // Sanity: module expansion produced both the RolePolicy resource

@@ -1,7 +1,7 @@
 pub mod wasm_convert;
 pub mod wasm_factory;
 
-mod secret_seal;
+mod desired_normalization;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use wasm_factory::GuestCallBudget;

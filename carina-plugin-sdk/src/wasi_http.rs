@@ -35,6 +35,7 @@ use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_runtime_api::http::Response;
 use aws_smithy_types::body::SdkBody;
+use carina_provider_protocol::http_trace::{TraceHeaders, TraceUri};
 
 use wasi::http::outgoing_handler;
 use wasi::http::types::{
@@ -234,7 +235,8 @@ pub fn send_phase_of(error: &ConnectorError) -> Option<SendPhase> {
 }
 
 /// When `CARINA_WASI_HTTP_TRACE=1` is set in the host environment, emit a
-/// per-phase wall-clock breakdown of each request to stderr.
+/// per-phase wall-clock breakdown of each request to stderr, with header values
+/// redacted unless allowlisted, and URI userinfo, fragment and query values removed.
 ///
 /// The env var is read once on first use and cached; flipping it
 /// mid-process has no effect. Off by default — the gate is a single atomic
@@ -247,6 +249,54 @@ fn trace_enabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+fn http_trace_headers_line(
+    method: &str,
+    uri: TraceUri<'_>,
+    body_len: usize,
+    headers: TraceHeaders<'_>,
+) -> String {
+    format!(
+        "carina-wasi-http-trace-headers method={} uri={} body_in={} headers=[{}]",
+        method, uri, body_len, headers,
+    )
+}
+
+fn http_trace_timing_line(
+    method: &str,
+    uri: TraceUri<'_>,
+    status: u16,
+    body_in: usize,
+    body_out: usize,
+    phases_ms: [u128; 7],
+) -> String {
+    let [
+        setup,
+        handle,
+        write_body,
+        body_finish,
+        pollable_block,
+        get_response,
+        read_body,
+    ] = phases_ms;
+    format!(
+        "carina-wasi-http-trace method={} uri={} status={} body_in={} body_out={} \
+         setup_ms={} handle_ms={} write_body_ms={} body_finish_ms={} \
+         pollable_block_ms={} get_response_ms={} read_body_ms={}",
+        method,
+        uri,
+        status,
+        body_in,
+        body_out,
+        setup,
+        handle,
+        write_body,
+        body_finish,
+        pollable_block,
+        get_response,
+        read_body,
+    )
 }
 
 /// An HTTP client that uses wasi:http/outgoing-handler for making requests.
@@ -496,17 +546,14 @@ fn execute(
         // confirm whether body-less requests carry `content-length: 0` /
         // `transfer-encoding: chunked` / `expect: 100-continue` (the
         // body-framing hypotheses narrowed for the ~20 s S3 latency).
-        let header_pairs: Vec<String> = request
-            .headers
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, String::from_utf8_lossy(v)))
-            .collect();
         eprintln!(
-            "carina-wasi-http-trace-headers method={} uri={} body_in={} headers=[{}]",
-            trace_method,
-            trace_uri,
-            request.body.len(),
-            header_pairs.join("; "),
+            "{}",
+            http_trace_headers_line(
+                &trace_method,
+                TraceUri::new(&trace_uri),
+                request.body.len(),
+                TraceHeaders::new(&request.headers),
+            )
         );
     }
 
@@ -560,21 +607,23 @@ fn execute(
         // they grow.
         let ms = |d: Option<Duration>| d.map(|x| x.as_millis()).unwrap_or(0);
         eprintln!(
-            "carina-wasi-http-trace method={} uri={} status={} body_in={} body_out={} \
-             setup_ms={} handle_ms={} write_body_ms={} body_finish_ms={} \
-             pollable_block_ms={} get_response_ms={} read_body_ms={}",
-            trace_method,
-            trace_uri,
-            response.status,
-            body_len,
-            response.body.len(),
-            ms(t_setup_done),
-            ms(t_handle_done),
-            ms(t_write_body_done),
-            ms(t_body_finish_done),
-            ms(t_pollable_block_done),
-            ms(t_get_response_done),
-            ms(t_read_body_done),
+            "{}",
+            http_trace_timing_line(
+                &trace_method,
+                TraceUri::new(&trace_uri),
+                response.status,
+                body_len,
+                response.body.len(),
+                [
+                    ms(t_setup_done),
+                    ms(t_handle_done),
+                    ms(t_write_body_done),
+                    ms(t_body_finish_done),
+                    ms(t_pollable_block_done),
+                    ms(t_get_response_done),
+                    ms(t_read_body_done),
+                ],
+            )
         );
     }
 
@@ -792,6 +841,94 @@ mod tests {
     use wasi::http::types::{DnsErrorPayload, FieldSizePayload, TlsAlertReceivedPayload};
 
     use super::*;
+
+    const HTTP_TRACE_SECRET_URI: &str = "https://user:PASSSECRET@bucket.s3.amazonaws.com/key?X-Amz-Credential=AKIDSECRET%2F...&X-Amz-Signature=SIGSECRET&X-Amz-Security-Token=TOKSECRET#FRAGSECRET";
+    const HTTP_TRACE_SAFE_URI: &str = "https://bucket.s3.amazonaws.com/key?X-Amz-Credential=<redacted>&X-Amz-Signature=<redacted>&X-Amz-Security-Token=<redacted>";
+
+    fn assert_http_trace_has_no_secrets(line: &str) {
+        for secret in [
+            "AKIDSECRET",
+            "deadbeefsig",
+            "SESSIONTOKENSECRET",
+            "COOKIESECRET",
+            "PROXYSECRET",
+            "ARBITRARYSECRET",
+            "PASSSECRET",
+            "SIGSECRET",
+            "TOKSECRET",
+            "FRAGSECRET",
+        ] {
+            assert!(!line.contains(secret), "trace leaked {secret}: {line}");
+        }
+    }
+
+    #[test]
+    fn http_trace_headers_line_redacts_every_unlisted_header() {
+        let headers = [
+            (
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDSECRET/...,Signature=deadbeefsig",
+            ),
+            ("x-amz-security-token", "SESSIONTOKENSECRET"),
+            ("cookie", "c=COOKIESECRET"),
+            ("proxy-authorization", "Basic PROXYSECRET"),
+            ("x-github-token-ish", "ARBITRARYSECRET"),
+            ("content-length", "0"),
+            ("host", "bucket.s3.amazonaws.com"),
+            ("x-amz-date", "20261101T120000Z"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()));
+        let line = http_trace_headers_line(
+            "GET",
+            TraceUri::new("https://bucket.s3.amazonaws.com/key"),
+            0,
+            TraceHeaders::new(&headers),
+        );
+
+        assert_http_trace_has_no_secrets(&line);
+        assert_eq!(
+            line,
+            "carina-wasi-http-trace-headers method=GET uri=https://bucket.s3.amazonaws.com/key body_in=0 headers=[authorization=<redacted>; x-amz-security-token=<redacted>; cookie=<redacted>; proxy-authorization=<redacted>; x-github-token-ish=<redacted>; content-length=0; host=bucket.s3.amazonaws.com; x-amz-date=20261101T120000Z]"
+        );
+    }
+
+    #[test]
+    fn http_trace_headers_line_redacts_uri_credentials() {
+        let line = http_trace_headers_line(
+            "GET",
+            TraceUri::new(HTTP_TRACE_SECRET_URI),
+            0,
+            TraceHeaders::new(&[]),
+        );
+
+        assert_http_trace_has_no_secrets(&line);
+        assert_eq!(
+            line,
+            format!(
+                "carina-wasi-http-trace-headers method=GET uri={HTTP_TRACE_SAFE_URI} body_in=0 headers=[]"
+            )
+        );
+    }
+
+    #[test]
+    fn http_trace_timing_line_redacts_uri_credentials_and_keeps_metrics() {
+        let line = http_trace_timing_line(
+            "GET",
+            TraceUri::new(HTTP_TRACE_SECRET_URI),
+            200,
+            0,
+            42,
+            [1, 2, 3, 4, 5, 6, 7],
+        );
+
+        assert_http_trace_has_no_secrets(&line);
+        assert_eq!(
+            line,
+            format!(
+                "carina-wasi-http-trace method=GET uri={HTTP_TRACE_SAFE_URI} status=200 body_in=0 body_out=42 setup_ms=1 handle_ms=2 write_body_ms=3 body_finish_ms=4 pollable_block_ms=5 get_response_ms=6 read_body_ms=7"
+            )
+        );
+    }
 
     #[derive(Debug)]
     struct WrappedTransportFailure(TransportFailure);

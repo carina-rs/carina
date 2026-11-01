@@ -229,9 +229,12 @@ fn main() -> ExitCode {
     };
     if tui {
         if let Err(e) = carina_tui::run(
-            &fp.plan,
+            carina_core::detail_rows::PlanDisplay::unprepared(
+                &fp.plan,
+                &historical_display,
+                fp.references.for_display(),
+            ),
             &fp.schemas,
-            &historical_display,
             Some(&fp.prev_explicit),
             &provider,
         ) {
@@ -269,6 +272,7 @@ fn main() -> ExitCode {
             Some(&fp.prev_explicit),
             None,
             &provider,
+            fp.references.for_display(),
         ) {
             eprintln!("error: {error}");
             return ExitCode::from(1);

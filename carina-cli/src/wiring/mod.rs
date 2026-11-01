@@ -91,7 +91,6 @@ use carina_core::deps::{
 pub use carina_core::differ::DeferredForExpansionChoice;
 use carina_core::differ::{
     CascadeDependents, DeferredCreateTargets, block_deletes_on_prior_consumer_updates,
-    create_plan_with_cascades,
 };
 use carina_core::differ::{
     Orphan, Orphans, PlanPriorStates, into_all_prior_states, lift_prior_state_enum_leaves,
@@ -195,9 +194,122 @@ impl TrustedLocalGrantInputs {
     }
 }
 
+/// Whether this planning invocation needs human-readable attribute rows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RowRequest {
+    Render(carina_core::detail_rows::DetailLevel),
+    None,
+}
+
+/// A successful plan either owns its requested display or has no rows at all.
+/// Diagnostics never inhabit this type.
+#[derive(Debug)]
+pub enum PlannedPlan {
+    Rendered {
+        display: Box<carina_core::detail_rows::PreparedPlanDisplay>,
+        references: carina_core::references::ResolvedReferences,
+    },
+    Unrendered {
+        plan: Plan,
+        references: carina_core::references::ResolvedReferences,
+    },
+}
+
+impl PlannedPlan {
+    pub(crate) fn references(&self) -> &carina_core::references::ResolvedReferences {
+        match self {
+            Self::Rendered { references, .. } | Self::Unrendered { references, .. } => references,
+        }
+    }
+}
+
+impl std::ops::Deref for PlannedPlan {
+    type Target = Plan;
+
+    fn deref(&self) -> &Plan {
+        match self {
+            Self::Rendered { display, .. } => display.plan(),
+            Self::Unrendered { plan, .. } => plan,
+        }
+    }
+}
+
+/// Command planning keeps diagnostics separate from every display-capable plan.
+#[derive(Debug)]
+pub enum PlanOutcome {
+    Planned(PlannedPlan),
+    Diagnostics(DiagnosticPlan),
+}
+
+#[derive(Debug)]
+pub struct DiagnosticPlan {
+    plan: Plan,
+    pub(crate) errors: NonEmptyPlanErrors,
+}
+
+impl std::ops::Deref for DiagnosticPlan {
+    type Target = Plan;
+    fn deref(&self) -> &Plan {
+        &self.plan
+    }
+}
+
+impl std::ops::Deref for PlanOutcome {
+    type Target = Plan;
+
+    fn deref(&self) -> &Plan {
+        match self {
+            Self::Planned(plan) => plan,
+            Self::Diagnostics(plan) => plan,
+        }
+    }
+}
+
+/// Seal the finalized plan according to the command's display request. Error
+/// plans exit through a distinct type before a historical view is constructed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_plan_outcome(
+    plan: Plan,
+    planning: carina_core::references::ResolvedReferences,
+    preparation: &mut carina_core::references::ReferencePreparation,
+    row_request: RowRequest,
+    managed_current: &HashMap<ResourceId, Current>,
+    state_file: Option<&StateFile>,
+    schemas: &SchemaRegistry,
+    explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    provider: &ProviderRouter,
+) -> Result<PlanOutcome, AppError> {
+    if let Ok(errors) = NonEmptyPlanErrors::try_from(plan.errors().to_vec()) {
+        return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
+    }
+    let planned = match row_request {
+        RowRequest::Render(detail) => {
+            let historical = crate::commands::plan::collect_historical_display_attributes(
+                &plan,
+                managed_current,
+                state_file,
+            );
+            let display = preparation
+                .display(
+                    plan, &planning, historical, detail, schemas, explicit, provider,
+                )
+                .await?;
+            PlannedPlan::Rendered {
+                display: Box::new(display.value),
+                references: display.references,
+            }
+        }
+        RowRequest::None => PlannedPlan::Unrendered {
+            plan,
+            references: planning,
+        },
+    };
+    Ok(PlanOutcome::Planned(planned))
+}
+
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
-    pub plan: Plan,
+    pub plan: PlanOutcome,
     pub provider: ProviderRouter,
     /// Evaluated desired resources after the identity-resolution boundary.
     pub sorted_resources: Vec<ResolvedResource>,
@@ -492,6 +604,7 @@ impl<R> ValidationReady<R> {
         self.inner
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn try_map_with_output_preserving_binding_use_resolution<T, O, E>(
         self,
         transform: impl FnOnce(R) -> Result<(T, O), E>,
@@ -504,6 +617,19 @@ impl<R> ValidationReady<R> {
             },
             output,
         ))
+    }
+
+    async fn try_map_async_with_output_preserving_binding_use_resolution<T, O, E, F, Fut>(
+        self,
+        transform: F,
+    ) -> Result<(ValidationReady<T>, O), E>
+    where
+        F: FnOnce(R) -> Fut,
+        Fut: std::future::Future<Output = Result<(T, O), E>>,
+    {
+        let Self { inner, origin } = self;
+        let (inner, output) = transform(inner).await?;
+        Ok((ValidationReady { inner, origin }, output))
     }
 
     async fn try_map_async_preserving_binding_use_resolution<T, E, F, Fut>(
@@ -832,7 +958,7 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)
         }
-        carina_core::validation::ResolveFileError::LeftoverPlaceholders(error) => error.into(),
+        carina_core::validation::ResolveFileError::Expansion(error) => error.into(),
     }
 }
 
@@ -879,7 +1005,7 @@ fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
     let parsed = resolve_file_binding_uses(parsed, base_dir, context)?;
     let unresolved = unresolved
         .into_iter()
-        .map(Resource::into_expanded)
+        .map(|resource| resource.into_expanded(context.schemas()))
         .collect::<Result<_, _>>()?;
     Ok((parsed, unresolved))
 }
@@ -1769,7 +1895,7 @@ impl<E> ValidatedConfig<ExpandedPlanContext<E>> {
 impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
     /// Consume this validated pair through the shared deferred-`for`
     /// expansion transition while retaining its validating provider load.
-    pub(crate) fn expand_deferred_for(
+    pub(crate) async fn expand_deferred_for(
         self,
         prepared: &PreparedDeferredForExpansion,
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1786,15 +1912,18 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
             wiring, resources, ..
         } = self;
         let (resources, expansion) = resources
-            .try_map_with_output_preserving_binding_use_resolution(|resources| {
-                prepared.expand(
-                    resources,
-                    wiring.context(),
-                    remote_bindings,
-                    warning_policy,
-                    provider,
-                )
-            })?;
+            .try_map_async_with_output_preserving_binding_use_resolution(|resources| async {
+                prepared
+                    .expand(
+                        resources,
+                        wiring.context(),
+                        remote_bindings,
+                        warning_policy,
+                        provider,
+                    )
+                    .await
+            })
+            .await?;
         Ok((
             ValidatedConfig {
                 wiring,
@@ -1820,15 +1949,14 @@ impl<E: Clone> ValidatedConfig<CanonicalResourcePair<E>> {
         } = self;
         let (resources, ()) =
             resources.try_map_with_output_preserving_binding_use_resolution(|resources| {
-                prepared
-                    .expand_for_plan(
-                        resources,
-                        wiring.context(),
-                        remote_bindings,
-                        warning_policy,
-                        provider,
-                    )
-                    .map(|expanded| (expanded, ()))
+                futures::executor::block_on(prepared.expand_for_plan(
+                    resources,
+                    wiring.context(),
+                    remote_bindings,
+                    warning_policy,
+                    provider,
+                ))
+                .map(|expanded| (expanded, ()))
             })?;
         Ok(ValidatedConfig {
             wiring,
@@ -4113,6 +4241,7 @@ pub(crate) fn prepare_default_provider_ready_config(
 /// - `kind` is the kind name (`aws`, `awscc`) — what the user writes
 ///   in `provider <kind> {}` and routes to via `directives.provider`.
 ///   Use `ProviderFactory::name()`, not `display_name()`.
+/// - `region = None` omits the region from the rendered line.
 /// - `binding = None` is the kind's default instance and is rendered
 ///   as `instance=default`. Explicit, not omitted: the omission is
 ///   exactly what made the old shape ambiguous.
@@ -4121,14 +4250,17 @@ pub(crate) fn prepare_default_provider_ready_config(
 ///   default's source.
 fn format_provider_using_line(
     kind: &str,
-    region: &str,
+    region: Option<&str>,
     binding: Option<&str>,
     source: Option<&ProviderSource>,
 ) -> String {
     let instance = binding.unwrap_or("default");
+    let region = region
+        .map(|region| format!("region: {region}, "))
+        .unwrap_or_default();
     match source {
-        Some(src) => format!("Using {kind} (region: {region}, instance={instance}, source: {src})"),
-        None => format!("Using {kind} (region: {region}, instance={instance})"),
+        Some(src) => format!("Using {kind} ({region}instance={instance}, source: {src})"),
+        None => format!("Using {kind} ({region}instance={instance})"),
     }
 }
 
@@ -4148,14 +4280,13 @@ async fn instantiate_provider_into_router(
     let binding = provider_config.binding();
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
         let config = prepare_provider_ready_config(factory, provider_config)?;
-        let region = factory.extract_region(config.attributes());
         let displayed_source = provider_config.source().or(inherited_source);
         let provider = factory
             .create_initialized_provider(binding, &config)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         progress_sink.line(
-            format_provider_using_line(factory.name(), &region, binding, displayed_source)
+            format_provider_using_line(factory.name(), config.region(), binding, displayed_source)
                 .cyan(color_mode),
         );
         router.add_normalizer(
@@ -5398,6 +5529,7 @@ struct DeferredForExpansionWitness;
 
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
 pub struct DeferredForExpansion {
+    reference_preparation: carina_core::references::ReferencePreparation,
     /// The augmented, re-sorted resource set: every original resource
     /// plus the materialized loop children, topologically ordered.
     /// Equal in length to the input when no loop resolved.
@@ -5479,7 +5611,7 @@ impl<E> ExpandedCanonicalResources<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn derive_managed_binding_stability<E>(
+pub async fn derive_managed_binding_stability<E>(
     parsed: &ExpandedFile<E>,
     resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
@@ -5490,7 +5622,10 @@ pub fn derive_managed_binding_stability<E>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
     provider: &ProviderRouter,
+    reference_preparation: &mut carina_core::references::ReferencePreparation,
 ) -> Result<HashMap<ResourceId, carina_core::binding_index::ManagedBindingStability>, AppError> {
+    // These inputs already crossed the plan normalization seam. Re-running
+    // provider normalization here can change non-idempotent provider values.
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         schemas,
@@ -5528,14 +5663,17 @@ pub fn derive_managed_binding_stability<E>(
         }
     }
     let resolved = schema_resolved;
-    let mut stability = carina_core::differ::managed_binding_stability(
-        &resolved,
-        &plan_input_current,
-        schemas,
-        saved_attrs,
-        prev_explicit,
-        provider,
-    )?;
+    let mut stability = reference_preparation
+        .stability(
+            &resolved,
+            &plan_input_current,
+            schemas,
+            saved_attrs,
+            prev_explicit,
+            provider,
+        )
+        .await?
+        .value;
     stability.extend(pending_stability);
     Ok(stability)
 }
@@ -5584,6 +5722,7 @@ impl children_settlement::Sealed for ApplyChildrenSettled {}
 /// `C` marker additionally prevents that seam from accepting expanded loop
 /// children before their prior-state transition has completed.
 struct PostExpansionPlanData<E> {
+    reference_preparation: carina_core::references::ReferencePreparation,
     expanded_resources: ExpandedCanonicalResources<E>,
     sorted_resources: Vec<Resource>,
     addressed: AddressedState,
@@ -5885,7 +6024,6 @@ impl PostExpansionMode for ApplyMode {
 pub(crate) struct PostExpansionArtifacts<R> {
     pub expanded_resources: R,
     pub residual_deferred_for: carina_core::parser::ResolvedDeferredForExpressions,
-    pub plan: Plan,
     pub compositions: Vec<LiveComposition>,
     pub data_sources: Vec<DataSource>,
     pub managed_current: HashMap<ResourceId, Current>,
@@ -5900,7 +6038,6 @@ impl<R> PostExpansionArtifacts<R> {
         let Self {
             expanded_resources,
             residual_deferred_for,
-            plan,
             compositions,
             data_sources,
             managed_current,
@@ -5912,7 +6049,6 @@ impl<R> PostExpansionArtifacts<R> {
         PostExpansionArtifacts {
             expanded_resources: map(expanded_resources),
             residual_deferred_for,
-            plan,
             compositions,
             data_sources,
             managed_current,
@@ -5926,6 +6062,7 @@ impl<R> PostExpansionArtifacts<R> {
 
 /// A successfully constructed plan with the resource view selected by `M`.
 pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
+    pub plan: PlannedPlan,
     pub artifacts: PostExpansionArtifacts<R>,
     pub resources: M::Resources,
 }
@@ -5934,20 +6071,25 @@ pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
 /// need to construct their command-specific error context.
 pub(crate) struct PostExpansionDiagnostics<R> {
     artifacts: PostExpansionArtifacts<R>,
+    plan: Plan,
     errors: NonEmptyPlanErrors,
 }
 
 impl<R> PostExpansionDiagnostics<R> {
-    fn new(artifacts: PostExpansionArtifacts<R>, errors: NonEmptyPlanErrors) -> Self {
-        Self { artifacts, errors }
+    fn new(artifacts: PostExpansionArtifacts<R>, plan: Plan, errors: NonEmptyPlanErrors) -> Self {
+        Self {
+            artifacts,
+            plan,
+            errors,
+        }
     }
 
     pub(crate) fn errors(&self) -> &NonEmptyPlanErrors {
         &self.errors
     }
 
-    pub(crate) fn into_artifacts(self) -> PostExpansionArtifacts<R> {
-        self.artifacts
+    pub(crate) fn into_parts(self) -> (PostExpansionArtifacts<R>, Plan) {
+        (self.artifacts, self.plan)
     }
 }
 
@@ -5962,16 +6104,23 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
     fn map_expanded_resources<T>(self, map: impl FnOnce(R) -> T) -> PostExpansionOutcome<M, T> {
         match self {
             Self::Planned(PostExpansionPlan {
+                plan,
                 artifacts,
                 resources,
             }) => PostExpansionOutcome::Planned(PostExpansionPlan {
+                plan,
                 artifacts: artifacts.map_expanded_resources(map),
                 resources,
             }),
             Self::Diagnostics(diagnostics) => {
-                let PostExpansionDiagnostics { artifacts, errors } = diagnostics;
+                let PostExpansionDiagnostics {
+                    artifacts,
+                    plan,
+                    errors,
+                } = diagnostics;
                 PostExpansionOutcome::Diagnostics(PostExpansionDiagnostics::new(
                     artifacts.map_expanded_resources(map),
+                    plan,
                     errors,
                 ))
             }
@@ -5983,6 +6132,7 @@ impl<M: PostExpansionMode, R> PostExpansionOutcome<M, R> {
 /// expansion.
 pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     input: PostExpansionPlanInput<'_, E, impl ChildrenSettledFor<M>>,
+    row_request: RowRequest,
 ) -> Result<PostExpansionOutcome<M, ExpandedCanonicalResources<E>>, AppError> {
     let PostExpansionPlanInput {
         context,
@@ -6003,6 +6153,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     let PostExpansionPlanView { data, children } = expansion;
     children.consume();
     let PostExpansionPlanData {
+        mut reference_preparation,
         expanded_resources,
         sorted_resources,
         mut addressed,
@@ -6031,7 +6182,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         remote_bindings,
         &wait_aliases,
         provider,
-    )?;
+        &mut reference_preparation,
+    )
+    .await?;
     let pre_apply_current = carina_core::resource::into_plan_input_current_map(
         addressed.managed_current.clone(),
         context.schemas(),
@@ -6105,7 +6258,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         let artifacts = PostExpansionArtifacts {
             expanded_resources,
             residual_deferred_for,
-            plan,
             compositions,
             data_sources: data_sources_for_plan,
             managed_current: into_all_prior_states(addressed.orphans, addressed.managed_current),
@@ -6115,7 +6267,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             wait_aliases,
         };
         return Ok(PostExpansionOutcome::Diagnostics(
-            PostExpansionDiagnostics::new(artifacts, errors),
+            PostExpansionDiagnostics::new(artifacts, plan, errors),
         ));
     }
 
@@ -6155,14 +6307,17 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         override_aware_resources.resources().iter().cloned(),
         context.schemas(),
     )?;
-    let managed_stability = carina_core::differ::managed_binding_stability(
-        &stability_resources,
-        &reconciled_input_current,
-        context.schemas(),
-        &addressed.saved_attrs,
-        &addressed.prev_explicit,
-        provider,
-    )?;
+    let managed_stability = reference_preparation
+        .stability(
+            &stability_resources,
+            &reconciled_input_current,
+            context.schemas(),
+            &addressed.saved_attrs,
+            &addressed.prev_explicit,
+            provider,
+        )
+        .await?
+        .value;
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
         RebuildBindingsInputs {
             compositions: &parsed.compositions,
@@ -6201,20 +6356,24 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     );
     let plan_input_desired =
         carina_core::resource::plan_input_desired_resources(&resolved_resources, context.schemas());
-    let plan = create_plan_with_cascades(
-        &plan_input_desired,
-        CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets),
-        &data_sources_for_plan,
-        provider,
-        PlanPriorStates::new(&plan_input_current, &addressed.orphans),
-        &directives_map,
-        context.schemas(),
-        &addressed.saved_attrs,
-        &addressed.prev_explicit,
-        &wait_bindings,
-        &outcome_unknown_import_replacements,
-    )?;
-    let plan = plan.finish(|plan| {
+    let dependents =
+        CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets);
+    let prepared = reference_preparation
+        .plan_with_cascades(
+            &plan_input_desired,
+            &dependents,
+            &data_sources_for_plan,
+            provider,
+            PlanPriorStates::new(&plan_input_current, &addressed.orphans),
+            &directives_map,
+            context.schemas(),
+            &addressed.saved_attrs,
+            &addressed.prev_explicit,
+            &wait_bindings,
+            &outcome_unknown_import_replacements,
+        )
+        .await?;
+    let plan = prepared.value.finish(|plan| {
         add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
         block_deletes_on_prior_consumer_updates(plan, &directives_map);
         override_aware_resources.apply_plan_stability(&plan_input_current, plan, context.schemas());
@@ -6239,6 +6398,37 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         .collect();
     let prev_explicit = addressed.prev_explicit;
     let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
+    let artifacts = PostExpansionArtifacts {
+        expanded_resources,
+        residual_deferred_for,
+        compositions,
+        data_sources: data_sources_for_plan,
+        managed_current,
+        data_source_values,
+        moved_origins,
+        prev_explicit,
+        wait_aliases,
+    };
+    let outcome = prepare_plan_outcome(
+        plan,
+        prepared.references,
+        &mut reference_preparation,
+        row_request,
+        &artifacts.managed_current,
+        state_file.as_ref(),
+        context.schemas(),
+        &artifacts.prev_explicit,
+        provider,
+    )
+    .await?;
+    let plan = match outcome {
+        PlanOutcome::Planned(plan) => plan,
+        PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }) => {
+            return Ok(PostExpansionOutcome::Diagnostics(
+                PostExpansionDiagnostics::new(artifacts, plan, errors),
+            ));
+        }
+    };
     let resources = M::build_resources(PostExpansionResourceInputs {
         override_aware: &override_aware_resources,
         unresolved_override_aware: &unresolved_override_aware_resources,
@@ -6248,18 +6438,8 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     });
 
     Ok(PostExpansionOutcome::Planned(PostExpansionPlan {
-        artifacts: PostExpansionArtifacts {
-            expanded_resources,
-            residual_deferred_for,
-            plan,
-            compositions,
-            data_sources: data_sources_for_plan,
-            managed_current,
-            data_source_values,
-            moved_origins,
-            prev_explicit,
-            wait_aliases,
-        },
+        plan,
+        artifacts,
         resources,
     }))
 }
@@ -6354,6 +6534,7 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
     pub(crate) async fn finish_post_expansion_plan<M: PostExpansionMode>(
         self,
         environment: PostExpansionPlanEnvironment<'_>,
+        row_request: RowRequest,
     ) -> Result<PostExpansionOutcome<M, ValidatedConfig<ExpandedCanonicalResources<E>>>, AppError>
     where
         S: ChildrenSettledFor<M>,
@@ -6366,11 +6547,14 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
             origin,
         } = resources;
         let context = wiring.context();
-        let outcome = build_post_expansion_plan::<M, E>(PostExpansionPlanInput {
-            context,
-            expansion,
-            environment,
-        })
+        let outcome = build_post_expansion_plan::<M, E>(
+            PostExpansionPlanInput {
+                context,
+                expansion,
+                environment,
+            },
+            row_request,
+        )
         .await?;
         Ok(
             outcome.map_expanded_resources(|expanded_resources| ValidatedConfig {
@@ -6389,7 +6573,7 @@ impl PreparedDeferredForExpansion {
     /// Expand against the exact addressed state/metadata view sealed by
     /// one of the prelude's typed address transitions, consuming the canonical
     /// pair into an [`ExpandedCanonicalResources`] witness.
-    pub(crate) fn expand<E: Clone>(
+    pub(crate) async fn expand<E: Clone>(
         &self,
         mut resources: CanonicalResourcePair<E>,
         ctx: &WiringContext,
@@ -6418,14 +6602,15 @@ impl PreparedDeferredForExpansion {
             warning_policy,
             provider,
             ctx,
-        )?;
+        )
+        .await?;
         Ok((ExpandedCanonicalResources { resources }, expansion))
     }
 
     /// Consume the prepared state and canonical pair as one plan-expansion
     /// transition. The returned bundle is the only input accepted by the
     /// shared post-expansion plan builder.
-    pub(crate) fn expand_for_plan<E: Clone>(
+    pub(crate) async fn expand_for_plan<E: Clone>(
         self,
         resources: CanonicalResourcePair<E>,
         ctx: &WiringContext,
@@ -6433,14 +6618,16 @@ impl PreparedDeferredForExpansion {
         warning_policy: DeferredForWarningPolicy,
         provider: &ProviderRouter,
     ) -> Result<PostExpansionPlanView<E, ChildrenPending>, AppError> {
-        let (expanded_resources, expansion) =
-            self.expand(resources, ctx, remote_bindings, warning_policy, provider)?;
+        let (expanded_resources, expansion) = self
+            .expand(resources, ctx, remote_bindings, warning_policy, provider)
+            .await?;
         let PreparedDeferredForExpansionParts {
             addressed,
             data_source_values,
             wait_aliases,
         } = self.into_parts();
         let DeferredForExpansion {
+            reference_preparation,
             sorted_resources,
             residual_deferred_for,
             #[cfg(test)]
@@ -6455,6 +6642,7 @@ impl PreparedDeferredForExpansion {
         } = expansion;
         Ok(PostExpansionPlanView {
             data: PostExpansionPlanData {
+                reference_preparation,
                 expanded_resources,
                 sorted_resources,
                 addressed,
@@ -6475,7 +6663,7 @@ impl PreparedDeferredForExpansion {
 impl PreparedAddressPreservingDeferredForExpansion {
     /// Raw-file expansion is reserved for address-preserving state refresh and
     /// focused tests; this type cannot invoke canonical prefix reconciliation.
-    pub(crate) fn expand_parsed<E: Clone>(
+    pub(crate) async fn expand_parsed<E: Clone>(
         &self,
         parsed: &mut ExpandedFile<E>,
         schemas: &SchemaRegistry,
@@ -6500,6 +6688,7 @@ impl PreparedAddressPreservingDeferredForExpansion {
             provider,
             identity_context,
         )
+        .await
     }
 }
 
@@ -6654,7 +6843,7 @@ impl<E> DeferredExpansionTarget<E> for ExpandedFile<E> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E>>(
+async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E>>(
     target: &mut T,
     sorted_resources: &[Resource],
     managed_current: &HashMap<ResourceId, Current>,
@@ -6670,6 +6859,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     provider: &ProviderRouter,
     identity_context: &WiringContext,
 ) -> Result<DeferredForExpansion, AppError> {
+    let mut reference_preparation = carina_core::references::ReferencePreparation::default();
     let parsed = target.parsed();
     // Common case: no deferred-for at all. Skip the binding projection
     // and the whole-`File` clone entirely (this runs on every plan /
@@ -6680,6 +6870,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         let printed_warnings =
             warning_policy == DeferredForWarningPolicy::Print && parsed.print_warnings();
         return Ok(DeferredForExpansion {
+            reference_preparation,
             sorted_resources: sorted_resources.to_vec(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             #[cfg(test)]
@@ -6709,7 +6900,9 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         remote_bindings,
         wait_aliases,
         provider,
-    )?;
+        &mut reference_preparation,
+    )
+    .await?;
     let plan_input_current = carina_core::resource::into_plan_input_current_map(
         managed_current.clone(),
         schemas,
@@ -6804,6 +6997,7 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
     );
 
     Ok(DeferredForExpansion {
+        reference_preparation,
         sorted_resources: resorted,
         residual_deferred_for,
         #[cfg(test)]
@@ -6877,14 +7071,14 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
         data_source_values: data_source_values.clone(),
     });
     let mut expanded = parsed.clone();
-    prepared.expand_parsed(
+    futures::executor::block_on(prepared.expand_parsed(
         &mut expanded,
         &comparison_schemas,
         remote_bindings,
         DeferredForWarningPolicy::Print,
         &comparison_provider,
         &identity_context,
-    )
+    ))
 }
 
 /// Result of the deferred-for expansion, materialised-child read,
@@ -6983,14 +7177,17 @@ async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormaliz
     parsed: &mut ExpandedFile<E>,
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P, PreparedAddressPreservingDeferredForExpansion>,
 ) -> Result<ExpandedRefreshState, AppError> {
-    let expansion = inputs.expansion.expand_parsed(
-        parsed,
-        inputs.schemas,
-        inputs.remote_bindings,
-        inputs.warning_policy,
-        inputs.comparison_provider,
-        inputs.identity_context,
-    )?;
+    let expansion = inputs
+        .expansion
+        .expand_parsed(
+            parsed,
+            inputs.schemas,
+            inputs.remote_bindings,
+            inputs.warning_policy,
+            inputs.comparison_provider,
+            inputs.identity_context,
+        )
+        .await?;
     finish_expanded_refresh_state(expansion, inputs).await
 }
 
@@ -7027,13 +7224,15 @@ pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
         let schemas = identity_context.schemas();
         canonical_resources
             .try_map_async_preserving_binding_use_resolution(|canonical_resources| async move {
-                let pending = expansion.expand_for_plan(
-                    canonical_resources,
-                    identity_context,
-                    remote_bindings,
-                    warning_policy,
-                    comparison_provider,
-                )?;
+                let pending = expansion
+                    .expand_for_plan(
+                        canonical_resources,
+                        identity_context,
+                        remote_bindings,
+                        warning_policy,
+                        comparison_provider,
+                    )
+                    .await?;
                 let settled = if let Some(state_file) = state_file.as_ref() {
                     pending
                         .settle_children_live(LiveExpandedChildrenInputs {
@@ -7232,6 +7431,7 @@ async fn finish_expanded_refresh_state<
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P, E>,
 ) -> Result<ExpandedRefreshState, AppError> {
     let DeferredForExpansion {
+        reference_preparation: _,
         sorted_resources,
         residual_deferred_for: _,
         #[cfg(test)]
@@ -7294,6 +7494,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
+    row_request: RowRequest,
 ) -> Result<ValidatedConfig<ExpandedPlanContext<E>>, AppError> {
     let ValidatedConfig {
         wiring,
@@ -7314,6 +7515,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                     remote_bindings,
                     state_block_claims,
                     resolved_state_block_targets,
+                    row_request,
                 )
                 .await
             })
@@ -7337,6 +7539,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
+    row_request: RowRequest,
 ) -> Result<ExpandedPlanContext<E>, AppError> {
     let color_mode = ctx.runtime().color_mode();
     let parsed = canonical_resources.parsed();
@@ -7519,13 +7722,15 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // Expansion yields a pending child-state witness. The plan seam accepts
     // only the settled witness produced by one of the three exhaustive prior-
     // state transitions below.
-    let pending_expansion = prepared_expansion.expand_for_plan(
-        canonical_resources,
-        ctx,
-        remote_bindings,
-        DeferredForWarningPolicy::Print,
-        &provider,
-    )?;
+    let pending_expansion = prepared_expansion
+        .expand_for_plan(
+            canonical_resources,
+            ctx,
+            remote_bindings,
+            DeferredForWarningPolicy::Print,
+            &provider,
+        )
+        .await?;
     let child_saved_dep_bindings = HashMap::new();
     let plan_expansion = match (refresh_phase.as_ref(), state_file.as_ref()) {
         (Some(refresh_phase), Some(state_file)) => pending_expansion
@@ -7553,35 +7758,53 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     };
 
     drop(refresh_phase);
-    let outcome = build_post_expansion_plan::<PlanMode, E>(PostExpansionPlanInput {
-        context: ctx,
-        expansion: plan_expansion,
-        environment: PostExpansionPlanEnvironment {
-            data_sources: &data_sources,
-            provider: &provider,
-            normalizer: &provider,
-            provider_configs: raw_provider_configs,
-            remote_bindings,
-            state_file,
-            state_block_claims,
-            resolved_state_block_targets,
-            preparation_errors: refresh_module_constraint_errors,
+    let outcome = build_post_expansion_plan::<PlanMode, E>(
+        PostExpansionPlanInput {
+            context: ctx,
+            expansion: plan_expansion,
+            environment: PostExpansionPlanEnvironment {
+                data_sources: &data_sources,
+                provider: &provider,
+                normalizer: &provider,
+                provider_configs: raw_provider_configs,
+                remote_bindings,
+                state_file,
+                state_block_claims,
+                resolved_state_block_targets,
+                preparation_errors: refresh_module_constraint_errors,
+            },
         },
-    })
+        row_request,
+    )
     .await?;
-    let (artifacts, sorted_resources, unresolved_resources) = match outcome {
+    let (artifacts, plan, sorted_resources, unresolved_resources) = match outcome {
         PostExpansionOutcome::Planned(PostExpansionPlan {
+            plan,
             artifacts,
             resources,
-        }) => (artifacts, resources.resolved, resources.unresolved),
+        }) => (
+            artifacts,
+            PlanOutcome::Planned(plan),
+            resources.resolved,
+            resources.unresolved,
+        ),
         PostExpansionOutcome::Diagnostics(diagnostics) => {
-            (diagnostics.into_artifacts(), Vec::new(), Vec::new())
+            let PostExpansionDiagnostics {
+                artifacts,
+                plan,
+                errors,
+            } = diagnostics;
+            (
+                artifacts,
+                PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }),
+                Vec::new(),
+                Vec::new(),
+            )
         }
     };
     let PostExpansionArtifacts {
         expanded_resources,
         residual_deferred_for,
-        plan,
         compositions,
         data_sources,
         managed_current,

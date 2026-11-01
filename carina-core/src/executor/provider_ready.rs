@@ -33,6 +33,7 @@ use crate::resource::{
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
+    ValidatedConfigSchema,
 };
 use crate::value::SerializationError;
 
@@ -134,12 +135,18 @@ impl Deref for CanonicalProviderConfigAttributes {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderReadyConfig {
     attributes: CanonicalProviderConfigAttributes,
+    region: Option<String>,
 }
 
 impl ProviderReadyConfig {
     /// Borrow the checked provider configuration attributes.
     pub fn attributes(&self) -> &IndexMap<String, Value> {
         self.attributes.attributes()
+    }
+
+    /// Borrow the resolved region when the provider config schema declares it.
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
     }
 }
 
@@ -554,11 +561,11 @@ pub fn validate_and_canonicalize_provider_config(
     factory: &dyn ProviderFactory,
     provider_name: &str,
     attributes: &IndexMap<String, Value>,
+    config_schema: &ValidatedConfigSchema,
 ) -> Result<CanonicalProviderConfigAttributes, ProviderConfigPreparationError> {
-    let config_schema = factory.provider_config_attribute_types();
     let canonical =
-        canonicalize_provider_config_attributes(provider_name, attributes, &config_schema)?;
-    validate_provider_config_attributes(factory, provider_name, &canonical, &config_schema)?;
+        canonicalize_provider_config_attributes(provider_name, attributes, config_schema)?;
+    validate_provider_config_attributes(factory, provider_name, &canonical, config_schema)?;
 
     let serializable = canonical
         .into_iter()
@@ -619,11 +626,20 @@ pub fn prepare_provider_ready_config(
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
     let provider_name = config.name();
     let attributes = config.attributes();
-    let canonical_attributes =
-        validate_and_canonicalize_provider_config(factory, provider_name, attributes)?;
+    let config_schema = factory.provider_config_attribute_types();
+    let canonical_attributes = validate_and_canonicalize_provider_config(
+        factory,
+        provider_name,
+        attributes,
+        &config_schema,
+    )?;
+    let region = config_schema
+        .rootless_type("region")
+        .and_then(|_| crate::utils::region_from_attrs(canonical_attributes.attributes()));
 
     Ok(ProviderReadyConfig {
         attributes: canonical_attributes,
+        region,
     })
 }
 
@@ -1126,10 +1142,6 @@ mod provider_config_tests {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "ap-northeast-1".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -1222,10 +1234,6 @@ mod provider_config_tests {
                 }
                 Some(_) | None => Ok(()),
             }
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -1961,10 +1969,6 @@ mod provider_config_tests {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -1998,7 +2002,8 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::String("valid".into())),
         )]);
 
-        validate_and_canonicalize_provider_config(&factory, "owner", &attributes)
+        let config_schema = factory.provider_config_attribute_types();
+        validate_and_canonicalize_provider_config(&factory, "owner", &attributes, &config_schema)
             .expect("the owning factory must validate its decoded refined config type");
 
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
@@ -2014,8 +2019,14 @@ mod provider_config_tests {
             Value::Concrete(ConcreteValue::String("valid".into())),
         )]);
 
-        validate_and_canonicalize_provider_config(&factory, "display-alias", &attributes)
-            .expect("the already-selected factory is the provider-config routing authority");
+        let config_schema = factory.provider_config_attribute_types();
+        validate_and_canonicalize_provider_config(
+            &factory,
+            "display-alias",
+            &attributes,
+            &config_schema,
+        )
+        .expect("the already-selected factory is the provider-config routing authority");
 
         assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
     }
@@ -2080,10 +2091,6 @@ mod provider_config_tests {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -2139,6 +2146,130 @@ mod provider_config_tests {
     }
 
     #[test]
+    fn prepare_provider_ready_config_has_no_region_without_schema_attribute() {
+        let factory = RefinedConfigFactory {
+            validate_calls: AtomicUsize::new(0),
+        };
+        let attributes = IndexMap::from([(
+            "endpoint".to_string(),
+            Value::Concrete(ConcreteValue::String("valid".into())),
+        )]);
+        let resolved = resolved_configs(attributes);
+
+        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect("provider config without a region schema must be prepared");
+
+        assert_eq!(ready.region(), None);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_ignores_undeclared_region() {
+        let factory = RefinedConfigFactory {
+            validate_calls: AtomicUsize::new(0),
+        };
+        let resolved = resolved_configs(config(Value::Concrete(ConcreteValue::String(
+            "us-west-2".into(),
+        ))));
+
+        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect("undeclared attributes must not imply a region schema");
+
+        assert_eq!(ready.region(), None);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_region_preserves_literal_string() {
+        struct StringRegionConfigFactory;
+
+        impl ProviderFactory for StringRegionConfigFactory {
+            fn name(&self) -> &str {
+                "test"
+            }
+
+            fn display_name(&self) -> &str {
+                "string region config test provider"
+            }
+
+            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+                ValidatedConfigSchema::validate(BTreeMap::from([(
+                    "region".to_string(),
+                    PatternAttributeType::string(),
+                )]))
+                .expect("test provider config schema must be valid")
+            }
+
+            fn validate_config(
+                &self,
+                _attributes: &CanonicalProviderConfigAttributes,
+            ) -> ProviderResult<()> {
+                Ok(())
+            }
+
+            fn create_provider(
+                &self,
+                _binding: Option<&str>,
+                _config: &ProviderReadyConfig,
+                _initialize_outcome: crate::provider::InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>>
+            {
+                unreachable!("config preparation tests do not create providers")
+            }
+
+            fn schema_witness(&self) -> crate::schema::ValidatedProviderSchemaWitness {
+                crate::schema::ValidatedProviderSchemaWitness::new(
+                    self.schemas(),
+                    self.provider_config_attribute_types(),
+                    Default::default(),
+                )
+                .unwrap()
+            }
+
+            fn schemas(&self) -> Vec<crate::schema::ValidatedResourceSchema> {
+                Vec::new()
+            }
+        }
+
+        let factory = StringRegionConfigFactory;
+        for literal in ["us-west-2", "test.Region.us_west_2"] {
+            let resolved = resolved_configs(config(Value::Concrete(ConcreteValue::String(
+                literal.into(),
+            ))));
+
+            let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+                .expect("literal region must be prepared");
+
+            assert_eq!(ready.region(), Some(literal));
+        }
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_region_uses_canonical_enum_api_value() {
+        let resolved = resolved_configs(config(Value::Concrete(ConcreteValue::CanonicalEnum(
+            crate::resource::CanonicalEnumValue::new_for_test(
+                crate::schema::enum_identity("Region", Some("test")),
+                "ap-northeast-1",
+            ),
+        ))));
+
+        let ready =
+            prepare_provider_ready_config(&EnumConfigFactory, resolved.iter().next().unwrap())
+                .expect("canonical region enum must be prepared");
+
+        assert_eq!(ready.region(), Some("ap-northeast-1"));
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_has_no_region_when_attribute_is_omitted() {
+        let factory = ConfigFactory::successful();
+        let resolved = resolved_configs(IndexMap::new());
+
+        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
+            .expect("provider config with an omitted region must be prepared");
+
+        assert_eq!(ready.region(), None);
+    }
+
+    #[test]
     fn parser_provider_config_skips_unexpandable_placeholder_without_panicking() {
         let factory = ConfigFactory::successful();
         let attributes = IndexMap::from([(
@@ -2179,6 +2310,7 @@ mod provider_config_tests {
             Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
                 if value.api_value() == "ap-northeast-1"
         ));
+        assert_eq!(ready.region(), Some("ap-northeast-1"));
     }
 
     #[test]

@@ -5694,6 +5694,16 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
             Value::Concrete(ConcreteValue::StringList(items)),
             crate::schema::FitKind::StringList(fits),
         ) => {
+            // Reference elements require the recursive typed comparison path;
+            // StringList remains the canonical union-of-plain-strings form.
+            // This changes only the in-memory list representation, never raw
+            // string values or their JSON payload/state representation.
+            let reference_elements = fits.iter().any(|fit| {
+                matches!(
+                    fit.attr.as_attr().shape_with_defs(defs),
+                    crate::schema::Shape::Reference { .. }
+                )
+            });
             debug_assert_eq!(items.len(), fits.len());
             let canonicalized = items
                 .into_iter()
@@ -5712,6 +5722,9 @@ fn canonicalize_with_fit<H: PlaceholderKind, B: BindingAddress, P: Canonicalizat
                     result.map_err(|error| error_policy.at_list_index(index, error))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if reference_elements {
+                return Ok(Value::Concrete(ConcreteValue::List(canonicalized)));
+            }
             let strings = canonicalized
                 .iter()
                 .map(|item| match item {
@@ -5866,7 +5879,8 @@ fn type_contains_enum(
                 .iter()
                 .flatten()
                 .any(|member| walk(member.as_attr(), defs, visited)),
-            AttrTypeKind::String { .. }
+            AttrTypeKind::Reference { .. }
+            | AttrTypeKind::String { .. }
             | AttrTypeKind::ResourceHandle { .. }
             | AttrTypeKind::StringLiteralSet { .. }
             | AttrTypeKind::Int { .. }
@@ -6830,7 +6844,31 @@ mod tests {
         }
     }
 
-    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {}
+    impl crate::resource::PlaceholderKind for DisplayMutablePlaceholder {
+        type DirectiveBool<B: crate::resource::BindingAddress> = bool;
+        type DirectivePreventDestroy<B: crate::resource::BindingAddress> =
+            crate::resource::PreventDestroy;
+        fn rebind_directives<
+            B: crate::resource::BindingAddress,
+            C: crate::resource::BindingAddress,
+        >(
+            directives: crate::resource::Directives<B, Self>,
+            resolve: &mut impl FnMut(B) -> C,
+        ) -> crate::resource::Directives<C, Self> {
+            crate::resource::directive_expr::rebind_resolved_directives(directives, resolve)
+        }
+
+        fn map_absolute_directive_values(
+            _directives: &mut crate::resource::Directives<
+                crate::resource::AbsoluteBindingAddress,
+                Self,
+            >,
+            _map: &mut impl FnMut(
+                &crate::resource::AbsoluteBindingAddress,
+            ) -> crate::resource::AbsoluteBindingAddress,
+        ) {
+        }
+    }
 
     #[test]
     fn placeholder_secret_material_uses_structured_serde_not_display_wording() {
@@ -13674,7 +13712,7 @@ mod tests {
                     .unwrap()
                     .as_schema(),
             ),
-            &crate::differ::exact_comparison_context_for_tests(),
+            &crate::differ::exact_comparison_schema_for_tests(),
         );
         assert!(
             matches!(result, Diff::NoChange(_)),

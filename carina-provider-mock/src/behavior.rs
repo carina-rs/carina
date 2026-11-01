@@ -120,6 +120,9 @@ pub struct ServerListMutation {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MockBehavior {
+    /// Supplied JSON is decoded when references are resolved, preserving lazy errors.
+    pub reference_table: Option<String>,
+    pub reference_echo_alias: bool,
     pub create_mode: CreateMode,
     pub resume_mode: ResumeMode,
     pub create_sent: SentAttributes,
@@ -137,6 +140,15 @@ pub struct MockBehavior {
     pub update_result_identifier: Option<String>,
     pub server_list_mutation: Option<ServerListMutation>,
     pub observations: MockObservations,
+}
+
+impl MockBehavior {
+    pub fn with_reference_table(mut self, table: crate::references::ReferenceTable) -> Self {
+        self.reference_table = Some(
+            serde_json::to_string(&table).expect("mock reference table must serialize as JSON"),
+        );
+        self
+    }
 }
 
 pub struct DecodedMockControls {
@@ -174,6 +186,8 @@ pub fn decode_controls(values: &BTreeMap<String, OsString>) -> DecodedMockContro
     DecodedMockControls {
         state_file: path("STATE_FILE"),
         behavior: MockBehavior {
+            reference_table: text("REFERENCE_TABLE"),
+            reference_echo_alias: text("REFERENCE_ECHO_ALIAS").as_deref() == Some("true"),
             create_mode: match text("CREATE_MODE").as_deref() {
                 Some("untracked") => CreateMode::Untracked,
                 Some("created") => CreateMode::Created,
@@ -249,6 +263,11 @@ mod tests {
     #[test]
     fn decodes_all_mock_controls_from_supplied_values() {
         let raw = [
+            (
+                "REFERENCE_TABLE",
+                "{\"alias/example\":{\"Ok\":{\"Resolved\":\"key/example\"}}}",
+            ),
+            ("REFERENCE_ECHO_ALIAS", "true"),
             ("STATE_FILE", "state.json"),
             ("CREATE_MODE", "created"),
             ("RESUME_MODE", "resend"),
@@ -295,6 +314,10 @@ mod tests {
         assert_eq!(
             behavior,
             MockBehavior {
+                reference_table: Some(
+                    "{\"alias/example\":{\"Ok\":{\"Resolved\":\"key/example\"}}}".to_owned()
+                ),
+                reference_echo_alias: true,
                 create_mode: CreateMode::Created,
                 resume_mode: ResumeMode::Resend,
                 create_sent: SentAttributes::Only(

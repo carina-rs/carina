@@ -845,6 +845,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
+    for error in parsed.directive_resolution_errors(placeholder_boundary, ctx.schemas()) {
+        errors.push(AppError::from(carina_core::resource::ExpansionError::from(
+            error,
+        )));
+    }
     if let Err(leftovers) = parsed.validate_expansion_boundary(placeholder_boundary) {
         errors.extend(leftovers.into_errors().into_iter().map(AppError::from));
         return Err(non_empty_validation_failure(errors));
@@ -1650,10 +1655,6 @@ child { values = [source] }
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "ap-northeast-1".to_string()
         }
 
         fn create_provider(

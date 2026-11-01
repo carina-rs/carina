@@ -177,7 +177,7 @@ fn anonymous_deferred_collision_fixture() -> (
         std::path::Path::new("."),
     )
     .expect("deferred fixture crosses the module-resolution seam")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("deferred-loop fixture contains no parser placeholders");
     let template = parsed.deferred_for_expressions()[0].clone();
     let mut bindings = ResolvedBindings::default();
@@ -1261,9 +1261,6 @@ impl ProviderFactory for AliasFactory {
         _attributes: &crate::provider::CanonicalProviderConfigAttributes,
     ) -> crate::provider::ProviderResult<()> {
         Ok(())
-    }
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        String::new()
     }
     fn create_provider(
         &self,
@@ -7137,7 +7134,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         std::path::Path::new("."),
     )
     .expect("reference alias fixture crosses the module-resolution seam")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("reference alias fixture contains no parser placeholders");
 
     let role = parsed
@@ -8535,6 +8532,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         &crate::provider::RawSavedAttrs::default().lift(&schemas),
         &HashMap::new(),
         &[],
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
 
@@ -9281,6 +9279,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &HashMap::new(),
         &[],
         &std::collections::HashSet::new(),
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
     .finish(|_| {});

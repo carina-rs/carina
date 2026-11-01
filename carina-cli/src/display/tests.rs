@@ -52,6 +52,9 @@ fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
         prev_explicit,
         expansion_trace,
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("display fixture must have an initialized provider route")
 }
@@ -126,6 +129,9 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
         None,
         None,
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("display fixture must have an initialized provider route");
 }
@@ -163,6 +169,9 @@ fn test_print_plan_with_internal_dependency_does_not_panic() {
         None,
         None,
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("display fixture must have an initialized provider route");
 }
@@ -714,6 +723,9 @@ fn test_print_plan_compact_does_not_panic() {
         None,
         None,
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("display fixture must have an initialized provider route");
 }
@@ -757,6 +769,9 @@ fn test_print_plan_compact_with_anonymous_resources() {
         None,
         None,
         &provider,
+        carina_core::detail_rows::DetailComparisons::Planning(
+            &carina_core::references::prepare_empty_for_tests(),
+        ),
     )
     .expect("display fixture must have an initialized provider route");
 }
@@ -951,7 +966,7 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
         std::path::Path::new("."),
     )
     .expect("root bindings resolve")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("loop slots finalize");
     let deferred = parsed
         .deferred_for_expressions()
@@ -2262,12 +2277,15 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
             ))
         ),
         printed: HashSet::new(),
-        plan: &plan,
+        display: PlanDisplay::unprepared(
+            &plan,
+            &historical_display,
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        ),
         dependents: HashMap::new(),
         replacement_create_info: HashMap::new(),
         replacement_delete_indices: HashSet::new(),
         detail: DetailLevel::None,
-        historical_display: &historical_display,
         schemas: None,
         moved_origins: &moved_origins,
         prev_explicit: None,
@@ -2343,12 +2361,15 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
-        plan: &plan,
+        display: PlanDisplay::unprepared(
+            &plan,
+            &historical_display,
+            carina_core::detail_rows::DetailComparisons::RecordedEffects,
+        ),
         dependents: HashMap::from([(0, vec![1])]),
         replacement_create_info: HashMap::new(),
         replacement_delete_indices: HashSet::new(),
         detail: DetailLevel::Full,
-        historical_display: &historical_display,
         schemas: None,
         moved_origins: &moved_origins,
         prev_explicit: None,

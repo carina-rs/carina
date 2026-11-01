@@ -17,6 +17,7 @@ pub mod builtins;
 pub mod config_loader;
 pub mod data_source_value;
 pub mod deps;
+pub mod desired;
 pub mod detail_rows;
 pub mod diff_helpers;
 pub mod differ;
@@ -41,6 +42,7 @@ pub mod plan_tree;
 pub mod protocol_convert;
 pub mod provider;
 pub mod provider_source;
+pub mod references;
 pub mod resolver;
 #[cfg(test)]
 mod resolver_split_tests;

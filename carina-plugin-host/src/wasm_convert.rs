@@ -274,14 +274,11 @@ impl std::error::Error for WasmAppliedStateDecodeError {}
 /// Returns `Err(SerializationError)` for an unresolved `EnumIdentifier` and
 /// for `Value::Deferred(DeferredValue::Unknown)`,
 /// `Value::Deferred(DeferredValue::ResourceRef)`, `Value::Deferred(DeferredValue::Interpolation)`, and
-/// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. The scoped transport wrapper in
-/// `WasmProviderNormalizer::normalize_desired` strips ref/Unknown-bearing
-/// attributes before conversion, reports their top-level names through the
-/// WIT `desired-resource.deferred` field, and restores their values after the
-/// guest call. Reaching any of these arms is therefore a producer-side bug —
-/// the diagnostic identifies which variant leaked. See RFC #2371 stage 2
-/// (#2378) for `Unknown` and #2387 for `ResourceRef` / `Interpolation` /
-/// `FunctionCall`.
+/// `Value::Deferred(DeferredValue::FunctionCall)` / `Unavailable`. Desired
+/// normalization uses a separate structural `desired-value` codec,
+/// projecting deferred leaves to opaque slots before the guest call. These
+/// ordinary-value encoders are used by CRUD/configuration and do not interpret
+/// normalization markers.
 ///
 /// `Value::Deferred(DeferredValue::Secret(inner))` is encoded as the `secret-val` WIT variant
 /// (#2390): the inner is JSON-encoded the same way `list-val` / `map-val`
@@ -1845,6 +1842,70 @@ pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProvide
     CoreProviderError::from_wire(wit_to_wire_provider_error(err))
 }
 
+pub(crate) fn decode_reference_results(
+    results: Vec<Result<wit::ReferenceOutcome, wit::ReferenceError>>,
+) -> Vec<Result<carina_core::references::ReferenceOutcome, carina_core::references::ReferenceError>>
+{
+    use carina_core::references::{ReferenceError, ReferenceOutcome};
+    // Core preparation validates the positional contract for every provider.
+    results
+        .into_iter()
+        .map(|result| match result {
+            Ok(wit::ReferenceOutcome::Resolved(value)) => {
+                ReferenceOutcome::from_guest(proto::ReferenceOutcome::Resolved(value))
+            }
+            Ok(wit::ReferenceOutcome::NotFound(error)) => Ok(ReferenceOutcome::NotFound(
+                wit_to_core_provider_error(error),
+            )),
+            Err(wit::ReferenceError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
+                wit_to_core_provider_error(error).into(),
+            )),
+            Err(wit::ReferenceError::Transient(error)) => Err(ReferenceError::Transient(
+                wit_to_core_provider_error(error).into(),
+            )),
+            Err(wit::ReferenceError::InvalidReference(error)) => Err(
+                ReferenceError::InvalidReference(wit_to_core_provider_error(error).into()),
+            ),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    use carina_core::references::{ReferenceError, ReferenceOutcome};
+
+    #[test]
+    fn reference_decode_preserves_positional_results_for_core_validation() {
+        for actual in [0, 1, 3] {
+            let mut results = Vec::with_capacity(actual);
+            for _ in 0..actual {
+                results.push(Ok(wit::ReferenceOutcome::Resolved("key/one".into())));
+            }
+            assert_eq!(decode_reference_results(results).len(), actual);
+        }
+    }
+
+    #[test]
+    fn reference_success_is_nonempty_and_format_is_guest_owned() {
+        let results = decode_reference_results(vec![
+            Ok(wit::ReferenceOutcome::Resolved(String::new())),
+            Ok(wit::ReferenceOutcome::Resolved(
+                "generic-provider-key".into(),
+            )),
+        ]);
+        let mut results = results.into_iter();
+        assert!(matches!(
+            results.next().unwrap(),
+            Err(ReferenceError::InvalidReference(_))
+        ));
+        assert!(matches!(
+            results.next().unwrap(),
+            Ok(ReferenceOutcome::Resolved(_))
+        ));
+    }
+}
+
 /// Decode a guest initialization error and attach its boundary phase when the
 /// guest did not provide a more specific operation.
 ///
@@ -2677,18 +2738,35 @@ mod tests {
     }
 
     #[test]
-    fn host_provider_schema_decode_retains_reference_forms() {
+    fn host_provider_schema_decode_retains_reference_forms_and_unique_reference_lists() {
         use carina_core::schema::{
-            ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
-            ValidatedProviderSchemaWitness,
+            ListElements, ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity,
+            ValidatedConfigSchema, ValidatedProviderSchemaWitness,
         };
 
         let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
+        let reference_identity = TypeIdentity::new(Some("test"), ["Widget"], "Reference");
         let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
                 PatternAttributeSchema::optional(
                     "name",
                     PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
+                )
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "keys",
+                    PatternAttributeType::refined_list(
+                        PatternAttributeType::reference(
+                            reference_identity.clone(),
+                            Some("^alias/[a-z]+$".into()),
+                            Some((Some(8), Some(12))),
+                        ),
+                        false,
+                        Some((Some(1), Some(3))),
+                        ListElements::Unique,
+                    ),
                 )
                 .build(),
             )
@@ -2703,13 +2781,25 @@ mod tests {
         let witness = ValidatedProviderSchemaWitness::new(
             vec![schema],
             ValidatedConfigSchema::default(),
-            ReferenceForms::from([(identity.clone(), form.clone())]),
+            ReferenceForms::from([
+                (identity.clone(), form.clone()),
+                (reference_identity.clone(), form.clone()),
+            ]),
         )
         .unwrap();
         let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
 
         let decoded = json_to_provider_schema(&json, ValidatedConfigSchema::default()).unwrap();
         assert_eq!(decoded.reference_forms().get(&identity), Some(&form));
+        assert_eq!(
+            decoded.reference_forms().get(&reference_identity),
+            Some(&form)
+        );
+        let reencoded = carina_plugin_sdk::provider_schema_to_json(&decoded).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&reencoded).unwrap(),
+        );
     }
 
     #[test]
@@ -4699,6 +4789,77 @@ mod tests {
         assert_eq!(id.provider_instance, None);
     }
 
+    #[test]
+    fn create_and_update_wire_values_keep_plaintext_secrets() {
+        let secret = |text: &str| {
+            CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+                ConcreteValue::String(text.to_string().into()),
+            ))))
+        };
+        let top = secret("top-plaintext");
+        let nested = CoreValue::Concrete(ConcreteValue::Map(
+            [(
+                "items".to_string(),
+                CoreValue::Concrete(ConcreteValue::List(vec![secret("nested-plaintext")])),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        let resource = CoreResource::new("test", "secret-boundaries")
+            .with_attribute("top", top.clone())
+            .with_attribute("nested", nested.clone());
+        // These are the value encoders called by the create/update request encoders.
+        let create = core_to_wit_resource(&resource).unwrap();
+        let update = core_to_wit_update_patch(&CoreUpdatePatch {
+            ops: vec![
+                CorePatchOp::Add {
+                    key: "top".into(),
+                    value: top.clone(),
+                },
+                CorePatchOp::Replace {
+                    key: "nested".into(),
+                    value: nested,
+                },
+                CorePatchOp::Reassert {
+                    key: "top".into(),
+                    value: top,
+                },
+            ],
+        })
+        .unwrap();
+        let update_values: Vec<_> = update
+            .ops
+            .iter()
+            .map(|op| match op {
+                wit::PatchOp::Add(value)
+                | wit::PatchOp::Replace(value)
+                | wit::PatchOp::Reassert(value) => (value.key.clone(), value.value.clone()),
+                wit::PatchOp::Remove(_) => panic!("the secret patch contains only values"),
+            })
+            .collect();
+        assert_eq!(create.attributes.len(), 2);
+        assert_eq!(update_values.len(), 3);
+        for attributes in [&create.attributes, &update_values] {
+            for (name, value) in attributes {
+                match (name.as_str(), value) {
+                    ("top", wit::Value::SecretVal(json)) => {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                            serde_json::json!("top-plaintext")
+                        );
+                    }
+                    ("nested", wit::Value::MapVal(json)) => {
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                            serde_json::json!({"items": ["nested-plaintext"]})
+                        );
+                    }
+                    _ => panic!("CRUD must preserve real secret wire values"),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
         use carina_core::resource::Value as CV;
@@ -4818,22 +4979,27 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v17_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 17);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 17);
+    fn test_protocol_version_range_accepts_only_the_current_version() {
+        assert_eq!(
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION,
+            carina_provider_protocol::PROTOCOL_VERSION
+        );
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_pre_v17_provider() {
-        for version in [13, 14, 15, 16] {
+    fn test_check_protocol_version_rejects_older_providers() {
+        for version in 13..carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION {
             let error = check_protocol_version(
             &format!(r#"{{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":{version}}}"#),
         )
-        .expect_err("a v17 host must reject an older provider before schema decoding");
+        .expect_err("the host must reject an older provider before schema decoding");
 
             assert!(error.contains("provider 'old'"));
             assert!(error.contains(&format!("protocol version {version}")));
-            assert!(error.contains("requires at least version 17"));
+            assert!(error.contains(&format!(
+                "requires at least version {}",
+                carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+            )));
         }
     }
 

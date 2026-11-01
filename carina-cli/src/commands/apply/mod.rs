@@ -246,7 +246,7 @@ async fn create_checked_bootstrap_resource(
     let resolved = request.resource().as_inner().clone();
     let resolved_comparison = comparison_provider.comparison_for(schemas, &resolved.id)?;
     let owner_schema = resolved_comparison.owner_schema();
-    let comparison = resolved_comparison.context();
+    let comparison = &resolved_comparison.context().observation();
     let schema = Some(owner_schema.schema().as_schema());
     let accepted_request = AcceptedRequest::from_create_request(&request);
     let (create, create_cancellation) =
@@ -1410,7 +1410,7 @@ pub(crate) async fn detect_drift<S: Clone>(
                                 planned_val,
                                 Some(validated_schema),
                                 key,
-                                typed_comparison.context(),
+                                &typed_comparison.context().observation(),
                             ) =>
                         {
                             let masked = carina_core::value::mask_plaintext_using_secret_shape(
@@ -2198,9 +2198,11 @@ async fn run_apply_locked_owned(
                         resolved_state_block_targets: &resolved_state_block_targets,
                         preparation_errors: refresh_module_constraint_errors,
                     },
+                    crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
                 )
                 .await?;
             let crate::wiring::PostExpansionPlan {
+                plan,
                 artifacts,
                 resources,
             } = match post_expansion {
@@ -2212,7 +2214,6 @@ async fn run_apply_locked_owned(
             let crate::wiring::PostExpansionArtifacts {
                 expanded_resources: validated_expansion,
                 residual_deferred_for,
-                plan,
                 compositions: pre_resolve_compositions,
                 data_sources: _,
                 mut managed_current,
@@ -2221,7 +2222,6 @@ async fn run_apply_locked_owned(
                 prev_explicit,
                 wait_aliases,
             } = artifacts;
-            render_plan_errors_and_abort(color_mode, &plan, project_dir)?;
             #[cfg(any(test, feature = "test-utils"))]
             capture_live_apply_plan_for_test(&runtime, &plan)?;
             let crate::wiring::PostExpansionApplyResources {
@@ -2281,20 +2281,16 @@ async fn run_apply_locked_owned(
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
-                let historical_display =
-                    carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
                 let summary = PlanChangeSummary::new(
                     &plan,
                     &export_changes,
                     &residual_deferred_for,
                     &directive_changes,
                 );
-                print_plan(
+                crate::display::print_planned_plan(
                     color_mode,
                     &plan,
                     &summary,
-                    DetailLevel::Full,
-                    &historical_display,
                     Some(ctx.schemas()),
                     &HashMap::new(),
                     None,
@@ -2366,10 +2362,6 @@ async fn run_apply_locked_owned(
                 )));
             }
 
-            // Build display-safe historical attributes from current and persisted state.
-            let historical_display =
-                collect_historical_display_attributes(&plan, &managed_current, state_file.as_ref());
-
             let checked_exports_pre_apply =
                 crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
                     export_params: &parsed.export_params,
@@ -2400,12 +2392,10 @@ async fn run_apply_locked_owned(
                 &residual_deferred_for,
                 &directive_changes,
             );
-            print_plan(
+            crate::display::print_planned_plan(
                 color_mode,
                 &plan,
                 &summary,
-                DetailLevel::Full,
-                &historical_display,
                 Some(ctx.schemas()),
                 &moved_origins,
                 Some(&prev_explicit),
@@ -2444,13 +2434,16 @@ async fn run_apply_locked_owned(
             // (carina#3060). They must stay the same object.
             let observer = observer_factory(color_mode, &plan, project_dir);
             let provider = Arc::new(provider);
-            let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
-                resolved_resources.clone(),
-                plan.clone(),
-                ctx.schemas().clone(),
-                None,
-                provider.as_ref(),
-            )?);
+            let state_save_inputs = Arc::new(
+                ApplyStateSaveInputs::new(
+                    resolved_resources.clone(),
+                    plan.clone(),
+                    ctx.schemas().clone(),
+                    None,
+                    provider.as_ref(),
+                )?
+                .with_reference_evidence(Some(plan.references().clone())),
+            );
             let saver =
                 start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
             let publisher = saver.publisher();
@@ -2932,12 +2925,14 @@ async fn prepare_saved_plan_secret_candidates(
             crate::wiring::DeferredForWarningPolicy::Suppress,
         )?
         .seal(data_source_values);
-    let (mut validated_expansion, _expansion) = validated_config.expand_deferred_for(
-        &prepared_expansion,
-        provider_inputs.remote_bindings(),
-        crate::wiring::DeferredForWarningPolicy::Suppress,
-        &provider,
-    )?;
+    let (mut validated_expansion, _expansion) = validated_config
+        .expand_deferred_for(
+            &prepared_expansion,
+            provider_inputs.remote_bindings(),
+            crate::wiring::DeferredForWarningPolicy::Suppress,
+            &provider,
+        )
+        .await?;
 
     let normalizers = create_normalizers_from_configs_with_ctx(
         validated_expansion.context(),
@@ -3164,7 +3159,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 37
+    // Validate version compatibility before decoding the payload. Format 38
+    // retains authored lifecycle values, default origins, and loop call sites;
+    // earlier binaries could silently discard safety directives. Format 37
     // requires a relative diagnostic file (or null) and line on each deferred-for
     // template. Format 36 adds typed deferred-for templates and stage-specific
     // placeholder types.
@@ -3743,6 +3740,7 @@ async fn run_apply_from_plan_locked_owned(
                     None,
                     None,
                     &provider,
+                    carina_core::detail_rows::DetailComparisons::RecordedEffects,
                 )?;
                 let stdin = tokio::io::BufReader::new(tokio::io::stdin());
                 if confirm_apply(wiring.runtime(), stdin, cancel.clone(), auto_approve).await?
@@ -3789,6 +3787,7 @@ async fn run_apply_from_plan_locked_owned(
                 None,
                 None,
                 &provider,
+                carina_core::detail_rows::DetailComparisons::RecordedEffects,
             )?;
             let moved_hints = crate::moved_hint::detect_moved_block_hints(
                 plan,

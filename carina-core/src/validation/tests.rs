@@ -6170,7 +6170,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
                 Value::Concrete(ConcreteValue::String(identifier.into())),
             )
             .resolve_root(&RootScope::new())
-            .into_expanded()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
             .expect("resource fixture contains no parser placeholder");
         ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &[resource],
@@ -7795,10 +7795,6 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -7930,10 +7926,6 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
                 .unwrap()
                 .push(attributes.attributes().clone());
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
-            String::new()
         }
 
         fn create_provider(

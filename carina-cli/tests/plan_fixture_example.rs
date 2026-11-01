@@ -52,6 +52,7 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
         Some(&fp.prev_explicit),
         None,
         &provider,
+        fp.references.for_display(),
     )
     .expect("fixture plan must have an initialized provider route")
 }

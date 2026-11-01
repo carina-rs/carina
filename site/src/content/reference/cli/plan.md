@@ -12,6 +12,9 @@ carina plan [OPTIONS] [PATH]
 
 **PATH** defaults to `.` (current directory). It must be a directory containing one or more `.crn` files — single-file paths are rejected.
 
+KMS references may require `kms:DescribeKey` during planning, independently of
+`--check-iam`. See [KMS reference planning permissions](/guides/aws-credentials/#kms-reference-planning-permissions), including key-policy authorization and first-use initialization of AWS-managed keys.
+
 ## Flags
 
 ### `--detail <LEVEL>`

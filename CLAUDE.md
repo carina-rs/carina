@@ -655,6 +655,24 @@ A struct type represents a nested object with typed fields.
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
   is invisible in production and cost carina#3034 its effect (carina#3772).
+- **Desired normalization is per leaf** (carina#4194). One core classifier,
+  `carina_core::resource::is_deferred_desired_leaf`, marks every
+  `Value::Deferred` leaf (references, unknowns, secrets, other unresolved
+  expressions) inside concrete lists/maps. The SDK's `DesiredView` presents
+  the same `DesiredValue` tree on the native route (`NativeDesiredNormalization`)
+  and the WASM route (`DesiredResource::into_normalization`), so a provider
+  normalizer is the same code on both. Deferred leaves are opaque
+  `DeferredLeaf` values: providers cannot construct, clone or inspect them,
+  and may only move them within their original top-level attribute. On the
+  wire they are host-issued slots (`desired-value::deferred-val`, or
+  `{"$carina_deferred": <u32>}` inside normalization JSON, whose user keys
+  starting with `$` are escaped only by `carina_provider_protocol::normalization`).
+  The host restores each slot to its original value only after checking that
+  every slot occurs exactly once in its original resource and attribute;
+  otherwise it returns a typed error naming them and applies nothing. CRUD,
+  config and persisted-state values never carry slots, and create/update still
+  deliver real secret values. Don't reintroduce a top-level deferred-name list
+  or let provider code see a deferred leaf's value.
 - **LSP integration**: when adding Struct validation, update
   `carina-lsp/src/diagnostics/validation.rs` to validate nested fields;
   completion should work recursively for struct fields.

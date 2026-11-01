@@ -17,3 +17,10 @@ enum NegativeCases {
     #[error("NEG_OK")]
     Ok,
 }
+
+#[derive(thiserror::Error, Debug)]
+#[error("NEG_CALLER_RENDERED_CONTEXT")] // error-chain: caller-renders-sources
+struct CallerRenderedContext {
+    #[source]
+    cause: std::io::Error,
+}

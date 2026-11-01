@@ -1431,7 +1431,7 @@ mod tests {
             std::path::Path::new("."),
         )
         .expect("deferred fixture crosses the module-resolution seam")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("deferred fixture crosses the placeholder boundary");
         parsed
             .into_deferred_for_expressions()

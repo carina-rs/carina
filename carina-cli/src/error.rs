@@ -1041,6 +1041,12 @@ pub enum AppError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
+    #[error(transparent)]
+    ReferencePreparation(#[from] Box<carina_core::references::ReferencePlanError>),
+
+    #[error(transparent)]
+    PlanComparison(#[from] carina_core::differ::PlanComparisonError),
+
     /// Host-side AWS credential resolution failed before a guest started.
     #[error(transparent)]
     AwsCredentials(#[from] AwsCredentialStartupError),
@@ -1169,6 +1175,10 @@ pub enum AppError {
     /// All parser-only placeholders rejected by one file expansion boundary.
     #[error("{}", .0.located())]
     LeftoverPlaceholders(carina_core::resource::LeftoverPlaceholders),
+
+    /// Lifecycle directive values must be concrete before consumers see them.
+    #[error("{}", .0.located())]
+    Expansion(carina_core::resource::ExpansionError),
 
     /// One core-owned module-call finding at its parser-authored location.
     #[error(transparent)]
@@ -1408,6 +1418,12 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 impl From<carina_core::resource::ResolvedResourceError> for AppError {
     fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
         Self::ResolvedResource(Box::new(error))
+    }
+}
+
+impl From<carina_core::resource::ExpansionError> for AppError {
+    fn from(error: carina_core::resource::ExpansionError) -> Self {
+        Self::Expansion(error)
     }
 }
 

@@ -77,8 +77,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_37_for_deferred_diagnostic_locations() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 37);
+fn saved_plan_version_is_38_for_resolved_directive_templates() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 38);
 }
 
 #[test]
@@ -163,10 +163,6 @@ impl ProviderFactory for EvidenceTestFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "test-region".to_string()
     }
 
     fn create_provider(
@@ -3985,7 +3981,7 @@ fn bound_deferred_template() -> carina_core::parser::DeferredForExpression {
     )
     .expect("bound deferred loop parses");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("bound deferred loop must contain only loop slots");
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(
@@ -4195,7 +4191,7 @@ fn plan_file_validation_rejects_resolved_unbound_deferred_template_identity() {
     )
     .expect("unbound deferred loop parses");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("unbound deferred loop must contain only loop slots");
     let template = parsed.deferred_for_expressions()[0].clone();
     assert!(matches!(

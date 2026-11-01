@@ -45,10 +45,9 @@ use carina_core::provider::{
     CreateFailureKind, CreateObservation, InFlightCreate, InFlightPersistence, ResumeFailureKind,
     UnobservedReason,
 };
-use carina_core::resource::{
-    Resource, ResourceId, ResourceIdentityState, State, Value, contains_resource_ref,
-    value_contains_unknown,
-};
+#[cfg(test)]
+use carina_core::resource::Resource;
+use carina_core::resource::{ResourceId, ResourceIdentityState, State, Value};
 use carina_core::schema::{
     CompletionValue, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
     ValidatedResourceSchema,
@@ -61,7 +60,8 @@ use carina_provider_resolver::{
     ProviderTrustClass, VerifiedEgressDeclaration, VerifiedLoad,
 };
 
-use crate::{secret_seal, wasm_convert};
+use crate::{desired_normalization, wasm_convert};
+use carina_provider_protocol::http_trace::TraceUri;
 use carina_provider_protocol::types as proto;
 #[cfg(any(test, feature = "test-utils"))]
 pub use guest_store::GuestCallBudget;
@@ -191,13 +191,20 @@ struct WasmOperationError<E> {
     source: E,
 }
 
-impl<E: fmt::Display> fmt::Display for WasmOperationError<E> {
+impl<E> fmt::Display for WasmOperationError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "in operation {}: {}", self.operation, self.source)
+        write!(f, "in operation {}", self.operation)
     }
 }
 
-impl<E> std::error::Error for WasmOperationError<E> where E: std::error::Error + 'static {}
+impl<E> std::error::Error for WasmOperationError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 #[derive(Debug)]
 struct InvalidWasmCreateResult {
@@ -1762,16 +1769,18 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 let queue_ms = handler_start.duration_since(spawn_start).as_millis();
                 let handler_ms = handler_start.elapsed().as_millis();
                 eprintln!(
-                    "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
-                    method,
-                    uri,
-                    queue_ms,
-                    handler_ms,
-                    match &result {
-                        Ok(Ok(response)) => format!("{}", response.resp.status().as_u16()),
-                        Ok(Err(error)) => format!("err:{error:?}"),
-                        Err(error) => format!("trap:{error}"),
-                    },
+                    "{}",
+                    http_trace_line(
+                        &method,
+                        TraceUri::new(&uri),
+                        queue_ms,
+                        handler_ms,
+                        &match &result {
+                            Ok(Ok(response)) => format!("{}", response.resp.status().as_u16()),
+                            Ok(Err(error)) => format!("err:{error:?}"),
+                            Err(error) => format!("trap:{error}"),
+                        },
+                    )
                 );
             }
             result
@@ -1784,8 +1793,8 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
 /// Companion to carina-plugin-sdk's `CARINA_WASI_HTTP_TRACE` switch.
 ///
 /// When set to "1", the host-side request handler emits its wall-clock
-/// breakdown to stderr. Off by default; the gate is a single atomic load per
-/// request when disabled.
+/// breakdown to stderr with URI userinfo, fragment and query values removed.
+/// Off by default; the gate is a single atomic load per request when disabled.
 fn trace_http_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -1793,6 +1802,28 @@ fn trace_http_enabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+fn http_trace_line(
+    method: &str,
+    uri: TraceUri<'_>,
+    queue_ms: u128,
+    handler_ms: u128,
+    status: &str,
+) -> String {
+    format!(
+        "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
+        method, uri, queue_ms, handler_ms, status,
+    )
+}
+
+fn http_trace_phases_line(method: &str, uri: TraceUri<'_>, phases_ms: [u128; 4]) -> String {
+    let [tcp_connect, tls_handshake, http_handshake, send_request] = phases_ms;
+    format!(
+        "carina-host-http-trace-phases method={} uri={} \
+         tcp_connect_ms={} tls_handshake_ms={} http_handshake_ms={} send_request_ms={}",
+        method, uri, tcp_connect, tls_handshake, http_handshake, send_request,
+    )
 }
 
 /// Local copy of `wasmtime_wasi_http::p2::default_send_request_handler` that
@@ -1944,9 +1975,17 @@ async fn send_request_handler(
 
     if let Some((method, uri)) = trace_request {
         eprintln!(
-            "carina-host-http-trace-phases method={} uri={} \
-             tcp_connect_ms={} tls_handshake_ms={} http_handshake_ms={} send_request_ms={}",
-            method, uri, tcp_connect_ms, tls_handshake_ms, http_handshake_ms, send_request_ms,
+            "{}",
+            http_trace_phases_line(
+                &method,
+                TraceUri::new(&uri),
+                [
+                    tcp_connect_ms,
+                    tls_handshake_ms,
+                    http_handshake_ms,
+                    send_request_ms
+                ],
+            )
         );
     }
 
@@ -2049,7 +2088,9 @@ pub(crate) mod version_checked_bindings {
 
     pub(crate) use aws::carina::provider::aws_credentials;
     pub(crate) use basic::carina::provider::types as wit_types;
-    pub(crate) use basic::exports::carina::provider::provider::PlanOp as WitPlanOp;
+    pub(crate) use basic::exports::carina::provider::provider::{
+        DesiredResource as WitDesiredResource, PlanOp as WitPlanOp,
+    };
 
     use basic::CarinaProvider;
     use http::CarinaProviderWithHttp;
@@ -2277,6 +2318,30 @@ pub(crate) mod version_checked_bindings {
                 RawWasmBindings::Http(b) => {
                     b.carina_provider_provider()
                         .call_validate_config(store, attrs)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_resolve_references(
+            &self,
+            store: &mut Store<HostState>,
+            requests: &[wit_types::ReferenceRequest],
+        ) -> wasmtime::Result<
+            Result<
+                Vec<Result<wit_types::ReferenceOutcome, wit_types::ReferenceError>>,
+                wit_types::ProviderError,
+            >,
+        > {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_resolve_references(store, requests)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_resolve_references(store, requests)
                         .await
                 }
             }
@@ -2557,80 +2622,19 @@ pub(crate) mod version_checked_bindings {
         pub(super) async fn call_normalize_desired(
             &self,
             store: &mut Store<HostState>,
-            desired: &secret_seal::SealedDesired,
-        ) -> wasmtime::Result<Result<secret_seal::GuestDesired, wit_types::ProviderError>> {
-            desired
-                .send(|resources, deferred| async move {
-                    match &self.raw {
-                        RawWasmBindings::Basic(b) => {
-                            let desired = resources
-                                .iter()
-                                .zip(deferred)
-                                .map(|(resource, deferred)| {
-                                    basic::exports::carina::provider::provider::DesiredResource {
-                                        resource: resource.clone(),
-                                        deferred: deferred.clone(),
-                                    }
-                                })
-                                .collect::<Vec<_>>();
-                            b.carina_provider_provider()
-                                .call_normalize_desired(store, &desired)
-                                .await
-                        }
-                        RawWasmBindings::Http(b) => {
-                            let desired = resources
-                                .iter()
-                                .zip(deferred)
-                                .map(|(resource, deferred)| {
-                                    http::exports::carina::provider::provider::DesiredResource {
-                                        resource: resource.clone(),
-                                        deferred: deferred.clone(),
-                                    }
-                                })
-                                .collect::<Vec<_>>();
-                            b.carina_provider_provider()
-                                .call_normalize_desired(store, &desired)
-                                .await
-                        }
-                    }
-                })
-                .await
-        }
-
-        #[cfg(test)]
-        pub(super) async fn call_normalize_desired_raw(
-            &self,
-            store: &mut Store<HostState>,
-            resources: &[wit_types::ResourceDef],
-        ) -> wasmtime::Result<Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError>>
-        {
+            resources: &[WitDesiredResource],
+        ) -> wasmtime::Result<Result<Vec<WitDesiredResource>, wit_types::ProviderError>> {
             match &self.raw {
-                RawWasmBindings::Basic(b) => {
-                    let desired = resources
-                        .iter()
-                        .map(|resource| {
-                            basic::exports::carina::provider::provider::DesiredResource {
-                                resource: resource.clone(),
-                                deferred: Vec::new(),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    b.carina_provider_provider()
-                        .call_normalize_desired(store, &desired)
+                RawWasmBindings::Basic(bindings) => {
+                    bindings
+                        .carina_provider_provider()
+                        .call_normalize_desired(store, resources)
                         .await
                 }
-                RawWasmBindings::Http(b) => {
-                    let desired = resources
-                        .iter()
-                        .map(|resource| {
-                            http::exports::carina::provider::provider::DesiredResource {
-                                resource: resource.clone(),
-                                deferred: Vec::new(),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    b.carina_provider_provider()
-                        .call_normalize_desired(store, &desired)
+                RawWasmBindings::Http(bindings) => {
+                    bindings
+                        .carina_provider_provider()
+                        .call_normalize_desired(store, resources)
                         .await
                 }
             }
@@ -4950,12 +4954,6 @@ impl ProviderFactory for WasmProviderFactory {
         })
     }
 
-    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String {
-        // Provider-ready config enums are already canonical host values;
-        // strings remain literal and are never shape-decoded here.
-        carina_core::utils::extract_region_from_attrs(attributes, "ap-northeast-1")
-    }
-
     fn config_completions(&self) -> HashMap<String, Vec<CompletionValue>> {
         self.cached_config_completions.clone()
     }
@@ -6873,6 +6871,42 @@ impl Provider for WasmProvider {
         &self.name
     }
 
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [carina_core::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<
+                Result<
+                    carina_core::references::ReferenceOutcome,
+                    carina_core::references::ReferenceError,
+                >,
+            >,
+        >,
+    > {
+        let encoded: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let carina_core::references::ReferenceRequest { ty, value } = request;
+                version_checked_bindings::wit_types::ReferenceRequest {
+                    ty: wasm_convert::core_type_identity_to_wit(ty),
+                    value: value.clone(),
+                }
+            })
+            .collect();
+        Box::pin(async move {
+            let locked = self.instance.acquire("resolve_references").await?;
+            let result = locked
+                .call("resolve_references", async |bindings, store| {
+                    bindings.call_resolve_references(store, &encoded).await
+                })
+                .await?;
+            let results = result.map_err(wasm_convert::wit_to_core_provider_error)?;
+            Ok(wasm_convert::decode_reference_results(results))
+        })
+    }
+
     fn read(
         &self,
         id: &ResourceId,
@@ -7227,92 +7261,20 @@ fn apply_wit_state_attribute_updates<M: StateValueAccess>(
     Ok(())
 }
 
-/// One stripped attribute retained so it can be reinserted at its original
-/// position after WASM desired normalization returns.
-struct StrippedAttribute {
-    insert_index: usize,
-    key: String,
-    value: Value,
-}
-
-/// Attributes removed from a resource slice, grouped by slice position.
-struct StrippedAttributes(Vec<Vec<StrippedAttribute>>);
-
-impl StrippedAttributes {
-    /// Exact top-level names withheld from each resource, preserving resource
-    /// position and the resource's original attribute order.
-    fn deferred_names(&self) -> Vec<Vec<String>> {
-        self.0
-            .iter()
-            .map(|entries| entries.iter().map(|entry| entry.key.clone()).collect())
-            .collect()
+fn desired_normalization_provider_error<S>(
+    resources: &[carina_core::resource::Resource<S>],
+    error: carina_provider_protocol::normalization::NormalizationError,
+    convert: impl FnOnce(carina_provider_protocol::normalization::NormalizationError) -> ProviderError,
+) -> ProviderError {
+    let id = error
+        .resource_index
+        .and_then(|index| resources.get(index))
+        .map(|resource| resource.id.clone());
+    let error = convert(error);
+    match id {
+        Some(id) => error.for_resource(id),
+        None => error,
     }
-}
-
-/// Strip every resource attribute that the WASM provider boundary refuses to
-/// serialize, retaining the original `IndexMap` positions for restoration.
-fn strip_provider_boundary_attributes<S>(resources: &mut [Resource<S>]) -> StrippedAttributes {
-    let mut out = Vec::with_capacity(resources.len());
-    for resource in resources.iter_mut() {
-        let mut stripped = Vec::new();
-        let to_remove: Vec<(usize, String)> = resource
-            .attributes
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, value))| value_contains_unknown(value) || contains_resource_ref(value))
-            .map(|(i, (key, _))| (i, key.clone()))
-            .collect();
-
-        for (insert_index, key) in to_remove.into_iter().rev() {
-            if let Some(value) = resource.attributes.shift_remove(&key) {
-                stripped.push(StrippedAttribute {
-                    insert_index,
-                    key,
-                    value,
-                });
-            }
-        }
-
-        stripped.sort_by_key(|entry| entry.insert_index);
-        out.push(stripped);
-    }
-    StrippedAttributes(out)
-}
-
-/// Reinsert attributes removed by [`strip_provider_boundary_attributes`] at
-/// their original positions.
-fn restore_stripped_attributes<S>(resources: &mut [Resource<S>], stripped: StrippedAttributes) {
-    for (resource, entries) in resources.iter_mut().zip(stripped.0) {
-        for entry in entries {
-            let target = entry.insert_index.min(resource.attributes.len());
-            resource
-                .attributes
-                .shift_insert(target, entry.key, entry.value);
-        }
-    }
-}
-
-/// Run one WASM desired-normalization boundary call with unsupported
-/// attributes temporarily removed.
-///
-/// The callback receives the names derived from the same stripping result that
-/// retains the values. Attributes are restored before returning on both
-/// success and error.
-async fn with_wasm_serializable_resources<S, F>(
-    resources: &mut [Resource<S>],
-    operation: F,
-) -> ProviderResult<()>
-where
-    F: for<'a> FnOnce(
-        &'a mut [Resource<S>],
-        &'a [Vec<String>],
-    ) -> BoxFuture<'a, ProviderResult<()>>,
-{
-    let stripped = strip_provider_boundary_attributes(resources);
-    let deferred_names = stripped.deferred_names();
-    let result = operation(resources, &deferred_names).await;
-    restore_stripped_attributes(resources, stripped);
-    result
 }
 
 impl ProviderNormalizer for WasmProviderNormalizer {
@@ -7322,39 +7284,32 @@ impl ProviderNormalizer for WasmProviderNormalizer {
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         let instance = Arc::clone(&self.instance);
         Box::pin(async move {
-            with_wasm_serializable_resources(resources, move |resources, deferred_names| {
-                Box::pin(async move {
-                    let (sealed, unsealer) =
-                        secret_seal::seal_with_deferred(resources, deferred_names).map_err(
-                            |error| wasm_value_encode_provider_error("normalize_desired", error),
-                        )?;
-
-                    // Plain `.await`, not a nested `block_on`: the guarded store is
-                    // acquired and dropped within this one polled future, so the
-                    // apply-path `renormalize` calling this once per resource cannot
-                    // self-deadlock (carina#3112).
-                    let result = {
-                        let locked = instance.acquire("normalize_desired").await?;
-                        let result = locked
-                            .call("normalize_desired", async |bindings, store| {
-                                bindings.call_normalize_desired(store, &sealed).await
-                            })
-                            .await?;
-                        result.map_err(wasm_convert::wit_to_core_provider_error)
-                    }?;
-
-                    // The scoped host helper hides ref/Unknown-bearing attributes only
-                    // while this WASM transport call is in flight and restores them on
-                    // every return path. Secret restoration filters mangled attributes
-                    // before guest values are written back.
-                    let restored = unsealer.try_restore(result).map_err(|error| {
-                        wasm_value_decode_provider_error("normalize_desired", error)
-                    })?;
-                    restored.apply_to(resources);
-                    Ok(())
+            let batch =
+                carina_core::desired::NormalizationBatch::new(resources).map_err(|error| {
+                    desired_normalization_provider_error(resources, error, |error| {
+                        wasm_value_encode_provider_error("normalize_desired", error)
+                    })
+                })?;
+            let sent = desired_normalization::encode(&batch).map_err(|error| {
+                desired_normalization_provider_error(resources, error, |error| {
+                    wasm_value_encode_provider_error("normalize_desired", error)
+                })
+            })?;
+            // Acquire and drop the guarded store in this future; never nest block_on.
+            let result = {
+                let locked = instance.acquire("normalize_desired").await?;
+                locked
+                    .call("normalize_desired", async |bindings, store| {
+                        bindings.call_normalize_desired(store, &sent).await
+                    })
+                    .await?
+                    .map_err(wasm_convert::wit_to_core_provider_error)
+            }?;
+            desired_normalization::apply(resources, batch, result).map_err(|error| {
+                desired_normalization_provider_error(resources, error, |error| {
+                    wasm_value_decode_provider_error("normalize_desired", error)
                 })
             })
-            .await
         })
     }
 
@@ -7568,16 +7523,138 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 mod tests {
     use super::*;
     use carina_core::provider::SentRecord;
-    use carina_core::resource::{
-        ApplyTimeUnknown, AuthoredAccessPath as AccessPath, ConcreteValue, Current, DeferredValue,
-        InterpolationPart, ModuleSource, absolute_binding_address_for_test,
-    };
+    use carina_core::resource::{ConcreteValue, Current, DeferredValue, ModuleSource};
     use std::borrow::Cow;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use wasm_encoder::{Component as EncoderComponent, CustomSection};
     use wasmtime::component::ResourceTable;
     use wasmtime_wasi::WasiCtxView;
+
+    #[test]
+    fn normalization_operation_wrapper_preserves_sources_and_renders_float_once() {
+        use carina_provider_protocol::normalization::{NormalizationError, NormalizationErrorKind};
+        use std::error::Error;
+        let id = carina_provider_protocol::types::ResourceId {
+            provider: "mock".into(),
+            resource_type: "example".into(),
+            identity: "float-error".into(),
+        };
+        let source = NormalizationError::new(id, "value", NormalizationErrorKind::Conversion)
+            .with_source(carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat);
+        let error = wasm_value_encode_provider_error("normalize_desired", source);
+        let normalization = error
+            .detail()
+            .cause()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<NormalizationError>()
+            .unwrap();
+        assert!(
+            normalization
+                .source()
+                .unwrap()
+                .is::<carina_core::protocol_convert::ProtocolConvertError>()
+        );
+        let rendered = error.to_string();
+        let reason =
+            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat.to_string();
+        assert_eq!(rendered.matches(&reason).count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn desired_normalization_errors_retain_the_original_provider_instance() {
+        use carina_core::desired::NormalizationBatch;
+        for encoding in [true, false] {
+            let mut resources: Vec<carina_core::resource::Resource> = ["east", "west"]
+                .into_iter()
+                .map(|instance| {
+                    carina_core::resource::Resource::with_provider(
+                        "mock",
+                        "example",
+                        "same-id",
+                        Some(instance.into()),
+                    )
+                    .with_attribute(
+                        "value",
+                        Value::Concrete(ConcreteValue::String("before".into())),
+                    )
+                })
+                .collect();
+            let error = if encoding {
+                resources[1].attributes.insert(
+                    "value".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                );
+                NormalizationBatch::new(&resources).err().unwrap()
+            } else {
+                let batch = NormalizationBatch::new(&resources).unwrap();
+                let mut returned = desired_normalization::encode(&batch).unwrap();
+                returned[1].attributes[0].1 = wit_types::DesiredValue::MapVal("[]".into());
+                desired_normalization::apply(&mut resources, batch, returned).unwrap_err()
+            };
+            assert_eq!(error.resource_index, Some(1));
+            let error = desired_normalization_provider_error(&resources, error, |error| {
+                if encoding {
+                    wasm_value_encode_provider_error("normalize_desired", error)
+                } else {
+                    wasm_value_decode_provider_error("normalize_desired", error)
+                }
+            });
+            assert_eq!(
+                error.detail().resource_id.as_deref(),
+                Some(&resources[1].id)
+            );
+            assert_ne!(
+                error.detail().resource_id.as_deref(),
+                Some(&resources[0].id)
+            );
+            assert!(error.detail().cause().is_some());
+        }
+    }
+
+    const HTTP_TRACE_SECRET_URI: &str = "https://user:PASSSECRET@bucket.s3.amazonaws.com/key?X-Amz-Credential=AKIDSECRET%2F...&X-Amz-Signature=SIGSECRET&X-Amz-Security-Token=TOKSECRET#FRAGSECRET";
+    const HTTP_TRACE_SAFE_URI: &str = "https://bucket.s3.amazonaws.com/key?X-Amz-Credential=<redacted>&X-Amz-Signature=<redacted>&X-Amz-Security-Token=<redacted>";
+
+    fn assert_http_trace_has_no_secrets(line: &str) {
+        for secret in [
+            "PASSSECRET",
+            "AKIDSECRET",
+            "SIGSECRET",
+            "TOKSECRET",
+            "FRAGSECRET",
+        ] {
+            assert!(!line.contains(secret), "trace leaked {secret}: {line}");
+        }
+    }
+
+    #[test]
+    fn http_trace_line_redacts_uri_credentials_and_keeps_metrics() {
+        let line = http_trace_line("GET", TraceUri::new(HTTP_TRACE_SECRET_URI), 1, 2, "200");
+
+        assert_http_trace_has_no_secrets(&line);
+        assert_eq!(
+            line,
+            format!(
+                "carina-host-http-trace method=GET uri={HTTP_TRACE_SAFE_URI} queue_ms=1 handler_ms=2 status=200"
+            )
+        );
+    }
+
+    #[test]
+    fn http_trace_phases_line_redacts_uri_credentials_and_keeps_metrics() {
+        let line =
+            http_trace_phases_line("GET", TraceUri::new(HTTP_TRACE_SECRET_URI), [1, 2, 3, 4]);
+
+        assert_http_trace_has_no_secrets(&line);
+        assert_eq!(
+            line,
+            format!(
+                "carina-host-http-trace-phases method=GET uri={HTTP_TRACE_SAFE_URI} tcp_connect_ms=1 tls_handshake_ms=2 http_handshake_ms=3 send_request_ms=4"
+            )
+        );
+    }
 
     struct UnusedAwsCredentialSource;
 
@@ -7826,7 +7903,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v16_wit_surface_compiles() {
+    fn protocol_v19_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();
@@ -7847,13 +7924,6 @@ mod tests {
 
     fn test_string_value(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string().into()))
-    }
-
-    fn root_resource_ref(binding: &str, attribute: &str) -> Value {
-        carina_core::resource::AuthoredValue::resource_ref(binding, attribute, Vec::new())
-            .resolve_root_for_test()
-            .into_expanded()
-            .expect("root resource reference contains no placeholders")
     }
 
     fn boundary_resource() -> (ResourceId, wit_types::ResourceId, wit_types::CreateRequest) {
@@ -8999,370 +9069,6 @@ mod tests {
             .expect("migrated test document must retain its attribute")
     }
 
-    fn assert_value_structure_eq(actual: &Value, expected: &Value) {
-        match (actual, expected) {
-            (
-                Value::Deferred(DeferredValue::Unknown(actual)),
-                Value::Deferred(DeferredValue::Unknown(expected)),
-            ) => assert_eq!(actual, expected),
-            (
-                Value::Concrete(ConcreteValue::List(actual)),
-                Value::Concrete(ConcreteValue::List(expected)),
-            ) => {
-                assert_eq!(actual.len(), expected.len());
-                for (actual, expected) in actual.iter().zip(expected) {
-                    assert_value_structure_eq(actual, expected);
-                }
-            }
-            (
-                Value::Concrete(ConcreteValue::Map(actual)),
-                Value::Concrete(ConcreteValue::Map(expected)),
-            ) => {
-                assert_eq!(
-                    actual.keys().collect::<Vec<_>>(),
-                    expected.keys().collect::<Vec<_>>()
-                );
-                for (key, expected) in expected {
-                    assert_value_structure_eq(&actual[key], expected);
-                }
-            }
-            (
-                Value::Deferred(DeferredValue::Interpolation(actual)),
-                Value::Deferred(DeferredValue::Interpolation(expected)),
-            ) => {
-                assert_eq!(actual.len(), expected.len());
-                for (actual, expected) in actual.iter().zip(expected) {
-                    match (actual, expected) {
-                        (
-                            InterpolationPart::Literal(actual),
-                            InterpolationPart::Literal(expected),
-                        ) => assert_eq!(actual, expected),
-                        (InterpolationPart::Expr(actual), InterpolationPart::Expr(expected)) => {
-                            assert_value_structure_eq(actual, expected)
-                        }
-                        _ => panic!("interpolation part variants differ"),
-                    }
-                }
-            }
-            (
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: actual_name,
-                    args: actual_args,
-                    ..
-                }),
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: expected_name,
-                    args: expected_args,
-                    ..
-                }),
-            ) => {
-                assert_eq!(actual_name, expected_name);
-                assert_eq!(actual_args.len(), expected_args.len());
-                for (actual, expected) in actual_args.iter().zip(expected_args) {
-                    assert_value_structure_eq(
-                        actual.value().expect("serialized function argument value"),
-                        expected
-                            .value()
-                            .expect("serialized function argument value"),
-                    );
-                }
-            }
-            (
-                Value::Deferred(DeferredValue::Access(actual_access)),
-                Value::Deferred(DeferredValue::Access(expected_access)),
-            ) => {
-                assert_eq!(actual_access.step(), expected_access.step());
-                assert_value_structure_eq(actual_access.base(), expected_access.base());
-            }
-            (
-                Value::Deferred(DeferredValue::Secret(actual)),
-                Value::Deferred(DeferredValue::Secret(expected)),
-            ) => assert_value_structure_eq(actual, expected),
-            _ => assert_eq!(actual, expected),
-        }
-    }
-
-    #[test]
-    fn stripped_attributes_expose_exact_deferred_names_by_resource_position() {
-        let mut first = Resource::new("test.t", "first");
-        first.set_attr("known", test_string_value("known"));
-        first.set_attr(
-            "pending",
-            Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("pending"),
-                },
-            )),
-        );
-        first.set_attr("peer", root_resource_ref("peer", "identifier"));
-        let mut second = Resource::new("test.t", "second");
-        second.set_attr("known", test_string_value("known"));
-        let mut third = Resource::new("test.t", "third");
-        third.set_attr(
-            "nested",
-            Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-                DeferredValue::Unknown(ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("nested"),
-                }),
-            )])),
-        );
-        let mut resources = vec![first, second, third];
-
-        let stripped = strip_provider_boundary_attributes(&mut resources);
-
-        assert_eq!(
-            stripped.deferred_names(),
-            vec![
-                vec!["pending".to_string(), "peer".to_string()],
-                Vec::new(),
-                vec!["nested".to_string()],
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_restores_original_attribute_order() {
-        let mut resource = Resource::new("test.t", "n");
-        resource.set_attr("before", test_string_value("before"));
-        resource.set_attr(
-            "pending",
-            Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("pending"),
-                },
-            )),
-        );
-        resource.set_attr("middle", test_string_value("middle"));
-        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
-        resource.set_attr("after", test_string_value("after"));
-        let mut resources = vec![resource];
-        let original_attributes = resources[0].attributes.clone();
-
-        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-            Box::pin(async move {
-                assert_eq!(
-                    resources[0].attributes.keys().collect::<Vec<_>>(),
-                    vec!["before", "middle", "after"]
-                );
-                resources[0].set_attr("guest_added", test_string_value("new"));
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(
-            resources[0].attributes.keys().collect::<Vec<_>>(),
-            vec![
-                "before",
-                "pending",
-                "middle",
-                "peer",
-                "after",
-                "guest_added"
-            ],
-            "restoration must preserve original positions and trail guest-added attributes"
-        );
-        for (key, value) in original_attributes {
-            assert_value_structure_eq(
-                resources[0]
-                    .get_attr(&key)
-                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
-                &value,
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_restores_duplicate_resource_ids_by_position() {
-        let first_hidden: Value = Value::Deferred(DeferredValue::Unknown(
-            ApplyTimeUnknown::UpstreamAllExports {
-                binding: absolute_binding_address_for_test("pending"),
-            },
-        ));
-        let second_hidden = root_resource_ref("peer", "identifier");
-
-        let mut first = Resource::new("test.t", "shared");
-        first.set_attr("visible", test_string_value("first"));
-        first.set_attr("hidden", first_hidden.clone());
-
-        let mut second = Resource::new("test.t", "shared");
-        second.set_attr("visible", test_string_value("second"));
-        second.set_attr("hidden", second_hidden.clone());
-
-        assert_eq!(first.id, second.id, "the regression requires duplicate IDs");
-        let mut resources = vec![first, second];
-
-        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-            Box::pin(async move {
-                for resource in resources {
-                    assert_eq!(
-                        resource.attributes.keys().collect::<Vec<_>>(),
-                        vec!["visible"]
-                    );
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        assert_value_structure_eq(
-            resources[0]
-                .get_attr("hidden")
-                .expect("the first resource's attribute must be restored"),
-            &first_hidden,
-        );
-        assert_value_structure_eq(
-            resources[1]
-                .get_attr("hidden")
-                .expect("the second resource's attribute must be restored"),
-            &second_hidden,
-        );
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_strips_values_in_nested_wrappers() {
-        let upstream_path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
-            .resolve_root_for_test();
-        let unknown = || {
-            Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
-                path: upstream_path.clone(),
-            }))
-        };
-        let resource_ref = || root_resource_ref("admins", "group_id");
-
-        let mut resource = Resource::new("test.t", "n");
-        resource.set_attr("stable", test_string_value("visible"));
-        resource.set_attr(
-            "unknown_list",
-            Value::Concrete(ConcreteValue::List(vec![unknown()])),
-        );
-        resource.set_attr(
-            "unknown_map",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "nested".to_string(),
-                unknown(),
-            )]))),
-        );
-        resource.set_attr(
-            "unknown_interpolation",
-            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-                unknown(),
-            )])),
-        );
-        resource.set_attr(
-            "unknown_function",
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: carina_core::builtins::BuiltinFunction::upper,
-                args: vec![unknown().into()],
-                source_line: 0.into(),
-            }),
-        );
-        resource.set_attr(
-            "unknown_secret",
-            Value::Deferred(DeferredValue::Secret(Box::new(unknown()))),
-        );
-        resource.set_attr(
-            "ref_map",
-            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                "nested".to_string(),
-                resource_ref(),
-            )]))),
-        );
-        resource.set_attr(
-            "ref_interpolation",
-            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-                resource_ref(),
-            )])),
-        );
-        resource.set_attr(
-            "ref_function",
-            Value::Deferred(DeferredValue::FunctionCall {
-                name: carina_core::builtins::BuiltinFunction::upper,
-                args: vec![resource_ref().into()],
-                source_line: 0.into(),
-            }),
-        );
-        resource.set_attr(
-            "ref_secret",
-            Value::Deferred(DeferredValue::Secret(Box::new(resource_ref()))),
-        );
-        let mut resources = vec![resource];
-        let original_attributes = resources[0].attributes.clone();
-
-        with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-            Box::pin(async move {
-                assert_eq!(
-                    resources[0].attributes.keys().collect::<Vec<_>>(),
-                    vec!["stable"],
-                    "the WASM transport operation must see only serializable attributes"
-                );
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(
-            resources[0].attributes.keys().collect::<Vec<_>>(),
-            original_attributes.keys().collect::<Vec<_>>()
-        );
-        for (key, value) in original_attributes {
-            assert_value_structure_eq(
-                resources[0]
-                    .get_attr(&key)
-                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
-                &value,
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn wasm_serializable_resources_restores_attributes_on_error() {
-        let mut resource = Resource::new("test.t", "n");
-        resource.set_attr("stable", test_string_value("visible"));
-        resource.set_attr("peer", root_resource_ref("peer", "identifier"));
-        resource.set_attr(
-            "pending",
-            Value::Deferred(DeferredValue::Unknown(
-                ApplyTimeUnknown::UpstreamAllExports {
-                    binding: absolute_binding_address_for_test("pending"),
-                },
-            )),
-        );
-        let mut resources = vec![resource];
-        let before = resources[0].attributes.clone();
-
-        let error =
-            with_wasm_serializable_resources(&mut resources, |resources, _deferred_names| {
-                Box::pin(async move {
-                    assert_eq!(
-                        resources[0].attributes.keys().collect::<Vec<_>>(),
-                        vec!["stable"]
-                    );
-                    Err(ProviderError::internal("boundary failed"))
-                })
-            })
-            .await
-            .expect_err("the boundary error must propagate");
-
-        assert_eq!(error.detail().context(), "boundary failed");
-        assert_eq!(
-            resources[0].attributes.keys().collect::<Vec<_>>(),
-            before.keys().collect::<Vec<_>>(),
-            "restored attributes must retain their original order"
-        );
-        for (key, value) in before {
-            assert_value_structure_eq(
-                resources[0]
-                    .get_attr(&key)
-                    .unwrap_or_else(|| panic!("attribute {key} must be restored")),
-                &value,
-            );
-        }
-    }
-
     #[test]
     fn malformed_config_completions_metadata_is_rejected() {
         let error = decode_config_completions_json("not json", "mock", "1.0.0")
@@ -9522,7 +9228,7 @@ mod tests {
             .get_or_create_shared_instance(None, &IndexMap::new())
             .await
             .expect("mock WASM provider should initialize");
-        let malformed = wit_types::ResourceDef {
+        let malformed = version_checked_bindings::WitDesiredResource {
             id: wit_types::ResourceId {
                 provider: "mock".to_string(),
                 resource_type: "test.resource".to_string(),
@@ -9530,7 +9236,7 @@ mod tests {
             },
             attributes: vec![(
                 "settings".to_string(),
-                wit_types::Value::ListVal("not-json".to_string()),
+                wit_types::DesiredValue::ListVal("not-json".to_string()),
             )],
         };
         let locked = instance
@@ -9540,7 +9246,7 @@ mod tests {
         let malformed = [malformed];
         let result = locked
             .call("normalize_desired", async |bindings, store| {
-                bindings.call_normalize_desired_raw(store, &malformed).await
+                bindings.call_normalize_desired(store, &malformed).await
             })
             .await
             .expect("the guest call should return its provider error");

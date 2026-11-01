@@ -14,11 +14,9 @@
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::Value;
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
 };
-use indexmap::IndexMap;
 use std::collections::HashMap;
 use tempfile::TempDir;
 
@@ -51,9 +49,6 @@ impl ProviderFactory for WaitTestFactory {
         _value: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
     fn create_provider(
         &self,

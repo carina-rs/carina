@@ -109,7 +109,9 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
         &SchemaRegistry::new(),
     )
     .unwrap();
-    let mut parsed = parsed.into_expanded().unwrap();
+    let mut parsed = parsed
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .unwrap();
     parsed.warnings = vec![
         carina_core::parser::ParseWarning {
             file: Some(source.display().to_string()),
@@ -300,6 +302,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         .empty_like();
     let expansion = PostExpansionPlanView {
         data: PostExpansionPlanData {
+            reference_preparation: Default::default(),
             expanded_resources,
             sorted_resources: Vec::new(),
             addressed: AddressedState {
@@ -329,21 +332,24 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let preparation_errors =
         NonEmptyPlanErrors::try_from(vec![expected.clone()]).expect("one error is non-empty");
 
-    let outcome = build_post_expansion_plan::<PlanMode, _>(PostExpansionPlanInput {
-        context: &context,
-        expansion,
-        environment: PostExpansionPlanEnvironment {
-            data_sources: &[],
-            provider: &provider,
-            normalizer: &provider,
-            provider_configs: &[],
-            remote_bindings: &HashMap::new(),
-            state_file: &state_file,
-            state_block_claims: &state_block_claims,
-            resolved_state_block_targets: &resolved_state_block_targets,
-            preparation_errors: Some(preparation_errors),
+    let outcome = build_post_expansion_plan::<PlanMode, _>(
+        PostExpansionPlanInput {
+            context: &context,
+            expansion,
+            environment: PostExpansionPlanEnvironment {
+                data_sources: &[],
+                provider: &provider,
+                normalizer: &provider,
+                provider_configs: &[],
+                remote_bindings: &HashMap::new(),
+                state_file: &state_file,
+                state_block_claims: &state_block_claims,
+                resolved_state_block_targets: &resolved_state_block_targets,
+                preparation_errors: Some(preparation_errors),
+            },
         },
-    })
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
+    )
     .await
     .expect("typed preparation diagnostics should produce an outcome");
 
@@ -351,9 +357,9 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         panic!("non-empty preparation diagnostics must not produce a plan")
     };
     let errors = diagnostics.errors().clone();
-    let artifacts = diagnostics.into_artifacts();
+    let (_artifacts, plan) = diagnostics.into_parts();
     assert_eq!(errors.as_slice(), &[expected]);
-    assert_eq!(artifacts.plan.errors(), errors.as_slice());
+    assert_eq!(plan.errors(), errors.as_slice());
 }
 
 struct RawEnumStateFactory;
@@ -376,10 +382,6 @@ impl ProviderFactory for RawEnumStateFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
     }
 
     fn create_provider(
@@ -592,6 +594,7 @@ let item = test.thing {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .unwrap_or_else(|error| panic!("refresh={refresh} plan failed: {error}"));
@@ -699,6 +702,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build enum/int rename plan");
@@ -794,6 +798,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build unordered enum rename plan");
@@ -859,7 +864,7 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
     assert_eq!(parsed.state_blocks.len(), 1, "fixture must parse one move");
     let provider_configs = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("anonymous move fixture has no parser placeholders");
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
         &crate::test_support::TestCommandRuntime::new(),
@@ -1007,6 +1012,7 @@ let first = test.thing {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("a contested orphan must fall back to delete and create");
@@ -1133,6 +1139,7 @@ let direct = awscc.ec2.Route {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("a cross-pass contest must fall back to delete and create");
@@ -1190,7 +1197,7 @@ query {}
     )
     .expect("anonymous calls must expand");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("anonymous module-call fixture has no parser placeholders");
 
     assert_eq!(
@@ -1282,7 +1289,7 @@ outer {{}}
     )
     .expect("nested calls must expand");
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("nested module-call fixture has no parser placeholders");
 
     let outer = parsed
@@ -2117,7 +2124,7 @@ fn resolved_provider_configs_from_resolved<
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let parsed = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider config must contain no parser placeholders");
     let remote = remote
         .iter()
@@ -2289,10 +2296,6 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
         }
 
         fn create_provider(
@@ -2648,7 +2651,7 @@ where
 {
     let parsed = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider config must contain no parser placeholders");
     carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
@@ -2728,6 +2731,7 @@ where
         remote_bindings,
         state_block_claims,
         resolved_state_block_targets,
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .map(ValidatedConfig::into_context_for_test)
@@ -3225,10 +3229,6 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -3358,10 +3358,6 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -3435,6 +3431,60 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
 }
 
 #[tokio::test]
+async fn provider_progress_uses_schema_region() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let ctx = WiringContext::new_for_test(
+        &runtime,
+        vec![
+            Box::new(RawEnumStateFactory),
+            Box::new(RegionIdentityFactory),
+        ],
+        &[],
+    );
+    let configs = validated_provider_configs(vec![
+        ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::from([(
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-west-2".into())),
+            )]),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        },
+        region_provider_config("aws.Region.ap_northeast_1"),
+    ]);
+    let lines = Box::leak(Box::new(RecordedProgressLines::default()));
+    let mut router = ProviderRouter::new();
+    let color_mode = ctx.runtime.color_mode();
+
+    for config in configs.iter() {
+        instantiate_provider_into_router(
+            &ctx,
+            &mut router,
+            config,
+            None,
+            ProgressSink::Recorded(lines),
+        )
+        .await
+        .expect("provider initialization must succeed");
+    }
+
+    assert_eq!(
+        lines.snapshot(),
+        [
+            "Using test (instance=default)".cyan(color_mode).to_string(),
+            "Using awscc (region: ap-northeast-1, instance=default)"
+                .cyan(color_mode)
+                .to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
     struct FailingInitializeFactory;
 
@@ -3456,10 +3506,6 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
         }
 
         fn create_provider(
@@ -3563,10 +3609,6 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
     }
 
     fn create_provider(
@@ -3712,6 +3754,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await;
     let error = match result {
@@ -3763,10 +3806,6 @@ impl ProviderFactory for CascadeAwsccFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -4122,10 +4161,6 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -4244,6 +4279,7 @@ let shared = read test.shared.Type {}
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("managed orphan and same-id data source must coexist through planning");
@@ -4501,10 +4537,6 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -4623,10 +4655,6 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -4938,7 +4966,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("moved-block fixture has no parser placeholders");
 
     let from = ResourceId::with_provider_identity("awscc", "s3.Bucket", "old_bucket", None);
@@ -5011,7 +5039,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("in-flight moved-block fixture has no parser placeholders");
     let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
     let to = ResourceId::with_provider_identity("mock", "test.resource", "new_name", None);
@@ -5104,7 +5132,7 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("orphan moved-block fixture has no parser placeholders");
 
     let from = ResourceId::with_provider_identity("mock", "test.resource", "old_name", None);
@@ -5989,7 +6017,7 @@ moved {
     let parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("moved collision fixture has no parser placeholders");
     let state_file = Some(bucket_state_file(&["live"]));
     let StateBlockResolution {
@@ -6061,7 +6089,7 @@ removed {
     let parsed = parse(source, &ProviderContext::default()).expect("parse removed fixture");
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("removed collision fixture has no parser placeholders");
     let state_file = {
         let mut sf = StateFile::new();
@@ -6199,7 +6227,7 @@ fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
         &ProviderContext::default(),
     )
     .expect("same-type moved block must parse")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("deposed moved-block fixture has no parser placeholders");
     let from = bucket_id("old_bucket");
     let to = bucket_id("new_bucket");
@@ -6712,10 +6740,6 @@ impl ProviderFactory for DeferredForCollisionFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -6850,10 +6874,6 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -7077,7 +7097,7 @@ fn legacy_loop_detector_resolves_ref_only_ambiguity_through_state_view() {
     );
     let providers = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let mut parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("legacy-loop fixture has no parser placeholders");
     let ctx = WiringContext::new_for_test(
         &crate::test_support::TestCommandRuntime::new(),
@@ -7197,7 +7217,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
 
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("prelude plan fixture has no parser placeholders");
     let mut resolved_resources = expanded.resources.clone(); // allow: direct — fixture test inspection
     let canonical =
@@ -7275,6 +7295,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build mixed automatic-move plan");
@@ -7409,7 +7430,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     );
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("late deferred-loop fixture has no parser placeholders");
 
     let anonymous_loop = expanded
@@ -7499,6 +7520,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &expanded_remote_bindings,
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build late mixed automatic-move plan");
@@ -8067,7 +8089,7 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
         .expect("anonymous destination assigned")
         .to_string();
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("legacy-loop fixture has no leftover parser placeholders");
 
     let exact_legacy = ResourceState::try_applied(
@@ -8684,7 +8706,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .clone();
     let expanded_provider_configs = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("cascade fixture has no leftover parser placeholders")
         .providers;
     let state_subnet_identity = concrete_subnet_identity(ctx, &expanded_provider_configs);
@@ -8733,6 +8755,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &HashMap::new(),
         &StateBlockClaims::empty(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan should build");
@@ -8888,7 +8911,7 @@ moved {{
     let parsed = parse(&source, &ProviderContext::default()).expect("parse fixture");
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("five-move fixture has no parser placeholders");
     let StateBlockResolution {
         claims: state_block_claims,
@@ -10090,10 +10113,6 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -10231,7 +10250,7 @@ fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
         &[],
     );
     let mut parsed = two_anonymous_loop_collision_file()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("identity fixture has no leftover parser placeholders");
 
     let error = <carina_core::parser::ExpandedParsedFile as DeferredExpansionTarget<
@@ -10272,7 +10291,7 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
         &[],
     );
     let parsed = two_anonymous_loop_collision_file()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("identity fixture has no leftover parser placeholders");
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(parsed.resources, ctx.schemas()),
@@ -10648,7 +10667,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         &carina_core::parser::ProviderContext::default(),
     )
     .expect("deferred map loop parses")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("deferred map-loop fixture has no parser placeholders");
     let children = carina_core::parser::expand_deferred_children(
         &parsed.deferred_for_expressions()[0],
@@ -11109,7 +11128,10 @@ let records = for (_, opt) in cert.domain_validation_options {{
 "#,
     );
     let parsed = parse(&source, &ProviderContext::default()).expect("parse state-block fixture");
-    let expanded = parsed.clone().into_expanded().unwrap();
+    let expanded = parsed
+        .clone()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .unwrap();
     assert_eq!(expanded.deferred_for_expressions().len(), 1);
 
     let mut state_file = StateFile::new();
@@ -11156,6 +11178,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         &HashMap::new(),
         &claims,
         &targets,
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("state blocks and the retained loop must plan together");
@@ -11220,7 +11243,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         "deferred effects must follow state-block effects: {:#?}",
         plan.effects()
     );
-    plan
+    (*plan).clone()
 }
 
 #[tokio::test]
@@ -11360,7 +11383,7 @@ mod expand_same_config_deferred_for_tests {
             "fixture should carry the single-quoted interpolation-like warning"
         );
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("warning fixture has no leftover parser placeholders");
 
         let out = expand_same_config_deferred_for(
@@ -11390,7 +11413,7 @@ mod expand_same_config_deferred_for_tests {
         let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
         let parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
         let mut parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("warning fixture has no leftover parser placeholders");
         let state_file = None;
         let schemas = SchemaRegistry::new();
@@ -11409,16 +11432,15 @@ mod expand_same_config_deferred_for_tests {
             })
             .seal(DataSourceValues::empty());
 
-        let out = prepared
-            .expand_parsed(
-                &mut parsed,
-                &schemas,
-                &HashMap::new(),
-                DeferredForWarningPolicy::Suppress,
-                &ProviderRouter::new(),
-                &identity_context,
-            )
-            .expect("deferred-for expansion should succeed");
+        let out = futures::executor::block_on(prepared.expand_parsed(
+            &mut parsed,
+            &schemas,
+            &HashMap::new(),
+            DeferredForWarningPolicy::Suppress,
+            &ProviderRouter::new(),
+            &identity_context,
+        ))
+        .expect("deferred-for expansion should succeed");
         assert!(
             !out.printed_warnings,
             "verification must not print warnings"
@@ -11530,7 +11552,7 @@ mod expand_same_config_deferred_for_tests {
         );
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11603,7 +11625,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", unknown_account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11655,7 +11677,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11692,7 +11714,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11736,7 +11758,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let states = states_with_cert(&parsed, "account_ids", account_ids());
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let pre_order: Vec<String> = sorted.iter().map(|r| r.id.to_string()).collect();
@@ -11794,7 +11816,7 @@ mod expand_same_config_deferred_for_tests {
         // stay in residual (carina#3128 placeholder), NOT mis-expand.
         let parsed = parse(SRC, &ProviderContext::default()).expect("parse");
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty_states: HashMap<ResourceId, State> = HashMap::new();
@@ -11859,7 +11881,7 @@ mod expand_same_config_deferred_for_tests {
         let parsed = parse(src, &ProviderContext::default()).expect("parse");
         assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("upstream deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -11946,7 +11968,7 @@ mod expand_same_config_deferred_for_tests {
         )]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("chained deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -12054,7 +12076,7 @@ mod expand_same_config_deferred_for_tests {
         )]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("moved-target fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -12176,7 +12198,7 @@ mod expand_same_config_deferred_for_tests {
         ]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("multi-child deferred-for fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -12301,7 +12323,7 @@ mod expand_same_config_deferred_for_tests {
         ]));
         let states = states_with_cert(&parsed, "domain_validation_options", dvo);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("already-refreshed fixture has no leftover parser placeholders");
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
 
@@ -12400,7 +12422,7 @@ mod using_line_format_tests {
             .parse()
             .unwrap();
         assert_eq!(
-            format_provider_using_line("awscc", "ap-northeast-1", None, Some(&source),),
+            format_provider_using_line("awscc", Some("ap-northeast-1"), None, Some(&source)),
             "Using awscc (region: ap-northeast-1, instance=default, \
              source: github.com/carina-rs/carina-provider-awscc)",
         );
@@ -12413,7 +12435,7 @@ mod using_line_format_tests {
         // identify what got wired up.
         let source = "github.com/carina-rs/carina-provider-aws".parse().unwrap();
         assert_eq!(
-            format_provider_using_line("aws", "us-east-1", Some("us"), Some(&source),),
+            format_provider_using_line("aws", Some("us-east-1"), Some("us"), Some(&source)),
             "Using aws (region: us-east-1, instance=us, \
              source: github.com/carina-rs/carina-provider-aws)",
         );
@@ -12424,7 +12446,7 @@ mod using_line_format_tests {
         // The kind's default instance must be labeled "instance=default"
         // explicitly, not omitted — the omission is what made the old
         // default-line and named-line shapes diverge.
-        let line = format_provider_using_line("aws", "ap-northeast-1", None, None);
+        let line = format_provider_using_line("aws", Some("ap-northeast-1"), None, None);
         assert!(
             line.contains("instance=default"),
             "default instance must surface as 'instance=default'; got: {line}",
@@ -12439,10 +12461,29 @@ mod using_line_format_tests {
         // ("AWS provider"). The old named-instance path used
         // display_name, which made the two log lines disagree on
         // what to call the same construct.
-        let line = format_provider_using_line("aws", "us-east-1", Some("us"), None);
+        let line = format_provider_using_line("aws", Some("us-east-1"), Some("us"), None);
         assert!(
             line.starts_with("Using aws "),
             "kind label must be the kind name, not a display name; got: {line}",
+        );
+    }
+
+    #[test]
+    fn default_instance_without_region_with_source() {
+        let source = "github.com/carina-rs/carina-provider-github"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            format_provider_using_line("github", None, None, Some(&source)),
+            "Using github (instance=default, source: github.com/carina-rs/carina-provider-github)",
+        );
+    }
+
+    #[test]
+    fn named_instance_without_region_or_source() {
+        assert_eq!(
+            format_provider_using_line("github", None, Some("team"), None),
+            "Using github (instance=team)",
         );
     }
 }
@@ -13146,10 +13187,6 @@ mod resolved_value_constraint_gate {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -13271,10 +13308,6 @@ mod resolved_value_constraint_gate {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
         }
 
         fn create_provider(
@@ -13891,6 +13924,7 @@ exports { team_prefix: String = "x" }"#,
             &remote_bindings,
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("resolved-value violations must be represented by the plan");
@@ -13969,6 +14003,7 @@ exports { team_prefix: String = "x" }"#,
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("module violations must be represented by the plan");
@@ -14129,7 +14164,7 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 &carina_core::parser::ProviderContext::default(),
             )
             .unwrap()
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .unwrap()
             .providers
         } else {
@@ -14217,4 +14252,81 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
         );
         assert_eq!(runtime.provider_load_count(), 1);
     }
+}
+
+#[tokio::test]
+async fn round2_binding_stability_reuses_normalized_inputs() {
+    struct AlreadyNormalized;
+    impl ProviderNormalizer for AlreadyNormalized {
+        fn normalize_desired<'a>(
+            &'a self,
+            _: &'a mut [carina_core::resource::ProviderResource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "desired values must not be normalized again",
+                ))
+            })
+        }
+        fn normalize_state<'a>(
+            &'a self,
+            _: &'a mut carina_core::provider::StateTransformMap,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "read values must not be normalized again",
+                ))
+            })
+        }
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _: &'a mut carina_core::provider::StateTransformMap,
+            _: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            carina_core::provider::ready_noop()
+        }
+    }
+    let parsed = parse("", &carina_core::parser::ProviderContext::default())
+        .unwrap()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let resource = Resource::with_provider("test", "test.Widget", "example", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("normalized".into())),
+    );
+    let state =
+        State::existing(resource.id.clone(), resource.resolved_attributes()).with_identifier("id");
+    let current = HashMap::from([(resource.id.clone(), Current::from_state(state))]);
+    let mut provider = comparison_provider_for_resources(&schemas, std::slice::from_ref(&resource));
+    provider.add_normalizer("test", Box::new(AlreadyNormalized));
+    let saved = carina_core::provider::RawSavedAttrs::default().lift(&schemas);
+    let stability = derive_managed_binding_stability(
+        &parsed,
+        std::slice::from_ref(&resource),
+        &current,
+        &DataSourceValues::empty(),
+        &schemas,
+        &saved,
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &provider,
+        &mut carina_core::references::ReferencePreparation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stability[&resource.id],
+        carina_core::binding_index::ManagedBindingStability::NoPlannedEffect
+    );
 }

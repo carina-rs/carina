@@ -1,4 +1,5 @@
 use super::comparison::SavedAttr;
+use super::diff_for_test as diff;
 use super::{create_plan_for_tests as create_plan, *};
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
@@ -22,8 +23,8 @@ use std::sync::LazyLock;
 static EXACT_SCOPE: ReferenceScope = ReferenceScope::Unavailable;
 static NO_REFERENCE_FORMS: LazyLock<ReferenceForms> = LazyLock::new(ReferenceForms::new);
 
-fn exact_comparison_context() -> ComparisonContext<'static> {
-    ComparisonContext::for_test(&EXACT_SCOPE, &NO_REFERENCE_FORMS)
+fn exact_comparison_context() -> ObservationComparison<'static> {
+    ObservationComparison::for_test(&EXACT_SCOPE, &NO_REFERENCE_FORMS)
 }
 
 fn type_aware_equal(
@@ -43,15 +44,24 @@ fn find_changed_attributes(
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Vec<String> {
-    super::comparison::find_changed_attributes(
-        desired,
-        current,
-        saved,
-        nested_write_only,
-        prev_explicit,
-        schema,
-        &exact_comparison_context(),
-    )
+    super::exact_comparison_schema_for_tests()
+        .with_references(
+            &crate::references::prepare_empty_for_tests(),
+            &ResourceId::with_identity("test.Resource", "example"),
+            |context| {
+                super::comparison::find_changed_attributes(
+                    desired,
+                    current,
+                    saved,
+                    nested_write_only,
+                    prev_explicit,
+                    schema,
+                    context,
+                    &exact_comparison_context(),
+                )
+            },
+        )
+        .unwrap()
 }
 
 fn key_should_enter_patch(
@@ -82,7 +92,7 @@ fn diff_test(
         saved,
         prev_explicit,
         schema,
-        &exact_comparison_context(),
+        &super::exact_comparison_schema_for_tests(),
     )
 }
 
@@ -154,8 +164,10 @@ fn ignored_top_level_readable_and_create_only_attributes_do_not_diff() {
             &saved,
             None,
             Some(schema),
-            &exact_comparison_context(),
-        ),
+            &super::exact_comparison_schema_for_tests(),
+            &crate::references::prepare_empty_for_tests(),
+        )
+        .unwrap(),
         Diff::NoChange(_)
     ));
 }
@@ -187,8 +199,10 @@ fn resolved_ignore_changes_without_comparison_schema_does_not_panic() {
             &saved,
             None,
             None,
-            &exact_comparison_context(),
-        ),
+            &super::exact_comparison_schema_for_tests(),
+            &crate::references::prepare_empty_for_tests(),
+        )
+        .unwrap(),
         Diff::NoChange(_)
     ));
 }
@@ -247,8 +261,10 @@ fn ignored_readable_struct_leaf_does_not_hide_changed_sibling() {
         &saved,
         None,
         Some(schema),
-        &exact_comparison_context(),
+        &super::exact_comparison_schema_for_tests(),
+        &crate::references::prepare_empty_for_tests(),
     )
+    .unwrap()
     else {
         panic!("memory change must still produce an update")
     };
@@ -290,7 +306,7 @@ fn string_value(value: &str) -> Value {
 #[test]
 fn refined_string_reference_form_equates_bare_name_and_local_arn() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(super::type_aware_equal(
         &string_value("processor"),
@@ -311,7 +327,7 @@ fn refined_string_applies_to_dsl_before_reference_form_canonicalization() {
         None,
         Some(crate::schema::DslTransform::StripSuffix("_api".to_string())),
     );
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(super::type_aware_equal(
         &string_value("processor_api"),
@@ -335,7 +351,7 @@ fn reference_scope_rejects_placeholder_text() {
 #[test]
 fn refined_string_reference_form_rejects_cross_account_arn_for_local_name() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -349,7 +365,7 @@ fn refined_string_reference_form_rejects_cross_account_arn_for_local_name() {
 #[test]
 fn refined_string_reference_form_rejects_qualified_arn_for_bare_name() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -363,7 +379,7 @@ fn refined_string_reference_form_rejects_qualified_arn_for_bare_name() {
 #[test]
 fn refined_string_reference_form_keeps_different_names_and_arns_distinct() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -384,7 +400,7 @@ fn refined_string_reference_form_keeps_different_names_and_arns_distinct() {
 #[test]
 fn refined_string_reference_form_is_exact_when_scope_is_unavailable() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(ReferenceScope::Unavailable);
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
 
     assert!(!super::type_aware_equal(
         &string_value("processor"),
@@ -399,7 +415,7 @@ fn refined_string_reference_form_is_exact_when_scope_is_unavailable() {
 fn union_uses_refined_string_reference_form_member() {
     let (scope, forms, string_type) =
         lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
     let union = AttributeType::union(vec![AttributeType::int(), string_type]);
 
     assert!(super::type_aware_equal(
@@ -414,7 +430,6 @@ fn union_uses_refined_string_reference_form_member() {
 #[test]
 fn create_only_reference_form_equivalence_suppresses_replace() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
     let schema = ResourceSchema::new("lambda.Permission").attribute(
         crate::schema::CompiledAttributeSchema::optional("function_name", attr_type)
             .create_only()
@@ -431,7 +446,14 @@ fn create_only_reference_form_equivalence_suppresses_replace() {
     )
     .with_identifier("permission-id");
 
-    let result = super::diff_test(&desired, &current, None, None, Some(&schema), &context);
+    let result = super::diff_test(
+        &desired,
+        &current,
+        None,
+        None,
+        Some(&schema),
+        &ComparisonSchema::for_test(&scope, &forms),
+    );
 
     assert!(matches!(result, Diff::NoChange(_)), "got {result:?}");
 }
@@ -439,7 +461,7 @@ fn create_only_reference_form_equivalence_suppresses_replace() {
 #[test]
 fn apply_time_patch_omits_reference_form_equivalent_key() {
     let (scope, forms, attr_type) = lambda_function_reference_fixture(available_reference_scope());
-    let context = ComparisonContext::for_test(&scope, &forms);
+    let context = ObservationComparison::for_test(&scope, &forms);
     let current = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");
     let desired = string_value("processor");
 
@@ -2289,6 +2311,7 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
             from: Some(&current),
             to: &desired,
             saved: Some(SavedAttr {
+                origins: None,
                 views: crate::resource::SavedValueViews::same(&saved),
                 authoring: &ExplicitFields::Unrecorded,
             }),
