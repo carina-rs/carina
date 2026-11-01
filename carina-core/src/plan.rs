@@ -18,8 +18,8 @@ use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
 pub use crate::resource::PreventDestroySource;
 use crate::resource::{
-    DeposedKey, Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity,
-    Value,
+    CanonicalComparisonAttributes, DeposedKey, Directives, ResolvedResource, ResolvedResourceId,
+    ResourceId, ResourceIdentity, Value,
 };
 pub use crate::resource::{ModuleSource, SavedModuleSource};
 
@@ -624,6 +624,8 @@ impl IgnoredChangeSummary {
 ))]
 pub struct Plan<S = ModuleSource> {
     effects: Vec<EffectWithSource<S>>,
+    #[serde(skip)]
+    comparison_attributes: HashMap<ResourceId, CanonicalComparisonAttributes>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ignored_change_summaries: Vec<IgnoredChangeSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -643,6 +645,7 @@ impl<S> Default for Plan<S> {
     fn default() -> Self {
         Self {
             effects: Vec::new(),
+            comparison_attributes: HashMap::new(),
             ignored_change_summaries: Vec::new(),
             replace_display: Vec::new(),
             permanent_name_overrides: Vec::new(),
@@ -653,6 +656,40 @@ impl<S> Default for Plan<S> {
 }
 
 pub type SavedPlan = Plan<SavedModuleSource>;
+
+fn comparison_attributes_for_effects<S>(
+    effects: &[Effect<S>],
+    schemas: &crate::schema::SchemaRegistry,
+) -> HashMap<ResourceId, CanonicalComparisonAttributes> {
+    effects
+        .iter()
+        .filter_map(|effect| {
+            let resource = match effect {
+                Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => resource,
+                Effect::Update { to, .. } => to,
+                Effect::Read { .. }
+                | Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. }
+                | Effect::ReleaseListKeys { .. }
+                | Effect::Wait { .. }
+                | Effect::DeferredCreate { .. }
+                | Effect::DeferredReplace(_) => return None,
+            };
+            let schema = schemas
+                .get_for(resource)
+                .map(|schema| schema.schema().as_schema());
+            Some((
+                resource.id.clone(),
+                CanonicalComparisonAttributes::from_attributes(
+                    resource.resolved_attributes(),
+                    schema,
+                ),
+            ))
+        })
+        .collect()
+}
 
 /// Deserialized saved-plan effects before managed resources have crossed the
 /// fingerprint-checked schema-resolution boundary.
@@ -675,6 +712,7 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
     fn from(plan: SavedPlan) -> Self {
         let Plan {
             effects,
+            comparison_attributes: _comparison_attributes,
             ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
@@ -753,11 +791,14 @@ impl UnresolvedSavedPlan {
             errors,
             abandoned_deposed,
         } = self;
+        let effects = effects
+            .into_iter()
+            .map(|effect| effect.resolve_with_schemas(schemas))
+            .collect::<Result<Vec<_>, _>>()?;
+        let comparison_attributes = comparison_attributes_for_effects(&effects, schemas);
         Ok(Plan {
-            effects: effects
-                .into_iter()
-                .map(|effect| effect.resolve_with_schemas(schemas))
-                .collect::<Result<Vec<_>, _>>()?,
+            effects,
+            comparison_attributes,
             ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
@@ -771,6 +812,7 @@ impl From<Plan> for SavedPlan {
     fn from(plan: Plan) -> Self {
         let Plan {
             effects,
+            comparison_attributes,
             ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
@@ -779,6 +821,7 @@ impl From<Plan> for SavedPlan {
         } = plan;
         Self {
             effects: effects.into_iter().map(SavedEffect::from).collect(),
+            comparison_attributes,
             ignored_change_summaries,
             replace_display,
             permanent_name_overrides,
@@ -854,6 +897,21 @@ impl<S> Plan<S> {
         &self.effects
     }
 
+    pub(crate) fn record_comparison_attributes(
+        &mut self,
+        id: ResourceId,
+        attributes: CanonicalComparisonAttributes,
+    ) {
+        self.comparison_attributes.insert(id, attributes);
+    }
+
+    pub(crate) fn comparison_attributes(
+        &self,
+        id: &ResourceId,
+    ) -> Option<&CanonicalComparisonAttributes> {
+        self.comparison_attributes.get(id)
+    }
+
     pub fn ignored_change_summaries(&self) -> &[IgnoredChangeSummary] {
         &self.ignored_change_summaries
     }
@@ -915,6 +973,7 @@ impl<S> Plan<S> {
     pub fn contains_redacted_secret_placeholders(&self) -> bool {
         let Plan {
             effects,
+            comparison_attributes: _comparison_attributes,
             ignored_change_summaries: _ignored_change_summaries,
             replace_display,
             permanent_name_overrides: _permanent_name_overrides,

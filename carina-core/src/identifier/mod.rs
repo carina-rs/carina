@@ -2168,7 +2168,10 @@ impl StateIdentityValues {
         observed_attributes: &HashMap<String, Value>,
     ) -> Self {
         let mut canonical = observed_attributes.clone();
-        crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
+        crate::value::canonicalize_state_attribute_map_with_schema(
+            &mut canonical,
+            schema.as_schema(),
+        );
         let resource_schema = schema.as_schema();
         let create_only = resource_schema
             .create_only_attributes()
@@ -2598,19 +2601,6 @@ fn desired_comparable_values<'attribute, S>(
         .into_iter()
         .filter_map(|attribute| {
             if prefer_prefixes && let Some(prefix) = resource.prefixes.get(attribute) {
-                if let Some(value) = resource.get_attr(attribute)
-                    && matches!(
-                        canonical_or_resolved_create_only_value(
-                            value,
-                            schema,
-                            attribute,
-                            find_state_by_binding,
-                        ),
-                        Ok(None)
-                    )
-                {
-                    return None;
-                }
                 return Some((
                     attribute.to_string(),
                     DesiredCreateOnlyValue::Prefix(prefix.clone()),
@@ -2794,7 +2784,10 @@ impl StateCreateOnlyValues {
         observed_attributes: &HashMap<String, Value>,
     ) -> Self {
         let mut canonical = observed_attributes.clone();
-        crate::value::canonicalize_state_attribute_map_with_schema(&mut canonical, schema);
+        crate::value::canonicalize_state_attribute_map_with_schema(
+            &mut canonical,
+            schema.as_schema(),
+        );
         let values = schema
             .as_schema()
             .create_only_attributes()

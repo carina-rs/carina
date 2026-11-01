@@ -66,6 +66,7 @@ struct HistoricalListKeyRelease {
 struct HistoricalUpdateAttributes {
     attributes: HashMap<String, Value>,
     stored_attributes: Option<HashMap<String, Value>>,
+    comparison_attributes: CanonicalComparisonAttributes,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +121,14 @@ impl HistoricalDisplayAttributes {
             match effect {
                 Effect::Update { from, to, .. } => {
                     let attributes = display.filter_released(&from.id, from.attributes.clone());
+                    let comparison_attributes = plan
+                        .comparison_attributes(&to.id)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            CanonicalComparisonAttributes::from_canonicalized(
+                                to.resolved_attributes(),
+                            )
+                        });
                     display.updates.insert(
                         from.id.clone(),
                         HistoricalUpdateAttributes {
@@ -128,6 +137,7 @@ impl HistoricalDisplayAttributes {
                                 &to.attributes,
                             ),
                             stored_attributes: None,
+                            comparison_attributes,
                         },
                     );
                 }
@@ -237,6 +247,11 @@ impl HistoricalDisplayAttributes {
         let persisted_masked =
             mask_attributes_using_persisted_shape(&filtered_provider, persisted_attributes);
         let desired_shape = self.updates.get(&id).map(|entry| &entry.attributes);
+        let comparison_attributes = self
+            .updates
+            .get(&id)
+            .map(|entry| entry.comparison_attributes.clone())
+            .unwrap_or_default();
         let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
         // Keep the stored anchor unfiltered: its list indices must stay
         // aligned with `prev_explicit::ListElements` so projection can still
@@ -248,6 +263,7 @@ impl HistoricalDisplayAttributes {
             HistoricalUpdateAttributes {
                 attributes: masked,
                 stored_attributes,
+                comparison_attributes,
             },
         );
     }
@@ -887,24 +903,28 @@ fn build_update_rows<S>(
     comparison: ComparisonContext<'_>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
-    let from_attributes = &historical.attributes;
-    let mut display_attributes = to.attributes.clone();
+    let from_attributes =
+        CanonicalComparisonAttributes::from_canonicalized(historical.attributes.clone());
+    let stored_attributes = historical
+        .stored_attributes
+        .clone()
+        .map(CanonicalComparisonAttributes::from_canonicalized);
+    let mut display_attributes = historical
+        .comparison_attributes
+        .clone()
+        .into_iter()
+        .collect();
     to.resolved_ignore_changes
-        .mask_desired_readable_leaves(&mut display_attributes, from_attributes);
-    let comparison_attributes = CanonicalComparisonAttributes::from_attributes(
-        display_attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        schema,
-    );
+        .mask_desired_readable_leaves(&mut display_attributes, &historical.attributes);
+    let comparison_attributes =
+        CanonicalComparisonAttributes::from_canonicalized(display_attributes.into_iter().collect());
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
     let projected = project_from_attrs(
-        from_attributes,
-        historical.stored_attributes.as_ref(),
-        &to.attributes,
+        &from_attributes,
+        stored_attributes.as_ref(),
+        &comparison_attributes,
         explicit,
         schema,
         comparison,
@@ -913,9 +933,9 @@ fn build_update_rows<S>(
 
     let attr_rows = build_attribute_diff_rows(
         to,
-        comparison_attributes.as_map(),
+        &comparison_attributes,
         AttributeDiffContext::for_update(
-            from_attributes,
+            &from_attributes,
             from_attrs_projected,
             schema,
             defs,
@@ -932,7 +952,7 @@ fn build_update_rows<S>(
     // removals (refs awscc#206).
     let mut removed_keys: Vec<_> = changed_attributes
         .iter()
-        .filter(|k| !comparison_attributes.as_map().contains_key(k.as_str()))
+        .filter(|key| !to.attributes.contains_key(key.as_str()))
         .collect();
     removed_keys.sort();
     for key in removed_keys {
@@ -950,7 +970,7 @@ fn build_update_rows<S>(
     if detail == DetailLevel::Full {
         let unchanged_count = compute_unchanged_count(
             from_attrs_projected,
-            comparison_attributes.as_map(),
+            &comparison_attributes,
             None,
             schema,
             &comparison,
@@ -1032,8 +1052,8 @@ fn string_list_diff_row(
 }
 
 struct AttributeDiffContext<'a> {
-    from_attrs_raw: &'a HashMap<String, Value>,
-    from_attrs_projected: &'a HashMap<String, Value>,
+    from_attrs_raw: &'a CanonicalComparisonAttributes,
+    from_attrs_projected: &'a CanonicalComparisonAttributes,
     schema: Option<&'a ResourceSchema>,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
     detail: DetailLevel,
@@ -1058,8 +1078,8 @@ struct ReplacementDiffContext<'a> {
 
 impl<'a> AttributeDiffContext<'a> {
     fn for_update(
-        from_attrs_raw: &'a HashMap<String, Value>,
-        from_attrs_projected: &'a HashMap<String, Value>,
+        from_attrs_raw: &'a CanonicalComparisonAttributes,
+        from_attrs_projected: &'a CanonicalComparisonAttributes,
         schema: Option<&'a ResourceSchema>,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
@@ -1081,8 +1101,8 @@ impl<'a> AttributeDiffContext<'a> {
     }
 
     fn for_replace(
-        from_attrs_raw: &'a HashMap<String, Value>,
-        from_attrs_projected: &'a HashMap<String, Value>,
+        from_attrs_raw: &'a CanonicalComparisonAttributes,
+        from_attrs_projected: &'a CanonicalComparisonAttributes,
         schema: Option<&'a ResourceSchema>,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
         detail: DetailLevel,
@@ -1110,6 +1130,15 @@ impl<'a> AttributeDiffContext<'a> {
 
     fn is_whole_value_authored(&self, key: &str) -> bool {
         is_whole_value(self.explicit_for_key(key))
+    }
+
+    fn payload_key_is_changed(&self, key: &str) -> bool {
+        match self.leaf_provenance {
+            DetailLeafProvenance::DecidedByPlan(keys) => keys.iter().any(|changed| changed == key),
+            DetailLeafProvenance::Recorded(_) => self
+                .forces_replacement_keys
+                .is_some_and(|keys| keys.contains(key)),
+        }
     }
 
     fn leaf_provenance(&self, key: &str) -> LeafProvenance<'_> {
@@ -1165,9 +1194,9 @@ fn is_whole_value(explicit: Option<&ProjectedAuthoring>) -> bool {
 }
 
 fn project_from_attrs(
-    from_attributes: &HashMap<String, Value>,
-    stored_attributes: Option<&HashMap<String, Value>>,
-    desired_attributes: &IndexMap<String, Value>,
+    from_attributes: &CanonicalComparisonAttributes,
+    stored_attributes: Option<&CanonicalComparisonAttributes>,
+    desired_attributes: &CanonicalComparisonAttributes,
     explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     comparison: ComparisonContext<'_>,
@@ -1177,7 +1206,7 @@ fn project_from_attrs(
     // the unchanged-count summary (refs awscc#206). Stored values anchor
     // per-element list records when present; otherwise the projection uses
     // the legacy union fallback.
-    let empty_stored = HashMap::new();
+    let empty_stored = CanonicalComparisonAttributes::default();
     match explicit {
         Some(explicit) => ExplicitProjection::for_desired(
             stored_attributes.unwrap_or(&empty_stored),
@@ -1187,16 +1216,14 @@ fn project_from_attrs(
             &comparison,
         )
         .project_attributes(from_attributes.clone()),
-        None => {
-            crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None, schema)
-        }
+        None => crate::explicit::ProjectedAttributes::unprojected(from_attributes.clone(), None),
     }
 }
 
 fn project_previous_attrs(
-    previous_attributes: &HashMap<String, Value>,
-    stored_attributes: Option<&HashMap<String, Value>>,
-    desired_attributes: &IndexMap<String, Value>,
+    previous_attributes: &CanonicalComparisonAttributes,
+    stored_attributes: Option<&CanonicalComparisonAttributes>,
+    desired_attributes: &CanonicalComparisonAttributes,
     explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     comparison: ComparisonContext<'_>,
@@ -1215,13 +1242,22 @@ fn project_previous_attrs(
 
 fn build_attribute_diff_rows<S>(
     to: &crate::resource::Resource<S>,
-    to_attributes: &HashMap<String, Value>,
+    to_attributes: &CanonicalComparisonAttributes,
     ctx: AttributeDiffContext<'_>,
 ) -> AttributeDiffRows {
     let mut rows = Vec::new();
 
-    let mut keys: Vec<_> = to_attributes.keys().collect();
+    let mut keys: Vec<_> = to_attributes.keys().cloned().collect();
+    keys.extend(
+        to.attributes
+            .keys()
+            .filter(|key| {
+                !to_attributes.contains_key(key) && ctx.payload_key_is_changed(key.as_str())
+            })
+            .cloned(),
+    );
     keys.sort();
+    keys.dedup();
 
     // Attributes where `semantically_equal` reported a diff but the
     // per-shape builder produced no display rows. Two shapes today:
@@ -1233,7 +1269,11 @@ fn build_attribute_diff_rows<S>(
     let mut effectively_unchanged: usize = 0;
 
     for key in keys {
-        let new_value = &to_attributes[key];
+        let payload_only = !to_attributes.contains_key(&key);
+        let new_value = to_attributes
+            .get(&key)
+            .or_else(|| to.attributes.get(&key))
+            .expect("display keys come from a desired value view");
         // Look up `old_value` from the projected map so MapDiff /
         // ListOfMapsDiff rows don't surface server-side default leaves
         // the user never authored (refs awscc#206). The same value the
@@ -1243,13 +1283,13 @@ fn build_attribute_diff_rows<S>(
         let forces_replacement = ctx
             .forces_replacement_keys
             .is_some_and(|keys| keys.contains(key.as_str()));
-        let old_value = ctx.from_attrs_projected.get(key).or_else(|| {
+        let old_value = ctx.from_attrs_projected.get(&key).or_else(|| {
             // A forcing key can be absent from the authoring projection (for
             // example, a legacy replacement record). Fall back to raw only in
             // that case; when projection retained the key, keep its nested
             // server-added fields/elements filtered for replacement display.
             if forces_replacement {
-                ctx.from_attrs_raw.get(key)
+                ctx.from_attrs_raw.get(&key)
             } else {
                 None
             }
@@ -1267,9 +1307,9 @@ fn build_attribute_diff_rows<S>(
             defs: ctx.defs,
         });
         let is_same = !key_should_enter_patch(
-            key,
+            &key,
             ctx.schema,
-            ctx.leaf_provenance(key),
+            ctx.leaf_provenance(&key),
             AttrComparison {
                 from: old_value,
                 to: new_value,
@@ -1290,7 +1330,7 @@ fn build_attribute_diff_rows<S>(
                 let new_str = ctx
                     .cascade_ref_hints
                     .iter()
-                    .find(|(attr, _)| attr == key)
+                    .find(|(attr, _)| attr == &key)
                     .map(|(_, hint)| render_other(hint.clone()))
                     .unwrap_or_else(|| render_value(new_value));
                 rows.push(DetailRow::ReplaceCascade {
@@ -1302,12 +1342,25 @@ fn build_attribute_diff_rows<S>(
             continue;
         }
 
+        if payload_only {
+            let old = old_value
+                .map(render_value)
+                .unwrap_or_else(|| render_other("(none)"));
+            rows.push(changed_row(
+                key,
+                old,
+                render_value(new_value),
+                forces_replacement,
+            ));
+            continue;
+        }
+
         // An attribute-level WholeValue means the entire value is authoritative.
         // This is the carried-list ambiguity fallback: using
         // element-level display pairing here could hide the pending removal
         // behind the same guessed identity the state record intentionally
         // refused to claim.
-        if ctx.is_whole_value_authored(key) && is_list_of_maps(new_value) {
+        if ctx.is_whole_value_authored(&key) && is_list_of_maps(new_value) {
             let old = old_value
                 .map(render_value)
                 .unwrap_or_else(|| render_other("(none)"));
@@ -1322,7 +1375,7 @@ fn build_attribute_diff_rows<S>(
 
         if is_list_of_maps(new_value) {
             match build_list_of_maps_diff_row(
-                key,
+                &key,
                 old_value,
                 new_value,
                 attr_type,
@@ -1337,7 +1390,7 @@ fn build_attribute_diff_rows<S>(
             }
         } else if should_render_as_map_diff(old_value, new_value) {
             match build_map_diff_row(
-                key,
+                &key,
                 old_value,
                 new_value,
                 attr_type,
@@ -1345,7 +1398,7 @@ fn build_attribute_diff_rows<S>(
                 ctx.detail,
                 forces_replacement,
                 (key == "tags").then_some(&to.default_tag_keys),
-                ctx.explicit_for_key(key),
+                ctx.explicit_for_key(&key),
                 ctx.comparison,
             ) {
                 Some(row) => rows.push(row),
@@ -1442,15 +1495,23 @@ pub fn build_replace_detail_rows_from_display<S>(
     let registry = registry
         .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: to.id.clone() })?;
     let resolved = provider.comparison_for(registry, &to.id)?;
+    let schema = Some(resolved.owner_schema().schema().as_schema());
+    let comparison_attributes = plan
+        .comparison_attributes(&to.id)
+        .cloned()
+        .unwrap_or_else(|| {
+            CanonicalComparisonAttributes::from_attributes(to.resolved_attributes(), schema)
+        });
     Ok(build_replace_rows_from_attributes(
         &historical_attributes.attributes,
         historical_attributes.stored_attributes.as_ref(),
         &historical_attributes.nested_write_only,
         to,
+        &comparison_attributes,
         replacement.changed_create_only,
         replacement.temporary_name,
         replacement.cascade_ref_hints,
-        Some(resolved.owner_schema().schema().as_schema()),
+        schema,
         detail,
         explicit,
         *resolved.context(),
@@ -1463,6 +1524,7 @@ fn build_replace_rows_from_attributes<S>(
     stored_attributes: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     to: &crate::resource::Resource<S>,
+    comparison_attributes: &CanonicalComparisonAttributes,
     changed_create_only: &[String],
     temporary_name: Option<&crate::effect::TemporaryName>,
     cascade_ref_hints: &[(String, String)],
@@ -1475,24 +1537,27 @@ fn build_replace_rows_from_attributes<S>(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
+    let previous_attributes =
+        CanonicalComparisonAttributes::from_canonicalized(previous_attributes.clone());
+    let stored_attributes = stored_attributes
+        .cloned()
+        .map(CanonicalComparisonAttributes::from_canonicalized);
     let projected = project_previous_attrs(
-        previous_attributes,
-        stored_attributes,
-        &to.attributes,
+        &previous_attributes,
+        stored_attributes.as_ref(),
+        comparison_attributes,
         explicit,
         schema,
         comparison,
     );
     let from_attrs_projected = projected.attributes();
-    let comparison_attributes =
-        CanonicalComparisonAttributes::from_attributes(to.resolved_attributes(), schema);
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
     let attr_rows = build_attribute_diff_rows(
         to,
-        comparison_attributes.as_map(),
+        comparison_attributes,
         AttributeDiffContext::for_replace(
-            previous_attributes,
+            &previous_attributes,
             from_attrs_projected,
             schema,
             defs,
@@ -1511,7 +1576,7 @@ fn build_replace_rows_from_attributes<S>(
     // Show removed create-only attributes.
     let mut removed_force_keys: Vec<_> = changed_create_only
         .iter()
-        .filter(|key| !comparison_attributes.as_map().contains_key(key.as_str()))
+        .filter(|key| !to.attributes.contains_key(key.as_str()))
         .collect();
     removed_force_keys.sort();
     for key in removed_force_keys {
@@ -1527,8 +1592,7 @@ fn build_replace_rows_from_attributes<S>(
     let mut removed_non_force_keys: Vec<_> = from_attrs_projected
         .keys()
         .filter(|key| {
-            !comparison_attributes.as_map().contains_key(key.as_str())
-                && !force_keys.contains(key.as_str())
+            !to.attributes.contains_key(key.as_str()) && !force_keys.contains(key.as_str())
         })
         .collect();
     removed_non_force_keys.sort();
@@ -1557,7 +1621,7 @@ fn build_replace_rows_from_attributes<S>(
     if detail == DetailLevel::Full {
         let unchanged_count = compute_unchanged_count(
             from_attrs_projected,
-            comparison_attributes.as_map(),
+            comparison_attributes,
             Some(&force_keys),
             schema,
             &comparison,
@@ -2579,6 +2643,15 @@ mod tests {
     ) -> Vec<DetailRow> {
         let mut plan = Plan::new();
         plan.add(effect.clone());
+        if let Effect::Update { to, .. } = effect {
+            let schema = registry
+                .and_then(|registry| registry.get_for(to))
+                .map(|schema| schema.schema().as_schema());
+            plan.record_comparison_attributes(
+                to.id.clone(),
+                CanonicalComparisonAttributes::from_attributes(to.resolved_attributes(), schema),
+            );
+        }
         let mut historical_attributes = HistoricalDisplayAttributes::for_plan(&plan);
         if let Effect::Update { from, .. } = effect
             && let Some(update) = historical_attributes.updates.get_mut(&from.id)
@@ -2627,11 +2700,14 @@ mod tests {
             .iter()
             .map(|attr| (*attr).to_string())
             .collect();
+        let comparison_attributes =
+            CanonicalComparisonAttributes::from_canonicalized(to.resolved_attributes());
         build_replace_rows_from_attributes(
             &from.attributes,
             Some(&from.attributes),
             &NestedWriteOnlyRecord::new(),
             &to,
+            &comparison_attributes,
             &changed_create_only,
             None,
             &cascade_ref_hints,
@@ -2765,6 +2841,44 @@ mod tests {
                 DetailRow::Changed { key, .. },
                 DetailRow::HiddenUnchanged { count: 1 }
             ] if key == "name"
+        ));
+    }
+
+    #[test]
+    fn update_rows_render_authored_empty_struct_as_provider_payload() {
+        let id = ResourceId::with_identity("test.Widget", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "label".to_string(),
+                    Value::Concrete(ConcreteValue::String("x".into())),
+                )]))),
+            )]),
+        );
+        let empty_config = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+        let to =
+            Resource::new("test.Widget", "example").with_attribute("config", empty_config.clone());
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("widget-id"),
+            from: Box::new(from),
+            to: resolved(to),
+            changed_attributes: vec!["config".to_string()],
+        };
+
+        let rows = build_detail_rows(
+            &effect,
+            Some(&empty_struct_comparison_registry()),
+            DetailLevel::Full,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            rows.as_slice(),
+            [DetailRow::Changed { key, new, .. }]
+                if key == "config" && new == &render_value(&empty_config)
         ));
     }
 

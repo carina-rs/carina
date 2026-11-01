@@ -2863,6 +2863,93 @@ fn plan_drops_unwritten_empty_all_optional_struct_from_state() {
 }
 
 #[test]
+fn plan_canonicalizes_empty_nested_structs_loaded_from_saved_state() {
+    use crate::provider::RawSavedAttrs;
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let settings = |include_empty_config| {
+        let mut fields = IndexMap::from([(
+            "enabled".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )]);
+        if include_empty_config {
+            fields.insert(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let desired =
+        Resource::new("test.Widget", "example").with_attribute("settings", settings(false));
+    let id = desired.id.clone();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("enabled", AttributeType::bool()).build(),
+                            StructField::optional(
+                                "config",
+                                AttributeType::struct_(
+                                    "Config",
+                                    vec![
+                                        StructField::optional("label", AttributeType::string())
+                                            .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        HashMap::from([(
+            id.clone(),
+            existing_state(
+                id.clone(),
+                HashMap::from([("settings".to_string(), settings(false))]),
+            ),
+        )]),
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+    let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        id,
+        HashMap::from([("settings".to_string(), settings(true))]),
+    )]))
+    .lift(&SchemaRegistry::new());
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &saved,
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "saved values must enter comparison in the same canonical absence form as desired and current"
+    );
+}
+
+#[test]
 fn plan_treats_authored_empty_all_optional_struct_and_empty_state_as_equal() {
     use crate::schema::{AttributeSchema, AttributeType, StructField};
 

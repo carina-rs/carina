@@ -9912,7 +9912,24 @@ impl Current {
             Self::CreateOutcomeUnknown(_unknown) => {}
             Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
         }
-        PlanInputCurrent(self)
+        let comparison_attributes = match &self {
+            Self::Absent(state) => {
+                CanonicalComparisonAttributes::from_canonicalized(state.state().attributes.clone())
+            }
+            Self::Present(present) => CanonicalComparisonAttributes::from_canonicalized(
+                present.state().attributes.clone(),
+            ),
+            Self::MissingIdentifier(state) => {
+                CanonicalComparisonAttributes::from_canonicalized(state.state().attributes.clone())
+            }
+            Self::CreateInFlight(_) | Self::CreateOutcomeUnknown(_) => {
+                CanonicalComparisonAttributes::default()
+            }
+        };
+        PlanInputCurrent {
+            current: self,
+            comparison_attributes,
+        }
     }
 }
 
@@ -9931,7 +9948,10 @@ pub fn fixture_present_current(state: State, identifier: AppliedIdentifier) -> C
 /// Managed current state after plan-only canonicalization and unknown
 /// reconstruction.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PlanInputCurrent(Current);
+pub struct PlanInputCurrent {
+    current: Current,
+    comparison_attributes: CanonicalComparisonAttributes,
+}
 
 impl PlanInputCurrent {
     pub(crate) fn absent(id: ResourceId) -> Self {
@@ -9939,11 +9959,15 @@ impl PlanInputCurrent {
     }
 
     pub fn current(&self) -> &Current {
-        &self.0
+        &self.current
+    }
+
+    pub(crate) fn comparison_attributes(&self) -> &CanonicalComparisonAttributes {
+        &self.comparison_attributes
     }
 
     pub fn into_current(self) -> Current {
-        self.0
+        self.current
     }
 }
 
@@ -9963,7 +9987,7 @@ pub struct PlanInputDesired<'a> {
 /// This is the only map shape accepted by desired/current comparison views
 /// built after the plan-input boundary. Construction applies state-style
 /// post-order canonicalization without mutating the provider-bound resource.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct CanonicalComparisonAttributes {
     attributes: HashMap<String, Value>,
 }
@@ -9974,20 +9998,47 @@ impl CanonicalComparisonAttributes {
         schema: Option<&crate::schema::ResourceSchema>,
     ) -> Self {
         if let Some(schema) = schema {
-            crate::value::canonicalize_state_attribute_map_with_resource_schema(
-                &mut attributes,
-                schema,
-            );
+            crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
         }
         Self { attributes }
     }
 
-    pub(crate) fn as_map(&self) -> &HashMap<String, Value> {
-        &self.attributes
+    pub(crate) fn from_canonicalized(attributes: HashMap<String, Value>) -> Self {
+        Self { attributes }
     }
 
-    pub(crate) fn into_map(self) -> HashMap<String, Value> {
-        self.attributes
+    pub(crate) fn get(&self, key: &str) -> Option<&Value> {
+        self.attributes.get(key)
+    }
+
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.attributes.contains_key(key)
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.attributes.keys()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.attributes.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
+    type Item = (&'a String, &'a Value);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.attributes.iter()
+    }
+}
+
+impl IntoIterator for CanonicalComparisonAttributes {
+    type Item = (String, Value);
+    type IntoIter = std::collections::hash_map::IntoIter<String, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.attributes.into_iter()
     }
 }
 
@@ -9996,8 +10047,8 @@ impl<'a> PlanInputDesired<'a> {
         self.authored
     }
 
-    pub(crate) fn comparison_attributes(&self) -> &HashMap<String, Value> {
-        self.comparison_attributes.as_map()
+    pub(crate) fn comparison_attributes(&self) -> &CanonicalComparisonAttributes {
+        &self.comparison_attributes
     }
 
     pub(crate) fn with_resource_schema(
@@ -10010,13 +10061,6 @@ impl<'a> PlanInputDesired<'a> {
             authored,
             comparison_attributes,
         }
-    }
-
-    pub(crate) fn with_validated_schema(
-        authored: &'a ResolvedResource,
-        schema: Option<&crate::schema::ValidatedResourceSchema>,
-    ) -> Self {
-        Self::with_resource_schema(authored, schema.map(|schema| schema.as_schema()))
     }
 }
 
@@ -10044,11 +10088,10 @@ pub fn plan_input_desired_resources<'a>(
     let comparison = resources
         .iter()
         .map(|authored| {
-            let schema = schemas.get_for(authored.as_resource());
-            PlanInputDesired::with_validated_schema(
-                authored,
-                schema.as_ref().map(|schema| schema.schema()),
-            )
+            let schema = schemas
+                .get_for(authored.as_resource())
+                .map(|schema| schema.schema().as_schema());
+            PlanInputDesired::with_resource_schema(authored, schema)
         })
         .collect();
     PlanInputDesiredResources {

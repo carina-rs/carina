@@ -8,8 +8,9 @@ use indexmap::IndexMap;
 use crate::explicit::{ExplicitFields, ExplicitProjection};
 use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope};
 use crate::resource::{
-    ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, ResolvedIgnoreChanges,
-    SavedValueViews, Value, merge_with_saved, value_at_leaf,
+    ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
+    InterpolationPart, ResolvedIgnoreChanges, SavedValueViews, Value, merge_with_saved,
+    value_at_leaf,
 };
 use crate::schema::{
     AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
@@ -988,17 +989,17 @@ pub(super) struct AttributeChanges {
 }
 
 pub(super) struct AttributeValueViews<'a> {
-    desired: &'a HashMap<String, Value>,
-    current: &'a HashMap<String, Value>,
-    saved: Option<&'a HashMap<String, Value>>,
+    desired: &'a CanonicalComparisonAttributes,
+    current: &'a CanonicalComparisonAttributes,
+    saved: Option<&'a CanonicalComparisonAttributes>,
     nested_write_only: &'a NestedWriteOnlyRecord,
 }
 
 impl<'a> AttributeValueViews<'a> {
     pub(super) fn new(
-        desired: &'a HashMap<String, Value>,
-        current: &'a HashMap<String, Value>,
-        saved: Option<&'a HashMap<String, Value>>,
+        desired: &'a CanonicalComparisonAttributes,
+        current: &'a CanonicalComparisonAttributes,
+        saved: Option<&'a CanonicalComparisonAttributes>,
         nested_write_only: &'a NestedWriteOnlyRecord,
     ) -> Self {
         Self {
@@ -1043,7 +1044,7 @@ pub(super) fn find_changed_attributes_with_ignores(
     // doesn't smuggle server-only fields back into `effective_desired`
     // (refs awscc#206).
     let raw_saved = saved;
-    let empty_stored = HashMap::new();
+    let empty_stored = CanonicalComparisonAttributes::default();
     let projection = prev_explicit.map(|explicit| {
         ExplicitProjection::for_desired(
             raw_saved.unwrap_or(&empty_stored),
@@ -1080,24 +1081,23 @@ pub(super) fn find_changed_attributes_with_ignores(
         let current_leaf = current
             .get(path.attribute())
             .and_then(|value| value_at_leaf(value, path.leaf()));
-        let attr_type = path
-            .leaf()
-            .segments()
-            .is_empty()
-            .then(|| {
-                schema?
-                    .attributes
-                    .get(path.attribute())
-                    .map(|attr| &attr.attr_type)
-            })
-            .flatten();
         let equal = match (desired_leaf, current_leaf) {
             (Some(desired), Some(current)) => {
+                let attr_type = path
+                    .leaf()
+                    .segments()
+                    .is_empty()
+                    .then(|| {
+                        schema?
+                            .attributes
+                            .get(path.attribute())
+                            .map(|attr| &attr.attr_type)
+                    })
+                    .flatten();
                 type_aware_equal(current, desired, attr_type, defs, context)
             }
             (None, None) => true,
-            (Some(_), None) => false,
-            (None, Some(_)) => false,
+            (Some(_), None) | (None, Some(_)) => false,
         };
         if !equal {
             differing_ignored_paths.insert(path.authored());
@@ -1216,8 +1216,13 @@ pub(super) fn find_changed_attributes(
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
 ) -> Vec<String> {
+    let desired = CanonicalComparisonAttributes::from_attributes(desired.clone(), schema);
+    let current = CanonicalComparisonAttributes::from_attributes(current.clone(), schema);
+    let saved = saved
+        .cloned()
+        .map(|saved| CanonicalComparisonAttributes::from_attributes(saved, schema));
     find_changed_attributes_with_ignores(
-        AttributeValueViews::new(desired, current, saved, nested_write_only),
+        AttributeValueViews::new(&desired, &current, saved.as_ref(), nested_write_only),
         prev_explicit,
         schema,
         &ResolvedIgnoreChanges::default(),

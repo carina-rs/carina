@@ -3,12 +3,14 @@
 //! These helpers extract the pure computation logic (no formatting/coloring)
 //! shared by CLI/TUI plan rendering and state refresh reporting.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 
 use crate::differ::ComparisonContext;
-use crate::resource::Value;
+use crate::resource::{CanonicalComparisonAttributes, Value};
 use crate::schema::{
     AttributeType, ResourceSchema, ValidatedResourceSchema, empty_defs_for_schema_walks,
 };
@@ -239,9 +241,9 @@ pub(crate) fn list_element_type<'a>(
 /// `# (n unchanged attributes hidden)` tally would not add up. With
 /// `schema = None`, behavior is the schema-blind `semantically_equal`
 /// path (unchanged for embedded / test callers).
-pub fn compute_unchanged_count(
-    from_attrs: &HashMap<String, Value>,
-    to_attrs: &HashMap<String, Value>,
+pub(crate) fn compute_unchanged_count(
+    from_attrs: &CanonicalComparisonAttributes,
+    to_attrs: &CanonicalComparisonAttributes,
     exclude: Option<&std::collections::HashSet<&str>>,
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
@@ -447,9 +449,11 @@ mod tests {
         exclude: Option<&std::collections::HashSet<&str>>,
         schema: Option<&ResourceSchema>,
     ) -> usize {
+        let from_attrs = CanonicalComparisonAttributes::from_attributes(from_attrs.clone(), schema);
+        let to_attrs = CanonicalComparisonAttributes::from_attributes(to_attrs.clone(), schema);
         super::compute_unchanged_count(
-            from_attrs,
-            to_attrs,
+            &from_attrs,
+            &to_attrs,
             exclude,
             schema,
             &crate::differ::exact_comparison_context_for_tests(),

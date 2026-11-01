@@ -1221,8 +1221,8 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// authored element as [`ExplicitFields::Unrecorded`]. Missing or mismatched
 /// stored lists use the legacy union projection. Schema-aware list pairing
 /// uses the same equality as state writeback.
-pub struct ExplicitProjection<'a> {
-    stored_attributes: &'a HashMap<String, Value>,
+pub(crate) struct ExplicitProjection<'a> {
+    stored_attributes: &'a CanonicalComparisonAttributes,
     desired: ProjectionDesired<'a>,
     explicit: &'a ExplicitFields,
     schema: Option<&'a ResourceSchema>,
@@ -1231,6 +1231,7 @@ pub struct ExplicitProjection<'a> {
 
 enum ProjectionDesired<'a> {
     Attributes(HashMap<&'a str, &'a Value>),
+    #[cfg(test)]
     Conservative,
 }
 
@@ -1257,16 +1258,13 @@ impl ProjectionDesiredValue<'_> {
 impl<'a> ExplicitProjection<'a> {
     /// Build a projection whose server-added classification is checked against
     /// the resource's desired attributes.
-    pub fn for_desired<I>(
-        stored_attributes: &'a HashMap<String, Value>,
-        desired_attributes: I,
+    pub(crate) fn for_desired(
+        stored_attributes: &'a CanonicalComparisonAttributes,
+        desired_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
         comparison: &ComparisonContext<'a>,
-    ) -> Self
-    where
-        I: IntoIterator<Item = (&'a String, &'a Value)>,
-    {
+    ) -> Self {
         Self {
             stored_attributes,
             desired: ProjectionDesired::Attributes(
@@ -1285,8 +1283,9 @@ impl<'a> ExplicitProjection<'a> {
     ///
     /// This mode never treats an `Unrecorded`-paired list element as a proven
     /// server addition, so uncertain elements remain visible.
-    pub fn conservative(
-        stored_attributes: &'a HashMap<String, Value>,
+    #[cfg(test)]
+    pub(crate) fn conservative(
+        stored_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
         comparison: &ComparisonContext<'a>,
@@ -1307,17 +1306,16 @@ impl<'a> ExplicitProjection<'a> {
     /// after applying the legacy union projection. Lists whose stored
     /// alignment is unavailable use that same fallback, so uncertainty remains
     /// visible without resurfacing unauthored fields inside retained elements.
-    pub fn project_attributes(&self, attributes: HashMap<String, Value>) -> ProjectedAttributes {
+    pub(crate) fn project_attributes(
+        &self,
+        attributes: CanonicalComparisonAttributes,
+    ) -> ProjectedAttributes {
         let defs = self
             .schema
             .map(|schema| &schema.defs)
             .unwrap_or(empty_defs_for_schema_walks());
         let ExplicitFields::Struct { children } = self.explicit else {
-            return ProjectedAttributes::canonicalized(
-                attributes,
-                ProjectedAuthoring::from_unprojected(self.explicit),
-                self.schema,
-            );
+            return ProjectedAttributes::unprojected(attributes, Some(self.explicit));
         };
 
         let mut projected_attributes = HashMap::new();
@@ -1337,6 +1335,7 @@ impl<'a> ExplicitProjection<'a> {
                         ProjectionDesiredValue::Present,
                     )
                 }
+                #[cfg(test)]
                 ProjectionDesired::Conservative => ProjectionDesiredValue::Conservative,
             };
             let projected = project_value(
@@ -1362,7 +1361,7 @@ impl<'a> ExplicitProjection<'a> {
 }
 
 /// Values produced by an [`ExplicitProjection`].
-pub struct ProjectedAttributes {
+pub(crate) struct ProjectedAttributes {
     attributes: CanonicalComparisonAttributes,
     pub(crate) authoring: ProjectedAuthoring,
 }
@@ -1380,25 +1379,23 @@ impl ProjectedAttributes {
     }
 
     pub(crate) fn unprojected(
-        attributes: HashMap<String, Value>,
+        attributes: CanonicalComparisonAttributes,
         explicit: Option<&ExplicitFields>,
-        schema: Option<&ResourceSchema>,
     ) -> Self {
-        Self::canonicalized(
+        Self {
             attributes,
-            explicit.map_or(ProjectedAuthoring::Opaque, |explicit| {
+            authoring: explicit.map_or(ProjectedAuthoring::Opaque, |explicit| {
                 ProjectedAuthoring::from_unprojected(explicit)
             }),
-            schema,
-        )
+        }
     }
 
-    pub fn attributes(&self) -> &HashMap<String, Value> {
-        self.attributes.as_map()
+    pub(crate) fn attributes(&self) -> &CanonicalComparisonAttributes {
+        &self.attributes
     }
 
-    pub fn into_attributes(self) -> HashMap<String, Value> {
-        self.attributes.into_map()
+    pub(crate) fn into_attributes(self) -> CanonicalComparisonAttributes {
+        self.attributes
     }
 }
 
@@ -1751,6 +1748,12 @@ mod tests {
         let current_attributes = HashMap::from([(key.clone(), value)]);
         let stored_attributes = HashMap::from([(key.clone(), stored)]);
         let desired_attributes = HashMap::from([(key.clone(), desired)]);
+        let current_attributes =
+            CanonicalComparisonAttributes::from_attributes(current_attributes, None);
+        let stored_attributes =
+            CanonicalComparisonAttributes::from_attributes(stored_attributes, None);
+        let desired_attributes =
+            CanonicalComparisonAttributes::from_attributes(desired_attributes, None);
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
@@ -1763,6 +1766,8 @@ mod tests {
         )
         .project_attributes(current_attributes)
         .into_attributes()
+        .into_iter()
+        .collect::<HashMap<_, _>>()
         .remove(&key)
         .expect("projected test value")
     }
@@ -1779,6 +1784,10 @@ mod tests {
         let key = "value".to_string();
         let current_attributes = HashMap::from([(key.clone(), value)]);
         let stored_attributes = HashMap::from([(key.clone(), stored)]);
+        let current_attributes =
+            CanonicalComparisonAttributes::from_attributes(current_attributes, None);
+        let stored_attributes =
+            CanonicalComparisonAttributes::from_attributes(stored_attributes, None);
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
@@ -1790,6 +1799,8 @@ mod tests {
         )
         .project_attributes(current_attributes)
         .into_attributes()
+        .into_iter()
+        .collect::<HashMap<_, _>>()
         .remove(&key)
         .expect("projected test value")
     }
@@ -1798,6 +1809,7 @@ mod tests {
         attributes: HashMap<String, Value>,
         explicit: &ExplicitFields,
     ) -> HashMap<String, Value> {
+        let attributes = CanonicalComparisonAttributes::from_attributes(attributes, None);
         ExplicitProjection::for_desired(
             &attributes,
             &attributes,
@@ -1807,6 +1819,8 @@ mod tests {
         )
         .project_attributes(attributes.clone())
         .into_attributes()
+        .into_iter()
+        .collect()
     }
 
     fn rule(port: i64, description: Option<&str>) -> Value {

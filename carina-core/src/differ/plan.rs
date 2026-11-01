@@ -14,9 +14,10 @@ use crate::plan::{
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
 use crate::resource::{
-    ConcreteValue, Current, DataSource, Directives, PlanInputCurrent, PlanInputDesiredResources,
-    ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
-    ResourceIdentity, State, Value, plan_input_desired_resources,
+    CanonicalComparisonAttributes, ConcreteValue, Current, DataSource, Directives,
+    PlanInputCurrent, PlanInputDesiredResources, ResolvedDataSource, ResolvedResource,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
+    plan_input_desired_resources,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
@@ -26,7 +27,10 @@ use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
 use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
-use super::{PlanPriorStates, PlannedListKeyRelease, PresentDiff, diff_present_with_releases};
+use super::{
+    ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates, PlannedListKeyRelease,
+    PresentDiff, diff_present_with_releases,
+};
 
 fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {
     for release in releases {
@@ -464,6 +468,7 @@ fn create_plan_parts(
     let mut pending_replaces = HashMap::new();
     let authored_managed = managed.authored();
     let known_bindings = known_binding_names(authored_managed, data_sources);
+    let comparison_saved = PlanInputSavedAttributes::new(saved_attrs, registry);
 
     // Data sources only generate Read effects; the typestate split
     // routes them through their own slice so the legacy
@@ -477,11 +482,15 @@ fn create_plan_parts(
 
     for comparison_desired in managed.iter() {
         let resource = comparison_desired.authored();
+        plan.record_comparison_attributes(
+            resource.id.clone(),
+            comparison_desired.comparison_attributes().clone(),
+        );
         let current = current_states
             .get(&resource.id)
             .cloned()
             .unwrap_or_else(|| PlanInputCurrent::absent(resource.id.clone()));
-        let saved = saved_attrs.get(&resource.id);
+        let saved = comparison_saved.get(&resource.id);
         let prev_explicit_for_resource = prev_explicit.get(&resource.id);
         match current.current() {
             Current::Absent(_absent) => plan.add(Effect::Create(resource.clone())),
@@ -511,6 +520,7 @@ fn create_plan_parts(
                 ));
             }
             Current::Present(present) => {
+                let current_attributes = current.comparison_attributes();
                 let resolved_comparison =
                     comparison_provider.comparison_for(registry, &resource.id)?;
                 let owner_schema = resolved_comparison.owner_schema();
@@ -520,11 +530,15 @@ fn create_plan_parts(
                 let result = diff_present_with_releases(
                     comparison_desired,
                     present,
-                    saved,
-                    saved_attrs.nested_write_only(&resource.id),
-                    prev_explicit_for_resource,
+                    ExistingComparisonInputs {
+                        current_attributes,
+                        saved,
+                        nested_write_only: saved_attrs.nested_write_only(&resource.id),
+                        prev_explicit: prev_explicit_for_resource,
+                        schema: Some(schema),
+                        context,
+                    },
                     validated_schema,
-                    context,
                 );
                 match result.diff {
                     PresentDiff::Update {
@@ -1266,6 +1280,7 @@ fn promote_pending_replaces_for_dependents(
                     resource,
                     &ref_attr_names,
                     current_states,
+                    owner_schema.schema().as_schema(),
                     outcome_unknown_import_replacements,
                 )
                 && let Some(replaced) = pending_replaces.get_mut(&replaced_identity)
@@ -1355,7 +1370,19 @@ fn promote_resource_to_pending_replace(
         ref_hints,
         registry,
     ) {
-        Ok(pending) => Some(pending),
+        Ok(pending) => {
+            let schema = registry
+                .get_for(resource)
+                .map(|schema| schema.schema().as_schema());
+            plan.record_comparison_attributes(
+                resource.id.clone(),
+                CanonicalComparisonAttributes::from_attributes(
+                    resource.resolved_attributes(),
+                    schema,
+                ),
+            );
+            Some(pending)
+        }
         Err(err) => {
             plan.add_error(PlanError::new(resource.id.clone(), err.into()));
             None
@@ -1386,8 +1413,13 @@ fn ensure_consumer_update(
     resource: &Resource,
     changed_attributes: &[String],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
+    schema: &ResourceSchema,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
+    let comparison_attributes = CanonicalComparisonAttributes::from_attributes(
+        resource.resolved_attributes(),
+        Some(schema),
+    );
     if let Some(effect) = plan
         .effects_mut()
         .iter_mut()
@@ -1406,6 +1438,7 @@ fn ensure_consumer_update(
                 }
             }
         }
+        plan.record_comparison_attributes(resource.id.clone(), comparison_attributes);
         return true;
     }
 
@@ -1443,6 +1476,7 @@ fn ensure_consumer_update(
         to: ResolvedResource::new(resource.clone()),
         changed_attributes: changed_attributes.to_vec(),
     });
+    plan.record_comparison_attributes(resource.id.clone(), comparison_attributes);
     true
 }
 
@@ -1489,6 +1523,7 @@ mod typed_current_identifier_tests {
             &resource,
             &["input".to_string()],
             &current,
+            &ResourceSchema::new("test.Resource"),
             &HashSet::new(),
         ));
         let [
@@ -1506,6 +1541,68 @@ mod typed_current_identifier_tests {
         assert_eq!(identifier.as_str(), "typed-provider-id");
         assert_eq!(to.id, resource.id);
         assert_eq!(changed_attributes, &["input".to_string()]);
+    }
+
+    #[test]
+    fn ensure_consumer_update_carries_the_rewritten_comparison_view() {
+        let old = Value::Concrete(ConcreteValue::String("old".into()));
+        let rewritten = Value::Concrete(ConcreteValue::String("rewritten".into()));
+        let resource = Resource::with_provider("mock", "test.Resource", "consumer", None)
+            .with_attribute("input", rewritten.clone());
+        let current = current_with_authoritative_identifier(&resource);
+        let schema = ResourceSchema::new("test.Resource").attribute(
+            crate::schema::AttributeSchema::optional(
+                "input",
+                crate::schema::AttributeType::string(),
+            )
+            .build(),
+        );
+        let previous_to = Resource::with_provider("mock", "test.Resource", "consumer", None)
+            .with_attribute("input", old.clone());
+        let mut plan = Plan::new();
+        plan.record_comparison_attributes(
+            resource.id.clone(),
+            CanonicalComparisonAttributes::from_attributes(
+                previous_to.resolved_attributes(),
+                Some(&schema),
+            ),
+        );
+        plan.add(Effect::Update {
+            from: Box::new(State::existing(resource.id.clone(), HashMap::new())),
+            identifier: crate::provider::fixture_applied_identifier("typed-provider-id"),
+            to: ResolvedResource::new(previous_to),
+            changed_attributes: vec!["other".to_string()],
+        });
+
+        assert!(ensure_consumer_update(
+            &mut plan,
+            &resource,
+            &["input".to_string()],
+            &current,
+            &schema,
+            &HashSet::new(),
+        ));
+
+        assert_eq!(
+            plan.comparison_attributes(&resource.id)
+                .and_then(|attributes| attributes.get("input")),
+            Some(&rewritten),
+        );
+        let [
+            Effect::Update {
+                to,
+                changed_attributes,
+                ..
+            },
+        ] = plan.effects()
+        else {
+            panic!("expected one rewritten Update effect");
+        };
+        assert_eq!(to.get_attr("input"), Some(&rewritten));
+        assert_eq!(
+            changed_attributes,
+            &["other".to_string(), "input".to_string()]
+        );
     }
 
     #[test]
