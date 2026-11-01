@@ -1221,7 +1221,7 @@ pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
 /// authored element as [`ExplicitFields::Unrecorded`]. Missing or mismatched
 /// stored lists use the legacy union projection. Schema-aware list pairing
 /// uses the same equality as state writeback.
-pub(crate) struct ExplicitProjection<'a> {
+pub struct ExplicitProjection<'a> {
     stored_attributes: &'a CanonicalComparisonAttributes,
     desired: ProjectionDesired<'a>,
     explicit: &'a ExplicitFields,
@@ -1231,7 +1231,6 @@ pub(crate) struct ExplicitProjection<'a> {
 
 enum ProjectionDesired<'a> {
     Attributes(HashMap<&'a str, &'a Value>),
-    #[cfg(test)]
     Conservative,
 }
 
@@ -1258,7 +1257,7 @@ impl ProjectionDesiredValue<'_> {
 impl<'a> ExplicitProjection<'a> {
     /// Build a projection whose server-added classification is checked against
     /// the resource's desired attributes.
-    pub(crate) fn for_desired(
+    pub fn for_desired(
         stored_attributes: &'a CanonicalComparisonAttributes,
         desired_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
@@ -1283,8 +1282,7 @@ impl<'a> ExplicitProjection<'a> {
     ///
     /// This mode never treats an `Unrecorded`-paired list element as a proven
     /// server addition, so uncertain elements remain visible.
-    #[cfg(test)]
-    pub(crate) fn conservative(
+    pub fn conservative(
         stored_attributes: &'a CanonicalComparisonAttributes,
         explicit: &'a ExplicitFields,
         schema: Option<&'a ResourceSchema>,
@@ -1306,7 +1304,7 @@ impl<'a> ExplicitProjection<'a> {
     /// after applying the legacy union projection. Lists whose stored
     /// alignment is unavailable use that same fallback, so uncertainty remains
     /// visible without resurfacing unauthored fields inside retained elements.
-    pub(crate) fn project_attributes(
+    pub fn project_attributes(
         &self,
         attributes: CanonicalComparisonAttributes,
     ) -> ProjectedAttributes {
@@ -1335,7 +1333,6 @@ impl<'a> ExplicitProjection<'a> {
                         ProjectionDesiredValue::Present,
                     )
                 }
-                #[cfg(test)]
                 ProjectionDesired::Conservative => ProjectionDesiredValue::Conservative,
             };
             let projected = project_value(
@@ -1361,7 +1358,7 @@ impl<'a> ExplicitProjection<'a> {
 }
 
 /// Values produced by an [`ExplicitProjection`].
-pub(crate) struct ProjectedAttributes {
+pub struct ProjectedAttributes {
     attributes: CanonicalComparisonAttributes,
     pub(crate) authoring: ProjectedAuthoring,
 }
@@ -1372,8 +1369,14 @@ impl ProjectedAttributes {
         authoring: ProjectedAuthoring,
         schema: Option<&ResourceSchema>,
     ) -> Self {
+        let attributes = match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(attributes),
+            ),
+        };
         Self {
-            attributes: CanonicalComparisonAttributes::from_attributes(attributes, schema),
+            attributes,
             authoring,
         }
     }
@@ -1390,11 +1393,11 @@ impl ProjectedAttributes {
         }
     }
 
-    pub(crate) fn attributes(&self) -> &CanonicalComparisonAttributes {
+    pub fn attributes(&self) -> &CanonicalComparisonAttributes {
         &self.attributes
     }
 
-    pub(crate) fn into_attributes(self) -> CanonicalComparisonAttributes {
+    pub fn into_attributes(self) -> CanonicalComparisonAttributes {
         self.attributes
     }
 }
@@ -1748,12 +1751,15 @@ mod tests {
         let current_attributes = HashMap::from([(key.clone(), value)]);
         let stored_attributes = HashMap::from([(key.clone(), stored)]);
         let desired_attributes = HashMap::from([(key.clone(), desired)]);
-        let current_attributes =
-            CanonicalComparisonAttributes::from_attributes(current_attributes, None);
-        let stored_attributes =
-            CanonicalComparisonAttributes::from_attributes(stored_attributes, None);
-        let desired_attributes =
-            CanonicalComparisonAttributes::from_attributes(desired_attributes, None);
+        let current_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current_attributes),
+        );
+        let stored_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(stored_attributes),
+        );
+        let desired_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(desired_attributes),
+        );
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
@@ -1784,10 +1790,12 @@ mod tests {
         let key = "value".to_string();
         let current_attributes = HashMap::from([(key.clone(), value)]);
         let stored_attributes = HashMap::from([(key.clone(), stored)]);
-        let current_attributes =
-            CanonicalComparisonAttributes::from_attributes(current_attributes, None);
-        let stored_attributes =
-            CanonicalComparisonAttributes::from_attributes(stored_attributes, None);
+        let current_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current_attributes),
+        );
+        let stored_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(stored_attributes),
+        );
         let root = ExplicitFields::Struct {
             children: HashMap::from([(key.clone(), explicit.clone())]),
         };
@@ -1809,7 +1817,9 @@ mod tests {
         attributes: HashMap<String, Value>,
         explicit: &ExplicitFields,
     ) -> HashMap<String, Value> {
-        let attributes = CanonicalComparisonAttributes::from_attributes(attributes, None);
+        let attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(attributes),
+        );
         ExplicitProjection::for_desired(
             &attributes,
             &attributes,

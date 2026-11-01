@@ -44,10 +44,13 @@ impl PlanInputSavedAttributes {
                         crate::schema::SchemaKind::Resource,
                     )
                     .map(|schema| schema.schema().as_schema());
-                Some((
-                    id.clone(),
-                    CanonicalComparisonAttributes::from_attributes(values, schema),
-                ))
+                let attributes = match schema {
+                    Some(schema) => CanonicalComparisonAttributes::canonicalize(values, schema),
+                    None => CanonicalComparisonAttributes::from_unschematized(
+                        crate::resource::UnschematizedComparisonAttributes::new(values),
+                    ),
+                };
+                Some((id.clone(), attributes))
             })
             .collect();
         Self { attributes }
@@ -1181,15 +1184,8 @@ fn diff_present_with_releases(
         };
     }
 
-    let mut filtered_current = inputs
-        .current_attributes
-        .clone()
-        .into_iter()
-        .collect::<HashMap<_, _>>();
-    let mut filtered_saved = inputs
-        .saved
-        .cloned()
-        .map(|saved| saved.into_iter().collect::<HashMap<_, _>>());
+    let mut filtered_current = inputs.current_attributes.clone();
+    let mut filtered_saved = inputs.saved.cloned();
     let mut filtered_explicit = inputs.prev_explicit.cloned();
     for release in &releases {
         let attribute = schema
@@ -1222,8 +1218,6 @@ fn diff_present_with_releases(
         }
     }
 
-    let filtered_current = CanonicalComparisonAttributes::from_canonicalized(filtered_current);
-    let filtered_saved = filtered_saved.map(CanonicalComparisonAttributes::from_canonicalized);
     let mut diff = diff_existing_state(
         desired,
         current.state(),
@@ -1333,12 +1327,23 @@ pub fn diff(
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
 ) -> Diff {
-    let current_attributes =
-        CanonicalComparisonAttributes::from_attributes(current.attributes.clone(), schema);
+    let current_attributes = match schema {
+        Some(schema) => {
+            CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)
+        }
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current.attributes.clone()),
+        ),
+    };
     let saved = saved_attrs
         .get(&desired.id)
         .cloned()
-        .map(|saved| CanonicalComparisonAttributes::from_attributes(saved, schema));
+        .map(|saved| match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(saved, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(saved),
+            ),
+        });
     diff_with_saved_parts(
         desired,
         current,
@@ -1388,11 +1393,20 @@ pub(crate) fn diff_test(
     schema: Option<&ResourceSchema>,
     context: &ComparisonContext<'_>,
 ) -> Diff {
-    let current_attributes =
-        CanonicalComparisonAttributes::from_attributes(current.attributes.clone(), schema);
-    let saved = saved
-        .cloned()
-        .map(|saved| CanonicalComparisonAttributes::from_attributes(saved, schema));
+    let current_attributes = match schema {
+        Some(schema) => {
+            CanonicalComparisonAttributes::canonicalize(current.attributes.clone(), schema)
+        }
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(current.attributes.clone()),
+        ),
+    };
+    let saved = saved.cloned().map(|saved| match schema {
+        Some(schema) => CanonicalComparisonAttributes::canonicalize(saved, schema),
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(saved),
+        ),
+    });
     diff_with_saved_parts(
         &ResolvedResource::new(desired.clone()),
         current,

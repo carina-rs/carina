@@ -680,13 +680,14 @@ fn comparison_attributes_for_effects<S>(
             let schema = schemas
                 .get_for(resource)
                 .map(|schema| schema.schema().as_schema());
-            Some((
-                resource.id.clone(),
-                CanonicalComparisonAttributes::from_attributes(
-                    resource.resolved_attributes(),
-                    schema,
+            let attributes = resource.resolved_attributes();
+            let attributes = match schema {
+                Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+                None => CanonicalComparisonAttributes::from_unschematized(
+                    crate::resource::UnschematizedComparisonAttributes::new(attributes),
                 ),
-            ))
+            };
+            Some((resource.id.clone(), attributes))
         })
         .collect()
 }

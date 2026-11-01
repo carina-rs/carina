@@ -1374,13 +1374,14 @@ fn promote_resource_to_pending_replace(
             let schema = registry
                 .get_for(resource)
                 .map(|schema| schema.schema().as_schema());
-            plan.record_comparison_attributes(
-                resource.id.clone(),
-                CanonicalComparisonAttributes::from_attributes(
-                    resource.resolved_attributes(),
-                    schema,
+            let attributes = resource.resolved_attributes();
+            let comparison_attributes = match schema {
+                Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+                None => CanonicalComparisonAttributes::from_unschematized(
+                    crate::resource::UnschematizedComparisonAttributes::new(attributes),
                 ),
-            );
+            };
+            plan.record_comparison_attributes(resource.id.clone(), comparison_attributes);
             Some(pending)
         }
         Err(err) => {
@@ -1416,10 +1417,8 @@ fn ensure_consumer_update(
     schema: &ResourceSchema,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
 ) -> bool {
-    let comparison_attributes = CanonicalComparisonAttributes::from_attributes(
-        resource.resolved_attributes(),
-        Some(schema),
-    );
+    let comparison_attributes =
+        CanonicalComparisonAttributes::canonicalize(resource.resolved_attributes(), schema);
     if let Some(effect) = plan
         .effects_mut()
         .iter_mut()
@@ -1562,10 +1561,7 @@ mod typed_current_identifier_tests {
         let mut plan = Plan::new();
         plan.record_comparison_attributes(
             resource.id.clone(),
-            CanonicalComparisonAttributes::from_attributes(
-                previous_to.resolved_attributes(),
-                Some(&schema),
-            ),
+            CanonicalComparisonAttributes::canonicalize(previous_to.resolved_attributes(), &schema),
         );
         plan.add(Effect::Update {
             from: Box::new(State::existing(resource.id.clone(), HashMap::new())),

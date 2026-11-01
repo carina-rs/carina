@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{ConcreteValue, PlaceholderKind, Resource, Value};
+use super::{CanonicalComparisonAttributes, ConcreteValue, PlaceholderKind, Resource, Value};
 use crate::schema::{
-    EffectiveType, LeafPath, LeafPathSegment, Shape, ShapeWalkBudget, ValidatedResourceSchema,
+    EffectiveType, LeafPath, LeafPathSegment, ResourceSchema, Shape, ShapeWalkBudget,
+    ValidatedResourceSchema,
 };
 
 /// A syntactic attribute path read from `directives.ignore_changes`.
@@ -139,6 +139,48 @@ impl ResolvedIgnoreChanges {
         value
     }
 
+    /// Apply readable ignore masks and restore the canonical comparison form.
+    pub(crate) fn mask_comparison_readable_leaves(
+        &self,
+        desired: &CanonicalComparisonAttributes,
+        observed: &CanonicalComparisonAttributes,
+        schema: Option<&ResourceSchema>,
+    ) -> CanonicalComparisonAttributes {
+        if self.is_empty() {
+            return desired.clone();
+        }
+        let schema = schema.expect("resolved ignore_changes paths require a resource schema");
+        let mut masked = desired.attributes.clone();
+        let attributes = self
+            .iter()
+            .filter(|path| !path.write_only)
+            .map(|path| path.attribute.clone())
+            .collect::<HashSet<_>>();
+        for attribute in attributes {
+            if self
+                .for_attribute(&attribute)
+                .any(|path| !path.write_only && path.leaf.segments().is_empty())
+            {
+                match observed.get(&attribute) {
+                    Some(value) => {
+                        masked.insert(attribute, value.clone());
+                    }
+                    None => {
+                        masked.remove(&attribute);
+                    }
+                }
+                continue;
+            }
+            let Some(value) = masked.get(&attribute).cloned() else {
+                continue;
+            };
+            let value =
+                self.with_observed_readable_leaves(&attribute, &value, observed.get(&attribute));
+            masked.insert(attribute, value);
+        }
+        CanonicalComparisonAttributes::canonicalize(masked, schema)
+    }
+
     /// Make an historical comparison baseline agree with a fresh observation
     /// at every readable ignored path.
     ///
@@ -176,40 +218,6 @@ impl ResolvedIgnoreChanges {
             let masked =
                 self.with_observed_readable_leaves(&attribute, &value, observed.get(&attribute));
             baseline.insert(attribute, masked);
-        }
-    }
-
-    pub(crate) fn mask_desired_readable_leaves(
-        &self,
-        desired: &mut IndexMap<String, Value>,
-        observed: &HashMap<String, Value>,
-    ) {
-        let attributes = self
-            .iter()
-            .filter(|path| !path.write_only)
-            .map(|path| path.attribute.clone())
-            .collect::<HashSet<_>>();
-        for attribute in attributes {
-            if self
-                .for_attribute(&attribute)
-                .any(|path| !path.write_only && path.leaf.segments().is_empty())
-            {
-                match observed.get(&attribute) {
-                    Some(value) => {
-                        desired.insert(attribute, value.clone());
-                    }
-                    None => {
-                        desired.shift_remove(&attribute);
-                    }
-                }
-                continue;
-            }
-            let Some(value) = desired.get(&attribute).cloned() else {
-                continue;
-            };
-            let masked =
-                self.with_observed_readable_leaves(&attribute, &value, observed.get(&attribute));
-            desired.insert(attribute, masked);
         }
     }
 }

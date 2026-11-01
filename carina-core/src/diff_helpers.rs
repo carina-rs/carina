@@ -241,7 +241,7 @@ pub(crate) fn list_element_type<'a>(
 /// `# (n unchanged attributes hidden)` tally would not add up. With
 /// `schema = None`, behavior is the schema-blind `semantically_equal`
 /// path (unchanged for embedded / test callers).
-pub(crate) fn compute_unchanged_count(
+pub fn compute_unchanged_count(
     from_attrs: &CanonicalComparisonAttributes,
     to_attrs: &CanonicalComparisonAttributes,
     exclude: Option<&std::collections::HashSet<&str>>,
@@ -449,8 +449,14 @@ mod tests {
         exclude: Option<&std::collections::HashSet<&str>>,
         schema: Option<&ResourceSchema>,
     ) -> usize {
-        let from_attrs = CanonicalComparisonAttributes::from_attributes(from_attrs.clone(), schema);
-        let to_attrs = CanonicalComparisonAttributes::from_attributes(to_attrs.clone(), schema);
+        let canonicalize = |attributes| match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(attributes),
+            ),
+        };
+        let from_attrs = canonicalize(from_attrs.clone());
+        let to_attrs = canonicalize(to_attrs.clone());
         super::compute_unchanged_count(
             &from_attrs,
             &to_attrs,

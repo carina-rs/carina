@@ -3313,6 +3313,97 @@ fn plan_canonicalizes_nested_ignored_empty_structs_before_comparison() {
 }
 
 #[test]
+fn plan_recanonicalizes_parent_after_ignored_missing_struct_leaf() {
+    use crate::schema::{AttributeSchema, AttributeType, StructField};
+
+    let settings = |label: Option<&str>| {
+        let mut fields = IndexMap::from([(
+            "keep".to_string(),
+            Value::Concrete(ConcreteValue::String("a".into())),
+        )]);
+        if let Some(label) = label {
+            fields.insert(
+                "cfg".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "label".to_string(),
+                    Value::Concrete(ConcreteValue::String(label.into())),
+                )]))),
+            );
+        } else {
+            fields.insert(
+                "cfg".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let mut desired = Resource::new("test.Widget", "example")
+        .with_attribute("settings", settings(Some("configured")));
+    desired.directives.ignore_changes = vec![ignore_path(&["settings", "cfg", "label"])];
+    let id = desired.id.clone();
+    let current_states = HashMap::from([(
+        id.clone(),
+        existing_state(
+            id,
+            HashMap::from([("settings".to_string(), settings(None))]),
+        ),
+    )]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test.Widget")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional("keep", AttributeType::string()).build(),
+                            StructField::optional(
+                                "cfg",
+                                AttributeType::struct_(
+                                    "Config",
+                                    vec![
+                                        StructField::optional("label", AttributeType::string())
+                                            .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .expect("schema fixture must be valid"),
+    );
+    let current = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &schemas,
+        std::slice::from_ref(&desired),
+    );
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &current,
+        &HashMap::new(),
+        &schemas,
+        &empty_lifted_saved_attrs(),
+        &HashMap::new(),
+        &Orphans::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "removing an ignored missing leaf must not recreate a noncanonical empty struct"
+    );
+}
+
+#[test]
 fn plan_update_keeps_authored_empty_struct_in_provider_payload() {
     use crate::schema::{AttributeSchema, AttributeType, StructField};
 

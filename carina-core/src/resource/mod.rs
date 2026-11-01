@@ -9913,15 +9913,15 @@ impl Current {
             Self::MissingIdentifier(state) => state.0.materialize_partial_read_unknowns(),
         }
         let comparison_attributes = match &self {
-            Self::Absent(state) => {
-                CanonicalComparisonAttributes::from_canonicalized(state.state().attributes.clone())
-            }
-            Self::Present(present) => CanonicalComparisonAttributes::from_canonicalized(
-                present.state().attributes.clone(),
-            ),
-            Self::MissingIdentifier(state) => {
-                CanonicalComparisonAttributes::from_canonicalized(state.state().attributes.clone())
-            }
+            Self::Absent(state) => CanonicalComparisonAttributes {
+                attributes: state.state().attributes.clone(),
+            },
+            Self::Present(present) => CanonicalComparisonAttributes {
+                attributes: present.state().attributes.clone(),
+            },
+            Self::MissingIdentifier(state) => CanonicalComparisonAttributes {
+                attributes: state.state().attributes.clone(),
+            },
             Self::CreateInFlight(_) | Self::CreateOutcomeUnknown(_) => {
                 CanonicalComparisonAttributes::default()
             }
@@ -9988,23 +9988,35 @@ pub struct PlanInputDesired<'a> {
 /// built after the plan-input boundary. Construction applies state-style
 /// post-order canonicalization without mutating the provider-bound resource.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct CanonicalComparisonAttributes {
+pub struct CanonicalComparisonAttributes {
     attributes: HashMap<String, Value>,
 }
 
+/// Attribute values used only when no resource schema exists.
+///
+/// The wrapper makes schema-less passthrough construction explicit instead of
+/// presenting it as an already-canonical comparison map.
+pub(crate) struct UnschematizedComparisonAttributes(HashMap<String, Value>);
+
+impl UnschematizedComparisonAttributes {
+    pub(crate) fn new(attributes: HashMap<String, Value>) -> Self {
+        Self(attributes)
+    }
+}
+
 impl CanonicalComparisonAttributes {
-    pub(crate) fn from_attributes(
+    pub(crate) fn canonicalize(
         mut attributes: HashMap<String, Value>,
-        schema: Option<&crate::schema::ResourceSchema>,
+        schema: &crate::schema::ResourceSchema,
     ) -> Self {
-        if let Some(schema) = schema {
-            crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
-        }
+        crate::value::canonicalize_state_attribute_map_with_schema(&mut attributes, schema);
         Self { attributes }
     }
 
-    pub(crate) fn from_canonicalized(attributes: HashMap<String, Value>) -> Self {
-        Self { attributes }
+    pub(crate) fn from_unschematized(attributes: UnschematizedComparisonAttributes) -> Self {
+        Self {
+            attributes: attributes.0,
+        }
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&Value> {
@@ -10021,6 +10033,24 @@ impl CanonicalComparisonAttributes {
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.attributes.iter()
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        self.attributes.get_mut(key)
+    }
+
+    pub(crate) fn with_missing_values_from(
+        &self,
+        fallback: &Self,
+        mut include: impl FnMut(&str, &Value) -> bool,
+    ) -> Self {
+        let mut combined = self.clone();
+        for (key, value) in fallback {
+            if !combined.contains_key(key) && include(key, value) {
+                combined.attributes.insert(key.clone(), value.clone());
+            }
+        }
+        combined
     }
 }
 
@@ -10055,8 +10085,13 @@ impl<'a> PlanInputDesired<'a> {
         authored: &'a ResolvedResource,
         schema: Option<&crate::schema::ResourceSchema>,
     ) -> Self {
-        let comparison_attributes =
-            CanonicalComparisonAttributes::from_attributes(authored.resolved_attributes(), schema);
+        let attributes = authored.resolved_attributes();
+        let comparison_attributes = match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                UnschematizedComparisonAttributes::new(attributes),
+            ),
+        };
         Self {
             authored,
             comparison_attributes,

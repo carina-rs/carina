@@ -66,7 +66,7 @@ struct HistoricalListKeyRelease {
 struct HistoricalUpdateAttributes {
     attributes: HashMap<String, Value>,
     stored_attributes: Option<HashMap<String, Value>>,
-    comparison_attributes: CanonicalComparisonAttributes,
+    comparison_attributes: Option<CanonicalComparisonAttributes>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,14 +121,7 @@ impl HistoricalDisplayAttributes {
             match effect {
                 Effect::Update { from, to, .. } => {
                     let attributes = display.filter_released(&from.id, from.attributes.clone());
-                    let comparison_attributes = plan
-                        .comparison_attributes(&to.id)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            CanonicalComparisonAttributes::from_canonicalized(
-                                to.resolved_attributes(),
-                            )
-                        });
+                    let comparison_attributes = plan.comparison_attributes(&to.id).cloned();
                     display.updates.insert(
                         from.id.clone(),
                         HistoricalUpdateAttributes {
@@ -250,8 +243,7 @@ impl HistoricalDisplayAttributes {
         let comparison_attributes = self
             .updates
             .get(&id)
-            .map(|entry| entry.comparison_attributes.clone())
-            .unwrap_or_default();
+            .and_then(|entry| entry.comparison_attributes.clone());
         let masked = combine_with_desired_secret_shape(persisted_masked, desired_shape);
         // Keep the stored anchor unfiltered: its list indices must stay
         // aligned with `prev_explicit::ListElements` so projection can still
@@ -903,21 +895,45 @@ fn build_update_rows<S>(
     comparison: ComparisonContext<'_>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
-    let from_attributes =
-        CanonicalComparisonAttributes::from_canonicalized(historical.attributes.clone());
+    let from_attributes = match schema {
+        Some(schema) => {
+            CanonicalComparisonAttributes::canonicalize(historical.attributes.clone(), schema)
+        }
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(historical.attributes.clone()),
+        ),
+    };
     let stored_attributes = historical
         .stored_attributes
         .clone()
-        .map(CanonicalComparisonAttributes::from_canonicalized);
-    let mut display_attributes = historical
-        .comparison_attributes
-        .clone()
-        .into_iter()
-        .collect();
-    to.resolved_ignore_changes
-        .mask_desired_readable_leaves(&mut display_attributes, &historical.attributes);
-    let comparison_attributes =
-        CanonicalComparisonAttributes::from_canonicalized(display_attributes.into_iter().collect());
+        .map(|attributes| match schema {
+            Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+            None => CanonicalComparisonAttributes::from_unschematized(
+                crate::resource::UnschematizedComparisonAttributes::new(attributes),
+            ),
+        });
+    let authored_comparison_attributes;
+    let comparison_attributes = match &historical.comparison_attributes {
+        Some(attributes) => attributes,
+        None => {
+            authored_comparison_attributes = match schema {
+                Some(schema) => {
+                    CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema)
+                }
+                None => CanonicalComparisonAttributes::from_unschematized(
+                    crate::resource::UnschematizedComparisonAttributes::new(
+                        to.resolved_attributes(),
+                    ),
+                ),
+            };
+            &authored_comparison_attributes
+        }
+    };
+    let comparison_attributes = to.resolved_ignore_changes.mask_comparison_readable_leaves(
+        comparison_attributes,
+        &from_attributes,
+        schema,
+    );
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
@@ -1495,12 +1511,12 @@ pub fn build_replace_detail_rows_from_display<S>(
     let registry = registry
         .ok_or_else(|| ComparisonResolutionError::MissingResourceSchema { id: to.id.clone() })?;
     let resolved = provider.comparison_for(registry, &to.id)?;
-    let schema = Some(resolved.owner_schema().schema().as_schema());
+    let schema = resolved.owner_schema().schema().as_schema();
     let comparison_attributes = plan
         .comparison_attributes(&to.id)
         .cloned()
         .unwrap_or_else(|| {
-            CanonicalComparisonAttributes::from_attributes(to.resolved_attributes(), schema)
+            CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema)
         });
     Ok(build_replace_rows_from_attributes(
         &historical_attributes.attributes,
@@ -1511,7 +1527,7 @@ pub fn build_replace_detail_rows_from_display<S>(
         replacement.changed_create_only,
         replacement.temporary_name,
         replacement.cascade_ref_hints,
-        schema,
+        Some(schema),
         detail,
         explicit,
         *resolved.context(),
@@ -1537,11 +1553,20 @@ fn build_replace_rows_from_attributes<S>(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let previous_attributes =
-        CanonicalComparisonAttributes::from_canonicalized(previous_attributes.clone());
-    let stored_attributes = stored_attributes
-        .cloned()
-        .map(CanonicalComparisonAttributes::from_canonicalized);
+    let previous_attributes = match schema {
+        Some(schema) => {
+            CanonicalComparisonAttributes::canonicalize(previous_attributes.clone(), schema)
+        }
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(previous_attributes.clone()),
+        ),
+    };
+    let stored_attributes = stored_attributes.cloned().map(|attributes| match schema {
+        Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+        None => CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(attributes),
+        ),
+    });
     let projected = project_previous_attrs(
         &previous_attributes,
         stored_attributes.as_ref(),
@@ -2647,10 +2672,14 @@ mod tests {
             let schema = registry
                 .and_then(|registry| registry.get_for(to))
                 .map(|schema| schema.schema().as_schema());
-            plan.record_comparison_attributes(
-                to.id.clone(),
-                CanonicalComparisonAttributes::from_attributes(to.resolved_attributes(), schema),
-            );
+            let attributes = to.resolved_attributes();
+            let comparison_attributes = match schema {
+                Some(schema) => CanonicalComparisonAttributes::canonicalize(attributes, schema),
+                None => CanonicalComparisonAttributes::from_unschematized(
+                    crate::resource::UnschematizedComparisonAttributes::new(attributes),
+                ),
+            };
+            plan.record_comparison_attributes(to.id.clone(), comparison_attributes);
         }
         let mut historical_attributes = HistoricalDisplayAttributes::for_plan(&plan);
         if let Effect::Update { from, .. } = effect
@@ -2700,8 +2729,9 @@ mod tests {
             .iter()
             .map(|attr| (*attr).to_string())
             .collect();
-        let comparison_attributes =
-            CanonicalComparisonAttributes::from_canonicalized(to.resolved_attributes());
+        let comparison_attributes = CanonicalComparisonAttributes::from_unschematized(
+            crate::resource::UnschematizedComparisonAttributes::new(to.resolved_attributes()),
+        );
         build_replace_rows_from_attributes(
             &from.attributes,
             Some(&from.attributes),
@@ -2841,6 +2871,203 @@ mod tests {
                 DetailRow::Changed { key, .. },
                 DetailRow::HiddenUnchanged { count: 1 }
             ] if key == "name"
+        ));
+    }
+
+    #[test]
+    fn update_rows_recanonicalize_parent_after_masking_ignored_missing_leaf() {
+        let settings = |label: Option<&str>| {
+            let mut fields =
+                IndexMap::from([("x".to_string(), Value::Concrete(ConcreteValue::Int(1)))]);
+            if let Some(label) = label {
+                fields.insert(
+                    "config".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "label".to_string(),
+                        Value::Concrete(ConcreteValue::String(label.into())),
+                    )]))),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let registry = empty_struct_comparison_registry();
+        let id = ResourceId::with_identity("test.Widget", "example");
+        let from = State::existing(
+            id,
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("before".into())),
+                ),
+                ("settings".to_string(), settings(None)),
+            ]),
+        );
+        let mut to = Resource::new("test.Widget", "example")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )
+            .with_attribute("settings", settings(Some("configured")));
+        to.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+            crate::resource::ParsedIgnorePathSegment::Attribute("settings".to_string()),
+            crate::resource::ParsedIgnorePathSegment::Attribute("config".to_string()),
+            crate::resource::ParsedIgnorePathSegment::Attribute("label".to_string()),
+        ])];
+        let to = ResolvedResource::resolve_with_schemas(to, &registry)
+            .expect("ignore_changes path must resolve");
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("widget-id"),
+            from: Box::new(from),
+            to,
+            changed_attributes: vec!["name".to_string()],
+        };
+
+        let rows = build_detail_rows(&effect, Some(&registry), DetailLevel::Explicit, None, None);
+
+        assert!(matches!(
+            rows.as_slice(),
+            [DetailRow::Changed { key, .. }] if key == "name"
+        ));
+    }
+
+    #[test]
+    fn update_rows_canonicalize_persisted_list_elements_before_projection() {
+        use crate::schema::{AttributeSchema, StructField};
+
+        let rule = |include_empty_options| {
+            let mut fields =
+                IndexMap::from([("port".to_string(), Value::Concrete(ConcreteValue::Int(80)))]);
+            if include_empty_options {
+                fields.insert(
+                    "opts".to_string(),
+                    Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let rules = |include_empty_options| {
+            Value::Concrete(ConcreteValue::List(vec![rule(include_empty_options)]))
+        };
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "",
+            ResourceSchema::new("test.Widget")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "rules",
+                        AttributeType::list(AttributeType::struct_(
+                            "Rule",
+                            vec![
+                                StructField::required("port", AttributeType::int()).build(),
+                                StructField::optional(
+                                    "opts",
+                                    AttributeType::struct_(
+                                        "Options",
+                                        vec![
+                                            StructField::optional("label", AttributeType::string())
+                                                .build(),
+                                        ],
+                                    ),
+                                )
+                                .build(),
+                            ],
+                        )),
+                    )
+                    .build(),
+                )
+                .validate()
+                .expect("schema fixture must be valid"),
+        );
+        let id = ResourceId::with_identity("test.Widget", "example");
+        let from = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("before".into())),
+                ),
+                ("rules".to_string(), rules(false)),
+            ]),
+        );
+        let to = Resource::new("test.Widget", "example")
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("after".into())),
+            )
+            .with_attribute("rules", rules(true));
+        let schema = registry
+            .get_for(&to)
+            .expect("schema fixture")
+            .schema()
+            .as_schema();
+        let comparison_attributes =
+            CanonicalComparisonAttributes::canonicalize(to.resolved_attributes(), schema);
+        let effect = Effect::Update {
+            identifier: crate::effect::fixture_applied_identifier("widget-id"),
+            from: Box::new(from.clone()),
+            to: resolved(to),
+            changed_attributes: vec!["name".to_string()],
+        };
+        let mut plan = Plan::new();
+        plan.record_comparison_attributes(id.clone(), comparison_attributes);
+        plan.add(effect);
+        let mut historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let persisted = PersistedAttributes::from_typed_persisted_wire_values(HashMap::from([
+            (
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("before".into())),
+            ),
+            ("rules".to_string(), rules(true)),
+        ]))
+        .expect("persisted attributes must encode");
+        historical.set_update_from_provider_and_persisted(
+            id.clone(),
+            &from.attributes,
+            Some(&persisted),
+        );
+        let explicit = HashMap::from([(
+            id,
+            ExplicitFields::Struct {
+                children: HashMap::from([
+                    ("name".to_string(), ExplicitFields::Leaf),
+                    (
+                        "rules".to_string(),
+                        ExplicitFields::ListElements {
+                            elements: vec![ExplicitFields::Struct {
+                                children: HashMap::from([
+                                    ("port".to_string(), ExplicitFields::Leaf),
+                                    (
+                                        "opts".to_string(),
+                                        ExplicitFields::Struct {
+                                            children: HashMap::new(),
+                                        },
+                                    ),
+                                ]),
+                            }],
+                        },
+                    ),
+                ]),
+            },
+        )]);
+        let (registry, provider) = crate::provider::comparison_fixture_for_test(
+            &registry,
+            std::iter::once(plan.effects()[0].resource_id()),
+        );
+
+        let rows = build_detail_rows_by_instance(
+            &plan.effects()[0],
+            Some(&registry),
+            DetailLevel::Explicit,
+            &historical,
+            Some(&explicit),
+            &provider,
+        )
+        .expect("detail display must resolve its comparison");
+
+        assert!(matches!(
+            rows.as_slice(),
+            [DetailRow::Changed { key, .. }] if key == "name"
         ));
     }
 
