@@ -62,9 +62,19 @@ and `generate-docs.sh`.
 
 Both guests use one shared resolver in `carina-aws-types`. Parse key ARNs
 without a call. Every other form (key ID, alias name, alias ARN) uses
-`DescribeKey(KeyId = raw value)` with the instance's effective credentials
-(including `assume_role`) and region; alias ARNs use their own region.
-The response must contain a valid key ARN. Core and host gain no AWS SDK.
+`DescribeKey(KeyId = raw value)`. The response must contain a valid key
+ARN. Core and host gain no AWS SDK.
+
+Region and account come from the routed provider instance, never from
+resource attributes: the instance's configured region and its effective
+credentials (after `assume_role`) are the scope the resource's own API
+calls use, so a bare key ID or `alias/name` means what the service means.
+The one exception is a qualified form. An alias ARN or key ARN names its
+own region and account; the resolver calls KMS in that ARN's region with
+the instance's credentials and never substitutes the instance's account
+or region into it. Whether KMS allows that cross-account/cross-region
+call is decided by the key policy, and a denial is D6's `AccessDenied`.
+A partition the instance cannot reach is `InvalidReference`, not a guess.
 
 ### D4. Keep raw values; compare typed references
 
@@ -104,12 +114,42 @@ Unknown/deferred leaves are never resolved and retain existing dependency
 and scheduling behavior. Apply executes effects; it does not re-diff
 materialized leaves or prepare them for comparison.
 
-### D6. Resolution failures are hard errors, including managed aliases
+### D6. Resolution failures are typed; only a dangling current value is a diff
 
-Access denied, not found, exhausted retries, transport/credential failures
-and invalid results abort planning (exit 1). Report provider instance,
-resource/path, reference and AWS diagnostics. No raw equality fallback or
-executable saved plan on failure.
+The resolver's per-request outcome is a closed enum, and the comparison
+side decides what each case means:
+
+```rust
+enum ReferenceOutcome { Resolved(KmsKeyArn), NotFound(ProviderError) }
+enum ReferenceError {
+    AccessDenied(ProviderError),   // AccessDeniedException, key policy denial
+    Transient(ProviderError),      // throttling after retries, transport, 5xx, credentials
+    InvalidReference(ProviderError), // malformed value, unreachable partition, non-ARN success
+}
+```
+
+| Case | Desired side | Current (read/state) side |
+|---|---|---|
+| `Resolved` | compare ARNs | compare ARNs |
+| `NotFound` (alias or key deleted) | plan error: apply would send a reference KMS rejects | `CurrentSide::Dangling`: unequal to every resolved desired ARN, so it is a diff |
+| `AccessDenied` / `Transient` / `InvalidReference` | plan error | plan error |
+
+`NotFound` on the current side means the resource points at nothing; an
+error there would block the very update that repairs it, so it becomes a
+diff whose plan detail says the current reference no longer resolves.
+Every other failure aborts planning (exit 1): it says nothing about
+equality, and treating it as a difference would silently plan an update
+or replacement, and treating it as equality would silently hide one.
+Denials and transient failures therefore never reach the differ.
+
+The types enforce this. `ResolvedReferences` stores
+`DesiredSide::Arn(KmsKeyArn)` and `CurrentSide::{Arn(KmsKeyArn), Dangling}`;
+the prepare step is the only constructor and returns `ReferenceError`
+(or `NotFound` for a desired value) as a typed plan error with its
+`#[source]` chain. The differ has no error case to fall back from, so a
+raw string comparison cannot be reached. Report provider instance,
+resource/path, reference and AWS code/request ID; no executable saved plan
+on failure.
 
 Resolve `alias/aws/<svc>` with plain `DescribeKey`, including first-use
 AWS-managed key initialization. No alias precheck or special success on
@@ -138,15 +178,23 @@ record reference-request {
     ty: type-identity,
     value: string,
 }
+variant reference-outcome { resolved(string), not-found(provider-error) }
+variant reference-error {
+    access-denied(provider-error),
+    transient(provider-error),
+    invalid-reference(provider-error),
+}
 resolve-references: func(requests: list<reference-request>)
-    -> result<list<result<string, provider-error>>, provider-error>;
+    -> result<list<result<reference-outcome, reference-error>>, provider-error>;
 ```
 
 Results are positional; the host retains resource/path fan-out and never
-sends unknown/deferred leaves. Reject length mismatches and successful
-values that are not valid key ARNs. The outer error covers whole-call
-failure; inner errors retain per-request provider diagnostics. The SDK
-default fails every request with an unsupported error.
+sends unknown/deferred leaves. Reject length mismatches and `resolved`
+values that are not valid key ARNs (as `invalid-reference`). The outer
+error covers whole-call failure and aborts planning. The variants map
+one-to-one onto D6's Rust enums; the guest classifies AWS error codes, so
+the host never parses error strings. The SDK default fails every request
+with `invalid-reference` naming the unsupported type identity.
 
 Use main's protocol version plus one at merge, advancing
 `MIN_SUPPORTED_PROTOCOL_VERSION` to match, with no shim. Main is 15 now;
@@ -177,6 +225,10 @@ requirement together.
   distinctions, ARN-returning repoints, echoed-alias equality, saved/write-only
   fallbacks and unchanged raw values. Require the witness for differ and
   binding-stability callers; missing needed entries are typed errors.
+  Every D6 table cell: desired `NotFound` and every `ReferenceError` abort
+  planning with the source chain; current `NotFound` becomes a diff.
+  Instance region/account scope for bare forms; ARN forms keep their own
+  region/account and are never rewritten to the instance's.
 - **WASM/host:** positional batches, length mismatch, non-ARN success,
   unsupported defaults, error/timeout transport and cache isolation by
   instance/type/value. Unknowns and schema-only loading make no KMS calls;
