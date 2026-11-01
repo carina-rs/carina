@@ -160,7 +160,7 @@ mod legacy_migration;
 mod override_aware;
 
 pub(crate) use legacy_migration::{
-    MaterializedConfiguration, classify_legacy_state, report_legacy_migration,
+    MaterializedConfiguration, classify_legacy_state, replay_legacy_migration,
 };
 
 pub use override_aware::{
@@ -1824,16 +1824,9 @@ impl MigrationCheckConfig {
             &self.resources.data_sources,
             &state_view,
         )?;
-        let configured = self.resources.resources.clone();
-        let data_sources = self.resources.data_sources.clone();
-        let residual_loops = self.resources.deferred_for_expressions().clone();
         classify_legacy_state(
             self.resources,
-            MaterializedConfiguration::Offline {
-                resources: &configured,
-                data_sources: &data_sources,
-                residual_loops: residual_loops.as_slice(),
-            },
+            MaterializedConfiguration::Offline,
             &moved_pairs,
             Some(&state),
         )
@@ -1864,7 +1857,7 @@ impl<E> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
     /// through classification, warning reporting, and strict graph validation.
     pub(crate) fn resolve_legacy_graph(
         self,
-        resources: &[Resource],
+        mode: MaterializedConfiguration,
         moves: &ResolvedMovePairs,
         state: Option<&StateFile>,
     ) -> Result<ValidatedLegacyConfiguration<E>, AppError> {
@@ -1877,17 +1870,7 @@ impl<E> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
             inner: parsed,
             origin,
         } = validated_resources;
-        let data_sources = parsed.data_sources.clone();
-        let validated = classify_legacy_state(
-            parsed,
-            MaterializedConfiguration::Planned {
-                resources,
-                data_sources: &data_sources,
-            },
-            moves,
-            state,
-        )?
-        .report_and_validate()?;
+        let validated = classify_legacy_state(parsed, mode, moves, state)?.report_and_validate()?;
         Ok(ValidatedLegacyConfiguration {
             config: ValidatedConfig {
                 wiring,
@@ -1903,6 +1886,109 @@ impl<E> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
 }
 
 impl<E: Clone> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
+    /// Materialize the migration configuration using the same phase-2 reads,
+    /// deferred-loop expansion, and child settlement as live planning. Destroy
+    /// and state refresh both preserve persisted addresses through this owner.
+    pub(crate) async fn materialize_legacy_configuration(
+        &mut self,
+        inputs: LegacyConfigurationReadInputs<'_, '_, '_>,
+    ) -> Result<MaterializedLegacyConfiguration, AppError> {
+        let LegacyConfigurationReadInputs {
+            prelude,
+            mut state,
+            provider,
+            state_file,
+            refresh_phase,
+            remote_bindings,
+            cancel,
+        } = inputs;
+        let (ctx, parsed) = self.context_and_resources();
+        hydrate_prior_managed_states(
+            &mut state.managed_current,
+            &mut state.orphans,
+            provider,
+            prelude.saved_attrs(),
+            state_file.as_ref(),
+        )
+        .await?;
+        let saved_dep_bindings = state_file
+            .as_ref()
+            .map(|file| {
+                prelude
+                    .sorted_resources()
+                    .iter()
+                    .filter_map(|resource| {
+                        let row = file.find_resource_for_id(&resource.id)?;
+                        Some((
+                            resource.id.clone(),
+                            row.dependency_bindings.to_resolved_dependencies(),
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let addressed = prelude.preserve_addresses(state);
+        let values = addressed
+            .read_data_sources_phase2(AddressedDataSourceReadInputs {
+                provider,
+                refresh_phase: Some(refresh_phase),
+                compositions: &parsed.compositions,
+                data_sources: &parsed.data_sources,
+                remote_bindings,
+                schemas: ctx.schemas(),
+                saved_dep_bindings: &saved_dep_bindings,
+                factories: ctx.factories(),
+                cancel: Some(cancel),
+            })
+            .await?
+            .into_values()?;
+        if cancel.phase() != carina_core::shutdown::ShutdownPhase::Running {
+            return Err(AppError::Interrupted);
+        }
+        let mut expansion = addressed.seal(values);
+        let ExpandedRefreshState { sorted_resources } = self
+            .expand_refresh_and_lift_states(ValidatedExpandRefreshAndLiftInputs {
+                provider,
+                comparison_provider: provider,
+                expansion: &mut expansion,
+                warning_policy: DeferredForWarningPolicy::Print,
+                remote_bindings,
+                state_file,
+                saved_dep_bindings: &saved_dep_bindings,
+                refresh_phase,
+            })
+            .await?;
+        let mut parts = expansion.into_parts();
+        let (ctx, parsed) = self.context_and_resources();
+        parts.data_source_values = read_expanded_data_sources_phase2(
+            parts.data_source_values,
+            ExpandedDataSourceReadInputs {
+                provider,
+                refresh_phase: Some(refresh_phase),
+                managed: &sorted_resources,
+                compositions: &parsed.compositions,
+                data_sources: &parsed.data_sources,
+                managed_current: &parts.addressed.managed_current,
+                orphans: &parts.addressed.orphans,
+                remote_bindings,
+                schemas: ctx.schemas(),
+                wait_aliases: &parts.wait_aliases,
+                saved_dep_bindings: &saved_dep_bindings,
+                factories: ctx.factories(),
+                cancel: Some(cancel),
+            },
+        )
+        .await?
+        .into_values()?;
+        if cancel.phase() != carina_core::shutdown::ShutdownPhase::Running {
+            return Err(AppError::Interrupted);
+        }
+        Ok(MaterializedLegacyConfiguration {
+            sorted_resources,
+            parts,
+        })
+    }
+
     /// Run the address-preserving state-refresh expansion through this owner,
     /// keeping the mutated file bound to its validating wiring.
     pub(crate) async fn expand_refresh_and_lift_states<P: Provider + ProviderNormalizer>(
@@ -1944,6 +2030,39 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
         )
         .await
     }
+}
+
+pub(crate) struct LegacyConfigurationReadInputs<'a, 'backend, 'state> {
+    pub prelude: DeferredForExpansionPrelude<'state>,
+    pub state: PreserveDeferredForExpansionInputs,
+    pub provider: &'a ProviderRouter,
+    pub state_file: &'a Option<StateFile>,
+    pub refresh_phase: &'a RefreshPhase<'backend>,
+    pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
+    pub cancel: &'a ShutdownToken,
+}
+
+pub(crate) struct MaterializedLegacyConfiguration {
+    pub sorted_resources: Vec<Resource>,
+    pub parts: PreparedDeferredForExpansionParts,
+}
+
+pub(crate) fn resources_at_destroy_addresses(
+    resources: Vec<Resource>,
+    moved_pairs: &ResolvedMovePairs,
+) -> Vec<Resource> {
+    resources
+        .into_iter()
+        .map(|mut resource| {
+            if let Some((source, _)) = moved_pairs
+                .iter()
+                .find(|(_, target)| target.as_inner() == &resource.id)
+            {
+                resource.id = source.as_inner().clone();
+            }
+            resource
+        })
+        .collect()
 }
 
 impl<E> ValidatedConfig<ExpandedCanonicalResources<E>> {
@@ -5293,24 +5412,17 @@ impl<'state> DetectedDeferredForExpansionPrelude<'state> {
         state_file.build_orphans(&desired_ids)
     }
 
-    pub(crate) fn into_destroy_resources(self, moved_pairs: &ResolvedMovePairs) -> Vec<Resource> {
+    pub(crate) fn into_destroy_prelude(
+        self,
+        moved_pairs: &ResolvedMovePairs,
+    ) -> DeferredForExpansionPrelude<'state> {
         let Self {
-            prelude,
+            mut prelude,
             automatic_moves: _,
         } = self;
+        prelude.sorted_resources =
+            resources_at_destroy_addresses(prelude.sorted_resources, moved_pairs);
         prelude
-            .sorted_resources
-            .into_iter()
-            .map(|mut resource| {
-                if let Some((source, _)) = moved_pairs
-                    .iter()
-                    .find(|(_, target)| target.as_inner() == &resource.id)
-                {
-                    resource.id = source.as_inner().clone();
-                }
-                resource
-            })
-            .collect()
     }
 
     pub(crate) fn saved_plan_replay_moves<E>(
@@ -5746,11 +5858,13 @@ impl<E> ExpandedCanonicalResources<E> {
     fn into_plan_configuration(
         self,
         configured: &OverrideAwareResources,
+        data_sources: &[DataSource],
     ) -> carina_core::parser::ModuleResolvedFile<E> {
         let mut parsed = self.into_configuration();
         // The override-aware owner contains configuration resources only and
         // has just reconciled their final anonymous addresses.
         parsed.resources = configured.resources().to_vec();
+        parsed.data_sources = data_sources.to_vec();
         parsed
     }
 
@@ -6421,11 +6535,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     )?;
 
     let validated = classify_legacy_state(
-        expanded_resources.into_plan_configuration(&override_aware_resources),
-        MaterializedConfiguration::Planned {
-            resources: override_aware_resources.resources(),
-            data_sources: &data_sources_for_plan,
-        },
+        expanded_resources
+            .into_plan_configuration(&override_aware_resources, &data_sources_for_plan),
+        MaterializedConfiguration::Planned,
         &addressed.moved_pairs,
         state_file.as_ref(),
     )?

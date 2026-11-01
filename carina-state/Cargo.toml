@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [lib]
-doctest = false
+doctest = true
 
 [features]
 test-utils = []

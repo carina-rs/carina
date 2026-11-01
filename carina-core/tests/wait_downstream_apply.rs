@@ -90,8 +90,13 @@ fn resolve_plan_graph(
     Vec<ResolvedResource>,
     Vec<carina_core::wait::ResolvedWaitBinding>,
 ) {
-    let index = carina_core::resolved_graph::resolve_expanded_graph(parsed, resources, &[])
-        .expect("expanded test graph must resolve");
+    let index = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (resources).to_vec();
+        configuration.data_sources = (&[]).to_vec();
+        configuration.into()
+    })
+    .expect("expanded test graph must resolve");
     let managed = resources
         .iter()
         .cloned()

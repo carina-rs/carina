@@ -54,11 +54,12 @@ use carina_core::schema::{
 
 fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedResource {
     let parsed = carina_core::parser::ParsedFile::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(
-        parsed,
-        std::slice::from_ref(&resource),
-        &[],
-    )
+    let graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (std::slice::from_ref(&resource)).to_vec();
+        configuration.data_sources = (&[]).to_vec();
+        configuration.into()
+    })
     .expect("carina3122 fixture graph must resolve");
     graph
         .resolve_resource(resource, registry)

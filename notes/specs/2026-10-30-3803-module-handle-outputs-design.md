@@ -340,11 +340,16 @@ the pending typestate, display
 `dependencies not yet migrated (legacy: ...)`, and never write it.
 
 Configuration-aware commands classify each legacy name against state rows first and then the current expanded
-graph. Graph construction consumes the expanded file once; classification and live plan/apply, destroy,
-refresh, and offline checks retain that same graph. Configuration-only membership and module scopes are captured
-in `ConfiguredResources`, constructed from the configuration file; orphan/state candidates cannot enter that set.
-For a row inside a module instance, resolution tries that instance's scope before root because old releases
-stored module-local dependency and argument spellings inconsistently. A configured row fails with a typed
+graph. Graph construction consumes `ConfiguredGraphInput`, which owns the expanded configuration file once;
+classification and live plan/apply, destroy, refresh, and offline checks retain that same graph. Its target maps
+contain configuration resources only. Orphan rows participate only as state-row candidates during classification,
+so a configured resource may reuse an orphan's binding after changing resource type. Configuration-only membership
+is captured in `ConfiguredResources`; it determines strictness, never the historical row's scope.
+Every row derives its enclosing instance scopes from its persisted binding address (or identity when no binding
+was recorded), including configured, moved, orphan, and deposed rows. Resolution probes those scopes from inside
+out before root, preserving quoted map-key segments. Removing a module or moving a row to another instance must
+not redirect its historical module-local edges to root or destination-instance resources. Old releases stored
+module-local dependency and argument spellings inconsistently. A configured row fails with a typed
 `LegacyDependencyMigrationError` when a name is missing or ambiguous. A saved plan persists the complete
 classification, including its source fingerprints and warnings, so `apply --plan` validates it against the loaded
 state and cannot fall back to the old kind-blind strings. Move scope is an opaque `ResolvedMovePairs` value with no
@@ -355,11 +360,14 @@ cannot be called with an untyped empty slice.
 An orphan or deposed row is different: deletion must remain possible after its former module or dependency has
 left the configuration. Classification retains every known managed edge and returns a typed
 `LegacyDestroyOrderingWarning` for each unresolved name. Classification before terminal wait validation yields
-`UnvalidatedLegacyMigration`, which owns the graph, classification, and `UnreportedMigratedState`. Its only
+`UnvalidatedLegacyMigration`, which owns the graph, classification, and still-unwritable legacy state. Its only
 transition reports every current and deposed warning through one CLI formatter on stderr, then strictly validates
 that same graph before releasing the writable v21 state or saved classification. A failed wait therefore prints
 the warnings and leaves v20 state unchanged, byte for byte. Saved plans contain only classifications that crossed
-strict validation; replay reports their warnings before any migration write. Scheduling uses the known edges.
+strict validation; replay owns that saved managed-row projection through the same pending migration type,
+reports its warnings, and validates completeness and source fingerprints before any migration write. Raw
+classification, migration-input construction, and state writeback are private to the state crate. Scheduling uses
+the known edges. Migration resolution errors retain their typed graph or persisted-address causes.
 The warning is operation-scoped rather than state
 data: v21 persists the known managed IDs only, never the unresolved name. Thus an unresolved name can leave memory
 only after it has been surfaced, while the v21 format remains free of dependency strings.
@@ -374,8 +382,11 @@ or state writes. It loads only provider metadata from exact installed artifacts;
 artifacts. The schema-only host admits the released protocol-v12 metadata function signatures and upgrades their
 older schema JSON in memory, while the ordinary runtime loader continues to require the current protocol. The
 command reports configured-row errors and orphan/deposed warnings and explicitly states that no state was written.
-If an unmaterialized deferred loop could own a state row, offline classification returns the typed `RequiresReads`
-outcome instead of guessing; the operator must run a read-capable migration path.
+Destroy with refresh and state refresh materialize deferred loops through the same read/expansion builder before
+using the migration-input builder shared with plan. A loop-owned row is therefore configured and strict on every
+read-capable command. Destroy with `--refresh=false` uses the offline input. If an unmaterialized deferred loop
+could own a state row, offline classification returns the typed `RequiresReads` outcome instead of guessing;
+destroy tells the operator to rerun with `--refresh=true` and leaves pending legacy state unchanged.
 
 ## Consumers to update
 

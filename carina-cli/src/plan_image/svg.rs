@@ -1401,8 +1401,13 @@ mod tests {
         );
         let resources = vec![a, connector, b];
         let parsed = carina_core::parser::ParsedFile::default();
-        let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed, &resources, &[])
-            .expect("test graph targets resolve");
+        let graph = carina_core::resolved_graph::resolve_expanded_graph({
+            let mut configuration = parsed;
+            configuration.resources = (&resources).to_vec();
+            configuration.data_sources = (&[]).to_vec();
+            configuration.into()
+        })
+        .expect("test graph targets resolve");
         let desired = resources
             .into_iter()
             .map(|resource| {

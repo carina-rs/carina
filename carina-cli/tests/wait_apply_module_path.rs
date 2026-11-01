@@ -617,11 +617,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .await
         .expect("plan preprocessing");
     let resources_for_plan = override_aware_resources.resources().to_vec();
-    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        parsed,
-        &resources_for_plan,
-        &data_sources,
-    )
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (&resources_for_plan).to_vec();
+        configuration.data_sources = (&data_sources).to_vec();
+        configuration.into()
+    })
     .expect("expanded graph resolution");
     let parsed = expanded_graph.configuration();
     let resolved_resources_for_plan = resources_for_plan

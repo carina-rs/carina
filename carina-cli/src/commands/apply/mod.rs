@@ -3456,12 +3456,10 @@ async fn run_apply_from_plan_locked_owned(
                             .to_string(),
                     ))
             );
-            let migration = try_with_lock!(
-                state
-                    .with_legacy_classification(classification)
-                    .map_err(|error| AppError::Backend(error.into()))
-            );
-            state = crate::wiring::report_legacy_migration(migration);
+            state = try_with_lock!(crate::wiring::replay_legacy_migration(
+                state,
+                classification
+            ));
         }
         state_file = Some(state);
     }

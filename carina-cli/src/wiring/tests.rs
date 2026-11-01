@@ -2418,9 +2418,13 @@ fn create_plan(
 ) -> Plan {
     let mut parsed = carina_core::parser::ParsedFile::default();
     parsed.wait_bindings = wait_bindings.to_vec();
-    let expanded_graph =
-        carina_core::resolved_graph::resolve_expanded_graph(parsed, managed, data_sources)
-            .expect("test graph dependencies must resolve");
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (managed).to_vec();
+        configuration.data_sources = (data_sources).to_vec();
+        configuration.into()
+    })
+    .expect("test graph dependencies must resolve");
     let managed = managed
         .iter()
         .cloned()

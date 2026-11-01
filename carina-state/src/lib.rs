@@ -95,10 +95,10 @@ pub use lock::LockInfo;
 pub use state::{
     ApplyDecision, CurrentInstance, DeposedAttributes, DeposedInstance, DeposedKey,
     ImportTargetDisposition, LegacyDependencyClassification, LegacyDependencyMigrationError,
-    LegacyDependencyNames, LegacyDestroyOrderingWarning, LegacyMigrationInput, LoadedOrphans,
-    LoadedState, MigratedStateFile, MigrationInfo, NameOverride, NotOutcomeUnknown,
-    NotOutcomeUnknownKind, OutcomeUnknownRow, PreviousSecretHashAuthority, PublishedExports,
-    ResourceState, ResourceStateEncodingError, RowBasis, StateFile, UnreportedMigratedState,
-    UnvalidatedLegacyMigration, ValidatedLegacyMigration, check_and_migrate,
-    check_and_migrate_bytes, log_state_migration_once, should_apply_override,
+    LegacyDependencyNames, LegacyDestroyOrderingWarning, LoadedOrphans, LoadedState,
+    MigratedStateFile, MigrationInfo, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind,
+    OutcomeUnknownRow, PreviousSecretHashAuthority, PublishedExports, ResourceState,
+    ResourceStateEncodingError, RowBasis, StateFile, UnvalidatedLegacyMigration,
+    ValidatedLegacyMigration, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
+    should_apply_override,
 };

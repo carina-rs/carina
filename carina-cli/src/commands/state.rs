@@ -27,8 +27,8 @@ use carina_core::provider::{
 #[cfg(test)]
 use carina_core::resource::PersistedDestroyDependencies;
 use carina_core::resource::{
-    Current, DataSource, ResolvedDataSource, ResolvedDependencies, ResolvedResource,
-    ResolvedResourceId, ResourceId, ResourceIdentity, State, Value,
+    Current, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
+    ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -58,8 +58,8 @@ use crate::commands::state_output::{StateShowCurrentKind, StateShowDocument, Sta
 use crate::cursor::CursorReveal;
 use crate::error::AppError;
 use crate::wiring::{
-    AddressedDataSourceReadInputs, MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig,
-    get_provider_with_ctx, prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
+    MigrationCheckProviderLoad, ProviderLoad, ValidatedConfig, get_provider_with_ctx,
+    prepare_default_provider_ready_config, refresh_loaded_orphan_with_retry,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -1761,7 +1761,7 @@ pub(crate) async fn run_state_refresh_locked(
             }
         }
     }
-    let mut orphans = refreshed_orphans.into_plan_orphans();
+    let orphans = refreshed_orphans.into_plan_orphans();
     already_refreshed.extend(refreshed_orphan_ids);
 
     // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
@@ -1782,109 +1782,37 @@ pub(crate) async fn run_state_refresh_locked(
     // carina#3739: `build_saved_attrs` returns raw persisted values; consuming
     // them through `lift` is required before the typed expansion input accepts
     // the map for Phase 2.5 hydration.
-    crate::wiring::hydrate_prior_managed_states(
-        &mut managed_current,
-        &mut orphans,
-        &provider,
-        expansion_prelude.saved_attrs(),
-        state_file.as_ref(),
-    )
-    .await?;
-    let saved_dep_bindings: HashMap<ResourceId, ResolvedDependencies> = state_file
-        .as_ref()
-        .map(|sf| {
-            sorted_resources
-                .iter()
-                .filter_map(|r| {
-                    let identity = r.id.identity_str()?;
-                    let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
-                    if rs.dependency_bindings.is_empty() {
-                        None
-                    } else {
-                        Some((
-                            r.id.clone(),
-                            rs.dependency_bindings.to_resolved_dependencies(),
-                        ))
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let addressed_expansion =
-        expansion_prelude.preserve_addresses(crate::wiring::PreserveDeferredForExpansionInputs {
-            managed_current,
-            orphans,
-            already_refreshed,
-        });
     let empty_remote_bindings = HashMap::new();
-    let data_source_values = addressed_expansion
-        .read_data_sources_phase2(AddressedDataSourceReadInputs {
-            provider: &provider,
-            refresh_phase: Some(&refresh_phase),
-            compositions: &parsed.compositions,
-            data_sources: &parsed.data_sources,
-            remote_bindings: &empty_remote_bindings,
-            schemas: ctx.schemas(),
-            saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
-            cancel: Some(&cancel),
-        })
-        .await?
-        .into_values()?;
-    match cancel.phase() {
-        ShutdownPhase::Running => {}
-        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
-            return Err(AppError::Interrupted);
-        }
-    }
-    let mut prepared_expansion = addressed_expansion.seal(data_source_values);
-    let crate::wiring::ExpandedRefreshState {
-        sorted_resources: resorted,
+    let crate::wiring::MaterializedLegacyConfiguration {
+        sorted_resources,
+        parts:
+            crate::wiring::PreparedDeferredForExpansionParts {
+                addressed,
+                mut data_source_values,
+                wait_aliases: _,
+            },
     } = validated_config
-        .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
+        .materialize_legacy_configuration(crate::wiring::LegacyConfigurationReadInputs {
+            prelude: expansion_prelude,
+            state: crate::wiring::PreserveDeferredForExpansionInputs {
+                managed_current,
+                orphans,
+                already_refreshed,
+            },
             provider: &provider,
-            comparison_provider: &provider,
-            expansion: &mut prepared_expansion,
-            warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
-            remote_bindings: &HashMap::new(),
             state_file: &state_file,
-            saved_dep_bindings: &saved_dep_bindings,
             refresh_phase: &refresh_phase,
+            remote_bindings: &empty_remote_bindings,
+            cancel: &cancel,
         })
         .await?;
     let (ctx, parsed) = validated_config.context_and_resources();
-    let sorted_resources = resorted;
-    let crate::wiring::PreparedDeferredForExpansionParts {
-        addressed,
-        mut data_source_values,
-        wait_aliases,
-    } = prepared_expansion.into_parts();
     let projected_state = addressed.projected_state(state_file.as_ref());
     let crate::wiring::AddressedStateParts {
         mut managed_current,
         orphans,
         saved_attrs: saved_attrs_for_expansion,
     } = addressed.into_parts();
-    data_source_values = crate::wiring::read_expanded_data_sources_phase2(
-        data_source_values,
-        crate::wiring::ExpandedDataSourceReadInputs {
-            provider: &provider,
-            refresh_phase: Some(&refresh_phase),
-            managed: &sorted_resources,
-            compositions: &parsed.compositions,
-            data_sources: &parsed.data_sources,
-            managed_current: &managed_current,
-            orphans: &orphans,
-            remote_bindings: &empty_remote_bindings,
-            schemas: ctx.schemas(),
-            wait_aliases: &wait_aliases,
-            saved_dep_bindings: &saved_dep_bindings,
-            factories: ctx.factories(),
-            cancel: Some(&cancel),
-        },
-    )
-    .await?
-    .into_values()?;
     for (resource, value) in data_source_values.iter() {
         if let DataSourceValue::DeferredToApply(unresolved) = value {
             eprintln!(
@@ -1947,25 +1875,18 @@ pub(crate) async fn run_state_refresh_locked(
     // the refreshed resource set through the one graph-address transition;
     // converting each raw resource independently would either reject its
     // authored snapshots or silently discard ordering metadata.
-    let state_for_graph = state_file
-        .as_ref()
-        .expect("non-empty state refresh retains its state file");
-    let graph_managed = sorted_resources
-        .iter()
-        .cloned()
-        .chain(orphan_ids.iter().map(|id| {
-            crate::commands::shared::state_writeback::build_orphan_resource(state_for_graph, id)
-        }))
-        .collect::<Vec<_>>();
     let moved_pairs = crate::wiring::resolve_moved_pairs(
         ctx,
         parsed,
-        &graph_managed,
+        &sorted_resources,
         &parsed.data_sources,
         &state_file,
     )?;
-    let validated =
-        validated_config.resolve_legacy_graph(&graph_managed, &moved_pairs, state_file.as_ref())?;
+    let validated = validated_config.resolve_legacy_graph(
+        crate::wiring::MaterializedConfiguration::Planned,
+        &moved_pairs,
+        state_file.as_ref(),
+    )?;
     let (ctx, expanded_graph) = validated.config.context_and_resources();
     let parsed = expanded_graph.configuration();
     if let Some(migrated) = validated.migrated_state {

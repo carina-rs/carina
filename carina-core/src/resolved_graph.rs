@@ -946,47 +946,33 @@ fn require_resolved_id(
     })
 }
 
-/// Configuration-only membership and module scopes for legacy migration.
+/// Configuration-only membership for legacy migration.
 /// State-row candidates can participate in address lookup, but cannot mint
 /// configured membership through this type.
 #[derive(Debug)]
-pub struct ConfiguredResources(HashMap<ResolvedResourceId, Option<String>>);
+pub struct ConfiguredResources(HashSet<ResolvedResourceId>);
 
 impl ConfiguredResources {
     pub fn from_configuration<E, D>(parsed: &File<E, D>) -> Self {
         Self::collect(&parsed.resources)
     }
 
-    fn collect<S: crate::resource::LegacyDependencyModuleSource>(
-        resources: &[Resource<S>],
-    ) -> Self {
-        use crate::resource::LegacyDependencyModuleSource;
+    fn collect<S>(resources: &[Resource<S>]) -> Self {
         Self(
             resources
                 .iter()
-                .filter_map(|resource| {
-                    ResolvedResourceId::try_new(resource.id.clone()).map(|id| {
-                        let scope = resource
-                            .module_source
-                            .as_ref()
-                            .and_then(LegacyDependencyModuleSource::legacy_dependency_scope_prefix)
-                            .map(str::to_owned);
-                        (id, scope)
-                    })
-                })
+                .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
                 .collect(),
         )
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn from_test_resources<S: crate::resource::LegacyDependencyModuleSource>(
-        resources: &[Resource<S>],
-    ) -> Self {
+    pub fn from_test_resources<S>(resources: &[Resource<S>]) -> Self {
         Self::collect(resources)
     }
 
-    pub fn scope(&self, id: &ResolvedResourceId) -> Option<Option<&str>> {
-        self.0.get(id).map(|scope| scope.as_deref())
+    pub fn contains(&self, id: &ResolvedResourceId) -> bool {
+        self.0.contains(id)
     }
 }
 
@@ -1064,21 +1050,29 @@ impl<E, D> Deref for ResolvedExpandedGraph<E, D> {
     }
 }
 
+/// Configuration-only resources for graph construction. State rows participate
+/// in legacy classification separately and cannot be supplied as target slices.
+pub struct ConfiguredGraphInput<E, D>(File<E, D>);
+
+impl<E, D> From<File<E, D>> for ConfiguredGraphInput<E, D> {
+    fn from(configuration: File<E, D>) -> Self {
+        Self(configuration)
+    }
+}
+
 /// Resolve all module handle outputs and build the address index used by every
 /// subsequent resource, data-source, and wait transition.
 ///
 /// ```compile_fail,E0382
 /// use carina_core::{parser::ParsedFile, resolved_graph::resolve_expanded_graph};
 /// let parsed = ParsedFile::default();
-/// let first = resolve_expanded_graph(parsed, &[], &[]);
-/// let second = resolve_expanded_graph(parsed, &[], &[]);
+/// let first = resolve_expanded_graph(parsed.into());
+/// let second = resolve_expanded_graph(parsed.into());
 /// ```
 pub fn resolve_expanded_graph<E, D>(
-    parsed: File<E, D>,
-    managed: &[Resource],
-    data_sources: &[DataSource],
+    configuration: ConfiguredGraphInput<E, D>,
 ) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError> {
-    resolve_expanded_graph_for_legacy_classification(parsed, managed, data_sources)?.validate()
+    resolve_expanded_graph_for_legacy_classification(configuration)?.validate()
 }
 
 /// Build the graph used only to classify legacy state before terminal wait
@@ -1086,10 +1080,9 @@ pub fn resolve_expanded_graph<E, D>(
 /// so legacy references to them fail closed as unresolved names. The strict
 /// validation consumes this graph before any migrated state is released.
 pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
-    mut parsed: File<E, D>,
-    managed: &[Resource],
-    data_sources: &[DataSource],
+    configuration: ConfiguredGraphInput<E, D>,
 ) -> Result<LegacyClassificationGraph<E, D>, ExpandedGraphResolutionError> {
+    let ConfiguredGraphInput(mut parsed) = configuration;
     let configured = ConfiguredResources::from_configuration(&parsed);
     let upstream_bindings = parsed
         .upstream_binding_names()
@@ -1105,7 +1098,7 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
         .map(|(binding, _handle)| (binding.clone(), ResolvedDependencies::default()))
         .collect::<HashMap<_, _>>();
     let mut managed_ids = HashSet::new();
-    for resource in managed {
+    for resource in &parsed.resources {
         let id = require_resolved_id(&resource.id)?;
         managed_ids.insert(id.clone());
         let target = ExpandedTarget::Managed {
@@ -1123,7 +1116,7 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
         }
         targets.insert_identity(id.identity_str().to_string(), target)?;
     }
-    for data_source in data_sources {
+    for data_source in &parsed.data_sources {
         let id = require_resolved_id(&data_source.id)?;
         let target = ExpandedTarget::DataSource { id: id.clone() };
         if let Some(binding) = &data_source.binding {
@@ -1240,7 +1233,7 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
     // references are leaves: a consumer depends on that row, not recursively
     // on everything the row itself consumes.
     let mut ephemeral_dependencies = HashMap::new();
-    for data_source in data_sources {
+    for data_source in &parsed.data_sources {
         let owner = data_source
             .binding
             .clone()
@@ -1368,8 +1361,13 @@ mod tests {
             binding: "orgs".to_string(),
             source: "../organizations".into(),
         });
-        let graph =
-            resolve_expanded_graph(parsed, &[], &[]).expect("upstream-only graph must resolve");
+        let graph = resolve_expanded_graph({
+            let mut configuration = parsed;
+            configuration.resources = (&[]).to_vec();
+            configuration.data_sources = (&[]).to_vec();
+            configuration.into()
+        })
+        .expect("upstream-only graph must resolve");
         let template = DeferredForExpression {
             file: Some("main.crn".to_string()),
             line: 4,

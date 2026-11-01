@@ -1,61 +1,30 @@
 use std::collections::BTreeSet;
 
 use carina_core::effect::ResolvedMovePairs;
-use carina_core::parser::{DeferredForExpression, ModuleResolvedFile};
+use carina_core::parser::ModuleResolvedFile;
 use carina_core::resolved_graph::{
     LegacyClassificationGraph, ResolvedExpandedGraph, loop_group_bindings,
     resolve_expanded_graph_for_legacy_classification,
 };
-use carina_core::resource::{DataSource, Resource};
-use carina_state::{
-    LegacyDependencyClassification, StateFile, UnreportedMigratedState, UnvalidatedLegacyMigration,
-};
+use carina_state::{LegacyDependencyClassification, StateFile, UnvalidatedLegacyMigration};
 use colored::Colorize;
 
 use crate::error::AppError;
 
-pub(crate) enum MaterializedConfiguration<'a> {
-    Planned {
-        resources: &'a [Resource],
-        data_sources: &'a [DataSource],
-    },
-    Offline {
-        resources: &'a [Resource],
-        data_sources: &'a [DataSource],
-        residual_loops: &'a [DeferredForExpression],
-    },
-}
-
-impl MaterializedConfiguration<'_> {
-    fn parts(&self) -> (&[Resource], &[DataSource], BTreeSet<String>) {
-        match self {
-            Self::Planned {
-                resources,
-                data_sources,
-            } => (resources, data_sources, BTreeSet::new()),
-            Self::Offline {
-                resources,
-                data_sources,
-                residual_loops,
-            } => {
-                let unmaterialized = residual_loops
-                    .iter()
-                    .flat_map(|deferred| {
-                        let target = deferred.target.scheduler_key();
-                        std::iter::once(target.to_string()).chain(loop_group_bindings(target))
-                    })
-                    .collect();
-                (resources, data_sources, unmaterialized)
-            }
-        }
-    }
+pub(crate) enum MaterializedConfiguration {
+    Planned,
+    Offline,
 }
 
 /// No writable state or executable graph can leave this owner until warnings
 /// have been reported and the same graph has passed strict wait validation.
 pub(crate) enum ClassifiedLegacyGraph<E> {
     Current(LegacyClassificationGraph<E, carina_core::parser::ResolvedDeferredForPhase>),
-    Migrating(UnvalidatedLegacyMigration<E, carina_core::parser::ResolvedDeferredForPhase>),
+    Migrating(
+        UnvalidatedLegacyMigration<
+            LegacyClassificationGraph<E, carina_core::parser::ResolvedDeferredForPhase>,
+        >,
+    ),
 }
 
 pub(crate) struct ValidatedLegacyGraph<E> {
@@ -87,7 +56,9 @@ impl<E> ClassifiedLegacyGraph<E> {
                 migrated_state: None,
             }),
             Self::Migrating(migration) => {
-                let validated = migration.report_and_validate(report_legacy_warning)?;
+                let validated = migration
+                    .report_and_validate(report_legacy_warning)
+                    .map_err(|error| AppError::Backend(error.into()))?;
                 Ok(ValidatedLegacyGraph {
                     graph: validated.graph,
                     classification: Some(validated.classification),
@@ -100,12 +71,22 @@ impl<E> ClassifiedLegacyGraph<E> {
 
 pub(crate) fn classify_legacy_state<E>(
     parsed: ModuleResolvedFile<E>,
-    configured: MaterializedConfiguration<'_>,
+    mode: MaterializedConfiguration,
     moves: &ResolvedMovePairs,
     state: Option<&StateFile>,
 ) -> Result<ClassifiedLegacyGraph<E>, AppError> {
-    let (resources, data_sources, offline_unmaterialized) = configured.parts();
-    let graph = resolve_expanded_graph_for_legacy_classification(parsed, resources, data_sources)?;
+    let offline_unmaterialized = match mode {
+        MaterializedConfiguration::Planned => BTreeSet::new(),
+        MaterializedConfiguration::Offline => parsed
+            .deferred_for_expressions()
+            .iter()
+            .flat_map(|deferred| {
+                let target = deferred.target.scheduler_key();
+                std::iter::once(target.to_string()).chain(loop_group_bindings(target))
+            })
+            .collect(),
+    };
+    let graph = resolve_expanded_graph_for_legacy_classification(parsed.into())?;
     if let Some(state) = state.filter(|state| state.requires_legacy_dependency_migration()) {
         let migration = state
             .clone()
@@ -117,8 +98,15 @@ pub(crate) fn classify_legacy_state<E>(
     }
 }
 
-pub(crate) fn report_legacy_migration(migration: UnreportedMigratedState) -> StateFile {
-    migration.report(report_legacy_warning)
+pub(crate) fn replay_legacy_migration(
+    state: StateFile,
+    classification: LegacyDependencyClassification,
+) -> Result<StateFile, AppError> {
+    state
+        .replay_legacy_graph(classification)
+        .report_and_validate(report_legacy_warning)
+        .map(|validated| validated.state)
+        .map_err(|error| AppError::Backend(error.into()))
 }
 
 fn report_legacy_warning(warning: &carina_state::LegacyDestroyOrderingWarning) {

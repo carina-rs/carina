@@ -1,7 +1,7 @@
 use super::{create_plan_for_tests as create_plan, *};
 
 use indexmap::IndexMap;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use crate::explicit::{ExplicitFields, PendingPaths};
 use crate::plan::{
@@ -2595,7 +2595,6 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
     let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
     let consumer = Resource::new("example.Consumer", "consumer-id")
         .with_binding("consumer")
-        .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]))
         .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
     let consumer_state = existing_state(
         consumer_id.clone(),
@@ -2614,22 +2613,30 @@ fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding
         crate::resource::PersistedDirectives::default(),
     )]);
 
-    let plan = create_plan(
+    // Exercise the inverse-edge rule at its resolved-address boundary. An
+    // authored configuration cannot name a resource that is only an orphan.
+    let consumer = crate::resource::ResolvedResource::from_resolved_parts(
+        consumer.into_resolved_dependency_phase_for_test(),
+        std::iter::once(resolved_id(&dependency_id)).collect(),
+        Default::default(),
+    );
+    let current_states = crate::resource::into_plan_input_current_map_from_states(
+        current_states,
+        &SchemaRegistry::new(),
+        &[],
+    );
+    let plan = super::plan::create_plan_for_test(
         &[consumer],
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_current_map_from_states(
-            current_states,
-            &crate::schema::SchemaRegistry::new(),
-            &[],
-        ),
+        PlanPriorStates::new(&current_states, &orphans),
         &HashMap::new(),
         &SchemaRegistry::new(),
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
-        &orphans,
         &[],
-    );
+    )
+    .expect("the resolved inverse-edge fixture must plan");
 
     let delete = plan
         .effects()
@@ -4131,8 +4138,13 @@ fn data_source_wait_is_rejected_at_the_expanded_graph_boundary() {
     let data_sources = vec![lookup];
     let mut parsed: crate::parser::ParsedFile = Default::default();
     parsed.wait_bindings.push(wait.clone());
-    let error = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &data_sources)
-        .expect_err("a data source cannot be a wait target");
+    let error = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (&resources).to_vec();
+        configuration.data_sources = (&data_sources).to_vec();
+        configuration.into()
+    })
+    .expect_err("a data source cannot be a wait target");
     assert!(
         matches!(
             &error,
@@ -4424,8 +4436,13 @@ fn wait_with_unknown_target_is_rejected_at_the_expanded_graph_boundary() {
 
     let mut parsed: crate::parser::ParsedFile = Default::default();
     parsed.wait_bindings.push(wait.clone());
-    let error = crate::resolved_graph::resolve_expanded_graph(parsed, &resources, &[])
-        .expect_err("missing wait target must fail graph resolution");
+    let error = crate::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (&resources).to_vec();
+        configuration.data_sources = (&[]).to_vec();
+        configuration.into()
+    })
+    .expect_err("missing wait target must fail graph resolution");
     assert!(
         matches!(
             &error,

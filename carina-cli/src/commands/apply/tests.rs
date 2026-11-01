@@ -15,9 +15,7 @@ use carina_core::resource::{
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
 };
-use carina_state::{
-    DeposedInstance, DeposedKey, LegacyMigrationInput, NameOverride, ResourceState,
-};
+use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -1842,9 +1840,13 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
     let example_id = example.id.clone();
     let migration_resources = vec![dependency.clone(), example.clone()];
     let graph_file = carina_core::parser::ParsedFile::default();
-    let graph =
-        carina_core::resolved_graph::resolve_expanded_graph(graph_file, &migration_resources, &[])
-            .expect("saved-plan migration graph resolves");
+    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
+        let mut configuration = graph_file;
+        configuration.resources = (&migration_resources).to_vec();
+        configuration.data_sources = (&[]).to_vec();
+        configuration.into()
+    })
+    .expect("saved-plan migration graph resolves");
     let loaded_state = carina_state::check_and_migrate(
         &std::fs::read_to_string(&state_path).expect("read v20 classification state"),
     )
@@ -1852,13 +1854,13 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
     .into_state();
     let no_move_plan: Plan = Plan::new();
     let moved_pairs = ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let configured =
-        carina_core::resolved_graph::ConfiguredResources::from_test_resources(&migration_resources);
-    let migration_input = LegacyMigrationInput::planned(&graph, &configured, &moved_pairs);
     let legacy_dependency_classification = Some(
         loaded_state
-            .classify_legacy_dependencies(&migration_input)
-            .expect("saved-plan migration classification resolves"),
+            .classify_legacy_graph(graph, &moved_pairs, Default::default())
+            .expect("saved-plan migration classification resolves")
+            .report_and_validate(|_| panic!("fixture has no warnings"))
+            .expect("saved-plan migration graph validates")
+            .classification,
     );
     let planned_example = State::existing(
         example_id.clone(),
@@ -3962,11 +3964,12 @@ fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
     parsed.resources.push(target.clone());
     parsed.data_sources.push(data_source.clone());
     let parsed = resolve_file_for_test(parsed);
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(
-        parsed,
-        std::slice::from_ref(&target),
-        std::slice::from_ref(&data_source),
-    )
+    let graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (std::slice::from_ref(&target)).to_vec();
+        configuration.data_sources = (std::slice::from_ref(&data_source)).to_vec();
+        configuration.into()
+    })
     .expect("data-source fixture graph resolves");
     let mut plan = Plan::new();
     plan.add(carina_core::effect::Effect::Read {
@@ -4058,11 +4061,12 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
     parsed.resources.push(target.clone());
     parsed.data_sources.push(data_source.clone());
     let parsed = resolve_file_for_test(parsed);
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(
-        parsed,
-        std::slice::from_ref(&target),
-        std::slice::from_ref(&data_source),
-    )
+    let graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (std::slice::from_ref(&target)).to_vec();
+        configuration.data_sources = (std::slice::from_ref(&data_source)).to_vec();
+        configuration.into()
+    })
     .expect("module-expanded graph resolves");
     let saved = carina_core::resource::SavedDataSource::from(data_source);
     let resolved = graph
@@ -4180,11 +4184,12 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     );
 
     let parsed = carina_core::parser::ParsedFile::default();
-    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph(
-        parsed,
-        &[target.clone(), consumer.clone()],
-        std::slice::from_ref(&lookup),
-    )
+    let expanded_graph = carina_core::resolved_graph::resolve_expanded_graph({
+        let mut configuration = parsed;
+        configuration.resources = (&[target.clone(), consumer.clone()]).to_vec();
+        configuration.data_sources = (std::slice::from_ref(&lookup)).to_vec();
+        configuration.into()
+    })
     .expect("saved-plan fixture dependencies must resolve");
     let schemas = SchemaRegistry::new();
 

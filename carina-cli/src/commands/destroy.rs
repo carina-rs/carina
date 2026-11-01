@@ -333,7 +333,8 @@ async fn run_destroy_locked_owned(
         &parsed.data_sources,
         &state_file,
     )?;
-    let mut all_resources = detected_resources.into_destroy_resources(&moved_pairs);
+    let expansion_prelude = detected_resources.into_destroy_prelude(&moved_pairs);
+    let mut all_resources = expansion_prelude.sorted_resources().to_vec();
 
     if !refresh {
         eprintln!(
@@ -344,6 +345,7 @@ async fn run_destroy_locked_owned(
 
     // Build managed current state -- either from the provider or the state file.
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
+    let mut orphans = carina_core::differ::Orphans::new();
 
     if refresh {
         let progress_backend = ProgressBackend::new(ProgressSink::Human);
@@ -539,6 +541,7 @@ async fn run_destroy_locked_owned(
                     continue;
                 }
                 let (id, loaded) = result?;
+                orphans.insert(loaded.clone());
                 let current = loaded.into_current();
                 let exists = match &current {
                     Current::Absent(_state) => false,
@@ -559,6 +562,35 @@ async fn run_destroy_locked_owned(
                 return Err(AppError::Interrupted);
             }
         }
+
+        let already_refreshed = managed_current.keys().cloned().collect();
+        for id in orphans.keys() {
+            managed_current.remove(id);
+        }
+        let crate::wiring::MaterializedLegacyConfiguration {
+            sorted_resources,
+            parts,
+        } = validated_config.materialize_legacy_configuration(
+            crate::wiring::LegacyConfigurationReadInputs {
+                prelude: expansion_prelude,
+                state: crate::wiring::PreserveDeferredForExpansionInputs {
+                    managed_current,
+                    orphans,
+                    already_refreshed,
+                },
+                provider: &provider,
+                state_file: &state_file,
+                refresh_phase: &refresh_phase,
+                remote_bindings: &HashMap::new(),
+                cancel: &cancel,
+            },
+        ).await?;
+        all_resources = crate::wiring::resources_at_destroy_addresses(sorted_resources, &moved_pairs);
+        let crate::wiring::AddressedStateParts { managed_current: expanded_current, orphans, .. } = parts.addressed.into_parts();
+        if let Some(state) = state_file.as_ref() {
+            all_resources.extend(orphans.keys().map(|id| build_orphan_resource(state, &ResolvedResourceId::new(id.clone()))));
+        }
+        managed_current = carina_core::differ::into_all_prior_states(orphans, expanded_current);
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls.
         // carina#3181: `all_resources` is managed-only.
@@ -580,7 +612,8 @@ async fn run_destroy_locked_owned(
     }
 
     let validated = validated_config.resolve_legacy_graph(
-        &all_resources, &moved_pairs, state_file.as_ref(),
+        if refresh { crate::wiring::MaterializedConfiguration::Planned } else { crate::wiring::MaterializedConfiguration::Offline },
+        &moved_pairs, state_file.as_ref(),
     )?;
     let (ctx, destroy_graph) = validated.config.context_and_resources();
     let parsed = destroy_graph.configuration();
