@@ -438,7 +438,7 @@ let schema = ResourceSchema::new("organizations.Account")
 Carina then rejects deletion and replacement unless the user writes the
 literal opt-out `directives { prevent_destroy = false }`. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
-severe consequences. The required boolean is transported in protocol-v14
+severe consequences. The required boolean is transported in protocol-v16
 schema JSON; an older provider that omits it fails during schema loading.
 
 ## The validated schema

@@ -4613,7 +4613,12 @@ fn non_empty_create_only_value_keeps_its_deterministic_identity_string() {
         Value::Concrete(ConcreteValue::String("configured".into())),
     )])));
     let resource = Resource::new("test.Widget", "example").with_attribute("config", value.clone());
-    let hash_inputs = stable_anonymous_hash_inputs(&resource, &schema);
+    let schema = schema.validate().expect("schema fixture must be valid");
+    let AnonymousIdentityInputs::CreateOnly(hash_inputs) =
+        anonymous_identity_inputs(&resource, &schema)
+    else {
+        panic!("a schema without declared identity must retain create-only hashing");
+    };
 
     assert_eq!(
         hash_inputs.get("config"),

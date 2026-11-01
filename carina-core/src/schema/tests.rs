@@ -1979,7 +1979,7 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 }
 
 #[test]
-fn schema_admission_rejects_closed_enum_transform_not_representable_in_v14() {
+fn schema_admission_rejects_closed_enum_transform_not_representable_in_v16() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
         ResourceSchema::new("test.Widget").attribute(
@@ -1998,12 +1998,12 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v14() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v14"), "{error}");
+    assert!(error.contains("protocol v16"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
 #[test]
-fn config_schema_admission_enforces_scalar_and_v14_enum_invariants() {
+fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
@@ -2031,7 +2031,7 @@ fn config_schema_admission_enforces_scalar_and_v14_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v14"), "{rendered}");
+    assert!(rendered.contains("protocol v16"), "{rendered}");
 }
 
 #[test]

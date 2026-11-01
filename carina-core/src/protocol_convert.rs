@@ -477,7 +477,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-/// Convert a validated resource schema into its version-14 protocol record.
+/// Convert a validated resource schema into its version-16 protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
 ) -> Result<protocol::ResourceSchema, ProtocolConvertError> {
@@ -495,10 +495,10 @@ pub fn resource_schema_to_protocol(
         default_wait_interval,
         defs,
     } = schema.parts();
-    // Protocol v14 has no resource wait-default fields. These are host-side
+    // Protocol v16 has no resource wait-default fields. These are host-side
     // execution policy, not provider metadata; projection intentionally omits
     // them and round-trip tests pin that one-way behavior.
-    let _v14_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
+    let _v16_omits_host_wait_defaults = (default_wait_timeout, default_wait_interval);
 
     let attributes = attributes
         .iter()
@@ -564,7 +564,7 @@ fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
     TypeIdentity::from_dotted(identity)
 }
 
-/// Project one aggregate provider-schema witness onto the version-14 envelope.
+/// Project one aggregate provider-schema witness onto the version-16 envelope.
 pub fn provider_schema_to_protocol(
     witness: &ValidatedProviderSchemaWitness,
 ) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
@@ -590,7 +590,7 @@ pub fn provider_schema_to_protocol(
     })
 }
 
-/// Decode the version-14 provider-schema envelope and jointly admit resource,
+/// Decode the version-16 provider-schema envelope and jointly admit resource,
 /// config, and reference-form declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
@@ -652,9 +652,9 @@ pub fn attribute_schema_to_protocol(
         identity_mode,
         deferred_populate,
     } = attribute.parts();
-    // Protocol v14 has no completion field. Completions are an in-process
+    // Protocol v16 has no completion field. Completions are an in-process
     // authoring aid, so JSON metadata projection intentionally omits them.
-    let _v14_omits_host_completions = completions;
+    let _v16_omits_host_completions = completions;
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
     let default = default
         .map(try_core_to_protocol_value)
@@ -2080,7 +2080,7 @@ pub fn protocol_to_core_persisted_value_map(
 }
 
 /// Encode a core resource id. Provider-instance routing is host-local and the
-/// version-14 protocol deliberately has no corresponding field.
+/// version-16 protocol deliberately has no corresponding field.
 pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     let ResourceId {
         provider,
@@ -2099,7 +2099,7 @@ pub fn resource_id_to_protocol(id: &ResourceId) -> protocol::ResourceId {
     }
 }
 
-/// Decode a version-14 resource id. The wire's empty identity is the pending
+/// Decode a version-16 resource id. The wire's empty identity is the pending
 /// sentinel, and provider-instance routing cannot be reconstructed.
 pub fn protocol_to_resource_id(id: &protocol::ResourceId) -> ResourceId {
     let protocol::ResourceId {
@@ -3887,7 +3887,7 @@ mod tests {
     }
 
     #[test]
-    fn v14_json_decode_rejects_an_empty_custom_enum_namespace() {
+    fn v16_json_decode_rejects_an_empty_custom_enum_namespace() {
         let wire = protocol::AttributeType::CustomEnum {
             name: "Mode".to_string(),
             base: Box::new(protocol::AttributeType::String {
@@ -3900,9 +3900,9 @@ mod tests {
             namespace: String::new(),
             dsl_transform: None,
         };
-        let json = serde_json::to_string(&wire).expect("v14 CustomEnum must serialize");
+        let json = serde_json::to_string(&wire).expect("v16 CustomEnum must serialize");
         let decoded_wire: protocol::AttributeType =
-            serde_json::from_str(&json).expect("v14 CustomEnum JSON must decode");
+            serde_json::from_str(&json).expect("v16 CustomEnum JSON must decode");
 
         let error = protocol_to_attribute_type(&decoded_wire)
             .expect_err("an empty namespace cannot identify a provider custom enum");
@@ -4128,7 +4128,7 @@ mod tests {
             }) if identity == "test.IdentifiedList"
         ));
         let decoded = protocol_to_attribute_type(&duplicate_wire)
-            .expect("v14 defines the enclosing Custom refinement as authoritative");
+            .expect("v16 defines the enclosing Custom refinement as authoritative");
         assert!(matches!(
             decoded.raw_shape(),
             RawShape::String {
