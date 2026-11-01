@@ -105,23 +105,31 @@ After refresh, hydration, reference evaluation and normalization, run the real
 planning computation in a recording session. This includes binding-stability
 passes, cascade planning and both detail-row rendering modes. When a concrete,
 non-byte-equal reference pair lacks evidence, the comparator records its operands
-with their desired/current/saved origins and provisionally returns unequal.
+at their resource paths and provisionally returns unequal.
 There is no separate walker enumerating pairs.
 
-Discard a pass that records anything, resolve its new values in one batch per
-initialized provider instance, and rerun. Provider batches run concurrently and
-validate their positional result lengths. Cache by `(provider instance, reference
-type identity, raw value)` for this planning invocation. Each rerun strictly grows
-the witness; exceeding 64 recording passes is a typed error.
+If pass 1 records any miss, discard its provisional result and enumerate every
+concrete reference value in the invocation: desired, current/read and saved
+leaves, including lists, binding-stability and cascade inputs, historical display
+operands and write-only fallbacks. This is a schema walk over values, not pairs.
+Resolve uncached values in one concurrent batch per initialized provider instance,
+checking positional lengths and nonempty successes. Replay exactly once.
+
+Cache `Resolved`, `NotFound` or `Failed` by `(provider instance, reference type
+identity, raw value)`, including a failure for every value of a failed batch.
+Only comparisons judge these outcomes under D6; unused outcomes produce no error
+or note. A miss after the replay is a typed internal `UnpreparedAfterReplay`
+error naming the resource, attribute path and redacted-safe raw value.
 
 The recording session returns only an opaque provisional result. Only a pass
 that records nothing releases its result and a `ResolvedReferences` witness.
 Provisional plans, rendering results and errors cannot escape that boundary.
-Secret-reference validation and the typed traversal-depth check finish before
-any guest call.
+A clean first pass makes no resolver call and needs no replay. Secret values
+are never requested; a comparison that uses one returns the typed secret error.
+The typed traversal-depth check finishes before any guest call.
 
 Unknown/deferred leaves retain existing dependency and scheduling behavior.
-Apply-time augmentation runs the same recording loop with a fresh cache for
+Apply-time augmentation uses the same single replay with a fresh cache for
 keys that become concrete or change after planning. Unchanged planned leaves
 keep their recorded decision.
 
@@ -148,18 +156,16 @@ enum ReferenceError {
 `NotFound` on the current side means the resource points at nothing; an
 error there would block the very update that repairs it, so it becomes a
 diff whose plan detail says the current reference no longer resolves.
-Every other failure aborts planning (exit 1): it says nothing about
-equality, and treating it as a difference would silently plan an update
+Every other failure aborts planning (exit 1) when a comparison uses it: it says
+nothing about equality, and treating it as a difference would silently plan an update
 or replacement, and treating it as equality would silently hide one.
-Denials and transient failures therefore never reach the differ.
+Unused lookup failures have no effect on planning.
 
-The types enforce this. `ResolvedReferences` stores
-`DesiredSide::Arn(KmsKeyArn)` and `CurrentSide::{Arn(KmsKeyArn), Dangling}`;
-the prepare step is the only constructor and returns `ReferenceError`
-(or `NotFound` for a desired value) as a typed plan error with its
-`#[source]` chain. The differ has no error case to fall back from, so a
-raw string comparison cannot be reached. Report provider instance,
-resource/path, reference and AWS code/request ID; no executable saved plan
+The types enforce this. Preparation stores per-value outcomes in
+`ResolvedReferences`; the comparator returns a typed plan error with its
+`#[source]` chain for a used failure or desired-side `NotFound`. Current/saved-only
+`NotFound` becomes dangling. No failed lookup falls back to raw equality.
+Report provider instance, resource/path, reference and AWS code/request ID; no executable saved plan
 on failure.
 
 Resolve `alias/aws/<svc>` with plain `DescribeKey`, including first-use
@@ -238,7 +244,7 @@ requirement together.
   distinctions, ARN-returning repoints, echoed-alias equality, saved/write-only
   fallbacks and unchanged raw values. Require the witness for differ and
   binding-stability callers; missing needed entries are typed errors.
-  Every D6 table cell: desired `NotFound` and every `ReferenceError` abort
+  Every D6 table cell: compared desired `NotFound` and `ReferenceError` abort
   planning with the source chain; current `NotFound` becomes a diff.
   Instance region/account scope for bare forms; ARN forms keep their own
   region/account and are never rewritten to the instance's.

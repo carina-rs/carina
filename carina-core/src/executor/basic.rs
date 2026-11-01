@@ -1210,14 +1210,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     Some(schema),
                 );
                 let additional = crate::references::ReferencePreparation::default()
-                    .run(ctx.comparison_provider, |session| {
-                        session.apply_time(
-                            &resolved_to,
-                            &masked,
-                            owner_schema,
-                            ctx.comparison_provider,
-                        )
-                    })
+                    .apply_time(&resolved_to, &masked, owner_schema, ctx.comparison_provider)
                     .await;
                 match additional {
                     Ok(additional) => effective_changed.extend(additional.value),

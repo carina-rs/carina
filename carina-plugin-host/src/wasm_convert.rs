@@ -1861,13 +1861,13 @@ pub(crate) fn decode_reference_results(
                 wit_to_core_provider_error(error),
             )),
             Err(wit::ReferenceError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
-                wit_to_core_provider_error(error),
+                wit_to_core_provider_error(error).into(),
             )),
-            Err(wit::ReferenceError::Transient(error)) => {
-                Err(ReferenceError::Transient(wit_to_core_provider_error(error)))
-            }
+            Err(wit::ReferenceError::Transient(error)) => Err(ReferenceError::Transient(
+                wit_to_core_provider_error(error).into(),
+            )),
             Err(wit::ReferenceError::InvalidReference(error)) => Err(
-                ReferenceError::InvalidReference(wit_to_core_provider_error(error)),
+                ReferenceError::InvalidReference(wit_to_core_provider_error(error).into()),
             ),
         })
         .collect()

@@ -80,6 +80,33 @@ struct HistoricalDeleteAttributes {
 }
 
 impl HistoricalDisplayAttributes {
+    pub(crate) fn reference_records(
+        &self,
+    ) -> impl Iterator<Item = (&ResourceId, &NestedWriteOnlyRecord)> {
+        self.deletes
+            .iter()
+            .map(|(key, entry)| (key.id(), &entry.nested_write_only))
+    }
+
+    pub(crate) fn reference_values(
+        &self,
+    ) -> impl Iterator<Item = (&ResourceId, &HashMap<String, Value>)> {
+        self.updates
+            .iter()
+            .flat_map(|(id, entry)| {
+                std::iter::once((id, &entry.attributes))
+                    .chain(entry.stored_attributes.as_ref().map(|values| (id, values)))
+            })
+            .chain(self.deletes.iter().flat_map(|(key, entry)| {
+                std::iter::once((key.id(), &entry.attributes)).chain(
+                    entry
+                        .stored_attributes
+                        .as_ref()
+                        .map(|values| (key.id(), values)),
+                )
+            }))
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_planning(plan: &Plan, saved: &crate::provider::LiftedSavedAttrs) -> Self {
         let mut display = Self::for_plan(plan);

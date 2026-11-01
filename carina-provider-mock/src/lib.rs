@@ -1683,13 +1683,13 @@ impl Provider for MockProvider {
                 .map(|result| match result {
                     Ok(outcome) => ReferenceOutcome::from_guest(outcome),
                     Err(WireError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
-                        ProviderError::from_wire(*error),
+                        ProviderError::from_wire(*error).into(),
                     )),
-                    Err(WireError::Transient(error)) => {
-                        Err(ReferenceError::Transient(ProviderError::from_wire(*error)))
-                    }
+                    Err(WireError::Transient(error)) => Err(ReferenceError::Transient(
+                        ProviderError::from_wire(*error).into(),
+                    )),
                     Err(WireError::InvalidReference(error)) => Err(
-                        ReferenceError::InvalidReference(ProviderError::from_wire(*error)),
+                        ReferenceError::InvalidReference(ProviderError::from_wire(*error).into()),
                     ),
                 })
                 .collect())

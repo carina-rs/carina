@@ -4906,7 +4906,8 @@ pub trait Provider: Send + Sync {
                         ProviderError::invalid_input(format!(
                             "unsupported reference identity {}",
                             request.ty
-                        )),
+                        ))
+                        .into(),
                     ))
                 })
                 .collect())

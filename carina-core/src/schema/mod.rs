@@ -8866,6 +8866,19 @@ pub struct EffectiveType<'a> {
 }
 
 impl<'a> EffectiveType<'a> {
+    /// A structural value walk without an enclosing attribute's mode context.
+    pub(crate) fn for_value_walk(
+        attr_type: &'a PatternAttributeType<Compiled>,
+        defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ) -> Self {
+        Self {
+            attr_type,
+            defs,
+            path: Vec::new(),
+            field_ancestry: FieldAncestry::WRITABLE,
+        }
+    }
+
     pub fn as_type(&self) -> &'a PatternAttributeType<Compiled> {
         self.attr_type
     }

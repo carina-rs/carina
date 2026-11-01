@@ -26,14 +26,14 @@ pub enum ReferenceOutcome {
     NotFound(ProviderError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ReferenceError {
     #[error("reference access denied")] // error-chain: caller-renders-sources
-    AccessDenied(#[source] ProviderError),
+    AccessDenied(#[source] Arc<ProviderError>),
     #[error("reference resolution temporarily failed")] // error-chain: caller-renders-sources
-    Transient(#[source] ProviderError),
+    Transient(#[source] Arc<ProviderError>),
     #[error("invalid reference")] // error-chain: caller-renders-sources
-    InvalidReference(#[source] ProviderError),
+    InvalidReference(#[source] Arc<ProviderError>),
 }
 
 impl ReferenceOutcome {
@@ -43,7 +43,7 @@ impl ReferenceOutcome {
         use carina_provider_protocol::types::ReferenceOutcome as Guest;
         match outcome {
             Guest::Resolved(value) if value.is_empty() => Err(ReferenceError::InvalidReference(
-                ProviderError::invalid_input("guest returned an empty canonical reference"),
+                ProviderError::invalid_input("guest returned an empty canonical reference").into(),
             )),
             // The guest owns canonical format validation (for example, ARN
             // shape). Core/host validate only non-emptiness and batch length;
@@ -54,18 +54,18 @@ impl ReferenceOutcome {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ReferenceFailure {
     #[error("desired reference does not resolve")] // error-chain: caller-renders-sources
     DesiredNotFound(#[source] Arc<ProviderError>),
     #[error(transparent)]
     Resolution(#[from] ReferenceError),
     #[error("provider reference resolution call failed")] // error-chain: caller-renders-sources
-    Call(#[source] ProviderError),
+    Call(#[source] Arc<ProviderError>),
     #[error("reference comparison was not prepared")]
     MissingWitness,
-    #[error("reference comparison did not converge after {limit} recording passes")]
-    IterationLimit { limit: usize },
+    #[error("internal error: reference comparison was not prepared after the single replay")]
+    UnpreparedAfterReplay,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +97,6 @@ struct Occurrence {
     resource: ResourceId,
     path: String,
     request: ReferenceRequest,
-    side: ReferenceSide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -174,6 +173,34 @@ pub struct ReferenceOperand {
 }
 
 impl ResolvedReferences {
+    fn first_missing(&self) -> Option<Occurrence> {
+        self.recording
+            .as_ref()
+            .expect("recording computation")
+            .lock()
+            .expect("reference recording lock")
+            .missing
+            .first()
+            .cloned()
+    }
+
+    /// The sole release boundary, used only after checking the recording.
+    fn release<T, E>(mut self, value: Result<T, E>) -> Result<PreparedComparison<T>, E> {
+        let value = value?;
+        self.dangling = self
+            .recording
+            .take()
+            .expect("recording computation")
+            .lock()
+            .expect("reference recording lock")
+            .dangling
+            .clone();
+        Ok(PreparedComparison {
+            value,
+            references: self,
+        })
+    }
+
     #[cfg(test)]
     fn dangling_paths(&self, resource: &ResourceId) -> impl Iterator<Item = String> {
         let mut seen = HashSet::new();
@@ -217,9 +244,10 @@ impl ResolvedReferences {
                     resource: resource.clone(),
                     path: operand.path.clone(),
                     raw: raw.clone(),
-                    source: ReferenceError::InvalidReference(ProviderError::invalid_input(
-                        "secret values cannot be used as references",
-                    ))
+                    source: ReferenceError::InvalidReference(
+                        ProviderError::invalid_input("secret values cannot be used as references")
+                            .into(),
+                    )
                     .into(),
                 }));
             }
@@ -232,7 +260,6 @@ impl ResolvedReferences {
             let occurrence = Occurrence {
                 resource: resource.clone(),
                 path: operand.path.clone(),
-                side: operand.side,
                 request: ReferenceRequest {
                     ty: ty.clone(),
                     value: raw.expose_plaintext().into(),
@@ -240,6 +267,7 @@ impl ResolvedReferences {
             };
             match self.values.get(&occurrence.key()) {
                 Some(CachedOutcome::Resolved(value)) => canonical.push(Some(value)),
+                Some(CachedOutcome::Failed(error)) => return Err(occurrence.error(error.clone())),
                 Some(CachedOutcome::NotFound(error)) => {
                     if operand.side == ReferenceSide::Desired {
                         return Err(
@@ -325,29 +353,22 @@ pub struct ReferencePreparation {
 enum CachedOutcome {
     Resolved(CanonicalReference),
     NotFound(Arc<ProviderError>),
+    Failed(ReferenceFailure),
 }
 
-const MAX_RECORDING_PASSES: usize = 64;
-
 impl ReferencePreparation {
-    pub(crate) async fn run<T, E>(
-        &mut self,
-        provider: &ProviderRouter,
-        compute: impl for<'run> FnMut(
-            RecordingSession<'run>,
-        ) -> ProvisionalComparison<'run, Result<T, E>>,
-    ) -> Result<PreparedComparison<T>, E>
-    where
-        E: From<Box<ReferencePlanError>>,
-    {
-        self.run_with_limit(provider, MAX_RECORDING_PASSES, compute)
-            .await
+    fn recording(&self) -> ResolvedReferences {
+        ResolvedReferences {
+            values: self.cache.clone(),
+            recording: Some(Arc::default()),
+            dangling: HashMap::new(),
+        }
     }
 
-    async fn run_with_limit<T, E>(
+    async fn run<T, E>(
         &mut self,
         provider: &ProviderRouter,
-        limit: usize,
+        enumerate: impl FnOnce() -> Result<Vec<Occurrence>, Box<ReferencePlanError>>,
         mut compute: impl for<'run> FnMut(
             RecordingSession<'run>,
         ) -> ProvisionalComparison<'run, Result<T, E>>,
@@ -355,53 +376,33 @@ impl ReferencePreparation {
     where
         E: From<Box<ReferencePlanError>>,
     {
-        for pass in 0..limit {
-            let mut references = ResolvedReferences {
-                values: self.cache.clone(),
-                recording: Some(Arc::default()),
-                dangling: HashMap::new(),
-            };
-            let provisional = compute(RecordingSession {
-                references: &references,
-            });
-            let (missing, dangling) = {
-                let recording = references
-                    .recording
-                    .as_ref()
-                    .expect("recording pass")
-                    .lock()
-                    .expect("reference recording lock");
-                (recording.missing.clone(), recording.dangling.clone())
-            };
-            if missing.is_empty() {
-                // This is the sole release point. Errors from provisional
-                // passes are discarded too: identities can change control flow.
-                let value = provisional.value?;
-                references.recording = None;
-                references.dangling = dangling;
-                return Ok(PreparedComparison { value, references });
-            }
-            drop(provisional);
-            if pass + 1 == limit {
-                return Err(missing[0]
-                    .error(ReferenceFailure::IterationLimit { limit })
-                    .into());
-            }
-            let previous_size = self.cache.len();
-            self.resolve_occurrences(&missing, provider).await?;
-            debug_assert!(
-                self.cache.len() > previous_size,
-                "a retry must strictly grow the witness"
-            );
+        let references = self.recording();
+        let provisional = compute(RecordingSession {
+            references: &references,
+        });
+        if references.first_missing().is_none() {
+            let value = provisional.value;
+            return references.release(value);
         }
-        unreachable!("the final recording pass either releases or returns the typed cap error")
+        // Discard even provisional errors: identities can change control flow.
+        drop(provisional);
+        let occurrences = enumerate()?;
+        self.resolve_occurrences(&occurrences, provider).await;
+
+        let references = self.recording();
+        let replay = compute(RecordingSession {
+            references: &references,
+        });
+        if let Some(missing) = references.first_missing() {
+            return Err(missing
+                .error(ReferenceFailure::UnpreparedAfterReplay)
+                .into());
+        }
+        let value = replay.value;
+        references.release(value)
     }
 
-    async fn resolve_occurrences(
-        &mut self,
-        occurrences: &[Occurrence],
-        provider: &ProviderRouter,
-    ) -> Result<(), Box<ReferencePlanError>> {
+    async fn resolve_occurrences(&mut self, occurrences: &[Occurrence], provider: &ProviderRouter) {
         let mut batches: BTreeMap<ProviderInstanceKey, Vec<&Occurrence>> = BTreeMap::new();
         let mut seen = HashSet::new();
         for occurrence in occurrences {
@@ -422,42 +423,43 @@ impl ReferencePreparation {
                 let first = occurrences[0];
                 let outcomes = provider
                     .resolve_references_for(&first.resource, &requests)
-                    .await
-                    .map_err(|error| first.error(ReferenceFailure::Call(error)))?;
-                if outcomes.len() != requests.len() {
-                    return Err(first.error(
-                        ReferenceError::InvalidReference(ProviderError::invalid_input(format!(
-                            "reference result length mismatch: expected {}, got {}",
-                            requests.len(),
-                            outcomes.len(),
-                        )))
-                        .into(),
-                    ));
-                }
-                Ok::<_, Box<ReferencePlanError>>(
-                    occurrences.into_iter().zip(outcomes).collect::<Vec<_>>(),
-                )
+                    .await;
+                let outcomes = match outcomes {
+                    Err(error) => vec![
+                        CachedOutcome::Failed(ReferenceFailure::Call(error.into()));
+                        requests.len()
+                    ],
+                    Ok(outcomes) if outcomes.len() != requests.len() => {
+                        let error = ReferenceError::InvalidReference(
+                            ProviderError::invalid_input(format!(
+                                "reference result length mismatch: expected {}, got {}",
+                                requests.len(),
+                                outcomes.len(),
+                            ))
+                            .into(),
+                        )
+                        .into();
+                        vec![CachedOutcome::Failed(error); requests.len()]
+                    }
+                    Ok(outcomes) => outcomes
+                        .into_iter()
+                        .map(|outcome| match outcome {
+                            Ok(ReferenceOutcome::Resolved(value)) => CachedOutcome::Resolved(value),
+                            Ok(ReferenceOutcome::NotFound(error)) => {
+                                CachedOutcome::NotFound(Arc::new(error))
+                            }
+                            Err(error) => CachedOutcome::Failed(error.into()),
+                        })
+                        .collect(),
+                };
+                occurrences.into_iter().zip(outcomes).collect::<Vec<_>>()
             }))
             .await;
         for batch in batches {
-            for (origin, outcome) in batch? {
-                let cached = match outcome.map_err(|error| origin.error(error.into()))? {
-                    ReferenceOutcome::Resolved(value) => CachedOutcome::Resolved(value),
-                    ReferenceOutcome::NotFound(error) => CachedOutcome::NotFound(Arc::new(error)),
-                };
-                self.cache.insert(origin.key(), cached);
+            for (origin, outcome) in batch {
+                self.cache.insert(origin.key(), outcome);
             }
         }
-        // Validate every recorded side, including duplicate raw values first
-        // encountered on a historical operand in another resource or pass.
-        for origin in occurrences {
-            if origin.side == ReferenceSide::Desired
-                && let Some(CachedOutcome::NotFound(error)) = self.cache.get(&origin.key())
-            {
-                return Err(origin.error(ReferenceFailure::DesiredNotFound(Arc::clone(error))));
-            }
-        }
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -473,17 +475,21 @@ impl ReferencePreparation {
         PreparedComparison<HashMap<ResourceId, crate::binding_index::ManagedBindingStability>>,
     > {
         validate_inputs(desired, current, registry, saved)?;
-        self.run(provider, |session| {
-            session.result(crate::differ::managed_binding_stability(
-                desired,
-                current,
-                registry,
-                saved,
-                explicit,
-                provider,
-                session.references,
-            ))
-        })
+        self.run(
+            provider,
+            || collect_inputs(desired, current, registry, saved),
+            |session| {
+                session.result(crate::differ::managed_binding_stability(
+                    desired,
+                    current,
+                    registry,
+                    saved,
+                    explicit,
+                    provider,
+                    session.references,
+                ))
+            },
+        )
         .await
     }
 
@@ -508,22 +514,35 @@ impl ReferencePreparation {
         let current = prior.materialize_current_states(desired.authored(), registry);
         validate_inputs(desired.authored(), &current, registry, saved)?;
         validate_inputs(dependents.managed(), &current, registry, saved)?;
-        self.run(provider, |session| {
-            session.result(crate::differ::create_plan_with_cascades(
-                desired,
-                dependents.for_recording_run(),
-                data_sources,
-                provider,
-                prior,
-                directives,
-                registry,
-                saved,
-                explicit,
-                waits,
-                unknown_imports,
-                session.references,
-            ))
-        })
+        self.run(
+            provider,
+            || {
+                let mut values = collect_inputs(desired.authored(), &current, registry, saved)?;
+                values.extend(collect_inputs(
+                    dependents.managed(),
+                    &current,
+                    registry,
+                    saved,
+                )?);
+                Ok(values)
+            },
+            |session| {
+                session.result(crate::differ::create_plan_with_cascades(
+                    desired,
+                    dependents.for_recording_run(),
+                    data_sources,
+                    provider,
+                    prior,
+                    directives,
+                    registry,
+                    saved,
+                    explicit,
+                    waits,
+                    unknown_imports,
+                    session.references,
+                ))
+            },
+        )
         .await
     }
 
@@ -543,17 +562,58 @@ impl ReferencePreparation {
     ) -> crate::provider::ProviderResult<PreparedComparison<crate::detail_rows::PreparedPlanDisplay>>
     {
         let plan = Arc::new(plan);
-        self.run(provider, |session| {
-            session.render(
-                Arc::clone(&plan),
-                planning,
-                historical.clone(),
-                detail,
-                registry,
-                explicit,
-                provider,
-            )
-        })
+        self.run(
+            provider,
+            || {
+                let mut values = Vec::new();
+                for effect in plan.effects() {
+                    match effect {
+                        crate::effect::Effect::Create(resource)
+                        | crate::effect::Effect::Update { to: resource, .. } => {
+                            if let Some(schema) = registry.get_for(resource) {
+                                collect_attributes(
+                                    &resource.id,
+                                    resource.resolved_attributes().iter(),
+                                    schema.schema(),
+                                    &mut values,
+                                )?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (id, attributes) in historical.reference_values() {
+                    if let Some(schema) = registry.get(
+                        &id.provider,
+                        &id.resource_type,
+                        crate::schema::SchemaKind::Resource,
+                    ) {
+                        collect_attributes(id, attributes.iter(), schema.schema(), &mut values)?;
+                    }
+                }
+                for (id, record) in historical.reference_records() {
+                    if let Some(schema) = registry.get(
+                        &id.provider,
+                        &id.resource_type,
+                        crate::schema::SchemaKind::Resource,
+                    ) {
+                        collect_record(id, record, schema.schema(), &mut values)?;
+                    }
+                }
+                Ok(values)
+            },
+            |session| {
+                session.render(
+                    Arc::clone(&plan),
+                    planning,
+                    historical.clone(),
+                    detail,
+                    registry,
+                    explicit,
+                    provider,
+                )
+            },
+        )
         .await
     }
 
@@ -579,20 +639,31 @@ impl ReferencePreparation {
             saved,
         )?;
         let prepared = self
-            .run(provider, |session| {
-                session.result(crate::differ::create_plan(
-                    desired,
-                    data_sources,
-                    provider,
-                    prior,
-                    directives,
-                    registry,
-                    saved,
-                    explicit,
-                    waits,
-                    session.references,
-                ))
-            })
+            .run(
+                provider,
+                || {
+                    collect_inputs(
+                        desired,
+                        &prior.materialize_current_states(desired, registry),
+                        registry,
+                        saved,
+                    )
+                },
+                |session| {
+                    session.result(crate::differ::create_plan(
+                        desired,
+                        data_sources,
+                        provider,
+                        prior,
+                        directives,
+                        registry,
+                        saved,
+                        explicit,
+                        waits,
+                        session.references,
+                    ))
+                },
+            )
             .await?;
         let plan = prepared.value;
         let historical =
@@ -647,10 +718,43 @@ impl ReferencePreparation {
                     resource: desired[0].id.clone(),
                     path: "<planning>".into(),
                     raw: "<planning>".into(),
-                    source: ReferenceFailure::Call(error),
+                    source: ReferenceFailure::Call(error.into()),
                 }))
             }
         }
+    }
+
+    pub(crate) async fn apply_time<S>(
+        &mut self,
+        resource: &ResolvedResource<S>,
+        masked: &crate::resource::MaskedComparisonAttributes,
+        schema: crate::schema::OwnerBoundResourceSchema<'_>,
+        provider: &ProviderRouter,
+    ) -> Result<PreparedComparison<Vec<String>>, crate::differ::ApplyTimeComparisonError> {
+        self.run(
+            provider,
+            || {
+                let mut values = Vec::new();
+                for attributes in [
+                    Some(masked.desired()),
+                    Some(masked.current()),
+                    masked.saved(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    collect_attributes(
+                        &resource.id,
+                        attributes.iter(),
+                        schema.schema(),
+                        &mut values,
+                    )?;
+                }
+                Ok(values)
+            },
+            |session| session.apply_time(resource, masked, schema, provider),
+        )
+        .await
     }
 }
 
@@ -715,7 +819,7 @@ impl<'run> RecordingSession<'run> {
                         resource: resource.id.clone(),
                         path: "<apply>".into(),
                         raw: "<apply>".into(),
-                        source: ReferenceFailure::Call(error),
+                        source: ReferenceFailure::Call(error.into()),
                     })
                 })?;
             Ok(
@@ -733,9 +837,8 @@ impl<'run> RecordingSession<'run> {
     }
 }
 
-/// Validation walks each operand independently. It never enumerates comparison
-/// pairs or requests identities. Complete this preflight before any guest call,
-/// including creates and values a short-circuiting comparator will not visit.
+/// Check traversal depth before any guest call, independently of comparison
+/// order. Secret errors are decided only when a comparison uses an operand.
 fn validate_inputs(
     desired: &[ResolvedResource],
     current: &HashMap<ResourceId, PlanInputCurrent>,
@@ -775,10 +878,194 @@ fn validate_inputs(
     Ok(())
 }
 
+/// Enumerate values independently of comparison order, projection and pairing.
+/// A replay can therefore take a different branch without another lookup round.
+fn collect_inputs(
+    desired: &[ResolvedResource],
+    current: &HashMap<ResourceId, PlanInputCurrent>,
+    registry: &SchemaRegistry,
+    saved: &LiftedSavedAttrs,
+) -> Result<Vec<Occurrence>, Box<ReferencePlanError>> {
+    let mut values = Vec::new();
+    for resource in desired {
+        if let Some(schema) = registry.get_for(resource.as_resource()) {
+            collect_attributes(
+                &resource.id,
+                resource.resolved_attributes().iter(),
+                schema.schema(),
+                &mut values,
+            )?;
+        }
+    }
+    for (id, current) in current {
+        if let Some(schema) = registry.get(
+            &id.provider,
+            &id.resource_type,
+            crate::schema::SchemaKind::Resource,
+        ) {
+            collect_attributes(
+                id,
+                current.comparison_attributes().iter(),
+                schema.schema(),
+                &mut values,
+            )?;
+        }
+    }
+    for id in saved.resource_ids() {
+        if let Some(schema) = registry.get(
+            &id.provider,
+            &id.resource_type,
+            crate::schema::SchemaKind::Resource,
+        ) {
+            collect_attributes(
+                id,
+                saved.get(id).expect("saved resource").iter(),
+                schema.schema(),
+                &mut values,
+            )?;
+        }
+    }
+    let resources = desired
+        .iter()
+        .map(|resource| &resource.id)
+        .chain(current.keys())
+        .chain(saved.resource_ids())
+        .collect::<HashSet<_>>();
+    for id in resources {
+        if let Some(schema) = registry.get(
+            &id.provider,
+            &id.resource_type,
+            crate::schema::SchemaKind::Resource,
+        ) {
+            collect_record(
+                id,
+                saved.nested_write_only(id),
+                schema.schema(),
+                &mut values,
+            )?;
+        }
+    }
+    Ok(values)
+}
+
+fn collect_attributes<'a>(
+    resource: &ResourceId,
+    attributes: impl Iterator<Item = (&'a String, &'a Value)>,
+    schema: &crate::schema::ValidatedResourceSchema,
+    values: &mut Vec<Occurrence>,
+) -> Result<(), Box<ReferencePlanError>> {
+    for (name, value) in attributes {
+        if let Some(attribute) = schema.effective_attribute(name) {
+            ReferenceValidation { resource }.walk(
+                value,
+                attribute.value_type(),
+                name,
+                false,
+                0,
+                &mut |value, ty, path, secret| {
+                    collect_leaf(resource, value, ty, path, secret, values)
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_leaf(
+    resource: &ResourceId,
+    value: &Value,
+    ty: &TypeIdentity,
+    path: &str,
+    secret: bool,
+    values: &mut Vec<Occurrence>,
+) -> Result<(), Box<ReferencePlanError>> {
+    // Secrets are never sent to a guest. Only a comparison that uses one
+    // returns its typed error.
+    if !secret
+        && let Value::Concrete(ConcreteValue::String(raw)) = value
+        && !raw.is_diagnostic_sensitive()
+    {
+        values.push(Occurrence {
+            resource: resource.clone(),
+            path: path.into(),
+            request: ReferenceRequest {
+                ty: ty.clone(),
+                value: raw.expose_plaintext().into(),
+            },
+        });
+    }
+    Ok(())
+}
+
+fn collect_record(
+    resource: &ResourceId,
+    record: &crate::provider::NestedWriteOnlyRecord,
+    schema: &crate::schema::ValidatedResourceSchema,
+    values: &mut Vec<Occurrence>,
+) -> Result<(), Box<ReferencePlanError>> {
+    for attribute in schema.effective_attributes() {
+        for (path, persisted) in record.get(attribute.name()).into_iter().flatten() {
+            if let Some(value) = persisted.decode() {
+                ReferenceValidation { resource }.record_leaf(
+                    &value,
+                    attribute.value_type(),
+                    path.segments(),
+                    attribute.name(),
+                    0,
+                    &mut |value, ty, path, secret| {
+                        collect_leaf(resource, value, ty, path, secret, values)
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 struct ReferenceValidation<'a> {
     resource: &'a ResourceId,
 }
 impl ReferenceValidation<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn record_leaf(
+        &self,
+        value: &Value,
+        ty: crate::schema::EffectiveType<'_>,
+        segments: &[crate::schema::LeafPathSegment],
+        path: &str,
+        depth: usize,
+        visit: &mut impl FnMut(&Value, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+    ) -> Result<(), Box<ReferencePlanError>> {
+        use crate::schema::LeafPathSegment;
+        let Some((segment, rest)) = segments.split_first().filter(|_| depth < 64) else {
+            return self.walk(value, ty, path, false, depth, visit);
+        };
+        if matches!(ty.shape(), Shape::Union) {
+            for member in ty.union_members() {
+                self.record_leaf(value, member, segments, path, depth + 1, visit)?;
+            }
+            return Ok(());
+        }
+        let (child, path) = match segment {
+            LeafPathSegment::StructField(name) => (
+                ty.field_candidates()
+                    .into_iter()
+                    .find(|field| field.name() == name)
+                    .map(|field| field.value_type()),
+                format!("{path}.{name}"),
+            ),
+            LeafPathSegment::MapKey(name) => (
+                ty.map_value(),
+                format!("{path}[{}]", crate::parser::display_string_literal(name)),
+            ),
+            LeafPathSegment::ListIndex(index) => (ty.list_element(), format!("{path}[{index}]")),
+        };
+        if let Some(child) = child {
+            self.record_leaf(value, child, rest, &path, depth + 1, visit)?;
+        }
+        Ok(())
+    }
+
     fn masked(
         &self,
         masked: &crate::resource::MaskedComparisonAttributes,
@@ -793,7 +1080,14 @@ impl ReferenceValidation<'_> {
             .into_iter()
             .flatten()
             {
-                self.validate(value, attribute.value_type(), attribute.name(), false, 0)?;
+                self.walk(
+                    value,
+                    attribute.value_type(),
+                    attribute.name(),
+                    false,
+                    0,
+                    &mut |_, _, _, _| Ok(()),
+                )?;
             }
         }
         Ok(())
@@ -806,26 +1100,9 @@ impl ReferenceValidation<'_> {
         secret: bool,
         depth: usize,
     ) -> Result<(), Box<ReferencePlanError>> {
-        if depth >= 64 {
-            return Err(Box::new(ReferencePlanError {
-                instance: ProviderInstanceKey::from(self.resource),
-                resource: self.resource.clone(),
-                path: path.into(),
-                raw: ValueString::diagnostic_sensitive("<depth limit>"),
-                source: ReferenceError::InvalidReference(ProviderError::invalid_input(format!(
-                    "reference traversal depth limit (64) exceeded at {path}"
-                )))
-                .into(),
-            }));
-        }
-        if let Value::Deferred(crate::resource::DeferredValue::Secret(inner)) = value {
-            return self.validate(inner, ty, path, true, depth + 1);
-        }
-        match ty.shape() {
-            Shape::Reference { .. }
-                if secret
-                    || crate::value::contains_secret(value)
-                    || matches!(value, Value::Concrete(ConcreteValue::String(raw)) if raw.is_diagnostic_sensitive()) =>
+        self.walk(value, ty, path, secret, depth, &mut |value, _, path, secret| {
+            if secret || crate::value::contains_secret(value)
+                || matches!(value, Value::Concrete(ConcreteValue::String(raw)) if raw.is_diagnostic_sensitive())
             {
                 return Err(Box::new(ReferencePlanError {
                     instance: ProviderInstanceKey::from(self.resource),
@@ -834,10 +1111,43 @@ impl ReferenceValidation<'_> {
                     raw: ValueString::diagnostic_sensitive("<redacted>"),
                     source: ReferenceError::InvalidReference(ProviderError::invalid_input(
                         "secret values cannot be used as references",
-                    ))
-                    .into(),
+                    ).into()).into(),
                 }));
             }
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        &self,
+        value: &Value,
+        ty: crate::schema::EffectiveType<'_>,
+        path: &str,
+        secret: bool,
+        depth: usize,
+        visit: &mut impl FnMut(&Value, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+    ) -> Result<(), Box<ReferencePlanError>> {
+        if depth >= 64 {
+            return Err(Box::new(ReferencePlanError {
+                instance: ProviderInstanceKey::from(self.resource),
+                resource: self.resource.clone(),
+                path: path.into(),
+                raw: ValueString::diagnostic_sensitive("<depth limit>"),
+                source: ReferenceError::InvalidReference(
+                    ProviderError::invalid_input(format!(
+                        "reference traversal depth limit (64) exceeded at {path}"
+                    ))
+                    .into(),
+                )
+                .into(),
+            }));
+        }
+        if let Value::Deferred(crate::resource::DeferredValue::Secret(inner)) = value {
+            return self.walk(inner, ty, path, true, depth + 1, visit);
+        }
+        match ty.shape() {
+            Shape::Reference { identity, .. } => visit(value, identity, path, secret)?,
             Shape::Struct { .. } | Shape::Map { .. } => {
                 if let Value::Concrete(ConcreteValue::Map(values)) = value {
                     let is_map = matches!(ty.shape(), Shape::Map { .. });
@@ -855,7 +1165,7 @@ impl ReferenceValidation<'_> {
                             } else {
                                 format!("{path}.{name}")
                             };
-                            self.validate(value, child_type, &path, secret, depth + 1)?;
+                            self.walk(value, child_type, &path, secret, depth + 1, visit)?;
                         }
                     }
                 }
@@ -865,25 +1175,35 @@ impl ReferenceValidation<'_> {
                     && let Some(element) = ty.list_element()
                 {
                     for (index, value) in items.iter().enumerate() {
-                        self.validate(
+                        self.walk(
                             value,
                             element.clone(),
                             &format!("{path}[{index}]"),
                             secret,
                             depth + 1,
+                            visit,
                         )?;
                     }
                 }
             }
             Shape::Union => {
                 for member in ty.union_members() {
-                    self.validate(value, member, path, secret, depth + 1)?;
+                    self.walk(value, member, path, secret, depth + 1, visit)?;
                 }
             }
             _ => {}
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_secret_operand(
+    resource: &ResourceId,
+    value: &Value,
+    ty: crate::schema::EffectiveType<'_>,
+    path: &str,
+) -> Result<(), Box<ReferencePlanError>> {
+    ReferenceValidation { resource }.validate(value, ty, path, false, 0)
 }
 
 #[cfg(any(test, feature = "test-utils"))]

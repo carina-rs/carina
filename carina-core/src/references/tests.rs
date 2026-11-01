@@ -13,6 +13,7 @@ struct TableProvider {
     calls: Arc<Mutex<Vec<Vec<ReferenceRequest>>>>,
     barrier: Option<Arc<tokio::sync::Barrier>>,
     result_count: Option<usize>,
+    fail_batch: bool,
     updates: Arc<Mutex<Vec<UpdateRequest>>>,
 }
 impl Provider for TableProvider {
@@ -28,6 +29,9 @@ impl Provider for TableProvider {
             if let Some(barrier) = &self.barrier {
                 barrier.wait().await;
             }
+            if self.fail_batch {
+                return Err(ProviderError::from_wire(*error()));
+            }
             Ok(requests
                 .iter()
                 .cycle()
@@ -38,14 +42,16 @@ impl Provider for TableProvider {
                     }) {
                         Ok(outcome) => ReferenceOutcome::from_guest(outcome),
                         Err(wire::ReferenceError::AccessDenied(error)) => Err(
-                            ReferenceError::AccessDenied(ProviderError::from_wire(*error)),
+                            ReferenceError::AccessDenied(ProviderError::from_wire(*error).into()),
                         ),
-                        Err(wire::ReferenceError::Transient(error)) => {
-                            Err(ReferenceError::Transient(ProviderError::from_wire(*error)))
+                        Err(wire::ReferenceError::Transient(error)) => Err(
+                            ReferenceError::Transient(ProviderError::from_wire(*error).into()),
+                        ),
+                        Err(wire::ReferenceError::InvalidReference(error)) => {
+                            Err(ReferenceError::InvalidReference(
+                                ProviderError::from_wire(*error).into(),
+                            ))
                         }
-                        Err(wire::ReferenceError::InvalidReference(error)) => Err(
-                            ReferenceError::InvalidReference(ProviderError::from_wire(*error)),
-                        ),
                     }
                 })
                 .collect())
@@ -181,6 +187,7 @@ impl Fixture {
                 calls: calls.clone(),
                 barrier: None,
                 result_count: None,
+                fail_batch: false,
                 updates: updates.clone(),
             })),
         );
@@ -214,6 +221,9 @@ impl Fixture {
             calls,
             updates,
         }
+    }
+    fn reference_values(&self) -> Result<Vec<Occurrence>, Box<ReferencePlanError>> {
+        collect_inputs(&self.desired, &self.current, &self.registry, &self.saved)
     }
     async fn prepare(&self) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
         ReferencePreparation::default()
@@ -521,6 +531,460 @@ async fn byte_equal_references_do_not_resolve_even_if_alias_was_repointed() {
 }
 
 #[tokio::test]
+async fn round8_enumerates_other_resources_without_judging_unused_outcomes() {
+    for outcome in [
+        Err(wire::ReferenceError::AccessDenied(error())),
+        Err(wire::ReferenceError::Transient(error())),
+        Ok(wire::ReferenceOutcome::NotFound(error())),
+    ] {
+        for repointed in [false, true] {
+            let mut fixture = Fixture::new(
+                string("alias/x"),
+                string("key/a"),
+                HashMap::from([
+                    (
+                        "alias/x".into(),
+                        resolved(if repointed { "key/b" } else { "key/a" }),
+                    ),
+                    ("alias/y".into(), outcome.clone()),
+                ]),
+                false,
+            );
+            let other = Resource::with_provider("test", "keys.Resource", "other", None)
+                .with_root_binding("other")
+                .with_attribute("key", string("alias/y"));
+            fixture
+                .current
+                .extend(crate::resource::into_plan_input_current_map(
+                    HashMap::from([(
+                        other.id.clone(),
+                        Current::from_state(
+                            State::existing(
+                                other.id.clone(),
+                                HashMap::from([("key".into(), string("alias/y"))]),
+                            )
+                            .with_identifier("other-id"),
+                        ),
+                    )]),
+                    &fixture.registry,
+                    std::slice::from_ref(&other),
+                ));
+            fixture.desired.extend(
+                ResolvedResource::collect_resolved_with_schemas([other], &fixture.registry)
+                    .unwrap(),
+            );
+            let references = fixture.prepare().await.unwrap();
+            let plan = fixture.plan(&references).unwrap();
+            assert_eq!(plan.effects().len(), usize::from(repointed));
+            assert_eq!(references.dangling_paths(&fixture.desired[1].id).count(), 0);
+            let calls = fixture.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0]
+                    .iter()
+                    .map(|request| request.value.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["alias/x", "alias/y", "key/a"]),
+                "the miss on X must prepare byte-equal Y too"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn round8_unordered_pairing_changes_control_flow_in_exactly_one_replay() {
+    let mut fixture = round5_list_fixture(false, false);
+    fixture.router.add_provider(
+        "test".into(),
+        InitializedProvider::unavailable(Box::new(TableProvider {
+            table: HashMap::from([
+                ("alias/a".into(), resolved("arn:A")),
+                ("alias/b".into(), resolved("arn:B")),
+            ]),
+            calls: fixture.calls.clone(),
+            barrier: None,
+            result_count: None,
+            fail_batch: false,
+            updates: fixture.updates.clone(),
+        })),
+    );
+    let list = |entries: &[(&str, &str)]| {
+        Value::Concrete(ConcreteValue::List(
+            entries
+                .iter()
+                .map(|(key, x)| round5_entry(key, x, string("same")))
+                .collect(),
+        ))
+    };
+    let current = list(&[("arn:B", "2"), ("arn:A", "1")]);
+    reset_values(
+        &mut fixture,
+        list(&[("alias/a", "1"), ("alias/b", "2")]),
+        current.clone(),
+        current,
+    );
+    fixture.saved = RawSavedAttrs::default().lift(&fixture.registry);
+    let mut passes = 0;
+    let prepared = ReferencePreparation::default()
+        .run(
+            &fixture.router,
+            || fixture.reference_values(),
+            |session| {
+                passes += 1;
+                session.result(fixture.plan(session.references))
+            },
+        )
+        .await
+        .unwrap();
+    assert!(prepared.value.effects().is_empty());
+    assert_eq!(
+        passes, 2,
+        "changed list pairing must use the single prepared replay"
+    );
+    assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn round8_a_miss_after_replay_is_an_internal_error_with_its_operand_path() {
+    let fixture = Fixture::new(
+        string("alias/first"),
+        string("key/a"),
+        HashMap::new(),
+        false,
+    );
+    let mut passes = 0;
+    let error = ReferencePreparation::default()
+        .run(
+            &fixture.router,
+            || fixture.reference_values(),
+            |session| {
+                passes += 1;
+                let (raw, path) = if passes == 1 {
+                    ("alias/first", "key")
+                } else {
+                    ("alias/outside-inputs", "key.late[1]")
+                };
+                session.result(session.references.equal(
+                    &fixture.desired[0].id,
+                    &identity(),
+                    &raw.into(),
+                    &"key/a".into(),
+                    &[
+                        ReferenceOperand {
+                            path: path.into(),
+                            side: ReferenceSide::Desired,
+                        },
+                        ReferenceOperand {
+                            path: "key".into(),
+                            side: ReferenceSide::Current,
+                        },
+                    ],
+                ))
+            },
+        )
+        .await
+        .expect_err("an operand outside the invocation cannot trigger a third computation");
+    assert!(matches!(
+        error.source,
+        ReferenceFailure::UnpreparedAfterReplay
+    ));
+    assert_eq!(error.resource, fixture.desired[0].id);
+    assert_eq!(error.path, "key.late[1]");
+    assert_eq!(error.raw.expose_plaintext(), "alias/outside-inputs");
+    assert_eq!(passes, 2);
+    assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn round8_clean_first_pass_never_enumerates_or_replays() {
+    let fixture = Fixture::new(
+        string("alias/equal"),
+        string("alias/equal"),
+        HashMap::new(),
+        false,
+    );
+    let mut passes = 0;
+    let prepared = ReferencePreparation::default()
+        .run(
+            &fixture.router,
+            || panic!("a clean first pass needs no enumeration"),
+            |session| {
+                passes += 1;
+                session.result(fixture.plan(session.references))
+            },
+        )
+        .await
+        .unwrap();
+    assert!(prepared.value.effects().is_empty());
+    assert_eq!(passes, 1);
+    assert!(fixture.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn round8_whole_batch_errors_are_cached_for_each_value_and_judged_on_use() {
+    let mut fixture = Fixture::new(
+        string("alias/live"),
+        string("key/a"),
+        HashMap::from([("alias/live".into(), resolved("key/a"))]),
+        false,
+    );
+    let mut other = Resource::with_provider("test", "keys.Resource", "other", None)
+        .with_root_binding("other")
+        .with_attribute("key", string("alias/untouched"));
+    other.id.provider_instance = Some("other".into());
+    let id = other.id.clone();
+    fixture
+        .current
+        .extend(crate::resource::into_plan_input_current_map(
+            HashMap::from([(
+                id.clone(),
+                Current::from_state(
+                    State::existing(
+                        id.clone(),
+                        HashMap::from([("key".into(), string("alias/untouched"))]),
+                    )
+                    .with_identifier("other-id"),
+                ),
+            )]),
+            &fixture.registry,
+            std::slice::from_ref(&other),
+        ));
+    fixture.saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+        id.clone(),
+        HashMap::from([("key".into(), string("alias/unused-saved"))]),
+    )]))
+    .lift(&fixture.registry);
+    fixture.desired.extend(
+        ResolvedResource::collect_resolved_with_schemas([other], &fixture.registry).unwrap(),
+    );
+    fixture.router.add_provider_instance(
+        ProviderInstanceKey::new("test", Some("other".into())),
+        InitializedProvider::unavailable(Box::new(TableProvider {
+            table: HashMap::new(),
+            calls: fixture.calls.clone(),
+            barrier: None,
+            result_count: None,
+            fail_batch: true,
+            updates: fixture.updates.clone(),
+        })),
+    );
+    let references = fixture
+        .prepare()
+        .await
+        .expect("unused batch failures cannot fail planning");
+    assert!(fixture.plan(&references).unwrap().effects().is_empty());
+    assert_eq!(
+        fixture.calls.lock().unwrap().len(),
+        2,
+        "one concurrent batch per instance"
+    );
+    for raw in ["alias/untouched", "alias/unused-saved"] {
+        assert!(matches!(
+            references.values.get(&CacheKey {
+                instance: ProviderInstanceKey::from(&id),
+                ty: identity(),
+                raw: raw.into(),
+            }),
+            Some(CachedOutcome::Failed(ReferenceFailure::Call(_)))
+        ));
+        let error = references
+            .equal(
+                &id,
+                &identity(),
+                &raw.into(),
+                &"key/a".into(),
+                &[
+                    ReferenceOperand {
+                        path: "key".into(),
+                        side: ReferenceSide::Current,
+                    },
+                    ReferenceOperand {
+                        path: "key".into(),
+                        side: ReferenceSide::Desired,
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(error.source, ReferenceFailure::Call(_)));
+        assert_eq!(error.path, "key");
+        assert_eq!(error.raw.expose_plaintext(), raw);
+    }
+    assert_eq!(references.dangling_paths(&id).count(), 0);
+    assert_eq!(fixture.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn round8_unused_secret_values_are_never_requested_or_rejected_by_enumeration() {
+    const SECRET: &str = "alias/secret-saved";
+    for wrapped in [true, false] {
+        let mut fixture = Fixture::new(
+            string("alias/live"),
+            string("key/a"),
+            HashMap::from([("alias/live".into(), resolved("key/a"))]),
+            false,
+        );
+        let value = if wrapped {
+            Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET))))
+        } else {
+            Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
+                SECRET,
+            )))
+        };
+        fixture.saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+            fixture.desired[0].id.clone(),
+            HashMap::from([("key".into(), value)]),
+        )]))
+        .lift(&fixture.registry);
+        let references = fixture
+            .prepare()
+            .await
+            .expect("an unused saved secret is not a comparison operand");
+        assert!(fixture.plan(&references).unwrap().effects().is_empty());
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].iter().all(|request| request.value != SECRET));
+    }
+}
+
+#[tokio::test]
+async fn round8_compared_secret_reference_list_leaves_keep_typed_paths_and_redaction() {
+    use crate::schema::AttributeType;
+    const SECRET: &str = "alias/private-list-secret";
+    for ordered in [true, false] {
+        for wrapped in [true, false] {
+            let secret = if wrapped {
+                Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET))))
+            } else {
+                Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
+                    SECRET,
+                )))
+            };
+            let mut fixture =
+                Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
+            let element = AttributeType::reference(identity(), None, None);
+            fixture.registry.insert(
+                "test",
+                crate::schema::ResourceSchema::new("keys.Resource")
+                    .attribute(
+                        AttributeSchema::optional(
+                            "key",
+                            if ordered {
+                                AttributeType::list(element)
+                            } else {
+                                AttributeType::unordered_list(element)
+                            },
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            reset_values(
+                &mut fixture,
+                Value::Concrete(ConcreteValue::List(vec![secret])),
+                Value::Concrete(ConcreteValue::List(vec![string(SECRET)])),
+                Value::Concrete(ConcreteValue::List(vec![string(SECRET)])),
+            );
+            let error = match fixture.prepare().await {
+                Err(error) => error,
+                Ok(_) => panic!("secret list ordered={ordered}, wrapped={wrapped}"),
+            };
+            assert!(matches!(
+                error.source,
+                ReferenceFailure::Resolution(ReferenceError::InvalidReference(_))
+            ));
+            assert_eq!(error.path, "key[0]");
+            assert!(!format!("{error:?}").contains(SECRET));
+            assert!(!error.to_string().contains(SECRET));
+            assert!(fixture.calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn round8_write_only_record_values_are_enumerated_independently_of_saved_attributes() {
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([
+            ("alias/desired".into(), resolved("key/a")),
+            ("alias/accepted".into(), resolved("key/a")),
+        ]),
+        false,
+    );
+    let schema = crate::schema::ResourceSchema::new("keys.Resource")
+        .attribute(
+            AttributeSchema::optional(
+                "key",
+                AttributeType::list(AttributeType::struct_(
+                    "Entry",
+                    vec![
+                        StructField::optional(
+                            "kms",
+                            AttributeType::reference(identity(), None, None),
+                        )
+                        .write_only()
+                        .build(),
+                        StructField::optional("mode", AttributeType::string()).build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let config = |key: Option<&str>| {
+        let mut values = indexmap::IndexMap::from([("mode".into(), string("same"))]);
+        if let Some(key) = key {
+            values.insert("kms".into(), string(key));
+        }
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(values),
+        )]))
+    };
+    let accepted = indexmap::IndexMap::from([("key".into(), config(Some("alias/accepted")))]);
+    let mut record = NestedWriteOnlyRecord::new();
+    record
+        .record_sent(schema.as_schema(), ["key"], &accepted, None)
+        .unwrap();
+    fixture.registry.insert("test", schema);
+    reset_values(
+        &mut fixture,
+        config(Some("alias/desired")),
+        config(None),
+        config(None),
+    );
+    let id = fixture.desired[0].id.clone();
+    fixture.saved = RawSavedAttrs::from_persisted(
+        HashMap::from([(
+            id.clone(),
+            PersistedAttributes::from_typed_persisted_wire_values(HashMap::from([(
+                "key".into(),
+                config(None),
+            )]))
+            .unwrap(),
+        )]),
+        HashMap::from([(id, record)]),
+    )
+    .lift(&fixture.registry);
+    let references = fixture
+        .prepare()
+        .await
+        .expect("the accepted write-only value needs no extra replay");
+    assert!(fixture.plan(&references).unwrap().effects().is_empty());
+    let calls = fixture.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]
+            .iter()
+            .map(|request| request.value.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["alias/desired", "alias/accepted"])
+    );
+}
+
+#[tokio::test]
 async fn unequal_raw_references_compare_only_canonical_identity_and_preserve_raw_values() {
     for current in ["key-id-a", "key/region-a/account-a/a"] {
         let fixture = Fixture::new(
@@ -779,6 +1243,7 @@ async fn resolution_cache_is_per_run_and_includes_type_and_provider_instance() {
             calls: fixture.calls.clone(),
             barrier: None,
             result_count: None,
+            fail_batch: false,
             updates: fixture.updates.clone(),
         })),
     );
@@ -1375,7 +1840,14 @@ async fn round3_unordered_list_index_ignore_precedes_projection_pairing_and_save
             .iter()
             .map(|r| r.value.as_str())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["alias/live", "alias/saved", "key/b"])
+        BTreeSet::from([
+            "alias/ignored-desired",
+            "alias/ignored-read",
+            "alias/ignored-saved",
+            "alias/live",
+            "alias/saved",
+            "key/b"
+        ])
     );
 }
 
@@ -1426,6 +1898,7 @@ async fn round3_native_reference_batches_reject_short_and_long_results() {
                 calls: fixture.calls.clone(),
                 barrier: None,
                 result_count: Some(count),
+                fail_batch: false,
                 updates: fixture.updates.clone(),
             })),
         );
@@ -2011,6 +2484,7 @@ async fn round2_provider_instance_batches_run_concurrently() {
                 calls: fixture.calls.clone(),
                 barrier: Some(barrier.clone()),
                 result_count: None,
+                fail_batch: false,
                 updates: fixture.updates.clone(),
             })),
         );
@@ -2129,7 +2603,7 @@ async fn round4_byte_equal_current_does_not_turn_saved_pairing_into_a_desired_fa
 }
 
 #[tokio::test]
-async fn round4_only_unmatched_list_references_are_resolved() {
+async fn round8_all_list_references_are_resolved_but_only_compared_failures_matter() {
     use crate::schema::AttributeType;
     for ordered in [false, true] {
         let mut fixture = Fixture::new(
@@ -2181,7 +2655,7 @@ async fn round4_only_unmatched_list_references_are_resolved() {
                 .iter()
                 .map(|request| request.value.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["alias/new", "key/old"])
+            BTreeSet::from(["alias/deleted", "alias/new", "key/old"])
         );
     }
 }
@@ -2680,44 +3154,6 @@ async fn round4_omitted_write_only_list_reference_is_still_a_desired_operand() {
 }
 
 #[tokio::test]
-async fn round5_recording_iteration_limit_is_typed_and_keeps_outputs_private() {
-    let fixture = Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
-    let mut pass = 0;
-    let error = ReferencePreparation::default()
-        .run_with_limit(&fixture.router, 2, |session| {
-            let value = format!("alias/{pass}");
-            pass += 1;
-            let result = session.references.equal(
-                &fixture.desired[0].id,
-                &identity(),
-                &value.into(),
-                &"key/a".into(),
-                &[
-                    ReferenceOperand {
-                        path: "key".into(),
-                        side: ReferenceSide::Desired,
-                    },
-                    ReferenceOperand {
-                        path: "key".into(),
-                        side: ReferenceSide::Current,
-                    },
-                ],
-            );
-            session.result(result)
-        })
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error.source,
-        ReferenceFailure::IterationLimit { limit: 2 }
-    ));
-    assert_eq!(error.path, "key");
-    assert_eq!(pass, 2);
-    let calls = fixture.calls.lock().unwrap();
-    assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), [2]);
-}
-
-#[tokio::test]
 async fn round5_provisional_errors_and_decisions_are_discarded_until_a_clean_run() {
     let fixture = Fixture::new(
         string("alias/live"),
@@ -2727,39 +3163,43 @@ async fn round5_provisional_errors_and_decisions_are_discarded_until_a_clean_run
     );
     let mut passes = 0;
     let prepared = ReferencePreparation::default()
-        .run(&fixture.router, |session| {
-            passes += 1;
-            let result = session
-                .references
-                .equal(
-                    &fixture.desired[0].id,
-                    &identity(),
-                    &"alias/live".into(),
-                    &"key/a".into(),
-                    &[
-                        ReferenceOperand {
-                            path: "key".into(),
-                            side: ReferenceSide::Desired,
-                        },
-                        ReferenceOperand {
-                            path: "key".into(),
-                            side: ReferenceSide::Current,
-                        },
-                    ],
-                )
-                .map_err(crate::differ::PlanComparisonError::from)
-                .and_then(|equal| {
-                    if equal {
-                        Ok("clean")
-                    } else {
-                        Err(
-                            ProviderError::invalid_input("provisional decision must never escape")
-                                .into(),
-                        )
-                    }
-                });
-            session.result(result)
-        })
+        .run(
+            &fixture.router,
+            || fixture.reference_values(),
+            |session| {
+                passes += 1;
+                let result = session
+                    .references
+                    .equal(
+                        &fixture.desired[0].id,
+                        &identity(),
+                        &"alias/live".into(),
+                        &"key/a".into(),
+                        &[
+                            ReferenceOperand {
+                                path: "key".into(),
+                                side: ReferenceSide::Desired,
+                            },
+                            ReferenceOperand {
+                                path: "key".into(),
+                                side: ReferenceSide::Current,
+                            },
+                        ],
+                    )
+                    .map_err(crate::differ::PlanComparisonError::from)
+                    .and_then(|equal| {
+                        if equal {
+                            Ok("clean")
+                        } else {
+                            Err(ProviderError::invalid_input(
+                                "provisional decision must never escape",
+                            )
+                            .into())
+                        }
+                    });
+                session.result(result)
+            },
+        )
         .await
         .unwrap();
     assert_eq!(passes, 2);
@@ -2781,6 +3221,7 @@ async fn round5_dangling_saved_leaf_does_not_annotate_a_different_list_element()
             calls: fixture.calls.clone(),
             barrier: None,
             result_count: None,
+            fail_batch: false,
             updates: fixture.updates.clone(),
         })),
     );
@@ -2901,6 +3342,7 @@ async fn round5_projected_list_notes_keep_the_current_operand_origin() {
             calls: fixture.calls.clone(),
             barrier: None,
             result_count: None,
+            fail_batch: false,
             updates: fixture.updates.clone(),
         })),
     );
@@ -3118,47 +3560,4 @@ async fn round5_projected_write_only_reference_is_still_a_desired_operand() {
         "{error:?}"
     );
     assert_eq!(error.path, "key.kms");
-}
-
-#[tokio::test]
-async fn recording_cap_releases_pass_64_but_never_runs_pass_65() {
-    for clean_pass in [64, 65] {
-        let fixture = Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
-        let mut passes = 0;
-        let result = ReferencePreparation::default()
-            .run(&fixture.router, |session| {
-                passes += 1;
-                // Introduce a new operand on every pass until the requested
-                // clean pass, then repeat the pair from the preceding pass.
-                let raw = format!("alias/{}", passes.min(clean_pass - 1));
-                let result = session.references.equal(
-                    &fixture.desired[0].id,
-                    &identity(),
-                    &raw.into(),
-                    &"key/a".into(),
-                    &[
-                        ReferenceOperand {
-                            path: "key".into(),
-                            side: ReferenceSide::Desired,
-                        },
-                        ReferenceOperand {
-                            path: "key".into(),
-                            side: ReferenceSide::Current,
-                        },
-                    ],
-                );
-                session.result(result)
-            })
-            .await;
-        assert_eq!(passes, 64, "the recording cap counts the clean pass too");
-        assert_eq!(fixture.calls.lock().unwrap().len(), 63);
-        if clean_pass == 64 {
-            assert!(result.is_ok(), "{result:?}");
-        } else {
-            assert!(matches!(
-                result.unwrap_err().source,
-                ReferenceFailure::IterationLimit { limit: 64 }
-            ));
-        }
-    }
 }

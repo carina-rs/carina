@@ -56,6 +56,16 @@ mod sealed {
 /// A closed set of policies for shared structural comparison helpers.
 pub trait ReferenceEquality: sealed::Sealed + std::fmt::Debug + Copy {
     #[doc(hidden)]
+    fn validate_secret(
+        &self,
+        _operand: &ReferenceOperand,
+        _value: &Value,
+        _ty: &AttributeType,
+        _defs: &BTreeMap<String, AttributeType>,
+    ) {
+    }
+
+    #[doc(hidden)]
     fn equal(
         &self,
         operands: &[ReferenceOperand; 2],
@@ -92,6 +102,23 @@ impl sealed::Sealed for AuthoringEquality<'_> {}
 impl sealed::Sealed for DisplayEquality {}
 
 impl ReferenceEquality for PlanningEquality<'_> {
+    fn validate_secret(
+        &self,
+        operand: &ReferenceOperand,
+        value: &Value,
+        ty: &AttributeType,
+        defs: &BTreeMap<String, AttributeType>,
+    ) {
+        if let Err(error) = crate::references::validate_secret_operand(
+            self.0.resource,
+            value,
+            crate::schema::EffectiveType::for_value_walk(ty, defs),
+            &operand.path,
+        ) {
+            self.0.error.borrow_mut().get_or_insert(error);
+        }
+    }
+
     fn equal(
         &self,
         operands: &[ReferenceOperand; 2],
@@ -286,6 +313,22 @@ pub(crate) type OperandOrigins = HashMap<String, ReferenceOperand>;
 pub(crate) type RenderedChanges = std::collections::BTreeSet<(ReferenceSide, String)>;
 
 impl<R: ReferenceEquality> ComparisonContext<'_, R> {
+    fn validate_secret_operands(
+        &self,
+        a: &Value,
+        b: &Value,
+        ty: Option<&AttributeType>,
+        defs: &BTreeMap<String, AttributeType>,
+    ) {
+        if let Some(ty) = ty {
+            for (value, operand) in [a, b].into_iter().zip(self.reference_operands()) {
+                if contains_secret(value) || value.contains_diagnostic_sensitive_string() {
+                    self.references.validate_secret(&operand, value, ty, defs);
+                }
+            }
+        }
+    }
+
     pub(crate) fn at_path<'p>(&'p self, path: &'p str) -> ComparisonContext<'p, R> {
         ComparisonContext {
             schema: self.schema,
@@ -722,6 +765,7 @@ pub(crate) fn type_aware_equal<R: ReferenceEquality>(
     defs: &BTreeMap<String, AttributeType>,
     context: &ComparisonContext<'_, R>,
 ) -> bool {
+    context.validate_secret_operands(a, b, attr_type, defs);
     type_aware_equal_on_path(a, b, attr_type, defs, &[], context)
 }
 
@@ -1334,6 +1378,10 @@ pub(crate) fn should_patch_attr<R: ReferenceEquality>(
         .type_info
         .map(|info| (Some(info.attr_type), info.defs))
         .unwrap_or((None, empty_defs_for_schema_walks()));
+
+    // Validate the operands before saved-list merging can choose an echoed
+    // ordinary string in place of a sensitive desired spelling.
+    context.validate_secret_operands(from_value, cmp.to, attr_type, defs);
 
     if from_value == cmp.to {
         // A raw no-change needs no saved merge, but still crosses typed
