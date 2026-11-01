@@ -211,9 +211,9 @@ pub enum BindingPattern {
 
 /// Provider-owned continuation for an operation that has not settled yet.
 ///
-/// A create, update, delete, or poll call is one short step that must finish
-/// well under the host's per-call hard timeout; providers must never run an
-/// in-call waiter. A poll may return another `Pending`. The host supplies the
+/// A create or update call, including each poll, is one short step that must
+/// finish well under the host's per-call hard timeout; providers must never
+/// run an in-call waiter. A poll may return another `Pending`. The host supplies the
 /// original request on every poll, so `token` must contain only opaque
 /// continuation metadata and must never contain request or secret data. A
 /// token must also serialize as finite JSON. If an initial create has already
@@ -227,7 +227,7 @@ pub struct Pending<T> {
     pub phase: carina_provider_protocol::PendingPhase,
 }
 
-pub use carina_provider_protocol::types::{PendingToken, Sent};
+pub use carina_provider_protocol::types::{PendingDelete, PendingToken, Sent};
 pub use carina_provider_protocol::{PendingPhase, PollFinality, PollRequest};
 
 impl<T> Pending<T> {
@@ -446,25 +446,6 @@ impl IssuedCreate {
         poll_after_secs: u32,
         error: ProviderError,
     ) -> CreateVerdict<T> {
-        self.preserve_in_phase(token, poll_after_secs, PendingPhase::Operation, error)
-    }
-
-    pub fn preserve_read_back<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        error: ProviderError,
-    ) -> CreateVerdict<T> {
-        self.preserve_in_phase(token, poll_after_secs, PendingPhase::ReadBack, error)
-    }
-
-    fn preserve_in_phase<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        phase: PendingPhase,
-        error: ProviderError,
-    ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
@@ -472,7 +453,7 @@ impl IssuedCreate {
                     identifier: Some(self.identifier),
                     sent: self.sent,
                     poll_after_secs,
-                    phase,
+                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -616,23 +597,13 @@ impl ResumeAttempt {
         poll_after_secs: u32,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
-        self.preserve_in_phase(token, poll_after_secs, PendingPhase::Operation, error)
-    }
-
-    fn preserve_in_phase<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        phase: PendingPhase,
-        error: ProviderError,
-    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
                     identifier: None,
                     poll_after_secs,
-                    phase,
+                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -727,32 +698,13 @@ impl ResumedCreate {
         poll_after_secs: u32,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
-        self.preserve_in_phase(token, poll_after_secs, PendingPhase::Operation, error)
-    }
-
-    pub fn preserve_read_back<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        error: ProviderError,
-    ) -> ResumeVerdict<T> {
-        self.preserve_in_phase(token, poll_after_secs, PendingPhase::ReadBack, error)
-    }
-
-    fn preserve_in_phase<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        phase: PendingPhase,
-        error: ProviderError,
-    ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
                     token,
                     identifier: Some(self.identifier),
                     poll_after_secs,
-                    phase,
+                    phase: PendingPhase::Operation,
                 },
                 error,
             },
@@ -764,6 +716,20 @@ impl ResumedCreate {
             identifier: self.identifier,
             attributes: read.attributes,
         })
+    }
+
+    pub fn partial<T>(
+        self,
+        attributes: BTreeMap<String, Value>,
+        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+    ) -> ResumeStep<T> {
+        ResumeStep(
+            carina_provider_protocol::types::ResumeStep::PartialSuccess {
+                identifier: self.identifier,
+                attributes,
+                diagnostic,
+            },
+        )
     }
 
     pub fn failed<T>(
@@ -799,6 +765,20 @@ impl FinishingResume {
             identifier: self.identifier,
             attributes: read.attributes,
         })
+    }
+
+    pub fn partial<T>(
+        self,
+        attributes: BTreeMap<String, Value>,
+        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+    ) -> ResumeStep<T> {
+        ResumeStep(
+            carina_provider_protocol::types::ResumeStep::PartialSuccess {
+                identifier: self.identifier,
+                attributes,
+                diagnostic,
+            },
+        )
     }
 
     pub fn failed<T>(
@@ -1003,7 +983,7 @@ pub enum UpdateOutcome<T> {
 #[derive(Debug)]
 pub enum DeleteOutcome<T> {
     Deleted,
-    Pending(Pending<T>),
+    Pending(PendingDelete<T>),
 }
 
 /// Token type for an operation kind that this provider can never defer.
@@ -1319,9 +1299,10 @@ pub trait CarinaProvider {
     ///
     /// The host passes the original request on every poll. This method may
     /// return a pending step again and must not wait in-call. When
-    /// `poll_request.finality` is [`PollFinality::FinalAttempt`], it must not
-    /// return another read-back pending step; finish with success, partial
-    /// success, or an error.
+    /// `poll_request.finality` is [`PollFinality::FinalAttempt`] after
+    /// read-back has begun, it must not return pending in either phase; finish
+    /// with success, partial success, or an error. A read-back continuation
+    /// must never regress to operation phase.
     fn poll_create(
         &self,
         id: &ResourceId,
@@ -1330,12 +1311,15 @@ pub trait CarinaProvider {
         poll_request: PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>>;
 
-    /// Continue a create operation loaded from state.
+    /// Continue a create operation loaded from state. `poll_request` has the
+    /// same host-owned finality and monotonic read-back semantics as
+    /// [`CarinaProvider::poll_create`].
     fn resume_create(
         &self,
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
+        poll_request: PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>>;
 
     /// Perform one short update step.
@@ -1358,8 +1342,9 @@ pub trait CarinaProvider {
     ///
     /// The host passes the original request and identifier on every poll. This
     /// method may return [`UpdateOutcome::Pending`] again and must not wait
-    /// in-call. A [`PollFinality::FinalAttempt`] request must not return
-    /// another read-back pending outcome.
+    /// in-call. A [`PollFinality::FinalAttempt`] request after read-back has
+    /// begun must not return pending in either phase, and read-back must never
+    /// regress to operation phase.
     fn poll_update(
         &self,
         id: &ResourceId,
@@ -1385,13 +1370,14 @@ pub trait CarinaProvider {
     ///
     /// The host passes the original request and identifier on every poll. This
     /// method may return [`DeleteOutcome::Pending`] again and must not wait
-    /// in-call.
+    /// in-call. [`PendingDelete`] deliberately has no phase because delete has
+    /// no post-apply read-back step.
     fn poll_delete(
         &self,
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError>;
 
     /// Permissions this provider needs to perform `op` on `id`.
@@ -1498,13 +1484,14 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
     request: CreateRequest,
     identifier: Option<AppliedIdentifier>,
     token: P::CreateToken,
+    poll_request: PollRequest,
 ) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict<P::CreateToken>>> {
     let resume = match identifier {
         Some(identifier) => Resume::Issued(ResumedCreate::new(identifier), token),
         None => Resume::Unissued(ResumeAttempt::new(), token),
     };
     provider
-        .resume_create(id, request, resume)
+        .resume_create(id, request, resume, poll_request)
         .map(ResumeStep::into_protocol)
         .map_err(|verdict| Box::new(verdict.into_protocol()))
 }
@@ -1596,6 +1583,7 @@ mod tests {
             _id: &ResourceId,
             _request: CreateRequest,
             _resume: Resume<Self::CreateToken>,
+            _poll_request: PollRequest,
         ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
             unimplemented!("schema-only provider")
         }
@@ -1634,7 +1622,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: DeleteRequest,
-            _pending: Pending<Self::DeleteToken>,
+            _pending: PendingDelete<Self::DeleteToken>,
         ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
             unimplemented!("schema-only provider")
         }
@@ -1785,9 +1773,9 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v14");
+            .expect_err("a validated schema must always be projectable to protocol v13");
 
-        assert!(error.to_string().contains("protocol v14"), "{error}");
+        assert!(error.to_string().contains("protocol v13"), "{error}");
     }
 
     #[test]

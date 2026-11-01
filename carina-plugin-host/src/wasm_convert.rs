@@ -1203,19 +1203,28 @@ impl UpdatePendingOperation {
 }
 
 #[derive(Clone)]
-pub(crate) struct DeletePendingOperation(PendingOperation);
+pub(crate) struct DeletePendingOperation {
+    token: PendingToken,
+    poll_after_secs: u32,
+}
 
 impl DeletePendingOperation {
+    fn from_wit(pending: wit::PendingDelete) -> Self {
+        Self {
+            token: PendingToken(pending.token),
+            poll_after_secs: pending.poll_after_secs,
+        }
+    }
+
     pub(crate) fn poll_after_secs(&self) -> u32 {
-        self.0.poll_after_secs()
+        self.poll_after_secs
     }
 
-    pub(crate) fn phase(&self) -> proto::PendingPhase {
-        self.0.phase()
-    }
-
-    pub(crate) fn into_wit(self) -> wit::PendingOperation {
-        self.0.into_wit()
+    pub(crate) fn into_wit(self) -> wit::PendingDelete {
+        wit::PendingDelete {
+            token: self.token.0,
+            poll_after_secs: self.poll_after_secs,
+        }
     }
 }
 
@@ -1368,12 +1377,14 @@ pub(crate) fn core_to_wit_pending_create_parts(
 pub(crate) fn core_to_wit_resume_pending(
     token: &proto::PendingToken,
     identifier: Option<&proto::AppliedIdentifier>,
+    poll_after_secs: u32,
+    phase: proto::PendingPhase,
 ) -> wit::ResumePending {
     wit::ResumePending {
         operation: wit::PendingOperation {
             token: token.expose_for_provider_call().to_string(),
-            poll_after_secs: 1,
-            phase: wit::PendingPhase::Operation,
+            poll_after_secs,
+            phase: core_to_wit_pending_phase(phase),
         },
         identifier: identifier.map(ToString::to_string),
     }
@@ -1604,6 +1615,28 @@ pub(crate) fn wit_to_core_resume_step(
                 })
             })
         }
+        wit::ResumeStep::PartialSuccess(partial) => {
+            let wit::CreatePartialSuccess { state, diagnostic } = partial;
+            let wit::PartialReadDiagnostic {
+                reason,
+                missing_attributes,
+            } = diagnostic;
+            decode_created_attributes(state, id, None, None).map(|decoded| {
+                decoded.map(|(identifier, attributes)| {
+                    match CorePartialReadDiagnostic::new(reason, missing_attributes) {
+                        Some(diagnostic) => proto::ResumeStep::PartialSuccess {
+                            identifier,
+                            attributes,
+                            diagnostic,
+                        },
+                        None => proto::ResumeStep::Completed {
+                            identifier,
+                            attributes,
+                        },
+                    }
+                })
+            })
+        }
         wit::ResumeStep::Pending(pending) => wit_to_core_resume_pending(pending, id)
             .map(proto::ResumeStep::Pending)
             .map(DecodedIssued::Decoded),
@@ -1707,7 +1740,7 @@ pub(crate) fn wit_to_core_delete_outcome(outcome: wit::DeleteOutcome) -> WasmDel
     match outcome {
         wit::DeleteOutcome::Deleted => WasmDeleteOutcome::Deleted,
         wit::DeleteOutcome::Pending(pending) => {
-            WasmDeleteOutcome::Pending(DeletePendingOperation(PendingOperation::from_wit(pending)))
+            WasmDeleteOutcome::Pending(DeletePendingOperation::from_wit(pending))
         }
     }
 }

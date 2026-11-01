@@ -4,7 +4,7 @@ description: Carina-side lifecycle, ordering, routing, and change-ownership cont
 ---
 
 A `directives` block controls how Carina manages a resource. Directives are not
-resource attributes. In provider protocol 14, only delete requests carry the
+resource attributes. In provider protocol 13, only delete requests carry the
 resolved provider-visible directives; other request resource records do not
 transport authored directives.
 

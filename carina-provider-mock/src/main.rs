@@ -11,8 +11,8 @@ use carina_core::schema::{
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, DesiredAttribute,
-    DesiredResource, FoundRead, NormalizedResource, Pending, Poll, PollRequest, PollVerdict,
-    Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+    DesiredResource, FoundRead, NormalizedResource, Pending, PendingDelete, Poll, PollRequest,
+    PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -234,6 +234,41 @@ impl MockProcessProvider {
             .get(&Self::resource_key(id))
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn restarted_read_back_attributes(id: &ResourceId) -> Option<BTreeMap<String, Value>> {
+        if id.resource_type != "test.read_back" {
+            return None;
+        }
+        let attributes = match id.identity.as_str() {
+            "within_source" => BTreeMap::from([
+                ("create_read_back_pending_polls".to_string(), Value::Int(1)),
+                ("present".to_string(), Value::String("present".to_string())),
+                ("computed".to_string(), Value::String("ready".to_string())),
+            ]),
+            "within_dependent" => BTreeMap::from([(
+                "from_read_back".to_string(),
+                Value::String("ready".to_string()),
+            )]),
+            "budget_source" => BTreeMap::from([
+                (
+                    "create_read_back_pending_polls".to_string(),
+                    Value::Int(100),
+                ),
+                ("present".to_string(), Value::String("present".to_string())),
+                ("computed".to_string(), Value::String("ready".to_string())),
+            ]),
+            "budget_present_dependent" => BTreeMap::from([(
+                "from_read_back".to_string(),
+                Value::String("present".to_string()),
+            )]),
+            "budget_missing_dependent" => BTreeMap::from([(
+                "from_read_back".to_string(),
+                Value::String("ready".to_string()),
+            )]),
+            _ => return None,
+        };
+        Some(attributes)
     }
 
     fn partial_read_diagnostic() -> PartialReadDiagnostic {
@@ -571,6 +606,39 @@ impl CarinaProvider for MockProcessProvider {
 
     fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
         vec![
+            CoreResourceSchema::new("test.read_back")
+                .attribute(
+                    CoreAttributeSchema::optional(
+                        "create_read_back_pending_polls",
+                        CoreAttributeType::int(),
+                    )
+                    .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional("present", CoreAttributeType::string()).build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::optional("from_read_back", CoreAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    CoreAttributeSchema::provider_populated(
+                        "computed",
+                        CoreAttributeType::string(),
+                    )
+                    .build(),
+                )
+                .with_description("Mock resource for host-owned read-back polling")
+                .with_operation_config(OperationConfig {
+                    create_timeout_secs: Some(5),
+                    update_timeout_secs: Some(5),
+                    delete_timeout_secs: Some(5),
+                    create_max_retries: None,
+                    delete_max_retries: None,
+                    read_back: ReadBackBudget::from_secs(2),
+                })
+                .validate()
+                .expect("mock read-back schema must be valid"),
             CoreResourceSchema::new("test.short_budget")
                 .attribute(Self::optional_string_attribute("create_mode"))
                 .with_description("Mock resource with short operation budgets")
@@ -739,6 +807,14 @@ impl CarinaProvider for MockProcessProvider {
                     id: id.clone(),
                     identifier: identifier.clone(),
                     attributes: attrs.clone(),
+                },
+            })
+        } else if let Some(attributes) = Self::restarted_read_back_attributes(id) {
+            Ok(ReadOutcome::Found {
+                state: AppliedState {
+                    id: id.clone(),
+                    identifier: identifier.clone(),
+                    attributes,
                 },
             })
         } else {
@@ -1133,6 +1209,12 @@ impl CarinaProvider for MockProcessProvider {
                     if poll_request.finality == carina_plugin_sdk::PollFinality::FinalAttempt {
                         if Self::bool_attribute(
                             &request.resource.attributes,
+                            "create_read_back_operation_after_final",
+                        ) {
+                            return Ok(issued.pending(token, 1));
+                        }
+                        if Self::bool_attribute(
+                            &request.resource.attributes,
                             "create_read_back_pending_after_final",
                         ) {
                             return Ok(issued.pending_read_back(token, 1));
@@ -1161,6 +1243,7 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
         resume: Resume<Self::CreateToken>,
+        poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         let unencodable_repending = matches!(
             request.resource.attributes.get("create_mode"),
@@ -1321,7 +1404,19 @@ impl CarinaProvider for MockProcessProvider {
                     })
                 }
                 CreateMode::ReadBack => {
-                    Ok(resumed.completed(Self::found_read(id, self.complete_read_back(id))))
+                    if poll_request.finality == carina_plugin_sdk::PollFinality::FinalAttempt {
+                        if Self::bool_attribute(
+                            &request.resource.attributes,
+                            "create_read_back_pending_after_final",
+                        ) {
+                            return Ok(resumed.pending_read_back(token, 1));
+                        }
+                        return Ok(resumed.partial(
+                            self.read_back_attributes(id),
+                            Self::partial_read_diagnostic(),
+                        ));
+                    }
+                    Ok(resumed.pending_read_back(token, 1))
                 }
             },
         }
@@ -1397,6 +1492,12 @@ impl CarinaProvider for MockProcessProvider {
             UpdateToken::ReadBack
                 if poll_request.finality == carina_plugin_sdk::PollFinality::FinalAttempt =>
             {
+                if Self::update_bool_attribute(&request, "update_read_back_operation_after_final") {
+                    return Ok(UpdateOutcome::Pending(Pending::operation(
+                        UpdateToken::ReadBack,
+                        1,
+                    )));
+                }
                 if Self::update_bool_attribute(&request, "update_read_back_pending_after_final") {
                     return Ok(UpdateOutcome::Pending(Pending::read_back(
                         UpdateToken::ReadBack,
@@ -1438,7 +1539,7 @@ impl CarinaProvider for MockProcessProvider {
             .map(|attributes| Self::pending_polls(attributes, "delete_pending_polls"))
             .unwrap_or(0);
         if pending_polls > 0 {
-            return Ok(DeleteOutcome::Pending(Pending::operation(
+            return Ok(DeleteOutcome::Pending(PendingDelete::new(
                 DeleteToken {
                     remaining: pending_polls - 1,
                 },
@@ -1454,10 +1555,10 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
         if pending.token.remaining > 0 {
-            return Ok(DeleteOutcome::Pending(Pending::operation(
+            return Ok(DeleteOutcome::Pending(PendingDelete::new(
                 DeleteToken {
                     remaining: pending.token.remaining - 1,
                 },

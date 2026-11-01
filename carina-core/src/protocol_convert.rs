@@ -2339,6 +2339,7 @@ pub fn try_update_outcome_to_protocol(
             let PartialReadDiagnostic {
                 reason,
                 missing_attributes,
+                read_back_budget_exhausted: _read_back_budget_exhausted,
             } = diagnostic;
             Ok(protocol::UpdateOutcome::PartialSuccess {
                 state: try_applied_update_state_to_protocol(state, state_after_patch)?,

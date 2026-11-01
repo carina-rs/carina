@@ -2253,176 +2253,6 @@ async fn create_success_publishes_complete() {
 }
 
 #[tokio::test]
-async fn read_back_completion_publishes_value_to_dependent_in_same_apply() {
-    let provider = MockProvider::new();
-    let source = make_resource("source", &[]);
-    let mut dependent = make_resource("dependent", &[]);
-    dependent.set_attr(
-        "from_read_back",
-        Value::resource_ref("source", "computed", vec![]),
-    );
-    dependent.dependency_bindings.insert("source".to_string());
-    let source_id = source.id.clone();
-    let dependent_id = dependent.id.clone();
-
-    let source_state = State::existing(
-        source_id.clone(),
-        HashMap::from([(
-            "computed".to_string(),
-            Value::Concrete(ConcreteValue::String("ready".into())),
-        )]),
-    )
-    .with_identifier("source-id");
-    provider.push_create(Ok(source_state));
-    provider.push_create(Ok(ok_state(&dependent_id)));
-
-    let mut plan = Plan::new();
-    plan.add(create_effect(source));
-    plan.add(create_effect(dependent));
-    let result = execute_lifecycle_fixture(&provider, &plan, HashMap::new()).await;
-
-    assert_eq!((result.success_count, result.failure_count), (2, 0));
-    let requests = provider.captured_create_resources();
-    let dependent_request = requests
-        .iter()
-        .find(|resource| resource.id == dependent_id)
-        .expect("the dependent must run after read-back completes");
-    assert_eq!(
-        dependent_request.get_attr("from_read_back"),
-        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
-    );
-}
-
-#[tokio::test]
-async fn partial_read_back_blocks_dependent_then_next_refresh_fills_value() {
-    let provider = MockProvider::new();
-    let source = make_resource("source", &[]);
-    let mut dependent = make_resource("dependent", &[]);
-    dependent.set_attr(
-        "from_read_back",
-        Value::resource_ref("source", "computed", vec![]),
-    );
-    dependent.dependency_bindings.insert("source".to_string());
-    let source_id = source.id.clone();
-    let dependent_id = dependent.id.clone();
-
-    let partial_state =
-        State::existing(source_id.clone(), HashMap::new()).with_identifier("source-id");
-    provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
-        applied_state_for_test(partial_state),
-        "mock read-back is still pending".to_string(),
-        vec!["computed".to_string()],
-    )));
-
-    let mut first_plan = Plan::new();
-    first_plan.add(create_effect(source.clone()));
-    first_plan.add(create_effect(dependent.clone()));
-    let first_observer = MockObserver::new();
-    let first = execute_lifecycle_fixture_with_observer(
-        &provider,
-        &first_plan,
-        HashMap::new(),
-        &first_observer,
-    )
-    .await;
-
-    assert_eq!((first.partial_count, first.failure_count), (1, 1));
-    let Applied::Complete { state, .. } = first
-        .applied_states
-        .get(&source_id)
-        .expect("partial create must be written back")
-    else {
-        panic!("partial create changed recovery classification")
-    };
-    assert!(
-        state.partial_read.is_some(),
-        "partial marker must be retained"
-    );
-    let first_events = first_observer.events();
-    let dependent_error = effect_failure_event(&first_events, &dependent_id);
-    assert!(
-        dependent_error.contains(
-            "`source` was created but its read-back did not complete within the configured budget: read after apply was incomplete: mock read-back is still pending. The value will be filled on the next apply or refresh."
-        ),
-        "{dependent_error}"
-    );
-    assert!(!dependent_error.contains("wait"), "{dependent_error}");
-
-    let refreshed_state = State::existing(
-        source_id.clone(),
-        HashMap::from([(
-            "computed".to_string(),
-            Value::Concrete(ConcreteValue::String("ready".into())),
-        )]),
-    )
-    .with_identifier("source-id");
-    provider.push_read(Ok(refreshed_state));
-    let refreshed = provider
-        .read(
-            &source_id,
-            &AppliedIdentifier::new("source-id").expect("fixture identifier is valid"),
-            ReadRequest,
-        )
-        .await
-        .expect("the next apply refresh should re-read the partial resource")
-        .into_state();
-    assert!(refreshed.partial_read.is_none());
-
-    let current =
-        crate::resource::current_map_from_states(HashMap::from([(source_id.clone(), refreshed)]));
-    let plan_current = crate::resource::into_plan_input_current_map(
-        current.clone(),
-        &TEST_SCHEMAS,
-        &[source.clone(), dependent.clone()],
-    );
-    let bindings = ResolvedBindings::pre_apply_live(crate::binding_index::LivePreApplyInputs {
-        managed: &[source, dependent.clone()],
-        compositions: &[],
-        managed_current: &plan_current,
-        data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
-        wait_aliases: &[],
-    });
-    provider.push_create(Ok(ok_state(&dependent_id)));
-    let mut second_plan = Plan::new();
-    second_plan.add(create_effect(dependent));
-    let second_input = ExecutionInput {
-        plan: &second_plan,
-        provider_check_inputs: ProviderCheckInputs::Authored,
-        compositions: &[],
-        bindings,
-        managed_current: current,
-        data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &TEST_SCHEMAS,
-        parallelism: crate::executor::TEST_UNCAPPED,
-        precompleted_success_count: 0,
-        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
-    };
-    let second = completed_result(
-        execute_plan(
-            &provider,
-            second_input,
-            &MockObserver::new(),
-            uncancelled_shutdown(),
-        )
-        .await,
-    );
-    assert_eq!((second.success_count, second.failure_count), (1, 0));
-    let requests = provider.captured_create_resources();
-    let dependent_request = requests
-        .iter()
-        .find(|resource| resource.id == dependent_id)
-        .expect("the refreshed dependent must reach the provider");
-    assert_eq!(
-        dependent_request.get_attr("from_read_back"),
-        Some(&Value::Concrete(ConcreteValue::String("ready".into())))
-    );
-}
-
-#[tokio::test]
 async fn resume_resumed_publishes_observed() {
     let provider = MockProvider::new();
     let source = make_resource("source", &[]);
@@ -8386,6 +8216,78 @@ async fn test_update_effect_binding_map_propagation() {
     let events = observer.events();
     assert!(events.iter().any(|e| e.starts_with("started:")));
     assert!(events.iter().any(|e| e.starts_with("succeeded:")));
+}
+
+#[tokio::test]
+async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
+    let provider = MockProvider::new();
+    let id = ResourceId::with_identity("test", "update-recovery");
+    let from = State::existing(id.clone(), HashMap::new()).with_identifier("stable-update-id");
+    let to = make_resource("update-recovery", &[]);
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::effect::fixture_applied_identifier("stable-update-id"),
+        from: Box::new(from.clone()),
+        to: resolved(to),
+        changed_attributes: vec!["some_attr".to_string()],
+    });
+    provider.push_update(Err(ProviderError::internal(
+        "WASM provider update violated the read-back polling protocol",
+    )));
+    provider.push_read(Ok(State::existing(
+        id.clone(),
+        HashMap::from([(
+            "recovered".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )]),
+    )));
+
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(id.clone(), Current::from_state(from))]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!((result.success_count, result.failure_count), (0, 1));
+    assert_eq!(
+        provider.calls(),
+        vec![
+            ("update".to_string(), id.to_string()),
+            ("read".to_string(), id.to_string()),
+        ]
+    );
+    let Current::Present(recovered) = result
+        .managed_current
+        .get(&id)
+        .expect("failed update must keep a recoverable current state")
+    else {
+        panic!("failed update recovery changed the current-state classification")
+    };
+    assert_eq!(recovered.identifier().as_str(), "stable-update-id");
+    assert_eq!(
+        recovered.state().attributes.get("recovered"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true)))
+    );
 }
 
 /// Regression test for #1195: dependency analysis also respects delete dependencies.

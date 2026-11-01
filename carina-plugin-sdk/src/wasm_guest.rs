@@ -36,7 +36,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource.id, resource.resource.attributes.iter())
 }
 
-/// Render one error chain for protocol-v14 metadata's string-only failure
+/// Render one error chain for protocol-v13 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -64,14 +64,14 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-14 WIT resource records.
+/// Return the honest directive default for protocol-13 WIT resource records.
 ///
-/// Protocol 14 does not transport directives on create, poll-create,
+/// Protocol 13 does not transport directives on create, poll-create,
 /// resume-create, read-data-source, or normalize-desired requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Delete-request directives are transported separately after host resolution.
 #[doc(hidden)]
-pub fn protocol_14_default_resource_directives() -> proto::Directives {
+pub fn protocol_13_default_resource_directives() -> proto::Directives {
     proto::Directives::default()
 }
 
@@ -601,7 +601,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v14 metadata exports return a bare string rather
+                // Protocol v13 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure
@@ -935,6 +935,24 @@ macro_rules! export_provider {
                     poll_after_secs: pending.poll_after_secs,
                     phase: wit_to_proto_pending_phase(pending.phase),
                 })
+            }
+
+            fn sdk_to_wit_pending_delete<T: serde::Serialize>(
+                pending: &$crate::PendingDelete<T>,
+            ) -> Result<wit_types::PendingDelete, serde_json::Error> {
+                Ok(wit_types::PendingDelete {
+                    token: serde_json::to_string(&pending.token)?,
+                    poll_after_secs: pending.poll_after_secs,
+                })
+            }
+
+            fn wit_to_sdk_pending_delete<T: serde::de::DeserializeOwned>(
+                pending: wit_types::PendingDelete,
+            ) -> Result<$crate::PendingDelete<T>, serde_json::Error> {
+                Ok($crate::PendingDelete::new(
+                    serde_json::from_str(&pending.token)?,
+                    pending.poll_after_secs,
+                ))
             }
 
             fn proto_to_wit_pending_phase(
@@ -1454,6 +1472,23 @@ macro_rules! export_provider {
                             Err(ResumeStepEncodeFailure::created(identifier, error))
                         }
                     },
+                    proto::ResumeStep::PartialSuccess {
+                        identifier,
+                        attributes,
+                        diagnostic,
+                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
+                        Ok(state) => Ok(wit_types::ResumeStep::PartialSuccess(
+                            wit_types::CreatePartialSuccess {
+                                state,
+                                diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic),
+                            },
+                        )),
+                        Err(error) => {
+                            let error =
+                                boundary_encode_to_provider_error(operation, None, error);
+                            Err(ResumeStepEncodeFailure::created(identifier, error))
+                        }
+                    },
                     proto::ResumeStep::Pending(pending) => {
                         sdk_to_wit_resume_pending(pending, operation)
                             .map(wit_types::ResumeStep::Pending)
@@ -1602,7 +1637,7 @@ macro_rules! export_provider {
             ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
                 match outcome {
                     $crate::DeleteOutcome::Deleted => Ok(wit_types::DeleteOutcome::Deleted),
-                    $crate::DeleteOutcome::Pending(pending) => sdk_to_wit_pending(pending)
+                    $crate::DeleteOutcome::Pending(pending) => sdk_to_wit_pending_delete(pending)
                         .map(wit_types::DeleteOutcome::Pending)
                         .map_err(|error| {
                             boundary_token_encode_to_provider_error(operation, error)
@@ -2018,7 +2053,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let directives = helpers::protocol_14_default_resource_directives();
+                    let directives = helpers::protocol_13_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
@@ -2036,7 +2071,7 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let directives = helpers::protocol_14_default_resource_directives();
+                    let directives = helpers::protocol_13_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2068,7 +2103,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_14_default_resource_directives();
+                    let directives = helpers::protocol_13_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2112,10 +2147,11 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
                     pending: wit_types::ResumePending,
+                    poll_request: wit_types::PollRequest,
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_14_default_resource_directives();
+                    let directives = helpers::protocol_13_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2133,12 +2169,14 @@ macro_rules! export_provider {
                         }
                     };
                     let provider = get_provider().lock().unwrap();
+                    let poll_request = wit_to_sdk_poll_request(poll_request);
                     match $crate::dispatch_resume_create(
                         &*provider,
                         &proto_id,
                         proto_request,
                         identifier,
                         token,
+                        poll_request,
                     ) {
                         Ok(step) => sdk_to_wit_resume_step(step, "resume_create")
                             .map_err(|failure| {
@@ -2239,14 +2277,14 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     identifier: String,
                     request: wit_types::DeleteRequest,
-                    pending: wit_types::PendingOperation,
+                    pending: wit_types::PendingDelete,
                 ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error("poll_delete", error)
                     })?;
                     let proto_request = wit_to_proto_delete_request(request);
-                    let pending = wit_to_sdk_pending::<
+                    let pending = wit_to_sdk_pending_delete::<
                         <$provider_type as $crate::CarinaProvider>::DeleteToken,
                     >(pending)
                     .map_err(|error| {
@@ -2334,7 +2372,7 @@ macro_rules! export_provider {
                                 resource,
                                 deferred,
                             } = desired;
-                            let directives = helpers::protocol_14_default_resource_directives();
+                            let directives = helpers::protocol_13_default_resource_directives();
                             let resource = wit_to_proto_resource(&resource, directives).map_err(|error| {
                                 boundary_decode_to_provider_error(
                                     "normalize_desired",
@@ -2494,7 +2532,7 @@ mod tests {
 
     #[test]
     fn wit_resource_protocol_directives_are_all_false_without_transport() {
-        let directives = protocol_14_default_resource_directives();
+        let directives = protocol_13_default_resource_directives();
 
         assert!(!directives.force_delete);
         assert!(!directives.create_before_destroy);

@@ -10,7 +10,8 @@ use carina_plugin_sdk::core::schema::{
 use carina_plugin_sdk::types::*;
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
-    PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
+    PendingDelete, PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent,
+    UpdateOutcome,
 };
 
 const URL_ATTRIBUTE: &str = "url";
@@ -315,6 +316,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _request: CreateRequest,
         _resume: Resume<Self::CreateToken>,
+        _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         unreachable!("the NaN fixture token cannot cross the guest boundary")
     }
@@ -357,7 +359,7 @@ impl CarinaProvider for MockHttpProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: DeleteRequest,
-        pending: Pending<Self::DeleteToken>,
+        pending: PendingDelete<Self::DeleteToken>,
     ) -> Result<DeleteOutcome<Self::DeleteToken>, ProviderError> {
         match pending.token {}
     }

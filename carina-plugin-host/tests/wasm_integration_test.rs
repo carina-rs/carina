@@ -1350,6 +1350,89 @@ async fn test_wasm_create_read_back_pending_after_final_preserves_identifier() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_cannot_regress_to_operation_phase() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-create-phase-regression",
+        None,
+    );
+    let mut resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-create-phase-regression",
+        "create_read_back_pending_polls",
+        100,
+    );
+    resource.set_attr(
+        "create_read_back_operation_after_final",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("read-back must not regress to operation pending")
+        .into_kind();
+    let CreateFailureKind::InFlight { pending, error } = failure else {
+        panic!("a phase regression must retain the issued create")
+    };
+    assert_eq!(
+        pending.identifier().map(AppliedIdentifier::as_str),
+        Some("mock-id")
+    );
+    assert!(error.to_string().contains("polling protocol"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_success() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "resumed-read-back-partial",
+        None,
+    );
+    let token = serde_json::json!({ "read_back": true }).to_string();
+    let pending = persisted_create_for_resume(&id, &token, Some("mock-id"));
+    let resource = resource_with_int_attribute(
+        "test.short_budget",
+        "resumed-read-back-partial",
+        "create_read_back_pending_polls",
+        100,
+    );
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+
+    let result = provider
+        .provider()
+        .resume_create(request)
+        .await
+        .map(ResumeOutcome::into_kind)
+        .map_err(ResumeFailure::into_kind);
+
+    let Ok(ResumeOutcomeKind::PartialSuccess(partial)) = result else {
+        panic!("final read-back attempt must return a partial success, got {result:?}")
+    };
+    assert_eq!(partial.identifier().as_str(), "mock-id");
+    assert_eq!(
+        partial.diagnostic().missing_attributes(),
+        &["computed".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_pending_update_polls_until_success() {
     const PENDING_POLLS: u32 = 2;
 
@@ -1505,6 +1588,72 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
         Some(&Value::Concrete(ConcreteValue::String("ready".into())))
     );
     assert!(refreshed.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_recoverable() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.short_budget",
+        "read-back-update-phase-regression",
+        None,
+    );
+    let mut resource = resource_with_int_attribute(
+        "test.short_budget",
+        "read-back-update-phase-regression",
+        "value",
+        1,
+    );
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("setup create should succeed"),
+    );
+    resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    resource.set_attr(
+        "update_read_back_pending_polls",
+        Value::Concrete(ConcreteValue::Int(100)),
+    );
+    resource.set_attr(
+        "update_read_back_operation_after_final",
+        Value::Concrete(ConcreteValue::Bool(true)),
+    );
+    let request = update_request_for_test(
+        resource,
+        created,
+        &[
+            "value".to_string(),
+            "update_read_back_pending_polls".to_string(),
+            "update_read_back_operation_after_final".to_string(),
+        ],
+    )
+    .await;
+
+    let error = provider
+        .provider()
+        .update(&id, &mock_identifier(), request)
+        .await
+        .expect_err("read-back must not regress to operation pending");
+    assert!(error.to_string().contains("polling protocol"), "{error}");
+
+    let recovered = provider
+        .provider()
+        .read(&id, &mock_identifier(), ReadRequest)
+        .await
+        .expect("the retained update identifier must remain usable for recovery")
+        .into_state();
+    assert_eq!(
+        recovered.attributes.get("value"),
+        Some(&Value::Concrete(ConcreteValue::Int(2)))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2075,6 +2224,9 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
         Ok(ResumeOutcomeKind::Resumed(created)) => {
             panic!("token encoding failure unexpectedly resumed {created:?}")
         }
+        Ok(ResumeOutcomeKind::PartialSuccess(outcome)) => {
+            panic!("token encoding failure unexpectedly completed partially {outcome:?}")
+        }
         Ok(ResumeOutcomeKind::Resent(outcome)) => {
             panic!("token encoding failure unexpectedly resent {outcome:?}")
         }
@@ -2146,6 +2298,9 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             (expected, Ok(ResumeOutcomeKind::Resumed(created))) => {
                 panic!("expected {expected}, got resumed {created:?}")
             }
+            (expected, Ok(ResumeOutcomeKind::PartialSuccess(outcome))) => {
+                panic!("expected {expected}, got partial {outcome:?}")
+            }
             (expected, Ok(ResumeOutcomeKind::Resent(outcome))) => {
                 panic!("expected {expected}, got resent {outcome:?}")
             }
@@ -2195,6 +2350,9 @@ async fn wasm_mock_exercises_resumed_discarded_undetermined_repending_and_resend
             "undecodable resume token unexpectedly resumed {}",
             created.identifier()
         ),
+        Ok(ResumeOutcomeKind::PartialSuccess(outcome)) => {
+            panic!("undecodable resume token unexpectedly completed partially: {outcome:?}")
+        }
         Ok(ResumeOutcomeKind::Resent(outcome)) => {
             panic!("undecodable resume token unexpectedly resent: {outcome:?}")
         }
@@ -2260,6 +2418,9 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     {
         Ok(ResumeOutcomeKind::Resumed(created)) => {
             assert_eq!(created.identifier().as_str(), canonical);
+        }
+        Ok(ResumeOutcomeKind::PartialSuccess(outcome)) => {
+            panic!("expected resumed canonical identifier, got partial {outcome:?}")
         }
         Ok(ResumeOutcomeKind::Resent(outcome)) => {
             panic!("expected resumed canonical identifier, got resent {outcome:?}")

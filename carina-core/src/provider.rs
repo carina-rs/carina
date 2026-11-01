@@ -2100,6 +2100,10 @@ pub enum UpdateOutcome {
 pub struct PartialReadDiagnostic {
     pub(crate) reason: String,
     pub(crate) missing_attributes: Vec<String>,
+    /// Host-only provenance for same-run guidance; never part of provider or
+    /// persisted diagnostic formats.
+    #[serde(skip)]
+    pub(crate) read_back_budget_exhausted: bool,
 }
 
 /// Validated UTC RFC3339 timestamp used only to describe when a persisted
@@ -2585,6 +2589,7 @@ pub struct ObservedCreate {
     identifier: AppliedIdentifier,
     observation: CreateObservation,
     sent: SentRecord,
+    partial_read: Option<Box<PartialReadDiagnostic>>,
     resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
@@ -2618,6 +2623,7 @@ impl ObservedCreate {
             identifier,
             observation,
             sent,
+            partial_read: None,
             resolved_desired_attributes: None,
         }
     }
@@ -2650,6 +2656,10 @@ impl ObservedCreate {
         &self.sent
     }
 
+    pub fn partial_read_diagnostic(&self) -> Option<&PartialReadDiagnostic> {
+        self.partial_read.as_deref()
+    }
+
     /// Resolved desired values and send evidence retained by the accepted
     /// create observation.
     pub fn sent_desired_attributes_for<'a, S>(
@@ -2669,6 +2679,18 @@ impl ObservedCreate {
     ) -> Self {
         self.resolved_desired_attributes = Some(attributes);
         self
+    }
+
+    fn with_partial_read(mut self, diagnostic: PartialReadDiagnostic) -> Self {
+        self.partial_read = Some(Box::new(diagnostic));
+        self
+    }
+
+    /// Attach a partial read-back diagnostic in cross-crate tests.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_partial_read_for_test(self, diagnostic: PartialReadDiagnostic) -> Self {
+        self.with_partial_read(diagnostic)
     }
 
     pub fn resolved_desired_attributes(&self) -> Option<&SecretPreservingAttributes> {
@@ -2712,8 +2734,12 @@ impl ObservedCreate {
             CreateObservation::Observed(state) => state.attributes().clone(),
             CreateObservation::Unobserved(_reason) => HashMap::new(),
         };
-        State::existing(self.id.clone(), attributes)
-            .with_identifier(self.identifier.as_str().to_string())
+        let state = State::existing(self.id.clone(), attributes)
+            .with_identifier(self.identifier.as_str().to_string());
+        match &self.partial_read {
+            Some(diagnostic) => diagnostic.as_ref().clone().into_state_for_writeback(state),
+            None => state,
+        }
     }
 }
 
@@ -3611,10 +3637,80 @@ impl CompletedResume {
     }
 }
 
+/// A resumed create whose resource is known but whose read-back is partial.
+///
+/// The completed observation retains the persisted continuation's sent-value
+/// authority; unlike a resent create, this type never invents a new `Sent`.
+#[derive(Debug)]
+pub struct PartialResume {
+    completed: CompletedResume,
+    diagnostic: PartialReadDiagnostic,
+}
+
+impl PartialResume {
+    fn new(
+        pending: InFlightCreate,
+        identifier: AppliedIdentifier,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> Self {
+        let state =
+            AppliedState::from_identifier(pending.id().clone(), identifier.clone(), attributes);
+        Self {
+            completed: CompletedResume::new(pending, identifier, state),
+            diagnostic,
+        }
+    }
+
+    fn id(&self) -> &ResourceId {
+        self.completed.id()
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        self.completed.identifier()
+    }
+
+    pub fn diagnostic(&self) -> &PartialReadDiagnostic {
+        &self.diagnostic
+    }
+
+    pub fn observed_state(&self) -> State {
+        self.diagnostic
+            .clone()
+            .into_state_for_writeback(self.completed.observed_state())
+    }
+
+    pub(crate) fn with_resolved_desired_attributes(
+        self,
+        attributes: SecretPreservingAttributes,
+    ) -> Self {
+        Self {
+            completed: self.completed.with_resolved_desired_attributes(attributes),
+            diagnostic: self.diagnostic,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (ObservedCreate, State, PartialReadDiagnostic) {
+        let Self {
+            completed,
+            diagnostic,
+        } = self;
+        let created = completed
+            .into_observed_create()
+            .with_partial_read(diagnostic.clone());
+        let state = created.observed_state();
+        (created, state, diagnostic)
+    }
+}
+
 /// Read-only classification exposed by an opaque [`ResumeOutcome`].
 #[derive(Debug)]
 pub enum ResumeOutcomeKind {
     Resumed(Box<CompletedResume>),
+    /// The persisted create completed, but its read-back remains incomplete.
+    /// This is distinct from `Resent`: no new create request or `sent` value
+    /// was fabricated to finish the resumed continuation.
+    PartialSuccess(Box<PartialResume>),
     Resent(Box<CreateOutcome>),
 }
 
@@ -3625,6 +3721,10 @@ impl ResumeOutcome {
 
     fn resent(outcome: CreateOutcome) -> Self {
         Self(ResumeOutcomeKind::Resent(Box::new(outcome)))
+    }
+
+    fn partial(outcome: PartialResume) -> Self {
+        Self(ResumeOutcomeKind::PartialSuccess(Box::new(outcome)))
     }
 
     pub fn kind(&self) -> &ResumeOutcomeKind {
@@ -3638,6 +3738,7 @@ impl ResumeOutcome {
     pub fn id(&self) -> &ResourceId {
         match &self.0 {
             ResumeOutcomeKind::Resumed(completed) => completed.id(),
+            ResumeOutcomeKind::PartialSuccess(outcome) => outcome.id(),
             ResumeOutcomeKind::Resent(outcome) => outcome.id(),
         }
     }
@@ -4151,6 +4252,19 @@ impl ResumedCreate {
         ResumeOutcome::resumed(CompletedResume::new(self.pending, self.identifier, state))
     }
 
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> ResumeOutcome {
+        ResumeOutcome::partial(PartialResume::new(
+            self.pending,
+            self.identifier,
+            attributes,
+            diagnostic,
+        ))
+    }
+
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
         let sent = self.pending.sent();
         let created = ObservedCreate::new(self.pending.id, self.identifier, observation, sent);
@@ -4180,6 +4294,19 @@ pub struct FinishingResume {
 impl FinishingResume {
     pub fn completed(self, state: AppliedState) -> ResumeOutcome {
         ResumeOutcome::resumed(CompletedResume::new(self.pending, self.identifier, state))
+    }
+
+    pub fn partial(
+        self,
+        attributes: HashMap<String, Value>,
+        diagnostic: PartialReadDiagnostic,
+    ) -> ResumeOutcome {
+        ResumeOutcome::partial(PartialResume::new(
+            self.pending,
+            self.identifier,
+            attributes,
+            diagnostic,
+        ))
     }
 
     pub fn failed(self, observation: Observation, error: ProviderError) -> ResumeFailure {
@@ -4567,6 +4694,7 @@ impl PartialReadDiagnostic {
             Some(Self {
                 reason,
                 missing_attributes,
+                read_back_budget_exhausted: false,
             })
         }
     }
@@ -4577,6 +4705,15 @@ impl PartialReadDiagnostic {
 
     pub fn missing_attributes(&self) -> &[String] {
         &self.missing_attributes
+    }
+
+    pub fn read_back_budget_exhausted(&self) -> bool {
+        self.read_back_budget_exhausted
+    }
+
+    #[doc(hidden)]
+    pub fn mark_read_back_budget_exhausted(&mut self) {
+        self.read_back_budget_exhausted = true;
     }
 
     /// Merge another partial-read diagnostic into this one.
@@ -8115,6 +8252,70 @@ mod tests {
             repended.pending.identifier(),
             Some(&original),
             "an issued continuation must keep the identifier it was issued with"
+        );
+    }
+
+    #[test]
+    fn resumed_partial_success_preserves_persisted_sent_authority() {
+        let id = ResourceId::with_provider_identity("test", "widget", "example", None);
+        let started_at =
+            Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
+        let identifier = AppliedIdentifier::new("persisted-id").expect("valid identifier");
+        let pending = PendingCreate::new(
+            id,
+            PendingToken::new("persisted-token"),
+            Some(identifier.clone()),
+            Sent::AllRequestAttributes,
+            1,
+            carina_provider_protocol::PendingPhase::ReadBack,
+            started_at,
+        )
+        .persist(
+            PersistedAttributes::default(),
+            PersistedAttributes::default(),
+        );
+        let diagnostic = PartialReadDiagnostic::new(
+            "read-back remained incomplete".to_string(),
+            vec!["computed".to_string()],
+        )
+        .expect("fixture has one missing attribute");
+
+        let outcome = ResumedCreate {
+            pending,
+            identifier: identifier.clone(),
+        }
+        .partial(
+            HashMap::from([(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("known-arn".into())),
+            )]),
+            diagnostic.clone(),
+        );
+        let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
+            panic!("resumed partial read-back must remain distinct from a resent create")
+        };
+        let (created, state, actual_diagnostic) = partial.into_parts();
+
+        let SentRecord::Persisted(envelope) = created.sent() else {
+            panic!("resumed partial read-back fabricated request sent authority")
+        };
+        assert_eq!(
+            envelope.token().expose_for_provider_call(),
+            "persisted-token"
+        );
+        assert_eq!(envelope.identifier(), Some(&identifier));
+        assert_eq!(actual_diagnostic, diagnostic);
+        assert_eq!(
+            state
+                .partial_read
+                .as_ref()
+                .expect("partial result retains a state marker")
+                .missing_attributes(),
+            &BTreeSet::from(["computed".to_string()])
+        );
+        assert_eq!(
+            state.attributes.get("arn"),
+            Some(&Value::Concrete(ConcreteValue::String("known-arn".into())))
         );
     }
 

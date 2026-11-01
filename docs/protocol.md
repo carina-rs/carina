@@ -18,12 +18,19 @@ active deadline.
 
 At the active deadline the host sends exactly one `final-attempt`. A create or
 update provider must finish with success, partial success, or an error; it
-must not return another `pending/read-back`. Doing so is a protocol violation.
-For create, the host retains the known identifier and continuation in recovery
+must not return `pending` in either phase after read-back has begun. Returning
+from `read-back` to `operation` at any point is also a protocol violation. For
+create, the host retains the known identifier and continuation in recovery
 state. Providers should return partial success when the mutation is known to
 have completed but the final read still lacks attributes. Core records the
-partial-read marker, does not publish the binding as complete, and retries the
-read on the next apply or refresh.
+partial-read marker, publishes returned attributes while keeping only the
+reported missing attributes unknown, and retries the read on the next apply or
+refresh.
+
+`resume-create` receives the same `poll-request` finality as `poll-create`; the
+host never fabricates the `sent` values that are absent from a persisted
+`resume-pending`. Delete continuations use the phase-less `pending-delete`
+record because delete has no post-apply read-back phase.
 
 `OperationConfig.read_back` participates in semantic schema fingerprint
 encoding v6. Provider protocol and minimum supported protocol are both 14;

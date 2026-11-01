@@ -17,8 +17,9 @@ use crate::executor::provider_ready::{
 };
 use crate::provider::{
     AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
-    PartialReadDiagnostic, Provider, ProviderReadyResource, ProviderRouter, ReadRequest,
-    ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome, UpdateRequest,
+    PartialReadDiagnostic, PartialResume, Provider, ProviderReadyResource, ProviderRouter,
+    ReadRequest, ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind, UpdateOutcome,
+    UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -62,6 +63,12 @@ pub(super) enum BasicEffectResult {
     },
     ResumeSuccess {
         completed: CompletedResume,
+        resource_id: ResourceId,
+        resolved_attrs: SecretPreservingAttributes,
+        binding: Option<String>,
+    },
+    ResumePartialSuccess {
+        partial: PartialResume,
         resource_id: ResourceId,
         resolved_attrs: SecretPreservingAttributes,
         binding: Option<String>,
@@ -130,6 +137,10 @@ impl<'a, S> StartedBasicEffectResult<'a, S> {
             BasicEffectResult::ResumeSuccess { completed, .. } => {
                 let state = completed.observed_state();
                 started.succeeded(Some(&state), duration);
+            }
+            BasicEffectResult::ResumePartialSuccess { partial, .. } => {
+                let state = partial.observed_state();
+                started.partially_succeeded(&state, partial.diagnostic(), duration);
             }
             BasicEffectResult::Deleted { .. } => {
                 started.succeeded(None, duration);
@@ -546,11 +557,21 @@ fn unresolved_binding_message(
     };
 
     let remediation = match bindings.completeness(referenced_binding) {
+        Some(BindingCompleteness::PartialReadBack(partial))
+            if partial.read_back_budget_exhausted() =>
+        {
+            format!(
+                "`{referenced_binding}` was {} but its read-back did not complete within the configured budget: {}. \
+                 The value will be filled on the next apply or refresh.",
+                partial.operation().past_tense(),
+                partial.reason(),
+            )
+        }
         Some(BindingCompleteness::PartialReadBack(partial)) => format!(
-            "`{referenced_binding}` was {} but its read-back did not complete within the configured budget: {}. \
-             The value will be filled on the next apply or refresh.",
+            "`{referenced_binding}` was {}, but the read-back was incomplete: {}; \
+             the value will be filled on the next apply or refresh.",
             partial.operation().past_tense(),
-            partial.pending(),
+            partial.reason(),
         ),
         _ => match bindings.source(referenced_binding) {
             Some(crate::binding_index::BindingValueSource::Upstream) => format!(
@@ -726,6 +747,35 @@ fn process_basic_outcome<S: Clone>(
             );
             BasicEffectCompletion::Succeeded
         }
+        BasicEffectResult::ResumePartialSuccess {
+            partial,
+            resource_id,
+            resolved_attrs,
+            binding,
+        } => {
+            let (created, state, diagnostic) = partial.into_parts();
+            let completeness = BindingCompleteness::PartialReadBack(
+                PartialReadBack::from_diagnostic(AppliedOperation::Create, &diagnostic),
+            );
+            exec.accumulator.mutate(|accumulated| {
+                accumulated.partial_count += 1;
+                accumulated.bindings.record_applied(
+                    binding.as_deref(),
+                    &resolved_attrs,
+                    &state,
+                    completeness,
+                );
+                accumulated
+                    .partial_diagnostics
+                    .push((resource_id.clone(), diagnostic));
+            });
+            exec.accumulator.insert_published(
+                resource_id,
+                Applied::Observed(std::sync::Arc::new(created)),
+                &state,
+            );
+            BasicEffectCompletion::Succeeded
+        }
         BasicEffectResult::ClassifiedFailure {
             error: _,
             recovery: _,
@@ -749,14 +799,9 @@ fn process_basic_outcome<S: Clone>(
                 super::AcceptedRequestKind::Create => AppliedOperation::Create,
                 super::AcceptedRequestKind::Update { .. } => AppliedOperation::Update,
             };
-            let pending = state
-                .partial_read
-                .as_ref()
-                .expect("a partial-success result carries a partial-read marker")
-                .pending()
-                .clone();
-            let completeness =
-                BindingCompleteness::PartialReadBack(PartialReadBack::new(operation, pending));
+            let completeness = BindingCompleteness::PartialReadBack(
+                PartialReadBack::from_diagnostic(operation, &diagnostic),
+            );
             exec.accumulator.mutate(|accumulated| {
                 accumulated.partial_count += 1;
                 if let Some(attrs) = &resolved_attrs {
@@ -1002,6 +1047,16 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         completed.with_resolved_desired_attributes(resolved_attrs.clone());
                     BasicEffectResult::ResumeSuccess {
                         completed,
+                        resource_id: resource.id.clone(),
+                        resolved_attrs,
+                        binding: resource.binding.clone(),
+                    }
+                }
+                Ok(ResumeOutcomeKind::PartialSuccess(partial)) => {
+                    let partial =
+                        (*partial).with_resolved_desired_attributes(resolved_attrs.clone());
+                    BasicEffectResult::ResumePartialSuccess {
+                        partial,
                         resource_id: resource.id.clone(),
                         resolved_attrs,
                         binding: resource.binding.clone(),
@@ -1399,7 +1454,10 @@ mod process_basic_result_tests {
         assert_eq!(result.success_count, 0);
         assert_eq!(result.failure_count, 0);
         assert_eq!(result.partial_count, 1);
-        assert_eq!(result.partial_diagnostics, vec![(id.clone(), diagnostic)]);
+        assert_eq!(
+            result.partial_diagnostics,
+            vec![(id.clone(), diagnostic.clone())]
+        );
         let applied = accumulator
             .applied_states()
             .get(&id)
@@ -1433,13 +1491,106 @@ mod process_basic_result_tests {
         assert_eq!(
             result.bindings.completeness("upstream"),
             Some(&crate::binding_index::BindingCompleteness::PartialReadBack(
-                crate::binding_index::PartialReadBack::new(
+                crate::binding_index::PartialReadBack::from_diagnostic(
                     crate::binding_index::AppliedOperation::Create,
-                    crate::resource::PendingReRead::incomplete("mock partial create"),
+                    &diagnostic,
                 ),
             )),
             "a partial read-back must not publish a complete binding snapshot",
         );
+    }
+
+    #[test]
+    fn partial_success_marks_only_reported_missing_attributes_unknown() {
+        let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let id = resource.id.clone();
+        let state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "arn".to_string(),
+                Value::Concrete(ConcreteValue::String("present-arn".into())),
+            )]),
+        )
+        .with_identifier("mock-id");
+        let diagnostic = PartialReadDiagnostic::new(
+            "computed is not visible yet".to_string(),
+            vec!["computed".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        let writeback_state = diagnostic.clone().into_state_for_writeback(state);
+        let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
+        let mut failed_indices = HashSet::new();
+        let mut pending_refreshes = HashMap::new();
+        let mut exec = ExecutionState {
+            idx: 0,
+            accumulator: &mut accumulator,
+            failed_indices: &mut failed_indices,
+            pending_refreshes: &mut pending_refreshes,
+        };
+
+        process_basic_outcome(
+            BasicEffectResult::PartialSuccess {
+                completed: CompletedEffect {
+                    state: Box::new(writeback_state),
+                    request: AcceptedRequest::create_for_test(),
+                },
+                resource_id: id,
+                diagnostic: diagnostic.clone(),
+                resolved_attrs: Some(SecretPreservingAttributes::from_provider_values(
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )),
+                binding: Some("source".to_string()),
+            },
+            &mut exec,
+        );
+
+        let bindings = &accumulator.result().bindings;
+        assert!(
+            bindings.attribute_value_is_definitive("source", "arn"),
+            "a returned attribute remains usable by same-apply dependents",
+        );
+        assert!(
+            !bindings.attribute_value_is_definitive("source", "computed"),
+            "the explicitly missing attribute remains unknown",
+        );
+    }
+
+    #[test]
+    fn partial_success_completeness_does_not_extract_state_marker() {
+        let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
+        let id = resource.id.clone();
+        let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
+        let diagnostic = PartialReadDiagnostic::new(
+            "computed is not visible yet".to_string(),
+            vec!["computed".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
+        let mut failed_indices = HashSet::new();
+        let mut pending_refreshes = HashMap::new();
+        let mut exec = ExecutionState {
+            idx: 0,
+            accumulator: &mut accumulator,
+            failed_indices: &mut failed_indices,
+            pending_refreshes: &mut pending_refreshes,
+        };
+
+        process_basic_outcome(
+            BasicEffectResult::PartialSuccess {
+                completed: CompletedEffect {
+                    state: Box::new(state),
+                    request: AcceptedRequest::create_for_test(),
+                },
+                resource_id: id,
+                diagnostic,
+                resolved_attrs: None,
+                binding: None,
+            },
+            &mut exec,
+        );
+
+        assert_eq!(accumulator.result().partial_count, 1);
     }
 }
 
@@ -1536,21 +1687,23 @@ mod assert_fully_resolved_tests {
     }
 
     #[test]
-    fn partial_read_back_uses_operation_specific_guidance_without_wait_hint() {
+    fn direct_partial_read_back_uses_neutral_guidance_without_wait_hint() {
         for (operation, verb) in [
             (crate::binding_index::AppliedOperation::Create, "created"),
             (crate::binding_index::AppliedOperation::Update, "updated"),
         ] {
+            let diagnostic = crate::provider::PartialReadDiagnostic::new(
+                "DVO is not populated yet".to_string(),
+                vec!["domain_validation_options".to_string()],
+            )
+            .expect("missing attributes are non-empty");
             let mut bindings = ResolvedBindings::default();
             bindings.set_with_completeness(
                 "cert",
                 HashMap::new(),
                 BindingValueSource::Local,
                 crate::binding_index::BindingCompleteness::PartialReadBack(
-                    crate::binding_index::PartialReadBack::new(
-                        operation,
-                        crate::resource::PendingReRead::incomplete("DVO is not populated yet"),
-                    ),
+                    crate::binding_index::PartialReadBack::from_diagnostic(operation, &diagnostic),
                 ),
             );
 
@@ -1558,15 +1711,58 @@ mod assert_fully_resolved_tests {
                 .expect_err("the partial read-back must keep the missing value unresolved");
             assert!(
                 error.contains(&format!(
-                    "`cert` was {verb} but its read-back did not complete within the configured budget: read after apply was incomplete: DVO is not populated yet. The value will be filled on the next apply or refresh."
+                    "`cert` was {verb}, but the read-back was incomplete: DVO is not populated yet; the value will be filled on the next apply or refresh."
                 )),
                 "unexpected partial read-back guidance: {error}",
+            );
+            assert!(
+                !error.contains("configured budget"),
+                "a direct provider partial must not claim that the host exhausted its budget: {error}",
             );
             assert!(
                 !error.contains("wait"),
                 "partial read-back guidance must not suggest a wait block: {error}",
             );
         }
+    }
+
+    #[test]
+    fn final_attempt_partial_read_back_reports_budget_without_wait_hint() {
+        let mut diagnostic = crate::provider::PartialReadDiagnostic::new(
+            "DVO is not populated yet".to_string(),
+            vec!["domain_validation_options".to_string()],
+        )
+        .expect("missing attributes are non-empty");
+        diagnostic.mark_read_back_budget_exhausted();
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "cert",
+            HashMap::new(),
+            BindingValueSource::Local,
+            crate::binding_index::BindingCompleteness::PartialReadBack(
+                crate::binding_index::PartialReadBack::from_diagnostic(
+                    crate::binding_index::AppliedOperation::Create,
+                    &diagnostic,
+                ),
+            ),
+        );
+
+        let error = assert_fully_resolved(&dvo_chained_ref(), "records", &bindings)
+            .expect_err("the partial read-back must keep the missing value unresolved");
+        assert!(
+            error.contains(
+                "`cert` was created but its read-back did not complete within the configured budget: DVO is not populated yet. The value will be filled on the next apply or refresh."
+            ),
+            "unexpected budget-exhausted guidance: {error}",
+        );
+        assert!(
+            !error.contains("read after apply was incomplete"),
+            "the diagnostic prefix must not be doubled: {error}",
+        );
+        assert!(
+            !error.contains("wait"),
+            "partial read-back guidance must not suggest a wait block: {error}",
+        );
     }
 
     #[test]

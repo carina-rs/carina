@@ -1453,11 +1453,21 @@ impl AppliedOperation {
 pub struct PartialReadBack {
     operation: AppliedOperation,
     pending: crate::resource::PendingReRead,
+    missing_attributes: HashSet<String>,
+    read_back_budget_exhausted: bool,
 }
 
 impl PartialReadBack {
-    pub fn new(operation: AppliedOperation, pending: crate::resource::PendingReRead) -> Self {
-        Self { operation, pending }
+    pub(crate) fn from_diagnostic(
+        operation: AppliedOperation,
+        diagnostic: &crate::provider::PartialReadDiagnostic,
+    ) -> Self {
+        Self {
+            operation,
+            pending: crate::resource::PendingReRead::incomplete(diagnostic.reason().to_string()),
+            missing_attributes: diagnostic.missing_attributes().iter().cloned().collect(),
+            read_back_budget_exhausted: diagnostic.read_back_budget_exhausted(),
+        }
     }
 
     pub fn operation(&self) -> AppliedOperation {
@@ -1466,6 +1476,22 @@ impl PartialReadBack {
 
     pub fn pending(&self) -> &crate::resource::PendingReRead {
         &self.pending
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        match self.pending.reason() {
+            crate::resource::ReReadReason::Incomplete { detail }
+            | crate::resource::ReReadReason::ReadFailed { detail } => detail,
+            crate::resource::ReReadReason::NotFound => "resource was not found",
+        }
+    }
+
+    pub(crate) fn attribute_is_missing(&self, attribute: &str) -> bool {
+        self.missing_attributes.contains(attribute)
+    }
+
+    pub(crate) fn read_back_budget_exhausted(&self) -> bool {
+        self.read_back_budget_exhausted
     }
 }
 
@@ -1514,9 +1540,9 @@ pub struct ResolvedBinding<P: PlaceholderKind = crate::resource::NoPlaceholder> 
     pub source: BindingValueSource,
     pub completeness: BindingCompleteness,
     /// Attributes whose present values are authoritative even when the
-    /// surrounding snapshot is incomplete. For managed resources these are
-    /// desired/configured attributes; provider outputs merged from an old or
-    /// in-flight snapshot are deliberately excluded.
+    /// surrounding snapshot is incomplete. These include desired/configured
+    /// attributes and provider outputs returned by a partial read-back;
+    /// outputs merged from an old or in-flight snapshot are excluded.
     definitive_attributes: HashSet<String>,
     /// Attributes directly changed by a planned update. This records which
     /// refreshed keys were replaced/removed by the authored desired view.
@@ -2369,13 +2395,21 @@ impl ResolvedBindings {
             );
             merged.insert(k.clone(), value);
         }
+        let definitive_attributes = match &completeness {
+            BindingCompleteness::PartialReadBack(partial) => merged
+                .keys()
+                .filter(|attribute| !partial.attribute_is_missing(attribute))
+                .cloned()
+                .collect(),
+            BindingCompleteness::Complete | BindingCompleteness::Incomplete => HashSet::new(),
+        };
         self.by_name.insert(
             name.to_string(),
             ResolvedBinding {
                 attributes: merged,
                 source: BindingValueSource::Local,
                 completeness,
-                definitive_attributes: HashSet::new(),
+                definitive_attributes,
                 changed_attributes: HashSet::new(),
                 refreshable_attributes: HashSet::new(),
                 removed_sensitive_attributes: HashSet::new(),

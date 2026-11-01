@@ -1,0 +1,3 @@
+let within_dependent = mock.test.read_back {
+  from_read_back = within_source.computed
+}

@@ -65,8 +65,8 @@ pub enum DriveOutcome<D, V, P> {
     OverBudget {
         last_pending: P,
     },
-    /// A provider returned another read-back continuation after it had been
-    /// told that the preceding poll was the final attempt.
+    /// A provider returned any pending continuation after a final read-back
+    /// attempt, or regressed from read-back to operation phase.
     ProtocolViolation {
         last_pending: P,
     },
@@ -174,8 +174,8 @@ pub async fn drive_pending_infallible<D, V, P, Initial, Poll, PollFuture, Sleep,
     operation_budget: Duration,
     read_back_budget: Duration,
     initial: Initial,
-    mut poll: Poll,
-    mut sleep: Sleep,
+    poll: Poll,
+    sleep: Sleep,
 ) -> DriveOutcome<D, V, P>
 where
     Initial: Future<Output = OperationStep<D, V, P>>,
@@ -184,48 +184,24 @@ where
     Sleep: FnMut(Duration) -> SleepFuture,
     SleepFuture: Future<Output = ()>,
 {
-    let started = Instant::now();
-    let mut deadlines = PollDeadlines::new(operation_budget, read_back_budget);
-    let mut preceding_poll = None;
-    let mut step = initial.await;
-    loop {
-        let (pending, poll_after_secs, phase) = match step {
-            OperationStep::Done(done) => return DriveOutcome::Done(done),
-            OperationStep::Verdict(verdict) => return DriveOutcome::Verdict(verdict),
-            OperationStep::Pending {
-                pending,
-                poll_after_secs,
-                phase,
-            } => (pending, poll_after_secs, phase),
-        };
-        if preceding_poll == Some(PollFinality::FinalAttempt) {
-            return if phase == PendingPhase::ReadBack {
-                DriveOutcome::ProtocolViolation {
-                    last_pending: pending,
-                }
-            } else {
-                DriveOutcome::OverBudget {
-                    last_pending: pending,
-                }
-            };
-        }
-        let elapsed = Instant::now().saturating_duration_since(started);
-        let next = deadlines.next(phase, poll_after_secs, elapsed);
-        if !next.delay.is_zero() {
-            sleep(next.delay).await;
-        }
-        step = poll(pending, next.finality).await;
-        preceding_poll = Some(next.finality);
-    }
+    drive_pending_infallible_with_clock(
+        operation_budget,
+        read_back_budget,
+        initial,
+        poll,
+        sleep,
+        Instant::now,
+    )
+    .await
 }
 
 async fn drive_pending_with_clock<D, V, P, E, Initial, Poll, PollFuture, Sleep, SleepFuture, Now>(
     operation_budget: Duration,
     read_back_budget: Duration,
     initial: Initial,
-    mut poll: Poll,
-    mut sleep: Sleep,
-    mut now: Now,
+    poll: Poll,
+    sleep: Sleep,
+    now: Now,
 ) -> Result<DriveOutcome<D, V, P>, DriveError<E, P>>
 where
     P: Clone,
@@ -236,10 +212,141 @@ where
     SleepFuture: Future<Output = ()>,
     Now: FnMut() -> Instant,
 {
+    drive_pending_with_clock_and_retention(
+        operation_budget,
+        read_back_budget,
+        async move { initial.await.map_err(DriveError::Initial) },
+        poll,
+        sleep,
+        now,
+        PreservePendingOnError,
+    )
+    .await
+}
+
+async fn drive_pending_infallible_with_clock<
+    D,
+    V,
+    P,
+    Initial,
+    Poll,
+    PollFuture,
+    Sleep,
+    SleepFuture,
+    Now,
+>(
+    operation_budget: Duration,
+    read_back_budget: Duration,
+    initial: Initial,
+    mut poll: Poll,
+    sleep: Sleep,
+    now: Now,
+) -> DriveOutcome<D, V, P>
+where
+    Initial: Future<Output = OperationStep<D, V, P>>,
+    Poll: FnMut(P, PollFinality) -> PollFuture,
+    PollFuture: Future<Output = OperationStep<D, V, P>>,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: Future<Output = ()>,
+    Now: FnMut() -> Instant,
+{
+    let outcome = drive_pending_with_clock_and_retention(
+        operation_budget,
+        read_back_budget,
+        async move { Ok::<_, DriveError<std::convert::Infallible, P>>(initial.await) },
+        |pending, finality| {
+            let future = poll(pending, finality);
+            async move { Ok::<_, std::convert::Infallible>(future.await) }
+        },
+        sleep,
+        now,
+        NoPendingNeededOnError,
+    )
+    .await;
+    match outcome {
+        Ok(outcome) => outcome,
+        Err(DriveError::Initial(never)) => match never {},
+        Err(DriveError::Poll {
+            error: never,
+            last_pending: _last_pending,
+        }) => match never {},
+    }
+}
+
+trait PendingErrorRetention<P, E> {
+    type Retained;
+
+    fn retain(&mut self, pending: &P) -> Self::Retained;
+    fn poll_error(&mut self, error: E, retained: Self::Retained) -> DriveError<E, P>;
+}
+
+struct PreservePendingOnError;
+
+impl<P: Clone, E> PendingErrorRetention<P, E> for PreservePendingOnError {
+    type Retained = P;
+
+    fn retain(&mut self, pending: &P) -> Self::Retained {
+        pending.clone()
+    }
+
+    fn poll_error(&mut self, error: E, last_pending: Self::Retained) -> DriveError<E, P> {
+        DriveError::Poll {
+            error,
+            last_pending,
+        }
+    }
+}
+
+struct NoPendingNeededOnError;
+
+impl<P> PendingErrorRetention<P, std::convert::Infallible> for NoPendingNeededOnError {
+    type Retained = ();
+
+    fn retain(&mut self, _pending: &P) -> Self::Retained {}
+
+    fn poll_error(
+        &mut self,
+        error: std::convert::Infallible,
+        _retained: Self::Retained,
+    ) -> DriveError<std::convert::Infallible, P> {
+        match error {}
+    }
+}
+
+async fn drive_pending_with_clock_and_retention<
+    D,
+    V,
+    P,
+    E,
+    Initial,
+    Poll,
+    PollFuture,
+    Sleep,
+    SleepFuture,
+    Now,
+    Retention,
+>(
+    operation_budget: Duration,
+    read_back_budget: Duration,
+    initial: Initial,
+    mut poll: Poll,
+    mut sleep: Sleep,
+    mut now: Now,
+    mut retention: Retention,
+) -> Result<DriveOutcome<D, V, P>, DriveError<E, P>>
+where
+    Initial: Future<Output = Result<OperationStep<D, V, P>, DriveError<E, P>>>,
+    Poll: FnMut(P, PollFinality) -> PollFuture,
+    PollFuture: Future<Output = Result<OperationStep<D, V, P>, E>>,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: Future<Output = ()>,
+    Now: FnMut() -> Instant,
+    Retention: PendingErrorRetention<P, E>,
+{
     let started = now();
     let mut deadlines = PollDeadlines::new(operation_budget, read_back_budget);
     let mut preceding_poll = None;
-    let mut step = initial.await.map_err(DriveError::Initial)?;
+    let mut step = initial.await?;
     loop {
         let (pending, poll_after_secs, phase) = match step {
             OperationStep::Done(done) => return Ok(DriveOutcome::Done(done)),
@@ -250,6 +357,11 @@ where
                 phase,
             } => (pending, poll_after_secs, phase),
         };
+        if deadlines.read_back_deadline.is_some() && phase == PendingPhase::Operation {
+            return Ok(DriveOutcome::ProtocolViolation {
+                last_pending: pending,
+            });
+        }
         if preceding_poll == Some(PollFinality::FinalAttempt) {
             return Ok(if phase == PendingPhase::ReadBack {
                 DriveOutcome::ProtocolViolation {
@@ -266,13 +378,10 @@ where
         if !next.delay.is_zero() {
             sleep(next.delay).await;
         }
-        let last_pending = pending.clone();
+        let retained = retention.retain(&pending);
         step = poll(pending, next.finality)
             .await
-            .map_err(|error| DriveError::Poll {
-                error,
-                last_pending,
-            })?;
+            .map_err(|error| retention.poll_error(error, retained))?;
         preceding_poll = Some(next.finality);
     }
 }
@@ -291,7 +400,7 @@ mod operation_poll_tests {
 
     use super::{
         DriveOutcome, NextPoll, OperationStep, PendingPhase, PollFinality,
-        drive_pending_with_clock, next_poll,
+        drive_pending_infallible_with_clock, drive_pending_with_clock, next_poll,
     };
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
@@ -693,5 +802,89 @@ mod operation_poll_tests {
             }
         );
         assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn operation_phase_after_read_back_is_protocol_violation_and_preserves_pending() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let clock_epoch = std::time::Instant::now();
+        let polls = Cell::new(0);
+        let result = block_on_ready(drive_pending_with_clock(
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            ready(Ok::<_, ()>(OperationStep::<(), (), String>::Pending {
+                pending: "known-id:read-back-token".to_string(),
+                poll_after_secs: 30,
+                phase: super::PendingPhase::ReadBack,
+            })),
+            |_pending, finality| {
+                assert_eq!(finality, super::PollFinality::FinalAttempt);
+                polls.set(polls.get() + 1);
+                ready(Ok(OperationStep::Pending {
+                    pending: "known-id:regressed-operation-token".to_string(),
+                    poll_after_secs: 30,
+                    phase: super::PendingPhase::Operation,
+                }))
+            },
+            |delay| {
+                elapsed.set(elapsed.get() + delay);
+                ready(())
+            },
+            || clock_epoch + elapsed.get(),
+        ))
+        .expect("driver should not produce a provider error");
+
+        assert_eq!(
+            result,
+            DriveOutcome::ProtocolViolation {
+                last_pending: "known-id:regressed-operation-token".to_string(),
+            }
+        );
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn infallible_driver_uses_injected_clock_for_linear_pending_value() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct LinearPending(&'static str);
+
+        let elapsed = Cell::new(Duration::ZERO);
+        let clock_epoch = std::time::Instant::now();
+        let result = block_on_ready(drive_pending_infallible_with_clock(
+            Duration::from_secs(30),
+            Duration::from_secs(4),
+            ready(OperationStep::<&str, (), _>::Pending {
+                pending: LinearPending("read-back-token"),
+                poll_after_secs: 300,
+                phase: PendingPhase::ReadBack,
+            }),
+            |pending, finality| {
+                assert_eq!(pending, LinearPending("read-back-token"));
+                assert_eq!(finality, PollFinality::FinalAttempt);
+                ready(OperationStep::Done("settled"))
+            },
+            |delay| {
+                elapsed.set(elapsed.get() + delay);
+                ready(())
+            },
+            || clock_epoch + elapsed.get(),
+        ));
+
+        assert_eq!(result, DriveOutcome::Done("settled"));
+        assert_eq!(elapsed.get(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn delete_pending_is_phase_less() {
+        let pending = crate::types::PendingDelete {
+            token: "delete-token",
+            poll_after_secs: 7,
+        };
+
+        let crate::types::PendingDelete {
+            token,
+            poll_after_secs,
+        } = pending;
+        assert_eq!((token, poll_after_secs), ("delete-token", 7));
     }
 }

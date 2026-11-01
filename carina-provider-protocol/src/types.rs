@@ -1029,6 +1029,22 @@ impl<T> ResumePending<T> {
     }
 }
 
+/// An unfinished delete operation. Delete has no post-apply read-back phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDelete<T> {
+    pub token: T,
+    pub poll_after_secs: u32,
+}
+
+impl<T> PendingDelete<T> {
+    pub fn new(token: T, poll_after_secs: u32) -> Self {
+        Self {
+            token,
+            poll_after_secs,
+        }
+    }
+}
+
 /// A resume continuation retained after an error stopped the current step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeInFlight<T, E> {
@@ -1124,6 +1140,11 @@ pub enum ResumeStep<A, D, T> {
     Completed {
         identifier: AppliedIdentifier,
         attributes: A,
+    },
+    PartialSuccess {
+        identifier: AppliedIdentifier,
+        attributes: A,
+        diagnostic: D,
     },
     Pending(ResumePending<T>),
     Resent(CreateStep<A, D, T>),
@@ -2224,8 +2245,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_maps_preserve_state_json_bytes() {
-        assert_eq!(crate::PROTOCOL_VERSION, 14);
+    fn ordered_maps_preserve_v13_state_json_bytes() {
         let state = State {
             id: ResourceId {
                 provider: "mock".into(),
