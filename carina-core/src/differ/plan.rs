@@ -47,13 +47,13 @@ pub enum DeferredForExpansionChoice {
     Retain,
 }
 
-/// The complete apply-time target set retained by deferred-loop expansion.
+/// The apply-time target set retained for one planning call.
 ///
-/// Partition the configuration's finalized loops with [`Self::partition_for_expansion`],
-/// which may produce an empty set. The invariant is that cascading and deferred
-/// effect emission consume the same target set, once. Its private representation
-/// and non-cloneable owner prevent callers from supplying independent subsets
-/// for those two planning stages.
+/// Partition finalized loops with [`Self::partition_for_expansion`], which may
+/// produce an empty set. Within one planning call, CBD promotion inspects the
+/// same owned set that deferred-effect emission consumes exactly once. The
+/// private, non-cloneable owner carries that set from [`CascadeDependents`] to
+/// [`PendingCascadePlan::finish`].
 ///
 /// ```compile_fail,E0423
 /// use carina_core::differ::DeferredCreateTargets;

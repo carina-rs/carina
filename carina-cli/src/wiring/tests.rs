@@ -10595,101 +10595,164 @@ fn deferred_template_binding_match_requires_single_numeric_index() {
     ));
 }
 
-fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpression {
-    let template_resource =
-        Resource::with_provider("aws", "route53.Record", "validation_records", None)
-            .with_binding("validation_records");
+async fn plan_deferred_for_with_state_block(state_block: &str, keep_other_child: bool) -> Plan {
+    use carina_core::parser::ProviderContext;
 
-    carina_core::parser::DeferredForExpression::new(
-        Some("main.crn".to_string()),
-        12,
-        "for opt in cert.domain_validation_options".to_string(),
-        carina_core::parser::DeferredForTarget::bound("validation_records")
-            .expect("fixture binding is valid"),
-        Value::resource_ref("cert", "domain_validation_options", Vec::new()),
-        carina_core::parser::ForBinding::Simple("opt".to_string()),
-        template_resource,
+    let source = format!(
+        r#"
+provider aws {{}}
+
+let cert = aws.acm.Certificate {{
+    domain_name = "r.example.com"
+    validation_method = "DNS"
+}}
+
+let records = for (_, opt) in cert.domain_validation_options {{
+    aws.route53.RecordSet {{
+        name = opt.resource_record.name
+        type = "CNAME"
+        resource_records = [opt.resource_record.value]
+    }}
+}}
+
+{state_block}
+"#,
+    );
+    let parsed = parse(&source, &ProviderContext::default()).expect("parse state-block fixture");
+    let expanded = parsed.clone().into_expanded().unwrap();
+    assert_eq!(expanded.deferred_for_expressions().len(), 1);
+
+    let mut state_file = StateFile::new();
+    for index in 0..=usize::from(keep_other_child) {
+        let child = format!("records[{index}]");
+        let mut row = carina_state::ResourceState::try_applied(
+            "route53.RecordSet",
+            test_identity(child.clone()),
+            "aws",
+            format!("old-record-{index}"),
+        )
+        .unwrap();
+        row.binding = Some(child);
+        state_file.upsert_resource(row).unwrap();
+    }
+    let state_file = Some(state_file);
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        vec![Box::new(DeferredForCollisionFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let StateBlockResolution { claims, targets } = resolve_state_blocks(
+        &expanded.state_blocks,
+        &state_file,
+        &expanded.resources,
+        wiring.context().schemas(),
+    );
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — fixture plan input
+        wiring.context().schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    // Use the production post-expansion path: create_plan_with_cascades,
+    // then finish's state-block callback, then deferred-effect emission.
+    let planned = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &state_file,
+        false,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &claims,
+        &targets,
     )
+    .await
+    .expect("state blocks and the retained loop must plan together");
+    let plan = planned.into_context_for_test().plan;
+    assert!(plan.errors().is_empty(), "{:#?}", plan.errors());
+    assert_eq!(plan.effects().len(), 3, "{:#?}", plan.effects());
+    assert!(
+        matches!(&plan.effects()[0], Effect::Create(resource) if resource.binding.as_deref() == Some("cert"))
+    );
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Delete { .. })),
+        "state-block deletes must be suppressed and any other child delete absorbed: {:#?}",
+        plan.effects(),
+    );
+
+    let deferred = plan
+        .effects()
+        .iter()
+        .find(|effect| {
+            matches!(
+                effect,
+                Effect::DeferredCreate(_) | Effect::DeferredReplace(_)
+            )
+        })
+        .expect("retained loop must emit a deferred effect");
+    let template = if keep_other_child {
+        let Effect::DeferredReplace(payload) = deferred else {
+            panic!(
+                "the remaining child needs a deferred replacement: {:#?}",
+                plan.effects()
+            )
+        };
+        assert_eq!(payload.deletes.len(), 1);
+        assert_eq!(payload.deletes[0].id.identity().as_str(), "records[1]");
+        assert_eq!(payload.deletes[0].identifier.as_str(), "old-record-1");
+        assert_eq!(payload.deletes[0].binding.as_deref(), Some("records[1]"));
+        &payload.template
+    } else {
+        let Effect::DeferredCreate(payload) = deferred else {
+            panic!(
+                "suppressing the only prior child leaves a deferred create: {:#?}",
+                plan.effects()
+            )
+        };
+        &payload.template
+    };
+    assert_eq!(template.target().bound_binding(), Some("records"));
+    assert!(
+        matches!(
+            plan.effects().last(),
+            Some(Effect::DeferredCreate(_) | Effect::DeferredReplace(_))
+        ),
+        "deferred effects must follow state-block effects: {:#?}",
+        plan.effects()
+    );
+    plan
 }
 
-#[test]
-fn removed_block_suppresses_deletes_already_absorbed_by_deferred_planning() {
-    use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, NonEmptyDeletes};
+#[tokio::test]
+async fn removed_block_suppresses_child_delete_before_deferred_emission() {
     for keep_other_child in [false, true] {
-        let child = "validation_records[0]";
-        let mut state_file = StateFile::new();
-        state_file
-            .upsert_resource(
-                carina_state::ResourceState::try_applied(
-                    "route53.Record",
-                    child,
-                    "aws",
-                    "child-old",
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let delete = DeferredReplaceDelete {
-            id: ResolvedResourceId::with_provider_identity("aws", "route53.Record", child, None),
-            identifier: crate::fixture_applied_identifier("child-old"),
-            directives: Directives::default(),
-            binding: Some(child.into()),
-            dependencies: HashSet::new(),
-            explicit_dependencies: HashSet::new(),
-            blocked_by_updates: HashSet::new(),
-        };
-        let mut deletes = vec![delete.clone()];
-        if keep_other_child {
-            deletes.push(DeferredReplaceDelete {
-                id: ResolvedResourceId::with_provider_identity(
-                    "aws",
-                    "route53.Record",
-                    "validation_records[1]",
-                    None,
-                ),
-                binding: Some("validation_records[1]".into()),
-                ..delete
-            });
-        }
-        let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-            deletes: NonEmptyDeletes::try_new(deletes).unwrap(),
-            template: Box::new(deferred_replace_test_template()),
-        })));
-        add_state_block_effects(
-            &mut plan,
-            &[StateBlock::Removed {
-                from: StateBlockAddress::new("aws", "route53.Record", child),
-            }],
-            &Some(state_file),
-            &[],
-            &[],
-            &ResolvedBindings::default(),
-            &HashSet::new(),
-        );
-        assert_eq!(plan.effects().len(), 2);
-        if keep_other_child {
-            let Effect::DeferredReplace(payload) = &plan.effects()[0] else {
-                panic!("other child still needs replacement")
-            };
-            assert_eq!(
-                payload.deletes.len(),
-                1,
-                "removed child must not be destroyed"
-            );
-            assert_eq!(
-                payload.deletes[0].binding.as_deref(),
-                Some("validation_records[1]")
-            );
-        } else {
-            assert!(
-                matches!(plan.effects()[0], Effect::DeferredCreate(_)),
-                "removing every prior child leaves a plain deferred create"
-            );
-        }
+        let plan = plan_deferred_for_with_state_block(
+            r#"removed { from = aws.route53.RecordSet "records[0]" }"#,
+            keep_other_child,
+        )
+        .await;
         assert!(
-            matches!(&plan.effects()[1], Effect::Remove { id } if id.identity().as_str() == child)
+            matches!(&plan.effects()[1], Effect::Remove { id } if id.identity().as_str() == "records[0]")
         );
+    }
+}
+
+#[tokio::test]
+async fn moved_block_suppresses_child_delete_before_deferred_emission() {
+    for keep_other_child in [false, true] {
+        let plan = plan_deferred_for_with_state_block(
+            r#"moved {
+                from = aws.route53.RecordSet "records[0]"
+                to = aws.route53.RecordSet "retired"
+            }"#,
+            keep_other_child,
+        )
+        .await;
+        assert!(matches!(&plan.effects()[1], Effect::Move { from, to, .. }
+            if from.identity().as_str() == "records[0]" && to.identity().as_str() == "retired"));
     }
 }
 

@@ -9,9 +9,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    ChangedCreateOnly, DeferredCreatePayload, DeferredReplacePayload, Effect, EffectGeneration,
-    EffectWithSource, MoveAuthority, NonEmptyDeletes, SavedEffect, TemporaryName,
-    UnresolvedSavedEffect,
+    ChangedCreateOnly, Effect, EffectGeneration, EffectWithSource, MoveAuthority, SavedEffect,
+    TemporaryName, UnresolvedSavedEffect,
 };
 use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
@@ -1101,9 +1100,9 @@ impl<S> Plan<S> {
 
     /// Suppress current-instance deletes managed by state-only operations.
     ///
-    /// Deferred planning already groups prior children into DeferredReplace.
-    /// A later `removed`/`moved` block must suppress those absorbed deletes too,
-    /// without dropping the template or any deposed-generation cleanup.
+    /// State-block adjustments run in [`crate::differ::PendingCascadePlan::finish`]
+    /// before deferred targets absorb surviving deletes. Suppression therefore
+    /// sees prior children as standalone deletes and preserves deposed cleanup.
     pub fn suppress_current_deletes(&mut self, ids: &HashSet<ResourceId>) {
         if ids.is_empty() {
             return;
@@ -1114,28 +1113,6 @@ impl<S> Plan<S> {
                     if ids.contains(id.as_inner())
             )
         });
-        // Mapping keeps the remaining effect indices (and replacement display
-        // metadata) unchanged. Moving payloads avoids cloning source locations.
-        self.effects = std::mem::take(&mut self.effects)
-            .into_iter()
-            .map(|effect| {
-                let Effect::DeferredReplace(payload) = effect else {
-                    return effect;
-                };
-                let DeferredReplacePayload { deletes, template } = *payload;
-                let deletes = Vec::from(deletes)
-                    .into_iter()
-                    .filter(|delete| !ids.contains(delete.id.as_inner()))
-                    .collect();
-                match NonEmptyDeletes::try_new(deletes) {
-                    Ok(deletes) => Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-                        deletes,
-                        template,
-                    })),
-                    Err(_) => Effect::DeferredCreate(DeferredCreatePayload::new(template)),
-                }
-            })
-            .collect();
     }
 
     /// Number of mutating Effects
