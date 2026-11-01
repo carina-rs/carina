@@ -31,6 +31,7 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaKind, SchemaRegistry, StructField,
     ValidatedConfigSchema, ValidatedProviderSchemaWitness,
 };
+use carina_core::value::CanonicalState;
 
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
 ///
@@ -379,10 +380,13 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
     let value: Value = Value::Concrete(ConcreteValue::Map(payload));
 
     let schema = schema.validate().expect("schema fixture must be valid");
-    let canon = schema
+    let CanonicalState::Present(canon) = schema
         .effective_attribute("selectors")
         .expect("selectors attribute must exist")
-        .canonicalize_state(value);
+        .canonicalize_state(value)
+    else {
+        panic!("non-empty selectors value must remain present");
+    };
 
     let Value::Concrete(ConcreteValue::Map(canon_map)) = canon else {
         panic!("canonicalized value must remain a Map");
