@@ -5149,6 +5149,107 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string("private-leaf"))));
+    let reference = root_resource_ref("peer", "identifier");
+    let resource = Resource::with_provider("mock", "test.normalize_leaf", "mixed", None)
+        .with_attribute("domain_name", string("example.com"))
+        .with_attribute(
+            "subject_alternative_names",
+            Value::Concrete(ConcreteValue::List(vec![
+                string("EXAMPLE.COM."),
+                string("WWW.EXAMPLE.COM."),
+                secret.clone(),
+                reference.clone(),
+            ])),
+        )
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([
+                    ("id".into(), secret.clone()),
+                    ("destination".into(), reference.clone()),
+                ])),
+            )])),
+        )
+        .with_attribute(
+            "alias_target",
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                ("dns_name".into(), string("target.example.com.")),
+                ("secret".into(), secret),
+                ("reference".into(), reference),
+                (
+                    "$carina_deferred".into(),
+                    Value::Concrete(ConcreteValue::Int(42)),
+                ),
+            ]))),
+        );
+    let mut resources = provider_resources(vec![resource]);
+    normalizer.normalize_desired(&mut resources).await.unwrap();
+    let Some(Value::Concrete(ConcreteValue::List(names))) =
+        resources[0].get_attr("subject_alternative_names")
+    else {
+        panic!()
+    };
+    assert_eq!(
+        names.len(),
+        3,
+        "known apex must be removed beside deferred leaves"
+    );
+    assert_eq!(names[0], string("www.example.com"));
+    assert!(
+        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.as_ref() == &string("private-leaf"))
+    );
+    assert!(matches!(
+        &names[2],
+        Value::Deferred(DeferredValue::ResourceRef { .. })
+    ));
+    let Some(Value::Concrete(ConcreteValue::List(rules))) = resources[0].get_attr("rules") else {
+        panic!()
+    };
+    let Value::Concrete(ConcreteValue::Map(rule)) = &rules[0] else {
+        panic!()
+    };
+    let Some(Value::Concrete(ConcreteValue::Map(default))) = rule.get("delete_marker_replication")
+    else {
+        panic!("known rule must receive its default")
+    };
+    assert_eq!(default.get("status"), Some(&string("Disabled")));
+    assert!(matches!(
+        rule.get("id"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    assert!(matches!(
+        rule.get("destination"),
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+    ));
+    let Some(Value::Concrete(ConcreteValue::Map(alias))) = resources[0].get_attr("alias_target")
+    else {
+        panic!()
+    };
+    assert_eq!(alias.get("dns_name"), Some(&string("target.example.com")));
+    assert_eq!(
+        alias.get("$carina_deferred"),
+        Some(&Value::Concrete(ConcreteValue::Int(42)))
+    );
+    assert!(matches!(
+        alias.get("secret"),
+        Some(Value::Deferred(DeferredValue::Secret(_)))
+    ));
+    assert!(matches!(
+        alias.get("reference"),
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wasm_normalize_desired_rejects_absent_required_together_attribute() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -5177,6 +5278,59 @@ async fn wasm_normalize_desired_rejects_absent_required_together_attribute() {
     assert_eq!(
         error.detail().context(),
         "test.normalize_required_together companion is required when primary is present"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_wasm_normalize_desired_preserves_leaf_handles() {
+    let path = skip_if_no_http_wasm!();
+    let (factory, _cache) = load_http_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("http-private".into()),
+    ))));
+    let reference = root_resource_ref("peer", "identifier");
+    let resource = Resource::with_provider("mock_http", "test.resource", "http-leaves", None)
+        .with_attribute("secret", secret.clone())
+        .with_attribute(
+            "items",
+            Value::Concrete(ConcreteValue::List(vec![reference.clone(), secret])),
+        )
+        .with_attribute(
+            "literal",
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "$carina_deferred".into(),
+                Value::Concrete(ConcreteValue::Int(0)),
+            )]))),
+        );
+    let mut resources = provider_resources(vec![resource]);
+    normalizer.normalize_desired(&mut resources).await.unwrap();
+    let Some(Value::Deferred(DeferredValue::Secret(inner))) = resources[0].get_attr("secret")
+    else {
+        panic!()
+    };
+    assert_eq!(
+        inner.as_ref(),
+        &Value::Concrete(ConcreteValue::String("http-private".into()))
+    );
+    let Some(Value::Concrete(ConcreteValue::List(items))) = resources[0].get_attr("items") else {
+        panic!()
+    };
+    assert_eq!(items[0], reference);
+    assert!(matches!(
+        &items[1],
+        Value::Deferred(DeferredValue::Secret(_))
+    ));
+    let Some(Value::Concrete(ConcreteValue::Map(literal))) = resources[0].get_attr("literal")
+    else {
+        panic!()
+    };
+    assert_eq!(
+        literal.get("$carina_deferred"),
+        Some(&Value::Concrete(ConcreteValue::Int(0)))
     );
 }
 

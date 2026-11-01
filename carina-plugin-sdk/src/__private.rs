@@ -4,6 +4,13 @@
 //! Generated namespaces, credentials imports and ABI helpers stay behind the
 //! binding crates' macro definition paths rather than becoming SDK modules.
 
+/// Admit a normalization-only wire record at the exported guest boundary.
+pub fn decode_desired_resource(
+    resource: carina_provider_protocol::normalization::NormalizationResource,
+) -> crate::DesiredResource {
+    crate::DesiredResource::from_wire(resource)
+}
+
 macro_rules! provider_world {
     ($world:ident, $bindings:ident) => {
         pub mod $world {

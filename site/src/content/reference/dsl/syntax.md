@@ -238,7 +238,7 @@ awscc.ec2.IpamPool {
 
 ### Directives
 
-A `directives` block inside a resource carries Carina-side instructions (`depends_on`, `create_before_destroy`, `prevent_destroy`, `force_delete`, `provider`, `ignore_changes`). In provider protocol 16, only delete requests carry the resolved provider-visible directives. See the [directives reference](/reference/dsl/directives/) for the full list, schema-default destruction protection, and the `ignore_changes` path rules.
+A `directives` block inside a resource carries Carina-side instructions (`depends_on`, `create_before_destroy`, `prevent_destroy`, `force_delete`, `provider`, `ignore_changes`). In provider protocol 19, only delete requests carry the resolved provider-visible directives. See the [directives reference](/reference/dsl/directives/) for the full list, schema-default destruction protection, and the `ignore_changes` path rules.
 
 ```crn
 awscc.s3.Bucket {
