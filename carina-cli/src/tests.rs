@@ -69,8 +69,8 @@ fn loaded_provider_context() -> LoadedProviderContext {
 }
 
 #[test]
-fn saved_plan_version_is_36_for_deferred_value_stages() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 36);
+fn saved_plan_version_is_37_for_deferred_diagnostic_locations() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 37);
 }
 
 #[test]
