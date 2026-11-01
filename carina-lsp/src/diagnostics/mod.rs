@@ -1180,10 +1180,13 @@ impl DiagnosticEngine {
                 let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
                 let authored_binding_scope = match rref {
                     ResourceRef::Deferred { .. } => None,
-                    _ => rref
+                    ResourceRef::Resource(_)
+                    | ResourceRef::LiveComposition(_)
+                    | ResourceRef::DataSource(_) => rref
                         .binding()
                         .and_then(|binding| let_binding_spans.get(binding))
-                        .map(|span| {
+                        .map(|spans| {
+                            let span = spans.statement;
                             (
                                 span.start_line().saturating_sub(1) as u32,
                                 span.end_line() as u32,
@@ -1906,27 +1909,43 @@ impl DiagnosticEngine {
                             // Structured type errors carry the authored attribute through
                             // container wrappers; fall back to the resource only when the
                             // error genuinely has no attribute provenance.
+                            let block_header_range = error
+                                .attribute_name()
+                                .and_then(|attr| {
+                                    carina_core::parser::attribute_value_source_spans(
+                                        &doc.text(),
+                                        attr,
+                                        &carina_core::schema::FieldPath::new(),
+                                        scope,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                })
+                                .and_then(|spans| spans.block_header)
+                                .and_then(|span| parser_span_range(doc, span));
                             let position = error
                                 .attribute_name()
                                 .and_then(|attr| self.find_attribute_position(doc, attr, scope));
                             let position = position.or_else(|| scope.map(|(start, _)| (start, 0)));
-                            if let Some((line, col)) = position {
-                                diagnostics.push(carina_diagnostic_range(
-                                    Range {
-                                        start: Position {
-                                            line,
-                                            character: col,
-                                        },
-                                        end: Position {
-                                            line,
-                                            character: col
-                                                + doc
-                                                    .text()
-                                                    .lines()
-                                                    .nth(line as usize)
-                                                    .map_or(0, |l| l.trim_end().len() as u32),
-                                        },
+                            let range = block_header_range.or_else(|| {
+                                position.map(|(line, col)| Range {
+                                    start: Position {
+                                        line,
+                                        character: col,
                                     },
+                                    end: Position {
+                                        line,
+                                        character: doc
+                                            .text()
+                                            .lines()
+                                            .nth(line as usize)
+                                            .map_or(col, |l| l.trim_end().chars().count() as u32),
+                                    },
+                                })
+                            });
+                            if let Some(range) = range {
+                                diagnostics.push(carina_diagnostic_range(
+                                    range,
                                     DiagnosticSeverity::ERROR,
                                     error.to_string(),
                                 ));

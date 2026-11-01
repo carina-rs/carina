@@ -1755,14 +1755,16 @@ impl DiagnosticEngine {
 
     /// Render duplicate declaration groups that contain a declaration in the
     /// current buffer. The loader owns provenance; this layer only locates the
-    /// corresponding name in the editor text because declaration AST nodes do
-    /// not carry spans.
+    /// corresponding name using parser spans for bindings and source lookups
+    /// for the other declaration kinds.
     pub(super) fn duplicate_declaration_diagnostics(
         &self,
         doc: &Document,
         current_file_name: Option<&str>,
         duplicates: &[DuplicateDeclaration],
     ) -> Vec<Diagnostic> {
+        let binding_spans =
+            carina_core::parser::top_level_let_binding_spans(&doc.text()).unwrap_or_default();
         duplicates
             .iter()
             .filter(|duplicate| {
@@ -1783,9 +1785,10 @@ impl DiagnosticEngine {
                     DeclarationKind::Export => {
                         self.find_exports_param_position(doc, duplicate.name())
                     }
-                    DeclarationKind::Binding => {
-                        self.find_let_binding_position(&doc.text(), duplicate.name())
-                    }
+                    DeclarationKind::Binding => binding_spans
+                        .get(duplicate.name())
+                        .and_then(|spans| parser_span_range(doc, spans.name))
+                        .map(|range| (range.start.line, range.start.character)),
                     DeclarationKind::Argument => self.find_declaration_block_param_position(
                         doc,
                         "arguments",
@@ -2339,14 +2342,16 @@ impl DiagnosticEngine {
     where
         I: IntoIterator<Item = String>,
     {
-        let text = doc.text();
+        let binding_spans =
+            carina_core::parser::top_level_let_binding_spans(&doc.text()).unwrap_or_default();
         let mut diagnostics = Vec::new();
         for binding_name in unused_bindings {
-            if let Some((line, col)) = self.find_let_binding_position(&text, &binding_name) {
-                diagnostics.push(carina_diagnostic(
-                    line,
-                    col,
-                    col + binding_name.len() as u32,
+            if let Some(range) = binding_spans
+                .get(&binding_name)
+                .and_then(|spans| parser_span_range(doc, spans.name))
+            {
+                diagnostics.push(carina_diagnostic_range(
+                    range,
                     DiagnosticSeverity::WARNING,
                     format!(
                         "Unused let binding '{}'. Consider using an anonymous resource instead.",
@@ -2356,26 +2361,6 @@ impl DiagnosticEngine {
             }
         }
         diagnostics
-    }
-
-    /// Find the position of a `let` binding name in the source text.
-    pub(super) fn find_let_binding_position(
-        &self,
-        text: &str,
-        binding_name: &str,
-    ) -> Option<(u32, u32)> {
-        for (line_idx, line) in text.lines().enumerate() {
-            if let Some((name, _)) = crate::let_parse::parse_let_header(line)
-                && name == binding_name
-            {
-                // Find the column of the binding name in the original line
-                let let_byte_pos = line.find("let ").unwrap();
-                let let_char_pos = position::byte_offset_to_char_offset(line, let_byte_pos);
-                let name_col = let_char_pos + 4; // "let " is 4 chars
-                return Some((line_idx as u32, name_col));
-            }
-        }
-        None
     }
 
     /// Extract resource binding names from `src` (variables defined with

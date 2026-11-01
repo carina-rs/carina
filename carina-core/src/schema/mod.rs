@@ -13405,7 +13405,7 @@ pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
     known
         .iter()
         .map(|name| (*name, levenshtein_distance(unknown, name)))
-        .filter(|(_, dist)| *dist <= max_distance)
+        .filter(|(name, dist)| *dist <= max_distance || name.strip_suffix("_id") == Some(unknown))
         .min_by_key(|(_, dist)| *dist)
         .map(|(name, _)| name.to_string())
 }

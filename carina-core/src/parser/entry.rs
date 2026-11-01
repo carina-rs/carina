@@ -89,6 +89,13 @@ pub struct AttributeValueSourceSpans {
     pub block_header: Option<super::SourceSpan>,
 }
 
+/// Parser-backed statement and identifier spans for a top-level `let` binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LetBindingSourceSpans {
+    pub statement: super::SourceSpan,
+    pub name: super::SourceSpan,
+}
+
 impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
@@ -416,13 +423,13 @@ pub fn top_level_upstream_state_spans(
     })
 }
 
-/// Return complete statement spans keyed by top-level `let` binding name.
+/// Return complete statement and name spans keyed by top-level `let` binding name.
 ///
 /// Only direct children of the file participate, so local bindings and binding
 /// text inside strings cannot change a resource's diagnostic scope.
 pub fn top_level_let_binding_spans(
     input: &str,
-) -> Result<HashMap<String, super::SourceSpan>, ParseError> {
+) -> Result<HashMap<String, LetBindingSourceSpans>, ParseError> {
     let file = super::preprocess_file(input)?;
     let mut spans = HashMap::new();
     for pair in file.parse()? {
@@ -445,7 +452,10 @@ pub fn top_level_let_binding_spans(
             if name.as_rule() == Rule::identifier {
                 spans.insert(
                     name.as_str().to_string(),
-                    super::SourceSpan::from_pest(&binding, &file),
+                    LetBindingSourceSpans {
+                        statement: super::SourceSpan::from_pest(&binding, &file),
+                        name: super::SourceSpan::from_pest(&name, &file),
+                    },
                 );
             }
         }
@@ -1544,10 +1554,17 @@ mod tests {
         let spans = top_level_let_binding_spans(&source).unwrap();
         assert_eq!(spans.len(), 2, "{spans:#?}");
         assert!(spans.contains_key("text"));
-        let span = spans.get("b").unwrap();
+        let binding_spans = spans.get("b").unwrap();
+        let span = binding_spans.statement;
         assert_eq!(span.start_line(), 13);
         assert_eq!(span.end_line(), 16);
         assert_eq!(&source[span.start_byte()..span.end_byte()], binding);
+        let name = binding_spans.name;
+        assert_eq!(name.start_line(), 13);
+        assert_eq!(name.start_column(), 5);
+        assert_eq!(name.end_line(), 13);
+        assert_eq!(name.end_column(), 6);
+        assert_eq!(&source[name.start_byte()..name.end_byte()], "b");
     }
 
     #[test]

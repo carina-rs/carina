@@ -143,6 +143,118 @@ fn unique_list_source_diagnostics(source: &str) -> Vec<Diagnostic> {
 }
 
 #[test]
+fn round7_unknown_attribute_suggests_existing_id_attribute_in_directory() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.Subnet")
+            .attribute(AttributeSchema::optional("vpc_id", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = "mock.test.Subnet {\n  vpc = \"vpc-123\"\n}\n";
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", source);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute 'vpc'");
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(error.range.start, Position::new(1, 2));
+    assert_eq!(
+        error.message,
+        "Unknown attribute 'vpc', did you mean 'vpc_id'?"
+    );
+}
+
+const ROUND7_HEREDOC_BINDING_PREFIX: &str = "let text = <<EOT\nlet b = fake { }\nEOT\n";
+const ROUND7_FOR_BINDING_PREFIX: &str =
+    "for x in [\"p\"] {\n  let b = x\n  mock.test.Other { name = b }\n}\n";
+const ROUND7_IF_BINDING_PREFIX: &str =
+    "if true {\n  let b = \"p\"\n  mock.test.Other { name = b }\n}\n";
+
+fn assert_round7_unused_binding_anchor(prefix: &str) {
+    let source = format!("{prefix}let b = mock.test.Other {{ name = \"b\" }}\n");
+    let diagnostics = unique_list_source_diagnostics(&source);
+    let warning = only_message_diagnostic(&diagnostics, "Unused let binding 'b'");
+    let line = prefix.lines().count() as u32;
+    assert_eq!(warning.severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        warning.range,
+        Range::new(Position::new(line, 4), Position::new(line, 5)),
+        "{diagnostics:#?}"
+    );
+}
+
+fn assert_round7_duplicate_binding_anchor(prefix: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("sibling.crn"),
+        "let b = \"sibling\"\n",
+    )
+    .unwrap();
+    let source = format!("{prefix}let b = \"buffer\"\n");
+    std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+    let diagnostics = analyze_with_buffer(&test_engine(), directory.path(), "main.crn", &source);
+    let error = only_message_diagnostic(&diagnostics, "duplicate binding 'b'");
+    let line = prefix.lines().count() as u32;
+    assert_eq!(error.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        error.range,
+        Range::new(Position::new(line, 4), Position::new(line, 5)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn round7_unused_binding_ignores_heredoc_binding_text() {
+    assert_round7_unused_binding_anchor(ROUND7_HEREDOC_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_unused_binding_ignores_for_local_binding() {
+    assert_round7_unused_binding_anchor(ROUND7_FOR_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_unused_binding_ignores_if_local_binding() {
+    assert_round7_unused_binding_anchor(ROUND7_IF_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_duplicate_binding_ignores_heredoc_binding_text() {
+    assert_round7_duplicate_binding_anchor(ROUND7_HEREDOC_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_duplicate_binding_ignores_for_local_binding() {
+    assert_round7_duplicate_binding_anchor(ROUND7_FOR_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_duplicate_binding_ignores_if_local_binding() {
+    assert_round7_duplicate_binding_anchor(ROUND7_IF_BINDING_PREFIX);
+}
+
+#[test]
+fn round7_second_pass_range_ends_at_indented_content_end() {
+    let (source, diagnostics) =
+        unique_list_declaration_scope_fixture("tag_list = \"\u{65e5}\u{672c}\u{8a9e}\"   ", true);
+    let error = only_message_diagnostic(&diagnostics, "Unknown attribute");
+    let line = source.lines().nth(2).unwrap();
+    assert_eq!(
+        error.range,
+        Range::new(
+            Position::new(2, 2),
+            Position::new(2, line.trim_end().chars().count() as u32),
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn round6_let_scope_ignores_for_local_binding() {
     let source = concat!(
         "for x in [\"p\"] {\n",
@@ -249,22 +361,22 @@ fn round6_unknown_attribute_with_resource_reference_keeps_core_suggestion() {
 }
 
 #[test]
-fn round6_block_unknown_attribute_falls_back_to_its_anonymous_resource_header() {
-    assert_block_unknown_attribute_fallback(false);
+fn round7_block_unknown_attribute_uses_its_anonymous_attribute_header() {
+    assert_block_unknown_attribute_header(false);
 }
 
 #[test]
-fn round6_block_unknown_attribute_falls_back_to_its_let_bound_resource_header() {
-    assert_block_unknown_attribute_fallback(true);
+fn round7_block_unknown_attribute_uses_its_let_bound_attribute_header() {
+    assert_block_unknown_attribute_header(true);
 }
 
-fn assert_block_unknown_attribute_fallback(let_bound: bool) {
+fn assert_block_unknown_attribute_header(let_bound: bool) {
     let (_, diagnostics) = unique_list_declaration_scope_fixture("typo { }", let_bound);
     let error = only_message_diagnostic(&diagnostics, "Unknown attribute 'typo'");
-    let header_line = if let_bound { 1 } else { 6 };
+    let header_line = if let_bound { 2 } else { 8 };
     assert_eq!(
-        error.range.start,
-        Position::new(header_line, 0),
+        error.range,
+        Range::new(Position::new(header_line, 2), Position::new(header_line, 6)),
         "{diagnostics:#?}"
     );
     assert_eq!(error.range.end.line, header_line, "{diagnostics:#?}");
@@ -3766,24 +3878,15 @@ config = {
 }
 
 #[test]
-fn find_let_binding_position_with_multibyte_leading_whitespace() {
-    // Regression test for issue #724: find_let_binding_position uses byte offset
-    // as character column. When multi-byte whitespace (e.g., full-width space U+3000)
-    // appears before "let", the byte offset differs from the character offset.
-    let engine = test_engine();
-
-    // U+3000 (ideographic space) is 3 bytes in UTF-8 but 1 character.
-    // Rust's str::trim() strips it as Unicode whitespace.
-    // Line: "\u{3000}let my_var = awscc.ec2.Vpc { }"
-    // "let " starts at byte 3, but character offset 1.
-    // name_col should be char 1 + 4 = 5 (correct)
-    // Bug produces byte 3 + 4 = 7 (wrong)
-    let text = "\u{3000}let my_var = awscc.ec2.Vpc { }";
-    let result = engine.find_let_binding_position(text, "my_var");
+fn unused_binding_position_after_multibyte_comment() {
+    // U+3000 is valid in a comment and occupies three UTF-8 bytes but one column.
+    let source = "/*\u{3000}*/ let my_var = mock.test.Other { name = \"b\" }\n";
+    let diagnostics = unique_list_source_diagnostics(source);
+    let warning = only_message_diagnostic(&diagnostics, "Unused let binding 'my_var'");
     assert_eq!(
-        result,
-        Some((0, 5)),
-        "Column should be character offset (5), not byte offset (7)"
+        warning.range,
+        Range::new(Position::new(0, 10), Position::new(0, 16)),
+        "{diagnostics:#?}"
     );
 }
 

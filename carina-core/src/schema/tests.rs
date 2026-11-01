@@ -4511,6 +4511,29 @@ fn test_levenshtein_distance() {
 }
 
 #[test]
+fn round7_unknown_attribute_suggests_existing_id_attribute() {
+    let schema = ResourceSchema::new("ec2.Subnet")
+        .attribute(AttributeSchema::optional("vpc_id", AttributeType::string()).build())
+        .validate()
+        .unwrap();
+    let attrs = HashMap::from([(
+        "vpc".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-123".into())),
+    )]);
+    let errors = schema.validate(&attrs).unwrap_err();
+    assert!(
+        matches!(&errors[..], [TypeError::UnknownAttribute { name, suggestion }]
+            if name == "vpc" && suggestion.as_deref() == Some("vpc_id")),
+        "{errors:#?}"
+    );
+    assert_eq!(
+        suggest_similar_name("vpc", &["vpc_id"]),
+        Some("vpc_id".into())
+    );
+    assert_eq!(suggest_similar_name("vpc", &["subnet_id"]), None);
+}
+
+#[test]
 fn test_suggest_similar_name() {
     let fields = vec!["ip_protocol", "from_port", "to_port", "cidr_ip"];
 
