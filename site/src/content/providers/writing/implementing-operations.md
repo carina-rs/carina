@@ -105,7 +105,7 @@ map that error to `String` for the trait method. Return
 `Unavailable`, the provider's reference forms are inert and do not expand
 short names during comparison.
 
-The component exports one concrete type, for example `export_provider!(WidgetProvider<HttpApi>, http)` with your real client as `HttpApi`; the `http` form also needs `wasi = "0.14"` in the `wasm32` dependencies, as the Overview explains. `export_provider!` builds the provider with `Default`, so that type needs a `Default` implementation, written in the same crate as `WidgetProvider` (Rust's orphan rule rejects it in a separate binary crate), and the client should take its endpoint and credentials in `initialize`, from the `provider` block. Remember that the host only lets requests reach AWS hosts today; see the [Overview](/providers/writing/overview/#what-a-provider-is).
+The component exports one concrete type, for example `export_provider!(WidgetProvider<HttpApi>, http, egress: ["api.example.com"])` with your real client as `HttpApi`; the `http` form requires an egress declaration and also needs `wasi = "0.14"` in the `wasm32` dependencies, as the Overview explains. `export_provider!` builds the provider with `Default`, so that type needs a `Default` implementation, written in the same crate as `WidgetProvider` (Rust's orphan rule rejects it in a separate binary crate), and the client should take its endpoint and credentials in `initialize`, from the `provider` block. See [Writing a Provider](/providers/writing/overview/#what-a-provider-is) for the declaration grammar and consent model.
 
 ## Helpers
 

@@ -564,21 +564,21 @@ mod tests {
     fn parser_side_deferred_resource_body_is_checked() {
         let mut parsed = parsed_with_unsynchronized_chained_ref();
         let record = parsed.resources.pop().expect("record resource"); // allow: direct — fixture test inspection
+        let target = DeferredForTarget::bound("records").expect("fixture binding is valid");
+        let body = DeferredForBody::resource(record);
         parsed
             .parsed_deferred_for_expressions_mut()
-            .push(ParsedDeferredForExpression {
-                file: None,
-                line: 1,
-                span: SourceSpan::dummy(),
-                header: "for item in pending.items".to_string(),
-                target: DeferredForTarget::Bound {
-                    binding: "records".to_string(),
-                },
-                iterable: Value::Concrete(ConcreteValue::List(Vec::new())),
-                iterable_state: crate::parser::ParsedDeferredForIterableState::Deferred,
-                binding: ForBinding::Simple("item".to_string()),
-                body: DeferredForBody::Resource(Box::new(record)),
-            });
+            .push(ParsedDeferredForExpression::new(
+                None,
+                1,
+                SourceSpan::dummy(),
+                "for item in pending.items".to_string(),
+                target,
+                Value::Concrete(ConcreteValue::List(Vec::new())),
+                crate::parser::ParsedDeferredForIterableState::Deferred,
+                ForBinding::Simple("item".to_string()),
+                body,
+            ));
 
         let diags = validate_deferred_populate_refs(&parsed, &registry_for_acm());
         assert_eq!(diags.len(), 1, "got: {diags:?}");

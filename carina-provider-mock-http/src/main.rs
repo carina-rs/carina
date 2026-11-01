@@ -19,6 +19,7 @@ const METHOD_ATTRIBUTE: &str = "method";
 const BODY_ATTRIBUTE: &str = "body";
 const SEND_PHASE_ATTRIBUTE: &str = "send_phase";
 const CREATE_BEHAVIOR_ATTRIBUTE: &str = "create_behavior";
+const VALIDATE_EGRESS_URL_ATTRIBUTE: &str = "validate_egress_url";
 
 #[derive(Default)]
 struct MockHttpProvider;
@@ -198,10 +199,17 @@ impl CarinaProvider for MockHttpProvider {
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
-        CoreValidatedConfigSchema::default()
+        CoreValidatedConfigSchema::validate(BTreeMap::from([(
+            VALIDATE_EGRESS_URL_ATTRIBUTE.to_string(),
+            CoreAttributeType::string(),
+        )]))
+        .expect("mock HTTP provider config schema must be valid")
     }
 
-    fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+        if let Some(Value::String(url)) = attrs.get(VALIDATE_EGRESS_URL_ATTRIBUTE) {
+            let _outcome = Self::wasi_http_send_phase(url, "GET", "");
+        }
         Ok(())
     }
 
@@ -374,7 +382,14 @@ impl CarinaProvider for MockHttpProvider {
 }
 
 #[cfg(target_arch = "wasm32")]
-carina_plugin_sdk::export_provider!(MockHttpProvider, http);
+carina_plugin_sdk::export_provider!(
+    MockHttpProvider,
+    http,
+    egress: [
+        "phase-test.invalid",
+        "resolved-metadata.invalid",
+    ],
+);
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}

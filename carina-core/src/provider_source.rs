@@ -161,17 +161,50 @@ pub enum ProviderSource {
     Remote(RemoteSource),
 }
 
-/// Error returned when a provider source string has an unsupported shape.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "Invalid source format: {input}. Expected: file://<path>, github.com/{{owner}}/{{repo}}, or [hostname/]namespace/name"
-)]
-pub struct ProviderSourceParseError {
-    input: String,
+/// Render an untrusted spelling without allowing terminal control characters
+/// or delimiters to affect the surrounding diagnostic.
+pub fn display_untrusted(value: &str) -> impl fmt::Display + '_ {
+    struct Escaped<'a>(&'a str);
+
+    impl fmt::Display for Escaped<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.escape_debug().fmt(formatter)
+        }
+    }
+
+    Escaped(value)
 }
 
+/// Error returned when a provider source string is unsafe or has an unsupported shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderSourceParseError {
+    /// The source does not match any supported provider source form.
+    InvalidFormat { input: String },
+    /// A local provider path contains a terminal control character.
+    FilePathContainsControl { input: String },
+}
+
+impl fmt::Display for ProviderSourceParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFormat { input } => write!(
+                formatter,
+                "Invalid source format: {}. Expected: file://<path>, github.com/{{owner}}/{{repo}}, or [hostname/]namespace/name",
+                display_untrusted(input)
+            ),
+            Self::FilePathContainsControl { input } => write!(
+                formatter,
+                "Invalid file provider source \"{}\": file:// paths must not contain control characters",
+                display_untrusted(input)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProviderSourceParseError {}
+
 fn invalid_source(source: &str) -> ProviderSourceParseError {
-    ProviderSourceParseError {
+    ProviderSourceParseError::InvalidFormat {
         input: source.to_string(),
     }
 }
@@ -223,7 +256,11 @@ impl FromStr for ProviderSource {
 
     fn from_str(source: &str) -> Result<Self, Self::Err> {
         if let Some(path) = source.strip_prefix("file://") {
-            return if path.is_empty() {
+            return if path.chars().any(char::is_control) {
+                Err(ProviderSourceParseError::FilePathContainsControl {
+                    input: source.to_string(),
+                })
+            } else if path.is_empty() {
                 Err(invalid_source(source))
             } else {
                 Ok(Self::File(FileSource {
@@ -307,7 +344,7 @@ impl<'de> Deserialize<'de> for ProviderSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_REGISTRY_HOST, ProviderSource, RemoteSource};
+    use super::{DEFAULT_REGISTRY_HOST, ProviderSource, ProviderSourceParseError, RemoteSource};
 
     #[test]
     fn parsed_sources_expose_validated_coordinates() {
@@ -382,6 +419,46 @@ mod tests {
                 "{source}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn file_sources_reject_control_characters_without_rendering_them_raw() {
+        for control in ['\u{1b}', '\u{7}', '\r', '\n', '\0'] {
+            let source = format!("file://provider{control}.wasm");
+            let error = source
+                .parse::<ProviderSource>()
+                .expect_err("file provider control characters must be rejected");
+
+            assert!(matches!(
+                error,
+                ProviderSourceParseError::FilePathContainsControl { .. }
+            ));
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("file:// paths must not contain control characters"),
+                "{rendered}"
+            );
+            assert!(
+                !rendered.chars().any(char::is_control),
+                "error rendered a control character: {rendered:?}"
+            );
+        }
+
+        assert!("file://provider.wasm".parse::<ProviderSource>().is_ok());
+    }
+
+    #[test]
+    fn invalid_source_format_does_not_render_control_characters_raw() {
+        let source = "not-a-source\u{1b}\u{7}";
+        let rendered = source
+            .parse::<ProviderSource>()
+            .expect_err("the fixture must have an invalid source shape")
+            .to_string();
+
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{7}'), "{rendered:?}");
+        assert!(rendered.contains(r"\u{1b}"), "{rendered:?}");
+        assert!(rendered.contains(r"\u{7}"), "{rendered:?}");
     }
 
     #[test]

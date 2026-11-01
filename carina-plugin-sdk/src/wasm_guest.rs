@@ -7,6 +7,162 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Structural failures that can be diagnosed in a provider's const context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressPatternStructureError {
+    Empty,
+    NonAscii,
+    InvalidWildcard,
+    EmptyLabel,
+    LabelTooLong,
+    InvalidLabel,
+    IpLiteral,
+}
+
+/// Return the structural error in an egress pattern, if any.
+///
+/// This is public because [`crate::export_provider!`] expands in the provider
+/// crate. The host performs the same checks again on the untrusted section.
+#[doc(hidden)]
+pub const fn egress_pattern_structure_error(pattern: &str) -> Option<EgressPatternStructureError> {
+    let bytes = pattern.as_bytes();
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'.' {
+        end -= 1;
+    }
+    if end == 0 {
+        return Some(EgressPatternStructureError::Empty);
+    }
+
+    let mut start = 0;
+    if bytes[0] == b'*' {
+        if end >= 3 && bytes[1] == b'*' && bytes[2] == b'.' {
+            start = 3;
+        } else if end >= 2 && bytes[1] == b'.' {
+            start = 2;
+        } else {
+            return Some(EgressPatternStructureError::InvalidWildcard);
+        }
+    }
+    if start == end {
+        return Some(EgressPatternStructureError::Empty);
+    }
+
+    let mut index = start;
+    let mut label_len = 0;
+    let mut label_starts_with_hyphen = false;
+    let mut previous_was_hyphen = false;
+    while index < end {
+        let byte = bytes[index];
+        if !byte.is_ascii() {
+            return Some(EgressPatternStructureError::NonAscii);
+        }
+        if byte == b'*' {
+            return Some(EgressPatternStructureError::InvalidWildcard);
+        }
+        if byte == b'.' {
+            if label_len == 0 {
+                return Some(EgressPatternStructureError::EmptyLabel);
+            }
+            if label_starts_with_hyphen || previous_was_hyphen {
+                return Some(EgressPatternStructureError::InvalidLabel);
+            }
+            label_len = 0;
+            label_starts_with_hyphen = false;
+            previous_was_hyphen = false;
+        } else {
+            if !byte.is_ascii_alphanumeric() && byte != b'-' {
+                return Some(EgressPatternStructureError::InvalidLabel);
+            }
+            if label_len == 0 {
+                label_starts_with_hyphen = byte == b'-';
+            }
+            previous_was_hyphen = byte == b'-';
+            label_len += 1;
+            if label_len > 63 {
+                return Some(EgressPatternStructureError::LabelTooLong);
+            }
+        }
+        index += 1;
+    }
+    if label_len == 0 {
+        return Some(EgressPatternStructureError::EmptyLabel);
+    }
+    if label_starts_with_hyphen || previous_was_hyphen {
+        return Some(EgressPatternStructureError::InvalidLabel);
+    }
+    if ends_in_number(bytes, start, end) {
+        return Some(EgressPatternStructureError::IpLiteral);
+    }
+    None
+}
+
+const fn ends_in_number(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut label_start = end;
+    while label_start > start && bytes[label_start - 1] != b'.' {
+        label_start -= 1;
+    }
+    if label_start == end {
+        return false;
+    }
+
+    let mut index = label_start;
+    let mut decimal = true;
+    while index < end {
+        if bytes[index] < b'0' || bytes[index] > b'9' {
+            decimal = false;
+            break;
+        }
+        index += 1;
+    }
+    if decimal {
+        return true;
+    }
+
+    if end - label_start <= 2
+        || bytes[label_start] != b'0'
+        || (bytes[label_start + 1] != b'x' && bytes[label_start + 1] != b'X')
+    {
+        return false;
+    }
+    index = label_start + 2;
+    while index < end {
+        let byte = bytes[index];
+        if !((byte >= b'0' && byte <= b'9')
+            || (byte >= b'a' && byte <= b'f')
+            || (byte >= b'A' && byte <= b'F'))
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Fail compilation when an exported HTTP provider declares an invalid shape.
+#[doc(hidden)]
+pub const fn assert_egress_pattern_structure(pattern: &str) {
+    if egress_pattern_structure_error(pattern).is_some() {
+        panic!("invalid provider egress host pattern");
+    }
+}
+
+/// Copy a compile-time JSON string into the fixed-size custom-section static.
+#[doc(hidden)]
+pub const fn egress_json_bytes<const N: usize>(json: &str) -> [u8; N] {
+    let bytes = json.as_bytes();
+    if bytes.len() != N {
+        panic!("invalid provider egress declaration length");
+    }
+    let mut output = [0; N];
+    let mut index = 0;
+    while index < N {
+        output[index] = bytes[index];
+        index += 1;
+    }
+    output
+}
+
 /// Decode the version-13 `desired-resource` record into the SDK's typed view.
 ///
 /// This is public only because [`crate::export_provider!`] expands in the
@@ -525,6 +681,23 @@ pub fn parse_resource_id_string(key: &str) -> crate::types::ResourceId {
     crate::parse_resource_id_string(key)
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __carina_egress_json {
+    () => {
+        "{\"version\":1,\"hosts\":[]}"
+    };
+    ($first:literal $(, $rest:literal)* $(,)?) => {
+        concat!(
+            "{\"version\":1,\"hosts\":[\"",
+            $first,
+            "\""
+            $(, ",\"", $rest, "\"")*,
+            "]}"
+        )
+    };
+}
+
 /// Macro to export a `CarinaProvider` implementation as a WASM component.
 ///
 /// This macro generates wit-bindgen bindings in the consumer crate and implements
@@ -538,7 +711,11 @@ pub fn parse_resource_id_string(key: &str) -> crate::types::ResourceId {
 ///
 /// // HTTP-capable provider (e.g., AWS provider)
 /// #[cfg(target_arch = "wasm32")]
-/// carina_plugin_sdk::export_provider!(MyProvider, http);
+/// carina_plugin_sdk::export_provider!(
+///     MyProvider,
+///     http,
+///     egress: ["**.amazonaws.com", "**.amazonaws.com.cn"],
+/// );
 /// ```
 #[macro_export]
 macro_rules! export_provider {
@@ -548,7 +725,18 @@ macro_rules! export_provider {
             world: "carina-provider",
         });
     };
-    ($provider_type:ty, http) => {
+    ($provider_type:ty, http, egress: [$($host:literal),* $(,)?] $(,)?) => {
+        const _: () = {
+            $(
+                $crate::wasm_guest::assert_egress_pattern_structure($host);
+            )*
+        };
+
+        #[used]
+        #[unsafe(link_section = "carina:egress")]
+        static __CARINA_EGRESS_DECLARATION: [u8; $crate::__carina_egress_json!($($host),*).len()] =
+            $crate::wasm_guest::egress_json_bytes($crate::__carina_egress_json!($($host),*));
+
         $crate::export_provider!(@internal $provider_type, {
             path: "../carina-plugin-wit/wit",
             world: "carina-provider-with-http",
@@ -2498,6 +2686,68 @@ macro_rules! export_provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn const_checker_is_a_strict_subset_of_shared_validation() {
+        for pattern in [
+            "api.example.com",
+            "*.example.com",
+            "**.example.com",
+            "API.Example.COM.",
+            "a-b.com",
+        ] {
+            assert_eq!(egress_pattern_structure_error(pattern), None, "{pattern}");
+            assert!(
+                crate::protocol::HostPattern::parse(pattern).is_ok(),
+                "{pattern}"
+            );
+        }
+
+        for pattern in [
+            "",
+            "api.*.com",
+            "a..example.com",
+            "169.254.169.254",
+            "[::1]",
+            "café.example.com",
+            "127.1",
+            "2130706433",
+            "0x7f.1",
+            "0177.0.0.1",
+            "a_b.com",
+            "x\"y.com",
+            "host:443",
+            "-a.com",
+            "a-.com",
+        ] {
+            assert!(
+                egress_pattern_structure_error(pattern).is_some(),
+                "{pattern}"
+            );
+            assert!(
+                crate::protocol::HostPattern::parse(pattern).is_err(),
+                "{pattern}"
+            );
+        }
+
+        for pattern in ["*.com", "localhost", "metadata.google.internal"] {
+            assert_eq!(egress_pattern_structure_error(pattern), None, "{pattern}");
+            assert!(
+                crate::protocol::HostPattern::parse(pattern).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_json_macro_emits_the_versioned_payload() {
+        const PAYLOAD: &str =
+            crate::__carina_egress_json!("api.example.com", "**.service.example.com");
+        assert_eq!(
+            PAYLOAD,
+            r#"{"version":1,"hosts":["api.example.com","**.service.example.com"]}"#
+        );
+    }
 
     #[test]
     fn schema_metadata_error_chain_keeps_the_typed_conversion_detail_once() {

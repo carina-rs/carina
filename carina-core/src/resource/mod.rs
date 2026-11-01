@@ -867,10 +867,9 @@ impl From<PendingResourceIdentityError> for ResolvedResourceError {
 /// Re-resolve authored resource directives that depend on the provider schema.
 ///
 /// Deferred anonymous-loop templates intentionally still have pending identities
-/// when a saved plan is loaded. Their directives must nevertheless be checked
-/// against the fingerprint-validated schemas before apply; identity validation
-/// remains the responsibility of [`ResolvedResource::resolve_with_schemas`]
-/// after the template has been materialized.
+/// when a saved plan is loaded. Bound templates instead expose their derived
+/// materialized address while directives are checked, so diagnostics name the
+/// template (for example, `items[?]`) rather than a pending placeholder.
 pub(crate) fn resolve_resource_ignore_changes<S, P: PlaceholderKind>(
     resource: &mut Resource<S, P>,
     registry: &crate::schema::SchemaRegistry,

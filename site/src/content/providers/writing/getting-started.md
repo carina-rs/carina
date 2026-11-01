@@ -330,7 +330,7 @@ carina apply
 
 `carina plan` shows the greeting to be created, with `message` as `(known after apply)`. After `apply`, another `plan` reports no changes, because `read` returns the same attributes. Change `name` to `'carina'` and `plan` shows the greeting must be replaced, because `name` is create-only. `carina destroy` deletes it.
 
-`carina init` installs the component into `.carina/providers/` (as a hard link when it can, otherwise a copy) and records its checksum in `carina-providers.lock`. Later commands use that copy, so after you rebuild the provider, run `carina init` again to pick up the new build and update the checksum.
+`carina init` installs the component into `.carina/providers/` (as a hard link when it can, otherwise a copy) and records its checksum in `carina-providers.lock`. Later commands use that copy, so after you rebuild the provider, run `carina init` again to pick up the new build and update the checksum. For an HTTP provider, that init also reads the new egress declaration: an unchanged declaration carries consent forward without a prompt, while a changed declaration shows the diff and asks again.
 
 ## Use it from GitHub
 

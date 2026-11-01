@@ -147,7 +147,7 @@ enum ValidatedEntry<'a> {
     /// `header` alone are identical for `for _, opt in cert.dvo { … }`
     /// repeated twice).
     DeferredLoop {
-        resource_type: String,
+        resource_type: &'a str,
         target: &'a carina_core::parser::DeferredForTarget,
         header: &'a str,
         file: Option<&'a str>,
@@ -173,16 +173,17 @@ impl std::fmt::Display for ValidatedEntry<'_> {
                 line,
             } => {
                 let location = match target {
-                    carina_core::parser::DeferredForTarget::Bound { .. } => match file {
+                    carina_core::parser::DeferredForTarget::Bound(_) => match file {
                         Some(file) => format!("{file}:{line}"),
                         None => line.to_string(),
                     },
                     carina_core::parser::DeferredForTarget::Unbound { .. } => target.display_name(),
                 };
                 match target {
-                    carina_core::parser::DeferredForTarget::Bound { binding } => write!(
+                    carina_core::parser::DeferredForTarget::Bound(target) => write!(
                         f,
-                        "{resource_type}.{binding}[?] (deferred: {header} @ {location})"
+                        "{resource_type}.{} (deferred: {header} @ {location})",
+                        target.template_address()
                     ),
                     carina_core::parser::DeferredForTarget::Unbound { .. } => {
                         write!(f, "{resource_type}.<pending> (deferred for at {location})")
@@ -223,8 +224,8 @@ fn validated_entries<E>(
                 resource: _resource,
                 deferred: d,
             } => ValidatedEntry::DeferredLoop {
-                resource_type: d.resource_type.clone(),
-                target: &d.target,
+                resource_type: d.resource_type(),
+                target: d.target(),
                 header: &d.header,
                 file: d.file.as_deref(),
                 line: d.line,
