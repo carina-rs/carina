@@ -89,6 +89,33 @@ share the phase-less `pending-operation` record for the token and poll interval.
 `poll-create`, `resume-create`, and `poll-update` receive a `poll-request`
 whose `finality` is `continue` or `final-attempt`.
 
+The guest SDK requires create and update tokens to implement `PhasedToken`.
+Identifier-bearing `IssuedCreate` and `ResumedCreate` handles derive both
+`pending` and `preserve` progress from the token's phase. Identifier-less
+create handles take `T::Operation`, the associated operation-phase payload;
+unissued poll and resume arms carry that payload directly. `from_operation`
+wraps it infallibly, while only SDK dispatch uses `into_operation` to narrow a
+decoded host token. `PhasedToken::phase()` derives its default from the borrowed
+`operation()` view (`Some` for operation, `None` for read-back), avoiding a
+separate phase match in provider implementations.
+Update continuations use `Pending::new(token, poll_after_secs)` and compute
+`Pending::phase()` from the token, without storing a separate mutable phase.
+The SDK does not serialize `Pending<T>` itself; guest glue serializes its token
+into the protocol's pending record.
+
+Guest decoding keeps the host's `create-progress` variant intact through
+create poll and resume dispatch. Phase validation rejects only the backward
+pairing: host progress is `reading-back`, but the token is in operation phase.
+Create poll and resume return `Undetermined` for that pairing, preserving the
+previous host continuation; update decoding rejects the same backward pairing.
+Operation progress with a read-back token is accepted when an identifier is
+available. The guest receives the identifier-bearing handle, and its next
+pending or preserved result reports read-back progress from the token.
+An identifier-less read-back token is permanently invalid: dispatch returns
+terminal `Untracked` with code `READ_BACK_WITHOUT_IDENTIFIER` before calling
+the provider. These SDK guarantees use the existing WIT variants and do not
+change the protocol version.
+
 The host starts the operation's existing deadline before the initial call.
 The read-back deadline starts only when the first `read-back` pending result
 arrives and is the earlier of that time plus the resource's read-back budget
@@ -118,12 +145,13 @@ refresh.
 `resume-create` receives the same `poll-request` finality as `poll-create`; the
 host never fabricates the `sent` values that are absent from a persisted
 `resume-pending`. Persisted state retains the resume token and identifier, but
-not scheduling metadata, so the first resume call's inbound phase and delay are
-non-authoritative: the host sends `operating` with the persisted optional
-identifier. The provider recovers the operation from its token and any
-pending result it returns establishes the phase used by later polls. Delete
-continuations use the phase-less `pending-delete` record because delete has no
-post-apply read-back phase.
+not scheduling metadata. The current host sends `operating` with the persisted
+optional identifier on the first resume call. This placeholder is not evidence
+of a phase regression: a saved read-back token with an identifier can resume
+directly into read-back, including from a fresh provider instance. A returned
+pending or preserved result establishes the phase used by subsequent polls.
+Delete continuations use the phase-less `pending-delete` record because delete
+has no post-apply read-back phase.
 
 `OperationConfig.read_back` participates in semantic schema fingerprint
 encoding v6. Provider protocol and minimum supported protocol are both 15;
