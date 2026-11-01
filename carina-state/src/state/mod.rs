@@ -1205,16 +1205,61 @@ impl StateFile {
     fn classify_legacy_dependencies(
         &self,
         input: &LegacyMigrationInput<'_>,
-    ) -> Result<LegacyDependencyClassification, LegacyDependencyMigrationError> {
+    ) -> Result<
+        LegacyClassificationOutcome<LegacyDependencyClassification>,
+        LegacyDependencyMigrationError,
+    > {
         use carina_core::utils::canonicalize_map_key_address;
 
         if !self.requires_legacy_dependency_migration() {
-            return Ok(LegacyDependencyClassification {
-                lineage: self.lineage.clone(),
-                sources: BTreeMap::new(),
-                rows: BTreeMap::new(),
-                warnings: Vec::new(),
+            return Ok(LegacyClassificationOutcome::Classified(
+                LegacyDependencyClassification {
+                    lineage: self.lineage.clone(),
+                    sources: BTreeMap::new(),
+                    rows: BTreeMap::new(),
+                    warnings: Vec::new(),
+                },
+            ));
+        }
+
+        let mut unread_rows = self
+            .resources
+            .iter()
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                let row_id = ResolvedResourceId::new(Self::id_for_resource_state(row));
+                if !self.legacy_dependencies.contains_key(&row_id) {
+                    return None;
+                }
+                let classified_id = input
+                    .moved_pairs
+                    .iter()
+                    .find_map(|(from, to)| (from == &row_id).then_some(to))
+                    .unwrap_or(&row_id);
+                let owned_by_residual_loop = !input.configured.contains(classified_id)
+                    && input.offline_unmaterialized.iter().any(|prefix| {
+                        [Some(row.identity.as_str()), row.binding.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .any(|address| {
+                                address == prefix
+                                    || address.strip_prefix(prefix).is_some_and(|suffix| {
+                                        suffix.starts_with('[') || suffix.starts_with('.')
+                                    })
+                            })
+                    });
+                owned_by_residual_loop.then_some(LegacyReadRequiredRow {
+                    row_index,
+                    row: row_id,
+                })
             });
+        if let Some(first) = unread_rows.next() {
+            return Ok(LegacyClassificationOutcome::RequiresReads(
+                LegacyReadRequiredRows {
+                    first,
+                    rest: unread_rows.collect(),
+                },
+            ));
         }
 
         let mut state_candidates: HashMap<String, Vec<LegacyStateCandidate>> = HashMap::new();
@@ -1260,24 +1305,6 @@ impl StateFile {
                 .find_map(|(from, to)| (from == &row_id).then_some(to))
                 .unwrap_or(&row_id);
             let configured = input.configured.contains(classified_id);
-            if !configured
-                && input.offline_unmaterialized.iter().any(|prefix| {
-                    [Some(row.identity.as_str()), row.binding.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .any(|address| {
-                            address == prefix
-                                || address.strip_prefix(prefix).is_some_and(|suffix| {
-                                    suffix.starts_with('[') || suffix.starts_with('.')
-                                })
-                        })
-                })
-            {
-                return Err(LegacyDependencyMigrationError::RequiresReads {
-                    row_index,
-                    row: row_id.to_string(),
-                });
-            }
             let scopes = legacy_row_scopes(row);
             let row_description = format!(
                 "resources[{row_index}] ({}.{} {:?})",
@@ -1357,12 +1384,14 @@ impl StateFile {
             );
         }
 
-        Ok(LegacyDependencyClassification {
-            lineage: self.lineage.clone(),
-            sources: self.legacy_dependencies.clone(),
-            rows: migrated,
-            warnings,
-        })
+        Ok(LegacyClassificationOutcome::Classified(
+            LegacyDependencyClassification {
+                lineage: self.lineage.clone(),
+                sources: self.legacy_dependencies.clone(),
+                rows: migrated,
+                warnings,
+            },
+        ))
     }
 
     /// Apply a classification only to the exact legacy source snapshot from
@@ -2395,8 +2424,6 @@ pub struct MigrationInfo {
 pub enum LegacyDependencyMigrationError {
     #[error(transparent)]
     GraphValidation(#[from] ExpandedGraphResolutionError),
-    #[error("{row}: cannot classify offline: requires reads; run with --refresh=true")]
-    RequiresReads { row_index: usize, row: String },
     #[error("legacy dependency classification is stale for this state")]
     StaleClassification,
     #[error(
@@ -2535,6 +2562,46 @@ where
         })
         .collect::<Result<HashMap<_, _>, _>>()
         .map_err(serde::de::Error::custom)
+}
+
+/// Classification either retains the complete result or identifies every row
+/// whose configured ownership cannot be established without materializing loops.
+/// Commands supply their own recovery advice for `RequiresReads`.
+#[derive(Debug)]
+pub enum LegacyClassificationOutcome<T> {
+    Classified(T),
+    RequiresReads(LegacyReadRequiredRows),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyReadRequiredRow {
+    pub row_index: usize,
+    pub row: ResolvedResourceId,
+}
+
+/// A nonempty collection of state rows requiring loop materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyReadRequiredRows {
+    first: LegacyReadRequiredRow,
+    rest: Vec<LegacyReadRequiredRow>,
+}
+
+impl LegacyReadRequiredRows {
+    pub fn iter(&self) -> impl Iterator<Item = &LegacyReadRequiredRow> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+impl std::fmt::Display for LegacyReadRequiredRows {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, row) in self.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "resources[{}] ({})", row.row_index, row.row)?;
+        }
+        Ok(())
+    }
 }
 
 /// Pure, replayable result of classifying every pre-v21 dependency spelling.
@@ -5158,7 +5225,7 @@ impl StateFile {
         moves: &ResolvedMovePairs,
         offline_unmaterialized: BTreeSet<String>,
     ) -> Result<
-        UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>,
+        LegacyClassificationOutcome<UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>>,
         LegacyDependencyMigrationError,
     > {
         let input = LegacyMigrationInput {
@@ -5167,12 +5234,18 @@ impl StateFile {
             moved_pairs: moves,
             offline_unmaterialized,
         };
-        let classification = self.classify_legacy_dependencies(&input)?;
-        Ok(UnvalidatedLegacyMigration {
-            graph,
-            classification,
-            state: self,
-        })
+        match self.classify_legacy_dependencies(&input)? {
+            LegacyClassificationOutcome::Classified(classification) => Ok(
+                LegacyClassificationOutcome::Classified(UnvalidatedLegacyMigration {
+                    graph,
+                    classification,
+                    state: self,
+                }),
+            ),
+            LegacyClassificationOutcome::RequiresReads(rows) => {
+                Ok(LegacyClassificationOutcome::RequiresReads(rows))
+            }
+        }
     }
 
     /// Replay the complete managed-row graph persisted by a strictly validated
@@ -5208,13 +5281,13 @@ impl StateFile {
 ///
 /// ```
 /// use carina_core::{effect::ResolvedMovePairs, resolved_graph::LegacyClassificationGraph};
-/// use carina_state::{LegacyDependencyMigrationError, StateFile, UnvalidatedLegacyMigration};
+/// use carina_state::{LegacyClassificationOutcome, LegacyDependencyMigrationError, StateFile, UnvalidatedLegacyMigration};
 ///
 /// fn classify<E, D>(
 ///     state: StateFile,
 ///     graph: LegacyClassificationGraph<E, D>,
 ///     moves: &ResolvedMovePairs,
-/// ) -> Result<UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>, LegacyDependencyMigrationError> {
+/// ) -> Result<LegacyClassificationOutcome<UnvalidatedLegacyMigration<LegacyClassificationGraph<E, D>>>, LegacyDependencyMigrationError> {
 ///     state.classify_legacy_graph(graph, moves, Default::default())
 /// }
 /// ```
@@ -5259,16 +5332,19 @@ impl StateFile {
 ///     parser::ParsedFile,
 ///     resolved_graph::resolve_expanded_graph_for_legacy_classification,
 /// };
-/// use carina_state::StateFile;
+/// use carina_state::{LegacyClassificationOutcome, StateFile};
 ///
 /// let configuration = ParsedFile::default();
 /// let moves = ResolvedMovePairs::from_addressed_moves(
 ///     AddressedMoves::preserve_addresses(&configuration.state_blocks),
 /// );
 /// let graph = resolve_expanded_graph_for_legacy_classification(configuration.into()).unwrap();
-/// let pending = StateFile::new()
+/// let outcome = StateFile::new()
 ///     .classify_legacy_graph(graph, &moves, Default::default()).unwrap();
-/// assert!(pending.warnings().is_empty());
+/// match outcome {
+///     LegacyClassificationOutcome::Classified(pending) => assert!(pending.warnings().is_empty()),
+///     LegacyClassificationOutcome::RequiresReads(rows) => panic!("unexpected unread rows: {rows}"),
+/// }
 /// ```
 ///
 /// Reporting alone cannot release the state; the pending owner has no

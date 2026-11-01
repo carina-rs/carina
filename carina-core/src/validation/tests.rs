@@ -8403,8 +8403,7 @@ fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
         "{:?}",
         report.diagnostics()
     );
-    let diagnostics =
-        depends_on::validate_depends_on(&parsed, report.resolved_argument_types().unwrap());
+    let diagnostics = depends_on::validate_depends_on(&parsed, report.resolved_argument_types());
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].severity, depends_on::Severity::Error);
     assert_eq!(
@@ -8414,14 +8413,53 @@ fn file_type_resolution_report_mints_resolved_dependency_argument_types() {
 }
 
 #[test]
-fn file_type_resolution_failure_cannot_mint_dependency_argument_types() {
+fn file_type_resolution_failure_classifies_each_dependency_argument_independently() {
     let mut parsed = crate::parser::parse(
-        "arguments { rec: list(aws.route53.Missing.Id) }\n",
+        r#"arguments {
+  bad: aws.route53.Missing.Id
+  value: aws.iam.Policy.Arn
+  handle: mock.test.resource
+}
+let consumer = mock.test.resource {
+  directives { depends_on = [bad, bad, value, handle, missing, consumer] }
+}
+"#,
         &ProviderContext::default(),
     )
     .unwrap();
-    let report =
-        resolve_file_type_exprs_report(&mut parsed, &enriched_context_with_iam_policy_arn(), None);
+    let context = ProviderContext {
+        resource_types: HashSet::from([("mock".to_string(), "test.resource".to_string())]),
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "aws",
+                TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn"),
+            )]),
+            Box::new(|_target, _value| Ok(())),
+        ),
+        ..ProviderContext::default()
+    };
+    let report = resolve_file_type_exprs_report(&mut parsed, &context, None);
     assert!(!report.diagnostics().is_empty());
-    assert!(report.resolved_argument_types().is_none());
+    let argument_types = report.resolved_argument_types();
+    let diagnostics = depends_on::validate_depends_on(&parsed, argument_types);
+    for expected in [
+        "got aws.iam.Policy.Arn",
+        "binding 'missing' is not declared",
+        "self-reference is not allowed",
+        "binding 'bad' is listed multiple times",
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "missing {expected:?}: {diagnostics:#?}"
+        );
+    }
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            diagnostic.severity != depends_on::Severity::Error
+                || !matches!(diagnostic.dep_name.as_deref(), Some("bad" | "handle"))
+        }),
+        "only the unresolved argument's handle-kind check must be skipped: {diagnostics:#?}"
+    );
 }

@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use crate::deps::{collect_dependencies, sort_resources_by_dependencies};
 use crate::parser::{File, ResourceRef, UnexpandedDependencies, UnexpandedDependencyOperand};
 
-use super::{ResolvedArgumentTypes, ResolvedDependencyArgumentType};
+use super::{DependencyArgumentResolution, ResolvedArgumentTypes, ResolvedDependencyArgumentType};
 
 /// Severity of a depends_on diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,8 +220,13 @@ pub fn validate_depends_on<E, D: crate::parser::DeferredForPhaseTraversal>(
                 }
                 if let Some(parameter_type) = module_parameters.get(dep_name.as_str()) {
                     match parameter_type {
-                        ResolvedDependencyArgumentType::ManagedHandle => continue,
-                        ResolvedDependencyArgumentType::Value(parameter_type) => {
+                        DependencyArgumentResolution::Unresolved
+                        | DependencyArgumentResolution::Resolved(
+                            ResolvedDependencyArgumentType::ManagedHandle,
+                        ) => continue,
+                        DependencyArgumentResolution::Resolved(
+                            ResolvedDependencyArgumentType::Value(parameter_type),
+                        ) => {
                             diags.push(
                                 DependsOnDiagnostic::error(format!(
                                     "directives.depends_on: expected a managed resource handle; got {parameter_type}",
@@ -318,7 +323,7 @@ mod tests {
             "{:?}",
             report.diagnostics()
         );
-        validate_depends_on(&parsed, report.resolved_argument_types().unwrap())
+        validate_depends_on(&parsed, report.resolved_argument_types())
     }
 
     fn diag_messages(diags: &[DependsOnDiagnostic], sev: Severity) -> Vec<String> {

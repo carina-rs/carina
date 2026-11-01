@@ -283,6 +283,12 @@ ambiguous dependency on a row still present in configuration is an error. For
 an orphan or deposed row, known ordering edges remain usable and every
 unresolved legacy name is printed as a warning.
 
+The check cannot classify rows owned by a deferred loop over `upstream_state`
+or unread data sources. It lists every affected row and reports `cannot
+classify offline`; run `plan` or `apply`, which reads those inputs, to migrate.
+`state migrate` has no `--refresh` flag. Loops whose iterable can be recovered
+from the copied state are expanded offline and can still be checked.
+
 #### Flags
 
 | Flag | Description |

@@ -645,7 +645,7 @@ impl DiagnosticEngine {
         if let Some(parsed) = &type_resolved_parsed
             && let Some(argument_types) = type_resolution
                 .as_ref()
-                .and_then(|report| report.resolved_argument_types())
+                .map(|report| report.resolved_argument_types())
         {
             diagnostics.extend(self.check_depends_on(doc, parsed, argument_types));
         }

@@ -664,9 +664,9 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
-    /// Plan format 37 stores the exact legacy-dependency classification used
-    /// by planning. Format 36 added resolved dependency addresses and
-    /// graph-projected destroy-dependency metadata.
+    /// Plan format 37 supersedes 36 and stores complete resolved dependency
+    /// addresses, graph-projected destroy-dependency metadata, and the exact
+    /// legacy-dependency classification used by planning.
     ///
     /// Plan format 35 stores the tri-state `prevent_destroy` directive so an
     /// explicit `false` remains distinct from an unspecified value, and

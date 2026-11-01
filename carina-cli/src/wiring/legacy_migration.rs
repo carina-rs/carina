@@ -6,14 +6,94 @@ use carina_core::resolved_graph::{
     LegacyClassificationGraph, ResolvedExpandedGraph, loop_group_bindings,
     resolve_expanded_graph_for_legacy_classification,
 };
-use carina_state::{LegacyDependencyClassification, StateFile, UnvalidatedLegacyMigration};
+use carina_state::{
+    LegacyClassificationOutcome, LegacyDependencyClassification, StateFile,
+    UnvalidatedLegacyMigration,
+};
 use colored::Colorize;
 
 use crate::error::AppError;
 
-pub(crate) enum MaterializedConfiguration {
-    Planned,
-    Offline,
+/// Configuration and materialization evidence travel as one owned value.
+/// Commands can inspect it, but only the materializer can construct Planned.
+pub(crate) struct MaterializedConfiguration<E> {
+    parsed: ModuleResolvedFile<E>,
+    materialization: ConfigurationMaterialization,
+}
+
+#[derive(Clone)]
+enum ConfigurationMaterialization {
+    Planned(CompleteDeferredForMaterialization),
+    Offline(ResidualDeferredLoops),
+}
+
+/// Minted only after the materializer has checked its final loop collection.
+#[derive(Clone)]
+struct CompleteDeferredForMaterialization;
+
+#[derive(Clone)]
+struct ResidualDeferredLoops {
+    bindings: BTreeSet<String>,
+}
+
+impl ResidualDeferredLoops {
+    fn from_loops(loops: &carina_core::parser::ResolvedDeferredForExpressions) -> Self {
+        Self {
+            bindings: loops
+                .iter()
+                .flat_map(|deferred| {
+                    let target = deferred.target.scheduler_key();
+                    std::iter::once(target.to_string()).chain(loop_group_bindings(target))
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Private materializer result. Completion and residual loops are mutually
+/// exclusive, and neither payload can be constructed by a command.
+#[derive(Clone)]
+pub(super) struct DeferredForExpansionWitness(ConfigurationMaterialization);
+
+impl DeferredForExpansionWitness {
+    pub(super) fn after_expansion(
+        loops: &carina_core::parser::ResolvedDeferredForExpressions,
+    ) -> Self {
+        let residual = ResidualDeferredLoops::from_loops(loops);
+        Self(if loops.is_empty() {
+            ConfigurationMaterialization::Planned(CompleteDeferredForMaterialization)
+        } else {
+            ConfigurationMaterialization::Offline(residual)
+        })
+    }
+}
+
+impl<E> MaterializedConfiguration<E> {
+    pub(super) fn after_expansion(
+        parsed: ModuleResolvedFile<E>,
+        witness: DeferredForExpansionWitness,
+    ) -> Self {
+        Self {
+            parsed,
+            materialization: witness.0,
+        }
+    }
+
+    pub(super) fn offline(parsed: ModuleResolvedFile<E>) -> Self {
+        let residual_loops = ResidualDeferredLoops::from_loops(parsed.deferred_for_expressions());
+        Self {
+            parsed,
+            materialization: ConfigurationMaterialization::Offline(residual_loops),
+        }
+    }
+}
+
+impl<E> std::ops::Deref for MaterializedConfiguration<E> {
+    type Target = ModuleResolvedFile<E>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.parsed
+    }
 }
 
 /// No writable state or executable graph can leave this owner until warnings
@@ -70,31 +150,38 @@ impl<E> ClassifiedLegacyGraph<E> {
 }
 
 pub(crate) fn classify_legacy_state<E>(
-    parsed: ModuleResolvedFile<E>,
-    mode: MaterializedConfiguration,
+    configuration: MaterializedConfiguration<E>,
     moves: &ResolvedMovePairs,
     state: Option<&StateFile>,
-) -> Result<ClassifiedLegacyGraph<E>, AppError> {
-    let offline_unmaterialized = match mode {
-        MaterializedConfiguration::Planned => BTreeSet::new(),
-        MaterializedConfiguration::Offline => parsed
-            .deferred_for_expressions()
-            .iter()
-            .flat_map(|deferred| {
-                let target = deferred.target.scheduler_key();
-                std::iter::once(target.to_string()).chain(loop_group_bindings(target))
-            })
-            .collect(),
+) -> Result<LegacyClassificationOutcome<ClassifiedLegacyGraph<E>>, AppError> {
+    let MaterializedConfiguration {
+        parsed,
+        materialization,
+    } = configuration;
+    let offline_unmaterialized = match materialization {
+        ConfigurationMaterialization::Planned(_complete) => BTreeSet::new(),
+        ConfigurationMaterialization::Offline(residual_loops) => residual_loops.bindings,
     };
     let graph = resolve_expanded_graph_for_legacy_classification(parsed.into())?;
     if let Some(state) = state.filter(|state| state.requires_legacy_dependency_migration()) {
-        let migration = state
+        let outcome = state
             .clone()
             .classify_legacy_graph(graph, moves, offline_unmaterialized)
             .map_err(|error| AppError::Backend(error.into()))?;
-        Ok(ClassifiedLegacyGraph::Migrating(migration))
+        match outcome {
+            LegacyClassificationOutcome::Classified(migration) => {
+                Ok(LegacyClassificationOutcome::Classified(
+                    ClassifiedLegacyGraph::Migrating(migration),
+                ))
+            }
+            LegacyClassificationOutcome::RequiresReads(rows) => {
+                Ok(LegacyClassificationOutcome::RequiresReads(rows))
+            }
+        }
     } else {
-        Ok(ClassifiedLegacyGraph::Current(graph))
+        Ok(LegacyClassificationOutcome::Classified(
+            ClassifiedLegacyGraph::Current(graph),
+        ))
     }
 }
 

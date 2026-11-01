@@ -597,7 +597,22 @@ pub(crate) fn validate_and_resolve_errors_inner(
         enriched_context,
         None,
     );
-    let resolved_argument_types = type_resolution.resolved_argument_types().cloned();
+    let resolved_argument_types = type_resolution.resolved_argument_types().clone();
+    if !skip_resource_validation {
+        // Declaration errors must not suppress independent graph errors.
+        // Warnings are emitted on the final expanded graph below.
+        errors.extend(
+            carina_core::validation::depends_on::validate_depends_on(
+                &parsed,
+                &resolved_argument_types,
+            )
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == carina_core::validation::depends_on::Severity::Error
+            })
+            .map(|diagnostic| AppError::Validation(diagnostic.message)),
+        );
+    }
     for diagnostic in type_resolution.into_diagnostics() {
         match carina_core::validation::ModuleCallFinding::try_from_type_resolution(diagnostic) {
             Ok(finding) => root_type_resolution_findings.push(finding),
@@ -857,9 +872,10 @@ pub(crate) fn validate_and_resolve_errors_inner(
         errors.extend(validate_no_empty_interpolations(parsed));
 
         errors.extend(validate_resources_with_ctx(ctx, parsed, enriched_context));
-        if let Some(argument_types) = &resolved_argument_types {
-            errors.extend(validate_depends_on_with_ctx(parsed, argument_types));
-        }
+        errors.extend(validate_depends_on_with_ctx(
+            parsed,
+            &resolved_argument_types,
+        ));
         errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
         errors.extend(

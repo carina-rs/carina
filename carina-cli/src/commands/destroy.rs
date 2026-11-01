@@ -347,7 +347,7 @@ async fn run_destroy_locked_owned(
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
     let mut orphans = carina_core::differ::Orphans::new();
 
-    if refresh {
+    let validated_config = if refresh {
         let progress_backend = ProgressBackend::new(ProgressSink::Human);
         let refresh_phase = RefreshPhase::start(&progress_backend);
 
@@ -568,6 +568,7 @@ async fn run_destroy_locked_owned(
             managed_current.remove(id);
         }
         let crate::wiring::MaterializedLegacyConfiguration {
+            config,
             sorted_resources,
             parts,
         } = validated_config.materialize_legacy_configuration(
@@ -591,30 +592,43 @@ async fn run_destroy_locked_owned(
             all_resources.extend(orphans.keys().map(|id| build_orphan_resource(state, &ResolvedResourceId::new(id.clone()))));
         }
         managed_current = carina_core::differ::into_all_prior_states(orphans, expanded_current);
-    } else if let Some(sf) = state_file.as_ref() {
-        // --refresh=false: build states from state file without AWS calls.
-        // carina#3181: `all_resources` is managed-only.
-        for resource in &all_resources {
-            let current = sf.build_state_for_resource(&resource.id);
-            managed_current.insert(resource.id.clone(), current);
-        }
-
-        // Include orphaned resources (in state but not in .crn)
-        let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
-        for (id, loaded) in sf.build_orphans(&desired_ids) {
-            let current = loaded.into_current();
-            if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
-                let orphan_resource = build_orphan_resource(sf, &resolved_id);
-                all_resources.push(orphan_resource);
+        config
+    } else {
+        if let Some(sf) = state_file.as_ref() {
+            // --refresh=false: build states from state file without AWS calls.
+            // carina#3181: `all_resources` is managed-only.
+            for resource in &all_resources {
+                let current = sf.build_state_for_resource(&resource.id);
+                managed_current.insert(resource.id.clone(), current);
             }
-            managed_current.insert(id, current);
-        }
-    }
 
-    let validated = validated_config.resolve_legacy_graph(
-        if refresh { crate::wiring::MaterializedConfiguration::Planned } else { crate::wiring::MaterializedConfiguration::Offline },
+            // Include orphaned resources (in state but not in .crn)
+            let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
+            for (id, loaded) in sf.build_orphans(&desired_ids) {
+                let current = loaded.into_current();
+                if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
+                    let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                    all_resources.push(orphan_resource);
+                }
+                managed_current.insert(id, current);
+            }
+        }
+        validated_config.into_offline_legacy_configuration()
+    };
+
+    let validated = match validated_config.resolve_legacy_graph(
         &moved_pairs, state_file.as_ref(),
-    )?;
+    )? {
+        carina_state::LegacyClassificationOutcome::Classified(validated) => validated,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            let advice = if refresh {
+                "run plan/apply (which reads upstream_state) to migrate"
+            } else {
+                "rerun destroy with --refresh=true"
+            };
+            return Err(AppError::Validation(format!("{rows}: legacy dependency migration requires reads; {advice}")));
+        }
+    };
     let (ctx, destroy_graph) = validated.config.context_and_resources();
     let parsed = destroy_graph.configuration();
     let resolved_wait_bindings = destroy_graph.configuration().wait_bindings.iter()

@@ -147,7 +147,7 @@ use carina_core::schema::{
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
 use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
-use carina_state::{LoadedOrphans, ResourceState, StateFile};
+use carina_state::{LegacyClassificationOutcome, LoadedOrphans, ResourceState, StateFile};
 
 #[cfg(test)]
 use crate::commands::shared::progress::RecordedProgressLines;
@@ -158,6 +158,8 @@ use crate::module_walk::ModuleWalk;
 
 mod legacy_migration;
 mod override_aware;
+
+use legacy_migration::DeferredForExpansionWitness;
 
 pub(crate) use legacy_migration::{
     MaterializedConfiguration, classify_legacy_state, replay_legacy_migration,
@@ -1810,7 +1812,9 @@ impl MigrationCheckConfig {
         mut self,
         mut state: StateFile,
     ) -> Result<
-        legacy_migration::ClassifiedLegacyGraph<carina_core::parser::InferredExportParam>,
+        LegacyClassificationOutcome<
+            legacy_migration::ClassifiedLegacyGraph<carina_core::parser::InferredExportParam>,
+        >,
         AppError,
     > {
         let state_view = Some(state.clone());
@@ -1825,8 +1829,7 @@ impl MigrationCheckConfig {
             &state_view,
         )?;
         classify_legacy_state(
-            self.resources,
-            MaterializedConfiguration::Offline,
+            MaterializedConfiguration::offline(self.resources),
             &moved_pairs,
             Some(&state),
         )
@@ -1852,15 +1855,14 @@ pub(crate) struct ValidatedLegacyConfiguration<E> {
     pub migrated_state: Option<StateFile>,
 }
 
-impl<E> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
+impl<E> ValidatedConfig<MaterializedConfiguration<E>> {
     /// Consume the configuration exactly once, preserving its wiring owner
     /// through classification, warning reporting, and strict graph validation.
     pub(crate) fn resolve_legacy_graph(
         self,
-        mode: MaterializedConfiguration,
         moves: &ResolvedMovePairs,
         state: Option<&StateFile>,
-    ) -> Result<ValidatedLegacyConfiguration<E>, AppError> {
+    ) -> Result<LegacyClassificationOutcome<ValidatedLegacyConfiguration<E>>, AppError> {
         let Self {
             wiring,
             resources: validated_resources,
@@ -1870,18 +1872,48 @@ impl<E> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
             inner: parsed,
             origin,
         } = validated_resources;
-        let validated = classify_legacy_state(parsed, mode, moves, state)?.report_and_validate()?;
-        Ok(ValidatedLegacyConfiguration {
-            config: ValidatedConfig {
-                wiring,
-                resources: ValidationReady {
-                    inner: validated.graph,
-                    origin,
+        let classified = match classify_legacy_state(parsed, moves, state)? {
+            LegacyClassificationOutcome::Classified(classified) => classified,
+            LegacyClassificationOutcome::RequiresReads(rows) => {
+                return Ok(LegacyClassificationOutcome::RequiresReads(rows));
+            }
+        };
+        let validated = classified.report_and_validate()?;
+        Ok(LegacyClassificationOutcome::Classified(
+            ValidatedLegacyConfiguration {
+                config: ValidatedConfig {
+                    wiring,
+                    resources: ValidationReady {
+                        inner: validated.graph,
+                        origin,
+                    },
+                    config_state: std::marker::PhantomData,
                 },
-                config_state: std::marker::PhantomData,
+                migrated_state: validated.migrated_state,
             },
-            migrated_state: validated.migrated_state,
-        })
+        ))
+    }
+}
+
+impl<E> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
+    /// An offline owner derives its classification evidence from the exact
+    /// residual loops it still owns; no command can choose a planned mode.
+    pub(crate) fn into_offline_legacy_configuration(
+        self,
+    ) -> ValidatedConfig<MaterializedConfiguration<E>> {
+        let Self {
+            wiring,
+            resources,
+            config_state: _,
+        } = self;
+        ValidatedConfig {
+            wiring,
+            resources: ValidationReady {
+                inner: MaterializedConfiguration::offline(resources.inner),
+                origin: resources.origin,
+            },
+            config_state: std::marker::PhantomData,
+        }
     }
 }
 
@@ -1890,9 +1922,9 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
     /// deferred-loop expansion, and child settlement as live planning. Destroy
     /// and state refresh both preserve persisted addresses through this owner.
     pub(crate) async fn materialize_legacy_configuration(
-        &mut self,
+        mut self,
         inputs: LegacyConfigurationReadInputs<'_, '_, '_>,
-    ) -> Result<MaterializedLegacyConfiguration, AppError> {
+    ) -> Result<MaterializedLegacyConfiguration<E>, AppError> {
         let LegacyConfigurationReadInputs {
             prelude,
             mut state,
@@ -1946,7 +1978,10 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
             return Err(AppError::Interrupted);
         }
         let mut expansion = addressed.seal(values);
-        let ExpandedRefreshState { sorted_resources } = self
+        let ExpandedRefreshState {
+            sorted_resources,
+            materialization,
+        } = self
             .expand_refresh_and_lift_states(ValidatedExpandRefreshAndLiftInputs {
                 provider,
                 comparison_provider: provider,
@@ -1983,7 +2018,21 @@ impl<E: Clone> ValidatedConfig<carina_core::parser::ModuleResolvedFile<E>> {
         if cancel.phase() != carina_core::shutdown::ShutdownPhase::Running {
             return Err(AppError::Interrupted);
         }
+        let Self {
+            wiring,
+            resources,
+            config_state: _,
+        } = self;
+        let config = ValidatedConfig {
+            wiring,
+            resources: ValidationReady {
+                inner: MaterializedConfiguration::after_expansion(resources.inner, materialization),
+                origin: resources.origin,
+            },
+            config_state: std::marker::PhantomData,
+        };
         Ok(MaterializedLegacyConfiguration {
+            config,
             sorted_resources,
             parts,
         })
@@ -2042,7 +2091,8 @@ pub(crate) struct LegacyConfigurationReadInputs<'a, 'backend, 'state> {
     pub cancel: &'a ShutdownToken,
 }
 
-pub(crate) struct MaterializedLegacyConfiguration {
+pub(crate) struct MaterializedLegacyConfiguration<E> {
+    pub config: ValidatedConfig<MaterializedConfiguration<E>>,
     pub sorted_resources: Vec<Resource>,
     pub parts: PreparedDeferredForExpansionParts,
 }
@@ -5770,10 +5820,6 @@ pub enum DeferredForWarningPolicy {
     Suppress,
 }
 
-/// Private proof that the addressed resource view came from the shared
-/// deferred-`for` expansion step.
-struct DeferredForExpansionWitness;
-
 /// Outcome of the carina#3132 post-refresh deferred-for expansion.
 pub struct DeferredForExpansion {
     /// The augmented, re-sorted resource set: every original resource
@@ -5836,6 +5882,7 @@ impl DeferredForExpansion {
 /// constructor is [`PreparedDeferredForExpansion::expand`].
 pub(crate) struct ExpandedCanonicalResources<E> {
     resources: CanonicalResourcePair<E>,
+    materialization: DeferredForExpansionWitness,
 }
 
 pub(crate) type PostExpansionConfiguration<E> = carina_core::resolved_graph::GraphConfiguration<
@@ -5860,13 +5907,17 @@ impl<E> ExpandedCanonicalResources<E> {
         self,
         configured: &OverrideAwareResources,
         data_sources: &[DataSource],
-    ) -> carina_core::parser::ModuleResolvedFile<E> {
-        let mut parsed = self.into_configuration();
+    ) -> MaterializedConfiguration<E> {
+        let Self {
+            resources,
+            materialization,
+        } = self;
+        let mut parsed = resources.into_parts().0;
         // The override-aware owner contains configuration resources only and
         // has just reconciled their final anonymous addresses.
         parsed.resources = configured.resources().to_vec();
         parsed.data_sources = data_sources.to_vec();
-        parsed
+        MaterializedConfiguration::after_expansion(parsed, materialization)
     }
 
     async fn prepare_desired_side_for_plan(
@@ -6538,11 +6589,18 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     let validated = classify_legacy_state(
         expanded_resources
             .into_plan_configuration(&override_aware_resources, &data_sources_for_plan),
-        MaterializedConfiguration::Planned,
         &addressed.moved_pairs,
         state_file.as_ref(),
-    )?
-    .report_and_validate()?;
+    )?;
+    let classified = match validated {
+        LegacyClassificationOutcome::Classified(classified) => classified,
+        LegacyClassificationOutcome::RequiresReads(rows) => {
+            return Err(AppError::Validation(format!(
+                "{rows}: legacy dependency migration requires reads; deferred loops remain unmaterialized after planning"
+            )));
+        }
+    };
+    let validated = classified.report_and_validate()?;
     let legacy_dependency_classification = validated.classification;
     let migrated_legacy_state = validated.migrated_state;
     if let Some(migrated) = migrated_legacy_state.as_ref() {
@@ -6862,7 +6920,14 @@ impl PreparedDeferredForExpansion {
             provider,
             ctx,
         )?;
-        Ok((ExpandedCanonicalResources { resources }, expansion))
+        let materialization = expansion._expanded.clone();
+        Ok((
+            ExpandedCanonicalResources {
+                resources,
+                materialization,
+            },
+            expansion,
+        ))
     }
 
     /// Consume the prepared state and canonical pair as one plan-expansion
@@ -7122,7 +7187,9 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
             new_child_ids: HashSet::new(),
             refreshable_child_ids: RefreshableChildIds::default(),
             printed_warnings,
-            _expanded: DeferredForExpansionWitness,
+            _expanded: DeferredForExpansionWitness::after_expansion(
+                parsed.deferred_for_expressions(),
+            ),
         });
     }
 
@@ -7248,7 +7315,9 @@ fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTarget<E
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
-        _expanded: DeferredForExpansionWitness,
+        _expanded: DeferredForExpansionWitness::after_expansion(
+            target.parsed().deferred_for_expressions(),
+        ),
     })
 }
 
@@ -7352,6 +7421,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
 /// part of prior state.
 pub(crate) struct ExpandedRefreshState {
     pub(crate) sorted_resources: Vec<Resource>,
+    materialization: DeferredForExpansionWitness,
 }
 
 /// Shared inputs for the refresh-and-lift constructors.
@@ -7678,7 +7748,7 @@ async fn finish_expanded_refresh_state<
         new_child_ids,
         refreshable_child_ids,
         printed_warnings,
-        _expanded: _,
+        _expanded: materialization,
     } = expansion;
     let children = ChildrenPending {
         new_child_ids,
@@ -7717,7 +7787,10 @@ async fn finish_expanded_refresh_state<
         );
     }
 
-    Ok(ExpandedRefreshState { sorted_resources })
+    Ok(ExpandedRefreshState {
+        sorted_resources,
+        materialization,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

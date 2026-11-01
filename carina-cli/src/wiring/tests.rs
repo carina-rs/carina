@@ -175,8 +175,12 @@ fn validation_failure_type_rejects_an_empty_error_vector() {
 #[tokio::test]
 async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let context = WiringContext::new_for_test(Vec::new(), &[]);
+    let resources = canonical_unresolved(Vec::new(), context.schemas());
+    let materialization =
+        DeferredForExpansionWitness::after_expansion(resources.parsed().deferred_for_expressions());
     let expanded_resources = ExpandedCanonicalResources {
-        resources: canonical_unresolved(Vec::new(), context.schemas()),
+        resources,
+        materialization,
     };
     let residual_deferred_for = expanded_resources
         .parsed()

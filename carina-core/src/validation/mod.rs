@@ -5013,14 +5013,20 @@ pub(crate) fn type_resolution_parser_error_is_covered<'a>(
 pub struct FileTypeResolutionReport {
     diagnostics: Vec<TypeResolutionDiagnostic>,
     covered_parser_error: bool,
-    resolved_argument_types: Option<ResolvedArgumentTypes>,
+    resolved_argument_types: ResolvedArgumentTypes,
 }
 
-/// Argument classifications minted only by successful declaration resolution.
-/// Dependency validation consumes these rather than ambiguous parser types.
+/// Per-argument outcomes minted by declaration resolution. An unresolved
+/// declaration cannot disable checks on unrelated dependency operands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedArgumentTypes {
-    types: IndexMap<String, ResolvedDependencyArgumentType>,
+    types: IndexMap<String, DependencyArgumentResolution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DependencyArgumentResolution {
+    Resolved(ResolvedDependencyArgumentType),
+    Unresolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5030,8 +5036,8 @@ enum ResolvedDependencyArgumentType {
 }
 
 impl FileTypeResolutionReport {
-    pub fn resolved_argument_types(&self) -> Option<&ResolvedArgumentTypes> {
-        self.resolved_argument_types.as_ref()
+    pub fn resolved_argument_types(&self) -> &ResolvedArgumentTypes {
+        &self.resolved_argument_types
     }
 
     pub fn diagnostics(&self) -> &[TypeResolutionDiagnostic] {
@@ -5107,7 +5113,7 @@ fn resolve_declaration_type(
 fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike, D>(
     parsed: &mut crate::parser::File<E, D>,
     config: &ProviderContext,
-) -> (Vec<TypeResolutionDiagnostic>, Option<ResolvedArgumentTypes>) {
+) -> (Vec<TypeResolutionDiagnostic>, ResolvedArgumentTypes) {
     let mut errors = Vec::new();
     let argument_sources = parsed
         .arguments
@@ -5125,18 +5131,18 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike, D>(
         })
         .collect::<IndexMap<_, _>>();
     let mut argument_types = IndexMap::new();
-    let mut arguments_resolved = true;
     for arg in &mut parsed.arguments {
         let argument_errors = resolve_declaration_type(&mut arg.static_type, config);
-        if argument_errors.is_empty() {
+        let resolution = if argument_errors.is_empty() {
             let classification = match &arg.static_type {
                 TypeExpr::Ref(_) => ResolvedDependencyArgumentType::ManagedHandle,
                 value => ResolvedDependencyArgumentType::Value(value.to_string()),
             };
-            argument_types.insert(arg.name.clone(), classification);
+            DependencyArgumentResolution::Resolved(classification)
         } else {
-            arguments_resolved = false;
-        }
+            DependencyArgumentResolution::Unresolved
+        };
+        argument_types.insert(arg.name.clone(), resolution);
         for error in argument_errors {
             errors.push(TypeResolutionDiagnostic::declaration(
                 TypeResolutionDeclarationKind::Argument,
@@ -5201,9 +5207,9 @@ fn resolve_file_type_exprs_impl<E: crate::parser::ExportParamLike, D>(
     }
     (
         errors,
-        arguments_resolved.then_some(ResolvedArgumentTypes {
+        ResolvedArgumentTypes {
             types: argument_types,
-        }),
+        },
     )
 }
 

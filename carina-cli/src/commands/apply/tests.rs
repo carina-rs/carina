@@ -1854,10 +1854,17 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
     .into_state();
     let no_move_plan: Plan = Plan::new();
     let moved_pairs = ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
+    let migration = match loaded_state
+        .classify_legacy_graph(graph, &moved_pairs, Default::default())
+        .expect("saved-plan migration classification resolves")
+    {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            panic!("saved-plan fixture unexpectedly requires reads: {rows}")
+        }
+    };
     let legacy_dependency_classification = Some(
-        loaded_state
-            .classify_legacy_graph(graph, &moved_pairs, Default::default())
-            .expect("saved-plan migration classification resolves")
+        migration
             .report_and_validate(|_| panic!("fixture has no warnings"))
             .expect("saved-plan migration graph validates")
             .classification,
@@ -9936,16 +9943,16 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn format_35_and_older_are_rejected_before_payload_decoding() {
+    async fn format_36_and_older_are_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            36,
-            "carina#3803 uses saved-plan format 36",
+            37,
+            "carina#3803 uses saved-plan format 37",
         );
 
-        for older_version in [35, 34, 33] {
+        for older_version in [36, 35, 34, 33] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

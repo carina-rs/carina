@@ -91,10 +91,16 @@ typed identities and values, refusing a mismatch with re-plan guidance before
 provider effects run. Format 34 plans cannot distinguish explicit false from
 an unspecified value and must be regenerated.
 
-Saved-plan format 36 stores complete resolved dependency addresses and the
-graph-projected destroy dependencies used by typed module handles and legacy
-state migration. Format 35 plans contain binding text rather than that typed
-projection and must be regenerated.
+Saved-plan format 37 supersedes format 36. It stores complete resolved
+dependency addresses, graph-projected destroy dependencies, and the exact
+legacy dependency migration classification approved during planning. Saved-plan
+apply replays that classification against the locked legacy state before any
+write. Older plans are rejected and must be regenerated with `carina plan --out`.
+
+State format 21 stores current and deposed dependencies and persisted
+`depends_on` directives as complete resolved resource addresses. Pre-v21 state
+must pass graph-aware legacy dependency classification before it can be written
+as v21; source-less inspection leaves that migration pending.
 
 Create, poll, and resume verdicts gain an `in-flight` arm. It carries the new
 continuation together with the error that stopped the current step. The host

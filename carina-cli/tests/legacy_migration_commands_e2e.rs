@@ -351,12 +351,63 @@ fn destroy_without_refresh_requires_reads_for_deferred_module_rows() {
     assert!(
         text.contains("net.children[0]")
             && text.contains("requires reads")
-            && text.contains("--refresh"),
+            && text.contains("rerun destroy with --refresh=true"),
         "{text}"
     );
     assert!(
         !project.temp.path().join("operations.log").exists(),
         "offline destroy must not issue provider reads"
+    );
+    assert_eq!(fs::read(project.state_path()).unwrap(), before);
+}
+
+fn residual_upstream_loop() -> Project {
+    let project = Project::new();
+    project.write(
+        "source.crn",
+        "let external = upstream_state { source = '../must-not-be-read' }\n",
+    );
+    project.write(
+        "children.crn",
+        "let children = for name in external.names {\n  mock.test.resource { name = name }\n}\n",
+    );
+    project.seed(
+        vec![row(
+            "test.resource",
+            "children[0]",
+            json!({"name": "child"}),
+            &["missing_dependency"],
+        )],
+        json!({"test.resource.children[0]": {"name": "child"}}),
+    );
+    project
+}
+
+#[test]
+fn destroy_refresh_cannot_claim_planned_materialization_with_residual_upstream_loops() {
+    let project = residual_upstream_loop();
+    let before = fs::read(project.state_path()).unwrap();
+    let output = project.run(&["destroy", "--auto-approve", "."]);
+    let text = rendered(&output);
+    assert!(
+        !output.status.success() && text.contains("children[0]") && text.contains("requires reads"),
+        "refresh=true cannot prove that deferred loops materialized: {text}"
+    );
+    assert_eq!(fs::read(project.state_path()).unwrap(), before);
+    let operations =
+        fs::read_to_string(project.temp.path().join("operations.log")).unwrap_or_default();
+    assert!(!operations.contains("delete"), "{operations}");
+}
+
+#[test]
+fn state_refresh_cannot_claim_planned_materialization_with_residual_upstream_loops() {
+    let project = residual_upstream_loop();
+    let before = fs::read(project.state_path()).unwrap();
+    let output = project.run(&["state", "refresh", "."]);
+    let text = rendered(&output);
+    assert!(
+        !output.status.success() && text.contains("children[0]") && text.contains("requires reads"),
+        "refresh must retain the residual-loop classification requirement: {text}"
     );
     assert_eq!(fs::read(project.state_path()).unwrap(), before);
 }

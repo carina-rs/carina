@@ -88,7 +88,8 @@ fn migrate_legacy_with_config(
     let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
     let moved_pairs =
         carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let migration = state.classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())?;
+    let migration =
+        expect_classified(state.classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())?);
     let migrated_rows = migration.migrated_rows();
     let mut warnings = Vec::new();
     let state = migration
@@ -107,6 +108,15 @@ fn migrate_legacy_with_config(
 struct ReportedLegacyMigration {
     migrated_rows: usize,
     warnings: Vec<LegacyDestroyOrderingWarning>,
+}
+
+fn expect_classified<T>(outcome: LegacyClassificationOutcome<T>) -> T {
+    match outcome {
+        LegacyClassificationOutcome::Classified(classified) => classified,
+        LegacyClassificationOutcome::RequiresReads(rows) => {
+            panic!("fixture requires reads: {rows}")
+        }
+    }
 }
 
 impl ReportedLegacyMigration {
@@ -6215,9 +6225,11 @@ fn v20_dependency_migration_classifies_moved_row_as_configured() {
     });
     let moved_pairs =
         carina_core::effect::ResolvedMovePairs::from_saved_plan(move_plan.move_effects());
-    let migration = state
-        .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
-        .expect("the moved row must classify with its persisted source scope");
+    let migration = expect_classified(
+        state
+            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
+            .expect("the moved row must classify with its persisted source scope"),
+    );
     assert!(migration.warnings().is_empty());
     let state = migration
         .report_and_validate(|_| panic!("fixture must not report warnings"))
@@ -6266,13 +6278,15 @@ fn with_legacy_classification_rejects_stale_sources() {
     let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
     let moved_pairs =
         carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let classification = original
-        .clone()
-        .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
-        .expect("original source classifies")
-        .report_and_validate(|_| panic!("fixture has no warnings"))
-        .expect("the graph must validate")
-        .classification;
+    let classification = expect_classified(
+        original
+            .clone()
+            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
+            .expect("original source classifies"),
+    )
+    .report_and_validate(|_| panic!("fixture has no warnings"))
+    .expect("the graph must validate")
+    .classification;
 
     consumer["dependency_bindings"] = serde_json::json!(["different_target"]);
     let changed = check_and_migrate(&state_json_with_resources(20, vec![target, consumer]))
@@ -6399,9 +6413,11 @@ fn report_invokes_sink_for_every_current_and_deposed_warning_before_returning_st
     let no_move_plan: carina_core::plan::Plan = carina_core::plan::Plan::new();
     let moved_pairs =
         carina_core::effect::ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let migration = state
-        .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
-        .expect("orphan unknown names classify as warnings");
+    let migration = expect_classified(
+        state
+            .classify_legacy_graph(graph, &moved_pairs, BTreeSet::new())
+            .expect("orphan unknown names classify as warnings"),
+    );
 
     let mut reported = Vec::new();
     let state = migration

@@ -32,6 +32,12 @@ Display the plan in an interactive TUI (terminal user interface) mode. Allows na
 
 Save the plan to a JSON file for later use with `carina apply`. The saved plan includes the effects, resource definitions, provider configurations, state metadata for drift detection, and the identity (SHA-256, source and version) and schema fingerprints of the providers it was computed with. Re-run `carina plan --out` after re-installing or upgrading a provider: `carina apply` rejects a saved plan whose providers no longer match (see [Applying a Saved Plan](/reference/cli/apply/#applying-a-saved-plan)).
 
+Saved-plan format 37 supersedes format 36 and records complete resolved
+dependency addresses and the legacy dependency migration classification used
+by planning. Applying it replays that classification against locked state
+before writing state v21. Older saved plans are rejected; regenerate them with
+`carina plan --out`.
+
 Saved plans never contain secret plaintext. Carina stores each secret as a
 typed placeholder containing only an Argon2id hash, including secrets nested
 inside lists or maps and values derived from `decrypt()` or other expressions.
@@ -117,9 +123,9 @@ its tagged tri-state object:
 }
 ```
 
-The array is required in saved-plan format 35, even when it is empty. Applying
-a saved plan recomputes it against locked state and refuses the plan if the
-typed IDs or values differ.
+The array has been required since saved-plan format 35, even when it is empty.
+Applying a saved plan recomputes it against locked state and refuses the plan
+if the typed IDs or values differ.
 
 ```bash
 carina plan --json

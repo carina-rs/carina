@@ -342,29 +342,22 @@ let consumer = mock.test.resource {
     assert!(!project.join("unused-backend-state.json").exists());
 }
 
-#[test]
-fn migration_check_reports_rows_that_require_data_source_reads_as_offline_unclassifiable() {
+fn assert_migration_check_requires_reads(source: &str, iterable: &str) {
     let temp = tempfile::tempdir().expect("create read-dependent migration project");
     let project = temp.path();
     fs::write(project.join("providers.crn"), "provider mock {}\n")
         .expect("write built-in provider declaration");
-    fs::write(
-        project.join("source.crn"),
-        r#"let roles = read mock.iam.Roles { name_regex = "x" }
-"#,
-    )
-    .expect("write data source");
+    fs::write(project.join("source.crn"), source).expect("write data source");
     fs::write(
         project.join("children.crn"),
-        r#"let children = for name in roles.names {
-  mock.test.resource { name = name }
-}
-"#,
+        format!(
+            "let children = for name in {iterable} {{\n  mock.test.resource {{ name = name }}\n}}\n"
+        ),
     )
     .expect("write read-dependent loop");
 
     let state = project.join("copied-v20-state.json");
-    let state_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+    let mut legacy_state = serde_json::json!({
         "version": 20,
         "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
         "serial": 12,
@@ -384,8 +377,16 @@ fn migration_check_reports_rows_that_require_data_source_reads_as_offline_unclas
             "dependency_bindings": ["gone_dependency"]
         }],
         "exports": {}
-    }))
-    .expect("encode read-dependent v20 state fixture");
+    });
+    let mut second_child = legacy_state["resources"][0].clone();
+    second_child["identity"] = serde_json::json!("children[1]");
+    second_child["binding"] = serde_json::json!("children[1]");
+    legacy_state["resources"]
+        .as_array_mut()
+        .unwrap()
+        .push(second_child);
+    let state_bytes =
+        serde_json::to_vec_pretty(&legacy_state).expect("encode read-dependent v20 state fixture");
     fs::write(&state, &state_bytes).expect("write copied v20 state");
 
     let output = run_builtin_check(project, &state);
@@ -400,13 +401,32 @@ fn migration_check_reports_rows_that_require_data_source_reads_as_offline_unclas
     );
     assert!(
         rendered.contains("children[0]")
-            && rendered.contains("cannot classify offline: requires reads"),
+            && rendered.contains("children[1]")
+            && rendered.contains("cannot classify offline: rows owned by a deferred loop")
+            && rendered.contains("run plan/apply (which reads) to migrate")
+            && !rendered.contains("--refresh"),
         "offline check must explain the unclassifiable row explicitly:\n{rendered}",
     );
     assert_eq!(
         fs::read(&state).expect("re-read copied state"),
         state_bytes,
         "the failed offline check must remain read-only",
+    );
+}
+
+#[test]
+fn migration_check_reports_rows_that_require_data_source_reads_as_offline_unclassifiable() {
+    assert_migration_check_requires_reads(
+        "let roles = read mock.iam.Roles { name_regex = \"x\" }\n",
+        "roles.names",
+    );
+}
+
+#[test]
+fn migration_check_reports_upstream_loop_rows_with_plan_apply_advice() {
+    assert_migration_check_requires_reads(
+        "let external = upstream_state { source = \"../must-not-be-read\" }\n",
+        "external.names",
     );
 }
 

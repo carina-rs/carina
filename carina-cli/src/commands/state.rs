@@ -471,7 +471,14 @@ async fn run_state_migration_check(
     // The owner performs parser-aware cleanup, late identity preparation,
     // moved-address projection, and graph construction as one transition.
     // Historical identifier-less read rows are removed only from this copy.
-    let migration = validated.migrate_legacy_dependencies_from_copied_state(state)?;
+    let migration = match validated.migrate_legacy_dependencies_from_copied_state(state)? {
+        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            return Err(AppError::Validation(format!(
+                "{rows}: cannot classify offline: rows owned by a deferred loop over upstream_state or unread data sources; run plan/apply (which reads) to migrate"
+            )));
+        }
+    };
     let migrated_rows = migration.migrated_rows();
     let warning_count = migration.warning_count();
     let _validated = migration.report_and_validate()?;
@@ -1772,6 +1779,7 @@ pub(crate) async fn run_state_refresh_locked(
     // the map for Phase 2.5 hydration.
     let empty_remote_bindings = HashMap::new();
     let crate::wiring::MaterializedLegacyConfiguration {
+        config: validated_config,
         sorted_resources,
         parts:
             crate::wiring::PreparedDeferredForExpansionParts {
@@ -1870,11 +1878,16 @@ pub(crate) async fn run_state_refresh_locked(
         &parsed.data_sources,
         &state_file,
     )?;
-    let validated = validated_config.resolve_legacy_graph(
-        crate::wiring::MaterializedConfiguration::Planned,
-        &moved_pairs,
-        state_file.as_ref(),
-    )?;
+    let validated = match validated_config
+        .resolve_legacy_graph(&moved_pairs, state_file.as_ref())?
+    {
+        carina_state::LegacyClassificationOutcome::Classified(validated) => validated,
+        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
+            return Err(AppError::Validation(format!(
+                "{rows}: legacy dependency migration requires reads; run plan/apply (which reads upstream_state) to migrate"
+            )));
+        }
+    };
     let (ctx, expanded_graph) = validated.config.context_and_resources();
     let parsed = expanded_graph.configuration();
     if let Some(migrated) = validated.migrated_state {
