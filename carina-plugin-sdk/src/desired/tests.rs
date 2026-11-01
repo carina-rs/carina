@@ -369,8 +369,8 @@ fn nat_and_sqs_validation_distinguishes_known_absent_and_deferred() {
 #[test]
 fn nat_validation_reads_native_enum_and_guest_string_identically() {
     use carina_core::resource::EnumValueResolver;
-    use carina_core::schema::{AttributeType, TypeIdentity};
-    let mode_type = AttributeType::enum_(
+    use carina_core::schema::{CompiledAttributeType, TypeIdentity};
+    let mode_type = CompiledAttributeType::enum_(
         TypeIdentity::new(Some("aws"), ["ec2", "NatGateway"], "AvailabilityMode"),
         Some(vec!["regional".into(), "zonal".into()]),
         Vec::new(),
@@ -530,8 +530,8 @@ fn removed_deferred_values_can_move_within_their_attribute_on_both_routes() {
 #[test]
 fn enum_and_duration_have_identical_wire_scalar_kinds_on_both_routes() {
     use carina_core::resource::EnumValueResolver;
-    use carina_core::schema::{AttributeType, TypeIdentity};
-    let ty = AttributeType::enum_(
+    use carina_core::schema::{CompiledAttributeType, TypeIdentity};
+    let ty = CompiledAttributeType::enum_(
         TypeIdentity::new(Some("aws"), ["ec2", "NatGateway"], "AvailabilityMode"),
         Some(vec!["regional".into()]),
         Vec::new(),
@@ -646,8 +646,8 @@ fn known_defaults_reject_occupied_known_and_deferred_keys() {
 #[test]
 fn move_within_preserves_enum_leaves_in_maps_on_both_routes() {
     use carina_core::resource::EnumValueResolver;
-    use carina_core::schema::{AttributeType, TypeIdentity};
-    let ty = AttributeType::enum_(
+    use carina_core::schema::{CompiledAttributeType, TypeIdentity};
+    let ty = CompiledAttributeType::enum_(
         TypeIdentity::new(Some("test"), ["Rule"], "Status"),
         Some(vec!["Enabled".into(), "Disabled".into()]),
         Vec::new(),

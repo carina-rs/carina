@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 
 use std::collections::HashSet;
 
@@ -36,19 +37,23 @@ fn base_schemas(subnet_vpc_id_create_only: bool) -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated("vpc_id", AttributeType::string()).build(),
+                PatternAttributeSchema::provider_populated(
+                    "vpc_id",
+                    PatternAttributeType::string(),
+                )
+                .build(),
             )
             .with_unique_name_attribute("name"))
         .validate()
@@ -64,23 +69,25 @@ fn subnet_schema(
     default_prevent_destroy: bool,
 ) -> crate::schema::ValidatedResourceSchema {
     let vpc_id = if subnet_vpc_id_create_only {
-        AttributeSchema::required("vpc_id", AttributeType::string())
+        PatternAttributeSchema::required("vpc_id", PatternAttributeType::string())
             .create_only()
             .build()
     } else {
-        AttributeSchema::required("vpc_id", AttributeType::string()).build()
+        PatternAttributeSchema::required("vpc_id", PatternAttributeType::string()).build()
     };
-    let schema = ResourceSchema::new("ec2.Subnet")
+    let schema = PatternResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::optional("name", AttributeType::string())
+            PatternAttributeSchema::optional("name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(vpc_id)
-        .attribute(AttributeSchema::required("cidr_block", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tags", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::optional("availability_zone", AttributeType::string())
+            PatternAttributeSchema::required("cidr_block", PatternAttributeType::string()).build(),
+        )
+        .attribute(PatternAttributeSchema::optional("tags", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("availability_zone", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
@@ -614,14 +621,14 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
     let mut schemas = base_schemas(false);
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             ))
@@ -665,19 +672,23 @@ fn chained_cbd_middle_binding_distinct_from_identity_auto_promoted() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test.Producer")
+        (PatternResourceSchema::new("test.Producer")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("shape", AttributeType::string())
+                PatternAttributeSchema::optional("shape", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::provider_populated("producer_id", AttributeType::string()).build(),
+                PatternAttributeSchema::provider_populated(
+                    "producer_id",
+                    PatternAttributeType::string(),
+                )
+                .build(),
             )
             .with_unique_name_attribute("name"))
         .validate()
@@ -685,31 +696,36 @@ fn chained_cbd_middle_binding_distinct_from_identity_auto_promoted() {
     );
     schemas.insert(
         "",
-        (ResourceSchema::new("test.Middle")
+        (PatternResourceSchema::new("test.Middle")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("a_id", AttributeType::string())
+                PatternAttributeSchema::optional("a_id", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
-            .attribute(AttributeSchema::provider_populated("b_id", AttributeType::string()).build())
+            .attribute(
+                PatternAttributeSchema::provider_populated("b_id", PatternAttributeType::string())
+                    .build(),
+            )
             .with_unique_name_attribute("name"))
         .validate()
         .expect("schema fixture must be valid"),
     );
     schemas.insert(
         "",
-        (ResourceSchema::new("test.Consumer")
+        (PatternResourceSchema::new("test.Consumer")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
-            .attribute(AttributeSchema::optional("b_id", AttributeType::string()).build())
+            .attribute(
+                PatternAttributeSchema::optional("b_id", PatternAttributeType::string()).build(),
+            )
             .with_unique_name_attribute("name"))
         .validate()
         .expect("schema fixture must be valid"),
@@ -817,7 +833,7 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
     .expect("multi-file collision fixture parses");
     let parsed = crate::module_resolver::resolve_modules_providerless(parsed, &directory)
         .expect("multi-file collision fixture crosses root expansion")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("collision fixture contains no parser placeholders");
     let mut unresolved = parsed.resources;
 
@@ -1359,7 +1375,7 @@ fn unbound_deferred_for_promotes_replaced_producer_to_cbd() {
     let parsed = crate::parser::parse(
         "let vpc = ec2.Vpc { name = 'vpc' }\nfor subnet in vpc.subnets { ec2.Subnet { name = subnet } }",
         &crate::parser::ProviderContext::default(),
-    ).unwrap().into_expanded().unwrap();
+    ).unwrap().into_expanded(&crate::schema::SchemaRegistry::new()).unwrap();
     let target = parsed.deferred_for_expressions()[0].target().clone();
     assert!(matches!(
         target,
@@ -1394,14 +1410,14 @@ fn impossible_cbd_promotion_names_deferred_and_managed_dependents() {
     let mut schemas = base_schemas(false);
     schemas.insert(
         "",
-        ResourceSchema::new("ec2.Vpc")
+        PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )

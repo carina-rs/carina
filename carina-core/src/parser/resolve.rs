@@ -492,6 +492,7 @@ trait PreApplyResourceMut {
     fn attributes(&self) -> &IndexMap<String, Value>;
     fn dependency_bindings(&self) -> &BTreeSet<RelativeBindingName>;
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value>;
+    fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives;
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName>;
 }
 
@@ -507,6 +508,9 @@ impl PreApplyResourceMut for Resource {
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
+    }
+    fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives {
+        &mut self.directives
     }
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName> {
         &mut self.dependency_bindings
@@ -525,6 +529,9 @@ impl PreApplyResourceMut for DataSource {
     }
     fn attributes_mut(&mut self) -> &mut IndexMap<String, Value> {
         &mut self.attributes
+    }
+    fn directives_mut(&mut self) -> &mut crate::resource::AuthoredDirectives {
+        &mut self.directives
     }
     fn dependency_bindings_mut(&mut self) -> &mut BTreeSet<RelativeBindingName> {
         &mut self.dependency_bindings
@@ -798,6 +805,13 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         }
 
         *resource.attributes_mut() = resolved_attrs;
+        resolve_directive_function_calls(
+            resource.directives_mut(),
+            &binding_map,
+            fn_ctx.config,
+            defer_unknown_functions,
+            preserve_failed_user_calls,
+        )?;
     }
 
     // Residual `for` bodies are not part of `iter_pre_apply_resources_mut`:
@@ -810,6 +824,23 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     // effect. Keep resource references deferred so apply-time expansion still
     // substitutes the loop value and other runtime bindings normally.
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
+        match &mut deferred.body {
+            crate::parser::DeferredForBody::Resource(resource) => resolve_directive_function_calls(
+                resource.directives_mut(),
+                &binding_map,
+                fn_ctx.config,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?,
+            crate::parser::DeferredForBody::Read(source) => resolve_directive_function_calls(
+                &mut source.directives,
+                &binding_map,
+                fn_ctx.config,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?,
+            crate::parser::DeferredForBody::ModuleCall(_) => {}
+        }
         let Some(attributes) = deferred.template_attributes_mut() else {
             continue;
         };
@@ -821,6 +852,32 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 defer_unknown_functions,
                 preserve_failed_user_calls,
             )?;
+        }
+    }
+
+    for conditional in &mut parsed.deferred_module_ifs {
+        for body in conditional.branches_mut() {
+            match body {
+                crate::parser::DeferredIfBody::Resource(resource) => {
+                    resolve_directive_function_calls(
+                        &mut resource.directives,
+                        &binding_map,
+                        fn_ctx.config,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?
+                }
+                crate::parser::DeferredIfBody::DataSource(source) => {
+                    resolve_directive_function_calls(
+                        &mut source.directives,
+                        &binding_map,
+                        fn_ctx.config,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?
+                }
+                crate::parser::DeferredIfBody::ModuleCall(_) => {}
+            }
         }
     }
 
@@ -1723,6 +1780,29 @@ fn reject_required_interpolation_unavailable<B: BindingAddress>(
         return Err(unavailable_builtin_error(function, reason, source_line));
     }
     Ok(())
+}
+
+fn resolve_directive_function_calls(
+    directives: &mut crate::resource::AuthoredDirectives,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+    config: &ProviderContext,
+    defer_unknown_functions: bool,
+    preserve_failed_user_calls: bool,
+) -> Result<(), ParseError> {
+    directives.try_update_expressions(|_, expression| {
+        expression.value = resolve_function_calls_only(
+            &expression.value,
+            binding_map,
+            config,
+            defer_unknown_functions,
+            preserve_failed_user_calls,
+        )
+        .map_err(|error| match expression.source().authored_location() {
+            Some((source_file, _)) => error.in_file(source_file),
+            None => error,
+        })?;
+        Ok(())
+    })
 }
 
 /// Walk a value tree and finalize any `Value::Deferred(DeferredValue::FunctionCall)` placeholder

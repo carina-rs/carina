@@ -127,7 +127,7 @@ fn unbound_deferred_test_target() -> DeferredForExpression {
         &crate::parser::ProviderContext::default(),
     )
     .expect("unbound deferred loop parses")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("unbound deferred-loop fixture has no parser placeholders");
     parsed.deferred_for_expressions()[0].clone()
 }

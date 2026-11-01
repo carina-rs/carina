@@ -140,11 +140,9 @@ use carina_core::resource::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 use carina_core::schema::ValidatedResourceSchema;
-#[cfg(test)]
-use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    OwnerBoundResourceSchema, ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
-    ValidatedProviderSchemaWitness, resolve_file_block_names_with_schemas,
+    CompiledResourceSchema as ResourceSchema, OwnerBoundResourceSchema, SchemaKind, SchemaRegistry,
+    TypeError, ValidatedProviderSchemaWitness, resolve_file_block_names_with_schemas,
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
@@ -901,7 +899,7 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)
         }
-        carina_core::validation::ResolveFileError::LeftoverPlaceholders(error) => error.into(),
+        carina_core::validation::ResolveFileError::Expansion(error) => error.into(),
     }
 }
 
@@ -948,7 +946,7 @@ fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
     let parsed = resolve_file_binding_uses(parsed, base_dir, context)?;
     let unresolved = unresolved
         .into_iter()
-        .map(Resource::into_expanded)
+        .map(|resource| resource.into_expanded(context.schemas()))
         .collect::<Result<_, _>>()?;
     Ok((parsed, unresolved))
 }

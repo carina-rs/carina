@@ -20,8 +20,8 @@ use crate::resource::{
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value, ValueString,
 };
 use crate::schema::{
-    AttributeType, IdentityMode, IdentityPath, IdentityPathSegment, ResourceSchema, SchemaRegistry,
-    Shape, ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, IdentityMode,
+    IdentityPath, IdentityPathSegment, SchemaRegistry, Shape, ValidatedResourceSchema,
 };
 use crate::validation::is_string_compatible_type;
 use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};

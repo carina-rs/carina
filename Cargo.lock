@@ -1107,6 +1107,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "regex",
+ "regex-syntax",
  "semver",
  "serde",
  "serde_json",

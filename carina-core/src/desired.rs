@@ -745,8 +745,8 @@ mod tests {
     #[test]
     fn an_edited_label_cannot_claim_an_unchanged_enums_metadata() {
         use crate::resource::EnumValueResolver;
-        use crate::schema::{AttributeType, TypeIdentity};
-        let ty = AttributeType::enum_(
+        use crate::schema::{CompiledAttributeType, TypeIdentity};
+        let ty = CompiledAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["Example"], "Mode"),
             Some(vec!["ENABLED".into()]),
             Vec::new(),
@@ -958,8 +958,8 @@ mod tests {
     #[test]
     fn edited_map_values_cannot_donate_enum_metadata_to_an_inserted_key() {
         use crate::resource::EnumValueResolver;
-        use crate::schema::{AttributeType, TypeIdentity};
-        let ty = AttributeType::enum_(
+        use crate::schema::{CompiledAttributeType, TypeIdentity};
+        let ty = CompiledAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["Example"], "Mode"),
             Some(vec!["ENABLED".into(), "DISABLED".into()]),
             Vec::new(),
@@ -1000,8 +1000,8 @@ mod tests {
     #[test]
     fn reordering_maps_in_a_list_preserves_nested_enum_and_sensitive_leaves() {
         use crate::resource::{EnumValueResolver, ValueString};
-        use crate::schema::{AttributeType, TypeIdentity};
-        let ty = AttributeType::enum_(
+        use crate::schema::{CompiledAttributeType, TypeIdentity};
+        let ty = CompiledAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["Rule"], "Status"),
             Some(vec!["Enabled".into(), "Disabled".into()]),
             Vec::new(),
@@ -1131,8 +1131,8 @@ mod tests {
     #[test]
     fn list_map_metadata_cannot_move_between_different_keys() {
         use crate::resource::EnumValueResolver;
-        use crate::schema::{AttributeType, TypeIdentity};
-        let ty = AttributeType::enum_(
+        use crate::schema::{CompiledAttributeType, TypeIdentity};
+        let ty = CompiledAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["Rule"], "Mode"),
             Some(vec!["ENABLED".into(), "DISABLED".into()]),
             Vec::new(),

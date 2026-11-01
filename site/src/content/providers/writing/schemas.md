@@ -164,10 +164,63 @@ Provider-populated attributes can still be marked `deferred_populate` when the A
 - Scalars: `string()`, `int()`, `float()`, `bool()`, `duration()`.
 - Refined scalars carry extra rules: `refined_string(identity, pattern, length, to_dsl)`, `refined_int(identity, range)` and `refined_float(identity, range)`, plus the `_with_validator` forms described in [Validators and type identities](#validators-and-type-identities).
 - Collections: `list(inner)`, `unordered_list(inner)` for lists whose order the API does not keep, `map(value)` and `map_with_key(key, value)`.
+- Refined lists: `refined_list(element_type, ordered, length, elements)`, with an explicit `ListElements::AllowDuplicates` or `ListElements::Unique` policy.
 - Enums: `enum_(identity, values, dsl_aliases, validate, to_dsl)`.
 - Structs: `struct_(name, fields)`, with fields built from `StructField`.
 - Unions: `union(members)`, for a value that may take one of several shapes.
 - References: `ref_(name)` points at a definition registered with `ResourceSchema::with_def`, which is how recursive shapes are written.
+
+Use `ListElements::Unique` when the API requires distinct elements. Ordering,
+length, and uniqueness are independent: an ordered list can still require
+unique elements, and a minimum length can reject an empty list. For example:
+
+```rust
+use carina_plugin_sdk::core::schema::{
+    AttributeSchema, AttributeType, ListElements, ResourceSchema, TypeIdentity,
+};
+
+let claim_key = AttributeType::enum_(
+    TypeIdentity::new(Some("github"), ["actions", "OidcSubject"], "ClaimKey"),
+    Some(vec!["repo".into(), "context".into()]),
+    Vec::new(),
+    None,
+    None,
+);
+let schema = ResourceSchema::new("actions.OidcSubject")
+    .attribute(AttributeSchema::required(
+        "claim_keys",
+        AttributeType::refined_list(
+            claim_key,
+            true,
+            Some((Some(1), None)),
+            ListElements::Unique,
+        ),
+    ).build())
+    .validate()
+    .expect("the subject schema is valid");
+```
+
+The shared schema validator enforces this declaration for authored desired
+values and provider configuration in `carina validate`, planning, and LSP
+diagnostics. It compares canonical values, so `[repo, repo]` and
+`[repo, github.actions.OidcSubject.ClaimKey.repo]` both fail. Enum aliases
+resolve to the same API value before comparison. Canonicalization preserves
+integer versus float spellings and struct block aliases versus canonical field
+keys, so those spellings compare as distinct. Strings, integers, and nested
+values also support uniqueness.
+
+Elements containing secrets, environment-derived (diagnostic-sensitive) values,
+or unresolved values are excluded from duplicate comparison; known,
+nonsensitive elements in the same list are still checked. A secret wrapping the
+whole list is also excluded. Provider read-back, persisted state values, and
+wait-condition right-hand sides are not checked for uniqueness. List length
+constraints still apply in all these cases. `list()` and `unordered_list()`
+allow duplicates.
+
+Since protocol v17, every list schema JSON record must carry `elements` as
+`"allow_duplicates"` or `"unique"`, including ordinary lists. There is no
+default at decode. Rebuild providers against the current SDK before loading
+them with the current host.
 
 Struct fields use the same three constructors as attributes, `StructField::optional`, `StructField::required` and `StructField::provider_populated`:
 
@@ -435,11 +488,33 @@ let schema = ResourceSchema::new("organizations.Account")
     .expect("the schema is valid");
 ```
 
-Carina then rejects deletion and replacement unless the user writes the
-literal opt-out `directives { prevent_destroy = false }`. Resource schemas are
+Carina then rejects deletion and replacement unless the user sets
+`prevent_destroy` to a value that resolves to `false`, for example
+`directives { prevent_destroy = false }`. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
-severe consequences. The required boolean is transported in protocol-v17
+severe consequences. The required boolean is transported in protocol-v18
 schema JSON; an older provider that omits it fails during schema loading.
+
+A module argument default that resolves to `false` cannot disable this schema
+protection. Validation requires the caller to pass the argument explicitly,
+such as `protect = false`. Any contributing default keeps a value defaulted,
+including through nested argument expressions, function calls, conditional value
+expressions, and coalescing. Loop directives and module-call arguments inherit
+the iterable's default origin only when they reference a loop variable.
+Combining an explicit value with a defaulted value retains all the contributing
+defaults. Diagnostics name every contributing default and identify the calls
+that omitted its argument.
+
+Literal `prevent_destroy = false` remains an explicit opt-out inside loops over
+defaulted iterables. A structural condition that selects whether a resource or
+module call exists does not supply the body's values, so it does not make a
+literal opt-out defaulted either. Reading a loop variable from a defaulted list
+or map still carries that iterable's default origin.
+
+An argument whose default refers to another argument remains defaulted even if
+that other argument was passed explicitly. The caller can replace the dependent
+default by passing that argument itself. Types without schema-default protection
+and the other boolean directives keep their usual resolved-value behavior.
 
 ## The validated schema
 

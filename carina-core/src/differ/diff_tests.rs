@@ -1,4 +1,7 @@
 use super::{create_plan_for_tests as create_plan, *};
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 
 use crate::resource::{
     AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue,
@@ -193,35 +196,39 @@ fn plan_for_reordered_iam_policy_value_lists(
     ordering: PolicyValueListOrdering,
     saved_policy_attrs: SavedPolicyAttrs,
 ) -> Plan {
-    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
     use crate::value::canonicalize_resources_with_schemas;
 
     let string_or_list = || {
         let list = match ordering {
-            PolicyValueListOrdering::Ordered => AttributeType::list(AttributeType::string()),
+            PolicyValueListOrdering::Ordered => {
+                PatternAttributeType::list(PatternAttributeType::string())
+            }
             PolicyValueListOrdering::Unordered => {
-                AttributeType::unordered_list(AttributeType::string())
+                PatternAttributeType::unordered_list(PatternAttributeType::string())
             }
         };
-        AttributeType::union(vec![AttributeType::string(), list])
+        PatternAttributeType::union(vec![PatternAttributeType::string(), list])
     };
-    let principal = AttributeType::struct_(
+    let principal = PatternAttributeType::struct_(
         "Principal",
-        vec![StructField::optional("aws", string_or_list()).build()],
+        vec![PatternStructField::optional("aws", string_or_list()).build()],
     );
-    let statement = AttributeType::struct_(
+    let statement = PatternAttributeType::struct_(
         "Statement",
         vec![
-            StructField::optional("action", string_or_list()).build(),
-            StructField::optional("principal", principal).build(),
+            PatternStructField::optional("action", string_or_list()).build(),
+            PatternStructField::optional("principal", principal).build(),
         ],
     );
-    let policy_document = AttributeType::struct_(
+    let policy_document = PatternAttributeType::struct_(
         "PolicyDocument",
-        vec![StructField::optional("statement", AttributeType::list(statement)).build()],
+        vec![
+            PatternStructField::optional("statement", PatternAttributeType::list(statement))
+                .build(),
+        ],
     );
-    let schema = ResourceSchema::new("iam.Policy")
-        .attribute(AttributeSchema::optional("policy_document", policy_document).build());
+    let schema = PatternResourceSchema::new("iam.Policy")
+        .attribute(PatternAttributeSchema::optional("policy_document", policy_document).build());
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "aws",
@@ -636,8 +643,6 @@ fn no_false_update_without_unique_name_attribute() {
 
 #[test]
 fn replace_when_create_only_attr_changed() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
         "cidr_block",
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
@@ -658,8 +663,8 @@ fn replace_when_create_only_attr_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc").attribute(
-            AttributeSchema::optional("cidr_block", AttributeType::string())
+        (PatternResourceSchema::new("ec2.Vpc").attribute(
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -757,6 +762,8 @@ fn nested_create_only_plan(immutable: &str, mutable: &str) -> (Plan, ResourceId)
 }
 
 fn omitted_optional_nested_create_only_fixture() -> (Resource, State, SchemaRegistry) {
+    use crate::schema::ResourceSchema;
+
     use crate::schema::{AttributeSchema, AttributeType, StructField};
 
     let id = ResourceId::with_identity("budgets.Budget", "monthly");
@@ -829,6 +836,8 @@ fn update_when_only_mutable_sibling_of_nested_create_only_field_changes() {
 }
 
 fn unordered_nested_create_only_plan(desired_items: Vec<Value>) -> (Plan, ResourceId) {
+    use crate::schema::ResourceSchema;
+
     use crate::schema::{AttributeSchema, AttributeType, StructField};
 
     let item = |key: &str, description: &str| {
@@ -1019,20 +1028,20 @@ fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_st
     ));
 }
 
-fn create_only_nested_write_only_fixture(
+fn create_only_nested_write_only_fixture<R: crate::schema::PatternForm>(
     password: &str,
-) -> (Resource, State, crate::schema::ResourceSchema) {
+) -> (Resource, State, crate::schema::PatternResourceSchema<R>) {
     use crate::resource::DeferredValue;
-    use crate::schema::{AttributeSchema, AttributeType, StructField};
 
-    let schema = crate::schema::ResourceSchema::new("test.Credential").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("test.Credential").attribute(
+        PatternAttributeSchema::optional(
             "creds",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Credentials",
                 vec![
-                    StructField::optional("username", AttributeType::string()).build(),
-                    StructField::optional("password", AttributeType::string())
+                    PatternStructField::optional("username", PatternAttributeType::string())
+                        .build(),
+                    PatternStructField::optional("password", PatternAttributeType::string())
                         .write_only()
                         .build(),
                 ],
@@ -1113,14 +1122,20 @@ fn create_only_nested_write_only_changed_record_plans_replace() {
     let (previous_desired, _previous_current, schema) =
         create_only_nested_write_only_fixture("old-secret");
     let (desired, current, _equivalent_schema) =
-        create_only_nested_write_only_fixture("new-secret");
+        create_only_nested_write_only_fixture::<crate::schema::Draft>("new-secret");
     let id = desired.id.clone();
+    let schema = schema.validate().expect("schema fixture must be valid");
     let mut record = crate::provider::NestedWriteOnlyRecord::default();
     record
-        .record_sent(&schema, ["creds"], &previous_desired.attributes, None)
+        .record_sent(
+            schema.as_schema(),
+            ["creds"],
+            &previous_desired.attributes,
+            None,
+        )
         .expect("fixture credentials are persistable");
     let mut schemas = SchemaRegistry::new();
-    schemas.insert("", schema.validate().expect("schema fixture must be valid"));
+    schemas.insert("", schema);
     let saved = crate::provider::RawSavedAttrs::from_persisted(
         HashMap::new(),
         HashMap::from([(id.clone(), record)]),
@@ -1151,8 +1166,6 @@ fn create_only_nested_write_only_changed_record_plans_replace() {
 
 #[test]
 fn normal_update_when_non_create_only_attr_changed() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let resources = vec![Resource::new("ec2.Vpc", "my-vpc").with_attribute(
         "enable_dns_support",
         Value::Concrete(ConcreteValue::Bool(true)),
@@ -1173,14 +1186,18 @@ fn normal_update_when_non_create_only_attr_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("enable_dns_support", AttributeType::bool()).build(),
+                PatternAttributeSchema::optional(
+                    "enable_dns_support",
+                    PatternAttributeType::bool(),
+                )
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -1213,8 +1230,6 @@ fn normal_update_when_non_create_only_attr_changed() {
 
 #[test]
 fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let resources = vec![
         Resource::new("ec2.Vpc", "my-vpc")
             .with_attribute(
@@ -1245,14 +1260,18 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("enable_dns_support", AttributeType::bool()).build(),
+                PatternAttributeSchema::optional(
+                    "enable_dns_support",
+                    PatternAttributeType::bool(),
+                )
+                .build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -1285,8 +1304,6 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
 
 #[test]
 fn replace_carries_create_before_destroy_directives() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     let mut resource = Resource::new("ec2.Vpc", "my-vpc")
         .with_attribute(
             "name",
@@ -1318,14 +1335,14 @@ fn replace_carries_create_before_destroy_directives() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (crate::schema::ResourceSchema::new("ec2.Vpc")
+        (PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -1423,8 +1440,6 @@ fn diff_no_change_when_list_of_maps_reordered() {
 
 #[test]
 fn replace_with_provider_prefixed_schema_key() {
-    use crate::schema::{AttributeSchema, AttributeType};
-
     // In production, schemas are keyed by "awscc.ec2.Vpc" but resource_type is "ec2.Vpc"
     // The resource must have provider set so the generic lookup works
     let resources = vec![
@@ -1452,8 +1467,8 @@ fn replace_with_provider_prefixed_schema_key() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        (crate::schema::ResourceSchema::new("ec2.Vpc").attribute(
-            AttributeSchema::optional("cidr_block", AttributeType::string())
+        (PatternResourceSchema::new("ec2.Vpc").attribute(
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                 .create_only()
                 .build(),
         ))
@@ -1796,7 +1811,9 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
 /// The differ should see no changes when comparing merged-desired vs current.
 #[test]
 fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
-    use crate::schema::{ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+    };
 
     // Build a schema that matches ec2.security_group's security_group_egress attribute
     let egress_struct = AttributeType::struct_(
@@ -1826,7 +1843,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
         ],
     );
     let schema = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::optional(
+        crate::schema::CompiledAttributeSchema::optional(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),
         )
@@ -2011,7 +2028,9 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
 /// comparison fails and falsely detects changes.
 #[test]
 fn diff_false_positive_when_ordered_true_for_struct_list() {
-    use crate::schema::{ResourceSchema, StructField};
+    use crate::schema::{
+        CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+    };
 
     let egress_struct = AttributeType::struct_(
         "Egress".to_string(),
@@ -2026,7 +2045,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 
     // Bug: ordered: true causes positional comparison of struct list items
     let schema_ordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::optional(
+        crate::schema::CompiledAttributeSchema::optional(
             "security_group_egress",
             AttributeType::list(egress_struct.clone()),
         )
@@ -2103,7 +2122,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 
     // With ordered: false (unordered_list), differ correctly sees no change
     let schema_unordered = ResourceSchema::new("awscc.ec2.SecurityGroup").attribute(
-        crate::schema::AttributeSchema::optional(
+        crate::schema::CompiledAttributeSchema::optional(
             "security_group_egress",
             AttributeType::unordered_list(egress_struct),
         )
@@ -2127,7 +2146,9 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
 /// two name the same enum value, so the differ must see NoChange.
 #[test]
 fn diff_no_change_for_compound_word_dsl_alias() {
-    use crate::schema::{AttributeSchema, ResourceSchema};
+    use crate::schema::{
+        CompiledAttributeSchema as AttributeSchema, CompiledResourceSchema as ResourceSchema,
+    };
 
     let schema = ResourceSchema::new("aws.s3.BucketOwnershipControls").attribute(
         AttributeSchema::optional(

@@ -10,14 +10,15 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AttrTypeKind, AttributeSchema, AttributeType, DslTransform, FieldGroup, FieldGroupKind,
-    IdentityMode, InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
-    ResourceSchema, ResourceValidation, SchemaKind, StructField, TypeIdentity, UniqueNameSpec,
-    ValidatorType,
+    AttrTypeKind, CompiledAttributeSchema as AttributeSchema,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
+    CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
+    InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation,
+    SchemaKind, TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v7";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v8";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -340,12 +341,16 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
         AttrTypeKind::List {
             element_type,
             ordered,
-            length,
+            constraints,
         } => {
             encoder.tag(8);
             encode_attribute_type(encoder, element_type);
             encoder.bool(*ordered);
-            encode_optional_u64_range(encoder, *length);
+            encode_optional_u64_range(encoder, constraints.length());
+            encoder.tag(match constraints.elements() {
+                super::ListElements::AllowDuplicates => 0,
+                super::ListElements::Unique => 1,
+            });
             encode_callback_presence(encoder, false);
         }
         AttrTypeKind::Map { key, value } => {
@@ -582,6 +587,8 @@ fn encode_json(encoder: &mut CanonicalEncoder, value: &serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+
     use super::*;
     use crate::schema::ReferenceTemplate;
 
@@ -620,7 +627,7 @@ mod tests {
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::list(AttributeType::bool())),
-            vec![8, 5, 1, 0, 0],
+            vec![8, 5, 1, 0, 0, 0],
             "List has no callback"
         );
     }
@@ -638,13 +645,30 @@ mod tests {
     }
 
     #[test]
+    fn list_elements_refinement_changes_the_fingerprint() {
+        let schema = |elements| {
+            ResourceSchema::new("test.Subject").attribute(
+                AttributeSchema::optional(
+                    "claims",
+                    AttributeType::refined_list(AttributeType::string(), true, None, elements),
+                )
+                .build(),
+            )
+        };
+        assert_ne!(
+            schema(super::super::ListElements::AllowDuplicates).semantic_fingerprint(),
+            schema(super::super::ListElements::Unique).semantic_fingerprint()
+        );
+    }
+
+    #[test]
     fn owner_reference_forms_change_the_resource_fingerprint() {
         let identity = TypeIdentity::new(Some("aws"), ["lambda", "Function"], "Name");
-        let schema = ResourceSchema::new("aws.lambda.Function")
+        let schema = PatternResourceSchema::new("aws.lambda.Function")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "name",
-                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
                 )
                 .build(),
             )

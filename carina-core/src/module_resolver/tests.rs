@@ -5,6 +5,7 @@
 //! substitute_arguments};` re-export there to bring those `pub(super)`
 //! helpers into the `super::*` glob below.
 
+use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,14 +24,14 @@ use crate::resource::{
     AbsoluteBindingAddress, CanonicalEnumValue, LoopSlot, ModuleSource, ParserPlaceholder,
     RawEnumIdentifier, RelativeBindingName, ResourceId, ResourceIdentity,
 };
-use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+use crate::schema::TypeIdentity;
 
 type Value<P = ParserPlaceholder, B = RelativeBindingName> = crate::resource::Value<P, B>;
 type ConcreteValue<P = ParserPlaceholder, B = RelativeBindingName> =
     crate::resource::ConcreteValue<P, B>;
 type DeferredValue<P = ParserPlaceholder, B = RelativeBindingName> =
     crate::resource::DeferredValue<P, B>;
-type Directives<B = RelativeBindingName> = crate::resource::Directives<B>;
+type Directives<B = RelativeBindingName> = crate::resource::AuthoredDirectives<B>;
 type Resource<S = ModuleSource, P = ParserPlaceholder, B = RelativeBindingName> =
     crate::resource::Resource<S, P, B>;
 type ExpandedValue = Value<ParserPlaceholder, AbsoluteBindingAddress>;
@@ -151,6 +152,178 @@ impl ModuleResolutionFixture {
             parsed,
             caller_file.parent().expect("caller file has a directory"),
         )
+    }
+}
+
+#[test]
+fn module_argument_force_delete_reaches_provider_directives() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("module/main.crn", "arguments { force: Bool }\nlet r = mock.test.resource { name = 'r' directives { force_delete = force } }\n");
+    fixture.write(
+        "main.crn",
+        "let m = use { source = './module' }\nlet instance = m { force = true }\n",
+    );
+    let expanded = fixture
+        .resolve_caller("main.crn")
+        .unwrap()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .unwrap();
+    let directives = crate::provider::ProviderDirectives::resolve(
+        &expanded.resources[0].directives,
+        crate::resource::ProviderDirectiveSchema::Unavailable,
+    );
+    assert!(
+        directives.force_delete(),
+        "the module argument must reach the provider request"
+    );
+}
+
+#[test]
+fn nested_module_directive_expressions_resolve_both_boolean_values() {
+    for flag in [false, true] {
+        let fixture = ModuleResolutionFixture::new();
+        fixture.write("inner/main.crn", "arguments { flag: Bool }\nlet r = mock.test.resource { name = 'r' directives { prevent_destroy = flag create_before_destroy = flag force_delete = if flag { true } else { false } } }\n");
+        fixture.write("outer/main.crn", "arguments { flag: Bool }\nlet inner = use { source = '../inner' }\nlet nested = inner { flag = flag }\n");
+        fixture.write("main.crn", &format!("let outer = use {{ source = './outer' }}\nlet instance = outer {{ flag = {flag} }}\n"));
+        let expanded = fixture
+            .resolve_caller("main.crn")
+            .unwrap()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .unwrap();
+        let directives = crate::provider::ProviderDirectives::resolve(
+            &expanded.resources[0].directives,
+            crate::resource::ProviderDirectiveSchema::Unavailable,
+        );
+        assert_eq!(directives.prevent_destroy(), flag);
+        assert_eq!(directives.create_before_destroy(), flag);
+        assert_eq!(directives.force_delete(), flag);
+    }
+}
+
+#[test]
+fn module_directives_resolve_before_deferred_loop_is_saved() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("module/main.crn", "arguments { flag: Bool }\nlet source = mock.test.resource { name = 'source' }\nlet resources = for name in source.items { mock.test.resource { name = name directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } } }\n");
+    fixture.write(
+        "main.crn",
+        "let m = use { source = './module' }\nlet instance = m { flag = true }\n",
+    );
+    let expanded = fixture
+        .resolve_caller("main.crn")
+        .unwrap()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .unwrap();
+    assert_eq!(expanded.deferred_for_expressions().len(), 1);
+    let deferred = &expanded.deferred_for_expressions()[0];
+    let saved = crate::parser::SavedDeferredForExpression::from(deferred.clone());
+    let json = serde_json::to_value(&saved)
+        .expect("resolved template directives keep the saved-plan format");
+    assert_eq!(
+        json["template_resource"]["directives"],
+        serde_json::json!({
+            "force_delete": true,
+            "create_before_destroy": true,
+            "prevent_destroy": {"kind": "explicit", "value": true},
+        })
+    );
+    let restored: crate::parser::SavedDeferredForExpression = serde_json::from_value(json).unwrap();
+    let children = crate::parser::expand_deferred_children(
+        &restored,
+        &crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "child".into(),
+            )),
+        ])),
+        crate::resource::AccessMissPolicy::Error,
+    )
+    .unwrap();
+    assert!(children[0].directives.explicitly_prevents_destroy());
+    assert!(children[0].directives.force_delete);
+    assert!(children[0].directives.create_before_destroy);
+}
+
+#[test]
+fn module_argument_resource_output_cannot_become_a_directive_default() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        let fixture = ModuleResolutionFixture::new();
+        fixture.write("module/main.crn", &format!("arguments {{ flag: Bool }}\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{ {directive} = flag }}\n}}\n"));
+        fixture.write("main.crn", "let source = mock.test.resource { name = 'source' }\nlet m = use { source = './module' }\nlet instance = m { flag = source.flag }\n");
+        let error = fixture
+            .resolve_caller("main.crn")
+            .unwrap()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
+            .expect_err("resource output must stay deferred");
+        let message = error.to_string();
+        assert!(
+            message.contains(directive) && message.contains("module/main.crn:4:"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn module_loop_directives_are_strictly_resolved_for_each_child() {
+    let fixture = ModuleResolutionFixture::new();
+    fixture.write("module/main.crn", "arguments { flags: list(Bool) }\nlet children = for flag in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
+    fixture.write("main.crn", "let source = mock.test.resource { name = 'source' }\nlet m = use { source = './module' }\nlet instance = m { flags = source.flags }\n");
+    let expanded = fixture
+        .resolve_caller("main.crn")
+        .unwrap()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
+        .unwrap();
+    let deferred = &expanded.deferred_for_expressions()[0];
+    for flag in [true, false] {
+        let children = crate::parser::expand_deferred_children(
+            deferred,
+            &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Bool(flag),
+            )])),
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .unwrap();
+        let directives = crate::provider::ProviderDirectives::resolve(
+            &children[0].directives,
+            crate::resource::ProviderDirectiveSchema::Unavailable,
+        );
+        assert_eq!(directives.prevent_destroy(), flag);
+        assert_eq!(directives.force_delete(), flag);
+        assert_eq!(directives.create_before_destroy(), flag);
+    }
+    for (value, kind) in [
+        (
+            Value::Concrete(ConcreteValue::String("not-a-bool".into())),
+            "got String",
+        ),
+        (
+            Value::root_resource_ref("source", "flag", Vec::new()),
+            "a resource reference",
+        ),
+        (
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: crate::resource::RootScope::new()
+                        .resolve(RelativeBindingName::new("upstream")),
+                },
+            )),
+            "unknown until apply",
+        ),
+    ] {
+        let error = crate::parser::expand_deferred_children(
+            deferred,
+            &Value::Concrete(ConcreteValue::List(vec![value])),
+            crate::resource::AccessMissPolicy::Error,
+        )
+        .expect_err("unresolved child directives must never become defaults");
+        let text = error.to_string();
+        assert!(
+            text.contains("module/main.crn:3:") && text.contains("prevent_destroy"),
+            "{text}"
+        );
+        assert!(
+            text.contains(kind) && text.contains("mock.test.resource"),
+            "{text}"
+        );
+        assert!(text.contains("main.crn:3:"), "{text}");
     }
 }
 
@@ -1387,7 +1560,7 @@ fn resolve_anonymous_loop_module_fixture(
         .expect("root fixture parses");
     let parsed = resolve_modules(parsed, root.path()).expect("module fixture expands");
     parsed
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders")
 }
 
@@ -1395,9 +1568,9 @@ fn loop_module_identity_registry() -> crate::schema::SchemaRegistry {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("test.Leaf")
+        PatternResourceSchema::new("test.Leaf")
             .attribute(
-                AttributeSchema::optional("identity_input", AttributeType::string())
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -1591,7 +1764,7 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
         .expect("root fixture parses");
     let parsed = resolve_modules(parsed, root.path()).expect("nested loop module expands");
     let mut parsed = parsed
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("expanded module fixture contains no parser placeholders");
     assert_eq!(
         parsed.resources.len(), // allow: direct — fixture test inspection
@@ -1611,9 +1784,9 @@ fn nested_unbound_module_loop_migrates_composed_legacy_address() {
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("test.resource")
+        PatternResourceSchema::new("test.resource")
             .attribute(
-                AttributeSchema::optional("name", AttributeType::string())
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -3249,20 +3422,17 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
     );
     let mut resources = resources
         .into_iter()
-        .map(crate::resource::Resource::into_expanded)
+        .map(|resource| resource.into_expanded(&crate::schema::SchemaRegistry::new()))
         .collect::<Result<Vec<_>, _>>()
         .expect("expanded module resources contain no parser placeholders");
 
     let mut registry = crate::schema::SchemaRegistry::new();
     registry.insert(
         "mock",
-        (crate::schema::ResourceSchema::new("test.resource").attribute(
-            crate::schema::AttributeSchema::optional(
-                "replacement_key",
-                crate::schema::AttributeType::string(),
-            )
-            .create_only()
-            .build(),
+        (PatternResourceSchema::new("test.resource").attribute(
+            PatternAttributeSchema::optional("replacement_key", PatternAttributeType::string())
+                .create_only()
+                .build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -7290,15 +7460,20 @@ let instance = child { count = source.count + 1 }
     let mut schemas = crate::schema::SchemaRegistry::new();
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Source")
-            .attribute(AttributeSchema::provider_populated("count", AttributeType::int()).build())
+        PatternResourceSchema::new("test.Source")
+            .attribute(
+                PatternAttributeSchema::provider_populated("count", PatternAttributeType::int())
+                    .build(),
+            )
             .validate()
             .expect("source schema"),
     );
     schemas.insert(
         "mock",
-        ResourceSchema::new("test.Target")
-            .attribute(AttributeSchema::required("count", AttributeType::int()).build())
+        PatternResourceSchema::new("test.Target")
+            .attribute(
+                PatternAttributeSchema::required("count", PatternAttributeType::int()).build(),
+            )
             .validate()
             .expect("target schema"),
     );

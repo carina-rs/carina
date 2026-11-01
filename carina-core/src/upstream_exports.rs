@@ -1322,6 +1322,10 @@ fn visit_subscript_access<P: crate::resource::PlaceholderKind, B: BindingAddress
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
     use crate::parser::ParsedFile;
     use crate::resource::DeferredValue;
@@ -2113,9 +2117,8 @@ mod tests {
         attr_name: &str,
         attr_type: crate::schema::AttributeType,
     ) -> SchemaRegistry {
-        use crate::schema::{AttributeSchema, ResourceSchema};
-        let schema = ResourceSchema::new("r.res")
-            .attribute(AttributeSchema::optional(attr_name, attr_type).build());
+        let schema = PatternResourceSchema::new("r.res")
+            .attribute(PatternAttributeSchema::optional(attr_name, attr_type).build());
         let mut registry = SchemaRegistry::new();
         registry.insert(
             "test",
@@ -2170,7 +2173,7 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
         assert!(errs[0].contains("orgs.count"), "unexpected: {errs:?}");
@@ -2190,7 +2193,7 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -2212,7 +2215,7 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert("count".to_string(), inference_not_run_entry());
         exports.insert(RelativeBindingName::new("orgs"), fields);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -2231,7 +2234,7 @@ mod tests {
             "test",
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected errors: {errs:?}");
         assert!(
@@ -2258,7 +2261,7 @@ mod tests {
         )]);
         let schemas = schema_with_attr(
             "name",
-            crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
+            PatternAttributeType::list(PatternAttributeType::string()),
         );
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
@@ -2279,7 +2282,7 @@ mod tests {
             "orgs",
             &[("counts", TypeExpr::List(Box::new(TypeExpr::Int)))],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
 
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
 
@@ -2303,9 +2306,9 @@ mod tests {
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr(
             "name",
-            crate::schema::AttributeType::union(vec![
-                crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
-                crate::schema::AttributeType::string(),
+            PatternAttributeType::union(vec![
+                PatternAttributeType::list(PatternAttributeType::string()),
+                PatternAttributeType::string(),
             ]),
         );
 
@@ -2332,9 +2335,9 @@ mod tests {
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr(
             "name",
-            crate::schema::AttributeType::union(vec![
-                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
-                crate::schema::AttributeType::string(),
+            PatternAttributeType::union(vec![
+                PatternAttributeType::map(PatternAttributeType::string()),
+                PatternAttributeType::string(),
             ]),
         );
 
@@ -2349,8 +2352,6 @@ mod tests {
 
     #[test]
     fn type_check_selects_unique_struct_member_of_union_for_map_value() {
-        use crate::schema::StructField;
-
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2363,15 +2364,15 @@ mod tests {
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr(
             "name",
-            crate::schema::AttributeType::union(vec![
-                crate::schema::AttributeType::struct_(
+            PatternAttributeType::union(vec![
+                PatternAttributeType::struct_(
                     "Count".to_string(),
                     vec![
-                        StructField::optional("count", crate::schema::AttributeType::string())
+                        PatternStructField::optional("count", PatternAttributeType::string())
                             .build(),
                     ],
                 ),
-                crate::schema::AttributeType::string(),
+                PatternAttributeType::string(),
             ]),
         );
 
@@ -2386,8 +2387,6 @@ mod tests {
 
     #[test]
     fn type_check_leaves_ambiguous_map_shaped_union_without_a_nested_sink() {
-        use crate::schema::StructField;
-
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2400,12 +2399,12 @@ mod tests {
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr(
             "name",
-            crate::schema::AttributeType::union(vec![
-                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
-                crate::schema::AttributeType::struct_(
+            PatternAttributeType::union(vec![
+                PatternAttributeType::map(PatternAttributeType::string()),
+                PatternAttributeType::struct_(
                     "Count".to_string(),
                     vec![
-                        StructField::optional("count", crate::schema::AttributeType::string())
+                        PatternStructField::optional("count", PatternAttributeType::string())
                             .build(),
                     ],
                 ),
@@ -2440,7 +2439,7 @@ mod tests {
                 ("counts", TypeExpr::List(Box::new(TypeExpr::Int))),
             ],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
@@ -2458,7 +2457,6 @@ mod tests {
     // refused at the very position it was designed for.
     #[test]
     fn type_check_accepts_arn_refinement_into_principal_union() {
-        use crate::schema::{AttributeType, StructField};
         let parsed = parse_project_with_provider(
             r#"
                 let bootstrap = upstream_state { source = "../bootstrap" }
@@ -2480,12 +2478,15 @@ mod tests {
         // hits the Union catch-all and walks each value against the
         // whole union, so the leaf `Simple(iam_oidc_provider_arn)`
         // must be assignable to the union receiver directly.
-        let principal_union = AttributeType::union(vec![
-            AttributeType::struct_(
+        let principal_union = PatternAttributeType::union(vec![
+            PatternAttributeType::struct_(
                 "IamPolicyPrincipal".to_string(),
-                vec![StructField::optional("federated", AttributeType::string()).build()],
+                vec![
+                    PatternStructField::optional("federated", PatternAttributeType::string())
+                        .build(),
+                ],
             ),
-            AttributeType::string(),
+            PatternAttributeType::string(),
         ]);
         let schemas = schema_with_attr("name", principal_union);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2502,7 +2503,7 @@ mod tests {
         // safe widening is represented by structured identities that retain
         // kind `Arn` and place `kms.Key` on the segments axis (covered by the
         // core directional-relation tests).
-        use crate::schema::{AttributeType, TypeIdentity};
+        use crate::schema::TypeIdentity;
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2516,7 +2517,7 @@ mod tests {
             "orgs",
             &[("key_arn", TypeExpr::Simple("kms_key_arn".to_string()))],
         )]);
-        let arn = AttributeType::refined_string_with_validator(
+        let arn = PatternAttributeType::refined_string_with_validator(
             TypeIdentity::bare("Arn"),
             None,
             None,
@@ -2544,7 +2545,7 @@ mod tests {
         // narrowing the comparison fires `map(AwsAccountId)` against the
         // receiver and (when the receiver is anything but a compatible map)
         // false-flags the position. Issue #2447.
-        use crate::schema::{AttributeType, TypeIdentity};
+        use crate::schema::TypeIdentity;
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2564,7 +2565,7 @@ mod tests {
         // Receiver is `String`. Without narrowing, `map(AwsAccountId)`
         // compares against `String` and fails. With narrowing,
         // `AwsAccountId` (Custom over String) is accepted.
-        let aws_account_id = AttributeType::refined_string_with_validator(
+        let aws_account_id = PatternAttributeType::refined_string_with_validator(
             TypeIdentity::bare("AwsAccountId"),
             None,
             None,
@@ -2588,7 +2589,7 @@ mod tests {
         // The top-level check must not reject the narrowed scalar against
         // the outer struct type — positional walking is the precise tool
         // for that, and the existing top-level check is too coarse.
-        use crate::schema::{AttributeType, StructField};
+
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2607,9 +2608,9 @@ mod tests {
                 TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
             )],
         )]);
-        let policy_struct = AttributeType::struct_(
+        let policy_struct = PatternAttributeType::struct_(
             "IamPolicyDocument".to_string(),
-            vec![StructField::required("statement", AttributeType::string()).build()],
+            vec![PatternStructField::required("statement", PatternAttributeType::string()).build()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2645,7 +2646,7 @@ mod tests {
             "orgs",
             &[("accounts", TypeExpr::Map(Box::new(account_struct)))],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
@@ -2670,7 +2671,7 @@ mod tests {
             "orgs",
             &[("regions", TypeExpr::List(Box::new(TypeExpr::String)))],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
@@ -2694,7 +2695,7 @@ mod tests {
         // accessed via the alias must still get its leaf ref checked
         // — here the leaf is a narrowed `Int` against a `String`
         // declaration, so the walker must flag the mismatch.
-        use crate::schema::{AttributeType, StructField};
+
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2710,10 +2711,10 @@ mod tests {
             "orgs",
             &[("counts", TypeExpr::Map(Box::new(TypeExpr::Int)))],
         )]);
-        let policy_struct = AttributeType::struct_(
+        let policy_struct = PatternAttributeType::struct_(
             "PolicyDoc".to_string(),
             vec![
-                StructField::required("statements", AttributeType::string())
+                PatternStructField::required("statements", PatternAttributeType::string())
                     .with_block_name("statement")
                     .build(),
             ],
@@ -2735,7 +2736,7 @@ mod tests {
         // (which only fires for `is_string_compatible_type` receivers).
         // Pin the path so a regression that wrongly broadened leniency
         // would still surface.
-        use crate::schema::{AttributeType, StructField};
+
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2749,9 +2750,9 @@ mod tests {
         );
         let exports =
             mk_typed_exports(&[("orgs", &[("ports", TypeExpr::Map(Box::new(TypeExpr::Int)))])]);
-        let cfg_struct = AttributeType::struct_(
+        let cfg_struct = PatternAttributeType::struct_(
             "Cfg".to_string(),
-            vec![StructField::required("port", AttributeType::int()).build()],
+            vec![PatternStructField::required("port", PatternAttributeType::int()).build()],
         );
         let schemas = schema_with_attr("config", cfg_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2767,7 +2768,7 @@ mod tests {
         // subscript on `map(Int)`) sitting in a struct field whose
         // declared type is `String` must be flagged. Pre-#2475 the
         // `is_scalar_type_expr` short-circuit silently accepted this.
-        use crate::schema::{AttributeType, StructField};
+
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2783,9 +2784,9 @@ mod tests {
             "orgs",
             &[("counts", TypeExpr::Map(Box::new(TypeExpr::Int)))],
         )]);
-        let policy_struct = AttributeType::struct_(
+        let policy_struct = PatternAttributeType::struct_(
             "PolicyDoc".to_string(),
-            vec![StructField::required("statement", AttributeType::string()).build()],
+            vec![PatternStructField::required("statement", PatternAttributeType::string()).build()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2804,7 +2805,7 @@ mod tests {
         // (Pre-fix this passed via the `is_scalar_type_expr`
         // short-circuit; post-fix it must pass via the positional
         // walker comparing AwsAccountId against the field's String.)
-        use crate::schema::{AttributeType, StructField};
+
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2823,9 +2824,9 @@ mod tests {
                 TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
             )],
         )]);
-        let policy_struct = AttributeType::struct_(
+        let policy_struct = PatternAttributeType::struct_(
             "IamPolicyDocument".to_string(),
-            vec![StructField::required("statement", AttributeType::string()).build()],
+            vec![PatternStructField::required("statement", PatternAttributeType::string()).build()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -2846,7 +2847,7 @@ mod tests {
         // the map value's interpolation, can spot that the
         // interpolation position is String and the embedded ref is a
         // `map(...)`. Pre-#2475 this regression slipped through.
-        use crate::schema::AttributeType;
+
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2863,7 +2864,10 @@ mod tests {
                 TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
             )],
         )]);
-        let schemas = schema_with_attr("tags", AttributeType::map(AttributeType::string()));
+        let schemas = schema_with_attr(
+            "tags",
+            PatternAttributeType::map(PatternAttributeType::string()),
+        );
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
@@ -3340,7 +3344,7 @@ mod tests {
             "orgs",
             &[("names", TypeExpr::List(Box::new(TypeExpr::String)))],
         )]);
-        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+        let schemas = schema_with_attr("name", PatternAttributeType::string());
 
         let generic_errors =
             check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
@@ -4226,11 +4230,11 @@ mod tests {
         let mut schemas = crate::schema::SchemaRegistry::new();
         schemas.insert(
             "test",
-            crate::schema::ResourceSchema::new("Item")
+            PatternResourceSchema::new("Item")
                 .attribute(
-                    crate::schema::AttributeSchema::optional(
+                    PatternAttributeSchema::optional(
                         "identifier",
-                        crate::schema::AttributeType::refined_string(
+                        PatternAttributeType::refined_string(
                             Some(owned.identity().clone()),
                             None,
                             None,

@@ -25,12 +25,13 @@ use carina_core::resource::{
 };
 #[cfg(test)]
 use carina_core::schema::{
-    AttributeSchema as CoreAttributeSchema, AttributeSchemaParts as CoreAttributeSchemaParts,
-    AttributeType as CoreAttributeType, IdentityMode as CoreIdentityMode,
-    InputMode as CoreInputMode, ResourceSchema as CoreResourceSchema,
+    AttributeSchemaParts as CoreAttributeSchemaParts,
+    CompiledAttributeSchema as CoreAttributeSchema, CompiledAttributeType as CoreAttributeType,
+    CompiledResourceSchema as CoreResourceSchema, CompiledStructField as CoreStructField,
+    IdentityMode as CoreIdentityMode, InputMode as CoreInputMode,
     ResourceSchemaParts as CoreResourceSchemaParts, SchemaKind as CoreSchemaKind,
-    SchemaRegistry as CoreSchemaRegistry, StructField as CoreStructField,
-    StructFieldParts as CoreStructFieldParts, UniqueNameSpec as CoreUniqueNameSpec,
+    SchemaRegistry as CoreSchemaRegistry, StructFieldParts as CoreStructFieldParts,
+    UniqueNameSpec as CoreUniqueNameSpec,
 };
 use carina_core::schema::{
     ValidatedConfigSchema as CoreValidatedConfigSchema,
@@ -2050,28 +2051,54 @@ fn proto_schema_to_core(
 fn proto_attr_schema_to_core(
     attribute: &proto::AttributeSchema,
 ) -> Result<CoreAttributeSchema, SchemaDecodeError> {
-    carina_core::protocol_convert::protocol_to_attribute_schema(attribute)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    let schema = proto::ResourceSchema {
+        resource_type: "test.Attribute".to_string(),
+        attributes: std::collections::BTreeMap::from([(attribute.name.clone(), attribute.clone())]),
+        description: None,
+        kind: proto::SchemaKind::Managed,
+        unique_name: proto::UniqueNameSpec::Conflicting,
+        operation_config: None,
+        validators: Vec::new(),
+        field_groups: Vec::new(),
+        default_prevent_destroy: false,
+        defs: std::collections::BTreeMap::new(),
+    };
+    let admitted = proto_schema_to_core(&schema)?;
+    Ok(admitted.as_schema().attributes()[&attribute.name].clone())
 }
 
 #[cfg(test)]
 fn proto_attr_type_to_core(
     attribute_type: &proto::AttributeType,
 ) -> Result<CoreAttributeType, SchemaDecodeError> {
-    carina_core::protocol_convert::protocol_to_attribute_type(attribute_type)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    let admitted = carina_core::protocol_convert::protocol_to_config_schema(
+        std::collections::BTreeMap::from([("value".to_string(), attribute_type.clone())]),
+    )
+    .map_err(SchemaDecodeError::protocol_conversion)?;
+    Ok(admitted.parts()["value"].clone())
 }
 
 #[cfg(test)]
 fn proto_struct_field_to_core(
     field: &proto::StructField,
 ) -> Result<CoreStructField, SchemaDecodeError> {
-    carina_core::protocol_convert::protocol_to_struct_field(field)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    let admitted = proto_attr_type_to_core(&proto::AttributeType::Struct {
+        name: "TestField".to_string(),
+        fields: vec![field.clone()],
+        field_groups: Vec::new(),
+    })?;
+    let carina_core::schema::RawShape::Struct { fields, .. } = admitted.raw_shape() else {
+        unreachable!("admitted field wrapper is a Struct")
+    };
+    Ok(fields[0].clone())
 }
 
 #[cfg(test)]
 mod tests {
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+    };
+
     use super::*;
 
     fn root_resource_ref(binding: &str, attribute: &str) -> CoreValue {
@@ -2493,6 +2520,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn json_schema_rejects_uncompilable_pattern_with_typed_diagnostic() {
+        let wire = proto_resource(
+            "acm.Certificate",
+            vec![(
+                "domain_name".to_string(),
+                proto_attr(
+                    "domain_name",
+                    proto_custom("DomainName", proto_string(), Some("^(?!-).+$"), None),
+                ),
+            )],
+        );
+        let json = serde_json::to_string(&vec![wire]).unwrap();
+        let error = json_to_schemas(&json).expect_err("invalid regex must fail provider load");
+        let validation =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("WASM conversion must preserve the typed validation error");
+        let (location, pattern_error) = validation
+            .pattern_errors()
+            .next()
+            .expect("typed regex diagnostic must remain accessible");
+        assert_eq!(
+            location,
+            &carina_core::schema::SchemaValidationIssueLocation::Attribute("domain_name".into())
+        );
+        assert_eq!(pattern_error.pattern, "^(?!-).+$");
+        assert!(matches!(
+            pattern_error.reason,
+            carina_core::schema::PatternCompileErrorSource::Parse(_)
+        ));
+        let diagnostic = pattern_error.reason.to_string();
+        let rendered = validation.to_string();
+        assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+        let rendered = render_error_chain(&error);
+        assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+        assert!(std::error::Error::source(validation).is_none());
+        assert!(std::error::Error::source(pattern_error).is_none());
+        let context =
+            find_error_in_chain::<carina_core::protocol_convert::SchemaDecodeError>(&error)
+                .expect("WASM conversion must preserve the schema context");
+        assert!(context.to_string().contains("acm.Certificate"));
+        assert!(context.to_string().contains("domain_name"));
+    }
+
     fn proto_attr(name: &str, attr_type: proto::AttributeType) -> proto::AttributeSchema {
         proto::AttributeSchema {
             name: name.to_string(),
@@ -2532,38 +2603,36 @@ mod tests {
 
     #[test]
     fn sdk_json_host_round_trip_property_covers_portable_defaults() {
-        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-
         let cases = vec![
             (
-                AttributeType::bool(),
+                PatternAttributeType::bool(),
                 CoreValue::Concrete(ConcreteValue::Bool(true)),
             ),
             (
-                AttributeType::int(),
+                PatternAttributeType::int(),
                 CoreValue::Concrete(ConcreteValue::Int(-42)),
             ),
             (
-                AttributeType::float(),
+                PatternAttributeType::float(),
                 CoreValue::Concrete(ConcreteValue::Float(1.25)),
             ),
             (
-                AttributeType::string(),
+                PatternAttributeType::string(),
                 CoreValue::Concrete(ConcreteValue::String("portable".into())),
             ),
             (
-                AttributeType::list(AttributeType::string()),
+                PatternAttributeType::list(PatternAttributeType::string()),
                 CoreValue::Concrete(ConcreteValue::StringList(vec!["one".into(), "two".into()])),
             ),
             (
-                AttributeType::list(AttributeType::int()),
+                PatternAttributeType::list(PatternAttributeType::int()),
                 CoreValue::Concrete(ConcreteValue::List(vec![
                     CoreValue::Concrete(ConcreteValue::Int(1)),
                     CoreValue::Concrete(ConcreteValue::Int(2)),
                 ])),
             ),
             (
-                AttributeType::map(AttributeType::string()),
+                PatternAttributeType::map(PatternAttributeType::string()),
                 CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
                     "key".to_string(),
                     CoreValue::Concrete(ConcreteValue::String("value".into())),
@@ -2572,9 +2641,9 @@ mod tests {
         ];
 
         for (index, (attribute_type, default)) in cases.into_iter().enumerate() {
-            let schema = ResourceSchema::new(format!("test.Portable{index}"))
+            let schema = PatternResourceSchema::new(format!("test.Portable{index}"))
                 .attribute(
-                    AttributeSchema::optional("value", attribute_type)
+                    PatternAttributeSchema::optional("value", attribute_type)
                         .with_default(default)
                         .build(),
                 )
@@ -2607,16 +2676,16 @@ mod tests {
     #[test]
     fn host_provider_schema_decode_retains_reference_forms() {
         use carina_core::schema::{
-            AttributeSchema, AttributeType, ReferenceForm, ReferenceForms, ReferenceTemplate,
-            ResourceSchema, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+            ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
+            ValidatedProviderSchemaWitness,
         };
 
         let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
-        let schema = ResourceSchema::new("test.Widget")
+        let schema = PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "name",
-                    AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                    PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
                 )
                 .build(),
             )
@@ -2643,31 +2712,31 @@ mod tests {
     #[test]
     fn typed_sdk_resource_and_config_witnesses_load_in_host() {
         use carina_core::schema::{
-            AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
-            ValidatedConfigSchema, ValidatorType, legacy_validator,
+            TypeIdentity, ValidatedConfigSchema, ValidatorType, legacy_validator,
         };
 
-        let resource_record = AttributeType::struct_(
+        let resource_record = PatternAttributeType::struct_(
             "ResourceRecord",
-            vec![StructField::required("name", AttributeType::string()).build()],
+            vec![PatternStructField::required("name", PatternAttributeType::string()).build()],
         );
-        let output = AttributeType::list(AttributeType::struct_(
+        let output = PatternAttributeType::list(PatternAttributeType::struct_(
             "DomainValidation",
             vec![
-                StructField::required("domain_name", AttributeType::string()).build(),
-                StructField::optional("resource_record", resource_record)
+                PatternStructField::required("domain_name", PatternAttributeType::string()).build(),
+                PatternStructField::optional("resource_record", resource_record)
                     .deferred_populate()
                     .build(),
             ],
         ));
-        let schema = ResourceSchema::new("test.Certificate")
+        let schema = PatternResourceSchema::new("test.Certificate")
             .attribute(
-                AttributeSchema::provider_populated("domain_validation_options", output).build(),
+                PatternAttributeSchema::provider_populated("domain_validation_options", output)
+                    .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "count",
-                    AttributeType::refined_int_with_validator(
+                    PatternAttributeType::refined_int_with_validator(
                         TypeIdentity::new(Some("test"), ["Certificate"], "PositiveCount"),
                         None,
                         legacy_validator(|value| match value {
@@ -2679,17 +2748,22 @@ mod tests {
                 .build(),
             )
             .attribute(
-                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "tags",
+                    PatternAttributeType::map(PatternAttributeType::string()),
+                )
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "settings",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "Setting",
                         vec![
-                            StructField::required("key", AttributeType::string()).build(),
-                            StructField::required("value", AttributeType::string()).build(),
+                            PatternStructField::required("key", PatternAttributeType::string())
+                                .build(),
+                            PatternStructField::required("value", PatternAttributeType::string())
+                                .build(),
                         ],
                     )),
                 )
@@ -2729,11 +2803,13 @@ mod tests {
 
         let config = ValidatedConfigSchema::validate(BTreeMap::from([(
             "assume_role".to_string(),
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "AssumeRole",
                 vec![
-                    StructField::required("role_arn", AttributeType::string()).build(),
-                    StructField::optional("session_name", AttributeType::string()).build(),
+                    PatternStructField::required("role_arn", PatternAttributeType::string())
+                        .build(),
+                    PatternStructField::optional("session_name", PatternAttributeType::string())
+                        .build(),
                 ],
             ),
         )]))
@@ -2778,7 +2854,8 @@ mod tests {
             deferred_populate: false,
         };
 
-        let error = proto_struct_field_to_core(&field)
+        let error = carina_core::protocol_convert::protocol_to_struct_field(&field)
+            .map_err(SchemaDecodeError::protocol_conversion)
             .expect_err("required and read-only must not form a core StructField");
 
         let rendered = render_error_chain(&error);
@@ -2806,7 +2883,8 @@ mod tests {
             deferred_populate: false,
         };
 
-        let error = proto_struct_field_to_core(&field)
+        let error = carina_core::protocol_convert::protocol_to_struct_field(&field)
+            .map_err(SchemaDecodeError::protocol_conversion)
             .expect_err("read-only and write-only must not form a core StructField");
 
         let rendered = render_error_chain(&error);
@@ -2823,6 +2901,7 @@ mod tests {
         let mut writable = proto_attr(
             "tags",
             proto::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(proto::AttributeType::Ref {
                     name: "Tag".to_string(),
                 }),
@@ -2835,6 +2914,7 @@ mod tests {
         let mut output = proto_attr(
             "effective_tags",
             proto::AttributeType::List {
+                elements: carina_provider_protocol::types::ListElements::AllowDuplicates,
                 element_type: Box::new(proto::AttributeType::Ref {
                     name: "Tag".to_string(),
                 }),
@@ -3587,7 +3667,7 @@ mod tests {
 
     #[test]
     fn canonical_enum_uses_api_spelling_even_in_persisted_wit_json() {
-        let attr_type = carina_core::schema::AttributeType::enum_(
+        let attr_type = carina_core::schema::CompiledAttributeType::enum_(
             carina_core::schema::enum_identity("Mode", Some("aws.x")),
             Some(vec!["ALLOW".to_string()]),
             vec![("ALLOW".to_string(), "allow".to_string())],
@@ -4718,14 +4798,11 @@ mod tests {
         let mut schemas = carina_core::schema::SchemaRegistry::new();
         schemas.insert(
             "",
-            carina_core::schema::ResourceSchema::new("test")
+            PatternResourceSchema::new("test")
                 .attribute(
-                    carina_core::schema::AttributeSchema::optional(
-                        "token",
-                        carina_core::schema::AttributeType::string(),
-                    )
-                    .write_only()
-                    .build(),
+                    PatternAttributeSchema::optional("token", PatternAttributeType::string())
+                        .write_only()
+                        .build(),
                 )
                 .validate()
                 .expect("test schema must be valid"),
@@ -4809,22 +4886,22 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_version_range_is_v17_only() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 17);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 17);
+    fn test_protocol_version_range_is_v18_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 18);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 18);
     }
 
     #[test]
-    fn test_check_protocol_version_rejects_pre_v17_provider() {
-        for version in [13, 14, 15, 16] {
+    fn test_check_protocol_version_rejects_pre_v18_provider() {
+        for version in [13, 14, 15, 16, 17] {
             let error = check_protocol_version(
             &format!(r#"{{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":{version}}}"#),
         )
-        .expect_err("a v17 host must reject an older provider before schema decoding");
+        .expect_err("a v18 host must reject an older provider before schema decoding");
 
             assert!(error.contains("provider 'old'"));
             assert!(error.contains(&format!("protocol version {version}")));
-            assert!(error.contains("requires at least version 17"));
+            assert!(error.contains("requires at least version 18"));
         }
     }
 
@@ -4929,6 +5006,12 @@ mod tests {
                             serde_json::Value::String("none".to_string()),
                         );
                     }
+                    if object.get("type").and_then(serde_json::Value::as_str) == Some("list") {
+                        object.insert(
+                            "elements".to_string(),
+                            serde_json::json!("allow_duplicates"),
+                        );
+                    }
                     if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
                         object.insert(
                             "field_groups".to_string(),
@@ -4973,6 +5056,7 @@ mod tests {
                     || rendered.contains("missing field `field_groups`")
                     || rendered.contains("missing field `create_only`")
                     || rendered.contains("missing field `identity`")
+                    || rendered.contains("missing field `elements`")
                     || rejected_legacy_identity_bool,
                 "released fixture {expected_resource_type} crossed the required-field gate: {rendered}",
             );
@@ -5036,7 +5120,7 @@ mod tests {
                     "domain_validation_options":{
                         "name":"domain_validation_options",
                         "attr_type":{
-                            "type":"list",
+                            "type":"list", "elements": "allow_duplicates",
                             "element_type":{
                                 "type":"struct",
                                 "name":"DomainValidation",
@@ -5150,7 +5234,7 @@ mod tests {
                                 },{
                                     "name":"validation_emails",
                                     "field_type":{
-                                        "type":"list",
+                                        "type":"list", "elements": "allow_duplicates",
                                         "element_type":{"type":"String","identity":"Email"},
                                         "ordered":true
                                     },
@@ -5390,7 +5474,7 @@ mod tests {
               "ingress": {
                 "name": "ingress",
                 "attr_type": {
-                  "type": "list",
+                  "type": "list", "elements": "allow_duplicates",
                   "inner": {
                     "type": "union",
                     "members": [
@@ -5558,7 +5642,7 @@ mod tests {
             carina_core::schema::Shape::List {
                 element_type: inner,
                 ordered,
-                ..
+                constraints: _constraints,
             } => {
                 assert!(!ordered, "list should be unordered");
 
@@ -6499,7 +6583,7 @@ mod tests {
                 "validate":true
             }"#,
             r#"{
-                "type":"list",
+                "type":"list", "elements": "allow_duplicates",
                 "element_type":{"type":"String"},
                 "ordered":true,
                 "validate":{"legacy":"callback"}
@@ -6570,7 +6654,7 @@ mod tests {
             "type":"custom",
             "name":"awscc.wafv2.StatementList",
             "base":{
-                "type":"list",
+                "type":"list", "elements": "allow_duplicates",
                 "inner":{"type":"String"},
                 "ordered":false
             },
@@ -6604,7 +6688,7 @@ mod tests {
             r#"{"type":"Int","identity":"aws.ec2.Port","range":[-1,65535]}"#,
             r#"{"type":"Float","identity":"awscc.wafv2.Size","range":[0.0,1.0]}"#,
             r#"{
-                "type":"list",
+                "type":"list", "elements": "allow_duplicates",
                 "element_type":{"type":"String"},
                 "ordered":true,
                 "length":[1,3]
@@ -6640,10 +6724,12 @@ mod tests {
                     assert_eq!(range, Some((Some(0.0), Some(1.0))));
                 }
                 carina_core::schema::Shape::List {
-                    ordered, length, ..
+                    ordered,
+                    constraints,
+                    element_type: _element_type,
                 } => {
                     assert!(ordered);
-                    assert_eq!(length, Some((Some(1), Some(3))));
+                    assert_eq!(constraints.length(), Some((Some(1), Some(3))));
                 }
                 other => panic!("unexpected lifted shape: {other:?}"),
             }

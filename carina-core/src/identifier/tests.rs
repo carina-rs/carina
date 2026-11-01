@@ -11,9 +11,11 @@ use crate::resource::{
     Subscript, ValueString,
 };
 use crate::schema::{
-    AttributeSchema, AttributeType, DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate,
-    ResourceSchema, SchemaRegistry, StructField, TypeIdentity, ValidatedConfigSchema,
-    ValidatedProviderSchemaWitness, enum_identity,
+    DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate, SchemaRegistry, TypeIdentity,
+    ValidatedConfigSchema, ValidatedProviderSchemaWitness, enum_identity,
+};
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 use indexmap::IndexMap;
 use std::path::Path;
@@ -138,17 +140,18 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         Path::new("."),
     )
     .expect("loop fixture crosses the module-resolution seam")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("loop fixture contains no parser placeholders")
     .resources
 }
 
 fn loop_identity_registry(stable: bool) -> SchemaRegistry {
-    let attribute = AttributeSchema::optional("identity_input", AttributeType::string());
+    let attribute =
+        PatternAttributeSchema::optional("identity_input", PatternAttributeType::string());
     let schema = if stable {
-        ResourceSchema::new("ec2.Vpc").attribute(attribute.create_only().build())
+        PatternResourceSchema::new("ec2.Vpc").attribute(attribute.create_only().build())
     } else {
-        ResourceSchema::new("ec2.Vpc").attribute(attribute.build())
+        PatternResourceSchema::new("ec2.Vpc").attribute(attribute.build())
     };
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -162,9 +165,9 @@ fn loop_identity_only_registry() -> SchemaRegistry {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("ec2.Vpc")
+        PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("identity_input", AttributeType::string())
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
                     .create_only()
                     .identity()
                     .build(),
@@ -407,9 +410,11 @@ fn detect_anonymous_to_named_renames_with_bindings_for_test(
     )
 }
 
-fn make_s3_bucket_schema() -> ResourceSchema {
-    ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+fn make_s3_bucket_schema<R: crate::schema::PatternForm>() -> crate::schema::PatternResourceSchema<R>
+{
+    PatternResourceSchema::new("s3.Bucket").attribute(
+        PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string()).build(),
+    )
 }
 
 fn registry_with_s3_bucket() -> SchemaRegistry {
@@ -439,8 +444,10 @@ fn provider_config(name: &str, attrs: Vec<(&str, Value)>) -> ProviderConfig {
     }
 }
 
-fn region_type(provider: &str) -> AttributeType {
-    AttributeType::enum_(
+fn region_type<R: crate::schema::PatternForm>(
+    provider: &str,
+) -> crate::schema::PatternAttributeType<R> {
+    PatternAttributeType::enum_(
         enum_identity("Region", Some(provider)),
         None,
         Vec::new(),
@@ -449,8 +456,10 @@ fn region_type(provider: &str) -> AttributeType {
     )
 }
 
-fn eip_domain_type(provider: &str) -> AttributeType {
-    AttributeType::enum_(
+fn eip_domain_type<R: crate::schema::PatternForm>(
+    provider: &str,
+) -> crate::schema::PatternAttributeType<R> {
+    PatternAttributeType::enum_(
         enum_identity("Domain", Some(&format!("{provider}.ec2.Eip"))),
         Some(vec!["vpc".to_string(), "standard".to_string()]),
         Vec::new(),
@@ -468,29 +477,30 @@ fn canonical_eip_domain(provider: &str, raw: &str) -> crate::resource::Canonical
 
 const LEGACY_NESTED_ENUM_ANONYMOUS_ID: &str = "awscc_ec2_eip_4823b455";
 
-fn route53_record_set_schema() -> ResourceSchema {
-    ResourceSchema::new("route53.record_set")
+fn route53_record_set_schema<R: crate::schema::PatternForm>()
+-> crate::schema::PatternResourceSchema<R> {
+    PatternResourceSchema::new("route53.record_set")
         .attribute(
-            AttributeSchema::optional("name", AttributeType::string())
+            PatternAttributeSchema::optional("name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("hosted_zone_id", AttributeType::string())
+            PatternAttributeSchema::optional("hosted_zone_id", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("type", AttributeType::string())
+            PatternAttributeSchema::optional("type", PatternAttributeType::string())
                 .create_only()
                 .identity()
                 .build(),
         )
-        .attribute(AttributeSchema::optional("ttl", AttributeType::string()).build())
+        .attribute(PatternAttributeSchema::optional("ttl", PatternAttributeType::string()).build())
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "resource_records",
-                AttributeType::list(AttributeType::string()),
+                PatternAttributeType::list(PatternAttributeType::string()),
             )
             .build(),
         )
@@ -529,11 +539,17 @@ fn route53_state_entry(registry: &SchemaRegistry, name: &str) -> AnonymousIdStat
     )
 }
 
-fn simhash_eip_schema() -> ResourceSchema {
-    ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build())
+fn simhash_eip_schema<R: crate::schema::PatternForm>() -> crate::schema::PatternResourceSchema<R> {
+    PatternResourceSchema::new("ec2.eip")
+        .attribute(
+            PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_name", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_env", PatternAttributeType::string()).build(),
+        )
 }
 
 fn simhash_eip_resource(tag_env: &str) -> Resource {
@@ -560,7 +576,9 @@ fn simhash_suffix_for_test(identifier: &str) -> SimHash {
     }
 }
 
-fn budget_identity_schema() -> ResourceSchema {
+fn budget_identity_schema() -> crate::schema::ResourceSchema {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     ResourceSchema::new("budgets.Budget")
         .attribute(
             AttributeSchema::required(
@@ -606,7 +624,9 @@ fn budget_resource(name: Option<&str>, notification: &str) -> Resource {
     resource
 }
 
-fn record_set_identity_schema() -> ResourceSchema {
+fn record_set_identity_schema() -> crate::schema::ResourceSchema {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     ResourceSchema::new("route53.RecordSet")
         .attribute(
             AttributeSchema::required("hosted_zone_id", AttributeType::string())
@@ -659,10 +679,10 @@ fn schema_less_anonymous_resources_do_not_create_attribute_derived_conflicts() {
 
 #[test]
 fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set() {
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
         .attribute(
-            AttributeSchema::optional("immutable_name", AttributeType::string())
+            PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -744,6 +764,8 @@ fn secret_declared_identity_is_incomplete_and_suggests_a_let_binding() {
 
 #[test]
 fn legacy_create_only_secret_remains_a_stable_identity_input() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -821,6 +843,8 @@ fn anonymous_deferred_declared_identity_is_a_typed_error() {
 
 #[test]
 fn anonymous_reference_valued_declared_identity_produces_a_stable_address() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -854,6 +878,8 @@ fn anonymous_reference_valued_declared_identity_produces_a_stable_address() {
 }
 
 fn scalar_identity_registry() -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -871,6 +897,8 @@ fn scalar_identity_registry() -> SchemaRegistry {
 }
 
 fn when_present_identity_registry() -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -909,6 +937,8 @@ fn when_present_identity_absence_has_a_distinct_address_from_every_written_fixtu
 
 #[test]
 fn nested_when_present_identity_distinguishes_an_absent_field_from_an_empty_string() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -1159,6 +1189,8 @@ fn different_nested_identity_values_produce_different_addresses() {
 
 #[test]
 fn generic_generated_address_collision_is_rejected_across_provider_instances() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -1392,6 +1424,8 @@ fn different_reference_expressions_are_distinct_identity_values() {
 
 #[test]
 fn longer_reference_chain_is_a_complete_identity_value() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
@@ -1447,8 +1481,8 @@ fn longer_reference_chain_resolves_from_state_for_legacy_identity_migration() {
 fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
     use crate::resource::AccessPath;
 
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("immutable_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -1473,8 +1507,8 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
 
 #[test]
 fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("immutable_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
             .create_only()
             .identity()
             .build(),
@@ -1497,8 +1531,8 @@ fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
 
 #[test]
 fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("immutable_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -1521,8 +1555,8 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
 
 #[test]
 fn identity_attribute_prefix_values_produce_distinct_anonymous_addresses() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("immutable_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
             .create_only()
             .identity()
             .build(),
@@ -1554,8 +1588,8 @@ fn identity_attribute_prefix_values_produce_distinct_anonymous_addresses() {
 
 #[test]
 fn unresolved_identity_prefix_values_produce_distinct_anonymous_addresses() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("immutable_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
             .create_only()
             .identity()
             .build(),
@@ -1590,8 +1624,8 @@ fn unresolved_identity_prefix_values_produce_distinct_anonymous_addresses() {
 
 #[test]
 fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -1658,8 +1692,8 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
 
 #[test]
 fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -1689,8 +1723,8 @@ fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities()
 
 #[test]
 fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("source", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("source", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -1735,8 +1769,8 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
 
 #[test]
 fn unresolved_and_resolved_identity_prefix_forms_have_the_same_complete_identity() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("immutable_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
             .create_only()
             .identity()
             .build(),
@@ -1772,6 +1806,8 @@ fn unresolved_and_resolved_identity_prefix_forms_have_the_same_complete_identity
 
 #[test]
 fn declared_identity_prefix_is_complete_and_hashes_the_same_before_and_after_resolution() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
             .create_only()
@@ -1812,6 +1848,8 @@ fn declared_identity_prefix_is_complete_and_hashes_the_same_before_and_after_res
 
 #[test]
 fn declared_identity_reconciliation_classifies_both_prefix_forms_as_complete() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let schema = ResourceSchema::new("test.resource").attribute(
         AttributeSchema::optional("immutable_name", AttributeType::string())
             .create_only()
@@ -1865,7 +1903,9 @@ fn declared_identity_reconciliation_classifies_both_prefix_forms_as_complete() {
     }
 }
 
-fn canonical_record_type_identity_schema() -> ResourceSchema {
+fn canonical_record_type_identity_schema() -> crate::schema::ResourceSchema {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     ResourceSchema::new("route53.RecordSet").attribute(
         AttributeSchema::required(
             "type",
@@ -1936,8 +1976,9 @@ fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
-        (ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        (PatternResourceSchema::new("test.resource").attribute(
+            PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -1962,8 +2003,9 @@ fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
-        (ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        (PatternResourceSchema::new("test.resource").attribute(
+            PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -1979,8 +2021,8 @@ fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
 
 #[test]
 fn check_allows_stable_named_and_separate_module_instance_resources() {
-    let schema = ResourceSchema::new("test.resource").attribute(
-        AttributeSchema::optional("immutable_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("test.resource").attribute(
+        PatternAttributeSchema::optional("immutable_name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -1991,8 +2033,9 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
     );
     registry.insert(
         "mock",
-        (ResourceSchema::new("other.resource")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        (PatternResourceSchema::new("other.resource").attribute(
+            PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -2026,10 +2069,17 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
 
 #[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
-    let schema = ResourceSchema::new("ec2.Route")
-        .attribute(AttributeSchema::optional("route_table_id", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("ec2.Route")
         .attribute(
-            AttributeSchema::optional("destination_cidr_block", AttributeType::string()).build(),
+            PatternAttributeSchema::optional("route_table_id", PatternAttributeType::string())
+                .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "destination_cidr_block",
+                PatternAttributeType::string(),
+            )
+            .build(),
         );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -2125,8 +2175,8 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
 #[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
     let schemas_for = |enum_provider: &str| {
-        let schema = ResourceSchema::new("ec2.Eip").attribute(
-            AttributeSchema::optional("domain", eip_domain_type(enum_provider))
+        let schema = PatternResourceSchema::new("ec2.Eip").attribute(
+            PatternAttributeSchema::optional("domain", eip_domain_type(enum_provider))
                 .create_only()
                 .build(),
         );
@@ -2184,16 +2234,22 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
 fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
     let schemas_for = |enum_provider: &str| {
         let domain = eip_domain_type(enum_provider);
-        let schema = ResourceSchema::new("ec2.Eip")
+        let schema = PatternResourceSchema::new("ec2.Eip")
             .attribute(
-                AttributeSchema::optional("domains", AttributeType::list(domain.clone()))
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "domains",
+                    PatternAttributeType::list(domain.clone()),
+                )
+                .create_only()
+                .build(),
             )
             .attribute(
-                AttributeSchema::optional("domain_by_name", AttributeType::map(domain))
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "domain_by_name",
+                    PatternAttributeType::map(domain),
+                )
+                .create_only()
+                .build(),
             );
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
@@ -2255,16 +2311,19 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
 #[test]
 fn test_reconcile_anonymous_id_after_provider_namespace_change() {
     let schemas_for = |enum_provider: &str| {
-        let schema = ResourceSchema::new("ec2.Eip")
+        let schema = PatternResourceSchema::new("ec2.Eip")
             .attribute(
-                AttributeSchema::optional("domain", eip_domain_type(enum_provider))
+                PatternAttributeSchema::optional("domain", eip_domain_type(enum_provider))
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
-                    .create_only()
-                    .build(),
+                PatternAttributeSchema::optional(
+                    "public_ipv4_pool",
+                    PatternAttributeType::string(),
+                )
+                .create_only()
+                .build(),
             );
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
@@ -2361,14 +2420,14 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
 #[test]
 fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
     let domain = eip_domain_type("aws");
-    let schema = ResourceSchema::new("ec2.Eip")
+    let schema = PatternResourceSchema::new("ec2.Eip")
         .attribute(
-            AttributeSchema::optional("domains", AttributeType::list(domain))
+            PatternAttributeSchema::optional("domains", PatternAttributeType::list(domain))
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+            PatternAttributeSchema::optional("public_ipv4_pool", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -2459,14 +2518,14 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
 #[test]
 fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
     let domain = eip_domain_type("aws");
-    let schema = ResourceSchema::new("ec2.Eip")
+    let schema = PatternResourceSchema::new("ec2.Eip")
         .attribute(
-            AttributeSchema::optional("domains", AttributeType::list(domain))
+            PatternAttributeSchema::optional("domains", PatternAttributeType::list(domain))
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+            PatternAttributeSchema::optional("public_ipv4_pool", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -2556,14 +2615,14 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
 #[test]
 fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
     let domain = eip_domain_type("aws");
-    let schema = ResourceSchema::new("ec2.Eip")
+    let schema = PatternResourceSchema::new("ec2.Eip")
         .attribute(
-            AttributeSchema::optional("domains", AttributeType::list(domain))
+            PatternAttributeSchema::optional("domains", PatternAttributeType::list(domain))
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+            PatternAttributeSchema::optional("public_ipv4_pool", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -2638,14 +2697,14 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
 
 #[test]
 fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribute() {
-    let schema = ResourceSchema::new("ec2.Subnet")
+    let schema = PatternResourceSchema::new("ec2.Subnet")
         .attribute(
-            AttributeSchema::optional("region", region_type("awscc"))
+            PatternAttributeSchema::optional("region", region_type("awscc"))
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("name", AttributeType::string())
+            PatternAttributeSchema::optional("name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -2891,14 +2950,14 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
 fn test_reconcile_anonymous_id_partial_create_only_match() {
     // When one create-only property changes but another stays the same,
     // reconciliation should move the state row to the fresh identifier.
-    let schema = ResourceSchema::new("iam.role")
+    let schema = PatternResourceSchema::new("iam.role")
         .attribute(
-            AttributeSchema::optional("role_name", AttributeType::string())
+            PatternAttributeSchema::optional("role_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("path", AttributeType::string())
+            PatternAttributeSchema::optional("path", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -2993,6 +3052,8 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
 
 #[test]
 fn state_row_identity_values_use_the_original_permanent_name_override() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let schema = ResourceSchema::new("test.unique_identity")
         .attribute(
             AttributeSchema::required("name", AttributeType::string())
@@ -3033,6 +3094,8 @@ fn state_row_identity_values_use_the_original_permanent_name_override() {
 
 #[test]
 fn reconcile_unknown_name_override_origin_requires_an_explicit_moved_block() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let schema = ResourceSchema::new("test.unique_identity")
         .attribute(
             AttributeSchema::required("name", AttributeType::string())
@@ -3105,6 +3168,8 @@ fn reconcile_unknown_name_override_origin_requires_an_explicit_moved_block() {
 
 #[test]
 fn reconcile_override_hidden_identity_row_with_comparable_mismatch_is_ignored() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let schema = ResourceSchema::new("test.unique_identity")
         .attribute(
             AttributeSchema::required("name", AttributeType::string())
@@ -3177,14 +3242,14 @@ fn reconcile_override_hidden_identity_row_with_comparable_mismatch_is_ignored() 
 
 #[test]
 fn full_and_partial_create_only_matches_emit_moves_without_changing_resource_ids() {
-    let schema = ResourceSchema::new("iam.role")
+    let schema = PatternResourceSchema::new("iam.role")
         .attribute(
-            AttributeSchema::optional("role_name", AttributeType::string())
+            PatternAttributeSchema::optional("role_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("path", AttributeType::string())
+            PatternAttributeSchema::optional("path", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -3286,14 +3351,14 @@ fn full_and_partial_create_only_matches_emit_moves_without_changing_resource_ids
 #[test]
 fn test_reconcile_anonymous_id_no_match_when_all_differ() {
     // When ALL create-only properties differ, no reconciliation (truly new resource)
-    let schema = ResourceSchema::new("iam.role")
+    let schema = PatternResourceSchema::new("iam.role")
         .attribute(
-            AttributeSchema::optional("role_name", AttributeType::string())
+            PatternAttributeSchema::optional("role_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("path", AttributeType::string())
+            PatternAttributeSchema::optional("path", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -3351,14 +3416,14 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
 fn test_reconcile_anonymous_id_unique_full_match_emits_move() {
     // A unique full match covers no-edit upgrades where the anonymous hash input
     // changed across Carina versions but all create-only values are unchanged.
-    let schema = ResourceSchema::new("iam.role")
+    let schema = PatternResourceSchema::new("iam.role")
         .attribute(
-            AttributeSchema::optional("role_name", AttributeType::string())
+            PatternAttributeSchema::optional("role_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("path", AttributeType::string())
+            PatternAttributeSchema::optional("path", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -3417,8 +3482,8 @@ fn test_reconcile_anonymous_id_unique_full_match_emits_move() {
 fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     // With only one create-only property, changing it means ALL changed,
     // so no reconciliation (matched=0 or mismatched=0)
-    let schema = ResourceSchema::new("ec2.Vpc").attribute(
-        AttributeSchema::optional("cidr_block", AttributeType::string())
+    let schema = PatternResourceSchema::new("ec2.Vpc").attribute(
+        PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -3471,8 +3536,9 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
 /// anonymous resource.
 #[test]
 fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
-    let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("iam.RolePolicy").attribute(
+        PatternAttributeSchema::optional("policy_name", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3522,10 +3588,16 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
 #[test]
 fn test_anonymous_resource_no_create_only_properties() {
     // Resources with no create-only properties should still work as anonymous resources
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("ec2.eip")
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+            PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -3579,8 +3651,9 @@ fn test_anonymous_resource_no_create_only_properties() {
 #[test]
 fn test_anonymous_resource_no_create_only_deterministic() {
     // Same attributes should produce the same identifier
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip").attribute(
+        PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3628,8 +3701,9 @@ fn test_anonymous_resource_no_create_only_deterministic() {
 #[test]
 fn test_anonymous_resource_no_create_only_collision() {
     // Two identical anonymous resources with no create-only properties should collide
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip").attribute(
+        PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -3673,28 +3747,28 @@ fn test_identity_attribute_prevents_collision() {
     // but different identity attrs should NOT collide.
     // This simulates route53.record_set where `name` is create-only (same)
     // but `type` is identity (A vs AAAA).
-    let schema = ResourceSchema::new("route53.record_set")
+    let schema = PatternResourceSchema::new("route53.record_set")
         .attribute(
-            AttributeSchema::optional("name", AttributeType::string())
+            PatternAttributeSchema::optional("name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("hosted_zone_id", AttributeType::string())
+            PatternAttributeSchema::optional("hosted_zone_id", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("type", AttributeType::string())
+            PatternAttributeSchema::optional("type", PatternAttributeType::string())
                 .create_only()
                 .identity()
                 .build(),
         )
-        .attribute(AttributeSchema::optional("ttl", AttributeType::string()).build())
+        .attribute(PatternAttributeSchema::optional("ttl", PatternAttributeType::string()).build())
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "resource_records",
-                AttributeType::list(AttributeType::string()),
+                PatternAttributeType::list(PatternAttributeType::string()),
             )
             .build(),
         );
@@ -3962,6 +4036,8 @@ fn reconcile_when_present_absence_selects_the_absent_row_beside_a_redacted_secre
 
 #[test]
 fn nested_when_present_absence_does_not_match_redacted_state() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let schema = ResourceSchema::new("test.nested_optional_identity")
         .attribute(
             AttributeSchema::required(
@@ -4463,15 +4539,16 @@ fn anonymous_identity_discriminator_uses_canonical_hash_suffix_parser() {
     );
 }
 
-fn subnet_route_table_association_schema() -> ResourceSchema {
-    ResourceSchema::new("ec2.SubnetRouteTableAssociation")
+fn subnet_route_table_association_schema<R: crate::schema::PatternForm>()
+-> crate::schema::PatternResourceSchema<R> {
+    PatternResourceSchema::new("ec2.SubnetRouteTableAssociation")
         .attribute(
-            AttributeSchema::optional("route_table_id", AttributeType::string())
+            PatternAttributeSchema::optional("route_table_id", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("subnet_id", AttributeType::string())
+            PatternAttributeSchema::optional("subnet_id", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
@@ -4547,15 +4624,16 @@ fn binding_state_entries_for(
 
 #[test]
 fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
-    use crate::schema::StructField;
-
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "config",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Config",
-                    vec![StructField::optional("label", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("label", PatternAttributeType::string())
+                            .build(),
+                    ],
                 ),
             )
             .create_only()
@@ -4605,7 +4683,7 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
 
 #[test]
 fn non_empty_create_only_value_keeps_its_deterministic_identity_string() {
-    use crate::schema::StructField;
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
     let schema = ResourceSchema::new("test.Widget").attribute(
         AttributeSchema::optional(
@@ -4680,9 +4758,10 @@ fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str
     resource
 }
 
-fn route_schema_with_create_only_route_table() -> ResourceSchema {
-    ResourceSchema::new("ec2.Route").attribute(
-        AttributeSchema::optional("route_table_id", AttributeType::string())
+fn route_schema_with_create_only_route_table<R: crate::schema::PatternForm>()
+-> crate::schema::PatternResourceSchema<R> {
+    PatternResourceSchema::new("ec2.Route").attribute(
+        PatternAttributeSchema::optional("route_table_id", PatternAttributeType::string())
             .create_only()
             .build(),
     )
@@ -5266,8 +5345,9 @@ fn test_reconcile_bare_binding_does_not_resolve_module_prefixed_state_entry() {
 
 #[test]
 fn test_reconcile_simhash_tie_refused() {
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip").attribute(
+        PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -5311,8 +5391,8 @@ fn test_reconcile_simhash_tie_refused() {
 
 #[test]
 fn reconcile_create_only_match_tracks_origin_and_projected_source_separately() {
-    let schema = ResourceSchema::new("iam.role").attribute(
-        AttributeSchema::optional("role_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("iam.role").attribute(
+        PatternAttributeSchema::optional("role_name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -5352,8 +5432,9 @@ fn reconcile_create_only_match_tracks_origin_and_projected_source_separately() {
 
 #[test]
 fn reconcile_simhash_match_tracks_origin_and_projected_source_separately() {
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip").attribute(
+        PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -5503,10 +5584,16 @@ fn test_canonical_create_only_string_matches_state_round_trip() {
 fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     // When schema has no create-only properties and an attribute changes,
     // Hamming distance reconciliation should match with the closest state entry.
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip")
+        .attribute(
+            PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_name", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_env", PatternAttributeType::string()).build(),
+        );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -5742,8 +5829,9 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
 #[test]
 fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
     // Completely different resources should not reconcile
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip").attribute(
+        PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -5790,10 +5878,12 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
 fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     // Case A: Schema has create-only properties, but user didn't set any.
     // Should use SimHash-based Hamming distance reconciliation.
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("ec2.eip")
         .attribute(
-            AttributeSchema::optional("public_ipv4_pool", AttributeType::string())
+            PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("public_ipv4_pool", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -6003,11 +6093,19 @@ fn test_simhash_all_attributes_changed_large_distance() {
 #[test]
 fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     // When multiple state entries exist, reconciliation should pick the closest one
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_team", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip")
+        .attribute(
+            PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_name", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_env", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_team", PatternAttributeType::string()).build(),
+        );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -6140,8 +6238,9 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
 #[test]
 fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     // If state already has the same identifier, no reconciliation needed
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip").attribute(
+        PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -6194,8 +6293,9 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
 #[test]
 fn test_reconcile_no_create_only_empty_state() {
     // No state entries = no reconciliation
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.eip").attribute(
+        PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -6231,10 +6331,16 @@ fn test_reconcile_no_create_only_empty_state() {
 #[test]
 fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
     // Verify that changing one attribute produces a different but nearby identifier
-    let schema = ResourceSchema::new("ec2.internet_gateway")
-        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_env", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_team", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("ec2.internet_gateway")
+        .attribute(
+            PatternAttributeSchema::optional("tag_name", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_env", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_team", PatternAttributeType::string()).build(),
+        );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -6296,16 +6402,22 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
 fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     // Resources with create-only properties use standard hash,
     // resources without use SimHash. Verify both work side by side.
-    let schema_with_co = ResourceSchema::new("ec2.Vpc")
+    let schema_with_co = PatternResourceSchema::new("ec2.Vpc")
         .attribute(
-            AttributeSchema::optional("cidr_block", AttributeType::string())
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
-        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build());
-    let schema_without_co = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("tag_name", AttributeType::string()).build());
+        .attribute(
+            PatternAttributeSchema::optional("tag_name", PatternAttributeType::string()).build(),
+        );
+    let schema_without_co = PatternResourceSchema::new("ec2.eip")
+        .attribute(
+            PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("tag_name", PatternAttributeType::string()).build(),
+        );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -6394,14 +6506,14 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
 fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
     // Verify that resources WITH create-only properties still use the
     // existing partial-match reconciliation, not Hamming distance.
-    let schema = ResourceSchema::new("iam.role")
+    let schema = PatternResourceSchema::new("iam.role")
         .attribute(
-            AttributeSchema::optional("role_name", AttributeType::string())
+            PatternAttributeSchema::optional("role_name", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("path", AttributeType::string())
+            PatternAttributeSchema::optional("path", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -6466,8 +6578,8 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
     // When a create-only attribute has a prefix (e.g., bucket_name_prefix),
     // the anonymous identifier should be based on the prefix, not the
     // randomly generated name. This ensures the hash is stable across runs.
-    let schema = ResourceSchema::new("s3.Bucket").attribute(
-        AttributeSchema::optional("bucket_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("s3.Bucket").attribute(
+        PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -6516,8 +6628,8 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 #[test]
 fn test_compute_anonymous_id_different_prefix_produces_different_id() {
     // Different prefixes should produce different anonymous identifiers
-    let schema = ResourceSchema::new("s3.Bucket").attribute(
-        AttributeSchema::optional("bucket_name", AttributeType::string())
+    let schema = PatternResourceSchema::new("s3.Bucket").attribute(
+        PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -6566,19 +6678,19 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
 fn test_reconcile_skips_let_bound_resources() {
     // Let-bound (named) resources should never be reconciled, even if their
     // name doesn't exist in state. The typed binding marks them as named.
-    let schema = ResourceSchema::new("ec2.security_group_ingress")
+    let schema = PatternResourceSchema::new("ec2.security_group_ingress")
         .attribute(
-            AttributeSchema::optional("cidr_ip", AttributeType::string())
+            PatternAttributeSchema::optional("cidr_ip", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("ip_protocol", AttributeType::string())
+            PatternAttributeSchema::optional("ip_protocol", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("description", AttributeType::string())
+            PatternAttributeSchema::optional("description", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -6643,19 +6755,19 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
     // When multiple state entries partially match an anonymous resource,
     // reconciliation should skip rather than picking the first match.
     // This prevents a new SG rule from hijacking an unrelated state entry.
-    let schema = ResourceSchema::new("ec2.security_group_ingress")
+    let schema = PatternResourceSchema::new("ec2.security_group_ingress")
         .attribute(
-            AttributeSchema::optional("cidr_ip", AttributeType::string())
+            PatternAttributeSchema::optional("cidr_ip", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("ip_protocol", AttributeType::string())
+            PatternAttributeSchema::optional("ip_protocol", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("description", AttributeType::string())
+            PatternAttributeSchema::optional("description", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -6744,30 +6856,39 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     // (address, ipam_pool_id, etc.) but user didn't set any. Only tags changed.
     // SimHash reconciliation should match the resource as an in-place update,
     // not a replace (delete+create).
-    let schema = ResourceSchema::new("ec2.eip")
-        .attribute(AttributeSchema::optional("domain", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("ec2.eip")
         .attribute(
-            AttributeSchema::optional("address", AttributeType::string())
+            PatternAttributeSchema::optional("domain", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("address", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("ipam_pool_id", AttributeType::string())
+            PatternAttributeSchema::optional("ipam_pool_id", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("network_border_group", AttributeType::string())
+            PatternAttributeSchema::optional(
+                "network_border_group",
+                PatternAttributeType::string(),
+            )
+            .create_only()
+            .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("transfer_address", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("transfer_address", AttributeType::string())
-                .create_only()
-                .build(),
-        )
-        .attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -6887,19 +7008,19 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
     //
     // Both resources are named (let-bound) and already match state entries by name.
     // Reconciliation should leave them unchanged.
-    let schema = ResourceSchema::new("ec2.security_group_ingress")
+    let schema = PatternResourceSchema::new("ec2.security_group_ingress")
         .attribute(
-            AttributeSchema::optional("cidr_ip", AttributeType::string())
+            PatternAttributeSchema::optional("cidr_ip", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("ip_protocol", AttributeType::string())
+            PatternAttributeSchema::optional("ip_protocol", PatternAttributeType::string())
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("description", AttributeType::string())
+            PatternAttributeSchema::optional("description", PatternAttributeType::string())
                 .create_only()
                 .build(),
         );
@@ -6993,8 +7114,8 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
 }
 
 fn make_sso_instance_registry() -> SchemaRegistry {
-    let schema = ResourceSchema::new("sso.Instance").attribute(
-        AttributeSchema::optional("name", AttributeType::string())
+    let schema = PatternResourceSchema::new("sso.Instance").attribute(
+        PatternAttributeSchema::optional("name", PatternAttributeType::string())
             .create_only()
             .build(),
     );
@@ -7008,10 +7129,10 @@ fn make_sso_instance_registry() -> SchemaRegistry {
 
 fn lambda_permission_reference_registry() -> SchemaRegistry {
     let identity = TypeIdentity::new(Some("mock"), ["lambda", "Function"], "Name");
-    let schema = ResourceSchema::new("lambda.Permission").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("lambda.Permission").attribute(
+        PatternAttributeSchema::optional(
             "function_name",
-            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
         )
         .create_only()
         .build(),
@@ -7224,10 +7345,13 @@ fn test_detect_rename_resolves_deferred_create_only_attrs_from_state_bindings() 
 
 #[test]
 fn test_detect_rename_matches_map_create_only_attr() {
-    let schema = ResourceSchema::new("test.MapIdentity").attribute(
-        AttributeSchema::optional("settings", AttributeType::map(AttributeType::string()))
-            .create_only()
-            .build(),
+    let schema = PatternResourceSchema::new("test.MapIdentity").attribute(
+        PatternAttributeSchema::optional(
+            "settings",
+            PatternAttributeType::map(PatternAttributeType::string()),
+        )
+        .create_only()
+        .build(),
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -7267,14 +7391,14 @@ fn test_detect_rename_matches_map_create_only_attr() {
 
 #[test]
 fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
-    let schema = ResourceSchema::new("test.TypedIdentity")
+    let schema = PatternResourceSchema::new("test.TypedIdentity")
         .attribute(
-            AttributeSchema::optional("domain", eip_domain_type("awscc"))
+            PatternAttributeSchema::optional("domain", eip_domain_type("awscc"))
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("priority", AttributeType::int())
+            PatternAttributeSchema::optional("priority", PatternAttributeType::int())
                 .create_only()
                 .build(),
         );
@@ -7322,14 +7446,14 @@ fn test_detect_rename_matches_enum_and_int_create_only_attrs() {
 #[test]
 fn test_detect_rename_matches_mixed_canonical_and_identifier_enums_in_list_and_map() {
     let domain = eip_domain_type("awscc");
-    let validated_schema = ResourceSchema::new("ec2.Eip")
+    let validated_schema = PatternResourceSchema::new("ec2.Eip")
         .attribute(
-            AttributeSchema::optional("domains", AttributeType::list(domain.clone()))
+            PatternAttributeSchema::optional("domains", PatternAttributeType::list(domain.clone()))
                 .create_only()
                 .build(),
         )
         .attribute(
-            AttributeSchema::optional("domain_by_name", AttributeType::map(domain))
+            PatternAttributeSchema::optional("domain_by_name", PatternAttributeType::map(domain))
                 .create_only()
                 .build(),
         )
@@ -7451,9 +7575,15 @@ fn test_detect_rename_falls_back_to_simhash_when_state_lacks_create_only_attr() 
     let mut legacy_schemas = SchemaRegistry::new();
     legacy_schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.SubnetRouteTableAssociation")
-            .attribute(AttributeSchema::optional("route_table_id", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("subnet_id", AttributeType::string()).build())
+        PatternResourceSchema::new("ec2.SubnetRouteTableAssociation")
+            .attribute(
+                PatternAttributeSchema::optional("route_table_id", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("subnet_id", PatternAttributeType::string())
+                    .build(),
+            )
             .validate()
             .expect("legacy schema fixture must be valid"),
     );
@@ -7556,8 +7686,11 @@ fn test_detect_rename_simhash_fallback_rejects_explicit_create_only_mismatches()
     let mut legacy_schemas = SchemaRegistry::new();
     legacy_schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Eip")
-            .attribute(AttributeSchema::optional("allocation_id", AttributeType::string()).build())
+        PatternResourceSchema::new("ec2.Eip")
+            .attribute(
+                PatternAttributeSchema::optional("allocation_id", PatternAttributeType::string())
+                    .build(),
+            )
             .validate()
             .expect("legacy schema fixture must be valid"),
     );
@@ -7597,9 +7730,9 @@ fn test_detect_rename_simhash_fallback_rejects_explicit_create_only_mismatches()
     let mut current_schemas = SchemaRegistry::new();
     current_schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Eip")
+        PatternResourceSchema::new("ec2.Eip")
             .attribute(
-                AttributeSchema::optional("allocation_id", AttributeType::string())
+                PatternAttributeSchema::optional("allocation_id", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
@@ -7676,9 +7809,9 @@ fn test_detect_rename_invalid_enum_is_typed_unresolved_and_does_not_rename() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
-        ResourceSchema::new("ec2.Eip")
+        PatternResourceSchema::new("ec2.Eip")
             .attribute(
-                AttributeSchema::optional("domain", eip_domain_type("awscc"))
+                PatternAttributeSchema::optional("domain", eip_domain_type("awscc"))
                     .create_only()
                     .build(),
             )
@@ -8185,8 +8318,9 @@ fn test_detect_rename_ignores_non_hash_state_names() {
 
 /// Registry with NO create-only attributes — like `awscc.sso.Instance`.
 fn make_sso_instance_registry_no_create_only() -> SchemaRegistry {
-    let schema = ResourceSchema::new("sso.Instance")
-        .attribute(AttributeSchema::optional("name", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("sso.Instance").attribute(
+        PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+    );
     let mut r = SchemaRegistry::new();
     r.insert(
         "awscc",
@@ -8508,8 +8642,9 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
 
 #[test]
 fn anonymous_identifier_includes_provider_prefix() {
-    let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("iam.RolePolicy").attribute(
+        PatternAttributeSchema::optional("policy_name", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -8549,8 +8684,9 @@ fn anonymous_identifier_includes_provider_prefix() {
 
 #[test]
 fn anonymous_identifier_provider_prefix_for_aws_provider() {
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("s3.Bucket").attribute(
+        PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -8590,8 +8726,9 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
 #[test]
 fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_move() {
     // Schema with NO create-only attrs forces the SimHash-distance branch.
-    let schema = ResourceSchema::new("iam.RolePolicy")
-        .attribute(AttributeSchema::optional("policy_name", AttributeType::string()).build());
+    let schema = PatternResourceSchema::new("iam.RolePolicy").attribute(
+        PatternAttributeSchema::optional("policy_name", PatternAttributeType::string()).build(),
+    );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "awscc",
@@ -8977,7 +9114,7 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
     .expect("directory parses");
     let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
         .expect("directory fixture crosses the module-resolution seam")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 
@@ -9078,8 +9215,6 @@ fn legacy_loop_detector_exact_match() {
 
 #[test]
 fn legacy_loop_detector_treats_empty_create_only_struct_as_unconfigured() {
-    use crate::schema::StructField;
-
     let source = concat!(
         "for value in ['stable'] {\n",
         "  mock.ec2.Vpc {\n",
@@ -9092,18 +9227,21 @@ fn legacy_loop_detector_treats_empty_create_only_struct_as_unconfigured() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("ec2.Vpc")
+        PatternResourceSchema::new("ec2.Vpc")
             .attribute(
-                AttributeSchema::optional("identity_input", AttributeType::string())
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "config",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Config",
-                        vec![StructField::optional("label", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("label", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .create_only()
@@ -9209,14 +9347,14 @@ fn legacy_loop_detector_compares_concrete_subset_when_other_inputs_are_reference
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "mock",
-        ResourceSchema::new("ec2.Subnet")
+        PatternResourceSchema::new("ec2.Subnet")
             .attribute(
-                AttributeSchema::optional("vpc_id", AttributeType::string())
+                PatternAttributeSchema::optional("vpc_id", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("cidr_block", AttributeType::string())
+                PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string())
                     .create_only()
                     .build(),
             )

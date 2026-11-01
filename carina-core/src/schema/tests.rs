@@ -1,4 +1,11 @@
 use super::*;
+use super::{
+    CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    CompiledResourceSchema as ResourceSchema, CompiledStructField as StructField,
+};
+use crate::schema::{
+    PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
+};
 
 fn absolute_binding(binding: &str) -> crate::resource::AbsoluteBindingAddress {
     crate::resource::RootScope::new().resolve(crate::resource::RelativeBindingName::new(binding))
@@ -29,6 +36,925 @@ type ParserDataSource = crate::resource::DataSource<
     crate::resource::RelativeBindingName,
 >;
 
+/// Duplicates carry their own index and need no extra list-item wrapper.
+fn assert_duplicate(error: TypeError) -> TypeError {
+    assert!(
+        matches!(
+            error,
+            TypeError::DuplicateListElement {
+                value: _,
+                index: _,
+                first_index: _,
+                attribute: _
+            }
+        ),
+        "{error:?}"
+    );
+    error
+}
+
+/// Exercise the portable declaration, including the protocol/core boundary.
+fn unique_list_from_protocol(element_type: AttributeType, ordered: bool) -> AttributeType {
+    let wire_element = crate::protocol_convert::attribute_type_to_protocol(&element_type).unwrap();
+    let wire = serde_json::from_value(serde_json::json!({
+        "type": "list",
+        "element_type": wire_element,
+        "ordered": ordered,
+        "length": [1, null],
+        "elements": "unique"
+    }))
+    .unwrap();
+    // Ref targets are supplied by the enclosing test schema after decoding.
+    crate::protocol_convert::protocol_to_attribute_type(&wire)
+        .unwrap()
+        .compile_patterns(
+            SchemaValidationIssueLocation::Attribute("value".to_string()),
+            &mut Vec::new(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn unique_enum_list_rejects_duplicate_canonical_values() {
+    let claim_key = AttributeType::enum_(
+        TypeIdentity::new(Some("github"), ["actions", "OidcSubject"], "ClaimKey"),
+        Some(vec!["repo".into(), "context".into()]),
+        Vec::new(),
+        None,
+        None,
+    );
+    for ordered in [true, false] {
+        let list = unique_list_from_protocol(claim_key.clone(), ordered);
+        for duplicate in ["repo", "github.actions.OidcSubject.ClaimKey.repo"] {
+            let value = Value::Concrete(ConcreteValue::List(
+                ["repo", "context", duplicate]
+                    .into_iter()
+                    .map(|item| Value::Concrete(ConcreteValue::enum_identifier(item)))
+                    .collect(),
+            ));
+            let error = list
+                .validate(&value)
+                .expect_err("unique enum list must reject duplicate canonical values");
+            assert!(matches!(
+                assert_duplicate(error.clone()),
+                TypeError::DuplicateListElement {
+                    index: 2,
+                    first_index: 0,
+                    value: _,
+                    attribute: _
+                }
+            ));
+            assert!(error.to_string().contains("repo"), "{error}");
+            let errors = Schema::flat(list.clone()).validate_collect(&value);
+            assert!(
+                !errors.is_empty(),
+                "the LSP collector must also reject duplicates"
+            );
+        }
+    }
+}
+
+#[test]
+fn unique_list_accepts_distinct_enum_values_and_resolves_aliases() {
+    let element = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test", "Subject"], "ClaimKey"),
+        Some(vec!["REPO".into(), "CONTEXT".into()]),
+        vec![
+            ("REPO".into(), "repo".into()),
+            ("CONTEXT".into(), "context".into()),
+        ],
+        None,
+        None,
+    );
+    let values = |items: &[&str]| {
+        Value::Concrete(ConcreteValue::List(
+            items
+                .iter()
+                .map(|item| Value::Concrete(ConcreteValue::enum_identifier(*item)))
+                .collect(),
+        ))
+    };
+    let unique = unique_list_from_protocol(element.clone(), true);
+    let distinct = values(&["repo", "mock.test.Subject.ClaimKey.context"]);
+    assert!(unique.validate(&distinct).is_ok());
+    assert!(
+        Schema::flat(unique.clone())
+            .validate_collect(&distinct)
+            .is_empty()
+    );
+    for alias in ["repo", "mock.test.Subject.ClaimKey.repo"] {
+        let duplicate = values(&["repo", alias]);
+        assert!(
+            matches!(
+                unique.validate(&duplicate).map_err(assert_duplicate),
+                Err(TypeError::DuplicateListElement {
+                    value: _,
+                    index: _,
+                    first_index: _,
+                    attribute: _
+                })
+            ),
+            "alias {alias}: {:?}",
+            unique.validate(&duplicate)
+        );
+        for list in [
+            AttributeType::list(element.clone()),
+            AttributeType::unordered_list(element.clone()),
+        ] {
+            assert!(list.validate(&duplicate).is_ok());
+            assert!(Schema::flat(list).validate_collect(&duplicate).is_empty());
+        }
+    }
+}
+
+#[test]
+fn unique_lists_validate_strings_ints_and_legacy_string_lists() {
+    for ordered in [true, false] {
+        for (element, first, second) in [
+            (
+                AttributeType::string(),
+                ConcreteValue::String("repo".into()),
+                ConcreteValue::String("context".into()),
+            ),
+            (
+                AttributeType::int(),
+                ConcreteValue::Int(42),
+                ConcreteValue::Int(43),
+            ),
+        ] {
+            let list = unique_list_from_protocol(element, ordered);
+            let distinct = Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(first.clone()),
+                Value::Concrete(second.clone()),
+            ]));
+            assert!(list.validate(&distinct).is_ok());
+            let duplicate = Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(first.clone()),
+                Value::Concrete(second),
+                Value::Concrete(first),
+            ]));
+            assert!(matches!(
+                list.validate(&duplicate).map_err(assert_duplicate),
+                Err(TypeError::DuplicateListElement {
+                    index: 2,
+                    first_index: 0,
+                    value: _,
+                    attribute: _
+                })
+            ));
+            assert_eq!(Schema::flat(list).validate_collect(&duplicate).len(), 1);
+        }
+        let list = unique_list_from_protocol(AttributeType::string(), ordered);
+        let duplicate = Value::Concrete(ConcreteValue::StringList(vec![
+            "repo".into(),
+            "repo".into(),
+        ]));
+        assert!(matches!(
+            list.validate(&duplicate).map_err(assert_duplicate),
+            Err(TypeError::DuplicateListElement {
+                value: _,
+                index: _,
+                first_index: _,
+                attribute: _
+            })
+        ));
+        assert_eq!(Schema::flat(list).validate_collect(&duplicate).len(), 1);
+    }
+}
+
+#[test]
+fn unique_lists_skip_unresolved_elements_but_check_known_elements() {
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let unknown = Value::Deferred(DeferredValue::Unknown(
+        crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+            binding: absolute_binding("upstream"),
+        },
+    ));
+    let reference = Value::Deferred(DeferredValue::BindingRef {
+        binding: absolute_binding("upstream"),
+    });
+    let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
+        crate::resource::InterpolationPart::Expr(reference.clone()),
+    ]));
+    for deferred in [unknown, reference, interpolation] {
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            deferred.clone(),
+            deferred.clone(),
+        ]));
+        assert!(list.validate(&value).is_ok());
+        assert!(
+            Schema::flat(list.clone())
+                .validate_collect(&value)
+                .is_empty()
+        );
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            deferred.clone(),
+            Value::Concrete(ConcreteValue::String("repo".into())),
+            deferred,
+            Value::Concrete(ConcreteValue::String("repo".into())),
+        ]));
+        assert!(matches!(
+            list.validate(&value).map_err(assert_duplicate),
+            Err(TypeError::DuplicateListElement {
+                index: 3,
+                first_index: 1,
+                value: _,
+                attribute: _
+            })
+        ));
+    }
+}
+
+#[test]
+fn unique_list_collector_reports_all_duplicates_and_item_errors() {
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("repo".into())),
+        Value::Concrete(ConcreteValue::Int(1)),
+        Value::Concrete(ConcreteValue::String("repo".into())),
+        Value::Concrete(ConcreteValue::String("repo".into())),
+    ]));
+    let errors = Schema::flat(list).validate_collect(&value);
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|(_, error)| matches!(
+                error,
+                TypeError::DuplicateListElement {
+                    first_index: 0,
+                    value: _,
+                    index: _,
+                    attribute: _
+                }
+            ))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn unique_enum_list_read_side_fits_and_canonicalizes_duplicate_api_spellings() {
+    let element = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test", "Subject"], "ClaimKey"),
+        Some(vec!["REPO".into()]),
+        vec![("REPO".into(), "repo".into())],
+        None,
+        None,
+    );
+    let canonical = EnumValueResolver::new(&element)
+        .resolve_state_text("REPO")
+        .unwrap();
+    let list = unique_list_from_protocol(element, true);
+    let authored = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::enum_identifier("repo")),
+        Value::Concrete(ConcreteValue::CanonicalEnum(canonical.clone())),
+    ]));
+    assert!(matches!(
+        list.validate(&authored).map_err(assert_duplicate),
+        Err(TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _
+        })
+    ));
+    for state in [
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("REPO".into())),
+            Value::Concrete(ConcreteValue::String("repo".into())),
+        ])),
+        Value::Concrete(ConcreteValue::StringList(vec![
+            "REPO".into(),
+            "repo".into(),
+        ])),
+    ] {
+        for purpose in [
+            CanonicalizationPurpose::State,
+            CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+        ] {
+            let fit = fit_value_to_type_on_path(
+                &list,
+                &state,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                purpose,
+                &mut Vec::new(),
+            )
+            .expect("read-side duplicates must still fit");
+            assert_eq!(
+                crate::value::canonical_json_with_fit(
+                    state.clone(),
+                    &fit,
+                    empty_defs_for_schema_walks(),
+                    purpose,
+                ),
+                Some(serde_json::json!(["REPO", "REPO"])),
+                "read-side values still canonicalize each element",
+            );
+        }
+        let expected = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(
+                ConcreteValue::CanonicalEnum(canonical.clone())
+            );
+            2
+        ]));
+        assert_eq!(
+            Schema::flat(list.clone())
+                .canonicalize_state(state.clone())
+                .into_present(),
+            Some(expected),
+        );
+    }
+}
+
+#[test]
+fn unique_lists_compare_nested_canonical_values_and_skip_partial_objects() {
+    let field_type = AttributeType::enum_(
+        TypeIdentity::new(Some("mock"), ["test"], "Mode"),
+        Some(vec!["Allow".into()]),
+        vec![("Allow".into(), "allow".into())],
+        None,
+        None,
+    );
+    let list = unique_list_from_protocol(AttributeType::ref_("Item"), true);
+    let schema = Schema {
+        root: list,
+        defs: BTreeMap::from([(
+            "Item".into(),
+            AttributeType::struct_(
+                "Item",
+                vec![
+                    StructField::required("mode", field_type).build(),
+                    StructField::optional("pending", AttributeType::string()).build(),
+                ],
+            ),
+        )]),
+    };
+    let object = |mode: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "mode".into(),
+            Value::Concrete(ConcreteValue::enum_identifier(mode)),
+        )])))
+    };
+    let duplicate = Value::Concrete(ConcreteValue::List(vec![
+        object("allow"),
+        object("mock.test.Mode.allow"),
+    ]));
+    assert!(matches!(
+        schema.validate(&duplicate).map_err(assert_duplicate),
+        Err(TypeError::DuplicateListElement {
+            value: _,
+            index: _,
+            first_index: _,
+            attribute: _
+        })
+    ));
+    assert_eq!(schema.validate_collect(&duplicate).len(), 1);
+    let mut partial = object("allow");
+    if let Value::Concrete(ConcreteValue::Map(fields)) = &mut partial {
+        fields.insert(
+            "pending".into(),
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: absolute_binding("upstream"),
+            }),
+        );
+    }
+    let value = Value::Concrete(ConcreteValue::List(vec![partial.clone(), partial]));
+    assert!(schema.validate(&value).is_ok());
+    assert!(schema.validate_collect(&value).is_empty());
+}
+
+#[test]
+fn unique_list_skips_whole_secrets_and_diagnostic_sensitive_elements() {
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let duplicate = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("private-claim".into())),
+        Value::Concrete(ConcreteValue::String("private-claim".into())),
+    ]));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate)));
+    assert!(list.validate(&secret).is_ok());
+    assert!(Schema::flat(list).validate_collect(&secret).is_empty());
+
+    let sensitive = Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
+        "env-private-claim",
+    )));
+    let duplicate = Value::Concrete(ConcreteValue::List(vec![sensitive.clone(), sensitive]));
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    assert!(list.validate(&duplicate).is_ok());
+    assert!(Schema::flat(list).validate_collect(&duplicate).is_empty());
+}
+
+#[test]
+fn unique_list_only_checks_authored_purposes_and_always_checks_length() {
+    let list = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((Some(1), Some(2))),
+        ListElements::Unique,
+    );
+    let duplicate = Value::Concrete(ConcreteValue::StringList(vec!["x".into(); 2]));
+    for (purpose, authored) in [
+        (
+            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+            true,
+        ),
+        (
+            CanonicalizationPurpose::ProviderConfig {
+                provider_name: "mock",
+            },
+            true,
+        ),
+        (CanonicalizationPurpose::WaitRhs, false),
+        (
+            CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+            false,
+        ),
+        (CanonicalizationPurpose::State, false),
+    ] {
+        let fits = |value: &Value| {
+            fit_value_to_type_on_path(
+                &list,
+                value,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                purpose,
+                &mut Vec::new(),
+            )
+            .is_some()
+        };
+        assert_eq!(fits(&duplicate), !authored);
+        for count in [0, 3] {
+            assert!(!fits(&Value::Concrete(ConcreteValue::StringList(
+                vec!["x".into(); count]
+            ))));
+        }
+    }
+}
+
+#[test]
+fn unique_list_whole_secret_still_checks_length_and_element_types() {
+    let list = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((None, Some(2))),
+        ListElements::Unique,
+    );
+    for items in [
+        vec![string_value("private"); 3],
+        vec![Value::Concrete(ConcreteValue::Int(1)); 2],
+    ] {
+        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::List(items),
+        ))));
+        assert!(list.validate(&value).is_err());
+        let collected = Schema::flat(list.clone()).validate_collect(&value);
+        assert!(!collected.is_empty());
+        assert!(!format!("{collected:?}").contains("DuplicateListElement"));
+        assert!(!format!("{collected:?}").contains("private"));
+    }
+}
+
+#[test]
+fn unique_list_constraints_collect_length_and_element_errors_together() {
+    let list = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((None, Some(2))),
+        ListElements::Unique,
+    );
+    for value in [
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::String("repo".into())),
+            Value::Concrete(ConcreteValue::String("repo".into())),
+            Value::Concrete(ConcreteValue::Int(7)),
+            Value::Concrete(ConcreteValue::String("repo".into())),
+        ])),
+        Value::Concrete(ConcreteValue::StringList(vec![
+            "repo".into(),
+            "repo".into(),
+            "repo".into(),
+        ])),
+    ] {
+        assert!(matches!(
+            list.validate(&value),
+            Err(TypeError::LengthOutOfRange {
+                value: _,
+                length: _,
+                min: _,
+                max: _,
+                attribute: _,
+                type_name: _
+            })
+        ));
+        assert!(
+            fit_value_to_type_on_path(
+                &list,
+                &value,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                &mut Vec::new(),
+            )
+            .is_none()
+        );
+        let errors = Schema::flat(list.clone()).validate_collect(&value);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|(_, error)| matches!(
+                    error,
+                    TypeError::LengthOutOfRange {
+                        value: _,
+                        length: _,
+                        min: _,
+                        max: _,
+                        attribute: _,
+                        type_name: _
+                    }
+                ))
+                .count(),
+            1,
+            "{errors:?}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|(_, error)| matches!(
+                    error,
+                    TypeError::DuplicateListElement {
+                        value: _,
+                        index: _,
+                        first_index: _,
+                        attribute: _
+                    }
+                ))
+                .count(),
+            2,
+            "{errors:?}"
+        );
+        assert_eq!(
+            errors.len(),
+            if matches!(value, Value::Concrete(ConcreteValue::List(_))) {
+                4
+            } else {
+                3
+            },
+            "{errors:?}"
+        );
+    }
+}
+
+fn assert_mixed_sensitive_list_is_not_comparable(secret: bool, sensitive_first: bool) {
+    let plain = Value::Concrete(ConcreteValue::String("private-mixed-claim".into()));
+    let sensitive = if secret {
+        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone())))
+    } else {
+        Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
+            "private-mixed-claim",
+        )))
+    };
+    let items = if sensitive_first {
+        vec![sensitive, plain]
+    } else {
+        vec![plain, sensitive]
+    };
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let value = Value::Concrete(ConcreteValue::List(items));
+    assert!(
+        list.validate(&value).is_ok(),
+        "sensitive equality must stay private"
+    );
+    let errors = Schema::flat(list).validate_collect(&value);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn unique_list_skips_secret_before_plain() {
+    assert_mixed_sensitive_list_is_not_comparable(true, true);
+}
+
+#[test]
+fn unique_list_skips_plain_before_secret() {
+    assert_mixed_sensitive_list_is_not_comparable(true, false);
+}
+
+#[test]
+fn unique_list_skips_diagnostic_sensitive_before_plain() {
+    assert_mixed_sensitive_list_is_not_comparable(false, true);
+}
+
+#[test]
+fn unique_list_skips_plain_before_diagnostic_sensitive() {
+    assert_mixed_sensitive_list_is_not_comparable(false, false);
+}
+
+#[test]
+fn unique_list_skips_two_secrets() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value("x"))));
+    let value = Value::Concrete(ConcreteValue::List(vec![secret.clone(), secret]));
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    assert!(list.validate(&value).is_ok());
+    assert!(Schema::flat(list).validate_collect(&value).is_empty());
+}
+
+#[test]
+fn unique_list_skips_nested_secret_struct_elements() {
+    let list = unique_list_from_protocol(
+        AttributeType::struct_(
+            "Item",
+            vec![StructField::required("a", AttributeType::string()).build()],
+        ),
+        true,
+    );
+    let object = |a| Value::Concrete(ConcreteValue::Map(IndexMap::from([("a".into(), a)])));
+    let secret = object(Value::Deferred(DeferredValue::Secret(Box::new(
+        string_value("x"),
+    ))));
+    let plain = object(string_value("x"));
+    let value = Value::Concrete(ConcreteValue::List(vec![secret.clone(), plain, secret]));
+    assert!(list.validate(&value).is_ok());
+    assert!(Schema::flat(list).validate_collect(&value).is_empty());
+}
+
+#[test]
+fn unique_list_three_plain_occurrences_keep_the_first_index() {
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let value = Value::Concrete(ConcreteValue::List(vec![string_value("x"); 3]));
+    let errors = Schema::flat(list).validate_collect(&value);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    for ((path, error), index) in errors.iter().zip([1, 2]) {
+        assert_eq!(path.steps(), &[FieldPathStep::Index(index)]);
+        assert!(
+            matches!(error, TypeError::DuplicateListElement { first_index: 0, index: found, value: _, attribute: _ } if *found == index)
+        );
+    }
+}
+
+#[test]
+fn unique_list_first_error_keeps_the_collected_item_path() {
+    let schema = Schema::flat(unique_list_from_protocol(AttributeType::string(), true));
+    let value = Value::Concrete(ConcreteValue::List(vec![string_value("x"); 2]));
+    let collected = schema.validate_collect(&value);
+    let error = schema.validate(&value).unwrap_err();
+    let TypeError::DuplicateListElement {
+        index,
+        value: _,
+        first_index: _,
+        attribute: _,
+    } = &error
+    else {
+        panic!("expected an unwrapped duplicate: {error:?}");
+    };
+    assert_eq!(collected[0].0.steps(), &[FieldPathStep::Index(*index)]);
+    assert_eq!(error.to_string(), collected[0].1.to_string());
+    assert_eq!(
+        error.to_string(),
+        "Duplicate list element 'x' at index 1 (first at index 0)"
+    );
+    let error = error.with_attribute("values");
+    assert_eq!(error.attribute_name(), Some("values"));
+    assert!(error.to_string().ends_with("for 'values'"));
+}
+
+#[test]
+fn unique_list_nested_duplicate_only_wraps_the_outer_index() {
+    let schema = Schema::flat(AttributeType::list(unique_list_from_protocol(
+        AttributeType::string(),
+        true,
+    )));
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::List(vec![string_value("x"); 2]),
+    )]));
+    let collected = schema.validate_collect(&value);
+    let TypeError::ListItemError { index: 0, inner } = schema.validate(&value).unwrap_err() else {
+        panic!("expected the outer list-item path");
+    };
+    assert!(matches!(
+        *inner,
+        TypeError::DuplicateListElement {
+            index: 1,
+            value: _,
+            first_index: _,
+            attribute: _
+        }
+    ));
+    assert_eq!(
+        collected[0].0.steps(),
+        &[FieldPathStep::Index(0), FieldPathStep::Index(1)]
+    );
+    assert_eq!(inner.to_string(), collected[0].1.to_string());
+}
+
+#[test]
+fn unique_list_inside_whole_secret_struct_does_not_report_equality() {
+    let schema = Schema::flat(AttributeType::struct_(
+        "Secret",
+        vec![
+            StructField::required(
+                "items",
+                unique_list_from_protocol(AttributeType::string(), true),
+            )
+            .build(),
+            StructField::required("enabled", AttributeType::bool()).build(),
+        ],
+    ));
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::Map(IndexMap::from([
+            (
+                "items".into(),
+                Value::Concrete(ConcreteValue::List(vec![string_value("private"); 2])),
+            ),
+            ("enabled".into(), string_value("invalid")),
+        ])),
+    ))));
+    let error = schema.validate(&value).unwrap_err();
+    let collected = schema.validate_collect(&value);
+    assert_eq!(collected.len(), 1, "{collected:?}");
+    assert!(!format!("{error:?} {collected:?}").contains("DuplicateListElement"));
+    assert!(!format!("{error:?} {collected:?}").contains("private"));
+}
+
+#[test]
+fn unique_list_state_preserves_duplicates_after_dropping_absent_struct_fields() {
+    let element = AttributeType::struct_(
+        "Item",
+        vec![
+            StructField::required("a", AttributeType::string()).build(),
+            StructField::optional(
+                "b",
+                AttributeType::struct_(
+                    "Optional",
+                    vec![StructField::optional("c", AttributeType::string()).build()],
+                ),
+            )
+            .build(),
+        ],
+    );
+    let first = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("a".into(), string_value("x")),
+        (
+            "b".into(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        ),
+    ])));
+    let second = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "a".into(),
+        string_value("x"),
+    )])));
+    let list = unique_list_from_protocol(element, true);
+    let value = Value::Concrete(ConcreteValue::List(vec![first, second]));
+    assert!(
+        list.validate(&value).is_ok(),
+        "authored empty struct remains explicit"
+    );
+    assert!(
+        fit_value_to_type_on_path(
+            &list,
+            &value,
+            empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+            CanonicalizationPurpose::State,
+            &mut Vec::new()
+        )
+        .is_some(),
+        "state duplicates must fit even after absent fields are dropped"
+    );
+}
+
+#[test]
+fn unique_list_state_comparison_preserves_empty_strings() {
+    let element = AttributeType::struct_(
+        "Item",
+        vec![
+            StructField::required("a", AttributeType::string()).build(),
+            StructField::optional("b", AttributeType::string()).build(),
+        ],
+    );
+    let first = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("a".into(), string_value("x")),
+        ("b".into(), string_value("")),
+    ])));
+    let second = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "a".into(),
+        string_value("x"),
+    )])));
+    let list = unique_list_from_protocol(element, true);
+    let value = Value::Concrete(ConcreteValue::List(vec![first, second]));
+    assert!(
+        fit_value_to_type_on_path(
+            &list,
+            &value,
+            empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+            CanonicalizationPurpose::State,
+            &mut Vec::new()
+        )
+        .is_some(),
+        "empty strings are not absent struct fields"
+    );
+}
+
+#[test]
+fn unique_list_compares_canonical_string_or_list_containers() {
+    let element = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::list(AttributeType::string()),
+    ]);
+    let list = unique_list_from_protocol(element, true);
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        string_value("x"),
+        Value::Concrete(ConcreteValue::List(vec![string_value("x")])),
+    ]));
+    assert!(
+        list.validate(&value).is_err(),
+        "canonical string lists are equal"
+    );
+    assert_eq!(Schema::flat(list).validate_collect(&value).len(), 1);
+}
+
+#[test]
+fn unique_float_list_keeps_integer_and_float_spellings_distinct() {
+    let list = unique_list_from_protocol(AttributeType::float(), true);
+    for items in [
+        vec![ConcreteValue::Int(1), ConcreteValue::Float(1.0)],
+        vec![ConcreteValue::Float(1.0), ConcreteValue::Int(1)],
+        vec![
+            ConcreteValue::Int(9_007_199_254_740_992),
+            ConcreteValue::Int(9_007_199_254_740_993),
+        ],
+    ] {
+        let value = Value::Concrete(ConcreteValue::List(
+            items.into_iter().map(Value::Concrete).collect(),
+        ));
+        assert!(list.validate(&value).is_ok());
+        assert!(
+            Schema::flat(list.clone())
+                .validate_collect(&value)
+                .is_empty()
+        );
+        for purpose in [
+            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+            CanonicalizationPurpose::State,
+        ] {
+            assert!(
+                fit_value_to_type_on_path(
+                    &list,
+                    &value,
+                    empty_defs_for_schema_walks(),
+                    FieldAncestry::WRITABLE,
+                    purpose,
+                    &mut Vec::new()
+                )
+                .is_some()
+            );
+        }
+    }
+}
+
+#[test]
+fn unique_struct_list_keeps_block_alias_and_canonical_keys_distinct() {
+    let element = AttributeType::struct_(
+        "Item",
+        vec![
+            StructField::required("canonical", AttributeType::string())
+                .with_block_name("alias")
+                .build(),
+        ],
+    );
+    let list = unique_list_from_protocol(element, true);
+    for names in [["canonical", "alias"], ["alias", "canonical"]] {
+        let value = Value::Concrete(ConcreteValue::List(
+            names
+                .into_iter()
+                .map(|name| {
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        name.into(),
+                        Value::Concrete(ConcreteValue::String("repo".into())),
+                    )])))
+                })
+                .collect(),
+        ));
+        assert!(list.validate(&value).is_ok());
+        assert!(
+            Schema::flat(list.clone())
+                .validate_collect(&value)
+                .is_empty()
+        );
+        assert!(
+            fit_value_to_type_on_path(
+                &list,
+                &value,
+                empty_defs_for_schema_walks(),
+                FieldAncestry::WRITABLE,
+                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+                &mut Vec::new()
+            )
+            .is_some()
+        );
+    }
+}
+
 #[test]
 fn field_group_members_require_two_distinct_field_names() {
     assert_eq!(
@@ -54,9 +980,14 @@ fn field_group_members_require_two_distinct_field_names() {
 
 #[test]
 fn schema_validation_checks_field_group_members_at_their_own_scope() {
-    let top_level = ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::optional("known", AttributeType::string()).build())
-        .attribute(AttributeSchema::provider_populated("output", AttributeType::string()).build())
+    let top_level = PatternResourceSchema::new("test.Widget")
+        .attribute(
+            PatternAttributeSchema::optional("known", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::provider_populated("output", PatternAttributeType::string())
+                .build(),
+        )
         .field_group(FieldGroup::exactly_one(["known", "missing"]).unwrap())
         .field_group(FieldGroup::at_most_one(["known", "output"]).unwrap())
         .validate()
@@ -67,19 +998,20 @@ fn schema_validation_checks_field_group_members_at_their_own_scope() {
     assert!(top_level.contains("field_groups[1]"));
     assert!(top_level.contains("provider-populated attribute `output`"));
 
-    let nested_type = AttributeType::struct_with_field_groups(
+    let nested_type = PatternAttributeType::struct_with_field_groups(
         "Nested",
         vec![
-            StructField::optional("known", AttributeType::string()).build(),
-            StructField::provider_populated("output", AttributeType::string()).build(),
+            PatternStructField::optional("known", PatternAttributeType::string()).build(),
+            PatternStructField::provider_populated("output", PatternAttributeType::string())
+                .build(),
         ],
         vec![
             FieldGroup::at_least_one(["known", "missing"]).unwrap(),
             FieldGroup::at_most_one(["known", "output"]).unwrap(),
         ],
     );
-    let nested = ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::optional("nested", nested_type).build())
+    let nested = PatternResourceSchema::new("test.Widget")
+        .attribute(PatternAttributeSchema::optional("nested", nested_type).build())
         .validate()
         .expect_err("struct groups must use fields from that struct")
         .to_string();
@@ -94,19 +1026,25 @@ fn schema_validation_checks_field_group_members_at_their_own_scope() {
 
 #[test]
 fn shared_struct_field_groups_are_admitted_at_writable_and_output_sites() {
-    let shared = AttributeType::struct_with_field_groups(
+    let shared = PatternAttributeType::struct_with_field_groups(
         "Shared",
         vec![
-            StructField::optional("first", AttributeType::string()).build(),
-            StructField::optional("second", AttributeType::string()).build(),
+            PatternStructField::optional("first", PatternAttributeType::string()).build(),
+            PatternStructField::optional("second", PatternAttributeType::string()).build(),
         ],
         vec![FieldGroup::exactly_one(["first", "second"]).unwrap()],
     );
 
-    ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::optional("input", AttributeType::ref_("Shared")).build())
+    PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::provider_populated("output", AttributeType::ref_("Shared")).build(),
+            PatternAttributeSchema::optional("input", PatternAttributeType::ref_("Shared")).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::provider_populated(
+                "output",
+                PatternAttributeType::ref_("Shared"),
+            )
+            .build(),
         )
         .with_def("Shared", shared)
         .validate()
@@ -115,16 +1053,16 @@ fn shared_struct_field_groups_are_admitted_at_writable_and_output_sites() {
 
 #[test]
 fn output_only_ancestors_do_not_hide_structural_field_group_errors() {
-    let output = AttributeType::struct_with_field_groups(
+    let output = PatternAttributeType::struct_with_field_groups(
         "Output",
         vec![
-            StructField::optional("known", AttributeType::string()).build(),
-            StructField::optional("other", AttributeType::string()).build(),
+            PatternStructField::optional("known", PatternAttributeType::string()).build(),
+            PatternStructField::optional("other", PatternAttributeType::string()).build(),
         ],
         vec![FieldGroup::at_least_one(["known", "missing"]).unwrap()],
     );
-    let error = ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::provider_populated("output", output).build())
+    let error = PatternResourceSchema::new("test.Widget")
+        .attribute(PatternAttributeSchema::provider_populated("output", output).build())
         .validate()
         .expect_err("unknown group members remain invalid below output-only attributes")
         .to_string();
@@ -135,11 +1073,11 @@ fn output_only_ancestors_do_not_hide_structural_field_group_errors() {
 
 #[test]
 fn config_schema_validation_rejects_invalid_struct_field_groups() {
-    let grouped = AttributeType::struct_with_field_groups(
+    let grouped = PatternAttributeType::struct_with_field_groups(
         "Config",
         vec![
-            StructField::optional("known", AttributeType::string()).build(),
-            StructField::optional("other", AttributeType::string()).build(),
+            PatternStructField::optional("known", PatternAttributeType::string()).build(),
+            PatternStructField::optional("other", PatternAttributeType::string()).build(),
         ],
         vec![FieldGroup::at_most_one(["known", "missing"]).unwrap()],
     );
@@ -153,9 +1091,15 @@ fn config_schema_validation_rejects_invalid_struct_field_groups() {
 
 #[test]
 fn resource_field_groups_reject_required_members() {
-    let error = ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::required("required_choice", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("optional_choice", AttributeType::string()).build())
+    let error = PatternResourceSchema::new("test.Widget")
+        .attribute(
+            PatternAttributeSchema::required("required_choice", PatternAttributeType::string())
+                .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("optional_choice", PatternAttributeType::string())
+                .build(),
+        )
         .field_group(FieldGroup::exactly_one(["required_choice", "optional_choice"]).unwrap())
         .validate()
         .expect_err("a required member makes a field group meaningless")
@@ -170,16 +1114,16 @@ fn resource_field_groups_reject_required_members() {
 
 #[test]
 fn struct_field_groups_reject_required_members() {
-    let nested = AttributeType::struct_with_field_groups(
+    let nested = PatternAttributeType::struct_with_field_groups(
         "Nested",
         vec![
-            StructField::required("required_choice", AttributeType::string()).build(),
-            StructField::optional("optional_choice", AttributeType::string()).build(),
+            PatternStructField::required("required_choice", PatternAttributeType::string()).build(),
+            PatternStructField::optional("optional_choice", PatternAttributeType::string()).build(),
         ],
         vec![FieldGroup::exactly_one(["required_choice", "optional_choice"]).unwrap()],
     );
-    let error = ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::optional("nested", nested).build())
+    let error = PatternResourceSchema::new("test.Widget")
+        .attribute(PatternAttributeSchema::optional("nested", nested).build())
         .validate()
         .expect_err("a required struct member makes a field group meaningless")
         .to_string();
@@ -193,13 +1137,16 @@ fn struct_field_groups_reject_required_members() {
 
 #[test]
 fn resource_field_groups_reject_defaulted_members() {
-    let error = ResourceSchema::new("test.Widget")
+    let error = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional("defaulted_choice", AttributeType::string())
+            PatternAttributeSchema::optional("defaulted_choice", PatternAttributeType::string())
                 .with_default(string_value("default"))
                 .build(),
         )
-        .attribute(AttributeSchema::optional("optional_choice", AttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("optional_choice", PatternAttributeType::string())
+                .build(),
+        )
         .field_group(FieldGroup::exactly_one(["defaulted_choice", "optional_choice"]).unwrap())
         .validate()
         .expect_err("a defaulted member makes authored-presence counting unsound")
@@ -214,9 +1161,13 @@ fn resource_field_groups_reject_defaulted_members() {
 
 #[test]
 fn resource_field_groups_reject_duplicate_member_sets_in_any_order() {
-    let error = ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::optional("first", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("second", AttributeType::string()).build())
+    let error = PatternResourceSchema::new("test.Widget")
+        .attribute(
+            PatternAttributeSchema::optional("first", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("second", PatternAttributeType::string()).build(),
+        )
         .field_group(FieldGroup::exactly_one(["first", "second"]).unwrap())
         .field_group(FieldGroup::exactly_one(["second", "first"]).unwrap())
         .validate()
@@ -233,19 +1184,19 @@ fn resource_field_groups_reject_duplicate_member_sets_in_any_order() {
 
 #[test]
 fn struct_field_groups_reject_duplicate_member_sets_in_any_order() {
-    let nested = AttributeType::struct_with_field_groups(
+    let nested = PatternAttributeType::struct_with_field_groups(
         "Nested",
         vec![
-            StructField::optional("first", AttributeType::string()).build(),
-            StructField::optional("second", AttributeType::string()).build(),
+            PatternStructField::optional("first", PatternAttributeType::string()).build(),
+            PatternStructField::optional("second", PatternAttributeType::string()).build(),
         ],
         vec![
             FieldGroup::at_least_one(["first", "second"]).unwrap(),
             FieldGroup::at_least_one(["second", "first"]).unwrap(),
         ],
     );
-    let error = ResourceSchema::new("test.Widget")
-        .attribute(AttributeSchema::optional("nested", nested).build())
+    let error = PatternResourceSchema::new("test.Widget")
+        .attribute(PatternAttributeSchema::optional("nested", nested).build())
         .validate()
         .expect_err("struct group member order must not distinguish duplicate groups")
         .to_string();
@@ -258,12 +1209,15 @@ fn struct_field_groups_reject_duplicate_member_sets_in_any_order() {
     assert!(error.contains("[first, second]"), "{error}");
 }
 
-fn choice_struct(kind: FieldGroupKind) -> AttributeType {
-    AttributeType::struct_with_field_groups(
+fn choice_struct<R: crate::schema::PatternForm>(
+    kind: FieldGroupKind,
+) -> crate::schema::PatternAttributeType<R> {
+    PatternAttributeType::struct_with_field_groups(
         "EvaluationWindow",
         vec![
-            StructField::optional("sliding_window", AttributeType::string()).build(),
-            StructField::optional("wall_clock_window", AttributeType::string()).build(),
+            PatternStructField::optional("sliding_window", PatternAttributeType::string()).build(),
+            PatternStructField::optional("wall_clock_window", PatternAttributeType::string())
+                .build(),
         ],
         vec![FieldGroup::new(kind, ["sliding_window", "wall_clock_window"]).unwrap()],
     )
@@ -520,9 +1474,9 @@ fn struct_field_groups_validate_through_lists_maps_unions_and_refs() {
 
 #[test]
 fn resource_validation_prefixes_nested_group_errors_with_the_struct_path() {
-    let schema = ResourceSchema::new("test.Metric")
+    let schema = PatternResourceSchema::new("test.Metric")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "evaluation_window",
                 choice_struct(FieldGroupKind::ExactlyOne),
             )
@@ -615,7 +1569,7 @@ fn secret_masking_preserves_custom_type_attribute_position() {
 
 #[test]
 fn schema_registry_lookup_binds_owner_to_the_validated_schema() {
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .validate()
         .expect("fixture schema must validate");
     let mut registry = SchemaRegistry::new();
@@ -631,11 +1585,11 @@ fn schema_registry_lookup_binds_owner_to_the_validated_schema() {
 #[test]
 fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
     let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "name",
-                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
             )
             .build(),
         )
@@ -671,11 +1625,11 @@ fn schema_registry_lookup_retains_the_owners_complete_reference_form_table() {
 #[test]
 fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_last() {
     let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
-    let owned_schema = ResourceSchema::new("test.Widget")
+    let owned_schema = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "name",
-                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
             )
             .build(),
         )
@@ -696,7 +1650,7 @@ fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_
         forms.clone(),
     )
     .expect("provider witness must validate");
-    let additional_schema = ResourceSchema::new("test.Additional")
+    let additional_schema = PatternResourceSchema::new("test.Additional")
         .validate()
         .expect("additional schema must validate");
 
@@ -718,11 +1672,11 @@ fn schema_registry_additional_schema_cannot_clear_witness_forms_when_registered_
 
 fn reference_form_witness(template: &str) -> (ValidatedProviderSchemaWitness, ReferenceForms) {
     let identity = TypeIdentity::new(Some("test"), ["Widget"], "Name");
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "name",
-                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
             )
             .build(),
         )
@@ -826,7 +1780,7 @@ fn rootless_lookup_collects_every_failure_without_a_fake_attribute() {
     );
 }
 
-fn admission_error(schema: ResourceSchema) -> String {
+fn admission_error(schema: super::ResourceSchema) -> String {
     schema
         .validate()
         .expect_err("schema admission must reject the malformed draft")
@@ -972,6 +1926,8 @@ fn struct_field_builder_methods_preserve_each_mode() {
 
 #[test]
 fn identity_paths_are_typed_and_include_top_level_and_nested_fields() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let schema = ResourceSchema::new("test.Budget")
         .attribute(
             AttributeSchema::required("account_id", AttributeType::string())
@@ -1017,6 +1973,8 @@ fn identity_paths_are_typed_and_include_top_level_and_nested_fields() {
 
 #[test]
 fn schema_admission_rejects_identity_below_provider_populated_ancestor() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let error = ResourceSchema::new("test.Output")
         .attribute(
             AttributeSchema::provider_populated(
@@ -1074,10 +2032,9 @@ fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
 
 #[test]
 fn schema_admission_rejects_a_dangling_attribute_ref() {
-    let error = admission_error(
-        ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::optional("config", AttributeType::ref_("Missing")).build()),
-    );
+    let error = admission_error(PatternResourceSchema::new("test.Widget").attribute(
+        PatternAttributeSchema::optional("config", PatternAttributeType::ref_("Missing")).build(),
+    ));
 
     assert!(error.contains("test.Widget"), "{error}");
     assert!(error.contains("config"), "{error}");
@@ -1087,9 +2044,12 @@ fn schema_admission_rejects_a_dangling_attribute_ref() {
 #[test]
 fn schema_admission_rejects_a_dangling_ref_reached_from_defs() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget")
-            .with_def("Root", AttributeType::ref_("Missing"))
-            .attribute(AttributeSchema::optional("config", AttributeType::ref_("Root")).build()),
+        PatternResourceSchema::new("test.Widget")
+            .with_def("Root", PatternAttributeType::ref_("Missing"))
+            .attribute(
+                PatternAttributeSchema::optional("config", PatternAttributeType::ref_("Root"))
+                    .build(),
+            ),
     );
 
     assert!(error.contains("defs.Root"), "{error}");
@@ -1099,9 +2059,13 @@ fn schema_admission_rejects_a_dangling_ref_reached_from_defs() {
 #[test]
 fn schema_admission_rejects_duplicate_top_level_attributes() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-            .attribute(AttributeSchema::required("name", AttributeType::string()).build()),
+        PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::required("name", PatternAttributeType::string()).build(),
+            ),
     );
 
     assert!(error.contains("duplicate"), "{error}");
@@ -1111,14 +2075,16 @@ fn schema_admission_rejects_duplicate_top_level_attributes() {
 #[test]
 fn schema_admission_rejects_duplicate_nested_struct_fields() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::optional(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional(
                 "config",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Config",
                     vec![
-                        StructField::optional("mode", AttributeType::string()).build(),
-                        StructField::required("mode", AttributeType::string()).build(),
+                        PatternStructField::optional("mode", PatternAttributeType::string())
+                            .build(),
+                        PatternStructField::required("mode", PatternAttributeType::string())
+                            .build(),
                     ],
                 ),
             )
@@ -1133,18 +2099,22 @@ fn schema_admission_rejects_duplicate_nested_struct_fields() {
 #[test]
 fn schema_admission_rejects_duplicate_struct_fields_in_defs() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .with_def(
                 "Config",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Config",
                     vec![
-                        StructField::optional("mode", AttributeType::string()).build(),
-                        StructField::optional("mode", AttributeType::int()).build(),
+                        PatternStructField::optional("mode", PatternAttributeType::string())
+                            .build(),
+                        PatternStructField::optional("mode", PatternAttributeType::int()).build(),
                     ],
                 ),
             )
-            .attribute(AttributeSchema::optional("config", AttributeType::ref_("Config")).build()),
+            .attribute(
+                PatternAttributeSchema::optional("config", PatternAttributeType::ref_("Config"))
+                    .build(),
+            ),
     );
 
     assert!(error.contains("defs.Config.mode"), "{error}");
@@ -1153,8 +2123,10 @@ fn schema_admission_rejects_duplicate_struct_fields_in_defs() {
 #[test]
 fn schema_admission_rejects_unknown_field_group_names() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::optional("left", AttributeType::string()).build())
+        PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional("left", PatternAttributeType::string()).build(),
+            )
             .field_group(FieldGroup::exactly_one(["left", "missing"]).unwrap()),
     );
 
@@ -1165,9 +2137,14 @@ fn schema_admission_rejects_unknown_field_group_names() {
 #[test]
 fn schema_admission_rejects_provider_populated_field_group_names() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget")
-            .attribute(AttributeSchema::provider_populated("arn", AttributeType::string()).build())
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::provider_populated("arn", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
             .field_group(FieldGroup::at_most_one(["arn", "name"]).unwrap()),
     );
 
@@ -1178,8 +2155,9 @@ fn schema_admission_rejects_provider_populated_field_group_names() {
 
 #[test]
 fn schema_admission_rejects_an_unknown_unique_name_attribute() {
-    let error =
-        admission_error(ResourceSchema::new("test.Widget").with_unique_name_attribute("missing"));
+    let error = admission_error(
+        PatternResourceSchema::new("test.Widget").with_unique_name_attribute("missing"),
+    );
 
     assert!(error.contains("unique name"), "{error}");
     assert!(error.contains("missing"), "{error}");
@@ -1189,8 +2167,8 @@ fn schema_admission_rejects_an_unknown_unique_name_attribute() {
 fn schema_admission_rejects_every_non_finite_default_at_top_level_and_nested() {
     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let error = admission_error(
-            ResourceSchema::new("test.Widget").attribute(
-                AttributeSchema::optional("threshold", AttributeType::float())
+            PatternResourceSchema::new("test.Widget").attribute(
+                PatternAttributeSchema::optional("threshold", PatternAttributeType::float())
                     .with_default(Value::Concrete(ConcreteValue::Float(value)))
                     .build(),
             ),
@@ -1200,12 +2178,15 @@ fn schema_admission_rejects_every_non_finite_default_at_top_level_and_nested() {
     }
 
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::optional("thresholds", AttributeType::list(AttributeType::float()))
-                .with_default(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Float(f64::NAN),
-                )])))
-                .build(),
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional(
+                "thresholds",
+                PatternAttributeType::list(PatternAttributeType::float()),
+            )
+            .with_default(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Float(f64::NAN),
+            )])))
+            .build(),
         ),
     );
     assert!(error.contains("thresholds[0]"), "{error}");
@@ -1215,8 +2196,8 @@ fn schema_admission_rejects_every_non_finite_default_at_top_level_and_nested() {
 #[test]
 fn schema_admission_rejects_deferred_defaults_recursively() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::optional("name", AttributeType::string())
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional("name", PatternAttributeType::string())
                 .with_default(Value::Deferred(DeferredValue::Unknown(
                     crate::resource::ApplyTimeUnknown::UpstreamAllExports {
                         binding: absolute_binding("upstream"),
@@ -1232,14 +2213,14 @@ fn schema_admission_rejects_deferred_defaults_recursively() {
 
 #[test]
 fn schema_admission_allows_declared_user_input_below_provider_populated_output() {
-    ResourceSchema::new("test.Widget")
+    PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::provider_populated(
+            PatternAttributeSchema::provider_populated(
                 "output",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Output",
                     vec![
-                        StructField::optional("value", AttributeType::string())
+                        PatternStructField::optional("value", PatternAttributeType::string())
                             .with_block_name("value_block")
                             .build(),
                     ],
@@ -1253,26 +2234,29 @@ fn schema_admission_allows_declared_user_input_below_provider_populated_output()
 
 #[test]
 fn shared_def_keeps_declared_mode_and_is_assignable_on_its_writable_path() {
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .with_def(
             "Tag",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Tag",
                 vec![
-                    StructField::required("key", AttributeType::string())
+                    PatternStructField::required("key", PatternAttributeType::string())
                         .with_block_name("tag_key")
                         .build(),
                 ],
             ),
         )
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::list(AttributeType::ref_("Tag")))
-                .build(),
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::list(PatternAttributeType::ref_("Tag")),
+            )
+            .build(),
         )
         .attribute(
-            AttributeSchema::provider_populated(
+            PatternAttributeSchema::provider_populated(
                 "effective_tags",
-                AttributeType::list(AttributeType::ref_("Tag")),
+                PatternAttributeType::list(PatternAttributeType::ref_("Tag")),
             )
             .build(),
         )
@@ -1306,22 +2290,25 @@ fn shared_def_keeps_declared_mode_and_is_assignable_on_its_writable_path() {
 
 #[test]
 fn effective_field_mode_is_derived_from_each_reference_path() {
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .with_def(
             "Tag",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Tag",
-                vec![StructField::required("key", AttributeType::string()).build()],
+                vec![PatternStructField::required("key", PatternAttributeType::string()).build()],
             ),
         )
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::list(AttributeType::ref_("Tag")))
-                .build(),
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::list(PatternAttributeType::ref_("Tag")),
+            )
+            .build(),
         )
         .attribute(
-            AttributeSchema::provider_populated(
+            PatternAttributeSchema::provider_populated(
                 "effective_tags",
-                AttributeType::list(AttributeType::ref_("Tag")),
+                PatternAttributeType::list(PatternAttributeType::ref_("Tag")),
             )
             .build(),
         )
@@ -1345,9 +2332,9 @@ fn effective_field_mode_is_derived_from_each_reference_path() {
 
 #[test]
 fn effective_attribute_separates_canonical_and_authored_names() {
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional("rules", AttributeType::string())
+            PatternAttributeSchema::optional("rules", PatternAttributeType::string())
                 .with_block_name("rule")
                 .build(),
         )
@@ -1373,19 +2360,19 @@ fn effective_attribute_separates_canonical_and_authored_names() {
 
 #[test]
 fn effective_node_lookup_gives_each_path_segment_a_fresh_shape_budget() {
-    let mut attr_type = AttributeType::string();
+    let mut attr_type = PatternAttributeType::string();
     let mut nested_segments = Vec::new();
     for index in (0..80).rev() {
         let name = format!("field_{index}");
-        attr_type = AttributeType::struct_(
+        attr_type = PatternAttributeType::struct_(
             format!("Level{index}"),
-            vec![StructField::required(name.clone(), attr_type).build()],
+            vec![PatternStructField::required(name.clone(), attr_type).build()],
         );
         nested_segments.push(name);
     }
     nested_segments.reverse();
-    let schema = ResourceSchema::new("test.Deep")
-        .attribute(AttributeSchema::provider_populated("output", attr_type).build())
+    let schema = PatternResourceSchema::new("test.Deep")
+        .attribute(PatternAttributeSchema::provider_populated("output", attr_type).build())
         .validate()
         .expect("deep schema must be valid");
     let mut path = vec!["output".to_string()];
@@ -1399,18 +2386,24 @@ fn effective_node_lookup_gives_each_path_segment_a_fresh_shape_budget() {
 
 #[test]
 fn schema_admission_rechecks_recursive_defs_per_ancestry_path() {
-    ResourceSchema::new("test.Node")
+    PatternResourceSchema::new("test.Node")
         .with_def(
             "Node",
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Node",
                 vec![
-                    StructField::optional("value", AttributeType::string()).build(),
-                    StructField::provider_populated("child", AttributeType::ref_("Node")).build(),
+                    PatternStructField::optional("value", PatternAttributeType::string()).build(),
+                    PatternStructField::provider_populated(
+                        "child",
+                        PatternAttributeType::ref_("Node"),
+                    )
+                    .build(),
                 ],
             ),
         )
-        .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node")).build())
+        .attribute(
+            PatternAttributeSchema::optional("root", PatternAttributeType::ref_("Node")).build(),
+        )
         .validate()
         .expect("recursive refs must distinguish writable and provider-populated ancestry");
 }
@@ -1418,21 +2411,27 @@ fn schema_admission_rechecks_recursive_defs_per_ancestry_path() {
 #[test]
 fn schema_admission_rejects_recursive_write_only_after_ancestry_changes() {
     let error = admission_error(
-        ResourceSchema::new("test.Node")
+        PatternResourceSchema::new("test.Node")
             .with_def(
                 "Node",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Node",
                     vec![
-                        StructField::optional("secret", AttributeType::string())
+                        PatternStructField::optional("secret", PatternAttributeType::string())
                             .write_only()
                             .build(),
-                        StructField::provider_populated("child", AttributeType::ref_("Node"))
-                            .build(),
+                        PatternStructField::provider_populated(
+                            "child",
+                            PatternAttributeType::ref_("Node"),
+                        )
+                        .build(),
                     ],
                 ),
             )
-            .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node")).build()),
+            .attribute(
+                PatternAttributeSchema::optional("root", PatternAttributeType::ref_("Node"))
+                    .build(),
+            ),
     );
 
     assert!(error.contains("root.child.secret"), "{error}");
@@ -1442,19 +2441,19 @@ fn schema_admission_rejects_recursive_write_only_after_ancestry_changes() {
 #[test]
 fn schema_admission_carries_provider_ancestry_through_union_members() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::provider_populated(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::provider_populated(
                 "output",
-                AttributeType::union(vec![
-                    AttributeType::struct_(
+                PatternAttributeType::union(vec![
+                    PatternAttributeType::struct_(
                         "Output",
                         vec![
-                            StructField::optional("secret", AttributeType::string())
+                            PatternStructField::optional("secret", PatternAttributeType::string())
                                 .write_only()
                                 .build(),
                         ],
                     ),
-                    AttributeType::string(),
+                    PatternAttributeType::string(),
                 ]),
             )
             .build(),
@@ -1468,13 +2467,13 @@ fn schema_admission_carries_provider_ancestry_through_union_members() {
 #[test]
 fn schema_admission_carries_provider_ancestry_through_map_values() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::provider_populated(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::provider_populated(
                 "output",
-                AttributeType::map(AttributeType::struct_(
+                PatternAttributeType::map(PatternAttributeType::struct_(
                     "Output",
                     vec![
-                        StructField::optional("secret", AttributeType::string())
+                        PatternStructField::optional("secret", PatternAttributeType::string())
                             .write_only()
                             .build(),
                     ],
@@ -1490,13 +2489,16 @@ fn schema_admission_carries_provider_ancestry_through_map_values() {
 
 #[test]
 fn provider_populated_read_model_does_not_require_declared_required_fields() {
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::provider_populated(
+            PatternAttributeSchema::provider_populated(
                 "output",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Output",
-                    vec![StructField::required("eventual", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::required("eventual", PatternAttributeType::string())
+                            .build(),
+                    ],
                 ),
             )
             .build(),
@@ -1518,13 +2520,13 @@ fn provider_populated_read_model_does_not_require_declared_required_fields() {
 #[test]
 fn schema_admission_rejects_write_only_below_provider_populated_output() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::provider_populated(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::provider_populated(
                 "output",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Output",
                     vec![
-                        StructField::optional("secret", AttributeType::string())
+                        PatternStructField::optional("secret", PatternAttributeType::string())
                             .write_only()
                             .build(),
                     ],
@@ -1541,21 +2543,24 @@ fn schema_admission_rejects_write_only_below_provider_populated_output() {
 #[test]
 fn schema_admission_rejects_write_only_in_shared_def_on_read_only_path() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .with_def(
                 "Shared",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Shared",
                     vec![
-                        StructField::optional("secret", AttributeType::string())
+                        PatternStructField::optional("secret", PatternAttributeType::string())
                             .write_only()
                             .build(),
                     ],
                 ),
             )
             .attribute(
-                AttributeSchema::provider_populated("output", AttributeType::ref_("Shared"))
-                    .build(),
+                PatternAttributeSchema::provider_populated(
+                    "output",
+                    PatternAttributeType::ref_("Shared"),
+                )
+                .build(),
             ),
     );
 
@@ -1566,22 +2571,28 @@ fn schema_admission_rejects_write_only_in_shared_def_on_read_only_path() {
 #[test]
 fn schema_admission_rejects_deferred_field_in_shared_def_on_writable_path() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .with_def(
                 "Shared",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Shared",
                     vec![
-                        StructField::optional("value", AttributeType::string())
+                        PatternStructField::optional("value", PatternAttributeType::string())
                             .deferred_populate()
                             .build(),
                     ],
                 ),
             )
-            .attribute(AttributeSchema::optional("input", AttributeType::ref_("Shared")).build())
             .attribute(
-                AttributeSchema::provider_populated("output", AttributeType::ref_("Shared"))
+                PatternAttributeSchema::optional("input", PatternAttributeType::ref_("Shared"))
                     .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::provider_populated(
+                    "output",
+                    PatternAttributeType::ref_("Shared"),
+                )
+                .build(),
             ),
     );
 
@@ -1592,10 +2603,11 @@ fn schema_admission_rejects_deferred_field_in_shared_def_on_writable_path() {
 #[test]
 fn schema_admission_rejects_a_default_on_provider_populated_output() {
     let mut attribute =
-        AttributeSchema::provider_populated("output", AttributeType::string()).build();
+        PatternAttributeSchema::provider_populated("output", PatternAttributeType::string())
+            .build();
     attribute.default = Some(Value::Concrete(ConcreteValue::String("invalid".into())));
 
-    let error = admission_error(ResourceSchema::new("test.Widget").attribute(attribute));
+    let error = admission_error(PatternResourceSchema::new("test.Widget").attribute(attribute));
 
     assert!(error.contains("output"), "{error}");
     assert!(error.contains("default"), "{error}");
@@ -1604,13 +2616,13 @@ fn schema_admission_rejects_a_default_on_provider_populated_output() {
 #[test]
 fn schema_admission_rejects_top_level_and_nested_write_only_conflicts() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::optional(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional(
                 "config",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Config",
                     vec![
-                        StructField::optional("secret", AttributeType::string())
+                        PatternStructField::optional("secret", PatternAttributeType::string())
                             .write_only()
                             .build(),
                     ],
@@ -1628,13 +2640,13 @@ fn schema_admission_rejects_top_level_and_nested_write_only_conflicts() {
 #[test]
 fn schema_admission_rejects_write_only_fields_inside_union_members() {
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::optional(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional(
                 "config",
-                AttributeType::union(vec![AttributeType::struct_(
+                PatternAttributeType::union(vec![PatternAttributeType::struct_(
                     "Config",
                     vec![
-                        StructField::optional("secret", AttributeType::string())
+                        PatternStructField::optional("secret", PatternAttributeType::string())
                             .write_only()
                             .build(),
                     ],
@@ -1650,6 +2662,8 @@ fn schema_admission_rejects_write_only_fields_inside_union_members() {
 
 #[test]
 fn schema_admission_rejects_create_only_fields_inside_union_members() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let error = admission_error(
         ResourceSchema::new("test.Widget").attribute(
             AttributeSchema::optional(
@@ -1676,6 +2690,8 @@ fn schema_admission_rejects_create_only_fields_inside_union_members() {
 
 #[test]
 fn schema_admission_rejects_identity_without_create_only_witness() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let mut attribute = AttributeSchema::optional("name", AttributeType::string())
         .create_only()
         .identity()
@@ -1703,6 +2719,8 @@ fn schema_admission_rejects_identity_without_create_only_witness() {
 
 #[test]
 fn schema_admission_rejects_when_present_identity_without_optional_create_only_witness() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let mut attribute = AttributeSchema::optional("name", AttributeType::string())
         .create_only()
         .identity_when_present()
@@ -1761,6 +2779,8 @@ fn schema_admission_rejects_when_present_identity_without_optional_create_only_w
 
 #[test]
 fn schema_admission_applies_existing_identity_rules_to_when_present_mode() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let provider_populated = admission_error(
         ResourceSchema::new("test.Output").attribute(
             AttributeSchema::provider_populated(
@@ -1822,6 +2842,8 @@ fn schema_admission_applies_existing_identity_rules_to_when_present_mode() {
 
 #[test]
 fn schema_admission_rejects_non_scalar_identity_leaves() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
     let top_level = admission_error(
         ResourceSchema::new("test.Widget").attribute(
             AttributeSchema::optional("names", AttributeType::list(AttributeType::string()))
@@ -1863,11 +2885,18 @@ fn schema_admission_rejects_non_scalar_identity_leaves() {
 
 #[test]
 fn schema_admission_rejects_provider_populated_fields_marked_write_only() {
-    let mut field = StructField::provider_populated("secret", AttributeType::string()).build();
+    let mut field =
+        PatternStructField::provider_populated("secret", PatternAttributeType::string()).build();
     field.write_only = true;
-    let error = admission_error(ResourceSchema::new("test.Widget").attribute(
-        AttributeSchema::optional("config", AttributeType::struct_("Config", vec![field])).build(),
-    ));
+    let error = admission_error(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional(
+                "config",
+                PatternAttributeType::struct_("Config", vec![field]),
+            )
+            .build(),
+        ),
+    );
 
     assert!(error.contains("config.secret"), "{error}");
     assert!(error.contains("write-only"), "{error}");
@@ -1876,14 +2905,14 @@ fn schema_admission_rejects_provider_populated_fields_marked_write_only() {
 #[test]
 fn config_schema_admission_rejects_dangling_refs_and_duplicate_fields() {
     let types = BTreeMap::from([
-        ("direct".to_string(), AttributeType::ref_("Missing")),
+        ("direct".to_string(), PatternAttributeType::ref_("Missing")),
         (
             "nested".to_string(),
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Nested",
                 vec![
-                    StructField::optional("value", AttributeType::string()).build(),
-                    StructField::optional("value", AttributeType::int()).build(),
+                    PatternStructField::optional("value", PatternAttributeType::string()).build(),
+                    PatternStructField::optional("value", PatternAttributeType::int()).build(),
                 ],
             ),
         ),
@@ -1899,17 +2928,20 @@ fn config_schema_admission_rejects_dangling_refs_and_duplicate_fields() {
 #[test]
 fn schema_admission_rejects_one_identity_bound_to_multiple_scalar_kinds() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Value");
-    let error = ResourceSchema::new("test.Widget")
+    let error = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "text",
-                AttributeType::refined_string(Some(identity.clone()), None, None, None),
+                PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
             )
             .build(),
         )
         .attribute(
-            AttributeSchema::optional("count", AttributeType::refined_int(Some(identity), None))
-                .build(),
+            PatternAttributeSchema::optional(
+                "count",
+                PatternAttributeType::refined_int(Some(identity), None),
+            )
+            .build(),
         )
         .validate()
         .expect_err("one provider schema cannot bind an identity as both String and Int");
@@ -1927,11 +2959,11 @@ fn config_schema_admission_reports_scalar_kind_conflicts_in_canonical_root_order
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "z_text".to_string(),
-            AttributeType::refined_string(Some(identity.clone()), None, None, None),
+            PatternAttributeType::refined_string(Some(identity.clone()), None, None, None),
         ),
         (
             "a_count".to_string(),
-            AttributeType::refined_int(Some(identity), None),
+            PatternAttributeType::refined_int(Some(identity), None),
         ),
     ]))
     .expect_err("one config schema cannot bind an identity as both Int and String");
@@ -1946,12 +2978,12 @@ fn config_schema_admission_reports_scalar_kind_conflicts_in_canonical_root_order
 fn schema_admission_rejects_identified_enum_without_a_scalar_base() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::optional(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional(
                 "mode",
-                AttributeType::enum_with_base(
+                PatternAttributeType::enum_with_base(
                     identity,
-                    AttributeType::bool(),
+                    PatternAttributeType::bool(),
                     Some(vec!["true".to_string()]),
                     Vec::new(),
                     None,
@@ -1969,16 +3001,20 @@ fn schema_admission_rejects_identified_enum_without_a_scalar_base() {
 #[test]
 fn schema_admission_checks_identified_types_inside_referenced_definitions() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
-    let error = ResourceSchema::new("test.Widget")
+    let error = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional("mode", AttributeType::ref_("Alias".to_string())).build(),
+            PatternAttributeSchema::optional(
+                "mode",
+                PatternAttributeType::ref_("Alias".to_string()),
+            )
+            .build(),
         )
-        .with_def("Alias", AttributeType::ref_("Mode".to_string()))
+        .with_def("Alias", PatternAttributeType::ref_("Mode".to_string()))
         .with_def(
             "Mode",
-            AttributeType::enum_with_base(
+            PatternAttributeType::enum_with_base(
                 identity,
-                AttributeType::bool(),
+                PatternAttributeType::bool(),
                 Some(vec!["true".to_string()]),
                 Vec::new(),
                 None,
@@ -1997,10 +3033,10 @@ fn schema_admission_checks_identified_types_inside_referenced_definitions() {
 fn schema_admission_rejects_closed_enum_transform_not_representable_in_v16() {
     let identity = TypeIdentity::new(Some("test"), ["widget"], "Mode");
     let error = admission_error(
-        ResourceSchema::new("test.Widget").attribute(
-            AttributeSchema::optional(
+        PatternResourceSchema::new("test.Widget").attribute(
+            PatternAttributeSchema::optional(
                 "mode",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     identity,
                     Some(vec!["api-value".to_string()]),
                     Vec::new(),
@@ -2013,7 +3049,7 @@ fn schema_admission_rejects_closed_enum_transform_not_representable_in_v16() {
     );
 
     assert!(error.contains("test.widget.Mode"), "{error}");
-    assert!(error.contains("protocol v17"), "{error}");
+    assert!(error.contains("protocol v18"), "{error}");
     assert!(error.contains("transform"), "{error}");
 }
 
@@ -2022,9 +3058,9 @@ fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
     let errors = ValidatedConfigSchema::validate(BTreeMap::from([
         (
             "non_scalar".to_string(),
-            AttributeType::enum_with_base(
+            PatternAttributeType::enum_with_base(
                 TypeIdentity::new(Some("test"), ["config"], "NonScalar"),
-                AttributeType::bool(),
+                PatternAttributeType::bool(),
                 Some(vec!["true".to_string()]),
                 Vec::new(),
                 None,
@@ -2033,7 +3069,7 @@ fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
         ),
         (
             "transformed".to_string(),
-            AttributeType::enum_(
+            PatternAttributeType::enum_(
                 TypeIdentity::new(Some("test"), ["config"], "Transformed"),
                 Some(vec!["api-value".to_string()]),
                 Vec::new(),
@@ -2046,21 +3082,24 @@ fn config_schema_admission_enforces_scalar_and_v16_enum_invariants() {
 
     let rendered = errors.to_string();
     assert!(rendered.contains("scalar base"), "{rendered}");
-    assert!(rendered.contains("protocol v17"), "{rendered}");
+    assert!(rendered.contains("protocol v18"), "{rendered}");
 }
 
 #[test]
 fn config_schema_admission_allows_declared_user_input_below_provider_output() {
     let types = BTreeMap::from([(
         "output".to_string(),
-        AttributeType::struct_(
+        PatternAttributeType::struct_(
             "Output",
             vec![
-                StructField::provider_populated(
+                PatternStructField::provider_populated(
                     "nested",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Nested",
-                        vec![StructField::required("value", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::required("value", PatternAttributeType::string())
+                                .build(),
+                        ],
                     ),
                 )
                 .build(),
@@ -2075,24 +3114,24 @@ fn config_schema_admission_allows_declared_user_input_below_provider_output() {
 #[test]
 fn config_schema_effective_field_lookup_carries_provider_populated_ancestry() {
     let nested = || {
-        AttributeType::struct_(
+        PatternAttributeType::struct_(
             "Nested",
-            vec![StructField::required("value", AttributeType::string()).build()],
+            vec![PatternStructField::required("value", PatternAttributeType::string()).build()],
         )
     };
     let types = BTreeMap::from([
         (
             "writable".to_string(),
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Writable",
-                vec![StructField::optional("nested", nested()).build()],
+                vec![PatternStructField::optional("nested", nested()).build()],
             ),
         ),
         (
             "output".to_string(),
-            AttributeType::struct_(
+            PatternAttributeType::struct_(
                 "Output",
-                vec![StructField::provider_populated("nested", nested()).build()],
+                vec![PatternStructField::provider_populated("nested", nested()).build()],
             ),
         ),
     ]);
@@ -2119,9 +3158,13 @@ fn config_schema_effective_field_lookup_carries_provider_populated_ancestry() {
 
 #[test]
 fn declared_tags_validator_executes_on_a_validated_schema() {
-    let schema = ResourceSchema::new("test.Widget")
+    let schema = PatternResourceSchema::new("test.Widget")
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         )
         .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
         .validate()
@@ -2550,8 +3593,9 @@ fn validate_enum_accepts_dsl_alias() {
     );
 }
 
-fn iam_policy_version_enum() -> AttributeType {
-    AttributeType::enum_(
+fn iam_policy_version_enum<R: crate::schema::PatternForm>() -> crate::schema::PatternAttributeType<R>
+{
+    PatternAttributeType::enum_(
         crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
         Some(vec!["2012-10-17".to_string(), "2008-10-17".to_string()]),
         vec![
@@ -2934,11 +3978,11 @@ fn schema_validate_wraps_enum_error_with_attribute_name() {
     // End-to-end at the ResourceSchema boundary: the attribute loop in
     // `ResourceSchema::validate` must wrap type errors with the attribute
     // name so every downstream consumer (CLI, LSP) sees the plumbed form.
-    let schema = ResourceSchema::new("test.assignment")
+    let schema = PatternResourceSchema::new("test.assignment")
         .attribute(
-            AttributeSchema::required(
+            PatternAttributeSchema::required(
                 "target_type",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
                     Some(vec!["AWS_ACCOUNT".to_string()]),
                     vec![],
@@ -3068,11 +4112,11 @@ fn schema_validate_with_origins_emits_string_literal_diagnostic_for_quoted_enum(
     // `ConcreteValue::EnumIdentifier` = bare/namespaced identifier),
     // so the diagnostic shape follows from the value's variant
     // independently of the origin tag.
-    let schema = ResourceSchema::new("test.assignment")
+    let schema = PatternResourceSchema::new("test.assignment")
         .attribute(
-            AttributeSchema::required(
+            PatternAttributeSchema::required(
                 "target_type",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
                     Some(vec!["AWS_ACCOUNT".to_string()]),
                     vec![],
@@ -3121,11 +4165,11 @@ fn schema_validate_with_origins_leaves_valid_values_alone() {
     // A valid enum value (bare or namespaced) must still pass even
     // when the caller tags it as string-literal origin — the shape
     // check is only triggered on a failing match.
-    let schema = ResourceSchema::new("test.assignment")
+    let schema = PatternResourceSchema::new("test.assignment")
         .attribute(
-            AttributeSchema::required(
+            PatternAttributeSchema::required(
                 "target_type",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
                     Some(vec!["AWS_ACCOUNT".to_string()]),
                     vec![],
@@ -3166,13 +4210,13 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
             _ => Err("expected String".to_string()),
         }
     }
-    let schema = ResourceSchema::new("test.r.mode_holder")
+    let schema = PatternResourceSchema::new("test.r.mode_holder")
         .attribute(
-            AttributeSchema::required(
+            PatternAttributeSchema::required(
                 "mode",
-                AttributeType::enum_with_base(
+                PatternAttributeType::enum_with_base(
                     crate::schema::enum_identity("Mode", Some("test.r")),
-                    AttributeType::string(),
+                    PatternAttributeType::string(),
                     None,
                     vec![],
                     Some(legacy_validator(validate_mode)),
@@ -3357,9 +4401,16 @@ fn validate_int_rejects_float() {
     ); // strict integer typing
 }
 
+fn admit_builtin_type(attr_type: super::AttributeType) -> AttributeType {
+    ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr_type)]))
+        .expect("builtin type must pass schema admission")
+        .parts()["value"]
+        .clone()
+}
+
 #[test]
 fn validate_positive_int() {
-    let t = types::positive_int();
+    let t = admit_builtin_type(types::positive_int());
     assert!(t.validate(&Value::Concrete(ConcreteValue::Int(1))).is_ok());
     assert!(
         t.validate(&Value::Concrete(ConcreteValue::Int(100)))
@@ -3374,10 +4425,12 @@ fn validate_positive_int() {
 
 #[test]
 fn validate_resource_schema() {
-    let schema = ResourceSchema::new("resource")
-        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("count", types::positive_int()).build())
-        .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build())
+    let schema = PatternResourceSchema::new("resource")
+        .attribute(PatternAttributeSchema::required("name", PatternAttributeType::string()).build())
+        .attribute(PatternAttributeSchema::optional("count", types::positive_int()).build())
+        .attribute(
+            PatternAttributeSchema::optional("enabled", PatternAttributeType::bool()).build(),
+        )
         .validate()
         .expect("resource validation schema must be valid");
 
@@ -3397,8 +4450,8 @@ fn validate_resource_schema() {
 
 #[test]
 fn missing_required_attribute() {
-    let schema = ResourceSchema::new("bucket")
-        .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("bucket")
+        .attribute(PatternAttributeSchema::required("name", PatternAttributeType::string()).build())
         .validate()
         .expect("bucket schema must be valid");
 
@@ -3409,7 +4462,7 @@ fn missing_required_attribute() {
 
 #[test]
 fn validate_cidr_type() {
-    let t = types::ipv4_cidr();
+    let t = admit_builtin_type(types::ipv4_cidr());
 
     // Valid CIDRs
     assert!(
@@ -3671,6 +4724,95 @@ fn test_levenshtein_distance() {
 }
 
 #[test]
+fn round7_unknown_attribute_suggests_existing_id_attribute() {
+    let schema = PatternResourceSchema::new("ec2.Subnet")
+        .attribute(
+            PatternAttributeSchema::optional("vpc_id", PatternAttributeType::string()).build(),
+        )
+        .validate()
+        .unwrap();
+    let attrs = HashMap::from([(
+        "vpc".to_string(),
+        Value::Concrete(ConcreteValue::String("vpc-123".into())),
+    )]);
+    let errors = schema.validate(&attrs).unwrap_err();
+    assert!(
+        matches!(&errors[..], [TypeError::UnknownAttribute { name, suggestion }]
+            if name == "vpc" && suggestion.as_deref() == Some("vpc_id")),
+        "{errors:#?}"
+    );
+    assert_eq!(suggest_similar_name("vpc", &["vpc_id"]), None);
+    assert_eq!(suggest_similar_name("vpc", &["subnet_id"]), None);
+}
+
+#[test]
+fn round8_unknown_attribute_prefers_existing_id_over_closer_name() {
+    for (unknown, known, expected) in [
+        ("vpc", vec!["vpc_id", "vpn"], "vpc_id"),
+        ("ip", vec!["ip_id"], "ip_id"),
+        ("vpc", vec!["vpn"], "vpn"),
+    ] {
+        let schema = known
+            .into_iter()
+            .fold(PatternResourceSchema::new("test.Subnet"), |schema, name| {
+                schema.attribute(
+                    PatternAttributeSchema::optional(name, PatternAttributeType::string()).build(),
+                )
+            })
+            .validate()
+            .unwrap();
+        let attrs = HashMap::from([(
+            unknown.to_string(),
+            Value::Concrete(ConcreteValue::String("id-123".into())),
+        )]);
+        let errors = schema.validate(&attrs).unwrap_err();
+        assert!(
+            matches!(&errors[..], [TypeError::UnknownAttribute { name, suggestion }]
+                if name == unknown && suggestion.as_deref() == Some(expected)),
+            "{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn round8_struct_field_and_binding_suggestions_do_not_invent_id_suffix() {
+    let ty = AttributeType::struct_(
+        "Rule",
+        vec![StructField::optional("ip_id", AttributeType::string()).build()],
+    );
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "ip".to_string(),
+        Value::Concrete(ConcreteValue::String("id-123".into())),
+    )])));
+    let error = ty.validate(&value).unwrap_err();
+    assert!(
+        matches!(&error, TypeError::UnknownStructField { struct_name, field, suggestion }
+            if struct_name == "Rule" && field == "ip" && suggestion.is_none()),
+        "{error:#?}"
+    );
+    assert_eq!(suggest_similar_name("ip", &["ip_id"]), None);
+    let binding_error = crate::parser::ParseError::undefined_identifier(
+        "ip".to_string(),
+        1,
+        vec!["ip_id".to_string()],
+    );
+    match binding_error {
+        crate::parser::ParseError::UndefinedIdentifier {
+            name,
+            line: _,
+            span: _,
+            suggestion,
+            in_scope,
+        } => {
+            assert_eq!(name, "ip");
+            assert_eq!(suggestion, None);
+            assert_eq!(in_scope, ["ip_id"]);
+        }
+        error => panic!("expected an undefined binding: {error:?}"),
+    }
+}
+
+#[test]
 fn test_suggest_similar_name() {
     let fields = vec!["ip_protocol", "from_port", "to_port", "cidr_ip"];
 
@@ -3783,7 +4925,7 @@ fn struct_rejects_block_syntax_multiple_elements() {
 
 #[test]
 fn validate_ipv4_cidr_type() {
-    let t = types::ipv4_cidr();
+    let t = admit_builtin_type(types::ipv4_cidr());
 
     // Valid IPv4 CIDRs
     assert!(
@@ -3822,7 +4964,7 @@ fn validate_ipv4_cidr_type() {
 
 #[test]
 fn validate_ipv6_cidr_type() {
-    let t = types::ipv6_cidr();
+    let t = admit_builtin_type(types::ipv6_cidr());
 
     // Valid IPv6 CIDRs
     assert!(
@@ -3909,7 +5051,7 @@ fn validate_ipv6_cidr_function_directly() {
 
 #[test]
 fn validate_cidr_accepts_both_ipv4_and_ipv6() {
-    let t = types::cidr();
+    let t = admit_builtin_type(types::cidr());
 
     // Valid IPv4 CIDRs
     assert!(
@@ -3953,7 +5095,7 @@ fn validate_cidr_accepts_both_ipv4_and_ipv6() {
 #[test]
 fn custom_type_accepts_resource_ref() {
     // ResourceRef values resolve to strings at runtime, so Custom types should accept them
-    let ipv4 = types::ipv4_cidr();
+    let ipv4 = admit_builtin_type(types::ipv4_cidr());
     assert!(
         ipv4.validate(&Value::root_resource_ref(
             "vpc".to_string(),
@@ -3963,7 +5105,7 @@ fn custom_type_accepts_resource_ref() {
         .is_ok()
     );
 
-    let ipv6 = types::ipv6_cidr();
+    let ipv6 = admit_builtin_type(types::ipv6_cidr());
     assert!(
         ipv6.validate(&Value::root_resource_ref(
             "subnet".to_string(),
@@ -3976,7 +5118,7 @@ fn custom_type_accepts_resource_ref() {
 
 #[test]
 fn validate_ipv4_address_type() {
-    let t = types::ipv4_address();
+    let t = admit_builtin_type(types::ipv4_address());
 
     // Valid IPv4 addresses
     assert!(
@@ -4027,7 +5169,7 @@ fn validate_ipv4_address_type() {
 
 #[test]
 fn validate_ipv6_address_type() {
-    let t = types::ipv6_address();
+    let t = admit_builtin_type(types::ipv6_address());
 
     // Valid IPv6 addresses
     assert!(
@@ -4101,9 +5243,13 @@ fn types_module_has_no_aws_specific_types() {
 
 #[test]
 fn declared_resource_validator_called() {
-    let schema = ResourceSchema::new("test")
+    let schema = PatternResourceSchema::new("test")
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         )
         .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
         .validate()
@@ -4151,32 +5297,37 @@ fn with_declared_validators_stores_portable_validation() {
 
 #[test]
 fn validate_known_values_defers_constraints_until_values_are_concrete() {
-    let schema = ResourceSchema::new("test.KnownValues")
+    let schema = PatternResourceSchema::new("test.KnownValues")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "pattern",
-                AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
+                PatternAttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".to_string()),
+                    None,
+                    None,
+                ),
             )
             .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "length",
-                AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+                PatternAttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
             )
             .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "range",
-                AttributeType::refined_int(None, Some((Some(1), Some(10)))),
+                PatternAttributeType::refined_int(None, Some((Some(1), Some(10)))),
             )
             .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "custom",
-                AttributeType::refined_string(
+                PatternAttributeType::refined_string(
                     Some(TypeIdentity::bare("CheckedId")),
                     None,
                     None,
@@ -4277,7 +5428,7 @@ fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
             "names",
             AttributeType::list(AttributeType::refined_string(
                 None,
-                Some("^[a-z]+$".to_string()),
+                Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
                 None,
                 None,
             )),
@@ -4314,14 +5465,14 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
     use indexmap::IndexMap;
 
     let constrained = || {
-        AttributeType::refined_string(
+        PatternAttributeType::refined_string(
             None,
             Some("^allowed$".to_string()),
             Some((Some(7), Some(7))),
             None,
         )
     };
-    let custom = AttributeType::refined_string_with_validator(
+    let custom = PatternAttributeType::refined_string_with_validator(
         TypeIdentity::bare("SecretCustom"),
         None,
         None,
@@ -4334,12 +5485,12 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         }),
         None,
     );
-    let schema = ResourceSchema::new("test.SecretValues")
-        .attribute(AttributeSchema::optional("length", constrained()).build())
+    let schema = PatternResourceSchema::new("test.SecretValues")
+        .attribute(PatternAttributeSchema::optional("length", constrained()).build())
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "enum_value",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     TypeIdentity::bare("Mode"),
                     Some(vec!["allowed".to_string()]),
                     vec![],
@@ -4349,22 +5500,32 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
             )
             .build(),
         )
-        .attribute(AttributeSchema::optional("custom", custom.clone()).build())
-        .attribute(AttributeSchema::optional("lookup", custom).build())
-        .attribute(AttributeSchema::optional("list", AttributeType::list(constrained())).build())
-        .attribute(AttributeSchema::optional("map", AttributeType::map(constrained())).build())
+        .attribute(PatternAttributeSchema::optional("custom", custom.clone()).build())
+        .attribute(PatternAttributeSchema::optional("lookup", custom).build())
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional("list", PatternAttributeType::list(constrained()))
+                .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("map", PatternAttributeType::map(constrained()))
+                .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
                 "struct",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "SecretStruct".to_string(),
-                    vec![StructField::optional("field", constrained()).build()],
+                    vec![PatternStructField::optional("field", constrained()).build()],
                 ),
             )
             .build(),
         )
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         )
         .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
         .validate()
@@ -4463,11 +5624,11 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
 fn secret_enum_literal_masks_typed_value_and_validator_message() {
     let enumerated_plaintext = "enumerated-secret-literal";
     let validator_plaintext = "validator-secret-literal";
-    let schema = ResourceSchema::new("test.SecretEnums")
+    let schema = PatternResourceSchema::new("test.SecretEnums")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "enumerated",
-                AttributeType::enum_(
+                PatternAttributeType::enum_(
                     TypeIdentity::bare("Mode"),
                     Some(vec!["allowed".to_string()]),
                     vec![],
@@ -4478,11 +5639,11 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
             .build(),
         )
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "validated",
-                AttributeType::enum_with_base(
+                PatternAttributeType::enum_with_base(
                     enum_identity("DynamicMode", Some("test.SecretEnums")),
-                    AttributeType::string(),
+                    PatternAttributeType::string(),
                     None,
                     vec![],
                     Some(legacy_validator(|value| match value {
@@ -4591,8 +5752,14 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
         ))))
     }
 
-    let constrained =
-        || AttributeType::refined_string(None, Some("^allowed$".to_string()), None, None);
+    let constrained = || {
+        AttributeType::refined_string(
+            None,
+            Some(crate::schema::CompiledPattern::try_new("^allowed$").unwrap()),
+            None,
+            None,
+        )
+    };
 
     let unknown_field = "unknown-struct-field-secret";
     let error = AttributeType::struct_(
@@ -4704,9 +5871,14 @@ fn secret_pattern_mismatch_is_masked_without_literal_quotes() {
     let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String(plaintext.to_string().into()),
     ))));
-    let error = AttributeType::refined_string(None, Some("^allowed$".to_string()), None, None)
-        .validate(&value)
-        .expect_err("secret must fail the pattern constraint");
+    let error = AttributeType::refined_string(
+        None,
+        Some(crate::schema::CompiledPattern::try_new("^allowed$").unwrap()),
+        None,
+        None,
+    )
+    .validate(&value)
+    .expect_err("secret must fail the pattern constraint");
 
     assert!(matches!(error, TypeError::PatternMismatch { .. }));
     let rendered = error.to_string();
@@ -4761,15 +5933,26 @@ fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
 
 #[test]
 fn validate_known_values_runs_declared_validator_without_structural_errors() {
-    let schema = ResourceSchema::new("test.KnownValues")
-        .attribute(AttributeSchema::required("required", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("test.KnownValues")
         .attribute(
-            AttributeSchema::provider_populated("read_only", AttributeType::string()).build(),
+            PatternAttributeSchema::required("required", PatternAttributeType::string()).build(),
         )
-        .attribute(AttributeSchema::optional("choice_a", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("choice_b", AttributeType::string()).build())
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+            PatternAttributeSchema::provider_populated("read_only", PatternAttributeType::string())
+                .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("choice_a", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("choice_b", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         )
         .field_group(FieldGroup::exactly_one(["choice_a", "choice_b"]).unwrap())
         .with_declared_validators(vec![ValidatorType::TagsKeyValueCheck])
@@ -4821,9 +6004,14 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
 
 #[test]
 fn top_level_exactly_one_field_group_is_declarative() {
-    let schema = ResourceSchema::new("vpc")
-        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("ipv4_ipam_pool_id", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("vpc")
+        .attribute(
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("ipv4_ipam_pool_id", PatternAttributeType::string())
+                .build(),
+        )
         .field_group(FieldGroup::exactly_one(["cidr_block", "ipv4_ipam_pool_id"]).unwrap())
         .validate()
         .expect("field-group schema must be valid");
@@ -4869,11 +6057,11 @@ fn top_level_exactly_one_field_group_is_declarative() {
 
 #[test]
 fn multiple_top_level_field_groups_are_independent() {
-    let schema = ResourceSchema::new("multi")
-        .attribute(AttributeSchema::optional("a", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("b", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("x", AttributeType::string()).build())
-        .attribute(AttributeSchema::optional("y", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("multi")
+        .attribute(PatternAttributeSchema::optional("a", PatternAttributeType::string()).build())
+        .attribute(PatternAttributeSchema::optional("b", PatternAttributeType::string()).build())
+        .attribute(PatternAttributeSchema::optional("x", PatternAttributeType::string()).build())
+        .attribute(PatternAttributeSchema::optional("y", PatternAttributeType::string()).build())
         .field_group(FieldGroup::exactly_one(["a", "b"]).unwrap())
         .field_group(FieldGroup::exactly_one(["x", "y"]).unwrap())
         .validate()
@@ -5107,8 +6295,8 @@ fn resolve_block_names_renames_key() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.ipam").attribute(
-            AttributeSchema::optional("operating_regions", AttributeType::string())
+        (PatternResourceSchema::new("ec2.ipam").attribute(
+            PatternAttributeSchema::optional("operating_regions", PatternAttributeType::string())
                 .with_block_name("operating_region")
                 .build(),
         ))
@@ -5139,22 +6327,22 @@ fn resolve_block_names_preserves_authored_order_across_multiple_aliases() {
     let mut resources = vec![resource];
 
     let block_type = || {
-        AttributeType::list(AttributeType::struct_(
+        PatternAttributeType::list(PatternAttributeType::struct_(
             "Entry".to_string(),
-            Vec::<StructField>::new(),
+            Vec::new(),
         ))
     };
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test.thing")
+        (PatternResourceSchema::new("test.thing")
             .attribute(
-                AttributeSchema::optional("firsts", block_type())
+                PatternAttributeSchema::optional("firsts", block_type())
                     .with_block_name("first")
                     .build(),
             )
             .attribute(
-                AttributeSchema::optional("seconds", block_type())
+                PatternAttributeSchema::optional("seconds", block_type())
                     .with_block_name("second")
                     .build(),
             ))
@@ -5188,8 +6376,9 @@ fn resolve_block_names_noop_when_no_match() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.ipam")
-            .attribute(AttributeSchema::optional("name", AttributeType::string()).build()))
+        (PatternResourceSchema::new("ec2.ipam").attribute(
+            PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+        ))
         .validate()
         .expect("schema fixture must be valid"),
     );
@@ -5237,8 +6426,8 @@ fn resolve_block_names_errors_on_mixed_syntax() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.ipam").attribute(
-            AttributeSchema::optional("operating_regions", AttributeType::string())
+        (PatternResourceSchema::new("ec2.ipam").attribute(
+            PatternAttributeSchema::optional("operating_regions", PatternAttributeType::string())
                 .with_block_name("operating_region")
                 .build(),
         ))
@@ -5315,15 +6504,15 @@ fn resolve_block_names_nested_struct() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional(
                 "lifecycle_configuration",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "LifecycleConfiguration".to_string(),
                     vec![
-                        StructField::optional(
+                        PatternStructField::optional(
                             "transitions",
-                            AttributeType::list(AttributeType::struct_(
+                            PatternAttributeType::list(PatternAttributeType::struct_(
                                 "Transition".to_string(),
                                 vec![],
                             )),
@@ -5389,20 +6578,20 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional(
                 "lifecycle_configuration",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "LifecycleConfiguration".to_string(),
                     vec![
-                        StructField::optional(
+                        PatternStructField::optional(
                             "transition",
-                            AttributeType::struct_("Transition".to_string(), vec![]),
+                            PatternAttributeType::struct_("Transition".to_string(), vec![]),
                         )
                         .build(),
-                        StructField::optional(
+                        PatternStructField::optional(
                             "transitions",
-                            AttributeType::list(AttributeType::struct_(
+                            PatternAttributeType::list(PatternAttributeType::struct_(
                                 "Transition".to_string(),
                                 vec![],
                             )),
@@ -5437,12 +6626,14 @@ fn resolve_block_names_singular_field_not_renamed_when_assigned() {
 
 #[test]
 fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
-    let schema = ResourceSchema::new("thing").attribute(
-        AttributeSchema::optional(
+    let schema = PatternResourceSchema::new("thing").attribute(
+        PatternAttributeSchema::optional(
             "rules",
-            AttributeType::list(AttributeType::struct_(
+            PatternAttributeType::list(PatternAttributeType::struct_(
                 "Rule",
-                vec![StructField::optional("action", AttributeType::string()).build()],
+                vec![
+                    PatternStructField::optional("action", PatternAttributeType::string()).build(),
+                ],
             )),
         )
         .with_block_name("rule")
@@ -5495,17 +6686,20 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
 
 #[test]
 fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
-    let lifecycle_type = AttributeType::struct_(
+    let lifecycle_type = PatternAttributeType::struct_(
         "LifecycleConfiguration".to_string(),
         vec![
-            StructField::optional(
+            PatternStructField::optional(
                 "transition",
-                AttributeType::struct_("Transition".to_string(), vec![]),
+                PatternAttributeType::struct_("Transition".to_string(), vec![]),
             )
             .build(),
-            StructField::optional(
+            PatternStructField::optional(
                 "transitions",
-                AttributeType::list(AttributeType::struct_("Transition".to_string(), vec![])),
+                PatternAttributeType::list(PatternAttributeType::struct_(
+                    "Transition".to_string(),
+                    vec![],
+                )),
             )
             .with_block_name("transition")
             .build(),
@@ -5514,8 +6708,8 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("thing").attribute(
-            AttributeSchema::optional("lifecycle_configuration", lifecycle_type).build(),
+        (PatternResourceSchema::new("thing").attribute(
+            PatternAttributeSchema::optional("lifecycle_configuration", lifecycle_type).build(),
         ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -5597,13 +6791,16 @@ fn resolve_file_block_names_canonicalizes_data_source_blocks() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "test",
-        (ResourceSchema::new("thing")
+        (PatternResourceSchema::new("thing")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "rules",
-                    AttributeType::list(AttributeType::struct_(
+                    PatternAttributeType::list(PatternAttributeType::struct_(
                         "Rule",
-                        vec![StructField::optional("action", AttributeType::string()).build()],
+                        vec![
+                            PatternStructField::optional("action", PatternAttributeType::string())
+                                .build(),
+                        ],
                     )),
                 )
                 .with_block_name("rule")
@@ -5654,20 +6851,20 @@ fn resolve_block_names_block_syntax_wins_ambiguous_non_list_field() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional(
                 "lifecycle_configuration",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "LifecycleConfiguration".to_string(),
                     vec![
-                        StructField::optional(
+                        PatternStructField::optional(
                             "transition",
-                            AttributeType::struct_("Transition".to_string(), vec![]),
+                            PatternAttributeType::struct_("Transition".to_string(), vec![]),
                         )
                         .build(),
-                        StructField::optional(
+                        PatternStructField::optional(
                             "transitions",
-                            AttributeType::list(AttributeType::struct_(
+                            PatternAttributeType::list(PatternAttributeType::struct_(
                                 "Transition".to_string(),
                                 vec![],
                             )),
@@ -5715,20 +6912,20 @@ fn resolve_block_names_real_list_field_wins_ambiguous_list_value() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("s3.Bucket").attribute(
+            PatternAttributeSchema::optional(
                 "lifecycle_configuration",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "LifecycleConfiguration".to_string(),
                     vec![
-                        StructField::optional(
+                        PatternStructField::optional(
                             "transition",
-                            AttributeType::list(AttributeType::string()),
+                            PatternAttributeType::list(PatternAttributeType::string()),
                         )
                         .build(),
-                        StructField::optional(
+                        PatternStructField::optional(
                             "transitions",
-                            AttributeType::list(AttributeType::struct_(
+                            PatternAttributeType::list(PatternAttributeType::struct_(
                                 "Transition".to_string(),
                                 vec![],
                             )),
@@ -5781,12 +6978,15 @@ fn resolve_block_names_same_block_and_canonical_name() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.SecurityGroup").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("ec2.SecurityGroup").attribute(
+            PatternAttributeSchema::optional(
                 "ingress",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Ingress".to_string(),
-                    vec![StructField::optional("ip_protocol", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("ip_protocol", PatternAttributeType::string())
+                            .build(),
+                    ],
                 )),
             )
             .with_block_name("ingress")
@@ -5843,12 +7043,15 @@ fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("ec2.SecurityGroup").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("ec2.SecurityGroup").attribute(
+            PatternAttributeSchema::optional(
                 "ingress",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Ingress".to_string(),
-                    vec![StructField::optional("ip_protocol", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("ip_protocol", PatternAttributeType::string())
+                            .build(),
+                    ],
                 )),
             )
             .with_block_name("ingress")
@@ -5903,19 +7106,27 @@ fn resolve_block_names_nested_same_block_and_canonical_name() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("test.resource").attribute(
-            AttributeSchema::optional(
+        (PatternResourceSchema::new("test.resource").attribute(
+            PatternAttributeSchema::optional(
                 "config",
-                AttributeType::struct_(
+                PatternAttributeType::struct_(
                     "Config".to_string(),
                     vec![
-                        StructField::optional(
+                        PatternStructField::optional(
                             "tag",
-                            AttributeType::list(AttributeType::struct_(
+                            PatternAttributeType::list(PatternAttributeType::struct_(
                                 "Tag".to_string(),
                                 vec![
-                                    StructField::optional("key", AttributeType::string()).build(),
-                                    StructField::optional("value", AttributeType::string()).build(),
+                                    PatternStructField::optional(
+                                        "key",
+                                        PatternAttributeType::string(),
+                                    )
+                                    .build(),
+                                    PatternStructField::optional(
+                                        "value",
+                                        PatternAttributeType::string(),
+                                    )
+                                    .build(),
                                 ],
                             )),
                         )
@@ -5994,14 +7205,16 @@ fn resolve_block_names_recurses_through_ref_attribute() {
         r
     }];
 
-    let lifecycle_def = AttributeType::struct_(
+    let lifecycle_def = PatternAttributeType::struct_(
         "LifecycleConfiguration".to_string(),
         vec![
-            StructField::optional(
+            PatternStructField::optional(
                 "rules",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Rule".to_string(),
-                    vec![StructField::optional("id", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("id", PatternAttributeType::string()).build(),
+                    ],
                 )),
             )
             .with_block_name("rule")
@@ -6012,11 +7225,11 @@ fn resolve_block_names_recurses_through_ref_attribute() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
+        (PatternResourceSchema::new("s3.Bucket")
             .attribute(
-                AttributeSchema::optional(
+                PatternAttributeSchema::optional(
                     "lifecycle_configuration",
-                    AttributeType::ref_("LifecycleConfiguration".to_string()),
+                    PatternAttributeType::ref_("LifecycleConfiguration".to_string()),
                 )
                 .build(),
             )
@@ -6076,14 +7289,16 @@ fn resolve_block_names_recurses_through_ref_inside_struct_field() {
         r
     }];
 
-    let lifecycle_def = AttributeType::struct_(
+    let lifecycle_def = PatternAttributeType::struct_(
         "LifecycleConfiguration".to_string(),
         vec![
-            StructField::optional(
+            PatternStructField::optional(
                 "rules",
-                AttributeType::list(AttributeType::struct_(
+                PatternAttributeType::list(PatternAttributeType::struct_(
                     "Rule".to_string(),
-                    vec![StructField::optional("id", AttributeType::string()).build()],
+                    vec![
+                        PatternStructField::optional("id", PatternAttributeType::string()).build(),
+                    ],
                 )),
             )
             .with_block_name("rule")
@@ -6091,12 +7306,12 @@ fn resolve_block_names_recurses_through_ref_inside_struct_field() {
         ],
     );
 
-    let wrapper_type = AttributeType::struct_(
+    let wrapper_type = PatternAttributeType::struct_(
         "Wrapper".to_string(),
         vec![
-            StructField::optional(
+            PatternStructField::optional(
                 "lifecycle",
-                AttributeType::ref_("LifecycleConfiguration".to_string()),
+                PatternAttributeType::ref_("LifecycleConfiguration".to_string()),
             )
             .build(),
         ],
@@ -6105,8 +7320,8 @@ fn resolve_block_names_recurses_through_ref_inside_struct_field() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        (ResourceSchema::new("s3.Bucket")
-            .attribute(AttributeSchema::optional("wrapper", wrapper_type).build())
+        (PatternResourceSchema::new("s3.Bucket")
+            .attribute(PatternAttributeSchema::optional("wrapper", wrapper_type).build())
             .with_def("LifecycleConfiguration", lifecycle_def))
         .validate()
         .expect("schema fixture must be valid"),
@@ -6149,16 +7364,19 @@ fn block_name_below_provider_output_is_not_resolved() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        ResourceSchema::new("test.Widget")
+        PatternResourceSchema::new("test.Widget")
             .attribute(
-                AttributeSchema::provider_populated(
+                PatternAttributeSchema::provider_populated(
                     "output",
-                    AttributeType::struct_(
+                    PatternAttributeType::struct_(
                         "Output",
                         vec![
-                            StructField::optional(
+                            PatternStructField::optional(
                                 "items",
-                                AttributeType::list(AttributeType::struct_("Item", vec![])),
+                                PatternAttributeType::list(PatternAttributeType::struct_(
+                                    "Item",
+                                    vec![],
+                                )),
                             )
                             .with_block_name("item")
                             .build(),
@@ -6268,7 +7486,7 @@ fn shape_ref_free_projects_non_ref_shape() {
         Shape::List {
             element_type: inner,
             ordered,
-            ..
+            constraints: _constraints,
         } => {
             assert!(ordered);
             assert!(matches!(inner.kind(), AttrTypeKind::String { .. }));
@@ -6378,8 +7596,10 @@ fn test_resource_schema_without_operation_config() {
 
 #[test]
 fn validate_rejects_unknown_attribute() {
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("s3.Bucket")
+        .attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string()).build(),
+        )
         .validate()
         .expect("bucket schema must be valid");
 
@@ -6402,10 +7622,16 @@ fn validate_rejects_unknown_attribute() {
 
 #[test]
 fn validate_allows_known_attributes_only() {
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("s3.Bucket")
         .attribute(
-            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string()).build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional(
+                "tags",
+                PatternAttributeType::map(PatternAttributeType::string()),
+            )
+            .build(),
         )
         .validate()
         .expect("bucket schema must be valid");
@@ -6425,9 +7651,12 @@ fn validate_allows_known_attributes_only() {
 
 #[test]
 fn validate_rejects_read_only_attribute_assignment() {
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-        .attribute(AttributeSchema::provider_populated("region", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("s3.Bucket")
+        .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::provider_populated("region", PatternAttributeType::string())
+                .build(),
+        )
         .validate()
         .expect("bucket schema must be valid");
 
@@ -6473,9 +7702,9 @@ fn validate_rejects_read_only_attribute_assignment() {
 
 #[test]
 fn validate_allows_optional_attribute_to_be_omitted_when_it_has_a_default() {
-    let schema = ResourceSchema::new("test.Resource")
+    let schema = PatternResourceSchema::new("test.Resource")
         .attribute(
-            AttributeSchema::optional("region", AttributeType::string())
+            PatternAttributeSchema::optional("region", PatternAttributeType::string())
                 .with_default(Value::Concrete(ConcreteValue::String("us-east-1".into())))
                 .build(),
         )
@@ -6546,11 +7775,11 @@ fn attribute_schema_removability_preserves_input_mode_and_create_only_matrix() {
 
 #[test]
 fn validate_user_input_block_name_alias_is_accepted() {
-    let schema = ResourceSchema::new("test.Resource")
+    let schema = PatternResourceSchema::new("test.Resource")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "generated_rules",
-                AttributeType::list(AttributeType::string()),
+                PatternAttributeType::list(PatternAttributeType::string()),
             )
             .with_block_name("generated_rule")
             .build(),
@@ -6571,14 +7800,20 @@ fn validate_user_input_block_name_alias_is_accepted() {
 
 #[test]
 fn validate_read_only_is_keyed_per_resource_type_not_by_attribute_name() {
-    let route_schema = ResourceSchema::new("ec2.Route")
+    let route_schema = PatternResourceSchema::new("ec2.Route")
         .attribute(
-            AttributeSchema::provider_populated("cidr_block", AttributeType::string()).build(),
+            PatternAttributeSchema::provider_populated(
+                "cidr_block",
+                PatternAttributeType::string(),
+            )
+            .build(),
         )
         .validate()
         .expect("route schema must be valid");
-    let vpc_schema = ResourceSchema::new("ec2.Vpc")
-        .attribute(AttributeSchema::optional("cidr_block", AttributeType::string()).build())
+    let vpc_schema = PatternResourceSchema::new("ec2.Vpc")
+        .attribute(
+            PatternAttributeSchema::optional("cidr_block", PatternAttributeType::string()).build(),
+        )
         .validate()
         .expect("VPC schema must be valid");
     let attrs = HashMap::from([(
@@ -6601,20 +7836,28 @@ fn validate_read_only_is_keyed_per_resource_type_not_by_attribute_name() {
 
 #[test]
 fn validate_read_only_scope_distinguishes_top_level_and_nested_struct_fields() {
-    let origin = AttributeType::struct_(
+    let origin = PatternAttributeType::struct_(
         "Origin".to_string(),
         vec![
-            StructField::required("id", AttributeType::string()).build(),
-            StructField::provider_populated("domain_name", AttributeType::string()).build(),
+            PatternStructField::required("id", PatternAttributeType::string()).build(),
+            PatternStructField::provider_populated("domain_name", PatternAttributeType::string())
+                .build(),
         ],
     );
-    let schema = ResourceSchema::new("cloudfront.Distribution")
-        .attribute(AttributeSchema::provider_populated("id", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("cloudfront.Distribution")
         .attribute(
-            AttributeSchema::provider_populated("domain_name", AttributeType::string()).build(),
+            PatternAttributeSchema::provider_populated("id", PatternAttributeType::string())
+                .build(),
         )
         .attribute(
-            AttributeSchema::optional("origins", AttributeType::list(origin))
+            PatternAttributeSchema::provider_populated(
+                "domain_name",
+                PatternAttributeType::string(),
+            )
+            .build(),
+        )
+        .attribute(
+            PatternAttributeSchema::optional("origins", PatternAttributeType::list(origin))
                 .with_block_name("origin")
                 .build(),
         )
@@ -6695,8 +7938,10 @@ fn validate_read_only_scope_distinguishes_top_level_and_nested_struct_fields() {
 
 #[test]
 fn validate_unknown_attribute_with_suggestion() {
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("s3.Bucket")
+        .attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string()).build(),
+        )
         .validate()
         .expect("bucket schema must be valid");
 
@@ -6721,11 +7966,11 @@ fn validate_unknown_attribute_with_suggestion() {
 
 #[test]
 fn validate_accepts_block_name_alias() {
-    let schema = ResourceSchema::new("ec2.SecurityGroup")
+    let schema = PatternResourceSchema::new("ec2.SecurityGroup")
         .attribute(
-            AttributeSchema::optional(
+            PatternAttributeSchema::optional(
                 "ingress_rules",
-                AttributeType::unordered_list(AttributeType::string()),
+                PatternAttributeType::unordered_list(PatternAttributeType::string()),
             )
             .with_block_name("ingress_rule")
             .build(),
@@ -6746,8 +7991,10 @@ fn validate_accepts_block_name_alias() {
 
 #[test]
 fn validate_does_not_exempt_underscore_prefixed_attributes() {
-    let schema = ResourceSchema::new("s3.Bucket")
-        .attribute(AttributeSchema::optional("bucket_name", AttributeType::string()).build())
+    let schema = PatternResourceSchema::new("s3.Bucket")
+        .attribute(
+            PatternAttributeSchema::optional("bucket_name", PatternAttributeType::string()).build(),
+        )
         .validate()
         .expect("bucket schema must be valid");
 
@@ -6795,7 +8042,12 @@ fn make_custom_anon_pattern_and_len(
     pattern: Option<&str>,
     length: Option<(Option<u64>, Option<u64>)>,
 ) -> AttributeType {
-    AttributeType::refined_string(None, pattern.map(str::to_string), length, None)
+    AttributeType::refined_string(
+        None,
+        pattern.map(|pattern| crate::schema::CompiledPattern::try_new(pattern).unwrap()),
+        length,
+        None,
+    )
 }
 
 fn assignable_with_defs(
@@ -7596,10 +8848,18 @@ fn assignable_inline_lists_remain_assignable() {
 
 #[test]
 fn assignable_list_ignores_order_and_length_metadata() {
-    let source =
-        AttributeType::refined_list(AttributeType::string(), false, Some((Some(1), Some(2))));
-    let sink =
-        AttributeType::refined_list(AttributeType::string(), true, Some((Some(10), Some(20))));
+    let source = AttributeType::refined_list(
+        AttributeType::string(),
+        false,
+        Some((Some(1), Some(2))),
+        ListElements::AllowDuplicates,
+    );
+    let sink = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((Some(10), Some(20))),
+        ListElements::AllowDuplicates,
+    );
 
     assert!(assignable(&source, &sink));
 }
@@ -7910,7 +9170,7 @@ fn assignable_specific_arn_flows_into_generic_arn() {
     let mk = |segments: &[&str], pattern: Option<&str>| {
         AttributeType::refined_string_with_validator(
             TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
-            pattern.map(str::to_string),
+            pattern.map(|pattern| crate::schema::CompiledPattern::try_new(pattern).unwrap()),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
@@ -7949,7 +9209,7 @@ fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
     let mk = |segments: &[&str], pattern: &str| {
         AttributeType::refined_string_with_validator(
             TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
-            Some(pattern.to_string()),
+            Some(crate::schema::CompiledPattern::try_new(pattern).unwrap()),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
@@ -7968,7 +9228,7 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
     let mk = |segments: &[&str], pattern: Option<&str>| {
         AttributeType::refined_string_with_validator(
             TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
-            pattern.map(str::to_string),
+            pattern.map(|pattern| crate::schema::CompiledPattern::try_new(pattern).unwrap()),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
@@ -8482,7 +9742,7 @@ fn assignable_anon_length_both_none_compatible() {
 fn custom_carries_semantic_name_pattern_length() {
     let t = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("VpcId"),
-        Some("^vpc-[a-f0-9]+$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^vpc-[a-f0-9]+$").unwrap()),
         Some((Some(8), Some(21))),
         crate::schema::legacy_validator(|_| Ok(())),
         None,
@@ -8504,7 +9764,12 @@ fn custom_carries_semantic_name_pattern_length() {
 
 #[test]
 fn custom_pattern_rejects_and_accepts_string_values() {
-    let attr = AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None);
+    let attr = AttributeType::refined_string(
+        None,
+        Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
+        None,
+        None,
+    );
 
     let err = attr
         .validate(&Value::Concrete(ConcreteValue::String("ABC".into())))
@@ -8525,10 +9790,99 @@ fn custom_pattern_rejects_and_accepts_string_values() {
 }
 
 #[test]
+fn schema_admission_compiles_patterns_before_validating_values() {
+    let schema = super::ResourceSchema::new("test.Pattern")
+        .attribute(
+            super::AttributeSchema::required(
+                "slug",
+                super::AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".to_string()),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("valid regex is admitted");
+    let attribute = schema.effective_attribute("slug").unwrap();
+    assert!(
+        attribute
+            .validate(&Value::Concrete(ConcreteValue::String("abc".into())))
+            .is_ok()
+    );
+    assert!(matches!(
+        attribute.validate(&Value::Concrete(ConcreteValue::String("ABC".into()))),
+        Err(TypeError::PatternMismatch { pattern, .. }) if pattern == "^[a-z]+$"
+    ));
+}
+
+#[test]
+fn schema_pattern_dialect_rejects_unicode_account_ids_and_preserves_transport() {
+    let schema = |pattern: &str| {
+        super::ResourceSchema::new("test.Account")
+            .attribute(
+                super::AttributeSchema::required(
+                    "account_id",
+                    super::AttributeType::refined_string(
+                        None,
+                        Some(pattern.to_string()),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap()
+    };
+    for (source, explicit_ascii_source, accepted, rejected) in [
+        (r"^\d{12}$", r"^[0-9]{12}$", "123456789012", "١٢٣٤٥٦٧٨٩٠١٢"),
+        (r"^\w+$", r"^[0-9A-Za-z_]+$", "Account_123", "é"),
+    ] {
+        let admitted = schema(source);
+        let attribute = admitted.effective_attribute("account_id").unwrap();
+        assert!(
+            attribute
+                .validate(&Value::Concrete(ConcreteValue::String(accepted.into())))
+                .is_ok()
+        );
+        assert!(matches!(
+            attribute.validate(&Value::Concrete(ConcreteValue::String(rejected.into()))),
+            Err(TypeError::PatternMismatch { pattern, .. }) if pattern == source
+        ));
+        let wire = crate::protocol_convert::resource_schema_to_protocol(&admitted).unwrap();
+        assert!(matches!(
+            &wire.attributes["account_id"].attr_type,
+            carina_provider_protocol::types::AttributeType::String { pattern: Some(pattern), .. } if pattern == source
+        ));
+        let decoded = crate::protocol_convert::protocol_to_resource_schema(&wire).unwrap();
+        assert_eq!(
+            decoded.as_schema().semantic_fingerprint(),
+            admitted.as_schema().semantic_fingerprint()
+        );
+        assert!(matches!(
+            decoded.effective_attribute("account_id").unwrap().validate(
+                &Value::Concrete(ConcreteValue::String(rejected.into()))
+            ),
+            Err(TypeError::PatternMismatch { pattern, .. }) if pattern == source
+        ));
+        assert_ne!(
+            admitted.as_schema().semantic_fingerprint(),
+            schema(explicit_ascii_source)
+                .as_schema()
+                .semantic_fingerprint(),
+            "fingerprints must continue to distinguish original source spellings"
+        );
+    }
+}
+
+#[test]
 fn custom_pattern_and_length_passes_still_run_validator() {
     let attr = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("TestValidator"),
-        Some("^[a-z]+$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
         Some((Some(1), Some(10))),
         validator(|_| {
             Err(TypeError::ValidationFailed {
@@ -8554,7 +9908,7 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
     let pattern = r"^[a-zA-Z0-9=:#@/\-,.][a-zA-Z0-9+=:#@/\-,.\s]+[a-zA-Z0-9+=:#@/\-,.]{1,256}$";
     let attr = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("EntityDescription"),
-        Some(pattern.to_string()),
+        Some(crate::schema::CompiledPattern::try_new(pattern).unwrap()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
@@ -8651,25 +10005,275 @@ fn custom_int_base_maps_length_to_range() {
 }
 
 #[test]
-fn custom_uncompilable_pattern_is_non_fatal() {
+fn schema_rejects_uncompilable_patterns() {
     let pattern = r"(?=x)";
     assert!(
         regex::Regex::new(pattern).is_err(),
         "test must use a pattern unsupported by the regex crate"
     );
-    let attr = AttributeType::refined_string(None, Some(pattern.to_string()), None, None);
+    let invalid =
+        || super::AttributeType::refined_string(None, Some(pattern.to_string()), None, None);
+    for (path, attr) in [
+        ("value", invalid()),
+        (
+            "value.field",
+            super::AttributeType::struct_(
+                "Nested",
+                vec![super::StructField::optional("field", invalid()).build()],
+            ),
+        ),
+        ("value[]", super::AttributeType::list(invalid())),
+        (
+            "value.<key>",
+            super::AttributeType::map_with_key(invalid(), super::AttributeType::string()),
+        ),
+        ("value.<value>", super::AttributeType::map(invalid())),
+        (
+            "value.<union:1>",
+            super::AttributeType::union(vec![super::AttributeType::bool(), invalid()]),
+        ),
+    ] {
+        let error = super::ResourceSchema::new("test.Pattern")
+            .attribute(super::AttributeSchema::optional("value", attr.clone()).build())
+            .validate()
+            .expect_err("invalid regex must fail schema admission");
+        assert!(
+            error.issues().any(|(location, _)| location == path),
+            "{error}"
+        );
+        let (location, source) = error.pattern_errors().next().expect("typed regex error");
+        assert_eq!(
+            location,
+            &SchemaValidationIssueLocation::Attribute(path.to_string())
+        );
+        assert_eq!(source.pattern, pattern);
+        assert!(matches!(source.reason, PatternCompileErrorSource::Parse(_)));
+        assert!(std::error::Error::source(&error).is_none());
 
-    assert!(
-        attr.validate(&Value::Concrete(ConcreteValue::String("anything".into())))
-            .is_ok()
+        let error = ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr)]))
+            .expect_err("config invalid regex must fail schema admission");
+        let (location, source) = error
+            .pattern_errors()
+            .next()
+            .expect("typed config regex error");
+        assert_eq!(
+            location,
+            &SchemaValidationIssueLocation::Attribute(path.to_string())
+        );
+        assert_eq!(source.pattern, pattern);
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    let error = super::ResourceSchema::new("test.Pattern")
+        .attribute(
+            super::AttributeSchema::optional("value", super::AttributeType::ref_("Pattern"))
+                .build(),
+        )
+        .with_def("Pattern", invalid())
+        .validate()
+        .expect_err("referenced invalid regex must fail schema admission");
+    let (location, source) = error
+        .pattern_errors()
+        .next()
+        .expect("typed definition regex error");
+    assert_eq!(
+        location,
+        &SchemaValidationIssueLocation::Definition("Pattern".to_string())
     );
+    assert_eq!(source.pattern, pattern);
+
+    ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), invalid())]))
+        .expect_err("config invalid regex must fail schema admission");
+}
+
+#[test]
+fn schema_reports_all_pattern_and_definition_errors() {
+    let invalid = || super::AttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let error = super::ResourceSchema::new("test.Pattern")
+        .attribute(super::AttributeSchema::optional("bad", invalid()).build())
+        .attribute(
+            super::AttributeSchema::optional("missing", super::AttributeType::ref_("Missing"))
+                .build(),
+        )
+        .with_def("Bad", invalid())
+        .validate()
+        .unwrap_err();
+
+    assert_eq!(error.issues().len(), 3, "{error}");
+    let locations: Vec<_> = error
+        .pattern_errors()
+        .map(|(location, _)| location.clone())
+        .collect();
+    assert_eq!(
+        locations,
+        vec![
+            SchemaValidationIssueLocation::Attribute("bad".into()),
+            SchemaValidationIssueLocation::Definition("Bad".into()),
+        ]
+    );
+    assert!(
+        error.issues().any(
+            |(path, message)| path == "missing" && message.contains("`Missing` is not defined")
+        )
+    );
+}
+
+#[test]
+fn compile_pass_collects_all_nested_pattern_errors() {
+    let invalid = || super::AttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let attr = super::AttributeType::union(vec![
+        super::AttributeType::map_with_key(invalid(), invalid()),
+        super::AttributeType::struct_(
+            "Nested",
+            vec![
+                super::StructField::optional("first", invalid()).build(),
+                super::StructField::optional("second", super::AttributeType::list(invalid()))
+                    .build(),
+            ],
+        ),
+        super::AttributeType::enum_with_base(
+            TypeIdentity::from_dotted("test.types.Pattern"),
+            invalid(),
+            None,
+            Vec::new(),
+            None,
+            None,
+        ),
+    ]);
+    let resource = super::ResourceSchema::new("test.Pattern")
+        .attribute(super::AttributeSchema::optional("value", attr.clone()).build())
+        .validate()
+        .unwrap_err();
+    let config =
+        ValidatedConfigSchema::validate(BTreeMap::from([("value".into(), attr)])).unwrap_err();
+    let expected = [
+        "value.<union:0>.<key>",
+        "value.<union:0>.<value>",
+        "value.<union:1>.first",
+        "value.<union:1>.second[]",
+        "value.<union:2>.<base>",
+    ];
+    for locations in [
+        resource
+            .pattern_errors()
+            .map(|(location, _)| location.to_string())
+            .collect::<Vec<_>>(),
+        config
+            .pattern_errors()
+            .map(|(location, _)| location.to_string())
+            .collect::<Vec<_>>(),
+    ] {
+        assert_eq!(locations, expected);
+    }
+}
+
+#[test]
+fn config_reports_all_pattern_and_definition_errors() {
+    let invalid = || super::AttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let error = ValidatedConfigSchema::validate(BTreeMap::from([
+        ("bad".into(), invalid()),
+        ("nested".into(), super::AttributeType::list(invalid())),
+        ("missing".into(), super::AttributeType::ref_("Missing")),
+    ]))
+    .unwrap_err();
+
+    assert_eq!(error.issues().len(), 3, "{error}");
+    assert_eq!(error.pattern_errors().count(), 2);
+    assert!(
+        error.issues().any(
+            |(path, message)| path == "missing" && message.contains("`Missing` is not defined")
+        )
+    );
+}
+
+#[test]
+fn pattern_errors_do_not_mask_scalar_kind_errors() {
+    let identity = TypeIdentity::bare("Conflicting");
+    let error = super::ResourceSchema::new("test.Pattern")
+        .attribute(
+            super::AttributeSchema::optional(
+                "string",
+                super::AttributeType::refined_string(
+                    Some(identity.clone()),
+                    Some("(?=x)".into()),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .with_def(
+            "Int",
+            super::AttributeType::refined_int(Some(identity), None),
+        )
+        .validate()
+        .unwrap_err();
+
+    assert_eq!(error.pattern_errors().count(), 1);
+    assert_eq!(error.issues().len(), 2, "{error}");
+    assert!(
+        error
+            .issues()
+            .any(|(_, message)| message.contains("is bound to both"))
+    );
+}
+
+#[test]
+fn pattern_error_display_renders_regex_diagnostics_once() {
+    let invalid = |pattern: &str| {
+        super::AttributeType::refined_string(None, Some(pattern.into()), None, None)
+    };
+    let resource = super::ResourceSchema::new("test.Pattern")
+        .attribute(super::AttributeSchema::optional("first", invalid("(?=x)")).build())
+        .attribute(super::AttributeSchema::optional("second", invalid("[")).build())
+        .validate()
+        .unwrap_err();
+    let config = ValidatedConfigSchema::validate(BTreeMap::from([
+        ("first".into(), invalid("(?=x)")),
+        ("second".into(), invalid("[")),
+    ]))
+    .unwrap_err();
+    for (error, issues, pattern_errors) in [
+        (
+            &resource as &dyn std::error::Error,
+            resource.issues().collect::<Vec<_>>(),
+            resource.pattern_errors().collect::<Vec<_>>(),
+        ),
+        (
+            &config as &dyn std::error::Error,
+            config.issues().collect::<Vec<_>>(),
+            config.pattern_errors().collect::<Vec<_>>(),
+        ),
+    ] {
+        let rendered = error.to_string();
+        assert!(error.source().is_none());
+        assert_eq!(pattern_errors.len(), 2);
+        for (location, error) in pattern_errors {
+            let message = issues
+                .iter()
+                .find(|(path, _)| *path == location.to_string())
+                .unwrap()
+                .1;
+            let diagnostic = error.to_string();
+            assert_eq!(message, diagnostic);
+            let reason = error.reason.to_string();
+            assert_eq!(message.matches(&reason).count(), 1, "{message}");
+            assert_eq!(rendered.matches(&reason).count(), 1, "{rendered}");
+            assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+        }
+        assert_eq!(
+            rendered.matches("regex parse error").count(),
+            2,
+            "{rendered}"
+        );
+    }
 }
 
 #[test]
 fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
     let attr = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("Slug"),
-        Some("^[a-z]+$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
@@ -8692,7 +10296,12 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
 
 #[test]
 fn custom_type_name_anonymous_pattern_only() {
-    let t = AttributeType::refined_string(None, Some("^foo$".to_string()), None, None);
+    let t = AttributeType::refined_string(
+        None,
+        Some(crate::schema::CompiledPattern::try_new("^foo$").unwrap()),
+        None,
+        None,
+    );
     assert_eq!(t.type_name(), "String(pattern)");
 }
 
@@ -8706,7 +10315,7 @@ fn custom_type_name_anonymous_length_only() {
 fn custom_type_name_anonymous_pattern_and_length() {
     let t = AttributeType::refined_string(
         None,
-        Some("^.*$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^.*$").unwrap()),
         Some((Some(1), Some(64))),
         None,
     );
@@ -8743,7 +10352,7 @@ fn validate_email_function_directly() {
 
 #[test]
 fn validate_email_type() {
-    let t = types::email();
+    let t = admit_builtin_type(types::email());
 
     // Type identity: refined String with kind "Email"
     match t.kind() {
@@ -8945,7 +10554,7 @@ fn validate_redirect_query_function_directly() {
 
 #[test]
 fn validate_http_response_status_code_type() {
-    let t = types::http_response_status_code();
+    let t = admit_builtin_type(types::http_response_status_code());
 
     // Type identity: refined String with kind "HttpResponseStatusCode"
     match t.kind() {
@@ -9849,13 +11458,13 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
             _ => Err("expected String".to_string()),
         }
     }
-    let schema = ResourceSchema::new("test.r.mode_holder")
+    let schema = PatternResourceSchema::new("test.r.mode_holder")
         .attribute(
-            AttributeSchema::required(
+            PatternAttributeSchema::required(
                 "mode",
-                AttributeType::enum_with_base(
+                PatternAttributeType::enum_with_base(
                     crate::schema::enum_identity("Mode", Some("test.r")),
-                    AttributeType::string(),
+                    PatternAttributeType::string(),
                     None,
                     vec![],
                     Some(legacy_validator(validate_mode)),
@@ -9950,15 +11559,15 @@ fn expected_enum_variant_serde_round_trip() {
 // Enum/Custom) wins over an unrelated member. Unique failures stay
 // verbatim; tied closed-Struct failures become an alternatives diagnostic.
 
-fn retention_union() -> AttributeType {
-    AttributeType::union(vec![
-        AttributeType::struct_(
+fn retention_union<R: crate::schema::PatternForm>() -> crate::schema::PatternAttributeType<R> {
+    PatternAttributeType::union(vec![
+        PatternAttributeType::struct_(
             "RetentionDays".to_string(),
-            vec![StructField::required("days", AttributeType::int()).build()],
+            vec![PatternStructField::required("days", PatternAttributeType::int()).build()],
         ),
-        AttributeType::struct_(
+        PatternAttributeType::struct_(
             "RetentionYears".to_string(),
-            vec![StructField::required("years", AttributeType::int()).build()],
+            vec![PatternStructField::required("years", PatternAttributeType::int()).build()],
         ),
     ])
 }
@@ -9982,12 +11591,15 @@ fn retention_ref_schema() -> Schema {
     }
 }
 
-fn required_int_struct(name: &str, fields: &[&str]) -> AttributeType {
-    AttributeType::struct_(
+fn required_int_struct<R: crate::schema::PatternForm>(
+    name: &str,
+    fields: &[&str],
+) -> crate::schema::PatternAttributeType<R> {
+    PatternAttributeType::struct_(
         name.to_string(),
         fields
             .iter()
-            .map(|field| StructField::required(*field, AttributeType::int()).build())
+            .map(|field| PatternStructField::required(*field, PatternAttributeType::int()).build())
             .collect(),
     )
 }
@@ -10992,7 +12604,7 @@ fn hosted_zone_id_union(enum_first: bool) -> AttributeType {
             ["route53", "Record", "AliasTarget"],
             "Route53HostedZoneId",
         )),
-        Some("^Z[A-Z0-9]+$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^Z[A-Z0-9]+$").unwrap()),
         None,
         None,
     );
@@ -11067,7 +12679,7 @@ fn nested_union_failures_are_flattened_in_declaration_order() {
     );
     let pattern = AttributeType::refined_string(
         Some(TypeIdentity::new(Some("test"), ["nested"], "PatternValue")),
-        Some("^Z+$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^Z+$").unwrap()),
         None,
         None,
     );
@@ -11116,13 +12728,13 @@ fn nested_union_failure_below_list_wrapper_is_parenthesized() {
     );
     let pattern_x = AttributeType::refined_string(
         Some(TypeIdentity::bare("PatternX")),
-        Some("^x$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^x$").unwrap()),
         None,
         None,
     );
     let pattern_y = AttributeType::refined_string(
         Some(TypeIdentity::bare("PatternY")),
-        Some("^y$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^y$").unwrap()),
         None,
         None,
     );
@@ -11170,15 +12782,15 @@ fn quoted_non_enum_validator_error_is_not_reshaped_as_an_enum_attribute() {
             false,
         )],
     };
-    let attr_type = AttributeType::refined_string_with_validator(
+    let attr_type = PatternAttributeType::refined_string_with_validator(
         TypeIdentity::bare("StringWithValidator"),
         None,
         None,
         validator(move |_| Err(enum_error.clone())),
         None,
     );
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::optional("value", attr_type).build())
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(PatternAttributeSchema::optional("value", attr_type).build())
         .validate()
         .expect("validated-string schema must be valid");
     let attributes = std::collections::HashMap::from([(
@@ -11213,16 +12825,17 @@ fn quoted_union_string_validator_error_is_not_reshaped_as_an_enum_arm() {
         )],
     };
     let expected = validator_error.clone().with_attribute("value");
-    let validated_string = AttributeType::refined_string_with_validator(
+    let validated_string = PatternAttributeType::refined_string_with_validator(
         TypeIdentity::bare("StringWithValidator"),
         None,
         None,
         validator(move |_| Err(validator_error.clone())),
         None,
     );
-    let attr_type = AttributeType::union(vec![AttributeType::int(), validated_string]);
-    let schema = ResourceSchema::new("test.resource")
-        .attribute(AttributeSchema::optional("value", attr_type).build())
+    let attr_type =
+        PatternAttributeType::union(vec![PatternAttributeType::int(), validated_string]);
+    let schema = PatternResourceSchema::new("test.resource")
+        .attribute(PatternAttributeSchema::optional("value", attr_type).build())
         .validate()
         .expect("union validator schema must be valid");
     let attributes = std::collections::HashMap::from([(
@@ -11292,7 +12905,7 @@ fn tied_map_union_reports_each_value_failure() {
 fn duplicate_tied_union_failures_collapse_to_the_verbatim_error() {
     let member = AttributeType::refined_string(
         Some(TypeIdentity::bare("HostedZoneId")),
-        Some("^Z[A-Z0-9]+$".to_string()),
+        Some(crate::schema::CompiledPattern::try_new("^Z[A-Z0-9]+$").unwrap()),
         None,
         None,
     );
@@ -11315,7 +12928,7 @@ fn unique_best_union_failure_remains_verbatim() {
     let union = AttributeType::union(vec![
         AttributeType::refined_string(
             Some(TypeIdentity::bare("HostedZoneId")),
-            Some("^Z[A-Z0-9]+$".to_string()),
+            Some(crate::schema::CompiledPattern::try_new("^Z[A-Z0-9]+$").unwrap()),
             None,
             None,
         ),
@@ -11863,8 +13476,8 @@ fn schema_registry_new_is_empty() {
 #[test]
 fn schema_registry_inserts_managed_and_data_source_for_same_type() {
     let mut registry = SchemaRegistry::new();
-    let managed = ResourceSchema::new("s3.Bucket");
-    let data_source = ResourceSchema::new("s3.Bucket").as_data_source();
+    let managed = PatternResourceSchema::new("s3.Bucket");
+    let data_source = PatternResourceSchema::new("s3.Bucket").as_data_source();
 
     registry.insert(
         "aws",
@@ -11892,13 +13505,13 @@ fn schema_registry_routes_lookup_by_typestate() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket"))
+        (PatternResourceSchema::new("s3.Bucket"))
             .validate()
             .expect("schema fixture must be valid"),
     );
     registry.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket").as_data_source())
+        (PatternResourceSchema::new("s3.Bucket").as_data_source())
             .validate()
             .expect("schema fixture must be valid"),
     );
@@ -11951,7 +13564,7 @@ fn schema_registry_resolves_data_source_directives_through_the_same_api() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "aws",
-        ResourceSchema::new("s3.Bucket")
+        PatternResourceSchema::new("s3.Bucket")
             .as_data_source()
             .validate()
             .expect("schema fixture must be valid"),
@@ -11984,7 +13597,7 @@ fn schema_registry_has_managed_only_does_not_imply_data_source() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "aws",
-        (ResourceSchema::new("s3.Bucket"))
+        (PatternResourceSchema::new("s3.Bucket"))
             .validate()
             .expect("schema fixture must be valid"),
     );
@@ -12056,12 +13669,18 @@ fn walk_custom_lookup_skips_value_unknown() {
     );
 }
 
-fn resource_schema_with_self_cyclic_string_union() -> ResourceSchema {
-    ResourceSchema::new("test.SelfCyclicUnion")
-        .attribute(AttributeSchema::optional("value", AttributeType::ref_("A")).build())
+fn resource_schema_with_self_cyclic_string_union<R: crate::schema::PatternForm>()
+-> crate::schema::PatternResourceSchema<R> {
+    PatternResourceSchema::new("test.SelfCyclicUnion")
+        .attribute(
+            PatternAttributeSchema::optional("value", PatternAttributeType::ref_("A")).build(),
+        )
         .with_def(
             "A",
-            AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]),
+            PatternAttributeType::union(vec![
+                PatternAttributeType::ref_("A"),
+                PatternAttributeType::string(),
+            ]),
         )
 }
 
@@ -12100,16 +13719,22 @@ fn resource_schema_validate_self_cyclic_union_with_invalid_value_terminates() {
 fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let custom_string =
-        AttributeType::refined_string(Some(TypeIdentity::bare("cyclic_leaf")), None, None, None);
-    let schema = ResourceSchema::new("test.CyclicCustomLookup")
-        .attribute(AttributeSchema::optional("value", AttributeType::ref_("A")).build())
+    let custom_string = PatternAttributeType::refined_string(
+        Some(TypeIdentity::bare("cyclic_leaf")),
+        None,
+        None,
+        None,
+    );
+    let schema = PatternResourceSchema::new("test.CyclicCustomLookup")
+        .attribute(
+            PatternAttributeSchema::optional("value", PatternAttributeType::ref_("A")).build(),
+        )
         .with_def(
             "A",
-            AttributeType::union(vec![
-                AttributeType::ref_("A"),
+            PatternAttributeType::union(vec![
+                PatternAttributeType::ref_("A"),
                 custom_string,
-                AttributeType::list(AttributeType::ref_("A")),
+                PatternAttributeType::list(PatternAttributeType::ref_("A")),
             ]),
         )
         .validate()
@@ -12799,7 +14424,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
     use crate::utils::lift_state_enum_leaves;
     use indexmap::IndexMap;
 
-    let version_enum = AttributeType::enum_(
+    let version_enum = PatternAttributeType::enum_(
         crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
         Some(vec!["2012-10-17".to_string(), "2008-10-17".to_string()]),
         vec![
@@ -12809,7 +14434,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
         None,
         None,
     );
-    let effect_enum = AttributeType::enum_(
+    let effect_enum = PatternAttributeType::enum_(
         crate::schema::enum_identity("Effect", Some("aws.iam.PolicyDocument")),
         Some(vec!["Allow".to_string(), "Deny".to_string()]),
         vec![
@@ -12819,20 +14444,23 @@ fn lift_state_enum_leaves_fixes_awscc251() {
         None,
         None,
     );
-    let statement_struct = AttributeType::struct_(
+    let statement_struct = PatternAttributeType::struct_(
         "Statement".to_string(),
-        vec![StructField::optional("effect", effect_enum).build()],
+        vec![PatternStructField::optional("effect", effect_enum).build()],
     );
-    let policy_struct = AttributeType::struct_(
+    let policy_struct = PatternAttributeType::struct_(
         "PolicyDocument".to_string(),
         vec![
-            StructField::optional("version", version_enum).build(),
-            StructField::optional("statement", AttributeType::unordered_list(statement_struct))
-                .build(),
+            PatternStructField::optional("version", version_enum).build(),
+            PatternStructField::optional(
+                "statement",
+                PatternAttributeType::unordered_list(statement_struct),
+            )
+            .build(),
         ],
     );
-    let schema = ResourceSchema::new("aws.iam.role_policy")
-        .attribute(AttributeSchema::optional("policy", policy_struct).build());
+    let schema = PatternResourceSchema::new("aws.iam.role_policy")
+        .attribute(PatternAttributeSchema::optional("policy", policy_struct).build());
     let validated = schema
         .clone()
         .validate()
@@ -12882,7 +14510,7 @@ fn lift_state_enum_leaves_fixes_awscc251() {
     );
 
     // Apply the lift.
-    lift_state_enum_leaves(&mut attrs, &schema);
+    lift_state_enum_leaves(&mut attrs, validated.as_schema());
 
     // AFTER the lift: validation passes.
     validated
@@ -12918,19 +14546,19 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
     use crate::utils::lift_state_enum_leaves;
     use indexmap::IndexMap;
 
-    let version_enum = AttributeType::enum_(
+    let version_enum = PatternAttributeType::enum_(
         crate::schema::enum_identity("Version", Some("aws.iam.PolicyDocument")),
         Some(vec!["2012-10-17".to_string()]),
         vec![("2012-10-17".to_string(), "2012_10_17".to_string())],
         None,
         None,
     );
-    let policy_struct = AttributeType::struct_(
+    let policy_struct = PatternAttributeType::struct_(
         "PolicyDocument".to_string(),
-        vec![StructField::optional("version", version_enum).build()],
+        vec![PatternStructField::optional("version", version_enum).build()],
     );
-    let schema = ResourceSchema::new("aws.iam.role_policy")
-        .attribute(AttributeSchema::optional("policy", policy_struct).build());
+    let schema = PatternResourceSchema::new("aws.iam.role_policy")
+        .attribute(PatternAttributeSchema::optional("policy", policy_struct).build());
     let validated = schema
         .clone()
         .validate()
@@ -12947,7 +14575,7 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
         "policy".to_string(),
         Value::Concrete(ConcreteValue::Map(already.clone())),
     );
-    lift_state_enum_leaves(&mut attrs, &schema);
+    lift_state_enum_leaves(&mut attrs, validated.as_schema());
     let Value::Concrete(ConcreteValue::Map(p)) = &attrs["policy"] else {
         panic!("map");
     };
@@ -12974,7 +14602,7 @@ fn lift_state_enums_is_idempotent_and_preserves_invalid() {
         "policy".to_string(),
         Value::Concrete(ConcreteValue::Map(bad)),
     );
-    lift_state_enum_leaves(&mut attrs2, &schema);
+    lift_state_enum_leaves(&mut attrs2, validated.as_schema());
     let Value::Concrete(ConcreteValue::Map(p2)) = &attrs2["policy"] else {
         panic!("map");
     };
@@ -13093,7 +14721,7 @@ fn principal_union_schema() -> AttributeType {
 fn select_union_member_for_test<'a>(
     union: &'a AttributeType,
     value: &Value,
-) -> Option<ResolvedUnionMember<'a>> {
+) -> Option<ResolvedUnionMember<'a, Compiled>> {
     let members = union_members_with_defs(union, empty_defs_for_schema_walks())
         .expect("test fixture must be a Union");
     let mut visited_refs = Vec::new();
@@ -13383,11 +15011,19 @@ fn raw_shape_passes_through_non_ref_variants() {
     ));
     assert!(matches!(AttributeType::bool().raw_shape(), RawShape::Bool));
     match AttributeType::list(AttributeType::string()).raw_shape() {
-        RawShape::List { ordered, .. } => assert!(ordered),
+        RawShape::List {
+            ordered,
+            element_type: _element_type,
+            constraints: _constraints,
+        } => assert!(ordered),
         other => panic!("expected RawShape::List, got {other:?}"),
     }
     match AttributeType::unordered_list(AttributeType::string()).raw_shape() {
-        RawShape::List { ordered, .. } => assert!(!ordered),
+        RawShape::List {
+            ordered,
+            element_type: _element_type,
+            constraints: _constraints,
+        } => assert!(!ordered),
         other => panic!("expected RawShape::List(unordered), got {other:?}"),
     }
 }
@@ -13613,10 +15249,10 @@ fn resource_schema_semantic_fingerprint_is_order_independent() {
 
 #[test]
 fn resource_schema_default_prevent_destroy_is_opt_in_and_survives_validation() {
-    let ordinary = ResourceSchema::new("test.Ordinary");
+    let ordinary = super::ResourceSchema::new("test.Ordinary");
     assert!(!ordinary.parts().default_prevent_destroy);
 
-    let protected = ResourceSchema::new("test.Protected")
+    let protected = PatternResourceSchema::new("test.Protected")
         .default_prevent_destroy()
         .validate()
         .expect("the lifecycle default must not invalidate a schema");
@@ -13625,7 +15261,7 @@ fn resource_schema_default_prevent_destroy_is_opt_in_and_survives_validation() {
 
 #[test]
 fn data_source_schema_rejects_default_prevent_destroy() {
-    let error = ResourceSchema::new("test.Lookup")
+    let error = PatternResourceSchema::new("test.Lookup")
         .as_data_source()
         .default_prevent_destroy()
         .validate()
@@ -13857,12 +15493,12 @@ fn resource_schema_semantic_fingerprint_covers_keyed_partial_update() {
 }
 
 fn keyed_partial_update_schema(
-    attr_type: AttributeType,
+    attr_type: super::AttributeType,
     key_field: &str,
 ) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
-    ResourceSchema::new("test.KeyedPartialUpdate")
+    PatternResourceSchema::new("test.KeyedPartialUpdate")
         .attribute(
-            AttributeSchema::optional("settings", attr_type)
+            PatternAttributeSchema::optional("settings", attr_type)
                 .keyed_partial_update(key_field)
                 .build(),
         )
@@ -13872,11 +15508,11 @@ fn keyed_partial_update_schema(
 #[test]
 fn keyed_partial_update_validation_accepts_a_string_key_field() {
     let schema = keyed_partial_update_schema(
-        AttributeType::list(AttributeType::struct_(
+        PatternAttributeType::list(PatternAttributeType::struct_(
             "Setting",
             vec![
-                StructField::required("key", AttributeType::string()).build(),
-                StructField::required("value", AttributeType::string()).build(),
+                PatternStructField::required("key", PatternAttributeType::string()).build(),
+                PatternStructField::required("value", PatternAttributeType::string()).build(),
             ],
         )),
         "key",
@@ -13894,9 +15530,9 @@ fn keyed_partial_update_validation_accepts_a_string_key_field() {
 #[test]
 fn keyed_partial_update_validation_rejects_an_unknown_key_field() {
     let error = keyed_partial_update_schema(
-        AttributeType::list(AttributeType::struct_(
+        PatternAttributeType::list(PatternAttributeType::struct_(
             "Setting",
-            vec![StructField::required("value", AttributeType::string()).build()],
+            vec![PatternStructField::required("value", PatternAttributeType::string()).build()],
         )),
         "key",
     )
@@ -13914,8 +15550,11 @@ fn keyed_partial_update_validation_rejects_an_unknown_key_field() {
 
 #[test]
 fn keyed_partial_update_validation_rejects_a_non_struct_list_shape() {
-    let error = keyed_partial_update_schema(AttributeType::list(AttributeType::string()), "key")
-        .expect_err("the attribute must be a list of structs");
+    let error = keyed_partial_update_schema(
+        PatternAttributeType::list(PatternAttributeType::string()),
+        "key",
+    )
+    .expect_err("the attribute must be a list of structs");
 
     let issues = error.located_issues().collect::<Vec<_>>();
     assert_eq!(
@@ -13929,7 +15568,7 @@ fn keyed_partial_update_validation_rejects_a_non_struct_list_shape() {
 
 #[test]
 fn keyed_partial_update_validation_rejects_a_non_list_shape() {
-    let error = keyed_partial_update_schema(AttributeType::string(), "key")
+    let error = keyed_partial_update_schema(PatternAttributeType::string(), "key")
         .expect_err("the attribute must be a list of structs");
 
     let issues = error.located_issues().collect::<Vec<_>>();
@@ -13945,9 +15584,9 @@ fn keyed_partial_update_validation_rejects_a_non_list_shape() {
 #[test]
 fn keyed_partial_update_validation_rejects_a_non_string_key_field() {
     let error = keyed_partial_update_schema(
-        AttributeType::list(AttributeType::struct_(
+        PatternAttributeType::list(PatternAttributeType::struct_(
             "Setting",
-            vec![StructField::required("key", AttributeType::int()).build()],
+            vec![PatternStructField::required("key", PatternAttributeType::int()).build()],
         )),
         "key",
     )
@@ -13961,4 +15600,32 @@ fn keyed_partial_update_validation_rejects_a_non_string_key_field() {
             "keyed partial-update key field `key` must be a scalar string"
         )]
     );
+}
+
+#[test]
+fn draft_keyed_partial_update_rejects_unresolvable_shapes() {
+    for attr_type in [
+        super::AttributeType::ref_("Loop"),
+        super::AttributeType::list(super::AttributeType::ref_("Loop")),
+        super::AttributeType::list(super::AttributeType::struct_(
+            "Entry",
+            vec![super::StructField::required("key", super::AttributeType::ref_("Loop")).build()],
+        )),
+    ] {
+        let error = super::ResourceSchema::new("test.Keyed")
+            .attribute(
+                super::AttributeSchema::optional("entries", attr_type)
+                    .keyed_partial_update("key")
+                    .build(),
+            )
+            .with_def("Loop", super::AttributeType::ref_("Loop"))
+            .validate()
+            .expect_err("a keyed update requires a resolvable list, struct, and key");
+        assert!(
+            error.issues().any(
+                |(path, message)| path == "entries" && message.contains("keyed partial-update")
+            ),
+            "{error}"
+        );
+    }
 }

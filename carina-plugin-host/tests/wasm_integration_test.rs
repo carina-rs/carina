@@ -23,7 +23,7 @@ use carina_core::resource::{
     ProviderResource, RawEnumIdentifier, RedactedSecretHash, ResolvedResource, Resource,
     ResourceId, State, Value, absolute_binding_address_for_test,
 };
-use carina_core::schema::{AttributeType, TypeIdentity};
+use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{
     AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
@@ -193,11 +193,11 @@ async fn update_request_for_test(
     let mut schemas = carina_core::schema::SchemaRegistry::new();
     schemas.insert(
         resource.id.provider.clone(),
-        carina_core::schema::ResourceSchema::new(resource.id.resource_type.clone())
+        carina_core::schema::PatternResourceSchema::new(resource.id.resource_type.clone())
             .attribute(
-                carina_core::schema::AttributeSchema::optional(
+                carina_core::schema::PatternAttributeSchema::optional(
                     "reassert_token",
-                    carina_core::schema::AttributeType::string(),
+                    carina_core::schema::PatternAttributeType::string(),
                 )
                 .write_only()
                 .build(),
@@ -983,6 +983,37 @@ async fn test_wasm_mock_provider_factory() {
     assert_eq!(short_budget.create_timeout_secs, Some(2));
     assert_eq!(short_budget.update_timeout_secs, Some(2));
     assert_eq!(short_budget.delete_timeout_secs, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_schema_preserves_unique_list_refinement() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let schemas = factory.schemas();
+    let schema = schemas
+        .iter()
+        .find(|schema| schema.parts().resource_type == "actions.OidcSubject")
+        .unwrap();
+    let claims = schema.effective_attribute("claim_keys").unwrap();
+    let value: Value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::enum_identifier("repo")),
+        Value::Concrete(ConcreteValue::enum_identifier(
+            "mock.actions.OidcSubject.ClaimKey.repo",
+        )),
+    ]));
+    let error = claims.validate(&value).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            carina_core::schema::TypeError::DuplicateListElement {
+                index: 1,
+                first_index: 0,
+                value: _,
+                attribute: _
+            }
+        ),
+        "{error:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2181,6 +2212,192 @@ async fn test_wasm_create_read_back_completes_within_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_read_back_preserve_error_keeps_phase_and_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "__mock_read_back_preserve_error__";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        identity,
+        "create_read_back_pending_polls",
+        100,
+    );
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .expect_err("a transient read error must retain the read-back continuation")
+        .into_kind();
+    let CreateFailureKind::InFlight { pending, error } = failure else {
+        panic!("read-back must remain in flight");
+    };
+    let pending = pending
+        .into_fresh()
+        .expect("the provider returned a fresh continuation");
+    assert_eq!(
+        pending.phase(),
+        carina_provider_protocol::PendingPhase::ReadBack
+    );
+    assert_minted_mock_identifier(pending.identifier().unwrap().as_str());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(pending.token().expose_for_provider_call())
+            .unwrap(),
+        serde_json::json!({"phase": "read_back"})
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("read-back temporarily unavailable"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("polling protocol"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_resumed_create_read_back_preserve_error_keeps_token_and_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "__mock_read_back_preserve_error__";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let token = serde_json::json!({"phase": "operation", "remaining": 0, "polls_served": 0, "mode": "normal"}).to_string();
+    let pending = persisted_create_for_resume(&id, &token, Some("mock-id"));
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        identity,
+        "create_read_back_pending_polls",
+        100,
+    );
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+    let failure = provider
+        .provider()
+        .resume_create(request)
+        .await
+        .expect_err("a transient resumed read error must retain the read-back continuation")
+        .into_kind();
+    let ResumeFailureKind::InFlight { pending, error } = failure else {
+        panic!("resumed read-back must remain in flight");
+    };
+    assert_eq!(pending.identifier().unwrap().as_str(), "mock-id");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(pending.token().expose_for_provider_call())
+            .unwrap(),
+        serde_json::json!({"phase": "read_back"}),
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("read-back temporarily unavailable"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("polling protocol"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_resumed_saved_read_back_from_fresh_instance_reads_by_identifier() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "resumed-saved-read-back";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let resource = resource_with_int_attribute(
+        "test.resource",
+        identity,
+        "create_read_back_pending_polls",
+        1,
+    );
+    let created = create_state_for_writeback(
+        provider
+            .provider()
+            .create_for_test(&id, create_request_for_test(resource.clone()).await)
+            .await
+            .expect("create a resource with identifier-based read-back"),
+    );
+    let identifier = created
+        .identifier
+        .expect("a created resource has an identifier");
+    drop(provider);
+    let (factory, _fresh_cache) = load_factory(&path).await;
+    let fresh = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("fresh provider should init");
+    let token = serde_json::json!({"phase": "read_back"}).to_string();
+    let pending = persisted_create_for_resume(&id, &token, Some(&identifier));
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+
+    // State has no phase. The first host call supplies Operating, and the saved
+    // read-back token must still reach a read by identifier in the fresh guest.
+    let outcome = fresh
+        .provider()
+        .resume_create(request)
+        .await
+        .expect("a saved read-back must complete from a fresh instance")
+        .into_kind();
+    let ResumeOutcomeKind::Resumed(resumed) = outcome else {
+        panic!("the resumed read-back must return a complete read, got {outcome:?}");
+    };
+    assert_eq!(resumed.identifier().as_str(), identifier);
+    let state = resumed.observed_state();
+    assert_eq!(
+        state.attributes.get("read_identifier"),
+        Some(&Value::Concrete(ConcreteValue::String(identifier.into()))),
+    );
+    assert_eq!(
+        state.attributes.get("computed"),
+        Some(&Value::Concrete(ConcreteValue::String("ready".into()))),
+    );
+    assert!(state.partial_read.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .expect("provider should init");
+    let identity = "invalid-resumed-read-back";
+    let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+    let token = serde_json::json!({"phase": "read_back"}).to_string();
+    let pending = persisted_create_for_resume(&id, &token, None);
+    let resource = resource_with_string_attribute("test.resource", identity, "name", identity);
+    let request = ResumeCreateRequest::for_test(pending, create_request_for_test(resource).await)
+        .expect("resume fixture route must match");
+    let failure = provider
+        .provider()
+        .resume_create(request)
+        .await
+        .expect_err("identifier-less read-back is permanently invalid")
+        .into_kind();
+    let ResumeFailureKind::Ended(error) = failure else {
+        panic!("invalid read-back must end polling, got {failure:?}");
+    };
+    assert!(
+        error.to_string().contains("requires an identifier"),
+        "{error}"
+    );
+    assert_eq!(
+        error.detail().code.as_deref(),
+        Some("READ_BACK_WITHOUT_IDENTIFIER")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_create_read_back_budget_returns_partial_then_refresh_completes() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -2334,7 +2551,7 @@ async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_succes
         "resumed-read-back-partial",
         None,
     );
-    let token = serde_json::json!({ "phase": "read_back" }).to_string();
+    let token = serde_json::json!({"phase": "read_back"}).to_string();
     let pending = persisted_create_for_resume(&id, &token, Some("mock-id"));
     let resource = resource_with_int_attribute(
         "test.short_budget",

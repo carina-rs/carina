@@ -44,7 +44,7 @@ fn updating_changed_iterable_defers_missing_element_output() {
         &ProviderContext::default(),
     )
     .expect("parse deferred loop")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("expand parser placeholders");
     let desired_rules = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(IndexMap::from([("name".into(), s("new-rule"))])),

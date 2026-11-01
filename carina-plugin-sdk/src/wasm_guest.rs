@@ -7,6 +7,22 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Decode and validate a host-owned update continuation before dispatch.
+#[doc(hidden)]
+pub fn decode_pending_update<T: serde::de::DeserializeOwned + crate::PhasedToken>(
+    token: &str,
+    poll_after_secs: u32,
+    host_phase: crate::PendingPhase,
+) -> Result<crate::Pending<T>, serde_json::Error> {
+    let pending = crate::Pending::new(serde_json::from_str::<T>(token)?, poll_after_secs);
+    if crate::continuation_phase_regresses(host_phase, pending.phase()) {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "update continuation phase does not match its token",
+        ));
+    }
+    Ok(pending)
+}
+
 /// Structural failures that can be diagnosed in a provider's const context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressPatternStructureError {
@@ -172,7 +188,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource)
 }
 
-/// Render one error chain for protocol-v17 metadata's string-only failure
+/// Render one error chain for protocol-v18 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -200,15 +216,15 @@ pub fn wit_to_proto_applied_identifier(
     proto::AppliedIdentifier::new(identifier)
 }
 
-/// Return the honest directive default for protocol-17 WIT resource records.
+/// Return the honest directive default for protocol-18 WIT resource records.
 ///
-/// Protocol 17 does not transport directives on create, poll-create,
+/// Protocol 18 does not transport directives on create, poll-create,
 /// resume-create, or read-data-source requests. Providers
 /// therefore receive all-false directives on those paths (see carina#4151).
 /// Desired normalization uses a separate record without directive fields.
 /// Delete-request directives are transported separately after host resolution.
 #[doc(hidden)]
-pub fn protocol_17_default_resource_directives() -> proto::Directives {
+pub fn protocol_18_default_resource_directives() -> proto::Directives {
     proto::Directives::default()
 }
 
@@ -787,7 +803,7 @@ macro_rules! export_provider {
                 operation: &str,
                 error: &(dyn ::std::error::Error + 'static),
             ) -> String {
-                // Protocol v17 metadata exports return a bare string rather
+                // Protocol v18 metadata exports return a bare string rather
                 // than `result`. A JSON string is deliberately the wrong
                 // top-level shape for both schema records and config maps, so
                 // the host reports its normal typed schema-decode failure
@@ -1102,7 +1118,7 @@ macro_rules! export_provider {
                 })
             }
 
-            fn sdk_to_wit_pending<T: serde::Serialize>(
+            fn sdk_to_wit_pending<T: serde::Serialize + $crate::PhasedToken>(
                 pending: &$crate::Pending<T>,
             ) -> Result<wit_types::PendingUpdate, serde_json::Error> {
                 Ok(wit_types::PendingUpdate {
@@ -1110,18 +1126,18 @@ macro_rules! export_provider {
                         token: serde_json::to_string(&pending.token)?,
                         poll_after_secs: pending.poll_after_secs,
                     },
-                    phase: proto_to_wit_pending_phase(pending.phase),
+                    phase: proto_to_wit_pending_phase(pending.phase()),
                 })
             }
 
-            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned>(
+            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned + $crate::PhasedToken>(
                 pending: wit_types::PendingUpdate,
             ) -> Result<$crate::Pending<T>, serde_json::Error> {
-                Ok($crate::Pending {
-                    token: serde_json::from_str(&pending.operation.token)?,
-                    poll_after_secs: pending.operation.poll_after_secs,
-                    phase: wit_to_proto_pending_phase(pending.phase),
-                })
+                helpers::decode_pending_update(
+                    &pending.operation.token,
+                    pending.operation.poll_after_secs,
+                    wit_to_proto_pending_phase(pending.phase),
+                )
             }
 
             fn sdk_to_wit_pending_delete<T: serde::Serialize>(
@@ -1732,22 +1748,33 @@ macro_rules! export_provider {
                 }
             }
 
-            fn decode_create_identifier(
+            fn decode_create_progress(
                 operation: &'static str,
-                identifier: Option<String>,
-            ) -> Result<Option<proto::AppliedIdentifier>, wit_types::ProviderError> {
-                identifier
-                    .map(proto::AppliedIdentifier::new)
-                    .transpose()
-                    .map_err(|error| {
+                progress: wit_types::CreateProgress,
+            ) -> Result<proto::CreateProgress, wit_types::ProviderError> {
+                let decode_identifier = |identifier| {
+                    proto::AppliedIdentifier::new(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error(operation, error)
                     })
+                };
+                Ok(match progress {
+                    wit_types::CreateProgress::Operating(identifier) => {
+                        proto::CreateProgress::Operating {
+                            identifier: identifier.map(decode_identifier).transpose()?,
+                        }
+                    }
+                    wit_types::CreateProgress::ReadingBack(identifier) => {
+                        proto::CreateProgress::ReadingBack {
+                            identifier: decode_identifier(identifier)?,
+                        }
+                    }
+                })
             }
 
             fn wit_to_sdk_poll<T: serde::de::DeserializeOwned>(
                 pending: wit_types::PendingCreate,
                 request: &proto::CreateRequest,
-            ) -> Result<(Option<proto::AppliedIdentifier>, proto::Sent, T), wit_types::ProviderError> {
+            ) -> Result<(proto::CreateProgress, proto::Sent, T), wit_types::ProviderError> {
                 let wit_types::PendingCreate {
                     operation,
                     progress,
@@ -1779,13 +1806,13 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("poll_create", error)
                 })?;
-                let identifier = decode_create_identifier("poll_create", wit_create_identifier(progress))?;
-                Ok((identifier, sent, token))
+                let progress = decode_create_progress("poll_create", progress)?;
+                Ok((progress, sent, token))
             }
 
             fn wit_to_sdk_resume<T: serde::de::DeserializeOwned>(
                 pending: wit_types::ResumePending,
-            ) -> Result<(Option<proto::AppliedIdentifier>, T), wit_types::ProviderError> {
+            ) -> Result<(proto::CreateProgress, T), wit_types::ProviderError> {
                 let wit_types::ResumePending {
                     operation,
                     progress,
@@ -1797,11 +1824,11 @@ macro_rules! export_provider {
                 let token = serde_json::from_str(&token).map_err(|error| {
                     boundary_token_decode_to_provider_error("resume_create", error)
                 })?;
-                let identifier = decode_create_identifier("resume_create", wit_create_identifier(progress))?;
-                Ok((identifier, token))
+                let progress = decode_create_progress("resume_create", progress)?;
+                Ok((progress, token))
             }
 
-            fn sdk_to_wit_update_outcome<T: serde::Serialize>(
+            fn sdk_to_wit_update_outcome<T: serde::Serialize + $crate::PhasedToken>(
                 outcome: &$crate::UpdateOutcome<T>,
                 operation: &'static str,
             ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
@@ -2246,7 +2273,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let directives = helpers::protocol_17_default_resource_directives();
+                    let directives = helpers::protocol_18_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
                     })?;
@@ -2264,7 +2291,7 @@ macro_rules! export_provider {
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
-                    let directives = helpers::protocol_17_default_resource_directives();
+                    let directives = helpers::protocol_18_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2296,7 +2323,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_17_default_resource_directives();
+                    let directives = helpers::protocol_18_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2305,7 +2332,7 @@ macro_rules! export_provider {
                             ));
                         }
                     };
-                    let (identifier, sent, token) = match wit_to_sdk_poll::<
+                    let (progress, sent, token) = match wit_to_sdk_poll::<
                         <$provider_type as $crate::CarinaProvider>::CreateToken,
                     >(pending, &proto_request) {
                         Ok(poll) => poll,
@@ -2319,7 +2346,7 @@ macro_rules! export_provider {
                         &*provider,
                         &proto_id,
                         proto_request,
-                        identifier,
+                        progress,
                         sent,
                         token,
                         poll_request,
@@ -2344,7 +2371,7 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
-                    let directives = helpers::protocol_17_default_resource_directives();
+                    let directives = helpers::protocol_18_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
                         Ok(request) => request,
                         Err(error) => {
@@ -2353,7 +2380,7 @@ macro_rules! export_provider {
                             ));
                         }
                     };
-                    let (identifier, token) = match wit_to_sdk_resume::<
+                    let (progress, token) = match wit_to_sdk_resume::<
                         <$provider_type as $crate::CarinaProvider>::CreateToken,
                     >(pending) {
                         Ok(resume) => resume,
@@ -2367,7 +2394,7 @@ macro_rules! export_provider {
                         &*provider,
                         &proto_id,
                         proto_request,
-                        identifier,
+                        progress,
                         token,
                         poll_request,
                     ) {
@@ -2778,7 +2805,7 @@ mod tests {
 
     #[test]
     fn wit_resource_protocol_directives_are_all_false_without_transport() {
-        let directives = protocol_17_default_resource_directives();
+        let directives = protocol_18_default_resource_directives();
 
         assert!(!directives.force_delete);
         assert!(!directives.create_before_destroy);

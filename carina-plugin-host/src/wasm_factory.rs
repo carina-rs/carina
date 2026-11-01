@@ -61,6 +61,7 @@ use carina_provider_resolver::{
 };
 
 use crate::{desired_normalization, wasm_convert};
+use carina_provider_protocol::http_trace::TraceUri;
 use carina_provider_protocol::types as proto;
 #[cfg(any(test, feature = "test-utils"))]
 pub use guest_store::GuestCallBudget;
@@ -1768,16 +1769,18 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                 let queue_ms = handler_start.duration_since(spawn_start).as_millis();
                 let handler_ms = handler_start.elapsed().as_millis();
                 eprintln!(
-                    "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
-                    method,
-                    uri,
-                    queue_ms,
-                    handler_ms,
-                    match &result {
-                        Ok(Ok(response)) => format!("{}", response.resp.status().as_u16()),
-                        Ok(Err(error)) => format!("err:{error:?}"),
-                        Err(error) => format!("trap:{error}"),
-                    },
+                    "{}",
+                    http_trace_line(
+                        &method,
+                        TraceUri::new(&uri),
+                        queue_ms,
+                        handler_ms,
+                        &match &result {
+                            Ok(Ok(response)) => format!("{}", response.resp.status().as_u16()),
+                            Ok(Err(error)) => format!("err:{error:?}"),
+                            Err(error) => format!("trap:{error}"),
+                        },
+                    )
                 );
             }
             result
@@ -1790,8 +1793,8 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
 /// Companion to carina-plugin-sdk's `CARINA_WASI_HTTP_TRACE` switch.
 ///
 /// When set to "1", the host-side request handler emits its wall-clock
-/// breakdown to stderr. Off by default; the gate is a single atomic load per
-/// request when disabled.
+/// breakdown to stderr with URI userinfo, fragment and query values removed.
+/// Off by default; the gate is a single atomic load per request when disabled.
 fn trace_http_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -1799,6 +1802,28 @@ fn trace_http_enabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+fn http_trace_line(
+    method: &str,
+    uri: TraceUri<'_>,
+    queue_ms: u128,
+    handler_ms: u128,
+    status: &str,
+) -> String {
+    format!(
+        "carina-host-http-trace method={} uri={} queue_ms={} handler_ms={} status={}",
+        method, uri, queue_ms, handler_ms, status,
+    )
+}
+
+fn http_trace_phases_line(method: &str, uri: TraceUri<'_>, phases_ms: [u128; 4]) -> String {
+    let [tcp_connect, tls_handshake, http_handshake, send_request] = phases_ms;
+    format!(
+        "carina-host-http-trace-phases method={} uri={} \
+         tcp_connect_ms={} tls_handshake_ms={} http_handshake_ms={} send_request_ms={}",
+        method, uri, tcp_connect, tls_handshake, http_handshake, send_request,
+    )
 }
 
 /// Local copy of `wasmtime_wasi_http::p2::default_send_request_handler` that
@@ -1950,9 +1975,17 @@ async fn send_request_handler(
 
     if let Some((method, uri)) = trace_request {
         eprintln!(
-            "carina-host-http-trace-phases method={} uri={} \
-             tcp_connect_ms={} tls_handshake_ms={} http_handshake_ms={} send_request_ms={}",
-            method, uri, tcp_connect_ms, tls_handshake_ms, http_handshake_ms, send_request_ms,
+            "{}",
+            http_trace_phases_line(
+                &method,
+                TraceUri::new(&uri),
+                [
+                    tcp_connect_ms,
+                    tls_handshake_ms,
+                    http_handshake_ms,
+                    send_request_ms
+                ],
+            )
         );
     }
 
@@ -6590,9 +6623,10 @@ impl WasmProvider {
             }
         };
         // Persisted resume state has no scheduling metadata, while WIT requires
-        // both fields. The WIT/SDK contract marks these first-call values as
-        // non-authoritative; the provider's returned pending phase drives the
-        // host from this point onward.
+        // both fields. This operation-phase placeholder allows saved read-back
+        // tokens to resume with an identifier: SDK dispatch only rejects a
+        // backward phase transition. Returned pending or preserved progress
+        // establishes the phase used by subsequent polls.
         let initial = self.call_resume_record(
             id.clone(),
             wit_id,
@@ -7526,6 +7560,48 @@ mod tests {
         }
     }
 
+    const HTTP_TRACE_SECRET_URI: &str = "https://user:PASSSECRET@bucket.s3.amazonaws.com/key?X-Amz-Credential=AKIDSECRET%2F...&X-Amz-Signature=SIGSECRET&X-Amz-Security-Token=TOKSECRET#FRAGSECRET";
+    const HTTP_TRACE_SAFE_URI: &str = "https://bucket.s3.amazonaws.com/key?X-Amz-Credential=<redacted>&X-Amz-Signature=<redacted>&X-Amz-Security-Token=<redacted>";
+
+    fn assert_http_trace_has_no_secrets(line: &str) {
+        for secret in [
+            "PASSSECRET",
+            "AKIDSECRET",
+            "SIGSECRET",
+            "TOKSECRET",
+            "FRAGSECRET",
+        ] {
+            assert!(!line.contains(secret), "trace leaked {secret}: {line}");
+        }
+    }
+
+    #[test]
+    fn http_trace_line_redacts_uri_credentials_and_keeps_metrics() {
+        let line = http_trace_line("GET", TraceUri::new(HTTP_TRACE_SECRET_URI), 1, 2, "200");
+
+        assert_http_trace_has_no_secrets(&line);
+        assert_eq!(
+            line,
+            format!(
+                "carina-host-http-trace method=GET uri={HTTP_TRACE_SAFE_URI} queue_ms=1 handler_ms=2 status=200"
+            )
+        );
+    }
+
+    #[test]
+    fn http_trace_phases_line_redacts_uri_credentials_and_keeps_metrics() {
+        let line =
+            http_trace_phases_line("GET", TraceUri::new(HTTP_TRACE_SECRET_URI), [1, 2, 3, 4]);
+
+        assert_http_trace_has_no_secrets(&line);
+        assert_eq!(
+            line,
+            format!(
+                "carina-host-http-trace-phases method=GET uri={HTTP_TRACE_SAFE_URI} tcp_connect_ms=1 tls_handshake_ms=2 http_handshake_ms=3 send_request_ms=4"
+            )
+        );
+    }
+
     struct UnusedAwsCredentialSource;
 
     impl AwsCredentialSource for UnusedAwsCredentialSource {
@@ -7773,7 +7849,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v17_wit_surface_compiles() {
+    fn protocol_v18_wit_surface_compiles() {
         fn assert_type<T>() {}
 
         assert_type::<wit_types::ReferenceScopeValues>();
@@ -9523,6 +9599,36 @@ mod tests {
         );
         assert!(!err.contains("carina init"), "{err}");
         assert!(!err.contains("bump the provider lock"), "{err}");
+    }
+
+    #[test]
+    fn pattern_diagnostics_are_rendered_once_in_provider_load_error() {
+        let detail = wasm_convert::json_to_attribute_types(
+            r#"{
+                "first":{"type":"String","pattern":"(?=x)"},
+                "second":{"type":"String","pattern":"["}
+            }"#,
+        )
+        .unwrap_err();
+        let diagnostic = ProviderSchemaDecodeDiagnostic(detail);
+        let rendered = diagnostic.to_string();
+        assert!(std::error::Error::source(&diagnostic).is_none());
+        for pattern in ["(?=x)", "["] {
+            let error = carina_core::schema::CompiledPattern::try_new(pattern).unwrap_err();
+            assert_eq!(
+                rendered.matches(&error.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&error.reason.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+        }
+        let error = provider_schema_decode_error("bad-provider", "9.9.9", diagnostic.0);
+        assert_eq!(error.to_string().matches(&rendered).count(), 1);
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

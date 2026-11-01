@@ -13,8 +13,9 @@ use crate::resource::{
     value_at_leaf,
 };
 use crate::schema::{
-    AttributeType, DslTransform, LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms,
-    ResourceSchema, TypeIdentity, empty_defs_for_schema_walks,
+    CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, DslTransform,
+    LeafPath, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, TypeIdentity,
+    empty_defs_for_schema_walks,
 };
 use crate::value::{PersistedValue, canonical_secret_hash_material, contains_secret};
 
@@ -224,7 +225,7 @@ fn type_aware_equal_on_path<'a>(
                 crate::schema::Shape::List {
                     element_type: inner,
                     ordered,
-                    ..
+                    constraints: _constraints,
                 },
             ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered, context),
 
@@ -234,7 +235,7 @@ fn type_aware_equal_on_path<'a>(
                 crate::schema::Shape::List {
                     element_type: inner,
                     ordered,
-                    ..
+                    constraints: _constraints,
                 },
             ) => {
                 // A StringList pair can reach any List shape; the
@@ -467,7 +468,7 @@ where
 fn type_aware_struct_equal(
     a: &IndexMap<String, Value>,
     b: &IndexMap<String, Value>,
-    fields: &[crate::schema::StructField],
+    fields: &[crate::schema::CompiledStructField],
     defs: &BTreeMap<String, AttributeType>,
     context: &ComparisonContext<'_>,
 ) -> bool {

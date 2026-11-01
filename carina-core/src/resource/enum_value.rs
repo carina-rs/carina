@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::schema::{
-    AttributeType, DslMap, EnumParts, ExpectedEnumVariant, InvalidEnumValueKind, TypeError,
-    TypeIdentity, enum_value_matches,
+    Compiled, Draft, DslMap, EnumParts, ExpectedEnumVariant, InvalidEnumValueKind,
+    PatternAttributeType, PatternForm, TypeError, TypeIdentity, enum_value_matches,
 };
 use crate::utils::{NamespacedId, extract_enum_value_with_values, validate_enum_namespace};
 
@@ -219,13 +219,13 @@ impl fmt::Display for CanonicalEnumValue {
     }
 }
 
-pub struct EnumValueResolver<'a> {
-    attr_type: &'a AttributeType,
-    defs: Option<&'a BTreeMap<String, AttributeType>>,
+pub struct EnumValueResolver<'a, R: PatternForm = Draft> {
+    attr_type: &'a PatternAttributeType<R>,
+    defs: Option<&'a BTreeMap<String, PatternAttributeType<R>>>,
 }
 
-impl<'a> EnumValueResolver<'a> {
-    pub fn new(attr_type: &'a AttributeType) -> Self {
+impl<'a, R: PatternForm> EnumValueResolver<'a, R> {
+    pub fn new(attr_type: &'a PatternAttributeType<R>) -> Self {
         Self {
             attr_type,
             defs: None,
@@ -233,8 +233,8 @@ impl<'a> EnumValueResolver<'a> {
     }
 
     pub fn with_defs(
-        attr_type: &'a AttributeType,
-        defs: &'a BTreeMap<String, AttributeType>,
+        attr_type: &'a PatternAttributeType<R>,
+        defs: &'a BTreeMap<String, PatternAttributeType<R>>,
     ) -> Self {
         Self {
             attr_type,
@@ -242,12 +242,27 @@ impl<'a> EnumValueResolver<'a> {
         }
     }
 
-    pub fn resolve_raw(&self, raw: &RawEnumIdentifier) -> Result<CanonicalEnumValue, TypeError> {
-        self.resolve_text(raw.as_str(), EnumInputPhase::RawDsl)
-    }
-
     pub fn enum_identity(&self) -> Option<TypeIdentity> {
         self.parts().ok().map(|(identity, ..)| identity.clone())
+    }
+
+    fn parts(&self) -> Result<EnumParts<'_>, TypeError> {
+        let attr_type = match self.defs {
+            Some(defs) => self.attr_type.resolve_refs_with_defs(defs).as_attr(),
+            None => self.attr_type,
+        };
+        attr_type
+            .enum_parts()
+            .ok_or_else(|| TypeError::TypeMismatch {
+                expected: "Enum".to_string(),
+                got: attr_type.type_name(),
+            })
+    }
+}
+
+impl EnumValueResolver<'_, Compiled> {
+    pub fn resolve_raw(&self, raw: &RawEnumIdentifier) -> Result<CanonicalEnumValue, TypeError> {
+        self.resolve_text(raw.as_str(), EnumInputPhase::RawDsl)
     }
 
     /// Resolve one authored DSL member and return both its canonical API value
@@ -283,19 +298,6 @@ impl<'a> EnumValueResolver<'a> {
 
     pub fn resolve_state_text(&self, text: &str) -> Result<CanonicalEnumValue, TypeError> {
         self.resolve_text(text, EnumInputPhase::StateText)
-    }
-
-    fn parts(&self) -> Result<EnumParts<'_>, TypeError> {
-        let attr_type = match self.defs {
-            Some(defs) => self.attr_type.resolve_refs_with_defs(defs).as_attr(),
-            None => self.attr_type,
-        };
-        attr_type
-            .enum_parts()
-            .ok_or_else(|| TypeError::TypeMismatch {
-                expected: "Enum".to_string(),
-                got: attr_type.type_name(),
-            })
     }
 
     fn resolve_text(
@@ -554,6 +556,7 @@ fn expected_variants(
 mod tests {
     use super::*;
     use crate::resource::ConcreteValue;
+    use crate::schema::CompiledAttributeType as AttributeType;
     use crate::schema::{DslTransform, enum_identity, validator};
 
     #[test]
