@@ -130,7 +130,7 @@ where
         carina_core::parser::IntoExpandedExportParam<carina_core::resource::AbsoluteBindingAddress>,
 {
     resolve_module_file_for_test(parsed)
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test fixture must contain no parser placeholders")
 }
 
@@ -877,7 +877,7 @@ fn resolved_provider_configs(
 ) -> carina_core::parser::ResolvedProviderConfigs {
     let parsed = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider configuration must contain no parser placeholders");
     carina_core::parser::resolve_provider_attributes_with_remote(
         &parsed,
@@ -901,7 +901,7 @@ fn expanded_provider_configs(
 ) -> Vec<carina_core::parser::ExpandedProviderConfig> {
     parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test provider configs must contain no parser placeholders")
         .providers
 }
@@ -998,7 +998,7 @@ for account_id in orgs.accounts {
         Path::new("."),
     )
     .expect("cross the deferred-body resolution seam")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan loop fixture must contain only loop slots");
 
     let mut deferred = parsed.deferred_for_expressions().to_vec().into_iter();
@@ -2272,7 +2272,7 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
     let (_temp, base_dir, parsed) =
         crate::provider_upstream_test_support::provider_default_tags_missing_upstream_fixture();
     let parsed = parsed
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider default-tags fixture has no parser placeholders");
 
     let error =
@@ -2378,7 +2378,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let wiring = ValidatedWiring::from_load_for_test(providers);
     let validated_config = validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
     let expanded = resolve_module_file_for_test(parsed.clone().into_parsed())
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider upstream fixture has no parser placeholders");
     let stale_inputs =
         load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
@@ -3721,7 +3721,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     );
     let expanded = parsed
         .clone()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("module data-source fixture has no parser placeholders");
     let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
         &expanded,
@@ -4554,7 +4554,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
         &SchemaRegistry::new(),
     )
     .expect("test fixture crosses module resolution")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
         &parsed,
@@ -9522,7 +9522,7 @@ mod apply_deferred_for_parity {
         let parsed = parse_resolved(src);
         let states = dvo_state(&parsed);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let schemas = comparison_schemas();
@@ -9592,7 +9592,7 @@ mod apply_deferred_for_parity {
         "#;
         let parsed = parse_resolved(src);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let empty: HashMap<ResourceId, State> = HashMap::new();
@@ -9652,7 +9652,7 @@ mod apply_deferred_for_parity {
         let parsed = parse_resolved(&src);
         let states = dvo_state(&parsed);
         let parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("deferred-for fixture must contain only loop slots");
         let sorted = carina_core::deps::sort_resources_by_dependencies(&parsed.resources).unwrap();
         let mut schemas = carina_core::schema::SchemaRegistry::new();
@@ -9862,18 +9862,20 @@ mod saved_plan_version_tests {
         );
     }
 
+    /// v37 and older could discard authored safety directives; reject their
+    /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
         let user_dirs = carina_core::TestUserDirs::new();
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            37,
-            "carina#4174 requires saved-plan format 37 for diagnostic locations",
+            38,
+            "carina#4072 requires format 38 to reject fail-open directive plans",
         );
-        let previous = 36;
+        let previous = 37;
 
-        for older_version in [previous, 35, 34, 33, 32] {
+        for older_version in [previous, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

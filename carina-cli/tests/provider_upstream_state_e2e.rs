@@ -129,7 +129,7 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
         .parsed
         .clone()
         .into_parsed()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("provider fixture has no parser placeholders");
     let resolved =
         resolve_provider_attributes_with_remote(&expanded, &remote, &ProviderContext::default())

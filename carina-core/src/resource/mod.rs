@@ -10,6 +10,8 @@
 //! public live resource identities.
 
 pub(crate) mod binding_address;
+pub(crate) mod directive_expr;
+pub(crate) use directive_expr::Substituted;
 mod enum_value;
 mod ignore_changes;
 mod loop_origin;
@@ -46,6 +48,11 @@ pub use binding_address::absolute_binding_address_for_test;
 pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
 pub(crate) use binding_address::{
     binding_with_index, binding_with_map_key, module_argument_placeholder,
+};
+pub use directive_expr::{
+    ArgumentValueOrigin, DirectiveExpr, DirectiveResolutionError, DirectiveResolutionErrors,
+    ExpansionError, LifecycleDirective, LoopDirective, LoopDirectiveExpr,
+    SerializableDirectivePhase,
 };
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
@@ -5505,6 +5512,25 @@ impl std::fmt::Display for ParserPlaceholder {
 pub trait PlaceholderKind:
     Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize
 {
+    /// Lifecycle settings follow the same authored-to-expanded phase as values.
+    type DirectiveBool<B: BindingAddress>: Clone + fmt::Debug + PartialEq + Default + Send + Sync;
+    type DirectivePreventDestroy<B: BindingAddress>: Clone
+        + fmt::Debug
+        + PartialEq
+        + Default
+        + Send
+        + Sync;
+
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self>;
+
+    fn map_absolute_directive_values(
+        directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    );
+
     fn module_argument_name(&self) -> Option<&str> {
         None
     }
@@ -5539,7 +5565,22 @@ pub trait PlaceholderKind:
     }
 }
 
-impl PlaceholderKind for NoPlaceholder {}
+impl PlaceholderKind for NoPlaceholder {
+    type DirectiveBool<B: BindingAddress> = bool;
+    type DirectivePreventDestroy<B: BindingAddress> = PreventDestroy;
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self> {
+        directive_expr::rebind_resolved_directives(directives, resolve)
+    }
+    fn map_absolute_directive_values(
+        _directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        _map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        // Lifecycle values are already resolved scalars in this phase.
+    }
+}
 
 impl fmt::Display for NoPlaceholder {
     fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -5558,6 +5599,15 @@ impl fmt::Display for LoopSlot {
 }
 
 impl PlaceholderKind for LoopSlot {
+    type DirectiveBool<B: BindingAddress> = LoopDirective<bool, B>;
+    type DirectivePreventDestroy<B: BindingAddress> = LoopDirective<PreventDestroy, B>;
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self> {
+        directive_expr::rebind_loop_directives(directives, resolve)
+    }
+
     fn loop_slot(&self) -> Option<LoopSlot> {
         Some(*self)
     }
@@ -5573,9 +5623,30 @@ impl PlaceholderKind for LoopSlot {
             Self::Value => "(known after upstream apply)".to_string(),
         }
     }
+    fn map_absolute_directive_values(
+        directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        directives.map_expression_bindings(&mut |binding| map(&binding));
+    }
 }
 
 impl PlaceholderKind for ParserPlaceholder {
+    type DirectiveBool<B: BindingAddress> = Option<DirectiveExpr<B>>;
+    type DirectivePreventDestroy<B: BindingAddress> = Option<DirectiveExpr<B>>;
+    fn rebind_directives<B: BindingAddress, C: BindingAddress>(
+        directives: Directives<B, Self>,
+        resolve: &mut impl FnMut(B) -> C,
+    ) -> Directives<C, Self> {
+        directive_expr::rebind_authored_directives(directives, resolve)
+    }
+    fn map_absolute_directive_values(
+        directives: &mut Directives<AbsoluteBindingAddress, Self>,
+        map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
+    ) {
+        directives.map_expressions(|expression| expression.value.map_absolute_bindings(map));
+    }
+
     fn module_argument_name(&self) -> Option<&str> {
         match self {
             Self::ModuleArgument { name, .. } => Some(name),
@@ -5703,6 +5774,12 @@ impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::Placeholder(_),
             ) => None,
         }
+    }
+
+    pub(crate) fn references_loop_slot(&self) -> bool {
+        let mut found = false;
+        self.visit_placeholders(&mut |placeholder| found |= placeholder.loop_slot().is_some());
+        found
     }
 
     pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
@@ -8433,6 +8510,19 @@ pub enum ProviderDirectiveSchema<'a> {
     Unavailable,
 }
 
+impl<'a> ProviderDirectiveSchema<'a> {
+    pub(crate) fn for_id(
+        schemas: &'a crate::schema::SchemaRegistry,
+        id: &ResourceId,
+        kind: crate::schema::SchemaKind,
+    ) -> Self {
+        match schemas.get(&id.provider, &id.resource_type, kind) {
+            Some(schema) => Self::Available(schema.schema().as_schema()),
+            None => Self::Unavailable,
+        }
+    }
+}
+
 impl PreventDestroyResolution {
     /// Return the protection provenance, or `None` when destruction is allowed.
     pub fn source(self) -> Option<PreventDestroySource> {
@@ -8470,22 +8560,32 @@ impl PreventDestroy {
 
 /// Carina-side directives for a resource.
 ///
+/// The default value phase contains only resolved lifecycle settings.
+/// [`AuthoredDirectives`] instead retains expressions until resource values
+/// cross the expansion boundary; it cannot be passed to runtime consumers.
+///
 /// These are instructions to Carina about how to handle the resource,
 /// not metadata about the resource itself. The provider-visible subset
 /// mirrors the WIT `directives` record; host-only fields remain outside it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "B: Serialize", deserialize = "B: Deserialize<'de>"))]
-pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
+#[serde(bound(
+    serialize = "B: Serialize, P: SerializableDirectivePhase<B>, P::DirectiveBool<B>: Serialize, P::DirectivePreventDestroy<B>: Serialize",
+    deserialize = "B: Deserialize<'de>, P: SerializableDirectivePhase<B>, P::DirectiveBool<B>: Deserialize<'de>, P::DirectivePreventDestroy<B>: Deserialize<'de>"
+))]
+pub struct Directives<
+    B: BindingAddress = AbsoluteBindingAddress,
+    P: PlaceholderKind = NoPlaceholder,
+> {
     /// If true, force-delete the resource (e.g., non-empty S3 buckets)
     #[serde(default)]
-    pub force_delete: bool,
+    pub force_delete: P::DirectiveBool<B>,
     /// If true, create the new resource before destroying the old one during replacement
     #[serde(default)]
-    pub create_before_destroy: bool,
+    pub create_before_destroy: P::DirectiveBool<B>,
     /// Authored destruction-protection setting. Private so effective policy
     /// can only be obtained through [`PreventDestroy::resolve`].
     #[serde(default)]
-    prevent_destroy: PreventDestroy,
+    prevent_destroy: P::DirectivePreventDestroy<B>,
     /// Explicit ordering edges declared by the user. Each element is the
     /// binding name of a sibling `let` (resource / wait / module).
     /// Set semantics (deduplicated, order-insensitive); represented as
@@ -8509,81 +8609,65 @@ pub struct Directives<B: BindingAddress = AbsoluteBindingAddress> {
     pub provider_instance: Option<String>,
 }
 
-pub type AuthoredDirectives = Directives<RelativeBindingName>;
+/// Authored settings carry expressions, so consumers cannot read them as
+/// booleans or pass them to a provider before resolution.
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::AuthoredResource;
+/// fn force_delete(resource: &AuthoredResource) -> bool {
+///     resource.directives.force_delete
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::resource::{AuthoredResource, ProviderDirectiveSchema};
+/// use carina_core::provider::ProviderDirectives;
+/// fn provider_directives(resource: &AuthoredResource) {
+///     ProviderDirectives::resolve(&resource.directives, ProviderDirectiveSchema::Unavailable);
+/// }
+/// ```
+pub type AuthoredDirectives<B = RelativeBindingName> = Directives<B, ParserPlaceholder>;
 pub type ExpandedDirectives = Directives<AbsoluteBindingAddress>;
 
-impl<B: BindingAddress> Directives<B> {
-    /// Move every directive field across a binding-address phase boundary.
-    ///
-    /// Callers resolve the public dependency addresses, while this defining
-    /// module alone carries the private authored destruction setting into the
-    /// new phase.
-    pub(crate) fn with_resolved_depends_on<C: BindingAddress>(
-        self,
-        depends_on: Vec<C>,
-    ) -> Directives<C> {
-        let Self {
-            force_delete,
-            create_before_destroy,
-            prevent_destroy,
-            depends_on: _depends_on,
-            depends_on_diagnostic_sources,
-            ignore_changes,
-            provider_instance,
-        } = self;
-        Directives {
-            force_delete,
-            create_before_destroy,
-            prevent_destroy,
-            depends_on,
-            depends_on_diagnostic_sources,
-            ignore_changes,
-            provider_instance,
-        }
-    }
-}
-
-impl Directives<RelativeBindingName> {
+impl<P: PlaceholderKind> Directives<RelativeBindingName, P> {
     fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
-    ) -> Directives<AbsoluteBindingAddress> {
-        let depends_on = self.depends_on.iter().cloned().map(resolve).collect();
-        self.with_resolved_depends_on(depends_on)
+    ) -> Directives<AbsoluteBindingAddress, P> {
+        P::rebind_directives(self, resolve)
     }
 }
 
-impl Directives<AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> Directives<AbsoluteBindingAddress, P> {
     pub(crate) fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
-        let Self {
-            force_delete: _force_delete,
-            create_before_destroy: _create_before_destroy,
-            prevent_destroy: _prevent_destroy,
-            depends_on,
-            depends_on_diagnostic_sources: _depends_on_diagnostic_sources,
-            ignore_changes: _ignore_changes,
-            provider_instance: _provider_instance,
-        } = self;
-        for binding in depends_on {
+        P::map_absolute_directive_values(self, map);
+        for binding in &mut self.depends_on {
             *binding = map(binding);
         }
     }
 }
 
-impl<B: BindingAddress> Default for Directives<B> {
+impl<B: BindingAddress, P: PlaceholderKind> Default for Directives<B, P> {
     fn default() -> Self {
         Self {
-            force_delete: false,
-            create_before_destroy: false,
-            prevent_destroy: PreventDestroy::default(),
+            force_delete: Default::default(),
+            create_before_destroy: Default::default(),
+            prevent_destroy: Default::default(),
             depends_on: Vec::new(),
             depends_on_diagnostic_sources: DiagnosticSourceLocations::default(),
             ignore_changes: Vec::new(),
             provider_instance: None,
         }
+    }
+}
+
+impl<B: BindingAddress, P: PlaceholderKind> Directives<B, P> {
+    pub fn with_provider_instance(mut self, provider_instance: impl Into<String>) -> Self {
+        self.provider_instance = Some(provider_instance.into());
+        self
     }
 }
 
@@ -8686,7 +8770,10 @@ impl PersistedDirectiveFieldChange {
     }
 }
 
-impl<B: BindingAddress> Directives<B> {
+impl<B: BindingAddress, P> Directives<B, P>
+where
+    P: PlaceholderKind<DirectiveBool<B> = bool, DirectivePreventDestroy<B> = PreventDestroy>,
+{
     pub fn with_force_delete(mut self, value: bool) -> Self {
         self.force_delete = value;
         self
@@ -8699,11 +8786,6 @@ impl<B: BindingAddress> Directives<B> {
 
     pub fn with_depends_on(mut self, depends_on: Vec<B>) -> Self {
         self.depends_on = depends_on;
-        self
-    }
-
-    pub fn with_provider_instance(mut self, provider_instance: impl Into<String>) -> Self {
-        self.provider_instance = Some(provider_instance.into());
         self
     }
 
@@ -9310,8 +9392,8 @@ impl DefaultTagKeys {
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize",
-    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
+    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize, Directives<B, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>, Directives<B, P>: Deserialize<'de>"
 ))]
 pub struct Resource<
     S = ModuleSource,
@@ -9329,8 +9411,8 @@ pub struct Resource<
     /// `directives` meta-argument block: Carina-side instructions for
     /// how to handle this resource (force-delete, create-before-destroy,
     /// prevent-destroy).
-    #[serde(default = "Directives::<B>::default")]
-    pub directives: Directives<B>,
+    #[serde(default = "Directives::<B, P>::default")]
+    pub directives: Directives<B, P>,
     /// Schema-resolved host lifecycle metadata. Persisted resources carry only
     /// the authored directive; every saved-plan load resolves it again after
     /// checking the provider schema fingerprint.
@@ -9539,7 +9621,10 @@ impl<P: PlaceholderKind, B: BindingAddress> From<Resource<ModuleSource, P, B>>
 }
 
 impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
-    pub fn into_expanded(self) -> Result<Resource<S, NoPlaceholder, B>, LeftoverPlaceholder> {
+    pub fn into_expanded(
+        self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<Resource<S, NoPlaceholder, B>, ExpansionError> {
         let Resource {
             id,
             attributes,
@@ -9553,6 +9638,10 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
             loop_provenance,
             quoted_string_attrs,
         } = self;
+        let directives = directives.resolve(
+            &id,
+            ProviderDirectiveSchema::for_id(schemas, &id, crate::schema::SchemaKind::Resource),
+        )?;
         let attributes = into_expanded_value_map(attributes, Some(&id))?;
         Ok(Resource {
             id,
@@ -9573,7 +9662,9 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
 impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
     pub(crate) fn into_loop_template(
         self,
-    ) -> Result<Resource<S, LoopSlot, B>, LeftoverPlaceholder> {
+        schemas: &crate::schema::SchemaRegistry,
+        element_type: Option<&crate::parser::TypeExpr>,
+    ) -> Result<Resource<S, LoopSlot, B>, ExpansionError> {
         let Resource {
             id,
             attributes,
@@ -9587,6 +9678,11 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
             loop_provenance,
             quoted_string_attrs,
         } = self;
+        let directives = directives.into_loop_template(
+            &id,
+            ProviderDirectiveSchema::for_id(schemas, &id, crate::schema::SchemaKind::Resource),
+            element_type,
+        )?;
         let resource_id = id.to_string();
         Ok(Resource {
             id,
@@ -9598,7 +9694,7 @@ impl<S, B: BindingAddress> Resource<S, ParserPlaceholder, B> {
                         .map(|value| (name.clone(), value))
                         .map_err(|error| error.in_resource_attribute(resource_id.clone(), name))
                 })
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<_, LeftoverPlaceholder>>()?,
             directives,
             resolved_ignore_changes,
             prefixes,

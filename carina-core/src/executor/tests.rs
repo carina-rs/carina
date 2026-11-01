@@ -177,7 +177,7 @@ fn anonymous_deferred_collision_fixture() -> (
         std::path::Path::new("."),
     )
     .expect("deferred fixture crosses the module-resolution seam")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("deferred-loop fixture contains no parser placeholders");
     let template = parsed.deferred_for_expressions()[0].clone();
     let mut bindings = ResolvedBindings::default();
@@ -7137,7 +7137,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         std::path::Path::new("."),
     )
     .expect("reference alias fixture crosses the module-resolution seam")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("reference alias fixture contains no parser placeholders");
 
     let role = parsed

@@ -2397,7 +2397,7 @@ mod tests {
             &carina_core::parser::ProviderContext::default(),
         )
         .unwrap()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("mock provider fixture must not retain parser placeholders")
         .providers
         .into_iter()

@@ -5335,7 +5335,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         std::path::Path::new("."),
     )
     .expect("plan fixture crosses the module-resolution seam")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("plan fixture contains no parser placeholders");
     let provider = HintProvider {
         hints: vec![BindingPattern::Exact("validation_records".to_string())],

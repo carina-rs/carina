@@ -658,6 +658,10 @@ pub struct PlanFileContents<S = ModuleSource, P = Plan<S>> {
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 38 resolves authored lifecycle directives and retains loop
+    /// expressions, default origins, and call-site diagnostics in templates.
+    /// Earlier plans could have silently discarded safety directives.
+    ///
     /// Plan format 37 requires relative diagnostic files (or null) and line
     /// numbers on every deferred-for template.
     ///
@@ -1962,7 +1966,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 37;
+    pub const CURRENT_VERSION: u32 = 38;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -6416,7 +6420,7 @@ mod load_upstream_states_tests {
         let (_temp, downstream, parsed) =
             crate::provider_upstream_test_support::provider_upstream_fixture();
         let mut parsed = parsed
-            .into_expanded()
+            .into_expanded(&carina_core::schema::SchemaRegistry::new())
             .expect("provider upstream fixture has no parser placeholders");
         parsed.providers[0].attributes.insert(
             "role_arn".to_string(),
@@ -6540,7 +6544,7 @@ mod load_upstream_states_tests {
             &ProviderContext::default(),
         )
         .unwrap()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("backend lock fixture has no parser placeholders")
         .backend
         .unwrap();
@@ -6974,7 +6978,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .expect("load config")
         .parsed
         .into_parsed()
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("exports-only fixture has no parser placeholders");
         let mut guard = seed_cycle_guard(&dir_b);
         let bindings = load_upstream_states(

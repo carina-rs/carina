@@ -893,6 +893,44 @@ impl DiagnosticEngine {
                         checks::MergedModuleResolution::ConstraintFailed { .. }
                         | checks::MergedModuleResolution::Unowned { .. } => None,
                     });
+            let directive_boundary =
+                if carina_core::validation::is_module_definition(merged.unwrap_or(parsed)) {
+                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+                } else {
+                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+                };
+            let directive_errors = if let Some(graph) = expanded_graph {
+                graph.directive_resolution_errors(directive_boundary, &self.schemas)
+            } else {
+                merged
+                    .unwrap_or(parsed)
+                    .directive_resolution_errors(directive_boundary, &self.schemas)
+            };
+            let mut directive_sites = HashSet::new();
+            for error in directive_errors {
+                let Some(range) = error.source_in_file(doc.source_file()) else {
+                    continue;
+                };
+                if !directive_sites.insert((error.resource().to_owned(), error.diagnostic_key())) {
+                    continue;
+                }
+                let (Some(start_line), Some(start_column), Some(end_line), Some(end_column)) = (
+                    range.start_line().checked_sub(1),
+                    range.start_column().checked_sub(1),
+                    range.end_line().checked_sub(1),
+                    range.end_column().checked_sub(1),
+                ) else {
+                    continue;
+                };
+                diagnostics.push(carina_diagnostic_range(
+                    Range::new(
+                        Position::new(start_line as u32, start_column as u32),
+                        Position::new(end_line as u32, end_column as u32),
+                    ),
+                    DiagnosticSeverity::ERROR,
+                    error.message(),
+                ));
+            }
             let pre_expansion_input = merged.unwrap_or(parsed);
             let semantic_view =
                 checks::SemanticView::for_analysis(parsed, merged, base_path.is_some());
@@ -2071,9 +2109,6 @@ impl DiagnosticEngine {
             // context meant for CLI output only and are not elevated here.
             diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
             diagnostics.extend(self.check_single_quoted_interpolation_warnings(parsed));
-            let prevent_destroy_warnings = merged_current_file.unwrap_or(parsed);
-            diagnostics
-                .extend(self.check_non_literal_prevent_destroy_warnings(prevent_destroy_warnings));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(doc, parsed, &binding_index));
@@ -2195,31 +2230,6 @@ impl DiagnosticEngine {
                     end_col,
                     DiagnosticSeverity::WARNING,
                     w.message.clone(),
-                ))
-            })
-            .collect()
-    }
-
-    fn check_non_literal_prevent_destroy_warnings(&self, parsed: &ParsedFile) -> Vec<Diagnostic> {
-        parsed
-            .warnings
-            .iter()
-            .filter(|warning| warning.kind == WarningKind::NonLiteralPreventDestroy)
-            .filter_map(|warning| {
-                let span = warning.span.as_ref()?;
-                Some(carina_diagnostic_range(
-                    Range::new(
-                        Position::new(
-                            span.start_line.checked_sub(1)? as u32,
-                            span.start_column.checked_sub(1)? as u32,
-                        ),
-                        Position::new(
-                            span.end_line.checked_sub(1)? as u32,
-                            span.end_column.checked_sub(1)? as u32,
-                        ),
-                    ),
-                    DiagnosticSeverity::WARNING,
-                    warning.message.clone(),
                 ))
             })
             .collect()

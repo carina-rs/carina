@@ -934,7 +934,7 @@ fn format_effect_unbound_deferred_for_uses_the_source_identity() {
         std::path::Path::new("."),
     )
     .expect("root bindings resolve")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("loop slots finalize");
     let deferred = parsed
         .deferred_for_expressions()

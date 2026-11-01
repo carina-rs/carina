@@ -415,7 +415,7 @@ fn snapshot_anonymous_loop_origin_effect_labels() {
         std::path::Path::new("."),
     )
     .expect("resolve anonymous-loop fixture")
-    .into_expanded()
+    .into_expanded(&carina_core::schema::SchemaRegistry::new())
     .expect("anonymous-loop fixture must not retain parser placeholders");
     let mut resource = parsed
         .resources
