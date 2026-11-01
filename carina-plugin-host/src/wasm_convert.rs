@@ -2517,7 +2517,7 @@ mod tests {
     }
 
     #[test]
-    fn json_schema_rejects_uncompilable_pattern_with_typed_source() {
+    fn json_schema_rejects_uncompilable_pattern_with_typed_diagnostic() {
         let wire = proto_resource(
             "acm.Certificate",
             vec![(
@@ -2530,9 +2530,29 @@ mod tests {
         );
         let json = serde_json::to_string(&vec![wire]).unwrap();
         let error = json_to_schemas(&json).expect_err("invalid regex must fail provider load");
-        let source = find_error_in_chain::<carina_core::schema::PatternCompileError>(&error)
-            .expect("WASM conversion must preserve the typed regex error");
-        assert_eq!(source.pattern, "^(?!-).+$");
+        let validation =
+            find_error_in_chain::<carina_core::schema::ResourceSchemaValidationError>(&error)
+                .expect("WASM conversion must preserve the typed validation error");
+        let (location, pattern_error) = validation
+            .pattern_errors()
+            .next()
+            .expect("typed regex diagnostic must remain accessible");
+        assert_eq!(
+            location,
+            &carina_core::schema::SchemaValidationIssueLocation::Attribute("domain_name".into())
+        );
+        assert_eq!(pattern_error.pattern, "^(?!-).+$");
+        assert!(matches!(
+            pattern_error.reason,
+            carina_core::schema::PatternCompileErrorSource::Parse(_)
+        ));
+        let diagnostic = pattern_error.reason.to_string();
+        let rendered = validation.to_string();
+        assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+        let rendered = render_error_chain(&error);
+        assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+        assert!(std::error::Error::source(validation).is_none());
+        assert!(std::error::Error::source(pattern_error).is_none());
         let context =
             find_error_in_chain::<carina_core::protocol_convert::SchemaDecodeError>(&error)
                 .expect("WASM conversion must preserve the schema context");

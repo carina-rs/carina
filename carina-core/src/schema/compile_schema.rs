@@ -34,7 +34,7 @@ impl PatternAttributeType<Draft> {
                             issues.push(SchemaDefinitionIssue {
                                 path: location.to_string(),
                                 location,
-                                message: format!("{error}: {}", error.source),
+                                message: error.to_string(),
                                 pattern_error: Some(error),
                             });
                             return None;

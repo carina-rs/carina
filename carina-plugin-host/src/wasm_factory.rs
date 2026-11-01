@@ -9941,6 +9941,36 @@ mod tests {
     }
 
     #[test]
+    fn pattern_diagnostics_are_rendered_once_in_provider_load_error() {
+        let detail = wasm_convert::json_to_attribute_types(
+            r#"{
+                "first":{"type":"String","pattern":"(?=x)"},
+                "second":{"type":"String","pattern":"["}
+            }"#,
+        )
+        .unwrap_err();
+        let diagnostic = ProviderSchemaDecodeDiagnostic(detail);
+        let rendered = diagnostic.to_string();
+        assert!(std::error::Error::source(&diagnostic).is_none());
+        for pattern in ["(?=x)", "["] {
+            let error = carina_core::schema::CompiledPattern::try_new(pattern).unwrap_err();
+            assert_eq!(
+                rendered.matches(&error.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&error.reason.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+        }
+        let error = provider_schema_decode_error("bad-provider", "9.9.9", diagnostic.0);
+        assert_eq!(error.to_string().matches(&rendered).count(), 1);
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
     fn provider_kind_comes_from_resolver_trust_identity() {
         let kind = |configured_name: &str, class| {
             ConfiguredProvider::new(&ProviderLoadIdentity::for_test(configured_name, class)).kind

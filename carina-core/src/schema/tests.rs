@@ -8681,12 +8681,8 @@ fn schema_rejects_uncompilable_patterns() {
             &SchemaValidationIssueLocation::Attribute(path.to_string())
         );
         assert_eq!(source.pattern, pattern);
-        assert!(matches!(source.source, PatternCompileErrorSource::Parse(_)));
-        assert!(
-            std::error::Error::source(&error)
-                .unwrap()
-                .is::<PatternCompileError>()
-        );
+        assert!(matches!(source.reason, PatternCompileErrorSource::Parse(_)));
+        assert!(std::error::Error::source(&error).is_none());
 
         let error = ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), attr)]))
             .expect_err("config invalid regex must fail schema admission");
@@ -8699,6 +8695,7 @@ fn schema_rejects_uncompilable_patterns() {
             &SchemaValidationIssueLocation::Attribute(path.to_string())
         );
         assert_eq!(source.pattern, pattern);
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     let error = super::ResourceSchema::new("test.Pattern")
@@ -8856,7 +8853,7 @@ fn pattern_errors_do_not_mask_scalar_kind_errors() {
 }
 
 #[test]
-fn pattern_error_chain_renders_regex_diagnostic_once() {
+fn pattern_error_display_renders_regex_diagnostics_once() {
     let invalid = |pattern: &str| {
         super::AttributeType::refined_string(None, Some(pattern.into()), None, None)
     };
@@ -8870,16 +8867,20 @@ fn pattern_error_chain_renders_regex_diagnostic_once() {
         ("second".into(), invalid("[")),
     ]))
     .unwrap_err();
-    for (issues, pattern_errors) in [
+    for (error, issues, pattern_errors) in [
         (
+            &resource as &dyn std::error::Error,
             resource.issues().collect::<Vec<_>>(),
             resource.pattern_errors().collect::<Vec<_>>(),
         ),
         (
+            &config as &dyn std::error::Error,
             config.issues().collect::<Vec<_>>(),
             config.pattern_errors().collect::<Vec<_>>(),
         ),
     ] {
+        let rendered = error.to_string();
+        assert!(error.source().is_none());
         assert_eq!(pattern_errors.len(), 2);
         for (location, error) in pattern_errors {
             let message = issues
@@ -8887,31 +8888,18 @@ fn pattern_error_chain_renders_regex_diagnostic_once() {
                 .find(|(path, _)| *path == location.to_string())
                 .unwrap()
                 .1;
-            assert!(
-                message.contains(&error.source.to_string()),
-                "each issue must include its regex reason: {message}"
-            );
-        }
-    }
-    for error in [&resource as &dyn std::error::Error, &config] {
-        let mut rendered = error.to_string();
-        let mut source = error.source();
-        while let Some(error) = source {
-            rendered.push_str(&format!("\nCaused by: {error}"));
-            source = error.source();
+            let diagnostic = error.to_string();
+            assert_eq!(message, diagnostic);
+            let reason = error.reason.to_string();
+            assert_eq!(message.matches(&reason).count(), 1, "{message}");
+            assert_eq!(rendered.matches(&reason).count(), 1, "{rendered}");
+            assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
         }
         assert_eq!(
             rendered.matches("regex parse error").count(),
             2,
             "{rendered}"
         );
-        for pattern in ["(?=x)", "["] {
-            let diagnostic = CompiledPattern::try_new(pattern)
-                .unwrap_err()
-                .source
-                .to_string();
-            assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
-        }
     }
 }
 

@@ -7947,19 +7947,11 @@ impl fmt::Display for SchemaDefinitionIssue {
 }
 
 fn fmt_schema_issues(issues: &[SchemaDefinitionIssue], f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    let mut first_pattern = true;
     for (index, issue) in issues.iter().enumerate() {
         if index != 0 {
             f.write_str("; ")?;
         }
-        if first_pattern && let Some(error) = &issue.pattern_error {
-            // Its regex diagnostic is exposed by Error::source. Other pattern
-            // issues have no source-chain slot and need their full message here.
-            write!(f, "{}: {error}", issue.path)?;
-            first_pattern = false;
-        } else {
-            fmt::Display::fmt(issue, f)?;
-        }
+        fmt::Display::fmt(issue, f)?;
     }
     Ok(())
 }
@@ -8007,11 +7999,7 @@ impl fmt::Display for ResourceSchemaValidationError {
     }
 }
 
-impl std::error::Error for ResourceSchemaValidationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.pattern_errors().next().map(|(_, error)| error as _)
-    }
-}
+impl std::error::Error for ResourceSchemaValidationError {}
 
 /// Error returned when provider-config attribute types fail graph validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8054,11 +8042,7 @@ impl fmt::Display for ConfigSchemaValidationError {
     }
 }
 
-impl std::error::Error for ConfigSchemaValidationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.pattern_errors().next().map(|(_, error)| error as _)
-    }
-}
+impl std::error::Error for ConfigSchemaValidationError {}
 
 /// A top-level resource attribute read through a validated schema witness.
 ///

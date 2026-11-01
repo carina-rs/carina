@@ -69,7 +69,7 @@ impl CompiledPattern {
             })
             .map_err(|error| PatternCompileError {
                 pattern: source.to_string(),
-                source: error,
+                reason: error,
             })
     }
 
@@ -91,11 +91,11 @@ impl Deref for CompiledPattern {
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
-#[error("invalid string pattern {pattern:?}")]
+#[error("invalid string pattern {pattern:?}: {reason}")]
 pub struct PatternCompileError {
     pub pattern: String,
-    #[source]
-    pub source: PatternCompileErrorSource,
+    /// Typed parser, dialect or regex compiler diagnostic rendered by this error.
+    pub reason: PatternCompileErrorSource,
 }
 
 impl Eq for PatternCompileError {}
@@ -388,18 +388,18 @@ mod tests {
         assert_eq!(error.pattern, source);
         assert!(
             error
-                .source
+                .reason
                 .to_string()
                 .contains("unclosed character class")
         );
         assert!(
-            matches!(error.source, PatternCompileErrorSource::Parse(ref error) if error.pattern() == source)
+            matches!(error.reason, PatternCompileErrorSource::Parse(ref error) if error.pattern() == source)
         );
         let source = r"^\d\p{NotAProperty}$";
         let error = CompiledPattern::try_new(source).unwrap_err();
         assert_eq!(error.pattern, source);
-        assert!(matches!(error.source, PatternCompileErrorSource::Regex(_)));
-        assert!(error.source.to_string().contains("Unicode property"));
+        assert!(matches!(error.reason, PatternCompileErrorSource::Regex(_)));
+        assert!(error.reason.to_string().contains("Unicode property"));
     }
 
     #[test]
@@ -408,7 +408,18 @@ mod tests {
         let error = CompiledPattern::try_new(source).unwrap_err();
         let expected = regex::Regex::new(source).unwrap_err();
         assert_eq!(error.pattern, source);
-        assert_eq!(error.source.to_string(), expected.to_string());
+        assert_eq!(error.reason.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn pattern_errors_are_terminal_diagnostics() {
+        for pattern in [r"(?=x)", r"^\d\p{NotAProperty}$", r"(?u:\d)"] {
+            let error = CompiledPattern::try_new(pattern).unwrap_err();
+            let rendered = error.to_string();
+            let diagnostic = error.reason.to_string();
+            assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 
     #[test]
@@ -416,12 +427,12 @@ mod tests {
         for source in [r"(?u)\d", r"(?-u:\w)", r"(?u:é)"] {
             let error = CompiledPattern::try_new(source).unwrap_err();
             assert_eq!(error.pattern, source);
-            assert!(error.source.to_string().contains("Unicode"));
+            assert!(error.reason.to_string().contains("Unicode"));
         }
         for source in [r"(?i:\w)", r"(?i)[^\w-]", r"(?i)(a|\W)"] {
             let error = CompiledPattern::try_new(source).unwrap_err();
             assert_eq!(error.pattern, source);
-            assert!(error.source.to_string().contains("case-insensitive"));
+            assert!(error.reason.to_string().contains("case-insensitive"));
         }
         assert!(
             CompiledPattern::try_new(r"(?i:(?-i:\w))")
