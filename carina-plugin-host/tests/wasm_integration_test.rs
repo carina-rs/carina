@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
 use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
@@ -903,7 +903,7 @@ async fn schema_only_loads_an_aws_world_without_a_credential_source() {
         cache.path(),
     )
     .await
-    .expect("schema-only loading must link the non-credentialing stub");
+    .expect("schema-only loading must link the failing credential import");
 
     assert!(
         factory
@@ -911,6 +911,68 @@ async fn schema_only_loads_an_aws_world_without_a_credential_source() {
             .iter()
             .any(|schema| schema.parts().resource_type == "test.aws_credentials")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_kind_runtime_rejects_an_http_world_before_provisioning_credentials() {
+    let path = skip_if_no_http_wasm!();
+    let cache = tempfile::tempdir().expect("create AWS-kind cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read HTTP-world WASM provider");
+    let load = mock_http_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let aws = CountingAwsCredentialProvisioner {
+        calls: Arc::clone(&calls),
+    };
+
+    let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("an AWS-kind runtime must reject a component built with the HTTP world"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        WasmProviderLoadError::AwsCredentialsImportMissing
+    ));
+    assert_eq!(
+        error.to_string(),
+        "an AWS-kind provider must be built with the `aws` world (`export_provider!(T, aws, egress: [..])`)"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aws_world_provision_failure_remains_a_typed_load_error() {
+    let path = skip_if_no_aws_http_wasm!();
+    let cache = tempfile::tempdir().expect("create AWS-world cache tempdir");
+    let wasm_bytes = std::fs::read(path).expect("read AWS-world WASM provider");
+    let load = mock_http_load_with_class(&wasm_bytes, ProviderTrustClass::Aws);
+    let locked_egress = explicit_test_egress(&load, cache.path());
+    let aws = FixedAwsCredentialProvisioner(Err(AwsCredentialError::NotFound(
+        "host provisioning failure sentinel".to_string(),
+    )));
+
+    let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+        load,
+        cache.path(),
+        locked_egress.as_ref(),
+        &aws,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(WasmProviderLoadError::AwsCredentials(
+            AwsCredentialError::NotFound(ref message)
+        )) if message == "host provisioning failure sentinel"
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1011,17 +1073,12 @@ async fn aws_credential_source_error_reaches_the_guest_as_a_wit_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn two_guest_calls_observe_refreshed_aws_credentials() {
+async fn each_guest_call_asks_the_host_source() {
     let path = skip_if_no_aws_http_wasm!();
     let source = Arc::new(SequenceAwsCredentialSource::new([
+        Ok(AwsCredentials::new("AKIAFIRST", "first-secret", None, None)),
         Ok(AwsCredentials::new(
-            "AKIAEXPIRING",
-            "first-secret",
-            None,
-            Some(SystemTime::now() + Duration::from_secs(1)),
-        )),
-        Ok(AwsCredentials::new(
-            "AKIAREFRESHED",
+            "AKIASECOND",
             "second-secret",
             None,
             None,
@@ -1046,15 +1103,11 @@ async fn two_guest_calls_observe_refreshed_aws_credentials() {
 
     assert_eq!(
         first.attributes.get("access_key_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "AKIAEXPIRING".into()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("AKIAFIRST".into())))
     );
     assert_eq!(
         second.attributes.get("access_key_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "AKIAREFRESHED".into()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("AKIASECOND".into())))
     );
 }
 
@@ -1215,11 +1268,12 @@ async fn schema_only_instance_denies_even_a_declared_host() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn provider_kinds_do_not_inherit_amazonaws_egress() {
-    let path = skip_if_no_http_wasm!();
-    for class in [
-        ProviderTrustClass::Aws,
-        ProviderTrustClass::GitHub,
-        ProviderTrustClass::Untrusted,
+    let http_path = skip_if_no_http_wasm!();
+    let aws_path = skip_if_no_aws_http_wasm!();
+    for (class, path) in [
+        (ProviderTrustClass::Aws, aws_path.as_path()),
+        (ProviderTrustClass::GitHub, http_path.as_path()),
+        (ProviderTrustClass::Untrusted, http_path.as_path()),
     ] {
         let socket = match tokio::net::TcpSocket::new_v4().and_then(|socket| {
             socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
@@ -1232,7 +1286,7 @@ async fn provider_kinds_do_not_inherit_amazonaws_egress() {
             }
         };
         let address = socket.local_addr().expect("reserved socket has an address");
-        let (factory, _cache) = load_http_factory_with_class(&path, class).await;
+        let (factory, _cache) = load_http_factory_with_class(path, class).await;
         let factory = factory.with_http_test_route("sts.amazonaws.com", address);
         let provider = factory
             .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
@@ -1440,7 +1494,7 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
             && rendered.contains("file:///test-providers/mock_http.wasm")
             && rendered.contains("request to resolved-metadata.invalid was denied")
             && rendered.contains(
-                "instance-metadata address 169.254.169.254 is not available to this provider"
+                "instance-metadata address 169.254.169.254 is withheld from every provider"
             ),
         "unexpected post-resolution metadata denial: {rendered}"
     );

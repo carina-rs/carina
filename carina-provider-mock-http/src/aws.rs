@@ -12,6 +12,8 @@ use carina_plugin_sdk::{
     PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, UpdateOutcome,
 };
 
+use carina_provider_mock_http::send_phase::{self, PreparedCreate, ProbeKind};
+
 const ACCESS_KEY_ID_ATTRIBUTE: &str = "access_key_id";
 const HAS_SESSION_TOKEN_ATTRIBUTE: &str = "has_session_token";
 
@@ -72,6 +74,7 @@ impl CarinaProvider for MockHttpAwsProvider {
                 .with_description("Host-resolved AWS credential import probe")
                 .validate()
                 .expect("mock AWS credential probe schema must be valid"),
+            send_phase::schema(ProbeKind::AwsWorld, None),
         ]
     }
 
@@ -134,14 +137,14 @@ impl CarinaProvider for MockHttpAwsProvider {
     fn create(
         &self,
         id: &ResourceId,
-        _request: CreateRequest,
+        request: CreateRequest,
         attempt: CreateAttempt,
     ) -> Result<CreateStep<Self::CreateToken>, CreateVerdict<Self::CreateToken>> {
-        Err(attempt.untracked(Self::error(
-            id,
-            ProviderErrorKind::InvalidInput,
-            "the AWS credential probe does not implement create",
-        )))
+        let probe =
+            PreparedCreate::prepare(request, attempt, ProbeKind::AwsWorld).map_err(|error| {
+                error.untracked(|message| Self::error(id, ProviderErrorKind::InvalidInput, message))
+            })?;
+        Ok(probe.send().succeeded())
     }
 
     fn poll_create(

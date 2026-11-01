@@ -742,6 +742,8 @@ pub enum WasmProviderLoadError {
     },
     /// Host-side AWS credential provisioning failed before guest instantiation.
     AwsCredentials(AwsCredentialError),
+    /// An AWS-kind runtime component did not import the AWS credential interface.
+    AwsCredentialsImportMissing,
     /// A non-AWS runtime component imported the AWS credential interface.
     AwsCredentialsRequired,
     /// A provider metadata export trapped or returned malformed data.
@@ -769,6 +771,9 @@ impl fmt::Display for WasmProviderLoadError {
                 "configured provider name '{configured}' does not match artifact-reported name '{reported}'"
             ),
             WasmProviderLoadError::AwsCredentials(error) => error.fmt(f),
+            WasmProviderLoadError::AwsCredentialsImportMissing => f.write_str(
+                "an AWS-kind provider must be built with the `aws` world (`export_provider!(T, aws, egress: [..])`)",
+            ),
             WasmProviderLoadError::AwsCredentialsRequired => f.write_str(
                 "this provider requires AWS credentials, which only an AWS-kind provider can receive",
             ),
@@ -790,6 +795,7 @@ impl std::error::Error for WasmProviderLoadError {
             | Self::Instantiation(_)
             | Self::ProviderNameMismatch { .. }
             | Self::AwsCredentials(_)
+            | Self::AwsCredentialsImportMissing
             | Self::AwsCredentialsRequired
             | Self::Metadata { .. }
             | Self::Other(_) => None,
@@ -1043,6 +1049,14 @@ enum GuestNetwork {
     },
 }
 
+enum GuestNetworkRequest<'a> {
+    SchemaOnly,
+    Runtime {
+        egress: ConsentedEgress,
+        aws: &'a dyn AwsCredentialProvisioner,
+    },
+}
+
 impl GuestNetwork {
     fn kind(&self) -> Option<ProviderKind> {
         match self {
@@ -1177,7 +1191,7 @@ impl fmt::Display for DestinationDenied {
             DestinationDenied::MetadataWithheld(address) => {
                 write!(
                     f,
-                    "instance-metadata address {address} is not available to this provider"
+                    "instance-metadata address {address} is withheld from every provider"
                 )
             }
             DestinationDenied::LoopbackAddressDenied(address) => {
@@ -1279,12 +1293,7 @@ impl std::error::Error for EgressDeniedCall {}
 /// still required before this value can become a [`VettedDestination`].
 struct AllowedHost {
     capabilities: Option<RuntimeCapabilities>,
-    target: AllowedHostTarget,
-}
-
-#[derive(Debug)]
-enum AllowedHostTarget {
-    Name(String),
+    host: String,
 }
 
 /// The only destination type accepted by the TCP connection handler.
@@ -1304,9 +1313,8 @@ impl VettedDestination {
     /// no bypass constructor.
     #[cfg(any(test, feature = "test-utils"))]
     fn from_http_test_route(allowed_host: AllowedHost, destination: HttpTestDestination) -> Self {
-        let AllowedHostTarget::Name(host) = allowed_host.target;
         Self {
-            host,
+            host: allowed_host.host,
             first: destination.address(),
             rest: Vec::new(),
         }
@@ -1490,7 +1498,7 @@ fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, Destina
             GuestNetwork::Runtime {
                 capabilities: _,
                 egress,
-            } if egress.allows(host) => AllowedHostTarget::Name(host.to_string()),
+            } if egress.allows(host) => host.to_string(),
             GuestNetwork::Runtime {
                 capabilities: _,
                 egress: _,
@@ -1502,7 +1510,7 @@ fn check_host(network: &GuestNetwork, host: &str) -> Result<AllowedHost, Destina
 
     Ok(AllowedHost {
         capabilities: capabilities.cloned(),
-        target,
+        host: target,
     })
 }
 
@@ -1511,11 +1519,7 @@ fn vet_resolved_destination(
     first: SocketAddr,
     rest: &[SocketAddr],
 ) -> Result<VettedDestination, (DestinationDenied, String)> {
-    let AllowedHost {
-        capabilities,
-        target,
-    } = allowed_host;
-    let AllowedHostTarget::Name(host) = target;
+    let AllowedHost { capabilities, host } = allowed_host;
     let private_address_policy = match &capabilities {
         Some(capabilities) => capabilities.private_address_policy(),
         None => PrivateAddressPolicy::Deny,
@@ -1693,7 +1697,7 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
                     return Ok::<_, ErrorCode>(resolution);
                 }
 
-                let AllowedHostTarget::Name(host) = &allowed_host.target;
+                let host = &allowed_host.host;
                 let addresses = tokio::time::timeout(
                     config.connect_timeout.min(HTTP_API_REQUEST_TIMEOUT),
                     resolver.resolve(host.clone(), port),
@@ -2892,9 +2896,21 @@ impl ConfiguredProvider {
 
 async fn runtime_network(
     configured: &ConfiguredProvider,
+    component_imports: &ComponentImports,
     egress: ConsentedEgress,
     aws: &dyn AwsCredentialProvisioner,
 ) -> Result<GuestNetwork, WasmProviderLoadError> {
+    let imports_aws_credentials = component_imports.imports_aws_credentials();
+    match configured.kind {
+        ProviderKind::Aws if !imports_aws_credentials => {
+            return Err(WasmProviderLoadError::AwsCredentialsImportMissing);
+        }
+        ProviderKind::GitHub | ProviderKind::Untrusted if imports_aws_credentials => {
+            return Err(WasmProviderLoadError::AwsCredentialsRequired);
+        }
+        ProviderKind::Aws | ProviderKind::GitHub | ProviderKind::Untrusted => {}
+    }
+
     let capabilities = match configured.kind {
         ProviderKind::Aws => RuntimeCapabilities::Aws {
             credentials: aws.provision().await?,
@@ -2927,7 +2943,7 @@ enum ProviderKind {
 /// Runtime-only capabilities granted according to resolver-owned provider
 /// trust. The AWS variant cannot be constructed without a credential source.
 #[derive(Clone)]
-pub enum RuntimeCapabilities {
+pub(crate) enum RuntimeCapabilities {
     Aws {
         credentials: Arc<dyn AwsCredentialSource>,
     },
@@ -4387,22 +4403,16 @@ impl WasmProviderFactory {
         component: Component,
         epoch_ticker: EpochTicker,
         configured: ConfiguredProvider,
-        runtime_network: GuestNetwork,
+        network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
         let budget = GuestCallBudget::PRODUCTION;
-        let imports_aws_credentials =
-            ComponentImports::from_component(&engine, &component).imports_aws_credentials();
-        if imports_aws_credentials
-            && matches!(
-                &runtime_network,
-                GuestNetwork::Runtime {
-                    capabilities: RuntimeCapabilities::GitHub | RuntimeCapabilities::Untrusted,
-                    egress: _,
-                }
-            )
-        {
-            return Err(WasmProviderLoadError::AwsCredentialsRequired);
-        }
+        let component_imports = ComponentImports::from_component(&engine, &component);
+        let runtime_network = match network_request {
+            GuestNetworkRequest::SchemaOnly => GuestNetwork::SchemaOnly,
+            GuestNetworkRequest::Runtime { egress, aws } => {
+                runtime_network(&configured, &component_imports, egress, aws).await?
+            }
+        };
         let mut rebuild = RebuildContext::new(
             engine.clone(),
             component.clone(),
@@ -4479,7 +4489,7 @@ impl WasmProviderFactory {
                 wasm_bytes.as_bytes(),
                 &cache_dir,
                 configured,
-                GuestNetwork::SchemaOnly,
+                GuestNetworkRequest::SchemaOnly,
             )
             .await
         });
@@ -4497,7 +4507,7 @@ impl WasmProviderFactory {
             load.bytes().as_bytes(),
             cache_dir,
             configured,
-            GuestNetwork::SchemaOnly,
+            GuestNetworkRequest::SchemaOnly,
         )
         .await
     }
@@ -4514,14 +4524,13 @@ impl WasmProviderFactory {
         let egress =
             ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
         let configured = ConfiguredProvider::new(load.identity());
-        let runtime_network = runtime_network(&configured, egress, aws).await?;
         let wasm_bytes = load.bytes().clone();
         let cache_dir = user_dirs.compiled_wasm_cache_dir().to_path_buf();
         Self::from_bytes_with_cache_dir_configured(
             wasm_bytes.as_bytes(),
             &cache_dir,
             configured,
-            runtime_network,
+            GuestNetworkRequest::Runtime { egress, aws },
         )
         .await
     }
@@ -4538,12 +4547,11 @@ impl WasmProviderFactory {
         let egress =
             ConsentedEgress::from_lock(locked_egress, declaration, load.carina_rs_signed())?;
         let configured = ConfiguredProvider::new(load.identity());
-        let runtime_network = runtime_network(&configured, egress, aws).await?;
         Self::from_bytes_with_cache_dir_configured(
             load.bytes().as_bytes(),
             cache_dir,
             configured,
-            runtime_network,
+            GuestNetworkRequest::Runtime { egress, aws },
         )
         .await
     }
@@ -4552,7 +4560,7 @@ impl WasmProviderFactory {
         wasm_bytes: &[u8],
         cache_dir: &Path,
         configured: ConfiguredProvider,
-        runtime_network: GuestNetwork,
+        network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
         let cwasm_name = Self::cache_key(wasm_bytes);
         let cwasm_path = cache_dir.join(&cwasm_name);
@@ -4564,7 +4572,7 @@ impl WasmProviderFactory {
             && let Err(error) = Self::precompile(wasm_bytes, &cwasm_path)
         {
             eprintln!("Failed to write precompile cache, loading directly: {error}");
-            return Self::new_uncached_configured(wasm_bytes, configured, runtime_network).await;
+            return Self::new_uncached_configured(wasm_bytes, configured, network_request).await;
         }
 
         let engine = Self::create_engine()?;
@@ -4592,7 +4600,7 @@ impl WasmProviderFactory {
         };
 
         let epoch_ticker = EpochTicker::start(engine.clone());
-        Self::bring_up_component(engine, component, epoch_ticker, configured, runtime_network).await
+        Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
     }
 
     /// Load provider bytes without any precompile caching.
@@ -4608,20 +4616,24 @@ impl WasmProviderFactory {
         let configured = ConfiguredProvider::new(load.identity());
         let egress =
             ConsentedEgress::from_lock(Some(&locked_egress), declaration, load.carina_rs_signed())?;
-        let runtime_network = runtime_network(&configured, egress, aws).await?;
-        Self::new_uncached_configured(load.bytes().as_bytes(), configured, runtime_network).await
+        Self::new_uncached_configured(
+            load.bytes().as_bytes(),
+            configured,
+            GuestNetworkRequest::Runtime { egress, aws },
+        )
+        .await
     }
 
     async fn new_uncached_configured(
         wasm_bytes: &[u8],
         configured: ConfiguredProvider,
-        runtime_network: GuestNetwork,
+        network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
         let engine = Self::create_engine()?;
         let component = Self::load_component_from_bytes(&engine, wasm_bytes)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
-        Self::bring_up_component(engine, component, epoch_ticker, configured, runtime_network).await
+        Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
     }
 
     /// Precompile provider bytes and save the result to a .cwasm file.
@@ -4691,7 +4703,7 @@ impl WasmProviderFactory {
             component,
             epoch_ticker,
             ConfiguredProvider::new(&identity),
-            GuestNetwork::SchemaOnly,
+            GuestNetworkRequest::SchemaOnly,
         )
         .await
     }
@@ -7498,7 +7510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failing_aws_provision_stops_before_guest_instantiation_with_typed_error() {
+    async fn aws_runtime_without_credential_import_stops_before_provisioning() {
         let declaration_json = serde_json::json!({
             "version": 1,
             "hosts": [],
@@ -7527,9 +7539,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(WasmProviderLoadError::AwsCredentials(
-                AwsCredentialError::NotFound(ref message)
-            )) if message == "host provisioning failed before instantiation"
+            Err(WasmProviderLoadError::AwsCredentialsImportMissing)
         ));
     }
 
@@ -9386,7 +9396,7 @@ mod tests {
                 )
             })
             .await
-            .expect("the schema-only stub must return promptly");
+            .expect("the schema-only credential import must fail promptly");
 
         assert!(matches!(
             result,
@@ -9784,8 +9794,8 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "provider 'mock_http' (file:///opt/providers/mock_http.wasm) request to \
-             169.254.169.254 was denied: instance-metadata address 169.254.169.254 is not \
-             available to this provider"
+             169.254.169.254 was denied: instance-metadata address 169.254.169.254 is withheld \
+             from every provider"
         );
         assert!(!error.to_string().contains("--trust-local-provider"));
         assert!(!error.to_string().contains("CARINA_TRUST_LOCAL_PROVIDER"));
@@ -9805,7 +9815,7 @@ mod tests {
         assert_eq!(
             rendered,
             "provider 'widget' (github.com/example/provider-widget) request to 169.254.169.254 was \
-             denied: instance-metadata address 169.254.169.254 is not available to this provider"
+             denied: instance-metadata address 169.254.169.254 is withheld from every provider"
         );
         assert!(!rendered.contains("--trust-local-provider"));
         assert!(!rendered.contains("CARINA_TRUST_LOCAL_PROVIDER"));
@@ -9825,7 +9835,7 @@ mod tests {
 
         assert!(
             rendered.contains(
-                "instance-metadata address 100.100.100.200 is not available to this provider"
+                "instance-metadata address 100.100.100.200 is withheld from every provider"
             ),
             "{rendered}"
         );
@@ -9860,7 +9870,7 @@ mod tests {
             ),
             (
                 DestinationDenied::MetadataWithheld(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
-                "instance-metadata address 169.254.169.254 is not available to this provider",
+                "instance-metadata address 169.254.169.254 is withheld from every provider",
             ),
         ];
 
@@ -9908,7 +9918,7 @@ mod tests {
         vet_resolved_destination(
             AllowedHost {
                 capabilities: Some(capabilities),
-                target: AllowedHostTarget::Name("x.amazonaws.com".to_string()),
+                host: "x.amazonaws.com".to_string(),
             },
             SocketAddr::new(address, 443),
             &[],
@@ -10672,7 +10682,7 @@ mod tests {
         let destination = VettedDestination::from_http_test_route(
             AllowedHost {
                 capabilities: Some(RuntimeCapabilities::Untrusted),
-                target: AllowedHostTarget::Name("phase-test.invalid".to_string()),
+                host: "phase-test.invalid".to_string(),
             },
             test_destination,
         );

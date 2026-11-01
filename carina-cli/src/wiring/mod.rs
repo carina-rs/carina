@@ -1824,11 +1824,14 @@ impl carina_plugin_host::AwsCredentialProvisioner for CliAwsCredentialProvisione
         Box::pin(async move {
             let source = self
                 .source
-                .get_or_init(|| async {
-                    Arc::new(carina_credentials_aws::AwsSdkCredentialSource::new().await)
-                        as Arc<dyn carina_plugin_host::AwsCredentialSource>
+                .get_or_try_init(|| async {
+                    carina_credentials_aws::AwsSdkCredentialSource::new()
+                        .await
+                        .map(|source| {
+                            Arc::new(source) as Arc<dyn carina_plugin_host::AwsCredentialSource>
+                        })
                 })
-                .await
+                .await?
                 .clone();
             source.current().await?;
             Ok(source)
@@ -4110,6 +4113,7 @@ fn source_provider_kind_mismatch_from_load_error(
         | carina_plugin_host::WasmProviderLoadError::EgressConsent(_)
         | carina_plugin_host::WasmProviderLoadError::Instantiation(_)
         | carina_plugin_host::WasmProviderLoadError::AwsCredentials(_)
+        | carina_plugin_host::WasmProviderLoadError::AwsCredentialsImportMissing
         | carina_plugin_host::WasmProviderLoadError::AwsCredentialsRequired
         | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
         | carina_plugin_host::WasmProviderLoadError::Other(_) => None,

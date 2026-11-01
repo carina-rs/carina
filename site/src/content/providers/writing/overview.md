@@ -49,7 +49,7 @@ carina_plugin_sdk::export_provider!(
 );
 ```
 
-Call `carina_plugin_sdk::aws_credentials::current()` to obtain the current base credentials. The SDK-side type exposes accessors but redacts secret fields from `Debug`. Native builds return a typed error so provider unit tests still compile. Only a component loaded with the AWS trust kind can link this import; schema-only loading uses a stub and does not resolve credentials. See [AWS Credentials](/guides/aws-credentials/) for the user-facing chain and refresh behavior.
+Call `carina_plugin_sdk::aws_credentials::current()` to obtain the current base credentials. The SDK-side type exposes accessors but redacts secret fields from `Debug`. Native builds return a typed error so provider unit tests still compile. At runtime, only a component loaded with the AWS trust kind can link this import. Schema-only loading links the import without resolving credentials and returns `ProviderFailed` if the provider calls it while schemas are loading. See [AWS Credentials](/guides/aws-credentials/) for the user-facing chain and refresh behavior.
 
 In native provider tests, validate declaration patterns with `carina_plugin_sdk::protocol::HostPattern::parse`.
 

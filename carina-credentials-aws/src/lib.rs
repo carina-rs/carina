@@ -9,35 +9,58 @@ use aws_credential_types::provider::error::CredentialsError;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use carina_plugin_host::{AwsCredentialError, AwsCredentialSource, AwsCredentials};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+const CREDENTIAL_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct CredentialCache {
+    credentials: Option<AwsCredentials>,
+    last_refresh_failure: Option<Instant>,
+}
 
 /// A run-scoped, refreshing AWS SDK default credential chain.
 pub struct AwsSdkCredentialSource {
     provider: Option<SharedCredentialsProvider>,
-    cache: Mutex<Option<AwsCredentials>>,
+    cache: Mutex<CredentialCache>,
 }
 
 impl AwsSdkCredentialSource {
     /// Loads the AWS SDK default chain, including environment, profiles, SSO,
     /// ECS, and IMDS providers.
-    pub async fn new() -> Self {
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .identity_cache(aws_config::identity::IdentityCache::lazy().build())
-            .load()
-            .await;
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AwsCredentialError::ProviderFailed`] if loading the SDK
+    /// configuration exceeds the credential-resolution timeout.
+    pub async fn new() -> Result<Self, AwsCredentialError> {
+        let loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        let config = tokio::time::timeout(CREDENTIAL_RESOLUTION_TIMEOUT, loader.load())
+            .await
+            .map_err(|_| credential_resolution_timeout("loading the AWS SDK default chain"))?;
+        Ok(Self {
             provider: config.credentials_provider(),
-            cache: Mutex::new(None),
-        }
+            cache: Mutex::new(CredentialCache::default()),
+        })
     }
 
     /// Returns the cached credentials, refreshing the selected SDK provider
     /// when the credentials are close to expiry.
     pub async fn current_credentials(&self) -> Result<AwsCredentials, AwsCredentialError> {
         let mut cache = self.cache.lock().await;
-        if let Some(credentials) = cache.as_ref()
-            && credentials_are_fresh(credentials, SystemTime::now())
+        let now = SystemTime::now();
+        if let Some(credentials) = cache.credentials.as_ref()
+            && credentials_are_fresh(credentials, now)
+        {
+            return Ok(credentials.clone());
+        }
+        if let Some(credentials) = cache.credentials.as_ref()
+            && credentials_are_unexpired(credentials, now)
+            && cache.last_refresh_failure.is_some_and(|failed_at| {
+                Instant::now().duration_since(failed_at) < REFRESH_FAILURE_BACKOFF
+            })
         {
             return Ok(credentials.clone());
         }
@@ -47,17 +70,39 @@ impl AwsSdkCredentialSource {
                 "the AWS SDK default chain did not configure a credential provider".to_string(),
             )
         })?;
-        let credentials = provider
-            .provide_credentials()
-            .await
-            .map_err(map_credentials_error)?;
+        let refreshed = match tokio::time::timeout(
+            CREDENTIAL_RESOLUTION_TIMEOUT,
+            provider.provide_credentials(),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(map_credentials_error),
+            Err(_) => Err(credential_resolution_timeout("fetching credentials")),
+        };
+        let credentials = match refreshed {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                cache.last_refresh_failure = Some(Instant::now());
+                if let Some(credentials) = cache.credentials.as_ref()
+                    && credentials_are_unexpired(credentials, SystemTime::now())
+                {
+                    let credentials = credentials.clone();
+                    log::warn!(
+                        "failed to refresh AWS credentials before expiry; using cached credentials"
+                    );
+                    return Ok(credentials);
+                }
+                return Err(error);
+            }
+        };
         let credentials = AwsCredentials::new(
             credentials.access_key_id(),
             credentials.secret_access_key(),
             credentials.session_token().map(str::to_string),
             credentials.expiry(),
         );
-        *cache = Some(credentials.clone());
+        cache.credentials = Some(credentials.clone());
+        cache.last_refresh_failure = None;
         Ok(credentials)
     }
 
@@ -65,7 +110,7 @@ impl AwsSdkCredentialSource {
     fn from_provider_for_test(provider: impl ProvideCredentials + 'static) -> Self {
         Self {
             provider: Some(SharedCredentialsProvider::new(provider)),
-            cache: Mutex::new(None),
+            cache: Mutex::new(CredentialCache::default()),
         }
     }
 
@@ -83,6 +128,22 @@ impl AwsSdkCredentialSource {
             expires_at,
             "carina-test",
         ))
+    }
+
+    #[cfg(test)]
+    async fn expire_cached_credentials_for_test(&self) {
+        let mut cache = self.cache.lock().await;
+        let credentials = cache
+            .credentials
+            .as_ref()
+            .expect("the test must populate the credential cache first");
+        let expired = AwsCredentials::new(
+            credentials.access_key_id(),
+            credentials.secret_access_key(),
+            credentials.session_token().map(str::to_string),
+            Some(SystemTime::now() - Duration::from_secs(1)),
+        );
+        cache.credentials = Some(expired);
     }
 }
 
@@ -112,6 +173,21 @@ fn credentials_are_fresh(credentials: &AwsCredentials, now: SystemTime) -> bool 
     })
 }
 
+fn credentials_are_unexpired(credentials: &AwsCredentials, now: SystemTime) -> bool {
+    credentials.expires_at().is_none_or(|expires_at| {
+        expires_at
+            .duration_since(now)
+            .is_ok_and(|remaining| !remaining.is_zero())
+    })
+}
+
+fn credential_resolution_timeout(operation: &str) -> AwsCredentialError {
+    AwsCredentialError::ProviderFailed(format!(
+        "AWS credential resolution timed out after {} seconds while {operation}",
+        CREDENTIAL_RESOLUTION_TIMEOUT.as_secs()
+    ))
+}
+
 fn map_credentials_error(error: CredentialsError) -> AwsCredentialError {
     let not_found = matches!(error, CredentialsError::CredentialsNotLoaded(_));
     let mut message = render_error_chain(&error);
@@ -132,8 +208,11 @@ fn render_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut rendered = error.to_string();
     let mut source = error.source();
     while let Some(error) = source {
-        rendered.push_str(": ");
-        rendered.push_str(&error.to_string());
+        let message = error.to_string();
+        if !rendered.contains(&message) {
+            rendered.push_str(": ");
+            rendered.push_str(&message);
+        }
         source = error.source();
     }
     rendered
@@ -176,7 +255,7 @@ mod tests {
 
     struct SequenceProvider {
         calls: Arc<AtomicUsize>,
-        credentials: StdMutex<VecDeque<Credentials>>,
+        results: StdMutex<VecDeque<Result<Credentials, CredentialsError>>>,
     }
 
     impl fmt::Debug for SequenceProvider {
@@ -191,13 +270,13 @@ mod tests {
             Self: 'a,
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let credentials = self
-                .credentials
+            let result = self
+                .results
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("test provider must have one credential per refresh");
-            future::ProvideCredentials::ready(Ok(credentials))
+                .expect("test provider must have one result per refresh");
+            future::ProvideCredentials::ready(result)
         }
     }
 
@@ -206,25 +285,198 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = SequenceProvider {
             calls: Arc::clone(&calls),
-            credentials: StdMutex::new(VecDeque::from([
-                Credentials::new(
+            results: StdMutex::new(VecDeque::from([
+                Ok(Credentials::new(
                     "AKIAEXPIRING",
                     "first-secret",
                     None,
                     Some(SystemTime::now() + Duration::from_secs(60)),
                     "test",
-                ),
-                Credentials::new("AKIAFRESH", "second-secret", None, None, "test"),
+                )),
+                Ok(Credentials::new(
+                    "AKIAFRESH",
+                    "second-secret",
+                    None,
+                    None,
+                    "test",
+                )),
             ])),
         };
         let source = AwsSdkCredentialSource::from_provider_for_test(provider);
 
         let first = source.current_credentials().await.unwrap();
         let second = source.current_credentials().await.unwrap();
+        let third = source.current_credentials().await.unwrap();
 
         assert_eq!(first.access_key_id(), "AKIAEXPIRING");
         assert_eq!(second.access_key_id(), "AKIAFRESH");
+        assert_eq!(third.access_key_id(), "AKIAFRESH");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_backs_off_while_cached_credentials_remain_unexpired() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = SequenceProvider {
+            calls: Arc::clone(&calls),
+            results: StdMutex::new(VecDeque::from([
+                Ok(Credentials::new(
+                    "AKIACACHED",
+                    "cached-secret",
+                    None,
+                    Some(SystemTime::now() + Duration::from_secs(60)),
+                    "test",
+                )),
+                Err(CredentialsError::provider_error("refresh failure sentinel")),
+                Ok(Credentials::new(
+                    "AKIAUNEXPECTED",
+                    "unexpected-secret",
+                    None,
+                    None,
+                    "test",
+                )),
+            ])),
+        };
+        let source = AwsSdkCredentialSource::from_provider_for_test(provider);
+
+        let first = source.current_credentials().await.unwrap();
+        let fallback = source.current_credentials().await.unwrap();
+        let backed_off = source.current_credentials().await.unwrap();
+
+        assert_eq!(first.access_key_id(), "AKIACACHED");
+        assert_eq!(fallback.access_key_id(), "AKIACACHED");
+        assert_eq!(backed_off.access_key_id(), "AKIACACHED");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_retries_after_backoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = SequenceProvider {
+            calls: Arc::clone(&calls),
+            results: StdMutex::new(VecDeque::from([
+                Ok(Credentials::new(
+                    "AKIACACHED",
+                    "cached-secret",
+                    None,
+                    Some(SystemTime::now() + Duration::from_secs(60)),
+                    "test",
+                )),
+                Err(CredentialsError::provider_error("refresh failure sentinel")),
+                Ok(Credentials::new(
+                    "AKIAREFRESHED",
+                    "refreshed-secret",
+                    None,
+                    None,
+                    "test",
+                )),
+            ])),
+        };
+        let source = AwsSdkCredentialSource::from_provider_for_test(provider);
+
+        source.current_credentials().await.unwrap();
+        source.current_credentials().await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let refreshed = source.current_credentials().await.unwrap();
+
+        assert_eq!(refreshed.access_key_id(), "AKIAREFRESHED");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_cache_refreshes_during_failure_backoff() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = SequenceProvider {
+            calls: Arc::clone(&calls),
+            results: StdMutex::new(VecDeque::from([
+                Ok(Credentials::new(
+                    "AKIACACHED",
+                    "cached-secret",
+                    None,
+                    Some(SystemTime::now() + Duration::from_secs(60)),
+                    "test",
+                )),
+                Err(CredentialsError::provider_error("refresh failure sentinel")),
+                Ok(Credentials::new(
+                    "AKIAREFRESHED",
+                    "refreshed-secret",
+                    None,
+                    None,
+                    "test",
+                )),
+            ])),
+        };
+        let source = AwsSdkCredentialSource::from_provider_for_test(provider);
+
+        source.current_credentials().await.unwrap();
+        source.current_credentials().await.unwrap();
+        source.expire_cached_credentials_for_test().await;
+        let refreshed = source.current_credentials().await.unwrap();
+
+        assert_eq!(refreshed.access_key_id(), "AKIAREFRESHED");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_rejects_cached_credentials_that_have_expired() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = SequenceProvider {
+            calls: Arc::clone(&calls),
+            results: StdMutex::new(VecDeque::from([
+                Ok(Credentials::new(
+                    "AKIAEXPIRED",
+                    "expired-secret",
+                    None,
+                    Some(SystemTime::now() - Duration::from_secs(1)),
+                    "test",
+                )),
+                Err(CredentialsError::provider_error(
+                    "expired refresh failure sentinel",
+                )),
+            ])),
+        };
+        let source = AwsSdkCredentialSource::from_provider_for_test(provider);
+
+        source.current_credentials().await.unwrap();
+        let error = source.current_credentials().await.unwrap_err();
+
+        assert!(matches!(error, AwsCredentialError::ProviderFailed(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("expired refresh failure sentinel")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Debug)]
+    struct SlowProvider;
+
+    impl ProvideCredentials for SlowProvider {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            future::ProvideCredentials::new(std::future::pending())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_provider_fetch_times_out_as_provider_failure() {
+        let source = AwsSdkCredentialSource::from_provider_for_test(SlowProvider);
+
+        let error = tokio::time::timeout(Duration::from_secs(31), source.current_credentials())
+            .await
+            .expect("the source must enforce its own 30-second timeout")
+            .unwrap_err();
+
+        assert!(matches!(error, AwsCredentialError::ProviderFailed(_)));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("timed out after 30 seconds"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("fetching credentials"), "{rendered}");
     }
 
     #[derive(Debug)]
@@ -283,6 +535,42 @@ mod tests {
         assert!(matches!(mapped, AwsCredentialError::ProviderFailed(_)));
         let rendered = mapped.to_string().to_ascii_lowercase();
         assert_eq!(rendered.matches("aws sso login").count(), 1, "{rendered}");
+    }
+
+    #[derive(Debug)]
+    struct ChainedTestError {
+        message: &'static str,
+        source: Option<Box<ChainedTestError>>,
+    }
+
+    impl fmt::Display for ChainedTestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for ChainedTestError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn error_chain_keeps_a_distinct_inner_message() {
+        let error = ChainedTestError {
+            message: "outer credential failure",
+            source: Some(Box::new(ChainedTestError {
+                message: "distinct inner cause",
+                source: None,
+            })),
+        };
+
+        assert_eq!(
+            render_error_chain(&error),
+            "outer credential failure: distinct inner cause"
+        );
     }
 
     struct EnvironmentGuard {
@@ -394,6 +682,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             AwsSdkCredentialSource::new()
                 .await
+                .expect("the isolated SDK configuration must load")
                 .current_credentials()
                 .await
         })
@@ -445,6 +734,7 @@ mod tests {
         let error = tokio::time::timeout(Duration::from_secs(10), async {
             AwsSdkCredentialSource::new()
                 .await
+                .expect("the isolated SSO SDK configuration must load")
                 .current_credentials()
                 .await
         })
@@ -456,7 +746,7 @@ mod tests {
         let rendered = error.to_string();
         assert_eq!(
             rendered,
-            "an error occurred while loading credentials: an error occurred while loading credentials: an error occurred while loading an access token: the SSO token has expired and cannot be refreshed; run `aws sso login` to refresh the session"
+            "an error occurred while loading credentials: an error occurred while loading an access token: the SSO token has expired and cannot be refreshed; run `aws sso login` to refresh the session"
         );
         assert_eq!(rendered.matches("aws sso login").count(), 1);
         assert!(!rendered.contains("expired-access-token-secret"));

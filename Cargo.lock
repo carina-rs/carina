@@ -1126,6 +1126,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "carina-plugin-host",
+ "log",
  "sha1",
  "tempfile",
  "tokio",

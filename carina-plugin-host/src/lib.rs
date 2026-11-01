@@ -7,6 +7,6 @@ mod secret_seal;
 pub use wasm_factory::GuestCallBudget;
 pub use wasm_factory::{
     AwsCredentialError, AwsCredentialProvisioner, AwsCredentialSource, AwsCredentials,
-    PrecompiledComponentDeserializationError, ProviderInstantiationError, RuntimeCapabilities,
-    WASI_HTTP_HOST_VERSION, WasmProviderFactory, WasmProviderLoadError,
+    PrecompiledComponentDeserializationError, ProviderInstantiationError, WASI_HTTP_HOST_VERSION,
+    WasmProviderFactory, WasmProviderLoadError,
 };
