@@ -905,7 +905,7 @@ async fn unordered_reference_list_elements_share_one_resolution_path() {
     );
     let witness = fixture.prepare().await.unwrap();
     assert!(fixture.plan(&witness).unwrap().effects().is_empty());
-    assert_eq!(fixture.calls.lock().unwrap()[0].len(), 2);
+    assert!(fixture.calls.lock().unwrap().is_empty());
 }
 
 fn reset_values(fixture: &mut Fixture, desired: Value, current: Value, saved: Value) {
@@ -1326,6 +1326,27 @@ async fn round3_apply_concrete_plan_reference_reresolves_without_widening_equiva
                 "a newly changed create-only identity requires replanning"
             );
             assert!(fixture.updates.lock().unwrap().is_empty());
+            let crate::executor::EffectFailureKind::Provider { error, .. } =
+                result.failures()[0].kind()
+            else {
+                panic!("expected an augmentation error")
+            };
+            let mut cause = Some(error.as_error() as &(dyn std::error::Error + 'static));
+            let mut typed_change = false;
+            while let Some(error) = cause {
+                if let Some(change) =
+                    error.downcast_ref::<crate::differ::ApplyTimeCreateOnlyChange>()
+                {
+                    assert_eq!(change.resource.as_ref(), &target.id);
+                    assert_eq!(change.attributes, ["key"]);
+                    typed_change = true;
+                }
+                cause = error.source();
+            }
+            assert!(
+                typed_change,
+                "the create-only guard must retain a typed cause"
+            );
             assert!(
                 format!("{:?}", result.failures())
                     .to_ascii_lowercase()
@@ -1811,4 +1832,614 @@ fn reference_plan_errors_preserve_secret_redaction_without_preparation() {
     ));
     assert!(!error.to_string().contains("alias/private-secret"));
     assert!(!format!("{error:?}").contains("alias/private-secret"));
+}
+
+#[tokio::test]
+async fn round4_byte_equal_current_does_not_turn_saved_pairing_into_a_desired_failure() {
+    use crate::schema::AttributeType;
+    for list in [false, true] {
+        let mut fixture = Fixture::new(
+            string("alias/x"),
+            string("alias/x"),
+            HashMap::from([(
+                "alias/x".into(),
+                Ok(wire::ReferenceOutcome::NotFound(error())),
+            )]),
+            false,
+        );
+        let value = |raw: &str| {
+            if list {
+                Value::Concrete(ConcreteValue::List(vec![string(raw)]))
+            } else {
+                string(raw)
+            }
+        };
+        if list {
+            fixture.registry.insert(
+                "test",
+                crate::schema::ResourceSchema::new("keys.Resource")
+                    .attribute(
+                        AttributeSchema::optional(
+                            "key",
+                            AttributeType::unordered_list(AttributeType::reference(
+                                identity(),
+                                None,
+                                None,
+                            )),
+                        )
+                        .build(),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+        }
+        reset_values(
+            &mut fixture,
+            value("alias/x"),
+            value("alias/x"),
+            value("alias/y"),
+        );
+        let references = fixture
+            .prepare()
+            .await
+            .expect("saved pairing cannot invalidate a byte-equal desired/current value");
+        assert!(fixture.plan(&references).unwrap().effects().is_empty());
+        if !list {
+            assert!(
+                fixture.calls.lock().unwrap().is_empty(),
+                "scalar saved values are not comparison operands when current is present"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn round4_only_unmatched_list_references_are_resolved() {
+    use crate::schema::AttributeType;
+    for ordered in [false, true] {
+        let mut fixture = Fixture::new(
+            string("unused"),
+            string("unused"),
+            HashMap::from([
+                (
+                    "alias/deleted".into(),
+                    Err(wire::ReferenceError::AccessDenied(error())),
+                ),
+                ("alias/new".into(), resolved("key/new")),
+            ]),
+            false,
+        );
+        let element = AttributeType::reference(identity(), None, None);
+        fixture.registry.insert(
+            "test",
+            crate::schema::ResourceSchema::new("keys.Resource")
+                .attribute(
+                    AttributeSchema::optional(
+                        "key",
+                        if ordered {
+                            AttributeType::list(element)
+                        } else {
+                            AttributeType::unordered_list(element)
+                        },
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let list = |raw: &str| {
+            Value::Concrete(ConcreteValue::List(vec![
+                string("alias/deleted"),
+                string(raw),
+            ]))
+        };
+        reset_values(
+            &mut fixture,
+            list("alias/new"),
+            list("key/old"),
+            list("key/old"),
+        );
+        let references = fixture.prepare().await.unwrap();
+        assert!(!fixture.plan(&references).unwrap().effects().is_empty());
+        assert_eq!(
+            fixture.calls.lock().unwrap()[0]
+                .iter()
+                .map(|request| request.value.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["alias/new", "key/old"])
+        );
+    }
+}
+
+#[tokio::test]
+async fn round4_saved_deleted_alias_does_not_annotate_a_tag_update() {
+    use crate::schema::AttributeType;
+    let mut fixture = Fixture::new(
+        string("key/a"),
+        string("key/a"),
+        HashMap::from([(
+            "alias/deleted".into(),
+            Ok(wire::ReferenceOutcome::NotFound(error())),
+        )]),
+        false,
+    );
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional("key", AttributeType::reference(identity(), None, None))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    reset_values(
+        &mut fixture,
+        string("key/a"),
+        string("key/a"),
+        string("alias/deleted"),
+    );
+    let mut target = fixture.desired[0].as_resource().clone();
+    target.attributes.insert(
+        "tags".into(),
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "env".into(),
+            string("new"),
+        )]))),
+    );
+    fixture.desired =
+        ResolvedResource::collect_resolved_with_schemas([target], &fixture.registry).unwrap();
+    let references = fixture.prepare().await.unwrap();
+    let plan = fixture.plan(&references).unwrap();
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let rows = crate::detail_rows::build_detail_rows_by_instance(
+        &plan.effects()[0],
+        Some(&fixture.registry),
+        crate::detail_rows::DetailLevel::Full,
+        &historical,
+        None,
+        &fixture.router,
+        crate::detail_rows::DetailComparisons::Planning(&references),
+    )
+    .unwrap();
+    assert!(
+        !format!("{rows:?}").contains("reference no longer resolves"),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn round4_historical_list_pairing_uses_only_unmatched_reference_values() {
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([
+            (
+                "alias/a".into(),
+                Err(wire::ReferenceError::AccessDenied(error())),
+            ),
+            (
+                "alias/b".into(),
+                Err(wire::ReferenceError::AccessDenied(error())),
+            ),
+        ]),
+        false,
+    );
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Entry",
+                        vec![
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(identity(), None, None),
+                            )
+                            .build(),
+                            StructField::optional("mode", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let list = |reverse: bool, mode: &str| {
+        let mut values = vec![
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "reference".into(),
+                string("alias/a"),
+            )]))),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "reference".into(),
+                string("alias/b"),
+            )]))),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "mode".into(),
+                string(mode),
+            )]))),
+        ];
+        if reverse {
+            values.reverse();
+        }
+        Value::Concrete(ConcreteValue::List(values))
+    };
+    reset_values(
+        &mut fixture,
+        list(false, "new"),
+        list(true, "old"),
+        list(true, "old"),
+    );
+    let mut target = fixture.desired[0].as_resource().clone();
+    target.attributes.insert(
+        "tags".into(),
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "env".into(),
+            string("new"),
+        )]))),
+    );
+    fixture.desired =
+        ResolvedResource::collect_resolved_with_schemas([target], &fixture.registry).unwrap();
+    let references = fixture.prepare().await.unwrap();
+    let plan = fixture.plan(&references).unwrap();
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    let persisted = PersistedAttributes::from_typed_persisted_wire_values(
+        fixture.saved.get(&fixture.desired[0].id).unwrap().clone(),
+    )
+    .unwrap();
+    let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
+        unreachable!()
+    };
+    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    historical.set_update_from_provider_and_persisted(
+        fixture.desired[0].id.clone(),
+        &current.state().attributes,
+        Some(&persisted),
+    );
+    let explicit = HashMap::from([(
+        fixture.desired[0].id.clone(),
+        crate::explicit::build_from_resource(fixture.desired[0].as_resource()),
+    )]);
+    let rows = crate::detail_rows::build_detail_rows_by_instance(
+        &plan.effects()[0],
+        Some(&fixture.registry),
+        crate::detail_rows::DetailLevel::Full,
+        &historical,
+        Some(&explicit),
+        &fixture.router,
+        crate::detail_rows::DetailComparisons::Planning(&references),
+    )
+    .expect("historical pairing must pre-pair echoed aliases before probing other elements");
+    assert!(format!("{rows:?}").contains("new"));
+    assert!(fixture.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn round4_reference_depth_limit_is_a_typed_error_with_the_leaf_path() {
+    use crate::schema::AttributeType;
+    let mut ty = AttributeType::reference(identity(), None, None);
+    let mut desired = string("alias/live");
+    let mut current = string("key/a");
+    for _ in 0..64 {
+        ty = AttributeType::list(ty);
+        desired = Value::Concrete(ConcreteValue::List(vec![desired]));
+        current = Value::Concrete(ConcreteValue::List(vec![current]));
+    }
+    let mut fixture = Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(AttributeSchema::optional("key", ty).build())
+            .validate()
+            .unwrap(),
+    );
+    reset_values(&mut fixture, desired, current.clone(), current);
+    let error = fixture
+        .prepare()
+        .await
+        .expect_err("reference recursion may not silently drop leaves");
+    assert!(matches!(
+        error.source,
+        ReferenceFailure::Resolution(ReferenceError::InvalidReference(_))
+    ));
+    assert_eq!(error.path, format!("key{}", "[0]".repeat(64)));
+    assert!(fixture.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn round4_dangling_note_requires_a_rendered_reference_field() {
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([(
+            "alias/deleted".into(),
+            Ok(wire::ReferenceOutcome::NotFound(error())),
+        )]),
+        false,
+    );
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Entry",
+                        vec![
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(identity(), None, None),
+                            )
+                            .build(),
+                            StructField::optional("mode", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let list = |raw: &str, mode: &str| {
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(indexmap::IndexMap::from([
+                ("reference".into(), string(raw)),
+                ("mode".into(), string(mode)),
+            ])),
+        )]))
+    };
+    reset_values(
+        &mut fixture,
+        list("key/a", "new"),
+        list("key/a", "old"),
+        list("alias/deleted", "old"),
+    );
+    let references = fixture.prepare().await.unwrap();
+    assert!(
+        references
+            .dangling_paths(&fixture.desired[0].id)
+            .next()
+            .is_some()
+    );
+    let plan = fixture.plan(&references).unwrap();
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let rows = crate::detail_rows::build_detail_rows_by_instance(
+        &plan.effects()[0],
+        Some(&fixture.registry),
+        crate::detail_rows::DetailLevel::Full,
+        &historical,
+        None,
+        &fixture.router,
+        crate::detail_rows::DetailComparisons::Planning(&references),
+    )
+    .unwrap();
+    assert!(
+        !format!("{rows:?}").contains("reference no longer resolves"),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn round4_dangling_saved_value_is_labeled_saved_in_its_diff_row() {
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([(
+            "alias/deleted".into(),
+            Ok(wire::ReferenceOutcome::NotFound(error())),
+        )]),
+        false,
+    );
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::struct_(
+                        "Encryption",
+                        vec![
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(identity(), None, None),
+                            )
+                            .build(),
+                            StructField::optional("mode", AttributeType::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let config = |raw: Option<&str>| {
+        let mut fields = indexmap::IndexMap::from([("mode".into(), string("KMS"))]);
+        if let Some(raw) = raw {
+            fields.insert("reference".into(), string(raw));
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    reset_values(
+        &mut fixture,
+        config(None),
+        config(Some("key/a")),
+        config(Some("alias/deleted")),
+    );
+    let references = fixture.prepare().await.unwrap();
+    let plan = fixture.plan(&references).unwrap();
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let rows = crate::detail_rows::build_detail_rows_by_instance(
+        &plan.effects()[0],
+        Some(&fixture.registry),
+        crate::detail_rows::DetailLevel::Full,
+        &historical,
+        None,
+        &fixture.router,
+        crate::detail_rows::DetailComparisons::Planning(&references),
+    )
+    .unwrap();
+    assert!(
+        format!("{rows:?}").contains("key.reference: saved reference no longer resolves"),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn round4_historical_pairing_does_not_compare_unmanaged_reference_peers() {
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
+    fixture.registry.insert(
+        "test",
+        crate::schema::ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::unordered_list(AttributeType::struct_(
+                        "Entry",
+                        vec![
+                            StructField::optional("id", AttributeType::int()).build(),
+                            StructField::optional(
+                                "reference",
+                                AttributeType::reference(identity(), None, None),
+                            )
+                            .build(),
+                            StructField::optional("mode", AttributeType::string()).build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let list = |current: bool| {
+        Value::Concrete(ConcreteValue::List(
+            (0..40)
+                .map(|index| {
+                    let mut fields = indexmap::IndexMap::from([
+                        ("id".into(), Value::Concrete(ConcreteValue::Int(index))),
+                        ("mode".into(), string(if current { "old" } else { "new" })),
+                    ]);
+                    if current {
+                        fields.insert("reference".into(), string(&format!("alias/{index}")));
+                    }
+                    Value::Concrete(ConcreteValue::Map(fields))
+                })
+                .collect(),
+        ))
+    };
+    reset_values(&mut fixture, list(false), list(true), list(true));
+    fixture.saved = RawSavedAttrs::default().lift(&fixture.registry);
+    let references = fixture.prepare().await.unwrap();
+    let plan = fixture.plan(&references).unwrap();
+    assert!(fixture.calls.lock().unwrap().is_empty());
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    crate::detail_rows::build_detail_rows_by_instance(
+        &plan.effects()[0],
+        Some(&fixture.registry),
+        crate::detail_rows::DetailLevel::Full,
+        &historical,
+        None,
+        &fixture.router,
+        crate::detail_rows::DetailComparisons::Planning(&references),
+    )
+    .expect("unmanaged historical references are not operands for desired/current equality");
+    assert!(fixture.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn round4_omitted_write_only_list_reference_is_still_a_desired_operand() {
+    use crate::schema::{AttributeType, StructField};
+    let mut fixture = Fixture::new(
+        string("unused"),
+        string("unused"),
+        HashMap::from([(
+            "alias/deleted".into(),
+            Ok(wire::ReferenceOutcome::NotFound(error())),
+        )]),
+        false,
+    );
+    let schema = crate::schema::ResourceSchema::new("keys.Resource")
+        .attribute(
+            AttributeSchema::optional(
+                "key",
+                AttributeType::unordered_list(AttributeType::struct_(
+                    "Entry",
+                    vec![
+                        StructField::optional(
+                            "reference",
+                            AttributeType::reference(identity(), None, None),
+                        )
+                        .write_only()
+                        .build(),
+                    ],
+                )),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let list = |raw: &str| {
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(indexmap::IndexMap::from([(
+                "reference".into(),
+                string(raw),
+            )])),
+        )]))
+    };
+    let accepted = indexmap::IndexMap::from([("key".into(), list("key/a"))]);
+    let mut record = NestedWriteOnlyRecord::new();
+    record
+        .record_sent(schema.as_schema(), ["key"], &accepted, None)
+        .unwrap();
+    fixture.registry.insert("test", schema);
+    let mut target = fixture.desired[0].as_resource().clone();
+    target
+        .attributes
+        .insert("key".into(), list("alias/deleted"));
+    fixture.saved = RawSavedAttrs::from_persisted(
+        HashMap::from([(
+            target.id.clone(),
+            PersistedAttributes::from_typed_persisted_wire_values(accepted.into_iter().collect())
+                .unwrap(),
+        )]),
+        HashMap::from([(target.id.clone(), record)]),
+    )
+    .lift(&fixture.registry);
+    fixture.current = crate::resource::into_plan_input_current_map(
+        HashMap::from([(
+            target.id.clone(),
+            Current::from_state(
+                State::existing(target.id.clone(), HashMap::new()).with_identifier("resource-123"),
+            ),
+        )]),
+        &fixture.registry,
+        &[target.clone()],
+    );
+    fixture.desired =
+        ResolvedResource::collect_resolved_with_schemas([target], &fixture.registry).unwrap();
+    let error = fixture
+        .prepare()
+        .await
+        .expect_err("a write-only desired lookup cannot use the saved-only failure rule");
+    assert!(
+        matches!(error.source, ReferenceFailure::DesiredNotFound(_)),
+        "{error:?}"
+    );
 }

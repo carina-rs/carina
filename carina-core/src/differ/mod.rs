@@ -933,12 +933,16 @@ fn empty_lifted_saved_attrs() -> crate::provider::LiftedSavedAttrs {
     crate::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
 }
 
+#[cfg(test)]
+pub(crate) use comparison::ApplyTimeCreateOnlyChange;
+
 // Re-export comparison primitives for consumers that must agree with
 // `find_changed_attributes`: detail rows render with the same equality,
 // and executor patch construction uses the same key/value gate.
 pub(crate) use comparison::{
-    AttrComparison, LeafProvenance, TypedAttr, find_apply_time_changed_attributes,
-    key_should_enter_patch, secret_grafted_comparison_view, type_aware_equal,
+    ApplyTimeComparisonError, AttrComparison, LeafProvenance, TypedAttr,
+    find_apply_time_changed_attributes, key_should_enter_patch, secret_grafted_comparison_view,
+    type_aware_equal,
 };
 
 /// Returns true when `binding` is one direct child emitted by the deferred-for

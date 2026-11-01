@@ -111,8 +111,10 @@ a needed pair is a typed error; no caller can compare a reference leaf as
 a plain string.
 
 Unknown/deferred leaves are never resolved and retain existing dependency
-and scheduling behavior. Apply executes effects; it does not re-diff
-materialized leaves or prepare them for comparison.
+and scheduling behavior. Apply re-prepares only leaves that become concrete
+or change after planning, for apply-time augmentation under D4 and D6's
+failure table. DescribeKey may therefore run at apply too; unchanged planned
+leaves keep the recorded decision.
 
 ### D6. Resolution failures are typed; only a dangling current value is a diff
 
@@ -166,7 +168,8 @@ this permission is independent of advisory `--check-iam`.
 Normal `apply` re-plans with fresh resolution. Saved plans carry effects
 with raw payloads: a KMS target moving between plan and apply is ordinary
 cloud-side drift, like any other attribute, under the existing saved-plan
-contract. No saved-plan format change is needed.
+contract. Apply-time augmentation follows D5, including fresh preparation
+for newly concrete or changed leaves. No saved-plan format change is needed.
 
 ## Protocol
 

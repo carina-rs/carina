@@ -1243,7 +1243,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             context,
                         )
                     })??;
-                    Ok::<_, crate::differ::PlanComparisonError>(additional)
+                    Ok::<_, crate::differ::ApplyTimeComparisonError>(additional)
                 }
                 .await;
                 match additional {

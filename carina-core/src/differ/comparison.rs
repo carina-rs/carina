@@ -669,7 +669,7 @@ fn type_aware_lists_equal<R: ReferenceEquality>(
         // Multiset comparison: order-insensitive
         let (matched_a, mut matched) = crate::resource::match_equal_concrete_items(a, b);
         for (i, item_a) in a.iter().enumerate() {
-            if matched_a[i] {
+            if matched_a[i].is_some() {
                 continue;
             }
             let mut found = false;
@@ -1534,6 +1534,22 @@ pub(super) fn find_changed_attributes_with_ignores(
     }
 }
 
+/// Apply cannot widen an Update into a replacement after planning.
+#[derive(Debug, thiserror::Error)]
+#[error("Create-only attributes changed after planning ({}) for {resource}; create a new plan before applying", .attributes.join(", "))]
+pub(crate) struct ApplyTimeCreateOnlyChange {
+    pub(crate) resource: Box<crate::resource::ResourceId>,
+    pub(crate) attributes: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApplyTimeComparisonError {
+    #[error(transparent)]
+    Reference(#[from] Box<crate::references::ReferencePlanError>),
+    #[error("Create-only augmentation failed")] // error-chain: caller-renders-sources
+    CreateOnly(#[from] ApplyTimeCreateOnlyChange),
+}
+
 /// Reconsider only apply-resolved keys excluded by the original plan. The
 /// caller prepares fresh reference evidence against these same masked values.
 pub(crate) fn find_apply_time_changed_attributes<S>(
@@ -1542,7 +1558,7 @@ pub(crate) fn find_apply_time_changed_attributes<S>(
     schema: &ResourceSchema,
     ignores: &ResolvedIgnoreChanges,
     context: &PlanningComparison<'_>,
-) -> crate::provider::ProviderResult<Vec<String>> {
+) -> Result<Vec<String>, ApplyTimeCreateOnlyChange> {
     let changed = masked
         .desired()
         .iter()
@@ -1571,11 +1587,10 @@ pub(crate) fn find_apply_time_changed_attributes<S>(
     let create_only =
         super::plan::find_changed_create_only(&changed, authored, &views, schema, context);
     if !create_only.is_empty() {
-        return Err(crate::provider::ProviderError::invalid_input(format!(
-            "Create-only attributes changed after planning ({}); create a new plan before applying",
-            create_only.join(", "),
-        ))
-        .for_resource(authored.id.clone()));
+        return Err(ApplyTimeCreateOnlyChange {
+            resource: Box::new(authored.id.clone()),
+            attributes: create_only,
+        });
     }
     Ok(changed)
 }

@@ -107,6 +107,33 @@ struct Occurrence {
     path: String,
     request: ReferenceRequest,
     desired: bool,
+    side: ReferenceSide,
+    fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ReferenceSide {
+    Desired,
+    Current,
+    Saved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DanglingReference {
+    pub(crate) path: String,
+    pub(crate) fields: Vec<String>,
+    pub(crate) side: ReferenceSide,
+    pub(crate) raw: String,
+}
+
+impl ReferenceSide {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Desired => "desired",
+            Self::Current => "current",
+            Self::Saved => "saved",
+        }
+    }
 }
 
 impl Occurrence {
@@ -135,7 +162,7 @@ impl Occurrence {
 pub struct ResolvedReferences {
     desired: HashMap<CacheKey, DesiredSide>,
     current: HashMap<CacheKey, CurrentSide>,
-    dangling: HashMap<ResourceId, BTreeSet<String>>,
+    dangling: HashMap<ResourceId, BTreeSet<DanglingReference>>,
     comparisons: HashMap<ResourceId, PreparedComparison>,
 }
 
@@ -173,11 +200,17 @@ impl ResolvedReferences {
             .then_some(&prepared.masked)
     }
     pub fn dangling_paths(&self, resource: &ResourceId) -> impl Iterator<Item = &str> {
-        self.dangling
-            .get(resource)
-            .into_iter()
-            .flatten()
-            .map(String::as_str)
+        let mut seen = HashSet::new();
+        self.dangling_references(resource)
+            .map(|reference| reference.path.as_str())
+            .filter(move |path| seen.insert(*path))
+    }
+
+    pub(crate) fn dangling_references(
+        &self,
+        resource: &ResourceId,
+    ) -> impl Iterator<Item = &DanglingReference> {
+        self.dangling.get(resource).into_iter().flatten()
     }
 
     fn lookup(
@@ -285,7 +318,7 @@ impl ReferencePreparation {
     ) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
         let mut collector = ReferenceCollector {
             resource,
-            paths: HashMap::new(),
+            occurrences: Vec::new(),
         };
         collector.collect(masked, schema)?;
         self.prepare_occurrences(collector.needed_occurrences(), provider)
@@ -378,7 +411,12 @@ impl ReferencePreparation {
                         .dangling
                         .entry(occurrence.resource.clone())
                         .or_default()
-                        .insert(occurrence.path.clone());
+                        .insert(DanglingReference {
+                            path: occurrence.path,
+                            fields: occurrence.fields,
+                            side: occurrence.side,
+                            raw: occurrence.request.value,
+                        });
                 }
             }
         }
@@ -421,7 +459,7 @@ fn collect<S>(
         );
         let mut collector = ReferenceCollector {
             resource: &resource.id,
-            paths: HashMap::new(),
+            occurrences: Vec::new(),
         };
         collector.collect(&masked, schema.schema())?;
         comparisons.insert(
@@ -446,29 +484,54 @@ fn collect<S>(
     })
 }
 
-/// Gather all operands a structural comparison can pair. List matching and
-/// similarity scoring can compare any elements, including desired vs saved;
-/// element indices therefore belong to diagnostics, not the schema path key.
+/// Collect possible comparison operands after pairing byte-equal list items.
+/// Indices identify diagnostic origins, never a reference's schema identity.
 struct ReferenceCollector<'a> {
     resource: &'a ResourceId,
-    paths: HashMap<(String, TypeIdentity), Vec<Occurrence>>,
+    occurrences: Vec<Occurrence>,
+}
+
+#[derive(Clone)]
+struct Operand<'a> {
+    value: &'a Value,
+    path: String,
+    side: ReferenceSide,
+    desired: bool,
+    fields: Vec<String>,
+}
+
+impl<'a> Operand<'a> {
+    fn child(&self, value: &'a Value, suffix: &str, field: Option<&str>) -> Self {
+        let mut fields = self.fields.clone();
+        fields.extend(field.map(str::to_owned));
+        Self {
+            fields,
+            value,
+            path: format!("{}{suffix}", self.path),
+            ..self.clone()
+        }
+    }
+
+    fn as_map(&self) -> Option<&'a indexmap::IndexMap<String, Value>> {
+        match self.value {
+            Value::Concrete(ConcreteValue::Map(map)) => Some(map),
+            _ => None,
+        }
+    }
+
+    fn historical(&self) -> Self {
+        Self {
+            desired: false,
+            ..self.clone()
+        }
+    }
 }
 
 impl ReferenceCollector<'_> {
     fn needed_occurrences(self) -> Vec<Occurrence> {
-        self.paths
-            .into_values()
-            .filter(|occurrences| {
-                occurrences
-                    .iter()
-                    .map(|occurrence| &occurrence.request.value)
-                    .collect::<HashSet<_>>()
-                    .len()
-                    > 1
-            })
-            .flatten()
-            .collect()
+        self.occurrences
     }
+
     fn collect(
         &mut self,
         masked: &crate::resource::MaskedComparisonAttributes,
@@ -476,66 +539,398 @@ impl ReferenceCollector<'_> {
     ) -> Result<(), Box<ReferencePlanError>> {
         for attribute in schema.effective_attributes() {
             let name = attribute.name();
-            for (value, desired) in [
-                (masked.desired().get(name), true),
-                (masked.current().get(name), false),
-                (masked.saved().and_then(|values| values.get(name)), false),
-            ] {
-                if let Some(value) = value {
-                    self.walk(value, attribute.value_type(), name, name, desired, false, 0)?;
-                }
+            let operand = |value, side| Operand {
+                value,
+                path: name.into(),
+                side,
+                desired: side == ReferenceSide::Desired,
+                fields: vec![name.into()],
+            };
+            let desired = masked
+                .desired()
+                .get(name)
+                .map(|value| operand(value, ReferenceSide::Desired));
+            let current = masked
+                .current()
+                .get(name)
+                .map(|value| operand(value, ReferenceSide::Current));
+            let saved = masked
+                .saved()
+                .and_then(|values| values.get(name))
+                .map(|value| operand(value, ReferenceSide::Saved));
+            for operand in [&desired, &current, &saved].into_iter().flatten() {
+                self.validate(
+                    operand.value,
+                    attribute.value_type(),
+                    &operand.path,
+                    false,
+                    0,
+                )?;
+            }
+            // Saved list anchors participate in projection and merge pairing,
+            // even when desired/current are byte-equal. They do not turn an
+            // otherwise unchanged desired reference into a desired-side error.
+            if let (Some(desired), Some(saved)) = (&desired, &saved) {
+                self.collect_pairing(&desired.historical(), saved, attribute.value_type());
+            }
+            if let (Some(saved), Some(current)) = (&saved, &current) {
+                self.collect_pairing(saved, current, attribute.value_type());
+            }
+            if desired.is_some() {
+                self.collect_merged(
+                    desired.as_ref(),
+                    current.as_ref(),
+                    saved.as_ref(),
+                    attribute.value_type(),
+                    attribute.is_write_only(),
+                );
             }
         }
         Ok(())
     }
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
+
+    fn record_pair(&mut self, a: &Operand<'_>, b: &Operand<'_>, identity: &TypeIdentity) {
+        let (
+            Value::Concrete(ConcreteValue::String(left)),
+            Value::Concrete(ConcreteValue::String(right)),
+        ) = (a.value, b.value)
+        else {
+            return;
+        };
+        if left == right {
+            return;
+        }
+        for (operand, raw) in [(a, left), (b, right)] {
+            self.occurrences.push(Occurrence {
+                resource: self.resource.clone(),
+                path: operand.path.clone(),
+                request: ReferenceRequest {
+                    ty: identity.clone(),
+                    value: raw.expose_plaintext().into(),
+                },
+                desired: operand.desired,
+                side: operand.side,
+                fields: operand.fields.clone(),
+            });
+        }
+    }
+
+    fn collect_pair(
+        &mut self,
+        a: &Operand<'_>,
+        b: &Operand<'_>,
+        ty: crate::schema::EffectiveType<'_>,
+    ) {
+        match ty.shape() {
+            Shape::Reference { identity, .. } => self.record_pair(a, b, identity),
+            Shape::Struct { .. } | Shape::Map { .. } => {
+                let (
+                    Value::Concrete(ConcreteValue::Map(left)),
+                    Value::Concrete(ConcreteValue::Map(right)),
+                ) = (a.value, b.value)
+                else {
+                    return;
+                };
+                for (name, value) in left {
+                    if let Some(other) = right.get(name)
+                        && let Some(child) = Self::child_type(&ty, name)
+                    {
+                        let suffix = Self::field_suffix(&ty, name);
+                        self.collect_pair(
+                            &a.child(value, &suffix, Some(name)),
+                            &b.child(other, &suffix, Some(name)),
+                            child,
+                        );
+                    }
+                }
+            }
+            Shape::List { ordered, .. } => {
+                self.collect_list_pairs(a, b, ty, ordered);
+            }
+            Shape::Union => {
+                for member in ty.union_members() {
+                    self.collect_pair(a, b, member);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_list_pairs(
+        &mut self,
+        a: &Operand<'_>,
+        b: &Operand<'_>,
+        ty: crate::schema::EffectiveType<'_>,
+        ordered: bool,
+    ) {
+        let (Some(left), Some(right), Some(element)) = (
+            crate::resource::comparison_list_items(a.value),
+            crate::resource::comparison_list_items(b.value),
+            ty.list_element(),
+        ) else {
+            return;
+        };
+        let (matched_left, matched_right) =
+            crate::resource::match_equal_concrete_items(&left, &right);
+        for (i, value) in left.iter().enumerate() {
+            for (j, other) in right.iter().enumerate() {
+                if if ordered {
+                    i != j
+                } else {
+                    matched_left[i].is_some() || matched_right[j]
+                } {
+                    continue;
+                }
+                self.collect_pair(
+                    &a.child(value, &format!("[{i}]"), None),
+                    &b.child(other, &format!("[{j}]"), None),
+                    element.clone(),
+                );
+            }
+        }
+    }
+
+    /// Only list correspondence compares desired/saved or saved/current
+    /// directly; scalar saved fallbacks are handled by collect_merged.
+    fn collect_pairing(
+        &mut self,
+        a: &Operand<'_>,
+        b: &Operand<'_>,
+        ty: crate::schema::EffectiveType<'_>,
+    ) {
+        match ty.shape() {
+            Shape::List { .. } => self.collect_list_pairs(a, b, ty, false),
+            Shape::Struct { .. } | Shape::Map { .. } => {
+                let (
+                    Value::Concrete(ConcreteValue::Map(left)),
+                    Value::Concrete(ConcreteValue::Map(right)),
+                ) = (a.value, b.value)
+                else {
+                    return;
+                };
+                for (name, value) in left {
+                    if let Some(other) = right.get(name)
+                        && let Some(child) = Self::child_type(&ty, name)
+                    {
+                        let suffix = Self::field_suffix(&ty, name);
+                        self.collect_pairing(
+                            &a.child(value, &suffix, Some(name)),
+                            &b.child(other, &suffix, Some(name)),
+                            child,
+                        );
+                    }
+                }
+            }
+            Shape::Union => {
+                for member in ty.union_members() {
+                    self.collect_pairing(a, b, member);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Account for values merge_with_saved can add to effective desired.
+    /// Unordered candidates can borrow fields from any unpaired saved item.
+    fn collect_merged(
+        &mut self,
+        desired: Option<&Operand<'_>>,
+        current: Option<&Operand<'_>>,
+        saved: Option<&Operand<'_>>,
+        ty: crate::schema::EffectiveType<'_>,
+        write_only: bool,
+    ) {
+        let Some(effective) = desired.or(saved) else {
+            return;
+        };
+        if current.is_none() && write_only {
+            if let (Some(desired), Some(saved)) = (desired, saved) {
+                self.collect_pair(desired, saved, ty);
+            }
+            return;
+        }
+        match ty.shape() {
+            Shape::Struct { .. } | Shape::Map { .. } => {
+                let Value::Concrete(ConcreteValue::Map(values)) = effective.value else {
+                    return;
+                };
+                let current_map = current.and_then(Operand::as_map);
+                let saved_map = saved.and_then(Operand::as_map);
+                let names = values
+                    .keys()
+                    .chain(saved_map.into_iter().flat_map(|map| map.keys()))
+                    .collect::<BTreeSet<_>>();
+                for name in names {
+                    let Some(child_type) = Self::child_type(&ty, name) else {
+                        continue;
+                    };
+                    let suffix = Self::field_suffix(&ty, name);
+                    let desired_child = desired.and_then(|operand| {
+                        values
+                            .get(name)
+                            .map(|value| operand.child(value, &suffix, Some(name)))
+                    });
+                    let current_child = current.zip(current_map).and_then(|(operand, map)| {
+                        map.get(name)
+                            .map(|value| operand.child(value, &suffix, Some(name)))
+                    });
+                    let saved_child = saved.zip(saved_map).and_then(|(operand, map)| {
+                        map.get(name)
+                            .map(|value| operand.child(value, &suffix, Some(name)))
+                    });
+                    let write_only = write_only
+                        || ty
+                            .field_candidates()
+                            .iter()
+                            .any(|field| field.name() == name && field.is_write_only());
+                    self.collect_merged(
+                        desired_child.as_ref(),
+                        current_child.as_ref(),
+                        saved_child.as_ref(),
+                        child_type,
+                        write_only,
+                    );
+                }
+            }
+            Shape::List { ordered, .. } => {
+                let Some(current) = current else {
+                    // Reads can omit a whole list containing write-only
+                    // leaves. Those desired leaves still compare against
+                    // accepted saved input, with desired-side failures.
+                    if let (Some(desired), Some(saved), Some(element)) =
+                        (desired, saved, ty.list_element())
+                        && let (Some(left), Some(right)) = (
+                            crate::resource::comparison_list_items(desired.value),
+                            crate::resource::comparison_list_items(saved.value),
+                        )
+                    {
+                        let (matched_left, matched_right) =
+                            crate::resource::match_equal_concrete_items(&left, &right);
+                        for (i, value) in left.iter().enumerate() {
+                            for (j, other) in right.iter().enumerate() {
+                                if matched_left[i].is_some() || matched_right[j] {
+                                    continue;
+                                }
+                                self.collect_merged(
+                                    Some(&desired.child(value, &format!("[{i}]"), None)),
+                                    None,
+                                    Some(&saved.child(other, &format!("[{j}]"), None)),
+                                    element.clone(),
+                                    write_only,
+                                );
+                            }
+                        }
+                    }
+                    return;
+                };
+                let (Some(left), Some(right), Some(element)) = (
+                    crate::resource::comparison_list_items(effective.value),
+                    crate::resource::comparison_list_items(current.value),
+                    ty.list_element(),
+                ) else {
+                    return;
+                };
+                let saved_items =
+                    saved.and_then(|operand| crate::resource::comparison_list_items(operand.value));
+                let (matched_left, matched_right) =
+                    crate::resource::match_equal_concrete_items(&left, &right);
+                for (i, value) in left.iter().enumerate() {
+                    for (j, other) in right.iter().enumerate() {
+                        if if ordered {
+                            i != j
+                        } else {
+                            matched_left[i].is_some() || matched_right[j]
+                        } {
+                            continue;
+                        }
+                        let a = effective.child(value, &format!("[{i}]"), None);
+                        let b = current.child(other, &format!("[{j}]"), None);
+                        self.collect_merged(Some(&a), Some(&b), None, element.clone(), write_only);
+                        if let Some(saved_items) = &saved_items {
+                            for (k, value) in saved_items.iter().enumerate() {
+                                let s = saved.unwrap().child(value, &format!("[{k}]"), None);
+                                self.collect_merged(
+                                    Some(&a),
+                                    Some(&b),
+                                    Some(&s),
+                                    element.clone(),
+                                    write_only,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Shape::Union => {
+                for member in ty.union_members() {
+                    self.collect_merged(desired, current, saved, member, write_only);
+                }
+            }
+            _ => {
+                if let Some(current) = current {
+                    self.collect_pair(effective, current, ty);
+                }
+            }
+        }
+    }
+
+    fn child_type<'a>(
+        ty: &crate::schema::EffectiveType<'a>,
+        name: &str,
+    ) -> Option<crate::schema::EffectiveType<'a>> {
+        ty.field_candidates()
+            .into_iter()
+            .find(|field| field.name() == name)
+            .map(|field| field.value_type())
+            .or_else(|| ty.map_value())
+    }
+
+    fn field_suffix(ty: &crate::schema::EffectiveType<'_>, name: &str) -> String {
+        if matches!(ty.shape(), Shape::Map { .. }) {
+            format!("[{}]", crate::parser::display_string_literal(name))
+        } else {
+            format!(".{name}")
+        }
+    }
+    fn validate(
         &mut self,
         value: &Value,
         ty: crate::schema::EffectiveType<'_>,
         path: &str,
-        schema_path: &str,
-        desired: bool,
         secret: bool,
         depth: usize,
     ) -> Result<(), Box<ReferencePlanError>> {
         if depth >= 64 {
-            return Ok(());
+            return Err(Box::new(ReferencePlanError {
+                instance: ProviderInstanceKey::from(self.resource),
+                resource: self.resource.clone(),
+                path: path.into(),
+                raw: ValueString::diagnostic_sensitive("<depth limit>"),
+                source: ReferenceError::InvalidReference(ProviderError::invalid_input(format!(
+                    "reference traversal depth limit (64) exceeded at {path}"
+                )))
+                .into(),
+            }));
         }
         if let Value::Deferred(crate::resource::DeferredValue::Secret(inner)) = value {
-            return self.walk(inner, ty, path, schema_path, desired, true, depth + 1);
+            return self.validate(inner, ty, path, true, depth + 1);
         }
         match ty.shape() {
-            Shape::Reference { identity, .. } => {
+            Shape::Reference { .. }
                 if secret
                     || crate::value::contains_secret(value)
-                    || matches!(value, Value::Concrete(ConcreteValue::String(raw)) if raw.is_diagnostic_sensitive())
-                {
-                    return Err(Box::new(ReferencePlanError {
-                        instance: ProviderInstanceKey::from(self.resource),
-                        resource: self.resource.clone(),
-                        path: path.into(),
-                        raw: ValueString::diagnostic_sensitive("<redacted>"),
-                        source: ReferenceError::InvalidReference(ProviderError::invalid_input(
-                            "secret values cannot be used as references",
-                        ))
-                        .into(),
-                    }));
-                }
-                if let Value::Concrete(ConcreteValue::String(raw)) = value {
-                    self.paths
-                        .entry((schema_path.into(), identity.clone()))
-                        .or_default()
-                        .push(Occurrence {
-                            resource: self.resource.clone(),
-                            path: path.into(),
-                            desired,
-                            request: ReferenceRequest {
-                                ty: identity.clone(),
-                                value: raw.expose_plaintext().into(),
-                            },
-                        });
-                }
+                    || matches!(value, Value::Concrete(ConcreteValue::String(raw)) if raw.is_diagnostic_sensitive()) =>
+            {
+                return Err(Box::new(ReferencePlanError {
+                    instance: ProviderInstanceKey::from(self.resource),
+                    resource: self.resource.clone(),
+                    path: path.into(),
+                    raw: ValueString::diagnostic_sensitive("<redacted>"),
+                    source: ReferenceError::InvalidReference(ProviderError::invalid_input(
+                        "secret values cannot be used as references",
+                    ))
+                    .into(),
+                }));
             }
             Shape::Struct { .. } | Shape::Map { .. } => {
                 if let Value::Concrete(ConcreteValue::Map(values)) = value {
@@ -549,26 +944,12 @@ impl ReferenceCollector<'_> {
                             .map(|field| field.value_type())
                             .or_else(|| ty.map_value())
                         {
-                            let (path, schema_path) = if is_map {
-                                (
-                                    format!(
-                                        "{path}[{}]",
-                                        crate::parser::display_string_literal(name)
-                                    ),
-                                    format!("{schema_path}.*"),
-                                )
+                            let path = if is_map {
+                                format!("{path}[{}]", crate::parser::display_string_literal(name))
                             } else {
-                                (format!("{path}.{name}"), format!("{schema_path}.{name}"))
+                                format!("{path}.{name}")
                             };
-                            self.walk(
-                                value,
-                                child_type,
-                                &path,
-                                &schema_path,
-                                desired,
-                                secret,
-                                depth + 1,
-                            )?;
+                            self.validate(value, child_type, &path, secret, depth + 1)?;
                         }
                     }
                 }
@@ -578,12 +959,10 @@ impl ReferenceCollector<'_> {
                     && let Some(element) = ty.list_element()
                 {
                     for (index, value) in items.iter().enumerate() {
-                        self.walk(
+                        self.validate(
                             value,
                             element.clone(),
                             &format!("{path}[{index}]"),
-                            &format!("{schema_path}[]"),
-                            desired,
                             secret,
                             depth + 1,
                         )?;
@@ -592,7 +971,7 @@ impl ReferenceCollector<'_> {
             }
             Shape::Union => {
                 for member in ty.union_members() {
-                    self.walk(value, member, path, schema_path, desired, secret, depth + 1)?;
+                    self.validate(value, member, path, secret, depth + 1)?;
                 }
             }
             _ => {}

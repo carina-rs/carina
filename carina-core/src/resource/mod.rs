@@ -7301,19 +7301,31 @@ impl<'a> SavedValueViews<'a> {
 /// Pair identical concrete items before probing other unordered candidates.
 /// Preparation and comparison share this pairing so a reordered echoed
 /// reference never requires resolution merely because another item came first.
-pub(crate) fn match_equal_concrete_items(a: &[Value], b: &[Value]) -> (Vec<bool>, Vec<bool>) {
-    let mut matched_a = vec![false; a.len()];
+pub(crate) fn match_equal_concrete_items<A: Borrow<Value>, B: Borrow<Value>>(
+    a: &[A],
+    b: &[B],
+) -> (Vec<Option<usize>>, Vec<bool>) {
+    let mut matched_a = vec![None; a.len()];
     let mut matched_b = vec![false; b.len()];
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (j, candidate) in b.iter().enumerate() {
+        buckets
+            .entry(candidate.borrow().canonical_hash())
+            .or_default()
+            .push(j);
+    }
     for (i, item) in a.iter().enumerate() {
+        let item = item.borrow();
         if !matches!(item, Value::Concrete(_)) || !item.is_fully_resolved() {
             continue;
         }
-        if let Some(j) = b
-            .iter()
-            .enumerate()
-            .position(|(j, candidate)| !matched_b[j] && item == candidate)
-        {
-            matched_a[i] = true;
+        if let Some(j) = buckets.get(&item.canonical_hash()).and_then(|bucket| {
+            bucket
+                .iter()
+                .copied()
+                .find(|&j| !matched_b[j] && item == b[j].borrow())
+        }) {
+            matched_a[i] = Some(j);
             matched_b[j] = true;
         }
     }
@@ -7463,8 +7475,44 @@ where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
-    commit_list_element_pairs(desired.len(), saved.len(), &candidates)
+    if !has_reference_leaves(attr_type, defs) {
+        let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
+        return commit_list_element_pairs(desired.len(), saved.len(), &candidates);
+    }
+    let (mut pairs, matched_saved) = match_equal_concrete_items(desired, saved);
+    let desired_indices = pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pair)| pair.is_none().then_some(i))
+        .collect::<Vec<_>>();
+    let saved_indices = matched_saved
+        .iter()
+        .enumerate()
+        .filter_map(|(i, matched)| (!matched).then_some(i))
+        .collect::<Vec<_>>();
+    let remaining_desired = desired_indices
+        .iter()
+        .map(|&i| desired[i].borrow())
+        .collect::<Vec<_>>();
+    let remaining_saved = saved_indices
+        .iter()
+        .map(|&i| saved[i].borrow())
+        .collect::<Vec<_>>();
+    let candidates = list_pair_candidates(
+        &remaining_desired,
+        &remaining_saved,
+        attr_type,
+        defs,
+        context,
+    );
+    for (i, pair) in
+        commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates)
+            .into_iter()
+            .enumerate()
+    {
+        pairs[desired_indices[i]] = pair.map(|index| saved_indices[index]);
+    }
+    pairs
 }
 
 /// A stable list-element pairing together with the evidence for that pairing.
@@ -7498,9 +7546,105 @@ where
     D: Borrow<Value>,
     S: Borrow<Value>,
 {
-    let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
-    let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
-    classify_list_element_pairs(&pairs, saved.len(), &candidates)
+    if !has_reference_leaves(attr_type, defs) {
+        let candidates = list_pair_candidates(desired, saved, attr_type, defs, context);
+        let pairs = commit_list_element_pairs(desired.len(), saved.len(), &candidates);
+        return classify_list_element_pairs(&pairs, saved.len(), &candidates);
+    }
+    let (exact, matched_saved) = match_equal_concrete_items(desired, saved);
+    let desired_indices = exact
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pair)| pair.is_none().then_some(i))
+        .collect::<Vec<_>>();
+    let saved_indices = matched_saved
+        .iter()
+        .enumerate()
+        .filter_map(|(i, matched)| (!matched).then_some(i))
+        .collect::<Vec<_>>();
+    let remaining_desired = desired_indices
+        .iter()
+        .map(|&i| desired[i].borrow())
+        .collect::<Vec<_>>();
+    let remaining_saved = saved_indices
+        .iter()
+        .map(|&i| saved[i].borrow())
+        .collect::<Vec<_>>();
+    let candidates = list_pair_candidates(
+        &remaining_desired,
+        &remaining_saved,
+        attr_type,
+        defs,
+        context,
+    );
+    let pairs =
+        commit_list_element_pairs(remaining_desired.len(), remaining_saved.len(), &candidates);
+    let mut classified = vec![ListElementPairing::Unmatched; desired.len()];
+    for (i, pairing) in classify_list_element_pairs(&pairs, remaining_saved.len(), &candidates)
+        .into_iter()
+        .enumerate()
+    {
+        classified[desired_indices[i]] = match pairing {
+            ListElementPairing::Unique(index) => ListElementPairing::Unique(saved_indices[index]),
+            other => other,
+        };
+    }
+    for (i, value) in desired.iter().enumerate() {
+        if let Some(index) = exact[i] {
+            // Equal duplicates establish a stable merge pair, but cannot
+            // establish a unique authoring correspondence.
+            classified[i] = if desired
+                .iter()
+                .filter(|item| (*item).borrow() == value.borrow())
+                .count()
+                == 1
+                && saved
+                    .iter()
+                    .filter(|item| (*item).borrow() == value.borrow())
+                    .count()
+                    == 1
+            {
+                ListElementPairing::Unique(index)
+            } else {
+                ListElementPairing::Ambiguous
+            };
+        } else if saved.iter().any(|item| item.borrow() == value.borrow()) {
+            classified[i] = ListElementPairing::Ambiguous;
+        }
+    }
+    classified
+}
+
+/// Reference-bearing list elements need D4 pre-pairing before similarity
+/// probes. Keep ordinary list attribution and its score ordering unchanged.
+fn has_reference_leaves(
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> bool {
+    let mut pending = attr_type.into_iter().collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some(ty) = pending.pop() {
+        if !seen.insert(ty as *const AttributeType) {
+            continue;
+        }
+        match ty.shape_with_defs(defs) {
+            Shape::Reference { .. } => return true,
+            Shape::Struct { .. } => {
+                if let Some(fields) = crate::schema::struct_fields_with_defs(ty, defs) {
+                    pending.extend(fields.iter().map(|field| &field.field_type));
+                }
+            }
+            Shape::List { element_type, .. } => pending.push(element_type),
+            Shape::Map { value, .. } => pending.push(value),
+            Shape::Union => {
+                if let Some(members) = crate::schema::union_members_with_defs(ty, defs) {
+                    pending.extend(members.iter().flatten().map(|member| member.as_attr()));
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn list_pair_candidates<D, S, R: ReferenceEquality>(
@@ -7795,6 +7939,12 @@ where
     let mut universal_map_fields: HashMap<&str, HashMap<u64, &Value>> = HashMap::new();
     for (key, value_buckets) in &map_field_buckets {
         let field_type = map_entry_subtype(attr_type, key, defs);
+        // Universal-bucket compression must not invent current/current
+        // reference comparisons. Only unmatched cross-side operands are
+        // prepared, and a field absent from desired needs no identity lookup.
+        if has_reference_leaves(field_type, defs) {
+            continue;
+        }
         let Some(representative) = saved.first().and_then(|saved_value| {
             let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
                 return None;
@@ -7835,7 +7985,9 @@ where
     }
 
     let mut universal_values = HashMap::new();
-    if let Some(representative) = saved.first().map(Borrow::borrow) {
+    if !has_reference_leaves(attr_type, defs)
+        && let Some(representative) = saved.first().map(Borrow::borrow)
+    {
         for (value_hash, bucket) in &value_buckets {
             if bucket.len() == saved.len()
                 && bucket.iter().copied().eq(0..saved.len())
