@@ -243,31 +243,6 @@ fn identity_path_field_names(path: &IdentityPath) -> Vec<String> {
         .collect()
 }
 
-fn value_at_identity_path_root<'a, P: PlaceholderKind>(
-    root: Option<&'a Value<P>>,
-    path: &IdentityPath,
-) -> Option<&'a Value<P>> {
-    let mut value = root?;
-    for field in path.struct_fields() {
-        value = match value {
-            Value::Concrete(ConcreteValue::Map(fields)) => fields.get(field)?,
-            Value::Concrete(
-                ConcreteValue::String(_)
-                | ConcreteValue::Int(_)
-                | ConcreteValue::Float(_)
-                | ConcreteValue::Bool(_)
-                | ConcreteValue::List(_)
-                | ConcreteValue::StringList(_)
-                | ConcreteValue::EnumIdentifier(_)
-                | ConcreteValue::CanonicalEnum(_)
-                | ConcreteValue::Duration(_),
-            )
-            | Value::Deferred(_) => return None,
-        };
-    }
-    Some(value)
-}
-
 fn value_has_authored_plan_time_expression<P: PlaceholderKind>(value: &Value<P>) -> bool {
     match value {
         Value::Concrete(ConcreteValue::List(values)) => {
@@ -2926,13 +2901,49 @@ impl AnonymousIdStateInfo {
 /// substitute authored original names for temporary replacement names.
 #[derive(Clone, Default)]
 struct StateRowIdentityValues {
-    comparable: ComparableStateRowIdentityValues,
+    values: BTreeMap<IdentityPath, StateIdentityValue>,
     override_hidden_attributes: BTreeSet<String>,
 }
 
-#[derive(Clone, Default)]
-struct ComparableStateRowIdentityValues {
-    values: BTreeMap<IdentityPath, ResolvedCreateOnlyValue>,
+/// Preserve path presence even when a persisted value cannot be compared.
+#[derive(Clone)]
+enum StateIdentityValue {
+    Absent,
+    Comparable(ResolvedCreateOnlyValue),
+    Uncomparable,
+}
+
+impl StateIdentityValue {
+    fn at_path(root: Option<&Value>, path: &IdentityPath) -> Self {
+        let Some(mut value) = root else {
+            return Self::Absent;
+        };
+        for field in path.struct_fields() {
+            value = match value {
+                Value::Concrete(ConcreteValue::Map(fields)) => {
+                    let Some(value) = fields.get(field) else {
+                        return Self::Absent;
+                    };
+                    value
+                }
+                Value::Concrete(
+                    ConcreteValue::String(_)
+                    | ConcreteValue::Int(_)
+                    | ConcreteValue::Float(_)
+                    | ConcreteValue::Bool(_)
+                    | ConcreteValue::List(_)
+                    | ConcreteValue::StringList(_)
+                    | ConcreteValue::EnumIdentifier(_)
+                    | ConcreteValue::CanonicalEnum(_)
+                    | ConcreteValue::Duration(_),
+                )
+                | Value::Deferred(_) => return Self::Uncomparable,
+            };
+        }
+        ResolvedCreateOnlyValue::from_value(value.clone())
+            .map(Self::Comparable)
+            .unwrap_or(Self::Uncomparable)
+    }
 }
 
 impl StateRowIdentityValues {
@@ -2968,18 +2979,17 @@ impl StateRowIdentityValues {
         let values = schema
             .identity_paths()
             .iter()
-            .filter_map(|path| {
-                if unknown_override_origins.contains(path.attribute_name()) {
-                    return None;
-                }
-                value_at_identity_path_root(canonical.get(path.attribute_name()), path)
-                    .cloned()
-                    .and_then(ResolvedCreateOnlyValue::from_value)
-                    .map(|value| (path.clone(), value))
+            .map(|path| {
+                let value = if unknown_override_origins.contains(path.attribute_name()) {
+                    StateIdentityValue::Uncomparable
+                } else {
+                    StateIdentityValue::at_path(canonical.get(path.attribute_name()), path)
+                };
+                (path.clone(), value)
             })
             .collect();
         Self {
-            comparable: ComparableStateRowIdentityValues { values },
+            values,
             override_hidden_attributes: unknown_override_origins,
         }
     }
@@ -2995,6 +3005,7 @@ enum DeclaredIdentityRowOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DeclaredIdentityRowUndecidability {
     DesiredUnresolved,
+    StateUncomparable,
     OverrideOriginUnknown { attributes: BTreeSet<String> },
     DesiredUnresolvedAndOverrideOriginUnknown { attributes: BTreeSet<String> },
 }
@@ -3005,13 +3016,13 @@ impl DeclaredIdentityRowUndecidability {
             Self::DesiredUnresolved | Self::DesiredUnresolvedAndOverrideOriginUnknown { .. } => {
                 true
             }
-            Self::OverrideOriginUnknown { .. } => false,
+            Self::StateUncomparable | Self::OverrideOriginUnknown { .. } => false,
         }
     }
 
     fn override_hidden_attributes(&self) -> Option<&BTreeSet<String>> {
         match self {
-            Self::DesiredUnresolved => None,
+            Self::DesiredUnresolved | Self::StateUncomparable => None,
             Self::OverrideOriginUnknown { attributes }
             | Self::DesiredUnresolvedAndOverrideOriginUnknown { attributes } => Some(attributes),
         }
@@ -3020,7 +3031,14 @@ impl DeclaredIdentityRowUndecidability {
 
 /// Desired values for every schema-declared identity path.
 struct DesiredIdentityValues {
-    values: BTreeMap<IdentityPath, DesiredCreateOnlyValue>,
+    values: BTreeMap<IdentityPath, DesiredIdentityValue>,
+}
+
+enum DesiredIdentityValue {
+    Absent,
+    Resolved(ResolvedCreateOnlyValue),
+    Prefix(String),
+    Unresolved,
 }
 
 impl DesiredIdentityValues {
@@ -3038,27 +3056,25 @@ impl DesiredIdentityValues {
                     schema
                         .effective_node_at_path(&names)
                         .is_some_and(|node| node.identity_mode() == IdentityMode::WhenPresent)
-                        .then(|| (path.clone(), DesiredCreateOnlyValue::Absent))
+                        .then(|| (path.clone(), DesiredIdentityValue::Absent))
                 }
                 IdentityPathInput::Unavailable => None,
                 IdentityPathInput::GeneratedPrefix(prefix) => Some((
                     path.clone(),
-                    DesiredCreateOnlyValue::Prefix(prefix.to_string()),
+                    DesiredIdentityValue::Prefix(prefix.to_string()),
                 )),
                 IdentityPathInput::AuthoredPrefix(Value::Concrete(ConcreteValue::String(
                     prefix,
                 ))) => Some((
                     path.clone(),
-                    DesiredCreateOnlyValue::Prefix(prefix.expose_plaintext().to_string()),
+                    DesiredIdentityValue::Prefix(prefix.expose_plaintext().to_string()),
                 )),
                 IdentityPathInput::AuthoredPrefix(value) => {
                     let value = resolve_deferred_create_only_value(value, find_state_by_binding)
                         .and_then(|resolved| match resolved {
-                            Value::Concrete(ConcreteValue::String(prefix)) => {
-                                Some(DesiredCreateOnlyValue::Prefix(
-                                    prefix.expose_plaintext().to_string(),
-                                ))
-                            }
+                            Value::Concrete(ConcreteValue::String(prefix)) => Some(
+                                DesiredIdentityValue::Prefix(prefix.expose_plaintext().to_string()),
+                            ),
                             Value::Concrete(
                                 ConcreteValue::Int(_)
                                 | ConcreteValue::Float(_)
@@ -3072,7 +3088,7 @@ impl DesiredIdentityValues {
                             )
                             | Value::Deferred(_) => None,
                         })
-                        .unwrap_or(DesiredCreateOnlyValue::Unresolved);
+                        .unwrap_or(DesiredIdentityValue::Unresolved);
                     Some((path.clone(), value))
                 }
                 IdentityPathInput::Value(value) if path.segments().len() == 1 => {
@@ -3082,16 +3098,16 @@ impl DesiredIdentityValues {
                         path.attribute_name(),
                         find_state_by_binding,
                     )
-                    .map(DesiredCreateOnlyValue::Resolved)
-                    .unwrap_or(DesiredCreateOnlyValue::Unresolved);
+                    .map(DesiredIdentityValue::Resolved)
+                    .unwrap_or(DesiredIdentityValue::Unresolved);
                     Some((path.clone(), value))
                 }
                 IdentityPathInput::Value(value) => {
                     let resolved = resolve_deferred_create_only_value(value, find_state_by_binding)
                         .unwrap_or_else(|| value.clone());
                     let value = ResolvedCreateOnlyValue::from_value(resolved)
-                        .map(DesiredCreateOnlyValue::Resolved)
-                        .unwrap_or(DesiredCreateOnlyValue::Unresolved);
+                        .map(DesiredIdentityValue::Resolved)
+                        .unwrap_or(DesiredIdentityValue::Unresolved);
                     Some((path.clone(), value))
                 }
             })
@@ -3107,57 +3123,58 @@ impl DesiredIdentityValues {
     ) -> DeclaredIdentityRowOutcome {
         let mut desired_unresolved = false;
         let mut override_hidden_attributes = BTreeSet::new();
-        let mut state_value_missing = false;
+        let mut state_uncomparable = false;
 
         for path in schema.identity_paths() {
-            let override_hidden = state_values
+            let desired = self
+                .values
+                .get(path)
+                .unwrap_or(&DesiredIdentityValue::Unresolved);
+            if state_values
                 .override_hidden_attributes
-                .contains(path.attribute_name());
-            let Some(desired) = self.values.get(path) else {
-                desired_unresolved = true;
-                if override_hidden {
-                    override_hidden_attributes.insert(path.attribute_name().to_string());
-                }
+                .contains(path.attribute_name())
+            {
+                desired_unresolved |= matches!(desired, DesiredIdentityValue::Unresolved);
+                override_hidden_attributes.insert(path.attribute_name().to_string());
                 continue;
-            };
-            match desired {
-                DesiredCreateOnlyValue::Absent => {
-                    if override_hidden {
-                        override_hidden_attributes.insert(path.attribute_name().to_string());
-                        continue;
-                    }
-                    if state_values.comparable.values.contains_key(path) {
-                        return DeclaredIdentityRowOutcome::Mismatch;
-                    }
-                }
-                DesiredCreateOnlyValue::Unresolved => {
+            }
+            let state = state_values
+                .values
+                .get(path)
+                .unwrap_or(&StateIdentityValue::Uncomparable);
+            match (desired, state) {
+                (DesiredIdentityValue::Absent, StateIdentityValue::Absent) => {}
+                (
+                    DesiredIdentityValue::Absent,
+                    StateIdentityValue::Comparable(_) | StateIdentityValue::Uncomparable,
+                )
+                | (
+                    DesiredIdentityValue::Resolved(_) | DesiredIdentityValue::Prefix(_),
+                    StateIdentityValue::Absent,
+                ) => return DeclaredIdentityRowOutcome::Mismatch,
+                (
+                    DesiredIdentityValue::Unresolved,
+                    StateIdentityValue::Absent
+                    | StateIdentityValue::Comparable(_)
+                    | StateIdentityValue::Uncomparable,
+                ) => {
                     desired_unresolved = true;
-                    if override_hidden {
-                        override_hidden_attributes.insert(path.attribute_name().to_string());
-                    }
                 }
-                DesiredCreateOnlyValue::Resolved(desired) => {
-                    if override_hidden {
-                        override_hidden_attributes.insert(path.attribute_name().to_string());
-                        continue;
-                    }
-                    let Some(state) = state_values.comparable.values.get(path) else {
-                        state_value_missing = true;
-                        continue;
-                    };
+                (
+                    DesiredIdentityValue::Resolved(_) | DesiredIdentityValue::Prefix(_),
+                    StateIdentityValue::Uncomparable,
+                ) => {
+                    state_uncomparable = true;
+                }
+                (
+                    DesiredIdentityValue::Resolved(desired),
+                    StateIdentityValue::Comparable(state),
+                ) => {
                     if !desired.semantically_equal_at_identity_path(state, schema, path, context) {
                         return DeclaredIdentityRowOutcome::Mismatch;
                     }
                 }
-                DesiredCreateOnlyValue::Prefix(prefix) => {
-                    if override_hidden {
-                        override_hidden_attributes.insert(path.attribute_name().to_string());
-                        continue;
-                    }
-                    let Some(state) = state_values.comparable.values.get(path) else {
-                        state_value_missing = true;
-                        continue;
-                    };
+                (DesiredIdentityValue::Prefix(prefix), StateIdentityValue::Comparable(state)) => {
                     if !state.starts_with_at_identity_path(prefix, schema, path, context) {
                         return DeclaredIdentityRowOutcome::Mismatch;
                     }
@@ -3179,7 +3196,9 @@ impl DesiredIdentityValues {
                     attributes: override_hidden_attributes,
                 },
             ),
-            (false, true) if state_value_missing => DeclaredIdentityRowOutcome::Mismatch,
+            (false, true) if state_uncomparable => DeclaredIdentityRowOutcome::Undecidable(
+                DeclaredIdentityRowUndecidability::StateUncomparable,
+            ),
             (false, true) => DeclaredIdentityRowOutcome::Match,
         }
     }
@@ -3210,6 +3229,7 @@ fn legacy_row_stable_identity_matches(
                 DeclaredIdentityRowOutcome::Mismatch => Some(false),
                 DeclaredIdentityRowOutcome::Undecidable(
                     DeclaredIdentityRowUndecidability::DesiredUnresolved
+                    | DeclaredIdentityRowUndecidability::StateUncomparable
                     | DeclaredIdentityRowUndecidability::OverrideOriginUnknown { .. }
                     | DeclaredIdentityRowUndecidability::DesiredUnresolvedAndOverrideOriginUnknown {
                         ..
@@ -3575,7 +3595,6 @@ impl ResolvedCreateOnlyValue {
 
 /// Whether one configured desired create-only value can be compared yet.
 enum DesiredCreateOnlyValue {
-    Absent,
     Resolved(ResolvedCreateOnlyValue),
     Prefix(String),
     Unresolved,
@@ -3590,7 +3609,6 @@ impl DesiredCreateOnlyValue {
         context: &ComparisonContext<'_>,
     ) -> Option<bool> {
         match self {
-            Self::Absent => Some(false),
             Self::Resolved(desired) => {
                 Some(desired.semantically_equal(state, schema, attribute, context))
             }
@@ -3671,11 +3689,6 @@ fn resolved_subset_match(
     let mut resolved = 0;
     let mut all_match = true;
     for (attribute, desired) in desired_values {
-        if matches!(desired, DesiredCreateOnlyValue::Absent) {
-            resolved += 1;
-            all_match &= !state_values.contains_key(attribute);
-            continue;
-        }
         let Some(matches) = state_values
             .get(attribute)
             .and_then(|state| desired.matches_state(state, schema, attribute, context))
@@ -3725,9 +3738,7 @@ impl DesiredCreateOnlyValues {
         self.values.values().any(|value| {
             matches!(
                 value,
-                DesiredCreateOnlyValue::Absent
-                    | DesiredCreateOnlyValue::Resolved(_)
-                    | DesiredCreateOnlyValue::Prefix(_)
+                DesiredCreateOnlyValue::Resolved(_) | DesiredCreateOnlyValue::Prefix(_)
             )
         })
     }
@@ -3737,9 +3748,7 @@ impl DesiredCreateOnlyValues {
         self.values.values().all(|value| {
             matches!(
                 value,
-                DesiredCreateOnlyValue::Absent
-                    | DesiredCreateOnlyValue::Resolved(_)
-                    | DesiredCreateOnlyValue::Prefix(_)
+                DesiredCreateOnlyValue::Resolved(_) | DesiredCreateOnlyValue::Prefix(_)
             )
         })
     }
@@ -3762,14 +3771,6 @@ impl DesiredCreateOnlyValues {
         let mut matched = 0;
         let mut mismatched = 0;
         for (attribute, desired_value) in &self.values {
-            if matches!(desired_value, DesiredCreateOnlyValue::Absent) {
-                if state_values.values.contains_key(attribute) {
-                    mismatched += 1;
-                } else {
-                    matched += 1;
-                }
-                continue;
-            }
             let Some(state_value) = state_values.values.get(attribute) else {
                 continue;
             };
@@ -3796,9 +3797,6 @@ impl DesiredCreateOnlyValues {
         context: &ComparisonContext<'_>,
     ) -> bool {
         self.values.iter().all(|(attribute, desired)| {
-            if matches!(desired, DesiredCreateOnlyValue::Absent) {
-                return !state_values.values.contains_key(attribute);
-            }
             let Some(state) = state_values.values.get(attribute) else {
                 return false;
             };
@@ -4206,6 +4204,7 @@ pub fn reconcile_anonymous_identifiers(
                     DeclaredIdentityRowOutcome::Mismatch => None,
                     DeclaredIdentityRowOutcome::Undecidable(
                         DeclaredIdentityRowUndecidability::DesiredUnresolved
+                        | DeclaredIdentityRowUndecidability::StateUncomparable
                         | DeclaredIdentityRowUndecidability::OverrideOriginUnknown { .. }
                         | DeclaredIdentityRowUndecidability::DesiredUnresolvedAndOverrideOriginUnknown {
                             ..

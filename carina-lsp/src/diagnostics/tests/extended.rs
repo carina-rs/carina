@@ -296,6 +296,20 @@ fn anonymous_absent_when_present_identity_matches_validate_and_is_complete() {
             .contains("not available as a written value or authored expression")),
         "validate accepts absence for when-present identity, so the LSP must too: {diagnostics:#?}",
     );
+
+    let diagnostics = analyze_anonymous_loop_source(concat!(
+        "mock.test.optional_identity {\n",
+        "  name = secret(\"known only at apply\")\n",
+        "}\n",
+    ));
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+    assert!(
+        diagnostic.message.contains("identity value 'name'"),
+        "a written unknown must still report incomplete identity: {diagnostics:#?}",
+    );
 }
 
 #[test]

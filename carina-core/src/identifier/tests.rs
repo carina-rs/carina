@@ -3846,6 +3846,183 @@ fn reconcile_when_present_absence_matches_only_a_state_row_with_the_attribute_ab
     );
 }
 
+fn redacted_identity_value() -> Value {
+    let digest = format!("argon2-legacy:73616c74:{}", "ab".repeat(32));
+    let hash = crate::resource::RedactedSecretHash::from_encoded_digest(&digest)
+        .expect("valid persisted secret digest");
+    Value::Deferred(DeferredValue::RedactedSecret { hash })
+}
+
+#[test]
+fn reconcile_when_present_absence_does_not_match_a_redacted_secret() {
+    let registry = when_present_identity_registry();
+    let mut desired = vec![Resource::pending_with_provider(
+        "mock",
+        "test.optional_identity",
+        None,
+    )];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("absent when-present identity must produce a destination address");
+    let state_entry = anonymous_state_entry(
+        &registry,
+        "mock",
+        "test.optional_identity",
+        "mock_test_optional_identity_11111111",
+        None,
+        None,
+        [("name", redacted_identity_value())],
+    );
+    let schema = registry.get_for(&desired[0]).unwrap();
+    let schema = schema.schema();
+    let desired_values = DesiredIdentityValues::from_resource(&desired[0], schema, &|_| Vec::new());
+
+    assert_eq!(
+        desired_values.compare_row(
+            &state_entry.identity_values,
+            schema,
+            &crate::differ::exact_comparison_context_for_tests(),
+        ),
+        DeclaredIdentityRowOutcome::Mismatch,
+        "a persisted redacted secret is present even though it cannot be compared",
+    );
+    let moves = reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| vec![state_entry.clone()],
+        &|_binding| Vec::new(),
+    );
+    assert!(
+        moves.is_empty(),
+        "a present secret must not migrate to absence"
+    );
+}
+
+#[test]
+fn reconcile_when_present_absence_selects_the_absent_row_beside_a_redacted_secret() {
+    let registry = when_present_identity_registry();
+    let mut desired = vec![Resource::pending_with_provider(
+        "mock",
+        "test.optional_identity",
+        None,
+    )];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("absent when-present identity must produce a destination address");
+    let destination = desired[0].id.identity_str().unwrap().to_string();
+    let absent_row = "mock_test_optional_identity_22222222";
+    let state_entries = vec![
+        anonymous_state_entry(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            "mock_test_optional_identity_11111111",
+            None,
+            None,
+            [("name", redacted_identity_value())],
+        ),
+        anonymous_state_entry_without_attributes(
+            &registry,
+            "mock",
+            "test.optional_identity",
+            absent_row,
+        ),
+    ];
+
+    let moves = try_reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| state_entries.clone(),
+        &|_binding| Vec::new(),
+    )
+    .expect("the secret row must not make the absent row ambiguous");
+
+    assert_eq!(
+        resolved_move_identity_pairs(&moves),
+        vec![(absent_row.to_string(), destination)],
+    );
+}
+
+#[test]
+fn nested_when_present_absence_does_not_match_redacted_state() {
+    let schema = ResourceSchema::new("test.nested_optional_identity")
+        .attribute(
+            AttributeSchema::required(
+                "settings",
+                AttributeType::struct_(
+                    "Settings",
+                    vec![
+                        StructField::optional("name", AttributeType::string())
+                            .create_only()
+                            .identity_when_present()
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .expect("nested when-present identity schema must be valid");
+    let desired = Resource::pending_with_provider("mock", "test.nested_optional_identity", None)
+        .with_attribute(
+            "settings",
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        );
+    let desired_values = DesiredIdentityValues::from_resource(&desired, &schema, &|_| Vec::new());
+    let redacted_leaf = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "name".to_string(),
+        redacted_identity_value(),
+    )])));
+
+    for settings in [redacted_leaf, redacted_identity_value()] {
+        let state = StateRowIdentityValues::from_state_row(
+            &schema,
+            &HashMap::from([("settings".to_string(), settings)]),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            desired_values.compare_row(
+                &state,
+                &schema,
+                &crate::differ::exact_comparison_context_for_tests(),
+            ),
+            DeclaredIdentityRowOutcome::Mismatch,
+            "a redacted leaf or ancestor cannot prove that the path is absent",
+        );
+    }
+}
+
+#[test]
+fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted_state() {
+    let registry = when_present_identity_registry();
+    let resolved = Resource::pending_with_provider("mock", "test.optional_identity", None)
+        .with_attribute("name", concrete_string("service-existing"));
+    let prefix = Resource::pending_with_provider("mock", "test.optional_identity", None)
+        .with_attribute("name_prefix", concrete_string("service-"));
+
+    for desired in [resolved, prefix] {
+        let schema = registry.get_for(&desired).unwrap();
+        let schema = schema.schema();
+        let desired_values =
+            DesiredIdentityValues::from_resource(&desired, schema, &|_| Vec::new());
+        let state = StateRowIdentityValues::from_state_row(
+            schema,
+            &HashMap::from([("name".to_string(), redacted_identity_value())]),
+            &HashMap::new(),
+        );
+        let context = crate::differ::exact_comparison_context_for_tests();
+
+        assert!(matches!(
+            desired_values.compare_row(&state, schema, &context),
+            DeclaredIdentityRowOutcome::Undecidable(_),
+        ));
+        let absent =
+            StateRowIdentityValues::from_state_row(schema, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            desired_values.compare_row(&absent, schema, &context),
+            DeclaredIdentityRowOutcome::Mismatch,
+        );
+    }
+}
+
 #[test]
 fn reconcile_declared_identity_migration_evaluates_interpolation_over_state_backed_reference() {
     let registry = scalar_identity_registry();
