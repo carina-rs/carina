@@ -73,10 +73,11 @@ length-prefixed. It contains the length-prefixed domain
 each length-prefixed key and value; then the identity-path count. Each path has
 its segment count followed by segments tagged `0` for an attribute or `1` for
 a struct field and a length-prefixed name. The path value then has a kind tag:
-`0` for `Written`, `1` for `ReferenceExpression`, or `2` for `Prefix`, followed
-by its length-prefixed deterministic spelling. Counts and lengths are unsigned
-64-bit little-endian integers. The address suffix is the first 32 bits of the
-SHA-256 digest, interpreted in big-endian byte order.
+`0` for `Written`, `1` for `ReferenceExpression`, `2` for `Prefix`, or `3` for
+`PrefixExpression`, followed by its length-prefixed deterministic spelling.
+Counts and lengths are unsigned 64-bit little-endian integers. The address
+suffix is the first 32 bits of the SHA-256 digest, interpreted in big-endian
+byte order.
 
 Nested create-only leaves in an unordered list are compared as a multiset,
 independent of element order and mutable sibling fields. Reordering alone is

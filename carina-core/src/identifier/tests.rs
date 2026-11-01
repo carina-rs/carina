@@ -703,6 +703,71 @@ fn anonymous_missing_declared_identity_is_a_typed_error() {
 }
 
 #[test]
+fn secret_declared_identity_is_incomplete_and_suggests_a_let_binding() {
+    let registry = scalar_identity_registry();
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(
+            "must-not-reach-the-address-hash",
+        )))),
+    );
+    let mut resources = vec![resource];
+
+    let error =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+            .expect_err("secret plaintext must not participate in a declared-identity address");
+
+    let AnonymousIdentityError::IncompleteDeclaredIdentity(incomplete) = &error else {
+        panic!("expected incomplete declared identity, got {error}");
+    };
+    assert_eq!(
+        incomplete
+            .missing_paths()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["name"],
+    );
+    assert!(error.to_string().contains("name with `let`"), "{error}");
+    assert!(resources[0].id.identity_str().is_none());
+}
+
+#[test]
+fn legacy_create_only_secret_remains_a_stable_identity_input() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.legacy_secret")
+            .attribute(
+                AttributeSchema::required("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .expect("legacy create-only fixture schema must be valid"),
+    );
+    let mut resource = Resource::pending_with_provider("mock", "test.legacy_secret", None);
+    resource.set_attr(
+        "name",
+        Value::Deferred(DeferredValue::Secret(Box::new(concrete_string(
+            "legacy-hash-material",
+        )))),
+    );
+    let mut resources = vec![resource];
+
+    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
+        .expect("the legacy create-only hash continues to accept secret values");
+
+    assert!(
+        resources[0]
+            .id
+            .identity_str()
+            .is_some_and(|identity| identity.starts_with("mock_test_legacy_secret_")),
+    );
+}
+
+#[test]
 fn anonymous_deferred_declared_identity_is_a_typed_error() {
     let mut registry = SchemaRegistry::new();
     registry.insert(
@@ -997,9 +1062,12 @@ fn generic_generated_address_collision_is_rejected_across_provider_instances() {
         compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
             .expect_err("a generic generated address must remain globally collision-checked");
 
-    assert!(
-        matches!(error, AnonymousIdentityError::Collision(_)),
-        "{error}"
+    let AnonymousIdentityError::Collision(collision) = error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::SharedAddress,
     );
 }
 
@@ -1021,7 +1089,15 @@ fn equal_declared_identity_values_are_a_typed_error_suggesting_let() {
         compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
             .expect_err("equal declared identity must be rejected");
 
-    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    let AnonymousIdentityError::Collision(collision) = &error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
+            same_identifier: true,
+        },
+    );
     assert!(
         error.to_string().contains("equal declared identity values"),
         "{error}",
@@ -1054,7 +1130,15 @@ fn equal_declared_identity_values_are_rejected_across_provider_instances() {
         compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
             .expect_err("state-key aliases across provider instances must be rejected");
 
-    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    let AnonymousIdentityError::Collision(collision) = &error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
+            same_identifier: true,
+        },
+    );
     assert!(
         error.to_string().contains("equal declared identity values"),
         "{error}",
@@ -1081,7 +1165,15 @@ fn equal_declared_identity_values_are_rejected_across_module_scopes() {
         compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
             .expect_err("module address prefixes must not hide equal real-world identities");
 
-    assert!(matches!(error, AnonymousIdentityError::Collision(_)));
+    let AnonymousIdentityError::Collision(collision) = &error else {
+        panic!("expected a typed collision, got {error}");
+    };
+    assert_eq!(
+        collision.kind(),
+        AnonymousResourceIdentifierCollisionKind::EqualDeclaredIdentity {
+            same_identifier: false,
+        },
+    );
     assert!(
         error.to_string().contains("equal declared identity values"),
         "{error}",
@@ -2805,15 +2897,14 @@ fn state_row_identity_values_use_the_original_permanent_name_override() {
         )]),
     );
     let context = crate::differ::exact_comparison_context_for_tests();
-    let StateRowIdentityValues::Comparable(without_override) = without_override else {
-        panic!("a row without an override must remain comparable");
-    };
-    let StateRowIdentityValues::Comparable(with_override) = with_override else {
-        panic!("a row with a recorded override origin must remain comparable");
-    };
-
-    assert!(!desired_values.all_match(&without_override, &schema, &context));
-    assert!(desired_values.all_match(&with_override, &schema, &context));
+    assert_eq!(
+        desired_values.compare_row(&without_override, &schema, &context),
+        DeclaredIdentityRowOutcome::Mismatch,
+    );
+    assert_eq!(
+        desired_values.compare_row(&with_override, &schema, &context),
+        DeclaredIdentityRowOutcome::Match,
+    );
 }
 
 #[test]
@@ -2886,6 +2977,78 @@ fn reconcile_unknown_name_override_origin_requires_an_explicit_moved_block() {
         "{message}",
     );
     assert!(message.contains("moved"), "{message}");
+}
+
+#[test]
+fn reconcile_override_hidden_identity_row_with_comparable_mismatch_is_ignored() {
+    let schema = ResourceSchema::new("test.unique_identity")
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required("scope", AttributeType::string())
+                .create_only()
+                .identity()
+                .build(),
+        )
+        .with_unique_name_attribute("name")
+        .validate()
+        .expect("schema fixture must be valid");
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+
+    let mut desired = Resource::with_provider(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_22222222",
+        None,
+    );
+    desired.set_attr("name", concrete_string("new-role"));
+    desired.set_attr("scope", concrete_string("new-scope"));
+
+    let origin_id = ResolvedResourceId::with_provider_identity(
+        "mock",
+        "test.unique_identity",
+        "mock_test_unique_identity_11111111",
+        None,
+    );
+    let state_entry = AnonymousIdStateInfo::try_from_state_row(
+        origin_id,
+        None,
+        registry
+            .get(
+                "mock",
+                "test.unique_identity",
+                crate::schema::SchemaKind::Resource,
+            )
+            .expect("registered schema")
+            .schema(),
+        &HashMap::from([
+            ("name".to_string(), concrete_string("old-role-temporary")),
+            ("scope".to_string(), concrete_string("old-scope")),
+        ]),
+        &HashMap::from([(
+            "name".to_string(),
+            crate::name_override::NameOverride {
+                temp_value: "old-role-temporary".to_string(),
+                original_value: None,
+            },
+        )]),
+    )
+    .expect("state fixture is comparable by provider and type");
+
+    let moves = try_reconcile_anonymous_identifiers(
+        &[desired],
+        &registry,
+        &|_provider, _resource_type| vec![state_entry.clone()],
+        &|_binding| Vec::new(),
+    )
+    .expect("a comparable identity mismatch makes the orphan an ordinary delete");
+
+    assert!(moves.is_empty());
 }
 
 #[test]
@@ -3615,6 +3778,43 @@ fn reconcile_unresolved_declared_identity_with_legacy_candidate_requires_moved()
     let message = error.to_string();
     assert!(message.contains(legacy), "{message}");
     assert!(message.contains("moved"), "{message}");
+}
+
+#[test]
+fn reconcile_unresolved_declared_identity_ignores_a_mismatched_orphan_row() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        record_set_identity_schema()
+            .validate()
+            .expect("record-set schema fixture must be valid"),
+    );
+    let mut desired = vec![reference_record_set("new_zone", "new.example.com.", "A")];
+    compute_anonymous_identifiers_for_test(&mut desired, &[], &registry, &|_| Vec::new())
+        .expect("authored hosted-zone reference must have a plan-time address");
+    let orphan = anonymous_state_entry(
+        &registry,
+        "mock",
+        "route53.RecordSet",
+        "mock_route53_record_set_11111111",
+        None,
+        None,
+        [
+            ("hosted_zone_id", concrete_string("Z-OLD")),
+            ("name", concrete_string("old.example.com.")),
+            ("type", concrete_string("A")),
+        ],
+    );
+
+    let moves = try_reconcile_anonymous_identifiers(
+        &desired,
+        &registry,
+        &|_provider, _resource_type| vec![orphan.clone()],
+        &|_binding| Vec::new(),
+    )
+    .expect("the differing record name proves this is not a state migration");
+
+    assert!(moves.is_empty());
 }
 
 #[test]

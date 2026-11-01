@@ -27,7 +27,7 @@ use crate::wait::{WaitTargetLookup, resolve_wait_target};
 
 use super::{
     ComparisonContext, PlanPriorStates, PlannedListKeyRelease, PresentDiff,
-    diff_present_with_releases, type_aware_equal,
+    comparison::AuthoredRemovalEvidence, diff_present_with_releases, type_aware_equal,
 };
 
 fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {
@@ -129,6 +129,7 @@ struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
     element_type: &'schema AttributeType,
     schema: &'schema ResourceSchema,
     context: &'context ComparisonContext<'comparison>,
+    removal_evidence: AuthoredRemovalEvidence,
     current_matches: &'items mut [Option<usize>],
 }
 
@@ -142,6 +143,7 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
                     self.desired_items[desired_index],
                     self.schema,
                     self.context,
+                    self.removal_evidence,
                     &mut Vec::new(),
                 )
             {
@@ -165,6 +167,7 @@ fn create_only_values_compatible<'schema>(
     desired: &Value,
     schema: &'schema ResourceSchema,
     context: &ComparisonContext<'_>,
+    removal_evidence: AuthoredRemovalEvidence,
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
     match &attr_type.kind {
@@ -177,7 +180,13 @@ fn create_only_values_compatible<'schema>(
             };
             ref_chain.push(name);
             let compatible = create_only_values_compatible(
-                definition, current, desired, schema, context, ref_chain,
+                definition,
+                current,
+                desired,
+                schema,
+                context,
+                removal_evidence,
+                ref_chain,
             );
             ref_chain.pop();
             compatible
@@ -209,6 +218,7 @@ fn create_only_values_compatible<'schema>(
                             desired,
                             schema,
                             context,
+                            removal_evidence,
                             &mut Vec::new(),
                         )
                     })
@@ -232,6 +242,7 @@ fn create_only_values_compatible<'schema>(
                     element_type,
                     schema,
                     context,
+                    removal_evidence,
                     current_matches: &mut current_matches,
                 };
                 (0..desired_items.len()).all(|desired_index| {
@@ -259,6 +270,7 @@ fn create_only_values_compatible<'schema>(
                             desired,
                             schema,
                             context,
+                            removal_evidence,
                             &mut Vec::new(),
                         )
                     })
@@ -278,7 +290,20 @@ fn create_only_values_compatible<'schema>(
             };
             fields.iter().all(|field| {
                 let Some(desired) = desired_fields.get(&field.name) else {
-                    return true;
+                    return match removal_evidence {
+                        AuthoredRemovalEvidence::Recorded => {
+                            current_fields.get(&field.name).is_none_or(|current| {
+                                !field.create_only
+                                    && !contains_authored_create_only_value(
+                                        &field.field_type,
+                                        current,
+                                        schema,
+                                        &mut Vec::new(),
+                                    )
+                            })
+                        }
+                        AuthoredRemovalEvidence::Unrecorded => true,
+                    };
                 };
                 if field.create_only {
                     return current_fields.get(&field.name).is_some_and(|current| {
@@ -303,6 +328,7 @@ fn create_only_values_compatible<'schema>(
                         desired,
                         schema,
                         context,
+                        removal_evidence,
                         &mut Vec::new(),
                     )
                 })
@@ -322,7 +348,8 @@ fn create_only_values_compatible<'schema>(
 
 pub(super) fn find_changed_create_only(
     changed_attributes: &[String],
-    from: &State,
+    current_attributes: &HashMap<String, Value>,
+    removal_evidence: AuthoredRemovalEvidence,
     to: &Resource,
     schema: &ResourceSchema,
     context: &ComparisonContext<'_>,
@@ -341,7 +368,7 @@ pub(super) fn find_changed_create_only(
             let Some(attribute_schema) = schema.attributes().get(attribute.as_str()) else {
                 return false;
             };
-            let Some(current) = from.attributes.get(attribute.as_str()) else {
+            let Some(current) = current_attributes.get(attribute.as_str()) else {
                 return contains_authored_create_only_value(
                     attribute_schema.attr_type(),
                     desired,
@@ -355,6 +382,7 @@ pub(super) fn find_changed_create_only(
                 desired,
                 schema,
                 context,
+                removal_evidence,
                 &mut Vec::new(),
             )
         })
@@ -863,9 +891,19 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
+                        let desired_attributes = to.resolved_attributes();
+                        let authored_views = super::comparison::project_authored_attribute_views(
+                            &desired_attributes,
+                            &from.attributes,
+                            saved,
+                            prev_explicit_for_resource,
+                            Some(schema),
+                            context,
+                        );
                         let changed_create_only = find_changed_create_only(
                             &changed_attributes,
-                            &from,
+                            authored_views.current(),
+                            authored_views.removal_evidence(),
                             &to,
                             schema,
                             context,
@@ -1517,7 +1555,8 @@ fn promote_pending_replaces_for_dependents(
             let owner_schema = resolved_comparison.owner_schema();
             let create_only_refs = find_changed_create_only(
                 &ref_attr_names,
-                present.state(),
+                &present.state().attributes,
+                AuthoredRemovalEvidence::Unrecorded,
                 resource,
                 owner_schema.schema().as_schema(),
                 resolved_comparison.context(),

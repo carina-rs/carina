@@ -994,6 +994,102 @@ pub(super) struct AttributeValueViews<'a> {
     nested_write_only: &'a NestedWriteOnlyRecord,
 }
 
+pub(super) struct AuthoredAttributeViews {
+    current: HashMap<String, Value>,
+    saved: Option<HashMap<String, Value>>,
+    removal_evidence: AuthoredRemovalEvidence,
+    previously_authored_top_level_attributes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AuthoredRemovalEvidence {
+    Recorded,
+    Unrecorded,
+}
+
+impl AuthoredAttributeViews {
+    pub(super) fn current(&self) -> &HashMap<String, Value> {
+        &self.current
+    }
+
+    fn saved(&self) -> Option<&HashMap<String, Value>> {
+        self.saved.as_ref()
+    }
+
+    pub(super) fn removal_evidence(&self) -> AuthoredRemovalEvidence {
+        self.removal_evidence
+    }
+
+    fn previously_authored_top_level_attributes(&self) -> &[String] {
+        &self.previously_authored_top_level_attributes
+    }
+}
+
+/// Apply the persisted authoring tree to current and saved values.
+///
+/// This is the shared removal-evidence seam for ordinary diffing and nested
+/// create-only replacement detection. A provider-populated value that the user
+/// never authored is absent from both projected views, while a previously
+/// authored value remains visible when desired omits it.
+pub(super) fn project_authored_attribute_views(
+    desired: &HashMap<String, Value>,
+    current: &HashMap<String, Value>,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+    context: &ComparisonContext<'_>,
+) -> AuthoredAttributeViews {
+    let (removal_evidence, previously_authored_top_level_attributes) = match prev_explicit {
+        Some(ExplicitFields::Struct { children }) => (
+            AuthoredRemovalEvidence::Recorded,
+            children.keys().cloned().collect(),
+        ),
+        Some(
+            ExplicitFields::Leaf
+            | ExplicitFields::List { .. }
+            | ExplicitFields::ListElements { .. }
+            | ExplicitFields::WholeValue { .. }
+            | ExplicitFields::Unrecorded,
+        )
+        | None => (AuthoredRemovalEvidence::Unrecorded, Vec::new()),
+    };
+    let empty_stored = HashMap::new();
+    let projection = prev_explicit.map(|explicit| {
+        ExplicitProjection::for_desired(
+            saved.unwrap_or(&empty_stored),
+            desired,
+            explicit,
+            schema,
+            context,
+        )
+    });
+    let current = projection.as_ref().map_or_else(
+        || current.clone(),
+        |projection| {
+            projection
+                .project_attributes(current.clone())
+                .into_attributes()
+        },
+    );
+    let saved = match saved {
+        Some(saved) => match projection.as_ref() {
+            Some(projection) => Some(
+                projection
+                    .project_attributes(saved.clone())
+                    .into_attributes(),
+            ),
+            None => Some(saved.clone()),
+        },
+        None => None,
+    };
+    AuthoredAttributeViews {
+        current,
+        saved,
+        removal_evidence,
+        previously_authored_top_level_attributes,
+    }
+}
+
 impl<'a> AttributeValueViews<'a> {
     pub(super) fn new(
         desired: &'a HashMap<String, Value>,
@@ -1043,33 +1139,16 @@ pub(super) fn find_changed_attributes_with_ignores(
     // doesn't smuggle server-only fields back into `effective_desired`
     // (refs awscc#206).
     let raw_saved = saved;
-    let empty_stored = HashMap::new();
-    let projection = prev_explicit.map(|explicit| {
-        ExplicitProjection::for_desired(
-            raw_saved.unwrap_or(&empty_stored),
-            desired,
-            explicit,
-            schema,
-            context,
-        )
-    });
-    let projected_current = projection.as_ref().map_or_else(
-        || current.clone(),
-        |projection| {
-            projection
-                .project_attributes(current.clone())
-                .into_attributes()
-        },
+    let projected = project_authored_attribute_views(
+        desired,
+        current,
+        raw_saved,
+        prev_explicit,
+        schema,
+        context,
     );
-    let projected_saved = match (projection.as_ref(), raw_saved) {
-        (Some(projection), Some(stored)) => Some(
-            projection
-                .project_attributes(stored.clone())
-                .into_attributes(),
-        ),
-        _ => None,
-    };
-    let projected_saved = projected_saved.as_ref().or(raw_saved);
+    let projected_current = projected.current();
+    let projected_saved = projected.saved();
 
     let mut differing_ignored_paths = std::collections::HashSet::new();
     for path in ignore_changes.iter().filter(|path| !path.is_write_only()) {
@@ -1178,25 +1257,13 @@ pub(super) fn find_changed_attributes_with_ignores(
     // attribute removal is not detected for those rows. A later desired-backed
     // state write can seed the record from desired keys (never provider keys),
     // after which removals of those recorded keys are detectable.
-    match prev_explicit {
-        Some(ExplicitFields::Struct { children }) => {
-            for key in children.keys() {
-                if desired.contains_key(key) {
-                    continue;
-                }
-                if projected_current.contains_key(key) {
-                    changed.push(key.clone());
-                }
-            }
+    for key in projected.previously_authored_top_level_attributes() {
+        if desired.contains_key(key) {
+            continue;
         }
-        Some(
-            ExplicitFields::Leaf
-            | ExplicitFields::List { .. }
-            | ExplicitFields::ListElements { .. }
-            | ExplicitFields::WholeValue { .. }
-            | ExplicitFields::Unrecorded,
-        )
-        | None => {}
+        if projected_current.contains_key(key) {
+            changed.push(key.clone());
+        }
     }
 
     AttributeChanges {

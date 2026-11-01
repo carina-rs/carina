@@ -248,6 +248,33 @@ fn anonymous_loop_missing_declared_identity_uses_the_loop_range() {
 }
 
 #[test]
+fn anonymous_secret_declared_identity_reports_the_shared_incomplete_error() {
+    let source = concat!(
+        "mock.test.identity {\n",
+        "  name = secret(\"must-not-reach-the-address-hash\")\n",
+        "}\n",
+    );
+    let diagnostics = analyze_anonymous_loop_source(source);
+    let diagnostic = only_message_diagnostic(
+        &diagnostics,
+        "not available as a written value or authored expression",
+    );
+
+    assert_eq!(
+        diagnostic.range,
+        Range::new(Position::new(0, 0), Position::new(0, 18))
+    );
+    assert_eq!(
+        diagnostic.message,
+        concat!(
+            "Anonymous resource of type 'mock.test.identity' cannot derive an address because ",
+            "identity value 'name' is not available as a written value or authored expression ",
+            "at plan time. Write the identity value or give the resource a name with `let`.",
+        )
+    );
+}
+
+#[test]
 fn incomplete_declared_identity_with_block_alias_is_anchored_from_typed_member() {
     let temp = tempfile::tempdir().expect("create diagnostic fixture");
     let source = concat!(

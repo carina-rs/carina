@@ -94,9 +94,19 @@ pub fn managed_binding_stability(
             );
             continue;
         }
+        let desired_attributes = to.resolved_attributes();
+        let authored_views = comparison::project_authored_attribute_views(
+            &desired_attributes,
+            &from.attributes,
+            saved_attrs.get(&resource.id),
+            prev_explicit.get(&resource.id),
+            Some(schema.as_schema()),
+            context,
+        );
         if !plan::find_changed_create_only(
             &changed_attributes,
-            &from,
+            authored_views.current(),
+            authored_views.removal_evidence(),
             &to,
             schema.as_schema(),
             context,

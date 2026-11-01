@@ -304,3 +304,54 @@ fn legacy_create_only_reference_hash_is_moved_to_the_declared_identity_address()
         output_text(&converged),
     );
 }
+
+#[test]
+fn hosted_zone_replacement_with_unrelated_record_plans_delete_and_create() {
+    let scenario = Scenario::new();
+    fs::write(
+        scenario.project.join("records.crn"),
+        r#"mock.route53.RecordSet {
+  hosted_zone_id   = zone.id
+  name             = "old.example.com."
+  type             = "A"
+  resource_records = ["192.0.2.10"]
+}
+"#,
+    )
+    .expect("write initial record fixture");
+    scenario.init();
+    assert_success(
+        "initial carina apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+
+    fs::write(
+        scenario.project.join("zone.crn"),
+        "let new_zone = mock.route53.HostedZone { name = \"new.example.com.\" }\n",
+    )
+    .expect("write replacement hosted zone");
+    fs::write(
+        scenario.project.join("records.crn"),
+        r#"mock.route53.RecordSet {
+  hosted_zone_id   = new_zone.id
+  name             = "new.example.com."
+  type             = "A"
+  resource_records = ["192.0.2.20"]
+}
+"#,
+    )
+    .expect("write replacement record fixture");
+
+    let replacement = scenario.carina(&["plan", "--refresh=false", "."]);
+    assert_success("hosted-zone replacement plan", &replacement);
+    let rendered = output_text(&replacement);
+    assert!(
+        rendered.contains("Plan: 2 to add, 0 to change, 2 to destroy."),
+        "the old zone and record must be deleted while their unrelated replacements are created:\n\
+         {rendered}",
+    );
+    assert!(
+        !rendered.contains("to move"),
+        "unexpected migration:\n{rendered}"
+    );
+}
