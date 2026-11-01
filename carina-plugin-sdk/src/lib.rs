@@ -232,31 +232,98 @@ pub enum BindingPattern {
 /// dispatched work but its identifier-less token cannot cross the WASM
 /// boundary, the guest traps so the host can classify the attempt from its
 /// per-call egress record instead of erasing it as untracked.
+///
+/// The phase comes only from the token; callers cannot supply a second phase:
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{Pending, PendingPhase, PhasedToken};
+///
+/// fn disagree<T: PhasedToken>(token: T) -> Pending<T> {
+///     Pending { token, poll_after_secs: 1, phase: PendingPhase::Operation }
+/// }
+/// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pending<T> {
     pub token: T,
     pub poll_after_secs: u32,
-    pub phase: carina_provider_protocol::PendingPhase,
 }
 
 pub use carina_provider_protocol::types::{CreateProgress, PendingDelete, PendingToken, Sent};
 pub use carina_provider_protocol::{PendingPhase, PollFinality, PollRequest};
 
-impl<T> Pending<T> {
-    pub fn operation(token: T, poll_after_secs: u32) -> Self {
+/// The phase carried by a provider-owned create or update continuation.
+///
+/// Derive this from the token's variant so pending and preserved results
+/// always report the phase of the continuation they carry.
+pub trait PhasedToken {
+    fn phase(&self) -> PendingPhase;
+}
+
+impl<T: PhasedToken> Pending<T> {
+    pub fn new(token: T, poll_after_secs: u32) -> Self {
         Self {
             token,
             poll_after_secs,
-            phase: PendingPhase::Operation,
         }
     }
 
-    pub fn read_back(token: T, poll_after_secs: u32) -> Self {
-        Self {
-            token,
-            poll_after_secs,
-            phase: PendingPhase::ReadBack,
+    pub fn phase(&self) -> PendingPhase {
+        self.token.phase()
+    }
+}
+
+/// An operation continuation that is safe to carry without an identifier.
+///
+/// Read-back requires an identifier. Identifier-less create handles accept
+/// only this checked token, and unissued poll/resume arms carry it as well.
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{CreateAttempt, CreateStep, PhasedToken, Sent};
+///
+/// fn pending<T: PhasedToken>(attempt: CreateAttempt, token: T) -> CreateStep<T> {
+///     attempt.pending(token, Sent::AllRequestAttributes, 1)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PhasedToken, PollAttempt, CreateStep};
+///
+/// fn pending<T: PhasedToken>(attempt: PollAttempt, token: T) -> CreateStep<T> {
+///     attempt.pending(token, 1)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_plugin_sdk::{PhasedToken, ResumeAttempt, ResumeVerdict, types::ProviderError};
+///
+/// fn preserve<T: PhasedToken>(attempt: ResumeAttempt, token: T, error: ProviderError)
+///     -> ResumeVerdict<T>
+/// {
+///     attempt.preserve(token, 1, error)
+/// }
+/// ```
+#[derive(Debug)]
+pub struct OperationToken<T>(T);
+
+impl<T: PhasedToken> OperationToken<T> {
+    /// Narrow an operation token, returning a read-back token unchanged.
+    pub fn new(token: T) -> Result<Self, T> {
+        match token.phase() {
+            PendingPhase::Operation => Ok(Self(token)),
+            PendingPhase::ReadBack => Err(token),
         }
+    }
+}
+
+impl<T> OperationToken<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> AsRef<T> for OperationToken<T> {
+    fn as_ref(&self) -> &T {
+        &self.0
     }
 }
 
@@ -295,10 +362,15 @@ impl CreateAttempt {
         IssuedCreate { identifier, sent }
     }
 
-    pub fn pending<T>(self, token: T, sent: Sent, poll_after_secs: u32) -> CreateStep<T> {
+    pub fn pending<T>(
+        self,
+        token: OperationToken<T>,
+        sent: Sent,
+        poll_after_secs: u32,
+    ) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
-                token,
+                token: token.into_inner(),
                 progress: CreateProgress::Operating { identifier: None },
                 sent,
                 poll_after_secs,
@@ -308,7 +380,7 @@ impl CreateAttempt {
 
     pub fn preserve<T>(
         self,
-        token: T,
+        token: OperationToken<T>,
         sent: Sent,
         poll_after_secs: u32,
         error: ProviderError,
@@ -316,7 +388,7 @@ impl CreateAttempt {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
-                    token,
+                    token: token.into_inner(),
                     progress: CreateProgress::Operating { identifier: None },
                     sent,
                     poll_after_secs,
@@ -368,10 +440,10 @@ impl PollAttempt {
         }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
+    pub fn pending<T>(self, token: OperationToken<T>, poll_after_secs: u32) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
             carina_provider_protocol::types::PendingCreate {
-                token,
+                token: token.into_inner(),
                 progress: CreateProgress::Operating { identifier: None },
                 sent: self.sent,
                 poll_after_secs,
@@ -381,14 +453,14 @@ impl PollAttempt {
 
     pub fn preserve<T>(
         self,
-        token: T,
+        token: OperationToken<T>,
         poll_after_secs: u32,
         error: ProviderError,
     ) -> PollVerdict<T> {
         PollVerdict(carina_provider_protocol::types::PollVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
                 pending: carina_provider_protocol::types::PendingCreate {
-                    token,
+                    token: token.into_inner(),
                     progress: CreateProgress::Operating { identifier: None },
                     sent: self.sent,
                     poll_after_secs,
@@ -422,39 +494,33 @@ impl IssuedCreate {
         }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
-    }
-
-    /// Continue polling the post-create read after the identifier is known.
-    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
-    }
-
-    fn pending_in_phase<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        phase: PendingPhase,
-    ) -> CreateStep<T> {
+    pub fn pending<T: PhasedToken>(self, token: T, poll_after_secs: u32) -> CreateStep<T> {
         CreateStep(carina_provider_protocol::types::CreateStep::Pending(
-            carina_provider_protocol::types::PendingCreate {
-                token,
-                progress: match phase {
-                    PendingPhase::Operation => CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
-                        identifier: self.identifier,
-                    },
-                },
-                sent: self.sent,
-                poll_after_secs,
-            },
+            self.into_pending(token, poll_after_secs),
         ))
     }
 
-    pub fn preserve<T>(
+    fn into_pending<T: PhasedToken>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+    ) -> carina_provider_protocol::types::PendingCreate<T> {
+        carina_provider_protocol::types::PendingCreate {
+            progress: match token.phase() {
+                PendingPhase::Operation => CreateProgress::Operating {
+                    identifier: Some(self.identifier),
+                },
+                PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                    identifier: self.identifier,
+                },
+            },
+            token,
+            sent: self.sent,
+            poll_after_secs,
+        }
+    }
+
+    pub fn preserve<T: PhasedToken>(
         self,
         token: T,
         poll_after_secs: u32,
@@ -462,14 +528,7 @@ impl IssuedCreate {
     ) -> CreateVerdict<T> {
         CreateVerdict(carina_provider_protocol::types::CreateVerdict::InFlight(
             carina_provider_protocol::types::CreateInFlight {
-                pending: carina_provider_protocol::types::PendingCreate {
-                    token,
-                    progress: CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    sent: self.sent,
-                    poll_after_secs,
-                },
+                pending: self.into_pending(token, poll_after_secs),
                 error,
             },
         ))
@@ -595,10 +654,10 @@ impl ResumeAttempt {
         ResumedCreate { identifier }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
+    pub fn pending<T>(self, token: OperationToken<T>, poll_after_secs: u32) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
             carina_provider_protocol::types::ResumePending {
-                token,
+                token: token.into_inner(),
                 progress: CreateProgress::Operating { identifier: None },
                 poll_after_secs,
             },
@@ -607,14 +666,14 @@ impl ResumeAttempt {
 
     pub fn preserve<T>(
         self,
-        token: T,
+        token: OperationToken<T>,
         poll_after_secs: u32,
         error: ProviderError,
     ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
                 pending: carina_provider_protocol::types::ResumePending {
-                    token,
+                    token: token.into_inner(),
                     progress: CreateProgress::Operating { identifier: None },
                     poll_after_secs,
                 },
@@ -681,37 +740,32 @@ impl ResumedCreate {
         FinishingResume { identifier }
     }
 
-    pub fn pending<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::Operation)
-    }
-
-    pub fn pending_read_back<T>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
-        self.pending_in_phase(token, poll_after_secs, PendingPhase::ReadBack)
-    }
-
-    fn pending_in_phase<T>(
-        self,
-        token: T,
-        poll_after_secs: u32,
-        phase: PendingPhase,
-    ) -> ResumeStep<T> {
+    pub fn pending<T: PhasedToken>(self, token: T, poll_after_secs: u32) -> ResumeStep<T> {
         ResumeStep(carina_provider_protocol::types::ResumeStep::Pending(
-            carina_provider_protocol::types::ResumePending {
-                token,
-                progress: match phase {
-                    PendingPhase::Operation => CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    PendingPhase::ReadBack => CreateProgress::ReadingBack {
-                        identifier: self.identifier,
-                    },
-                },
-                poll_after_secs,
-            },
+            self.into_pending(token, poll_after_secs),
         ))
     }
 
-    pub fn preserve<T>(
+    fn into_pending<T: PhasedToken>(
+        self,
+        token: T,
+        poll_after_secs: u32,
+    ) -> carina_provider_protocol::types::ResumePending<T> {
+        carina_provider_protocol::types::ResumePending {
+            progress: match token.phase() {
+                PendingPhase::Operation => CreateProgress::Operating {
+                    identifier: Some(self.identifier),
+                },
+                PendingPhase::ReadBack => CreateProgress::ReadingBack {
+                    identifier: self.identifier,
+                },
+            },
+            token,
+            poll_after_secs,
+        }
+    }
+
+    pub fn preserve<T: PhasedToken>(
         self,
         token: T,
         poll_after_secs: u32,
@@ -719,13 +773,7 @@ impl ResumedCreate {
     ) -> ResumeVerdict<T> {
         ResumeVerdict(carina_provider_protocol::types::ResumeVerdict::InFlight(
             carina_provider_protocol::types::ResumeInFlight {
-                pending: carina_provider_protocol::types::ResumePending {
-                    token,
-                    progress: CreateProgress::Operating {
-                        identifier: Some(self.identifier),
-                    },
-                    poll_after_secs,
-                },
+                pending: self.into_pending(token, poll_after_secs),
                 error,
             },
         ))
@@ -825,14 +873,14 @@ impl FinishingResume {
 /// Typestate and provider-owned token passed to a create poll.
 #[derive(Debug)]
 pub enum Poll<T> {
-    Unissued(PollAttempt, T),
+    Unissued(PollAttempt, OperationToken<T>),
     Issued(IssuedCreate, T),
 }
 
 /// Typestate and provider-owned token passed to a persisted create resume.
 #[derive(Debug)]
 pub enum Resume<T> {
-    Unissued(ResumeAttempt, T),
+    Unissued(ResumeAttempt, OperationToken<T>),
     Issued(ResumedCreate, T),
 }
 
@@ -1009,6 +1057,12 @@ pub enum DeleteOutcome<T> {
 /// Token type for an operation kind that this provider can never defer.
 #[derive(Debug)]
 pub enum Never {}
+
+impl PhasedToken for Never {
+    fn phase(&self) -> PendingPhase {
+        match *self {}
+    }
+}
 
 impl serde::Serialize for Never {
     fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
@@ -1242,8 +1296,8 @@ impl DesiredResource {
 /// Trait that provider authors implement.
 #[allow(clippy::result_large_err)]
 pub trait CarinaProvider {
-    type CreateToken: serde::Serialize + serde::de::DeserializeOwned;
-    type UpdateToken: serde::Serialize + serde::de::DeserializeOwned;
+    type CreateToken: PhasedToken + serde::Serialize + serde::de::DeserializeOwned;
+    type UpdateToken: PhasedToken + serde::Serialize + serde::de::DeserializeOwned;
     type DeleteToken: serde::Serialize + serde::de::DeserializeOwned;
 
     /// Return provider name and display name.
@@ -1497,7 +1551,14 @@ pub fn dispatch_poll_create<P: CarinaProvider + ?Sized>(
 ) -> Result<ProtocolCreateStep<P::CreateToken>, Box<ProtocolPollVerdict<P::CreateToken>>> {
     let poll = match identifier {
         Some(identifier) => Poll::Issued(IssuedCreate::from_parts(identifier, sent), token),
-        None => Poll::Unissued(PollAttempt::from_sent(sent), token),
+        None => Poll::Unissued(
+            PollAttempt::from_sent(sent),
+            OperationToken::new(token).map_err(|_token| {
+                Box::new(types::PollVerdict::Undetermined(
+                    read_back_without_identifier(id),
+                ))
+            })?,
+        ),
     };
     provider
         .poll_create(id, request, poll, poll_request)
@@ -1516,12 +1577,33 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
 ) -> Result<ProtocolResumeStep<P::CreateToken>, Box<ProtocolResumeVerdict<P::CreateToken>>> {
     let resume = match identifier {
         Some(identifier) => Resume::Issued(ResumedCreate::new(identifier), token),
-        None => Resume::Unissued(ResumeAttempt::new(), token),
+        None => Resume::Unissued(
+            ResumeAttempt::new(),
+            OperationToken::new(token).map_err(|_token| {
+                Box::new(types::ResumeVerdict::Undetermined(
+                    read_back_without_identifier(id),
+                ))
+            })?,
+        ),
     };
     provider
         .resume_create(id, request, resume, poll_request)
         .map(ResumeStep::into_protocol)
         .map_err(|verdict| Box::new(verdict.into_protocol()))
+}
+
+fn read_back_without_identifier(id: &ResourceId) -> ProviderError {
+    ProviderError {
+        kind: types::ProviderErrorKind::Internal,
+        message: "read-back continuation requires an identifier".to_string(),
+        resource_id: Some(id.clone()),
+        cause: None,
+        provider_name: None,
+        operation: None,
+        status: None,
+        code: None,
+        request_id: None,
+    }
 }
 
 #[cfg(test)]
@@ -1536,7 +1618,7 @@ mod tests {
     }
 
     impl CarinaProvider for SchemaOnlyProvider {
-        type CreateToken = Never;
+        type CreateToken = TestToken;
         type UpdateToken = Never;
         type DeleteToken = Never;
 
@@ -1806,12 +1888,129 @@ mod tests {
         assert!(error.to_string().contains("protocol v16"), "{error}");
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    enum TestToken {
+        Operation,
+        ReadBack,
+    }
+
+    impl PhasedToken for TestToken {
+        fn phase(&self) -> PendingPhase {
+            match self {
+                Self::Operation => PendingPhase::Operation,
+                Self::ReadBack => PendingPhase::ReadBack,
+            }
+        }
+    }
+
+    fn continuation_error() -> ProviderError {
+        ProviderError {
+            kind: types::ProviderErrorKind::Internal,
+            message: "transient continuation error".to_string(),
+            resource_id: None,
+            cause: None,
+            provider_name: None,
+            operation: None,
+            status: None,
+            code: None,
+            request_id: None,
+        }
+    }
+
     #[test]
-    fn read_back_create_and_resume_progress_keep_the_issued_identifier() {
+    fn issued_create_preserve_follows_read_back_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let error = continuation_error();
+        let verdict = CreateAttempt::new()
+            .issued(identifier.clone(), Sent::only(["name"]))
+            .preserve(TestToken::ReadBack, 7, error.clone())
+            .into_protocol();
+        let types::CreateVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::ReadingBack { identifier }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::ReadBack);
+        assert_eq!(in_flight.pending.sent, Sent::only(["name"]));
+        assert_eq!(in_flight.pending.poll_after_secs, 7);
+        assert_eq!(
+            serde_json::to_value(in_flight.error).unwrap(),
+            serde_json::to_value(error).unwrap()
+        );
+    }
+
+    #[test]
+    fn issued_create_preserve_follows_operation_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let verdict = CreateAttempt::new()
+            .issued(identifier.clone(), Sent::AllRequestAttributes)
+            .preserve(TestToken::Operation, 3, continuation_error())
+            .into_protocol();
+        let types::CreateVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::Operating {
+                identifier: Some(identifier)
+            }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::Operation);
+        assert_eq!(in_flight.pending.sent, Sent::AllRequestAttributes);
+        assert_eq!(in_flight.pending.poll_after_secs, 3);
+    }
+
+    #[test]
+    fn resumed_create_preserve_follows_read_back_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let error = continuation_error();
+        let verdict = ResumeAttempt::new()
+            .issued(identifier.clone())
+            .preserve(TestToken::ReadBack, 9, error.clone())
+            .into_protocol();
+        let types::ResumeVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::ReadingBack { identifier }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::ReadBack);
+        assert_eq!(in_flight.pending.poll_after_secs, 9);
+        assert_eq!(
+            serde_json::to_value(in_flight.error).unwrap(),
+            serde_json::to_value(error).unwrap()
+        );
+    }
+
+    #[test]
+    fn resumed_create_preserve_follows_operation_token_phase() {
+        let identifier = AppliedIdentifier::new("created-id").unwrap();
+        let verdict = ResumeAttempt::new()
+            .issued(identifier.clone())
+            .preserve(TestToken::Operation, 5, continuation_error())
+            .into_protocol();
+        let types::ResumeVerdict::InFlight(in_flight) = verdict else {
+            panic!("continuation must remain in flight");
+        };
+        assert_eq!(
+            in_flight.pending.progress,
+            CreateProgress::Operating {
+                identifier: Some(identifier)
+            }
+        );
+        assert_eq!(in_flight.pending.token, TestToken::Operation);
+        assert_eq!(in_flight.pending.poll_after_secs, 5);
+    }
+
+    #[test]
+    fn pending_create_and_resume_follow_read_back_token_phase() {
         let identifier = AppliedIdentifier::new("created-id").unwrap();
         let create = CreateAttempt::new()
             .issued(identifier.clone(), Sent::only(["name"]))
-            .pending_read_back("create-token", 7)
+            .pending(TestToken::ReadBack, 7)
             .into_protocol();
         let carina_provider_protocol::types::CreateStep::Pending(create) = create else {
             panic!("issued create must remain pending")
@@ -1825,12 +2024,80 @@ mod tests {
         assert_eq!(create.sent, Sent::only(["name"]));
         let resume = ResumeAttempt::new()
             .issued(identifier.clone())
-            .pending_read_back("resume-token", 9)
+            .pending(TestToken::ReadBack, 9)
             .into_protocol();
         let carina_provider_protocol::types::ResumeStep::Pending(resume) = resume else {
             panic!("issued resume must remain pending")
         };
         assert_eq!(resume.progress, CreateProgress::ReadingBack { identifier });
+    }
+
+    #[test]
+    fn pending_update_follows_token_phase() {
+        for (token, phase) in [
+            (TestToken::Operation, PendingPhase::Operation),
+            (TestToken::ReadBack, PendingPhase::ReadBack),
+        ] {
+            let pending = Pending::new(token, 4);
+            assert_eq!(pending.phase(), phase);
+            assert_eq!(pending.token, token);
+            assert_eq!(pending.poll_after_secs, 4);
+        }
+    }
+
+    #[test]
+    fn operation_token_rejects_read_back_without_losing_the_token() {
+        assert_eq!(
+            OperationToken::new(TestToken::ReadBack).unwrap_err(),
+            TestToken::ReadBack
+        );
+        let token = OperationToken::new(TestToken::Operation).unwrap();
+        assert_eq!(token.into_inner(), TestToken::Operation);
+    }
+
+    #[test]
+    fn identifierless_dispatch_rejects_read_back_tokens_before_calling_provider() {
+        let provider = SchemaOnlyProvider {
+            resources: Vec::new(),
+            forms: ReferenceForms::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let resource = desired_resource(BTreeMap::new());
+        let id = resource.id.clone();
+        let request = CreateRequest { resource };
+        let poll_request = PollRequest {
+            finality: PollFinality::Continue,
+        };
+        let verdict = dispatch_poll_create(
+            &provider,
+            &id,
+            request.clone(),
+            None,
+            Sent::AllRequestAttributes,
+            TestToken::ReadBack,
+            poll_request,
+        )
+        .unwrap_err();
+        let types::PollVerdict::Undetermined(error) = *verdict else {
+            panic!("invalid read-back must preserve the host's previous continuation");
+        };
+        assert!(error.message.contains("requires an identifier"));
+        assert_eq!(error.resource_id, Some(id.clone()));
+
+        let verdict = dispatch_resume_create(
+            &provider,
+            &id,
+            request,
+            None,
+            TestToken::ReadBack,
+            poll_request,
+        )
+        .unwrap_err();
+        let types::ResumeVerdict::Undetermined(error) = *verdict else {
+            panic!("invalid resumed read-back must preserve the persisted continuation");
+        };
+        assert!(error.message.contains("requires an identifier"));
+        assert_eq!(error.resource_id, Some(id));
     }
 
     #[test]

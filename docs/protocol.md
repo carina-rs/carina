@@ -89,6 +89,16 @@ share the phase-less `pending-operation` record for the token and poll interval.
 `poll-create`, `resume-create`, and `poll-update` receive a `poll-request`
 whose `finality` is `continue` or `final-attempt`.
 
+The guest SDK requires create and update tokens to implement `PhasedToken`.
+Identifier-bearing `IssuedCreate` and `ResumedCreate` handles derive both
+`pending` and `preserve` progress from the token's phase. Identifier-less
+create handles accept only `OperationToken<T>`, whose checked constructor
+rejects read-back tokens; unissued poll and resume arms carry that wrapper.
+Update continuations use `Pending::new(token, poll_after_secs)` and compute
+`Pending::phase()` from the token, without storing a separate mutable phase.
+These SDK guarantees use the existing WIT variants and do not change the
+protocol version.
+
 The host starts the operation's existing deadline before the initial call.
 The read-back deadline starts only when the first `read-back` pending result
 arrives and is the earlier of that time plus the resource's read-back budget

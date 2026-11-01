@@ -155,7 +155,8 @@ impl CarinaProvider for MockHttpAwsProvider {
         _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<CreateStep<Self::CreateToken>, PollVerdict<Self::CreateToken>> {
         match poll {
-            Poll::Unissued(_, token) | Poll::Issued(_, token) => match token {},
+            Poll::Unissued(_, token) => match *token.as_ref() {},
+            Poll::Issued(_, token) => match token {},
         }
     }
 
@@ -167,7 +168,8 @@ impl CarinaProvider for MockHttpAwsProvider {
         _poll_request: carina_plugin_sdk::PollRequest,
     ) -> Result<ResumeStep<Self::CreateToken>, ResumeVerdict<Self::CreateToken>> {
         match resume {
-            Resume::Unissued(_, token) | Resume::Issued(_, token) => match token {},
+            Resume::Unissued(_, token) => match *token.as_ref() {},
+            Resume::Issued(_, token) => match token {},
         }
     }
 

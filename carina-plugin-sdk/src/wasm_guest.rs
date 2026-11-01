@@ -1121,7 +1121,7 @@ macro_rules! export_provider {
                 })
             }
 
-            fn sdk_to_wit_pending<T: serde::Serialize>(
+            fn sdk_to_wit_pending<T: serde::Serialize + $crate::PhasedToken>(
                 pending: &$crate::Pending<T>,
             ) -> Result<wit_types::PendingUpdate, serde_json::Error> {
                 Ok(wit_types::PendingUpdate {
@@ -1129,18 +1129,23 @@ macro_rules! export_provider {
                         token: serde_json::to_string(&pending.token)?,
                         poll_after_secs: pending.poll_after_secs,
                     },
-                    phase: proto_to_wit_pending_phase(pending.phase),
+                    phase: proto_to_wit_pending_phase(pending.phase()),
                 })
             }
 
-            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned>(
+            fn wit_to_sdk_pending<T: serde::de::DeserializeOwned + $crate::PhasedToken>(
                 pending: wit_types::PendingUpdate,
             ) -> Result<$crate::Pending<T>, serde_json::Error> {
-                Ok($crate::Pending {
-                    token: serde_json::from_str(&pending.operation.token)?,
-                    poll_after_secs: pending.operation.poll_after_secs,
-                    phase: wit_to_proto_pending_phase(pending.phase),
-                })
+                let decoded = $crate::Pending::new(
+                    serde_json::from_str::<T>(&pending.operation.token)?,
+                    pending.operation.poll_after_secs,
+                );
+                if decoded.phase() != wit_to_proto_pending_phase(pending.phase) {
+                    return Err(<serde_json::Error as serde::de::Error>::custom(
+                        "update continuation phase does not match its token",
+                    ));
+                }
+                Ok(decoded)
             }
 
             fn sdk_to_wit_pending_delete<T: serde::Serialize>(
@@ -1820,7 +1825,7 @@ macro_rules! export_provider {
                 Ok((identifier, token))
             }
 
-            fn sdk_to_wit_update_outcome<T: serde::Serialize>(
+            fn sdk_to_wit_update_outcome<T: serde::Serialize + $crate::PhasedToken>(
                 outcome: &$crate::UpdateOutcome<T>,
                 operation: &'static str,
             ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
