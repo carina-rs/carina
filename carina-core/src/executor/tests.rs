@@ -2294,13 +2294,61 @@ async fn dependency_cycle_records_members_and_emits_failure_events() {
     assert!(cycle.contains(&second_id.to_string()), "event: {cycle}");
     let blocked = effect_failure_event(&events, &second_id);
     assert!(
-        blocked.contains("blocked by the dependency cycle above"),
+        blocked.contains(&format!(
+            "blocked by the dependency cycle containing create {first_id}"
+        )),
         "event: {blocked}"
     );
     assert!(
-        !blocked.contains(&first_id.to_string()),
+        !blocked.contains('{'),
         "blocked events must not repeat the cycle: {blocked}"
     );
+}
+
+#[test]
+fn independent_dependency_cycles_have_unambiguous_blocked_references() {
+    let effects = [
+        create_effect(make_resource("a", &["b"])),
+        create_effect(make_resource("b", &["a"])),
+        create_effect(make_resource("c", &["d"])),
+        create_effect(make_resource("d", &["c"])),
+        create_effect(make_resource("e", &["c"])),
+    ];
+    let deps = HashMap::from([
+        (0, HashSet::from([1])),
+        (1, HashSet::from([0])),
+        (2, HashSet::from([3])),
+        (3, HashSet::from([2])),
+        (4, HashSet::from([2])),
+    ]);
+    let failures = classify_stalled_effects(
+        &effects,
+        &deps,
+        &HashSet::from([0, 1, 2, 3, 4]),
+        &HashSet::new(),
+    );
+    assert_eq!(
+        failures
+            .iter()
+            .filter(|(_, kind)| matches!(kind, EffectFailureKind::DependencyCycle { .. }))
+            .count(),
+        2
+    );
+    for (idx, first) in [(1, 0), (3, 2), (4, 2)] {
+        let kind = &failures.iter().find(|(index, _)| *index == idx).unwrap().1;
+        let message = kind.to_string();
+        assert_eq!(
+            message,
+            format!(
+                "blocked by the dependency cycle containing {}",
+                EffectEndpoint::from_effect(&effects[first])
+            )
+        );
+        assert!(
+            !message.contains('{'),
+            "blocked references must not repeat members: {message}"
+        );
+    }
 }
 
 #[test]

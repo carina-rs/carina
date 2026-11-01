@@ -1117,7 +1117,7 @@ impl EffectFailureKind {
             Self::DeferredMaterialization { .. } => "deferred materialization failure",
             Self::MissingDependency { .. } => "missing dependency",
             Self::DependencyCycle { .. } => "dependency cycle",
-            Self::BlockedByDependencyCycle { .. } => "blocked by the dependency cycle above",
+            Self::BlockedByDependencyCycle { .. } => "blocked by dependency cycle",
             Self::NoProgress { .. } => "no scheduler progress",
             Self::ModuleConstraint { .. } => "module constraint failure",
         }
@@ -1224,7 +1224,13 @@ impl std::fmt::Display for EffectFailureKind {
                 )
             }
             Self::DependencyCycle { cycle } => cycle.fmt(formatter),
-            Self::BlockedByDependencyCycle { .. } => formatter.write_str(self.label()),
+            Self::BlockedByDependencyCycle { cycle } => match cycle.members().first() {
+                Some(member) => write!(
+                    formatter,
+                    "blocked by the dependency cycle containing {member}"
+                ),
+                None => write!(formatter, "blocked by {cycle}"),
+            },
             Self::NoProgress { waiting_on } => {
                 if waiting_on.is_empty() {
                     formatter.write_str("no progress: effect was not dispatched despite all dependencies completing")

@@ -1262,8 +1262,7 @@ fn record_parsed_file_source_metadata(parsed: &mut ParsedFile, path: &Path, disp
         warning.file = warning_file.clone();
     }
     for deferred in parsed.parsed_deferred_for_expressions_mut() {
-        deferred.source_file = warning_file.clone();
-        deferred.file = Some(display_file.clone());
+        deferred.record_source_location(path, display_root);
     }
 }
 
@@ -2116,7 +2115,7 @@ for account_id in orgs.accounts {
         )
         .expect("directory fixture crosses the module-resolution seam");
         assert_eq!(parsed.deferred_for_expressions().len(), 1);
-        let deferred_line = parsed.deferred_for_expressions()[0].line;
+        let deferred_line = parsed.deferred_for_expressions()[0].line();
         parsed.warnings.push(crate::parser::ParseWarning {
             file: Some(crn_path.display().to_string()),
             line: deferred_line,
@@ -2600,7 +2599,7 @@ let orgs = upstream_state {
             );
         };
         assert_eq!(deferred.header, "for x in src.list");
-        assert_eq!(deferred.line, 3);
+        assert_eq!(deferred.line(), 3);
         assert_eq!(deferred.resource_type(), "mock.test.resource");
         assert_eq!(deferred.template_resource_binding(), Some("res_items[?]"));
         assert!(matches!(

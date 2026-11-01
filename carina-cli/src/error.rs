@@ -40,7 +40,15 @@ impl std::fmt::Display for ExecutionFailureReport {
                 .endpoint()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "module constraint".into());
-            write!(f, "\n  {endpoint}: {}", failure.kind().label())?;
+            write!(f, "\n  {endpoint}: ")?;
+            match failure.kind() {
+                kind @ carina_core::executor::EffectFailureKind::BlockedByDependencyCycle {
+                    ..
+                } => {
+                    std::fmt::Display::fmt(kind, f)?;
+                }
+                kind => f.write_str(kind.label())?,
+            }
         }
         Ok(())
     }

@@ -227,8 +227,8 @@ fn validated_entries<E>(
                 resource_type: d.resource_type(),
                 target: d.target(),
                 header: &d.header,
-                file: d.file.as_deref(),
-                line: d.line,
+                file: d.file(),
+                line: d.line(),
             },
             // Managed / Virtual / DataSource — all direct, classified
             // by whether the id has a resolved identity.

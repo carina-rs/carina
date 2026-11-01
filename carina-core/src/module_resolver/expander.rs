@@ -2265,9 +2265,8 @@ pub(super) fn prefix_parsed_deferred_for_expression(
         arguments,
     )?;
     let rebuild = |body| {
-        let mut expanded = ParsedDeferredForExpression::new(
-            deferred.file.clone(),
-            deferred.line,
+        ParsedDeferredForExpression::from_location(
+            deferred.location().clone(),
             deferred.span,
             deferred.header.clone(),
             target.clone(),
@@ -2275,9 +2274,7 @@ pub(super) fn prefix_parsed_deferred_for_expression(
             deferred.iterable_state.clone(),
             deferred.binding.clone(),
             body,
-        );
-        expanded.source_file = deferred.source_file.clone();
-        expanded
+        )
     };
 
     match deferred.body() {

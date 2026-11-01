@@ -2335,9 +2335,16 @@ mod tests {
     }
 
     fn deferred_for_template() -> crate::parser::DeferredForExpression {
+        deferred_for_template_at(Some("main.crn".to_string()), 12)
+    }
+
+    fn deferred_for_template_at(
+        file: Option<String>,
+        line: usize,
+    ) -> crate::parser::DeferredForExpression {
         crate::parser::DeferredForExpression::new(
-            Some("main.crn".to_string()),
-            12,
+            file,
+            line,
             "for opt in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound("validation_records")
                 .expect("fixture binding is valid"),
@@ -2354,9 +2361,7 @@ mod tests {
     }
 
     fn deferred_replace_effect() -> Effect {
-        let mut template = deferred_for_template();
-        template.file = None;
-        template.line = 0;
+        let template = deferred_for_template_at(None, 0);
         Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -2645,9 +2650,7 @@ mod tests {
 
     #[test]
     fn deferred_replace_blocking_bindings_includes_upstream_and_delete_deps() {
-        let mut template = deferred_for_template();
-        template.file = None;
-        template.line = 0;
+        let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -2673,9 +2676,7 @@ mod tests {
 
     #[test]
     fn deferred_replace_explicit_dependencies_unions_delete_explicit_deps() {
-        let mut template = deferred_for_template();
-        template.file = None;
-        template.line = 0;
+        let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -2722,8 +2723,8 @@ mod tests {
         match decoded {
             Effect::DeferredCreate(payload) => {
                 let template = payload.template;
-                assert_eq!(template.file.as_deref(), Some("main.crn"));
-                assert_eq!(template.line, 12);
+                assert_eq!(template.file(), Some("main.crn"));
+                assert_eq!(template.line(), 12);
                 assert_eq!(template.header, "for opt in cert.domain_validation_options");
                 assert_eq!(template.resource_type(), "route53.Record");
                 assert_eq!(

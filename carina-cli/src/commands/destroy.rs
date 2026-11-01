@@ -225,18 +225,36 @@ struct DeleteRetryFailure {
     last_error: ProviderError,
 }
 
+enum DeleteRetryStop {
+    NoProgress,
+    LimitReached,
+    Cancelled,
+    NotRetryable,
+}
+
 impl DeleteRetryFailure {
-    fn exhausted(self, no_progress: bool) -> EffectFailureKind {
-        let context = format!(
-            "retries exhausted after {} attempt{}{}",
-            self.attempts,
-            if self.attempts == 1 { "" } else { "s" },
-            if no_progress {
-                " (no progress possible)"
-            } else {
-                ""
-            },
-        );
+    fn stopped(self, reason: DeleteRetryStop) -> EffectFailureKind {
+        let context = match reason {
+            DeleteRetryStop::NoProgress if self.attempts == 1 => {
+                "failed (no retry possible: no other deletes can make progress)".into()
+            }
+            DeleteRetryStop::NoProgress => format!(
+                "failed after {} attempts (no further retry possible: no other deletes can make progress)",
+                self.attempts
+            ),
+            DeleteRetryStop::LimitReached => {
+                format!("retries exhausted after {} attempts", self.attempts)
+            }
+            DeleteRetryStop::Cancelled => format!(
+                "destroy cancelled before retry after {} failed attempt{}",
+                self.attempts,
+                if self.attempts == 1 { "" } else { "s" }
+            ),
+            DeleteRetryStop::NotRetryable => format!(
+                "delete failed after {} attempts (last error is not retryable)",
+                self.attempts
+            ),
+        };
         EffectFailureKind::provider_with_context(context, self.last_error)
     }
 }
@@ -1076,24 +1094,8 @@ async fn run_destroy_locked_owned(
         // If nothing is in flight, we're done (or stuck)
         if in_flight.is_empty() {
             if cancelled {
-                let remaining: Vec<usize> = all_indices
-                    .iter()
-                    .filter(|idx| !dispatched.contains(idx) && !completed_indices.contains(idx))
-                    .copied()
-                    .collect();
-                for idx in remaining {
-                    let (_, effect) = &resource_info[idx];
-                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(
-                        &completed_counter,
-                        destroy_total,
-                        effect,
-                        "- skipped (destroy cancelled)",
-                    ));
-                    progress.outcome_line(outcome);
-                    dispatched.insert(idx);
-                    completed_indices.insert(idx);
-                    skip_count += 1;
-                }
+                // The shared cancellation drain below distinguishes retained
+                // provider failures from work that never ran.
                 break;
             }
             let remaining: Vec<usize> = all_indices
@@ -1114,7 +1116,7 @@ async fn run_destroy_locked_owned(
                     record_destroy_failure(
                         &mut failures,
                         effect,
-                        retry.exhausted(true),
+                        retry.stopped(DeleteRetryStop::NoProgress),
                         |failure| {
                             let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
                                 &completed_counter,
@@ -1215,11 +1217,12 @@ async fn run_destroy_locked_owned(
             }
             Err(e) => {
                 let retries = retry_failures.get(&finished_idx).map_or(0, |retry| retry.attempts);
+                let retryable = is_retryable_delete_error(&e);
                 let has_pending_or_in_flight = !in_flight.is_empty()
                     || all_indices
                         .iter()
                         .any(|idx| !dispatched.contains(idx) && !completed_indices.contains(idx));
-                if is_retryable_delete_error(&e)
+                if retryable
                     && retries < max_retries
                     && has_pending_or_in_flight
                 {
@@ -1238,7 +1241,14 @@ async fn run_destroy_locked_owned(
                 } else {
                     retry_failures.remove(&finished_idx);
                     let kind = if retries > 0 {
-                        DeleteRetryFailure { attempts: retries + 1, last_error: e }.exhausted(false)
+                        let reason = if !retryable {
+                            DeleteRetryStop::NotRetryable
+                        } else if retries >= max_retries {
+                            DeleteRetryStop::LimitReached
+                        } else {
+                            DeleteRetryStop::NoProgress
+                        };
+                        DeleteRetryFailure { attempts: retries + 1, last_error: e }.stopped(reason)
                     } else {
                         EffectFailureKind::provider(e)
                     };
@@ -1262,6 +1272,39 @@ async fn run_destroy_locked_owned(
                     );
                     failed_indices.insert(finished_idx);
                 }
+            }
+        }
+    }
+
+    // Both graceful cancellation and cleanup priority may leave failed deletes
+    // waiting for retry. Report those causes before classifying untouched work
+    // as skipped. In-flight retries still have an unknown latest outcome.
+    if cancelled {
+        for &idx in &all_indices {
+            if dispatched.contains(&idx) || completed_indices.contains(&idx) {
+                continue;
+            }
+            if let Some(retry) = retry_failures.remove(&idx) {
+                let effect = &resource_info[idx].1;
+                record_destroy_failure(
+                    &mut failures,
+                    effect,
+                    retry.stopped(DeleteRetryStop::Cancelled),
+                    |failure| {
+                        progress.failed_line(FailedOutcome::new(
+                            format_destroy_outcome_summary(
+                                &completed_counter,
+                                destroy_total,
+                                effect,
+                                "- failed (destroy cancelled before retry)",
+                            ),
+                            [failure.to_string()],
+                        ));
+                    },
+                );
+                failed_indices.insert(idx);
+                dispatched.insert(idx);
+                completed_indices.insert(idx);
             }
         }
     }
@@ -2214,6 +2257,30 @@ mod tests {
     }
 
     #[test]
+    fn delete_retry_no_progress_does_not_claim_unattempted_retries_were_exhausted() {
+        for attempts in [1, 2] {
+            let effect: Effect = Effect::Create(carina_core::resource::ResolvedResource::new(
+                Resource::new("test.resource", "blocked"),
+            ));
+            let failure = EffectFailure::new(
+                &effect,
+                DeleteRetryFailure {
+                    attempts,
+                    last_error: ProviderError::api_error("DependencyViolation: eni-distinctive"),
+                }
+                .stopped(DeleteRetryStop::NoProgress),
+            );
+            let rendered = failure.to_string();
+            assert!(!rendered.contains("retries exhausted"), "{rendered}");
+            assert!(
+                rendered.contains("no other deletes can make progress"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("eni-distinctive"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn exhausted_delete_retry_retains_typed_provider_source_in_final_report() {
         let effect: Effect = Effect::Delete {
             id: ResolvedResourceId::with_provider_identity(
@@ -2239,7 +2306,7 @@ mod tests {
                 std::io::Error::other("blocking ENI eni-distinctive"),
             ),
         }
-        .exhausted(true);
+        .stopped(DeleteRetryStop::NoProgress);
         record_destroy_failure(&mut sink, &effect, kind, |failure| {
             streamed = failure.to_string();
         });

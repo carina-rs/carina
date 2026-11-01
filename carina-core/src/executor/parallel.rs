@@ -475,7 +475,7 @@ pub fn classify_stalled_effects<S>(
         })
         .collect::<Vec<_>>();
     // A blocked effect may precede the SCC owner in plan order. Render every
-    // cycle once before emitting references to the cycle "above".
+    // cycle once before emitting the short references to it.
     failures.sort_by_key(|(idx, kind)| {
         (
             !matches!(kind, EffectFailureKind::DependencyCycle { .. }),

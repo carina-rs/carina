@@ -6459,7 +6459,7 @@ impl<E> DeferredExpansionTarget<E> for ExpandedFile<E> {
             warning.kind != WarningKind::DeferredFor
                 || !retained
                     .iter()
-                    .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
+                    .any(|deferred| deferred.location().matches_deferred_warning(warning))
         });
         self.replace_deferred_for_expressions(selected);
         self.expand_deferred_for_expressions(bindings)?;

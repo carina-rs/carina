@@ -759,7 +759,7 @@ mod tests {
         assert!(
             stderr.find(members).unwrap()
                 < stderr
-                    .find("blocked by the dependency cycle above")
+                    .find("blocked by the dependency cycle containing create test.resource.a")
                     .unwrap(),
             "{stderr}"
         );
@@ -773,7 +773,7 @@ mod tests {
             "{summary}"
         );
         assert!(
-            summary.contains("create test.resource.blocked: blocked by the dependency cycle above"),
+            summary.contains("create test.resource.blocked: blocked by the dependency cycle containing create test.resource.a"),
             "{summary}"
         );
     }

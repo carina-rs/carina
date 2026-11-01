@@ -325,7 +325,7 @@ impl<E> CanonicalResourcePair<E> {
             warning.kind != carina_core::parser::WarningKind::DeferredFor
                 || !retained
                     .iter()
-                    .any(|deferred| deferred.file == warning.file && deferred.line == warning.line)
+                    .any(|deferred| deferred.location().matches_deferred_warning(warning))
         });
         self.parsed.replace_deferred_for_expressions(selected);
         self.parsed.expand_deferred_for_expressions(bindings)?;

@@ -258,7 +258,7 @@ pub(super) fn materialize_deferred_create<
     let iterable = match crate::resolver::resolve_ref_value_status(&template.iterable, bindings)
         .map_err(|message| DeferredCreateFailure::ValueAccess {
             error: DeferredForExpansionError::Resolution {
-                line: template.line,
+                line: template.line(),
                 expression: crate::value::format_value(&template.iterable),
                 message,
             },
@@ -266,8 +266,8 @@ pub(super) fn materialize_deferred_create<
         crate::resolver::ValueResolution::Present(value) => value,
         crate::resolver::ValueResolution::Absent => {
             return Err(DeferredCreateFailure::IterableAbsent {
-                file: template.file.clone(),
-                line: template.line,
+                file: template.file().map(str::to_owned),
+                line: template.line(),
                 binding: template.target().scheduler_key().to_string(),
                 expression,
                 candidates,
@@ -275,8 +275,8 @@ pub(super) fn materialize_deferred_create<
         }
         crate::resolver::ValueResolution::Unknown(_) => {
             return Err(DeferredCreateFailure::IterableUnknown {
-                file: template.file.clone(),
-                line: template.line,
+                file: template.file().map(str::to_owned),
+                line: template.line(),
                 binding: template.target().scheduler_key().to_string(),
                 expression,
                 candidates,
@@ -289,8 +289,8 @@ pub(super) fn materialize_deferred_create<
         |error| match error {
             DeferredForExpansionError::ShapeMismatch(mismatch) => {
                 DeferredCreateFailure::ShapeMismatch {
-                    file: template.file.clone(),
-                    line: template.line,
+                    file: template.file().map(str::to_owned),
+                    line: template.line(),
                     binding: template.target().scheduler_key().to_string(),
                     expression: crate::value::format_value(&template.iterable),
                     candidates: template.reference_candidates().into_iter().collect(),

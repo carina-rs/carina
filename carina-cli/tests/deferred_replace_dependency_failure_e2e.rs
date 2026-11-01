@@ -351,6 +351,7 @@ let DependencyViolation_eni_4174 = mock.test.resource {
   name = "consumer"
   parent = producer.identifier
 }
+
 "#,
     );
     assert_success("initial apply", &scenario.apply_config());
@@ -373,12 +374,144 @@ let DependencyViolation_eni_4174 = mock.test.resource {
     assert!(!output.status.success(), "{}", output_text(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("retries exhausted after 1 attempt (no progress possible)"),
+        stderr.contains("failed (no retry possible: no other deletes can make progress)"),
         "{stderr}"
     );
     assert!(stderr.contains("CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for test.resource.DependencyViolation_eni_4174"), "{stderr}");
     assert!(stderr.contains("1 failed, 1 skipped"), "{stderr}");
     assert_eq!(scenario.state()["resources"].as_array().unwrap().len(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_graceful_cancellation_keeps_pending_retry_failure() {
+    assert_cancelled_retry_keeps_provider_cause(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn destroy_cleanup_priority_keeps_pending_retry_failure() {
+    assert_cancelled_retry_keeps_provider_cause(true);
+}
+
+#[cfg(unix)]
+fn assert_cancelled_retry_keeps_provider_cause(cleanup_priority: bool) {
+    use std::time::{Duration, Instant};
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let scenario = Scenario::new(
+        r#"let a_DependencyViolation_eni_4174 = mock.test.resource { name = "failed" }
+let b_draining = mock.test.resource { name = "draining" }
+let c_never_ran = mock.test.resource { name = "never-ran" }
+"#,
+    );
+    assert_success("initial apply", &scenario.apply_config());
+    let ready = scenario.project.join("delete-ready");
+    let stdout_path = scenario.project.join("destroy.stdout");
+    let stderr_path = scenario.project.join("destroy.stderr");
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(&scenario.project)
+            .args([
+                "destroy",
+                ".",
+                "--auto-approve",
+                "--lock=false",
+                "--refresh=false",
+                "--parallelism",
+                "1",
+            ])
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .env("CARINA_MOCK_STATE_FILE", &scenario.mock_state)
+            .env(
+                "CARINA_MOCK_DELETE_FAIL_FOR",
+                "test.resource.a_DependencyViolation_eni_4174",
+            )
+            .env(
+                "CARINA_MOCK_DELETE_DELAY_MS_FOR",
+                "test.resource.b_draining",
+            )
+            .env(
+                "CARINA_MOCK_DELETE_DELAY_MS",
+                if cleanup_priority { "60000" } else { "1500" },
+            )
+            .env("CARINA_MOCK_DELETE_READY_PATH", &ready)
+            .stdout(fs::File::create(&stdout_path).unwrap())
+            .stderr(fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "delete did not reach readiness handshake"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "destroy exited before draining"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The second delete can only start after the first provider failure was
+    // retained for retry. The signal therefore cannot precede that failure.
+    assert_eq!(
+        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    if cleanup_priority {
+        while !fs::read_to_string(&stderr_path)
+            .unwrap()
+            .contains("Received shutdown signal: Interrupt.")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "graceful shutdown was not observed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+    }
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "destroy did not finish cancellation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = fs::read_to_string(stdout_path).unwrap();
+    let stderr = fs::read_to_string(stderr_path).unwrap();
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("destroy cancelled before retry"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for test.resource.a_DependencyViolation_eni_4174"), "{stderr}");
+    assert!(
+        stdout.contains("1 failed, 1 skipped"),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        scenario.state()["resources"].as_array().unwrap().len(),
+        if cleanup_priority { 3 } else { 2 }
+    );
 }
 
 #[test]

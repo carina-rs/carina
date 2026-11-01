@@ -29,6 +29,61 @@ fn comparison_provider_for_resources(
     .1
 }
 
+#[test]
+fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("main.crn");
+    std::fs::write(&source, "let orgs = upstream_state { source = '../orgs' }\nlet rows = for item in orgs.ids { mock.test.resource { name = item } }\n").unwrap();
+    let loaded = carina_core::config_loader::load_configuration(project.path()).unwrap();
+    let parsed = carina_core::module_resolver::resolve_modules_with_providerless_config(
+        loaded.parsed,
+        project.path(),
+        &carina_core::parser::ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let mut parsed = parsed.into_expanded().unwrap();
+    parsed.warnings = vec![
+        carina_core::parser::ParseWarning {
+            file: Some(source.display().to_string()),
+            line: 2,
+            kind: WarningKind::DeferredFor,
+            span: None,
+            message: "owned deferred warning".into(),
+        },
+        carina_core::parser::ParseWarning {
+            file: Some(project.path().join("other.crn").display().to_string()),
+            line: 2,
+            kind: WarningKind::DeferredFor,
+            span: None,
+            message: "other file warning".into(),
+        },
+        carina_core::parser::ParseWarning {
+            file: Some(source.display().to_string()),
+            line: 2,
+            kind: WarningKind::SingleQuotedInterpolation,
+            span: None,
+            message: "unrelated same-line warning".into(),
+        },
+    ];
+    let bindings = carina_core::binding_index::IterableBindings::from_upstream_only(HashMap::new());
+    let mut pair = CanonicalResourcePair::for_test(parsed.clone(), Vec::new());
+    parsed
+        .expand_partitioned(&bindings, |_| DeferredForExpansionChoice::Retain)
+        .unwrap();
+    pair.expand_deferred_for_expressions(&bindings, |_| DeferredForExpansionChoice::Retain)
+        .unwrap();
+    for warnings in [&parsed.warnings, &pair.parsed().warnings] {
+        assert_eq!(
+            warnings
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            ["other file warning", "unrelated same-line warning"]
+        );
+    }
+}
+
 fn reconcile_anonymous_identifiers_with_ctx(
     ctx: &WiringContext,
     resources: &[Resource],
