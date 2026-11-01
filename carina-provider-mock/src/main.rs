@@ -838,6 +838,11 @@ impl CarinaProvider for MockProcessProvider {
                 .expect("normalization probe schema must be valid"),
         ]
         .into_iter()
+        .chain(std::iter::once(
+            carina_provider_mock::unique_list_schema()
+                .validate()
+                .expect("unique-list fixture is valid"),
+        ))
         .chain(
             carina_provider_mock::anonymous_identity_schemas()
                 .into_iter()
@@ -855,11 +860,19 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn provider_config_attribute_types(&self) -> CoreValidatedConfigSchema {
-        CoreValidatedConfigSchema::validate(BTreeMap::from([(
-            "reference_table".into(),
-            CoreAttributeType::string(),
-        )]))
-        .expect("mock config schema")
+        CoreValidatedConfigSchema::validate(BTreeMap::from([
+            ("reference_table".into(), CoreAttributeType::string()),
+            (
+                "unique_values".to_string(),
+                CoreAttributeType::refined_list(
+                    CoreAttributeType::string(),
+                    true,
+                    None,
+                    carina_core::schema::ListElements::Unique,
+                ),
+            ),
+        ]))
+        .expect("mock provider config schema must be valid")
     }
 
     fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {

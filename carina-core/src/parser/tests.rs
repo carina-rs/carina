@@ -15,6 +15,17 @@ use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourc
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
+#[test]
+fn attribute_value_source_span_ignores_names_in_earlier_nested_maps() {
+    let source = "mock.test.Resource {\n  nested = { values = [\"a\"] }\n  values = [\"repo\", \"repo\"]\n}\n";
+    let path = crate::schema::FieldPath::new().push_index(1);
+    let span = attribute_value_source_span(source, "values", &path, Some((0, 4)))
+        .unwrap()
+        .expect("the direct resource attribute has a second item");
+    assert_eq!(span.start_line(), 3);
+    assert_eq!(&source[span.start_byte()..span.end_byte()], "\"repo\"");
+}
+
 fn resolve_remote_bindings(
     remote: HashMap<String, HashMap<String, Value>>,
 ) -> HashMap<String, HashMap<String, ExpandedValue>> {

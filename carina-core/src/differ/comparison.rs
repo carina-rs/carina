@@ -825,7 +825,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                 crate::schema::Shape::List {
                     element_type: inner,
                     ordered,
-                    ..
+                    constraints: _constraints,
                 },
             ) => type_aware_lists_equal(la, lb, Some(inner), defs, ordered, context),
 
@@ -835,7 +835,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                 crate::schema::Shape::List {
                     element_type: inner,
                     ordered,
-                    ..
+                    constraints: _constraints,
                 },
             ) => {
                 // A StringList pair can reach any List shape; the

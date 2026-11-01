@@ -210,9 +210,8 @@ one-to-one onto D6's Rust enums; the guest classifies AWS error codes, so
 the host never parses error strings. The SDK default fails every request
 with `invalid-reference` naming the unsupported type identity.
 
-Use main's protocol version plus one at merge, advancing
-`MIN_SUPPORTED_PROTOCOL_VERSION` to match, with no shim. Do not reserve a
-version.
+Use protocol v18 after merging main's v17 list uniqueness change (#4196),
+advancing `MIN_SUPPORTED_PROTOCOL_VERSION` to match, with no shim.
 
 ## Migration
 
