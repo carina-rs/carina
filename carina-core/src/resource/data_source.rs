@@ -15,9 +15,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AbsoluteBindingAddress, BindingAddress, Directives, LeftoverPlaceholder, ModuleSource,
-    NoPlaceholder, ParserPlaceholder, PlaceholderKind, ProviderModuleSource, RelativeBindingName,
-    ResourceId, ResourceIdentity, ResourceIdentityState, SavedModuleSource, Value,
+    AbsoluteBindingAddress, BindingAddress, Directives, ModuleSource, NoPlaceholder,
+    ParserPlaceholder, PlaceholderKind, ProviderModuleSource, RelativeBindingName, ResourceId,
+    ResourceIdentity, ResourceIdentityState, SavedModuleSource, Value,
 };
 
 /// A read-only resource (data source).
@@ -55,8 +55,8 @@ use super::{
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize",
-    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>"
+    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize, Directives<B, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>, Directives<B, P>: Deserialize<'de>"
 ))]
 pub struct DataSource<
     S = ModuleSource,
@@ -69,7 +69,7 @@ pub struct DataSource<
     /// `directives` meta-argument block — `depends_on` and
     /// `provider_instance` are meaningful for data sources too.
     #[serde(default)]
-    pub directives: Directives<B>,
+    pub directives: Directives<B, P>,
     /// Binding name from `let` bindings in DSL.
     #[serde(default)]
     pub binding: Option<B>,
@@ -214,7 +214,8 @@ impl<S: Clone, P: PlaceholderKind, B: BindingAddress> DataSource<S, P, B> {
 impl<S, B: BindingAddress> DataSource<S, ParserPlaceholder, B> {
     pub(crate) fn into_expanded(
         self,
-    ) -> Result<DataSource<S, NoPlaceholder, B>, LeftoverPlaceholder> {
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<DataSource<S, NoPlaceholder, B>, super::ExpansionError> {
         let DataSource {
             id,
             attributes,
@@ -224,6 +225,14 @@ impl<S, B: BindingAddress> DataSource<S, ParserPlaceholder, B> {
             module_source,
             quoted_string_attrs,
         } = self;
+        let directives = directives.resolve(
+            &id,
+            super::ProviderDirectiveSchema::for_id(
+                schemas,
+                &id,
+                crate::schema::SchemaKind::DataSource,
+            ),
+        )?;
         let attributes = super::into_expanded_value_map(attributes, Some(&id))?;
         Ok(DataSource {
             id,

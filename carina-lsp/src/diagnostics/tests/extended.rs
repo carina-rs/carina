@@ -1768,8 +1768,9 @@ fn authored_binding_regression_schemas() -> SchemaRegistry {
                 )
                 .build(),
             )
+            .attribute(AttributeSchema::provider_populated("arn", AttributeType::string()).build())
             .attribute(
-                AttributeSchema::provider_populated("arn", AttributeType::string()).build(),
+                AttributeSchema::provider_populated("protected", AttributeType::bool()).build(),
             ))
         .validate()
         .expect("schema fixture must be valid"),
@@ -1778,32 +1779,503 @@ fn authored_binding_regression_schemas() -> SchemaRegistry {
 }
 
 #[test]
-fn prevent_destroy_non_literal_uses_the_shared_parser_warning_in_lsp() {
-    let engine = custom_engine(authored_binding_regression_schemas());
-    let source = r#"provider mock {}
-let allow_destroy = false
-mock.test.resource {
-  name = "example"
-  directives { prevent_destroy = allow_destroy }
-}
-"#;
-
-    let diagnostics = engine.analyze(&create_document(source), None);
-
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic
+fn invalid_module_directive_argument_is_reported_at_call_site() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        std::fs::write(fixture.path().join("module/main.crn"), format!("arguments {{ flag: Bool }}\nlet r = mock.test.resource {{ name = 'r' directives {{ {directive} = flag }} }}\n")).unwrap();
+        std::fs::write(
+            fixture.path().join("providers.crn"),
+            "provider mock {}\nlet peer = mock.test.resource { name = 'peer' }\n",
+        )
+        .unwrap();
+        let source =
+            "let m = use { source = './module' }\nlet instance = m { flag = peer.protected }\n";
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, source).unwrap();
+        let diagnostics = custom_engine(authored_binding_regression_schemas())
+            .analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains(&format!("directives.{directive}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            errors[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(errors[0].range.start.line, 1);
+        assert_eq!(errors[0].range.start.character, 26);
+        assert!(
+            !errors[0]
                 .message
-                .contains("only a literal `false` opts out of schema-default protection")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
-    assert_eq!(
-        warnings[0].severity,
-        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+                .contains(&fixture.path().display().to_string()),
+            "{errors:#?}"
+        );
+        assert!(errors[0].message.starts_with("directives."), "{errors:#?}");
+        assert!(
+            errors[0].message.contains("a resource reference"),
+            "{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn defaulted_protection_opt_out_is_reported_at_the_omitting_call_site() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    for nested in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        std::fs::write(fixture.path().join("module/main.crn"), "arguments { protect: Bool = false }\nlet r = mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = protect } }\n").unwrap();
+        let module = if nested {
+            std::fs::create_dir(fixture.path().join("outer")).unwrap();
+            std::fs::write(fixture.path().join("outer/main.crn"), "arguments { protect: Bool = false }\nlet inner = use { source = '../module' }\nlet child = inner { protect = protect }\n").unwrap();
+            "./outer"
+        } else {
+            "./module"
+        };
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = format!("let m = use {{ source = '{module}' }}\nlet instance = m {{}}\n");
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, &source).unwrap();
+        let mut schemas = authored_binding_regression_schemas();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.default_prevent_destroy")
+                .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+                .default_prevent_destroy()
+                .validate()
+                .unwrap(),
+        );
+        let diagnostics =
+            custom_engine(schemas).analyze(&create_document_at(&source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("default of argument `protect`"))
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+        assert_eq!(errors[0].range.start.line, 1);
+        assert!(
+            errors[0].message.contains(module) && errors[0].message.contains("protect = false"),
+            "{errors:#?}"
+        );
+        assert!(
+            !errors[0]
+                .message
+                .contains(&fixture.path().display().to_string()),
+            "{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn default_opt_out_diagnostics_keep_all_resources_at_one_omitting_call() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    for anonymous in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        let first = if anonymous { "" } else { "let first = " };
+        let second = if anonymous { "" } else { "let second = " };
+        std::fs::write(fixture.path().join("module/main.crn"), format!("arguments {{ protect: Bool = false }}\n{first}mock.test.default_prevent_destroy {{ name = 'first' directives {{ prevent_destroy = protect }} }}\n{second}mock.test.default_prevent_destroy {{ name = 'second' directives {{ prevent_destroy = protect }} }}\n")).unwrap();
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let source = "let m = use { source = './module' }\nlet instance = m {}\n";
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, source).unwrap();
+        let mut schemas = authored_binding_regression_schemas();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.default_prevent_destroy")
+                .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+                .default_prevent_destroy()
+                .validate()
+                .unwrap(),
+        );
+        let diagnostics =
+            custom_engine(schemas).analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("false came from"))
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), 2, "{diagnostics:#?}");
+        if !anonymous {
+            for resource in ["instance.first", "instance.second"] {
+                assert!(
+                    errors.iter().any(|error| error.message.contains(resource)),
+                    "{errors:#?}"
+                );
+            }
+        }
+        assert_eq!(errors[0].range, errors[1].range);
+        assert_eq!(errors[0].range.start.line, 1);
+        assert!(
+            errors.iter().all(
+                |error| error.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            )
+        );
+    }
+}
+
+#[test]
+fn default_control_values_only_taint_dependent_directives_in_lsp() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    for (arguments, body, error_expected) in [
+        (
+            "flags: list(Bool) = [false]",
+            "for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }",
+            false,
+        ),
+        (
+            "flags: list(Bool) = [false]",
+            "for flag in flags { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = flag } } }",
+            true,
+        ),
+        (
+            "enabled: Bool = true",
+            "if enabled { mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = false } } }",
+            false,
+        ),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fixture.path().join("module")).unwrap();
+        std::fs::write(
+            fixture.path().join("module/main.crn"),
+            format!("arguments {{ {arguments} }}\nlet child = {body}\n"),
+        )
+        .unwrap();
+        let source = "let m = use { source = './module' }\nlet instance = m {}\n";
+        let path = fixture.path().join("calls.crn");
+        std::fs::write(&path, source).unwrap();
+        std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let mut schemas = authored_binding_regression_schemas();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.default_prevent_destroy")
+                .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+                .default_prevent_destroy()
+                .validate()
+                .unwrap(),
+        );
+        let diagnostics =
+            custom_engine(schemas).analyze(&create_document_at(source, path.clone()), Some(&path));
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors.len(),
+            usize::from(error_expected),
+            "{body}: {diagnostics:#?}"
+        );
+        if error_expected {
+            assert!(errors[0].message.contains("default of argument `flags`"));
+            assert_eq!(errors[0].range.start.line, 1);
+        }
+    }
+}
+
+#[test]
+fn default_opt_out_diagnostics_only_anchor_calls_that_omitted_values() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("inner")).unwrap();
+    std::fs::create_dir(fixture.path().join("outer")).unwrap();
+    std::fs::write(fixture.path().join("inner/main.crn"), "arguments { protect: Bool = false }\nlet r = mock.test.default_prevent_destroy { name = 'r' directives { prevent_destroy = protect } }\n").unwrap();
+    let outer = "arguments { label: String }\nlet inner = use { source = '../inner' }\nlet child = inner {}\n";
+    let outer_path = fixture.path().join("outer/main.crn");
+    std::fs::write(&outer_path, outer).unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let root =
+        "let outer = use { source = './outer' }\nlet instance = outer { label = 'explicit' }\n";
+    let root_path = fixture.path().join("call.crn");
+    std::fs::write(&root_path, root).unwrap();
+    let mut schemas = authored_binding_regression_schemas();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.default_prevent_destroy")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .default_prevent_destroy()
+            .validate()
+            .unwrap(),
     );
-    assert_eq!(warnings[0].range.start.line, 4);
+    let engine = custom_engine(schemas);
+    let root_diagnostics = engine.analyze(
+        &create_document_at(root, root_path.clone()),
+        Some(&root_path),
+    );
+    assert!(
+        root_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("false came from")),
+        "the outer caller did not omit protect: {root_diagnostics:#?}"
+    );
+    let outer_diagnostics = engine.analyze(
+        &create_document_at(outer, outer_path.clone()),
+        Some(&outer_path),
+    );
+    let errors = outer_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("false came from"))
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{outer_diagnostics:#?}");
+    assert_eq!(errors[0].range.start.line, 2);
+}
+
+#[test]
+fn directive_argument_exemptions_reject_computed_and_non_bool_loop_values_in_lsp() {
+    for (arguments, body) in [
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = \"${protect}\" } }",
+        ),
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = length([protect]) } }",
+        ),
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = protect ?? false } }",
+        ),
+        (
+            "protect: Bool",
+            "mock.test.resource { name = 'r' directives { prevent_destroy = if protect { true } else { false } } }",
+        ),
+        (
+            "flags: list(Bool)",
+            "for flag in flags { mock.test.resource { name = 'r' directives { prevent_destroy = lookup({ keep = flag }, 'keep', false) } } }",
+        ),
+        (
+            "names: list(String)",
+            "for flag in names { mock.test.resource { name = 'r' directives { prevent_destroy = flag } } }",
+        ),
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("arguments.crn"),
+            format!("arguments {{ {arguments} }}\n"),
+        )
+        .unwrap();
+        let path = fixture.path().join("resource.crn");
+        std::fs::write(&path, body).unwrap();
+        let diagnostics = custom_engine(authored_binding_regression_schemas())
+            .analyze(&create_document_at(body, path.clone()), Some(&path));
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("directives.prevent_destroy")
+                && diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+            "{diagnostics:#?}"
+        );
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("directives.prevent_destroy"))
+            .unwrap();
+        let expected = if arguments == "names: list(String)" {
+            "got String"
+        } else {
+            "cannot be checked until the module is instantiated"
+        };
+        assert!(error.message.contains(expected), "{error:#?}");
+        assert!(!error.message.contains("unknown until apply"), "{error:#?}");
+    }
+}
+
+#[test]
+fn non_local_loop_directive_dependencies_are_errors_in_lsp() {
+    for expression in [
+        "lookup({ value = flag }, 'value', peer.protected)",
+        "flag ?? false",
+    ] {
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("providers.crn"),
+            "provider mock {}\nlet peer = mock.test.resource { name = 'peer' }\n",
+        )
+        .unwrap();
+        let source = format!(
+            "for flag in peer.items {{\n  mock.test.resource {{ name = 'r' directives {{ prevent_destroy = {expression} }} }}\n}}\n"
+        );
+        let path = fixture.path().join("loops.crn");
+        std::fs::write(&path, &source).unwrap();
+        let diagnostics = custom_engine(authored_binding_regression_schemas())
+            .analyze(&create_document_at(&source, path.clone()), Some(&path));
+        let error = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("directives.prevent_destroy"))
+            .unwrap_or_else(|| panic!("{expression}: non-local loop directive must be diagnosed before apply: {diagnostics:#?}"));
+        assert_eq!(
+            error.severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(error.range.start.line, 1);
+        assert!(
+            error
+                .message
+                .contains("loop directive must depend only on the current element"),
+            "{error:#?}"
+        );
+        assert!(!error.message.contains("unknown until apply"), "{error:#?}");
+    }
+}
+
+#[test]
+fn standalone_module_directive_arguments_must_be_bool_in_lsp() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        for kind in ["String", "Int"] {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(
+                fixture.path().join("arguments.crn"),
+                format!("arguments {{ flag: {kind} }}\n"),
+            )
+            .unwrap();
+            let source = format!(
+                "let r = mock.test.resource {{\n  name = 'r'\n  directives {{ {directive} = flag }}\n}}\n"
+            );
+            let path = fixture.path().join("resource.crn");
+            std::fs::write(&path, &source).unwrap();
+            let diagnostics = custom_engine(authored_binding_regression_schemas())
+                .analyze(&create_document_at(&source, path.clone()), Some(&path));
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains(&format!("directives.{directive}"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{kind}: {diagnostics:#?}");
+            assert_eq!(errors[0].range.start.line, 2);
+            assert!(
+                errors[0].message.contains(&format!("got {kind}")),
+                "{errors:#?}"
+            );
+            assert!(
+                errors[0].message.contains("mock.test.resource"),
+                "{errors:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn module_argument_iterable_directives_are_valid_in_lsp() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments { flags: list(Bool) }\n",
+    )
+    .unwrap();
+    let source = "for flag in flags {\n  mock.test.resource { name = 'r' directives { prevent_destroy = flag create_before_destroy = flag force_delete = flag } }\n}\n";
+    let path = fixture.path().join("resource.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = custom_engine(authored_binding_regression_schemas())
+        .analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn instantiated_module_loop_directives_are_valid_in_lsp() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::create_dir(fixture.path().join("module")).unwrap();
+    std::fs::write(
+        fixture.path().join("module/arguments.crn"),
+        "arguments { flags: list(Bool) }\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.path().join("module/resources.crn"), "for flag in flags { mock.test.resource { name = 'r' directives { prevent_destroy = flag create_before_destroy = flag force_delete = flag } } }\n").unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let source = "let m = use { source = './module' }\nlet instance = m { flags = [true] }\n";
+    let path = fixture.path().join("calls.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = custom_engine(authored_binding_regression_schemas())
+        .analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics.iter().all(|diagnostic| diagnostic.severity
+            != Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn module_argument_directives_remain_valid_in_module_diagnostics() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments { flag: Bool }\n",
+    )
+    .unwrap();
+    let source = "let r = mock.test.resource {\n  name = 'r'\n  directives { prevent_destroy = flag create_before_destroy = flag force_delete = flag }\n}\n";
+    let path = fixture.path().join("resource.crn");
+    std::fs::write(&path, source).unwrap();
+    let engine = custom_engine(authored_binding_regression_schemas());
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn directive_value_errors_use_authored_ranges_in_lsp() {
+    for directive in ["prevent_destroy", "create_before_destroy", "force_delete"] {
+        for expression in ["peer.arn", "bad"] {
+            for trailing in ["", " // comment", " /* comment */", " /* comment\nmore */"] {
+                let fixture = tempfile::tempdir().unwrap();
+                std::fs::write(fixture.path().join("flags.crn"), "let bad = 1\n").unwrap();
+                std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+                let prefix = if expression == "bad" {
+                    "let doc = <<EOF\nalpha\nbeta\nEOF\n"
+                } else {
+                    ""
+                };
+                let directive_line = prefix.lines().count() as u32 + 4;
+                let source = format!(
+                    "{prefix}let peer = mock.test.resource {{ name = 'peer' }}\nlet r = mock.test.resource {{\n  name = 'r'\n  directives {{\n    {directive} = {expression}{trailing}\n  }}\n}}\n"
+                );
+                let path = fixture.path().join("resources.crn");
+                std::fs::write(&path, &source).unwrap();
+                let engine = custom_engine(authored_binding_regression_schemas());
+                let diagnostics =
+                    engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+                let errors = diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic
+                            .message
+                            .contains(&format!("directives.{directive}"))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+                assert!(errors[0].message.starts_with("directives."), "{errors:#?}");
+                assert_eq!(
+                    errors[0].severity,
+                    Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+                );
+                assert_eq!(errors[0].range.start.line, directive_line);
+                assert_eq!(
+                    errors[0].range.start.character,
+                    (directive.len() + 7) as u32
+                );
+                assert_eq!(errors[0].range.end.line, directive_line, "{errors:#?}");
+                assert_eq!(
+                    errors[0].range.end.character,
+                    errors[0].range.start.character + expression.len() as u32
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -10310,7 +10782,7 @@ fn single_quoted_interpolation_like_sequence_emits_warning_at_span() {
 }
 
 #[test]
-fn non_literal_prevent_destroy_warning_is_directory_scoped() {
+fn folded_false_prevent_destroy_is_valid_across_files() {
     let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
     let resource = r#"let account = mock.test.resource {
   name = "example"
@@ -10329,26 +10801,16 @@ fn non_literal_prevent_destroy_warning_is_directory_scoped() {
     let path = fixture.path().join("resources.crn");
     let diagnostics =
         test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic
-                .message
-                .contains("only a literal `false` opts out of schema-default protection")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(warnings.len(), 1, "diagnostics: {diagnostics:#?}");
-    let warning = warnings[0];
-
-    assert_eq!(
-        warning.severity,
-        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.prevent_destroy")),
+        "{diagnostics:#?}"
     );
-    assert_eq!(warning.range.start.line, 2);
 }
 
 #[test]
-fn sibling_true_prevent_destroy_expression_does_not_warn() {
+fn sibling_true_prevent_destroy_expression_is_valid() {
     let fixture = tempfile::tempdir().expect("multi-file diagnostics fixture");
     let resource = r#"let account = mock.test.resource {
   name = "example"
@@ -10364,18 +10826,11 @@ fn sibling_true_prevent_destroy_expression_does_not_warn() {
     let path = fixture.path().join("resources.crn");
     let diagnostics =
         test_engine().analyze(&create_document_at(resource, path.clone()), Some(&path));
-    let warnings = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic
-                .message
-                .contains("only a literal `false` opts out of schema-default protection")
-        })
-        .collect::<Vec<_>>();
-
     assert!(
-        warnings.is_empty(),
-        "the directory-resolved true value enables protection without an opt-out warning: {diagnostics:#?}"
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("directives.prevent_destroy")),
+        "{diagnostics:#?}"
     );
 }
 

@@ -833,7 +833,7 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
     .expect("multi-file collision fixture parses");
     let parsed = crate::module_resolver::resolve_modules_providerless(parsed, &directory)
         .expect("multi-file collision fixture crosses root expansion")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("collision fixture contains no parser placeholders");
     let mut unresolved = parsed.resources;
 
@@ -1375,7 +1375,7 @@ fn unbound_deferred_for_promotes_replaced_producer_to_cbd() {
     let parsed = crate::parser::parse(
         "let vpc = ec2.Vpc { name = 'vpc' }\nfor subnet in vpc.subnets { ec2.Subnet { name = subnet } }",
         &crate::parser::ProviderContext::default(),
-    ).unwrap().into_expanded().unwrap();
+    ).unwrap().into_expanded(&crate::schema::SchemaRegistry::new()).unwrap();
     let target = parsed.deferred_for_expressions()[0].target().clone();
     assert!(matches!(
         target,

@@ -2279,7 +2279,7 @@ for account_id in orgs.accounts {
                 )]),
             )]));
         let mut parsed = parsed
-            .into_expanded()
+            .into_expanded(&crate::schema::SchemaRegistry::new())
             .expect("directory fixture must contain no parser placeholders");
         parsed
             .expand_deferred_for_expressions(&bindings)

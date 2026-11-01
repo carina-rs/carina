@@ -2780,7 +2780,7 @@ mod tests {
             &SchemaRegistry::new(),
         )
         .expect("test fixture crosses module resolution")
-        .into_expanded()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
         .expect("test fixture contains no leftover parser placeholders")
     }
 

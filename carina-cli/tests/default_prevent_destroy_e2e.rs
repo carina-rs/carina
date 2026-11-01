@@ -245,29 +245,21 @@ fn schema_default_protects_remove_replace_and_destroy_until_explicit_opt_out() {
 }
 
 #[test]
-fn non_literal_false_is_valid_but_does_not_opt_out() {
+fn folded_false_opts_out_of_schema_default() {
     let scenario = Scenario::new();
     scenario.write_resource_with_expression("account-v1");
     assert_success("carina init", &scenario.run(&["init", "."]));
     let validate = scenario.run(&["validate", "."]);
     assert_success("carina validate", &validate);
-    let validate_output = output_text(&validate);
-    assert!(
-        validate_output.contains("only a literal `false` opts out of schema-default protection"),
-        "validate must warn about the ignored non-literal opt-out:\n{validate_output}"
-    );
     assert_success(
         "initial apply",
         &scenario.run(&["apply", ".", "--auto-approve", "--lock=false"]),
     );
 
     scenario.write_resource_with_expression("account-v2");
-    let plan = scenario.run(&["plan", "."]);
-    assert_schema_default_refusal("non-literal false replacement plan", &plan);
-    let plan_output = output_text(&plan);
-    assert!(
-        plan_output.contains("only a literal `false` opts out of schema-default protection"),
-        "plan must warn about the ignored non-literal opt-out:\n{plan_output}"
+    assert_success(
+        "folded false replacement plan",
+        &scenario.run(&["plan", "."]),
     );
 }
 

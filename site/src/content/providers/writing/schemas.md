@@ -488,11 +488,33 @@ let schema = ResourceSchema::new("organizations.Account")
     .expect("the schema is valid");
 ```
 
-Carina then rejects deletion and replacement unless the user writes the
-literal opt-out `directives { prevent_destroy = false }`. Resource schemas are
+Carina then rejects deletion and replacement unless the user sets
+`prevent_destroy` to a value that resolves to `false`, for example
+`directives { prevent_destroy = false }`. Resource schemas are
 unprotected by default, so use this builder only where deletion has unusually
 severe consequences. The required boolean is transported in protocol-v16
 schema JSON; an older provider that omits it fails during schema loading.
+
+A module argument default that resolves to `false` cannot disable this schema
+protection. Validation requires the caller to pass the argument explicitly,
+such as `protect = false`. Any contributing default keeps a value defaulted,
+including through nested argument expressions, function calls, conditional value
+expressions, and coalescing. Loop directives and module-call arguments inherit
+the iterable's default origin only when they reference a loop variable.
+Combining an explicit value with a defaulted value retains all the contributing
+defaults. Diagnostics name every contributing default and identify the calls
+that omitted its argument.
+
+Literal `prevent_destroy = false` remains an explicit opt-out inside loops over
+defaulted iterables. A structural condition that selects whether a resource or
+module call exists does not supply the body's values, so it does not make a
+literal opt-out defaulted either. Reading a loop variable from a defaulted list
+or map still carries that iterable's default origin.
+
+An argument whose default refers to another argument remains defaulted even if
+that other argument was passed explicitly. The caller can replace the dependent
+default by passing that argument itself. Types without schema-default protection
+and the other boolean directives keep their usual resolved-value behavior.
 
 ## The validated schema
 

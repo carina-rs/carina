@@ -899,7 +899,7 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)
         }
-        carina_core::validation::ResolveFileError::LeftoverPlaceholders(error) => error.into(),
+        carina_core::validation::ResolveFileError::Expansion(error) => error.into(),
     }
 }
 
@@ -946,7 +946,7 @@ fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
     let parsed = resolve_file_binding_uses(parsed, base_dir, context)?;
     let unresolved = unresolved
         .into_iter()
-        .map(Resource::into_expanded)
+        .map(|resource| resource.into_expanded(context.schemas()))
         .collect::<Result<_, _>>()?;
     Ok((parsed, unresolved))
 }

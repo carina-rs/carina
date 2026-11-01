@@ -140,7 +140,7 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         Path::new("."),
     )
     .expect("loop fixture crosses the module-resolution seam")
-    .into_expanded()
+    .into_expanded(&crate::schema::SchemaRegistry::new())
     .expect("loop fixture contains no parser placeholders")
     .resources
 }
@@ -9114,7 +9114,7 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
     .expect("directory parses");
     let mut parsed = crate::module_resolver::resolve_modules_providerless(parsed, fixture.path())
         .expect("directory fixture crosses the module-resolution seam")
-        .into_expanded()
+        .into_expanded(&crate::schema::SchemaRegistry::new())
         .expect("directory fixture contains no parser placeholders");
     let registry = loop_identity_registry(false);
 

@@ -77,15 +77,13 @@ impl DependsOnDiagnostic {
 
 /// The `directives.depends_on` list of a resource, or an empty slice.
 ///
-/// `LiveComposition` carries no directives — [`ResourceRef::directives`]
-/// is `None` for that arm, treated here as an empty `depends_on` list.
+/// `LiveComposition` has no directive dependencies.
 fn depends_on_of<B, D>(rref: ParsedResourceRef<'_, D, B>) -> &[B]
 where
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    rref.directives()
-        .map_or(&[][..], |d| d.depends_on.as_slice())
+    rref.directive_dependencies()
 }
 
 /// Run all depends_on checks against a parsed file. Returns the full
