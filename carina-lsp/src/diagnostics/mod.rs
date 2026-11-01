@@ -19,7 +19,8 @@ use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
 };
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, ParserPlaceholder, RelativeBindingName, Value as GenericValue,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder,
+    RelativeBindingName, Value as GenericValue,
 };
 use carina_core::schema::{SchemaRegistry, TypeError, TypeInSchema};
 
@@ -211,6 +212,41 @@ struct DiagnosticValidationInputs<'a> {
         carina_core::binding_index::ResolvedBindings<ParserPlaceholder, RelativeBindingName>,
 }
 
+/// Expanded values and their binding authority stay in the absolute phase.
+/// Authored values are used separately for source positions and lexical checks.
+struct ExpandedDiagnosticValidationInputs<'a> {
+    graph: &'a carina_core::parser::ModuleResolvedParsedFile,
+    binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
+    inference_bindings: carina_core::validation::inference::InferenceBindings<
+        ParserPlaceholder,
+        AbsoluteBindingAddress,
+    >,
+}
+
+impl ExpandedDiagnosticValidationInputs<'_> {
+    fn check_resource_access(
+        &self,
+        resource_id: &carina_core::resource::ResourceId,
+        attribute: &str,
+        expected: TypeInSchema<'_>,
+        schemas: &SchemaRegistry,
+    ) -> Option<Result<(), carina_core::validation::DeferredAccessTypeError>> {
+        let resource = self
+            .graph
+            .iter_all_resources()
+            .find(|candidate| candidate.id() == resource_id)?;
+        let attributes = resource.attributes();
+        let value = attributes.get(attribute)?;
+        Some(carina_core::validation::check_deferred_access_type(
+            value,
+            expected,
+            &self.inference_bindings,
+            schemas,
+            &self.binding_index,
+        ))
+    }
+}
+
 impl DiagnosticProviderContext {
     fn loaded(&self) -> Option<&carina_core::parser::LoadedProviderContext> {
         match self {
@@ -252,6 +288,34 @@ pub struct DiagnosticEngine {
 }
 
 impl DiagnosticEngine {
+    fn resolve_diagnostic_upstream_exports<B: BindingAddress>(
+        &self,
+        base: &Path,
+        upstream_states: &[carina_core::parser::UpstreamState<B>],
+    ) -> (
+        carina_core::upstream_exports::UpstreamExports<B>,
+        Vec<carina_core::upstream_exports::UpstreamResolveError>,
+    ) {
+        match &self.provider_context {
+            DiagnosticProviderContext::Loaded(provider_context) => {
+                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                    base,
+                    upstream_states,
+                    provider_context,
+                    Some(&self.schemas),
+                )
+            }
+            DiagnosticProviderContext::Unloaded(provider_context) => {
+                carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
+                    base,
+                    upstream_states,
+                    provider_context,
+                    Some(&self.schemas),
+                )
+            }
+        }
+    }
+
     /// Construct diagnostics backed by one loaded-provider snapshot.
     pub fn new(loaded_providers: Arc<LoadedProviderSnapshot>, provider_names: Vec<String>) -> Self {
         Self::new_with_known_providers(loaded_providers, provider_names, HashSet::new())
@@ -569,25 +633,12 @@ impl DiagnosticEngine {
             ));
         }
         let upstream_resolution = match (base_path, merged) {
-            (Some(base), Some(merged)) => Some(match &self.provider_context {
-                DiagnosticProviderContext::Loaded(provider_context) => {
-                    carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
-                        base,
-                        &merged.upstream_states,
-                        provider_context,
-                        Some(&self.schemas),
-                    )
-                }
-                DiagnosticProviderContext::Unloaded(provider_context) => {
-                    carina_core::upstream_exports::resolve_upstream_exports_providerless_with_schemas(
-                        base,
-                        &merged.upstream_states,
-                        provider_context,
-                        Some(&self.schemas),
-                    )
-                }
-            }),
-            _ => None,
+            (Some(base), Some(merged)) => {
+                Some(self.resolve_diagnostic_upstream_exports(base, &merged.upstream_states))
+            }
+            (Some(_base), None) => None,
+            (None, Some(_merged)) => None,
+            (None, None) => None,
         };
 
         if let (Some(merged), Some((exports, resolve_errors))) =
@@ -837,6 +888,28 @@ impl DiagnosticEngine {
                 .unwrap_or_default();
             let validation_inputs =
                 self.validation_inputs(pre_expansion_input, upstream_exports, &module_signatures);
+            let expanded_upstream_exports = match (base_path, expanded_graph) {
+                (Some(base), Some(graph)) => {
+                    self.resolve_diagnostic_upstream_exports(base, &graph.upstream_states)
+                        .0
+                }
+                (Some(_base), None) => Default::default(),
+                (None, Some(_graph)) => Default::default(),
+                (None, None) => Default::default(),
+            };
+            let expanded_validation_inputs =
+                expanded_graph.map(|graph| ExpandedDiagnosticValidationInputs {
+                    graph,
+                    binding_index:
+                        carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
+                            graph,
+                            &self.schemas,
+                            &expanded_upstream_exports,
+                        ),
+                    inference_bindings: carina_core::validation::inference::bindings_from_parsed(
+                        graph,
+                    ),
+                });
             let DiagnosticValidationInputs {
                 binding_index,
                 inference_bindings,
@@ -995,17 +1068,13 @@ impl DiagnosticEngine {
                 ),
                 None => Vec::new(),
             };
-            let expanded_reference_findings = match expanded_graph {
-                Some(graph) => {
-                    let expanded_binding_index =
-                        carina_core::binding_index::BindingIndex::from_parsed(graph, &self.schemas);
-                    carina_core::validation::check_expanded_module_calls(
-                        carina_core::validation::ExpandedModuleCallCheckInput::References {
-                            compositions: &graph.compositions,
-                            bindings: &expanded_binding_index,
-                        },
-                    )
-                }
+            let expanded_reference_findings = match expanded_validation_inputs.as_ref() {
+                Some(inputs) => carina_core::validation::check_expanded_module_calls(
+                    carina_core::validation::ExpandedModuleCallCheckInput::References {
+                        compositions: &inputs.graph.compositions,
+                        bindings: &inputs.binding_index,
+                    },
+                ),
                 None => Vec::new(),
             };
             let findings = carina_core::validation::merge_module_call_findings([
@@ -1530,15 +1599,27 @@ impl DiagnosticEngine {
                                         DeferredValue::ResourceRef { .. }
                                         | DeferredValue::Access(_),
                                     ),
-                                ) => carina_core::validation::check_deferred_access_type(
-                                    value,
-                                    schema.type_in_schema(attr_schema.attr_type()),
-                                    &inference_bindings,
-                                    &self.schemas,
-                                    &binding_index,
-                                )
-                                .err()
-                                .map(|error| error.to_string()),
+                                ) => expanded_validation_inputs
+                                    .as_ref()
+                                    .and_then(|inputs| {
+                                        inputs.check_resource_access(
+                                            resource_id,
+                                            attr_name,
+                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            &self.schemas,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        carina_core::validation::check_deferred_access_type(
+                                            value,
+                                            schema.type_in_schema(attr_schema.attr_type()),
+                                            &inference_bindings,
+                                            &self.schemas,
+                                            &binding_index,
+                                        )
+                                    })
+                                    .err()
+                                    .map(|error| error.to_string()),
                                 (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
                                     check_resource_ref_type_mismatch(
                                         &binding_index,
@@ -1844,6 +1925,7 @@ impl DiagnosticEngine {
                 parsed,
                 &semantic_view,
                 &export_value_bindings,
+                expanded_graph,
             ));
 
             // Unused `let` detection. When a directory parse is available,

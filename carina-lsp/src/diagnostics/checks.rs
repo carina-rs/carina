@@ -15,7 +15,8 @@ use carina_core::parser::{
     SourceSpan, TopLevelBlockSourceSpan, TypeExpr,
 };
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, ParserPlaceholder, RelativeBindingName, Value as GenericValue,
+    BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, RelativeBindingName,
+    Value as GenericValue,
 };
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
@@ -2550,7 +2551,7 @@ impl DiagnosticEngine {
 
     /// Validate export parameter values against their type annotations.
     ///
-    /// `merged` is the directory-merged parse used to feed inference so
+    /// The expanded graph, when available, feeds inference and secrecy checks so
     /// module-call / `upstream_state` bindings declared in sibling
     /// `.crn` files are visible — without it the export inference would
     /// raise spurious `unknown binding` for an `exports.crn` that
@@ -2561,35 +2562,41 @@ impl DiagnosticEngine {
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
         value_bindings: &ResolvedBindings,
+        expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        let expanded_values = expanded.map(|graph| {
+            (
+                graph,
+                GenericResolvedBindings::for_expanded_validation(graph),
+            )
+        });
 
         for param in &parsed.export_params {
-            let mut fallback;
-            let semantic_param = match semantic_view.lookup(param) {
-                Some(semantic_param) => semantic_param,
+            let message = match expanded_values.as_ref() {
+                Some((graph, bindings)) => graph
+                    .export_params
+                    .iter()
+                    .find(|candidate| {
+                        candidate.source_file() == param.source_file()
+                            && candidate.source_span() == param.source_span()
+                    })
+                    .and_then(|semantic_param| self.export_value_error(semantic_param, bindings)),
                 None => {
-                    let Some(value) = semantic_view.value_for_typecheck(param) else {
-                        continue;
+                    let mut fallback;
+                    let semantic_param = match semantic_view.lookup(param) {
+                        Some(semantic_param) => semantic_param,
+                        None => {
+                            let Some(value) = semantic_view.value_for_typecheck(param) else {
+                                continue;
+                            };
+                            fallback = param.clone();
+                            fallback.value = Some(value.clone());
+                            &fallback
+                        }
                     };
-                    fallback = param.clone();
-                    fallback.value = Some(value.clone());
-                    &fallback
+                    self.export_value_error(semantic_param, value_bindings)
                 }
-            };
-            let message = match self.provider_context.loaded() {
-                Some(provider_context) => carina_core::validation::check_export_values_pre_apply(
-                    std::slice::from_ref(semantic_param),
-                    value_bindings,
-                    provider_context,
-                )
-                .err(),
-                None => carina_core::validation::check_export_values_pre_apply_providerless(
-                    std::slice::from_ref(semantic_param),
-                    value_bindings,
-                    &self.provider_context,
-                )
-                .err(),
             };
             if let Some(message) = message
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
@@ -2627,30 +2634,55 @@ impl DiagnosticEngine {
         // whole `InferredFile`. Use the merged, module-expanded parse when
         // available so sibling-file bindings are visible and module calls
         // appear as inferable `Virtual` compositions (#2493).
-        let inferred_diagnostics = match semantic_view {
-            SemanticView::Standalone(inference_input)
-            | SemanticView::DirectoryParsed {
-                merged: inference_input,
-            } => self.check_inferred_export_types(doc, inference_input),
-            SemanticView::DirectoryUnavailable => Vec::new(),
+        let inferred_diagnostics = match expanded {
+            Some(graph) => self.check_inferred_export_types(doc, graph),
+            None => match semantic_view {
+                SemanticView::Standalone(inference_input)
+                | SemanticView::DirectoryParsed {
+                    merged: inference_input,
+                } => self.check_inferred_export_types(doc, inference_input),
+                SemanticView::DirectoryUnavailable => Vec::new(),
+            },
         };
         diagnostics.extend(inferred_diagnostics);
 
         diagnostics
     }
 
-    fn check_inferred_export_types<D>(
+    fn export_value_error<B: BindingAddress>(
+        &self,
+        param: &ParsedExportParam<ParserPlaceholder, B>,
+        value_bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
+    ) -> Option<String> {
+        match self.provider_context.loaded() {
+            Some(provider_context) => carina_core::validation::check_export_values_pre_apply(
+                std::slice::from_ref(param),
+                value_bindings,
+                provider_context,
+            )
+            .err(),
+            None => carina_core::validation::check_export_values_pre_apply_providerless(
+                std::slice::from_ref(param),
+                value_bindings,
+                &self.provider_context,
+            )
+            .err(),
+        }
+    }
+
+    fn check_inferred_export_types<D, B: BindingAddress>(
         &self,
         doc: &Document,
         inference_input: &carina_core::parser::File<
-            ParsedExportParam,
+            ParsedExportParam<ParserPlaceholder, B>,
             ParserPlaceholder,
             ParserPlaceholder,
             D,
+            B,
         >,
     ) -> Vec<Diagnostic>
     where
-        D: carina_core::parser::DeferredForPhaseTraversal,
+        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let mut diagnostics = Vec::new();
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
@@ -2711,17 +2743,18 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    fn infer_export_params_without_loaded_provider_schemas<D>(
+    fn infer_export_params_without_loaded_provider_schemas<D, B: BindingAddress>(
         &self,
         parsed: &carina_core::parser::File<
-            ParsedExportParam,
+            ParsedExportParam<ParserPlaceholder, B>,
             ParserPlaceholder,
             ParserPlaceholder,
             D,
+            B,
         >,
-    ) -> carina_core::validation::inference::SchemaCheckedExportParams
+    ) -> carina_core::validation::inference::SchemaCheckedExportParams<B>
     where
-        D: carina_core::parser::DeferredForPhaseTraversal,
+        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         carina_core::validation::inference::infer_export_params(parsed, &self.schemas)
     }

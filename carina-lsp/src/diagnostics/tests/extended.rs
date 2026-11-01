@@ -7289,21 +7289,27 @@ let instance = component {
 
     let diagnostics = analyze_with_buffer(&engine, &root, "resources.crn", resources);
 
-    assert!(
-        diagnostics.iter().any(|diagnostic| {
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
             diagnostic.message.contains("Type mismatch")
                 && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
                 && diagnostic
                     .message
                     .contains("from instance.security_group_id")
-        }),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mismatches.len(),
+        1,
         "LSP must report the same composition-consumer mismatch as validate: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)
             .collect::<Vec<_>>(),
     );
+    assert_eq!(mismatches[0].range.start.line, 2);
 }
 
 #[test]
