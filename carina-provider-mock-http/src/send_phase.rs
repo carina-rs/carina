@@ -237,7 +237,8 @@ pub fn wasi_http_send_phase(url: &str, method: &str, body: &str, kind: ProbeKind
         *request.body_mut() = body.as_bytes().to_vec().into();
 
         match futures::executor::block_on(connector.call(request)) {
-            Ok(_) => "success".to_string(),
+            Ok(response) if response.status().is_success() => "success".to_string(),
+            Ok(response) => format!("status:{}", response.status().as_u16()),
             Err(error) => {
                 let sdk_error: SdkError<(), ()> = SdkError::dispatch_failure(error);
                 let SdkError::DispatchFailure(dispatch) = &sdk_error else {
