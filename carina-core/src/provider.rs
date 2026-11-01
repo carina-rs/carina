@@ -6332,9 +6332,9 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
 /// strings by convention.
 pub fn identified_custom_type_scalar_kind(
     attribute_type: &AttributeType,
-) -> Option<RefinedScalarKind> {
-    match attribute_type.raw_shape() {
-        RawShape::UnloadedSchemaType(_) => None,
+) -> Result<Option<RefinedScalarKind>, crate::parser::UnloadedSchemaType> {
+    Ok(match attribute_type.raw_shape() {
+        RawShape::UnloadedSchemaType(unloaded) => return Err(unloaded.clone()),
         RawShape::String {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::String),
@@ -6355,7 +6355,7 @@ pub fn identified_custom_type_scalar_kind(
         | RawShape::Struct { .. }
         | RawShape::Union(_)
         | RawShape::Ref(_) => None,
-    }
+    })
 }
 
 fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
@@ -6406,12 +6406,12 @@ pub fn canonicalize_custom_type_value(
             type_name: declared_type.type_name(),
         }
     })?;
-    let scalar_kind = identified_custom_type_scalar_kind(declared_type).ok_or_else(|| {
-        CustomTypeCanonicalizationError::MissingScalarKind {
+    let scalar_kind = identified_custom_type_scalar_kind(declared_type)
+        .map_err(|_| CustomTypeCanonicalizationError::ProvidersNotLoaded)?
+        .ok_or_else(|| CustomTypeCanonicalizationError::MissingScalarKind {
             identity: identity.clone(),
             type_name: declared_type.type_name(),
-        }
-    })?;
+        })?;
     match (declared_type.raw_shape(), value) {
         (RawShape::UnloadedSchemaType(_), _) => {
             Err(CustomTypeCanonicalizationError::ProvidersNotLoaded)
@@ -7138,6 +7138,7 @@ impl CustomTypeDispatchTable {
         let mut bindings = HashMap::<TypeIdentity, CustomTypeDispatchBinding>::new();
         for (identity, declaration) in witness.identified_declarations() {
             let kind = identified_custom_type_scalar_kind(&declaration)
+                .expect("validated declarations have loaded scalar kinds")
                 .expect("validated provider schema guarantees a scalar bridge kind");
             let callback = local_custom_validator(&declaration).cloned();
             match bindings.entry(identity) {
@@ -7175,7 +7176,7 @@ impl CustomTypeDispatchTable {
         for (identity, declaration) in
             crate::schema::identified_declarations_from_witnesses(schemas, config)
         {
-            let Some(kind) = identified_custom_type_scalar_kind(&declaration) else {
+            let Ok(Some(kind)) = identified_custom_type_scalar_kind(&declaration) else {
                 return Err(CustomTypeDispatchTableError::MissingScalarKind { identity });
             };
             let callback = local_custom_validator(&declaration).cloned();
@@ -7347,6 +7348,7 @@ where
             );
             for (identity, declarations) in &indexed.declarations {
                 let kind = identified_custom_type_scalar_kind(&declarations[0])
+                    .expect("validated declarations have loaded scalar kinds")
                     .expect("validated identified declarations have a scalar kind");
                 owners_by_identity
                     .entry((identity.clone(), kind))
@@ -7600,7 +7602,7 @@ fn validate_custom_type_annotation(
             if local_custom_validator(declaration).is_none()
                 && let Some(canonical) = canonical
             {
-                let Some(kind) = identified_custom_type_scalar_kind(declaration) else {
+                let Ok(Some(kind)) = identified_custom_type_scalar_kind(declaration) else {
                     return Err(CustomTypeValidationError::Rejected {
                         owner: owner.clone(),
                         identity: identity.clone(),

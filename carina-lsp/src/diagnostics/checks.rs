@@ -1483,8 +1483,12 @@ impl DiagnosticEngine {
         };
         let binding_use_report =
             carina_core::validation::check_bare_binding_uses(parsed, &validation_context);
-        let bindings =
-            BindingIndex::from_parsed_with_module_signatures(parsed, &self.schemas, &signatures);
+        let bindings = BindingIndex::from_parsed_with_module_signatures(
+            parsed,
+            &self.schemas,
+            &signatures,
+            &self.provider_context,
+        );
         match &self.provider_context {
             super::DiagnosticProviderContext::Loaded(provider_context) => {
                 carina_core::validation::check_module_calls(
@@ -2503,6 +2507,7 @@ impl DiagnosticEngine {
                                 schemas: &self.schemas,
                             },
                         )
+                        .require_provider_schemas()
                         .err(),
                         None => typecheck::check_type_expr_value_providerless(
                             type_expr,
@@ -2513,6 +2518,7 @@ impl DiagnosticEngine {
                                 schemas: &self.schemas,
                             },
                         )
+                        .allow_deferred()
                         .err(),
                     };
                     if let Some(type_error) = type_error
@@ -2812,8 +2818,11 @@ impl DiagnosticEngine {
         } else {
             self.infer_export_params_without_loaded_provider_schemas(inference_input)
         };
-        let export_bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
+        let export_bindings = carina_core::binding_index::BindingIndex::from_parsed(
+            inference_input,
+            &self.schemas,
+            &self.provider_context,
+        );
         if let Err(ref_errors) =
             carina_core::validation::validate_export_param_ref_types_with_bindings(
                 inferred_export_params.parameters(),
@@ -2899,28 +2908,6 @@ impl DiagnosticEngine {
                     .err()
                     .map(|error| error.to_string())
             }
-            TypeExpr::Simple(name) => {
-                if carina_core::parser::builtin_bare_custom_types().contains_key(name) {
-                    return None;
-                }
-                // The document's provisional parse has no provider context,
-                // so a registered bare provider type may still be a `Simple`
-                // node here. The authoritative directory parse promotes it to
-                // owner-bearing `SchemaType`; mirror only the recognition
-                // check here and never route validation by bare identity.
-                let identity = carina_core::schema::TypeIdentity::bare(
-                    carina_core::parser::snake_to_pascal(name),
-                );
-                if self
-                    .provider_context
-                    .known_custom_types()
-                    .iter()
-                    .any(|owned| owned.identity() == &identity)
-                {
-                    return None;
-                }
-                Some(format!("Unknown type '{name}'."))
-            }
             TypeExpr::List(inner) => self.check_unknown_type_names(inner),
             TypeExpr::Map(inner) => self.check_unknown_type_names(inner),
             TypeExpr::Struct { fields } => fields
@@ -2934,6 +2921,7 @@ impl DiagnosticEngine {
             | TypeExpr::Int
             | TypeExpr::Float
             | TypeExpr::Duration
+            | TypeExpr::Simple(_)
             | TypeExpr::Ref(_)
             | TypeExpr::DottedUnresolved(_)
             | TypeExpr::SchemaType { .. }

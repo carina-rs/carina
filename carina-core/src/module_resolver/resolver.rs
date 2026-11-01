@@ -617,6 +617,7 @@ mod diagnostic_status_tests {
             &parsed,
             &schemas,
             &signatures,
+            &provider_context,
         );
         let findings = crate::validation::check_module_calls_providerless(
             crate::validation::ModuleCallCheckInput {
@@ -956,6 +957,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             parsed,
             self.schemas,
             &imported_modules,
+            self.config(),
         );
         crate::validation::validate_expansion_boundary_ref_types_with_bindings(
             parsed,
@@ -1932,6 +1934,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         parsed,
         resolver.schemas,
         &signatures,
+        resolver.config(),
     );
     let resolved_bindings =
         crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);
@@ -1977,6 +1980,7 @@ fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
         parsed,
         resolver.schemas,
         &signatures,
+        resolver.config(),
     );
     let resolved_bindings =
         crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);

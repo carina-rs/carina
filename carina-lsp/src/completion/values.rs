@@ -67,11 +67,16 @@ impl StructuralTypeForCompletion<TypeExpr> {
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         schemas: &SchemaRegistry,
+        provider_ctx: &carina_core::parser::ProviderContext,
     ) -> bool {
         match self {
-            Self::Known(type_expr) => {
-                type_expr_source_is_assignable_to(type_expr, target, target_defs, schemas)
-            }
+            Self::Known(type_expr) => type_expr_source_is_assignable_to(
+                type_expr,
+                target,
+                target_defs,
+                schemas,
+                provider_ctx,
+            ),
             Self::Unnameable(_type_expr) => true,
         }
     }
@@ -123,11 +128,16 @@ impl<'a> UpstreamCompletionStaticType<'a> {
         target: &AttributeType,
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         schemas: &SchemaRegistry,
+        provider_ctx: &carina_core::parser::ProviderContext,
     ) -> bool {
         match self {
-            Self::Known(type_expr) => {
-                type_expr_source_is_assignable_to(type_expr, target, target_defs, schemas)
-            }
+            Self::Known(type_expr) => type_expr_source_is_assignable_to(
+                type_expr,
+                target,
+                target_defs,
+                schemas,
+                provider_ctx,
+            ),
             Self::DeclaredUnnameable(_reason) | Self::InferredUnnameable(_reason) => true,
             Self::NotInferable(_reason) => false,
             Self::InferenceFailed(_error) => false,
@@ -205,8 +215,11 @@ fn type_expr_source_is_assignable_to(
     sink: &AttributeType,
     sink_defs: &std::collections::BTreeMap<String, AttributeType>,
     schemas: &SchemaRegistry,
+    provider_ctx: &carina_core::parser::ProviderContext,
 ) -> bool {
-    let Ok(source) = carina_core::parser::resolve_type_expr_from_schemas(source, schemas) else {
+    let Ok(source) =
+        carina_core::parser::resolve_type_expr_from_schemas(source, schemas, provider_ctx)
+    else {
         return true;
     };
     let Some(source) = carina_core::validation::lift_type_expr(&source) else {
@@ -461,6 +474,7 @@ impl CompletionProvider {
                         attr_schema.attr_type(),
                         schema.as_schema().defs(),
                         &self.schemas,
+                        provider_ctx,
                     ) {
                         continue;
                     }
@@ -542,6 +556,7 @@ impl CompletionProvider {
                         attr_type,
                         target_defs,
                         &self.schemas,
+                        provider_ctx,
                     )
                 }));
             }
@@ -567,7 +582,12 @@ impl CompletionProvider {
                     &self.schemas,
                     &mut exports_cache,
                 )
-                && !element_type.is_candidate_for_target(attr_type, target_defs, &self.schemas)
+                && !element_type.is_candidate_for_target(
+                    attr_type,
+                    target_defs,
+                    &self.schemas,
+                    provider_ctx,
+                )
             {
                 continue;
             }
@@ -1693,6 +1713,7 @@ impl CompletionProvider {
         attr_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &carina_core::parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
@@ -1701,14 +1722,20 @@ impl CompletionProvider {
             text,
             base_path,
         ));
-        items.extend(
-            self.module_call_binding_ref_completions_for_type(
-                attr_type, attr_defs, text, base_path,
-            ),
-        );
-        items.extend(
-            self.upstream_state_ref_completions_for_type(attr_type, attr_defs, text, base_path),
-        );
+        items.extend(self.module_call_binding_ref_completions_for_type(
+            attr_type,
+            attr_defs,
+            text,
+            base_path,
+            provider_ctx,
+        ));
+        items.extend(self.upstream_state_ref_completions_for_type(
+            attr_type,
+            attr_defs,
+            text,
+            base_path,
+            provider_ctx,
+        ));
         items
     }
 
@@ -1726,6 +1753,7 @@ impl CompletionProvider {
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &carina_core::parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -1745,7 +1773,12 @@ impl CompletionProvider {
             );
             for (export_name, entry) in exports {
                 let completion_type = structural_type_for_completion(entry);
-                if !completion_type.is_candidate_for_target(target, target_defs, &self.schemas) {
+                if !completion_type.is_candidate_for_target(
+                    target,
+                    target_defs,
+                    &self.schemas,
+                    provider_ctx,
+                ) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding, export_name);
@@ -1823,6 +1856,7 @@ impl CompletionProvider {
         target_defs: &std::collections::BTreeMap<String, AttributeType>,
         text: &str,
         base_path: Option<&Path>,
+        provider_ctx: &carina_core::parser::ProviderContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
         let mut src_buf = String::new();
@@ -1850,8 +1884,13 @@ impl CompletionProvider {
                 let Some(export_ty) = export.static_type.as_ref() else {
                     continue;
                 };
-                if !type_expr_source_is_assignable_to(export_ty, target, target_defs, &self.schemas)
-                {
+                if !type_expr_source_is_assignable_to(
+                    export_ty,
+                    target,
+                    target_defs,
+                    &self.schemas,
+                    provider_ctx,
+                ) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding_name, export.name);
@@ -2576,31 +2615,36 @@ mod return_type_fits_tests {
             &source,
             &nominal("KmsKeyArn"),
             &defs,
-            &schemas
+            &schemas,
+            carina_core::parser::ProviderContext::unloaded()
         ));
         assert!(!type_expr_source_is_assignable_to(
             &source,
             &nominal("Arn"),
             &defs,
-            &schemas
+            &schemas,
+            carina_core::parser::ProviderContext::unloaded()
         ));
         assert!(type_expr_source_is_assignable_to(
             &source,
             &AttributeType::string(),
             &defs,
-            &schemas
+            &schemas,
+            carina_core::parser::ProviderContext::unloaded()
         ));
         assert!(!type_expr_source_is_assignable_to(
             &source,
             &nominal("PositiveInt"),
             &defs,
-            &schemas
+            &schemas,
+            carina_core::parser::ProviderContext::unloaded()
         ));
         assert!(!type_expr_source_is_assignable_to(
             &TypeExpr::String,
             &nominal("KmsKeyArn"),
             &defs,
-            &schemas
+            &schemas,
+            carina_core::parser::ProviderContext::unloaded()
         ));
     }
 

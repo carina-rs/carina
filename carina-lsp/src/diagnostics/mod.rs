@@ -398,8 +398,7 @@ impl DiagnosticEngine {
             binding_input,
             &self.schemas,
             upstream_exports,
-            module_signatures,
-        );
+            module_signatures, &self.provider_context);
         let inference_bindings =
             carina_core::validation::inference::bindings_from_parsed(binding_input);
         let binding_use_report = match &self.provider_context {
@@ -914,6 +913,7 @@ impl DiagnosticEngine {
                             graph,
                             &self.schemas,
                             &expanded_upstream_exports,
+                            &self.provider_context,
                         ),
                     inference_bindings: carina_core::validation::inference::bindings_from_parsed(
                         graph,

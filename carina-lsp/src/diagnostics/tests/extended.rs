@@ -854,13 +854,15 @@ fn render_value_type_error(
             value,
             provider_context,
             carina_core::validation::typecheck::TypecheckInference::Unavailable,
-        ),
+        )
+        .require_provider_schemas(),
         None => carina_core::validation::typecheck::check_type_expr_value_providerless(
             type_expr,
             value,
             &engine.provider_context,
             carina_core::validation::typecheck::TypecheckInference::Unavailable,
-        ),
+        )
+        .allow_deferred(),
     };
     result.err().map(|error| error.to_string())
 }
@@ -3817,7 +3819,9 @@ let name = join("-", parts)
 #[test]
 fn shared_typecheck_ipv4_address_invalid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
+    let type_expr = carina_core::parser::TypeExpr::Simple(
+        carina_core::parser::BuiltinTypeName::lookup("ipv4_address").unwrap(),
+    );
     let value = Value::Concrete(ConcreteValue::String("not-an-ip".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -3829,7 +3833,9 @@ fn shared_typecheck_ipv4_address_invalid() {
 #[test]
 fn shared_typecheck_ipv4_address_valid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
+    let type_expr = carina_core::parser::TypeExpr::Simple(
+        carina_core::parser::BuiltinTypeName::lookup("ipv4_address").unwrap(),
+    );
     let value = Value::Concrete(ConcreteValue::String("192.168.1.1".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -3842,7 +3848,9 @@ fn shared_typecheck_ipv4_address_valid() {
 #[test]
 fn shared_typecheck_ipv6_cidr_invalid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
+    let type_expr = carina_core::parser::TypeExpr::Simple(
+        carina_core::parser::BuiltinTypeName::lookup("ipv6_cidr").unwrap(),
+    );
     let value = Value::Concrete(ConcreteValue::String("not-a-cidr".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -3854,7 +3862,9 @@ fn shared_typecheck_ipv6_cidr_invalid() {
 #[test]
 fn shared_typecheck_ipv6_cidr_valid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
+    let type_expr = carina_core::parser::TypeExpr::Simple(
+        carina_core::parser::BuiltinTypeName::lookup("ipv6_cidr").unwrap(),
+    );
     let value = Value::Concrete(ConcreteValue::String("2001:db8::/32".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -3867,7 +3877,9 @@ fn shared_typecheck_ipv6_cidr_valid() {
 #[test]
 fn shared_typecheck_ipv6_address_invalid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
+    let type_expr = carina_core::parser::TypeExpr::Simple(
+        carina_core::parser::BuiltinTypeName::lookup("ipv6_address").unwrap(),
+    );
     let value = Value::Concrete(ConcreteValue::String("not-an-ipv6".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -3879,7 +3891,9 @@ fn shared_typecheck_ipv6_address_invalid() {
 #[test]
 fn shared_typecheck_ipv6_address_valid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
+    let type_expr = carina_core::parser::TypeExpr::Simple(
+        carina_core::parser::BuiltinTypeName::lookup("ipv6_address").unwrap(),
+    );
     let value = Value::Concrete(ConcreteValue::String("2001:db8::1".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -3892,9 +3906,10 @@ fn shared_typecheck_ipv6_address_valid() {
 #[test]
 fn shared_typecheck_list_ipv4_address_invalid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::List(Box::new(
-        carina_core::parser::TypeExpr::Simple("ipv4_address".to_string()),
-    ));
+    let type_expr =
+        carina_core::parser::TypeExpr::List(Box::new(carina_core::parser::TypeExpr::Simple(
+            carina_core::parser::BuiltinTypeName::lookup("ipv4_address").unwrap(),
+        )));
     let value = Value::Concrete(ConcreteValue::List(vec![
         Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
         Value::Concrete(ConcreteValue::String("bad-ip".into())),
@@ -3914,9 +3929,10 @@ fn shared_typecheck_list_ipv4_address_invalid() {
 #[test]
 fn shared_typecheck_list_ipv6_cidr_valid() {
     let engine = test_engine();
-    let type_expr = carina_core::parser::TypeExpr::List(Box::new(
-        carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string()),
-    ));
+    let type_expr =
+        carina_core::parser::TypeExpr::List(Box::new(carina_core::parser::TypeExpr::Simple(
+            carina_core::parser::BuiltinTypeName::lookup("ipv6_cidr").unwrap(),
+        )));
     let value = Value::Concrete(ConcreteValue::List(vec![
         Value::Concrete(ConcreteValue::String("2001:db8::/32".into())),
         Value::Concrete(ConcreteValue::String("::/0".into())),
@@ -5421,6 +5437,21 @@ fn exports_type_warning_for_literal_mismatch() {
 }
 
 #[test]
+fn unloaded_bare_attribute_interpolation_has_no_type_warning() {
+    let engine = DiagnosticEngine::without_loaded_provider_schemas();
+    let doc = create_document(
+        r#"
+arguments { x: String }
+attributes {
+  value: SomeBareProviderType = "${x}"
+}
+"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+}
+
+#[test]
 fn orphan_exports_check_builtins_without_calling_unloaded_custom_types() {
     let engine = DiagnosticEngine::without_loaded_provider_schemas();
     let doc = create_document(
@@ -5428,6 +5459,7 @@ fn orphan_exports_check_builtins_without_calling_unloaded_custom_types() {
   flag: Bool = 'hello'
   identifiers: list(mock.RecoveryProbe) = ['identifier']
 }
+
 attributes {
   identifier: mock.RecoveryProbe = 'identifier'
 }"#,
@@ -6356,7 +6388,11 @@ let first = unrelated { }
         ),
     );
     binding_input.compositions.extend([source, consumer]);
-    let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
+    let bindings = BindingIndex::from_parsed(
+        &binding_input,
+        &engine.schemas,
+        carina_core::parser::ProviderContext::unloaded(),
+    );
     let findings = carina_core::validation::check_expanded_module_calls(
         carina_core::validation::ExpandedModuleCallCheckInput::References {
             compositions: &binding_input.compositions,

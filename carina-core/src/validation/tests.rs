@@ -289,7 +289,12 @@ fn module_call_findings_for_test(
         parsed,
         &ValidationTypeContext::new(parsed, &schemas, provider_context, signatures),
     );
-    let bindings = BindingIndex::from_parsed_with_module_signatures(parsed, &schemas, signatures);
+    let bindings = BindingIndex::from_parsed_with_module_signatures(
+        parsed,
+        &schemas,
+        signatures,
+        crate::parser::ProviderContext::unloaded(),
+    );
     check_module_calls(ModuleCallCheckInput {
         authored: parsed,
         semantic: Some(parsed),
@@ -337,7 +342,11 @@ fn validate_resource_ref_types_for_test<
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
-    let bindings = crate::binding_index::BindingIndex::from_parsed(parsed, schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        parsed,
+        schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let argument_names = parsed
         .arguments
         .iter()
@@ -620,7 +629,11 @@ mock.test.resource { name = f(r.name) }
     )
     .expect("fixture must parse");
     let schemas = function_ref_schema();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
         .expect_err("String resource attribute passed to Int must be rejected");
@@ -646,7 +659,11 @@ let generated = for item in pending.items {
     .expect("fixture must parse");
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
     let schemas = function_ref_schema();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
         .expect_err("deferred body function argument mismatch must be rejected");
@@ -668,7 +685,11 @@ let r2 = mock.test.resource { name = f() }
     )
     .expect("fixture must parse");
     let schemas = function_ref_schema();
-    let mismatch_bindings = crate::binding_index::BindingIndex::from_parsed(&mismatch, &schemas);
+    let mismatch_bindings = crate::binding_index::BindingIndex::from_parsed(
+        &mismatch,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let error = validate_user_function_ref_types_with_bindings(&mismatch, &mismatch_bindings)
         .expect_err("String function result passed to Int must be rejected");
     assert!(
@@ -685,7 +706,11 @@ let r2 = mock.test.resource { name = f() }
         &ProviderContext::default(),
     )
     .expect("fixture must parse");
-    let matching_bindings = crate::binding_index::BindingIndex::from_parsed(&matching, &schemas);
+    let matching_bindings = crate::binding_index::BindingIndex::from_parsed(
+        &matching,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     assert!(validate_user_function_ref_types_with_bindings(&matching, &matching_bindings).is_ok());
 }
 
@@ -719,7 +744,11 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
 
     let schemas = SchemaRegistry::new();
     let mismatch = parsed_with_nested_call("String");
-    let bindings = BindingIndex::from_parsed(&mismatch, &schemas);
+    let bindings = BindingIndex::from_parsed(
+        &mismatch,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let error = validate_user_function_ref_types_with_bindings(&mismatch, &bindings)
         .expect_err("g(): String must not satisfy f(Int)");
     assert!(
@@ -730,7 +759,11 @@ fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
     );
 
     let matching = parsed_with_nested_call("Int");
-    let bindings = BindingIndex::from_parsed(&matching, &schemas);
+    let bindings = BindingIndex::from_parsed(
+        &matching,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     assert!(validate_user_function_ref_types_with_bindings(&matching, &bindings).is_ok());
 }
 
@@ -1002,7 +1035,7 @@ fn resolve_type_expr_rejects_conflicting_owner_scalar_kinds() {
     for (identity, annotation) in [
         (
             TypeIdentity::bare("Count"),
-            TypeExpr::Simple("count".into()),
+            crate::parser::bare_type_for_test("count".into()),
         ),
         (
             TypeIdentity::from_dotted("test.counter.Count"),
@@ -1189,7 +1222,8 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
     .unwrap();
     validate_resource_ref_types_for_test(&parsed, &SchemaRegistry::new())
         .expect("unloaded operand kinds defer while retaining the Int result shape");
-    let ty = resolve_type_expr(&TypeExpr::Simple("count".into()), &context).unwrap();
+    let ty =
+        resolve_type_expr(&crate::parser::bare_type_for_test("count".into()), &context).unwrap();
     let value: Value = Value::Concrete(ConcreteValue::Int(3));
     assert!(matches!(
         resolve_parameter_type_for_check(&ty, &context).unwrap(),
@@ -1242,7 +1276,8 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
     );
     assert!(
         resolve_type_expr(
-            &resolve_type_expr(&TypeExpr::Simple("typo".into()), &context).unwrap(),
+            &resolve_type_expr(&crate::parser::bare_type_for_test("typo".into()), &context)
+                .unwrap(),
             &loaded,
         )
         .is_err()
@@ -1252,7 +1287,8 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
 #[test]
 fn lift_type_expr_preserves_every_builtin_scalar_kind() {
     for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
-        let expr = TypeExpr::Simple(crate::parser::pascal_to_snake(&identity.kind));
+        let expr =
+            crate::parser::bare_type_for_test(crate::parser::pascal_to_snake(&identity.kind));
         let lifted = lift_type_expr(&expr).unwrap();
         let expected = match kind {
             crate::schema::RefinedScalarKind::String => AttributeType::string(),
@@ -3664,7 +3700,7 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
         ("domain_name", ConcreteValue::Int(5)),
         ("email", ConcreteValue::Int(5)),
     ] {
-        let expected = TypeExpr::Simple(name.to_string());
+        let expected = crate::parser::bare_type_for_test(name.to_string());
         let value = Value::Concrete(value);
         let error = typecheck::check_type_expr_value_with_context(
             &expected,
@@ -3711,7 +3747,7 @@ fn bare_builtin_custom_types_run_declared_validators() {
             ConcreteValue::String("user@example.com".into()),
         ),
     ] {
-        let expected = TypeExpr::Simple(name.to_string());
+        let expected = crate::parser::bare_type_for_test(name.to_string());
         let error = rendered_typecheck_result(
             &expected,
             &Value::Concrete(invalid),
@@ -3739,7 +3775,7 @@ fn bare_builtin_custom_types_validate_enum_identifier_text() {
         ("positive_int", "5", false),
     ] {
         let error = rendered_typecheck_result(
-            &TypeExpr::Simple(name.to_string()),
+            &crate::parser::bare_type_for_test(name.to_string()),
             &Value::Concrete(ConcreteValue::enum_identifier(text.to_string())),
             &ProviderContext::default(),
         );
@@ -3784,7 +3820,7 @@ fn validate_type_expr_struct_error_uses_pascal_case_in_field_type() {
 #[test]
 fn rendered_typecheck_result_ipv4_cidr_valid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv4_cidr".to_string()),
+        &crate::parser::bare_type_for_test("ipv4_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         &ProviderContext::default(),
     );
@@ -3794,7 +3830,7 @@ fn rendered_typecheck_result_ipv4_cidr_valid() {
 #[test]
 fn rendered_typecheck_result_ipv4_cidr_invalid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv4_cidr".to_string()),
+        &crate::parser::bare_type_for_test("ipv4_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("not-a-cidr".into())),
         &ProviderContext::default(),
     );
@@ -3804,7 +3840,7 @@ fn rendered_typecheck_result_ipv4_cidr_invalid() {
 #[test]
 fn rendered_typecheck_result_ipv4_address_valid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv4_address".to_string()),
+        &crate::parser::bare_type_for_test("ipv4_address".to_string()),
         &Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
         &ProviderContext::default(),
     );
@@ -3814,7 +3850,7 @@ fn rendered_typecheck_result_ipv4_address_valid() {
 #[test]
 fn rendered_typecheck_result_ipv4_address_invalid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv4_address".to_string()),
+        &crate::parser::bare_type_for_test("ipv4_address".to_string()),
         &Value::Concrete(ConcreteValue::String("999.999.999.999".into())),
         &ProviderContext::default(),
     );
@@ -3824,7 +3860,7 @@ fn rendered_typecheck_result_ipv4_address_invalid() {
 #[test]
 fn rendered_typecheck_result_ipv6_cidr_valid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv6_cidr".to_string()),
+        &crate::parser::bare_type_for_test("ipv6_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("2001:db8::/32".into())),
         &ProviderContext::default(),
     );
@@ -3834,7 +3870,7 @@ fn rendered_typecheck_result_ipv6_cidr_valid() {
 #[test]
 fn rendered_typecheck_result_ipv6_cidr_invalid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv6_cidr".to_string()),
+        &crate::parser::bare_type_for_test("ipv6_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("not-ipv6-cidr".into())),
         &ProviderContext::default(),
     );
@@ -3844,7 +3880,7 @@ fn rendered_typecheck_result_ipv6_cidr_invalid() {
 #[test]
 fn rendered_typecheck_result_ipv6_address_valid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv6_address".to_string()),
+        &crate::parser::bare_type_for_test("ipv6_address".to_string()),
         &Value::Concrete(ConcreteValue::String("2001:db8::1".into())),
         &ProviderContext::default(),
     );
@@ -3854,7 +3890,7 @@ fn rendered_typecheck_result_ipv6_address_valid() {
 #[test]
 fn rendered_typecheck_result_ipv6_address_invalid() {
     let result = rendered_typecheck_result(
-        &TypeExpr::Simple("ipv6_address".to_string()),
+        &crate::parser::bare_type_for_test("ipv6_address".to_string()),
         &Value::Concrete(ConcreteValue::String("zzz::zzz".into())),
         &ProviderContext::default(),
     );
@@ -3901,7 +3937,9 @@ fn rendered_typecheck_result_list_of_ipv4_address() {
         Value::Concrete(ConcreteValue::String("999.0.0.1".into())),
     ];
     let result = rendered_typecheck_result(
-        &TypeExpr::List(Box::new(TypeExpr::Simple("ipv4_address".to_string()))),
+        &TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+            "ipv4_address".to_string(),
+        ))),
         &Value::Concrete(ConcreteValue::List(items)),
         &ProviderContext::default(),
     );
@@ -4526,13 +4564,58 @@ fn lifted_simple_vpc_id_accepts_matching_custom_identity() {
         legacy_validator(noop),
         None,
     );
-    // Parser normalizes `: VpcId` to TypeExpr::Simple("vpc_id") (snake).
-    let expr = TypeExpr::Simple("vpc_id".to_string());
+    // Parser normalizes `: VpcId` to crate::parser::bare_type_for_test("vpc_id") (snake).
+    let expr = crate::parser::bare_type_for_test("vpc_id".to_string());
     assert!(lifted_source_is_assignable_to_schema(
         &expr,
         &schema,
         crate::schema::empty_defs_for_schema_walks()
     ));
+}
+
+#[test]
+fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
+    let config = ProviderContext::default();
+    let module = crate::parser::parse("arguments { count: Count }", &config).unwrap();
+    let parsed =
+        crate::parser::parse("let m = use { source = './m' }\nm { count = 3 }", &config).unwrap();
+    let signatures = HashMap::from([(
+        "m".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: module
+                .arguments
+                .into_iter()
+                .map(|argument| crate::parser::ArgumentParameter {
+                    name: argument.name,
+                    static_type: consumer_type(argument.static_type),
+                    default: argument.default,
+                    description: argument.description,
+                    validations: argument.validations,
+                })
+                .collect(),
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+    let schemas = SchemaRegistry::new();
+    let report = check_bare_binding_uses(
+        &parsed,
+        &ValidationTypeContext::new_providerless(&parsed, &schemas, &config, &signatures),
+    );
+    let bindings =
+        BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures, &config);
+    let findings = check_module_calls_providerless(ModuleCallCheckInput {
+        authored: &parsed,
+        semantic: Some(&parsed),
+        base_dir: None,
+        imported_signatures: &signatures,
+        provider_context: &config,
+        schemas: &schemas,
+        binding_use_report: &report,
+        bindings: &bindings,
+        reference_checks: ModuleCallReferenceChecks::Enabled,
+    });
+    assert!(findings.is_empty(), "{findings:#?}");
 }
 
 #[test]
@@ -4756,7 +4839,12 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         &parsed,
         &ValidationTypeContext::new(&parsed, &schemas, &provider_context, &signatures),
     );
-    let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
+    let bindings = BindingIndex::from_parsed_with_module_signatures(
+        &parsed,
+        &schemas,
+        &signatures,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let findings = check_module_calls(ModuleCallCheckInput {
         authored: &parsed,
@@ -5097,7 +5185,12 @@ let child = child_module { value = forwarded }
         report.findings()[0].error,
         BindingResolutionError::ReferenceType(_)
     ));
-    let bindings = BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures);
+    let bindings = BindingIndex::from_parsed_with_module_signatures(
+        &parsed,
+        &schemas,
+        &signatures,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let authored = check_module_calls_providerless(ModuleCallCheckInput {
         authored: &parsed,
         semantic: Some(&parsed),
@@ -5352,12 +5445,18 @@ fn attribute_param_ref_type_mismatch_detected() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(role); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     // Attribute param: role_arn: iam_role_arn = role.role_name (MISMATCH: String vs iam_role_arn)
     let params_mismatch = vec![AttributeParameter::dummy(
         "role_arn".to_string(),
-        Some(TypeExpr::Simple("iam_role_arn".to_string())),
+        Some(crate::parser::bare_type_for_test(
+            "iam_role_arn".to_string(),
+        )),
         Some(Value::resource_ref(
             "role".to_string(),
             "role_name".to_string(),
@@ -5377,7 +5476,9 @@ fn attribute_param_ref_type_mismatch_detected() {
     // Attribute param: role_arn: iam_role_arn = role.arn (MATCH: IamRoleArn matches iam_role_arn)
     let params_match = vec![AttributeParameter::dummy(
         "role_arn".to_string(),
-        Some(TypeExpr::Simple("iam_role_arn".to_string())),
+        Some(crate::parser::bare_type_for_test(
+            "iam_role_arn".to_string(),
+        )),
         Some(Value::resource_ref(
             "role".to_string(),
             "arn".to_string(),
@@ -5417,7 +5518,11 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
     );
     let mut parsed = empty_parsed();
     parsed.resources.push(source); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let params = vec![AttributeParameter::dummy(
         "value".to_string(),
         Some(TypeExpr::String),
@@ -5464,7 +5569,11 @@ fn attribute_param_ref_existence_checks_composition_attribute_membership_only() 
         .compositions
         .push(make_composition("instance", &["target_group_arn"]));
     let schemas = SchemaRegistry::new();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
 
@@ -5486,7 +5595,9 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
     let params = vec![
         AttributeParameter::dummy(
             "valid".to_string(),
-            Some(TypeExpr::Simple("unrelated_type".to_string())),
+            Some(crate::parser::bare_type_for_test(
+                "unrelated_type".to_string(),
+            )),
             Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_arn".to_string(),
@@ -5495,7 +5606,9 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
         ),
         AttributeParameter::dummy(
             "invalid".to_string(),
-            Some(TypeExpr::Simple("unrelated_type".to_string())),
+            Some(crate::parser::bare_type_for_test(
+                "unrelated_type".to_string(),
+            )),
             Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_ar".to_string(),
@@ -5508,7 +5621,11 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
         .compositions
         .push(make_composition("instance", &["target_group_arn"]));
     let schemas = SchemaRegistry::new();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
 
@@ -5553,7 +5670,11 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     parsed.compositions.extend([source, consumer]);
     let parsed = parsed.resolve_root(&RootScope::new());
     let (_context, schemas) = string_refinement_fixture();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
         .iter()
@@ -5626,7 +5747,11 @@ fn composition_ref_error_dedup_uses_the_full_call_path() {
     parsed.compositions = compositions;
     let parsed = parsed.resolve_root(&RootScope::new());
     let (_context, schemas) = string_refinement_fixture();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
 
@@ -5655,7 +5780,11 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
     parsed.compositions.extend([source, consumer]);
     let parsed = parsed.resolve_root(&RootScope::new());
     let schemas = SchemaRegistry::new();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let err = errors
         .iter()
@@ -5708,7 +5837,11 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
     }
     let parsed = parsed.resolve_root(&RootScope::new());
     let (_context, schemas) = string_refinement_fixture();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let declaration_errors: Vec<_> = errors
@@ -5764,7 +5897,11 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
     let parsed = parsed.resolve_root(&RootScope::new());
 
     let (_context, schemas) = string_refinement_fixture();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let declaration_errors: Vec<_> = errors
         .iter()
@@ -5828,7 +5965,11 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     parsed.compositions.extend([source, consumer]);
     let parsed = parsed.resolve_root(&RootScope::new());
     let (_context, schemas) = string_refinement_fixture();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
     let rendered = errors
@@ -5887,7 +6028,11 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
     parsed
         .resources
         .push(Resource::with_provider("aws", "ec2.SecurityGroup", "web", None).with_binding("web"));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let call = ModuleCall::test(
         "consumer".to_string(),
@@ -5960,7 +6105,11 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
     parsed
         .resources
         .push(Resource::with_provider("mock", "counter", "source", None).with_binding("source"));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let call = ModuleCall::test(
         "consumer".to_string(),
         None,
@@ -6026,13 +6175,17 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
     );
     let params = vec![AttributeParameter::dummy(
         "network".to_string(),
-        Some(TypeExpr::Simple("vpc_id".to_string())),
+        Some(crate::parser::bare_type_for_test("vpc_id".to_string())),
         Some(Value::Concrete(ConcreteValue::Map(nested))),
     )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
     assert!(
         err.contains("attribute 'network': unknown attribute 'bad_attr' on 'vpc'"),
@@ -6069,7 +6222,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
 
     let params = vec![AttributeParameter::dummy(
         "certificate_arn".to_string(),
-        Some(TypeExpr::Simple("string".to_string())),
+        Some(crate::parser::bare_type_for_test("string".to_string())),
         Some(Value::resource_ref(
             "cert_issued".to_string(),
             "bad_attr".to_string(),
@@ -6095,7 +6248,11 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         line: 1,
     });
 
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
     assert!(
         err.contains("attribute 'certificate_arn': unknown attribute 'bad_attr' on 'cert_issued'"),
@@ -6133,13 +6290,17 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
     );
     let params = vec![AttributeParameter::dummy(
         "network".to_string(),
-        Some(TypeExpr::Simple("vpc_id".to_string())),
+        Some(crate::parser::bare_type_for_test("vpc_id".to_string())),
         Some(Value::Concrete(ConcreteValue::Map(nested))),
     )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let result = validate_attribute_param_ref_types_with_bindings(&params, &bindings);
     assert!(
         result.is_ok(),
@@ -6168,7 +6329,11 @@ fn validate_attribute_params_against_target_group(
     );
     let mut parsed = empty_parsed();
     parsed.resources.push(target_group); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     validate_attribute_param_ref_types_with_bindings(params, &bindings)
 }
@@ -6211,7 +6376,11 @@ fn validate_attribute_params_against_target_group_tags(
     );
     let mut parsed = empty_parsed();
     parsed.resources.push(target_group); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     validate_attribute_param_ref_types_with_bindings(params, &bindings)
 }
@@ -6274,7 +6443,9 @@ fn attribute_param_nested_simple_annotation_uses_leaf_type() {
 
     let params = vec![AttributeParameter::dummy(
         "x".to_string(),
-        Some(TypeExpr::Simple("environment_name".to_string())),
+        Some(crate::parser::bare_type_for_test(
+            "environment_name".to_string(),
+        )),
         Some(Value::resource_ref(
             "target_group".to_string(),
             "tags".to_string(),
@@ -6358,7 +6529,9 @@ fn simple_annotated_plain_ref_reports_unknown_attribute_once() {
 
     let params = vec![AttributeParameter::dummy(
         "target_group_arn".to_string(),
-        Some(TypeExpr::Simple("target_group_arn".to_string())),
+        Some(crate::parser::bare_type_for_test(
+            "target_group_arn".to_string(),
+        )),
         Some(Value::resource_ref(
             "target_group".to_string(),
             "target_group_ar".to_string(),
@@ -6458,9 +6631,9 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
 
     let builtin_custom: RuntimeInferredExportParam = InferredExportParam {
         name: "cidr".to_string(),
-        static_type: crate::static_type::ExportStaticType::Declared(TypeExpr::Simple(
-            "ipv4_cidr".to_string(),
-        )),
+        static_type: crate::static_type::ExportStaticType::Declared(
+            crate::parser::bare_type_for_test("ipv4_cidr".to_string()),
+        ),
         value: Some(RuntimeValue::Concrete(RuntimeConcreteValue::String(
             "10.0.0.0/16".to_string().into(),
         ))),
@@ -6763,7 +6936,7 @@ fn type_relation_provider_scoped_subtype_flows_into_bare_annotation() {
     assert!(schema_source_is_assignable_to_lifted_sink(
         &kms_key_arn,
         crate::schema::empty_defs_for_schema_walks(),
-        &TypeExpr::Simple("arn".to_string()),
+        &crate::parser::bare_type_for_test("arn".to_string()),
     ));
 }
 
@@ -6780,7 +6953,7 @@ fn type_relation_sibling_rejected_by_declared_sink() {
     assert!(!schema_source_is_assignable_to_lifted_sink(
         &iam_role_arn,
         crate::schema::empty_defs_for_schema_walks(),
-        &TypeExpr::Simple("kms_key_arn".to_string()),
+        &crate::parser::bare_type_for_test("kms_key_arn".to_string()),
     ));
 }
 
@@ -6798,7 +6971,7 @@ fn type_relation_resource_id_subtype_flows_into_bare_annotation() {
     assert!(schema_source_is_assignable_to_lifted_sink(
         &vpc_id,
         crate::schema::empty_defs_for_schema_walks(),
-        &TypeExpr::Simple("resource_id".to_string()),
+        &crate::parser::bare_type_for_test("resource_id".to_string()),
     ));
 }
 
@@ -6815,7 +6988,7 @@ fn type_relation_resource_id_siblings_rejected() {
     assert!(!schema_source_is_assignable_to_lifted_sink(
         &subnet_id,
         crate::schema::empty_defs_for_schema_walks(),
-        &TypeExpr::Simple("vpc_id".to_string()),
+        &crate::parser::bare_type_for_test("vpc_id".to_string()),
     ));
 }
 
@@ -6831,7 +7004,7 @@ fn type_relation_exact_identity_match() {
     assert!(schema_source_is_assignable_to_lifted_sink(
         &arn,
         crate::schema::empty_defs_for_schema_walks(),
-        &TypeExpr::Simple("arn".to_string()),
+        &crate::parser::bare_type_for_test("arn".to_string()),
     ));
 }
 
@@ -6878,7 +7051,7 @@ fn directional_relation_accepts_refined_string_through_mixed_union_string_member
     // is sufficient, regardless of other scalar alternatives.
     let mixed = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
     assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Simple("aws_account_id".to_string()),
+        &crate::parser::bare_type_for_test("aws_account_id".to_string()),
         &mixed,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -6893,7 +7066,7 @@ fn lifted_simple_subtypes_into_plain_string() {
     // remains rejected by directional identity assignability. See #1874 and
     // #2643.
     assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Simple("aws_account_id".to_string()),
+        &crate::parser::bare_type_for_test("aws_account_id".to_string()),
         &AttributeType::string(),
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -6929,7 +7102,7 @@ fn lifted_simple_flows_into_union_struct_or_string() {
     ] {
         assert!(
             lifted_source_is_assignable_to_schema(
-                &TypeExpr::Simple(name.to_string()),
+                &crate::parser::bare_type_for_test(name.to_string()),
                 &principal_union,
                 crate::schema::empty_defs_for_schema_walks(),
             ),
@@ -6953,7 +7126,7 @@ fn directional_relation_accepts_refined_string_when_union_has_other_scalar() {
         AttributeType::int(),
     ]);
     assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &crate::parser::bare_type_for_test("iam_oidc_provider_arn".to_string()),
         &mixed,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -6972,7 +7145,7 @@ fn lifted_simple_rejected_when_union_has_no_compatible_member() {
         AttributeType::list(AttributeType::string()),
     ]);
     assert!(!lifted_source_is_assignable_to_schema(
-        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &crate::parser::bare_type_for_test("iam_oidc_provider_arn".to_string()),
         &no_string,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -6991,7 +7164,7 @@ fn directional_relation_accepts_refined_string_with_string_shaped_union_peers() 
     );
     let with_custom = AttributeType::union(vec![AttributeType::string(), arn]);
     assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &crate::parser::bare_type_for_test("iam_oidc_provider_arn".to_string()),
         &with_custom,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -7006,7 +7179,7 @@ fn directional_relation_accepts_refined_string_with_string_shaped_union_peers() 
         ),
     ]);
     assert!(lifted_source_is_assignable_to_schema(
-        &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+        &crate::parser::bare_type_for_test("iam_oidc_provider_arn".to_string()),
         &with_enum,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -7055,7 +7228,11 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_ok(),
@@ -7107,7 +7284,11 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_err(),
@@ -7154,7 +7335,11 @@ fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
     }];
     let mut parsed = empty_parsed();
     parsed.resources.push(source); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let error = validate_export_param_ref_types_with_bindings(&exports, &bindings)
         .expect_err("List<String> must not satisfy Bool");
@@ -7199,7 +7384,11 @@ fn export_param_ref_types_flags_unknown_attribute() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
         err.contains("export 'x': unknown attribute 'bad_attr' on 'vpc' in reference vpc.bad_attr"),
@@ -7236,7 +7425,11 @@ fn export_param_ref_types_check_composition_attribute_membership_only() {
         .compositions
         .push(make_composition("instance", &["target_group_arn"]));
     let schemas = SchemaRegistry::new();
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
 
@@ -7303,7 +7496,11 @@ fn unchecked_export_checks_existence_and_attached_failure_skips_duplicate_walk()
     parsed
         .compositions
         .push(make_composition("instance", &["target_group_arn"]));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
 
     let all_errors =
         validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
@@ -7392,7 +7589,11 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         line: 1,
     });
 
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
         err.contains(
@@ -7445,7 +7646,11 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
     assert!(
         err.contains(
@@ -7487,7 +7692,11 @@ fn validate_export_param_ref_types_skips_attached_inference_failure() {
 
     let mut parsed = empty_parsed();
     parsed.resources.push(schema_resource); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(
         result.is_ok(),
@@ -7534,7 +7743,11 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     let _: &[UpstreamState] = &[]; // signature no longer takes upstream_states; doc only.
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        &schemas,
+        crate::parser::ProviderContext::unloaded(),
+    );
     let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
     assert!(result.is_ok(), "got {:?}", result);
 }
@@ -8629,12 +8842,14 @@ fn enriched_context_with_iam_policy_arn() -> LoadedProviderContext {
 
 #[test]
 fn resolve_file_type_exprs_rejects_unknown_in_arguments() {
-    use crate::parser::{ArgumentParameter, TypeExpr};
+    use crate::parser::ArgumentParameter;
 
     let mut parsed = empty_parsed();
     parsed.arguments.push(ArgumentParameter {
         name: "bad_arg".to_string(),
-        static_type: local_type(TypeExpr::Simple("totally_made_up_type".to_string())),
+        static_type: local_type(crate::parser::bare_type_for_test(
+            "totally_made_up_type".to_string(),
+        )),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -8699,7 +8914,7 @@ fn file_type_resolution_parser_error_coverage_ignores_rendered_wording() {
 
 #[test]
 fn resolve_file_type_exprs_accepts_registered_bare_identity() {
-    use crate::parser::{ArgumentParameter, TypeExpr};
+    use crate::parser::ArgumentParameter;
 
     let mut parsed = empty_parsed();
     parsed.arguments.push(ArgumentParameter {
@@ -8708,7 +8923,9 @@ fn resolve_file_type_exprs_accepts_registered_bare_identity() {
         // validator; this is the round-trip "name a registered custom
         // type and have it pass" path that proves the resolver isn't
         // over-firing.
-        static_type: local_type(TypeExpr::Simple("iam_policy_arn".to_string())),
+        static_type: local_type(crate::parser::bare_type_for_test(
+            "iam_policy_arn".to_string(),
+        )),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -8727,14 +8944,14 @@ fn resolve_file_type_exprs_accepts_registered_bare_identity() {
 
 #[test]
 fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
-    use crate::parser::{ArgumentParameter, TypeExpr};
+    use crate::parser::ArgumentParameter;
 
     let mut parsed = empty_parsed();
 
     // List<UnknownA>
     parsed.arguments.push(ArgumentParameter {
         name: "in_list".to_string(),
-        static_type: local_type(TypeExpr::List(Box::new(TypeExpr::Simple(
+        static_type: local_type(TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
             "unknown_a".to_string(),
         )))),
         default: None,
@@ -8745,7 +8962,7 @@ fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
     // Map<UnknownB>
     parsed.arguments.push(ArgumentParameter {
         name: "in_map".to_string(),
-        static_type: local_type(TypeExpr::Map(Box::new(TypeExpr::Simple(
+        static_type: local_type(TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
             "unknown_b".to_string(),
         )))),
         default: None,
@@ -8760,8 +8977,8 @@ fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
     parsed.arguments.push(ArgumentParameter {
         name: "in_union".to_string(),
         static_type: local_type(TypeExpr::Union(vec![
-            TypeExpr::Simple("unknown_c".to_string()),
-            TypeExpr::Simple("unknown_d".to_string()),
+            crate::parser::bare_type_for_test("unknown_c".to_string()),
+            crate::parser::bare_type_for_test("unknown_d".to_string()),
         ])),
         default: None,
         description: None,
@@ -8774,7 +8991,7 @@ fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
         static_type: local_type(TypeExpr::Struct {
             fields: vec![(
                 "nested".to_string(),
-                TypeExpr::Simple("unknown_e".to_string()),
+                crate::parser::bare_type_for_test("unknown_e".to_string()),
             )],
         }),
         default: None,
@@ -8799,12 +9016,14 @@ fn resolve_file_type_exprs_walks_into_list_map_union_struct() {
 
 #[test]
 fn resolve_file_type_exprs_defers_unknown_bare_types_until_the_catalog_is_loaded() {
-    use crate::parser::{ArgumentParameter, TypeExpr};
+    use crate::parser::ArgumentParameter;
 
     let mut parsed = empty_parsed();
     parsed.arguments.push(ArgumentParameter {
         name: "bad_arg".to_string(),
-        static_type: local_type(TypeExpr::Simple("totally_made_up_type".to_string())),
+        static_type: local_type(crate::parser::bare_type_for_test(
+            "totally_made_up_type".to_string(),
+        )),
         default: None,
         description: None,
         validations: Vec::new(),
@@ -8940,8 +9159,11 @@ fn resolve_type_expr_promotes_a_bare_provider_type_to_an_owned_key() {
     );
     let ctx = context_with_known_custom_types(HashSet::from([owned.clone()]));
 
-    let resolved = resolve_type_expr(&TypeExpr::Simple("vpc_id".to_string()), &ctx)
-        .expect("the unique bare provider identity must resolve");
+    let resolved = resolve_type_expr(
+        &crate::parser::bare_type_for_test("vpc_id".to_string()),
+        &ctx,
+    )
+    .expect("the unique bare provider identity must resolve");
 
     assert_eq!(resolved, TypeExpr::SchemaType { owned });
     assert_eq!(resolved.to_string(), "VpcId");

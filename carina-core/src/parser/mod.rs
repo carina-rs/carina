@@ -138,12 +138,11 @@ pub(crate) use resolve::{
 };
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::{
-    UnloadedSchemaType, builtin_bare_custom_types, parse_type_expr_str,
+    BuiltinTypeName, UnloadedSchemaType, builtin_bare_custom_types, parse_type_expr_str,
     resolve_type_expr_from_schemas,
 };
 pub(crate) use types::{
-    merge_custom_type_candidates, resolve_custom_type_identity, resolve_known_bare_custom_type,
-    unknown_custom_type_error,
+    merge_custom_type_candidates, resolve_custom_type_identity, unknown_custom_type_error,
 };
 pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
@@ -166,3 +165,6 @@ pub(crate) use static_eval::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use types::bare_type_for_test;

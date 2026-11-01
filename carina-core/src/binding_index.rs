@@ -36,7 +36,7 @@
 //! binding-name table is scoped.
 //!
 //! ```ignore
-//! let index = BindingIndex::from_parsed(&parsed, &registry);
+//! let index = BindingIndex::from_parsed(&parsed, &registry, crate::parser::ProviderContext::unloaded());
 //! if let Some(entry) = index.get("vpc") {
 //!     // entry.target is the statically known validation surface
 //! }
@@ -495,6 +495,7 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 #[derive(Debug)]
 pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     schemas: &'a SchemaRegistry,
+    provider_context: &'a crate::parser::ProviderContext,
     entries: HashMap<String, BindingEntry<'a, B>>,
     known_names: std::collections::HashSet<String>,
     resource_handles: HashMap<String, AttributeType>,
@@ -514,11 +515,12 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
     pub fn from_parsed<E, D>(
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
+        provider_context: &'a crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::build(parsed, registry, None, None)
+        Self::build(parsed, registry, None, None, provider_context)
     }
 
     /// Build the index with the declared output surfaces of imported modules.
@@ -529,11 +531,18 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+        provider_context: &'a crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::build(parsed, registry, None, Some(module_signatures))
+        Self::build(
+            parsed,
+            registry,
+            None,
+            Some(module_signatures),
+            provider_context,
+        )
     }
 
     /// Build the index with statically resolved `upstream_state` exports.
@@ -543,11 +552,18 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
+        provider_context: &'a crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::build(parsed, registry, Some(upstream_exports), None)
+        Self::build(
+            parsed,
+            registry,
+            Some(upstream_exports),
+            None,
+            provider_context,
+        )
     }
 
     /// Build the complete pre-expansion validation index used by the LSP.
@@ -556,6 +572,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports<B>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+        provider_context: &'a crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -565,6 +582,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             registry,
             Some(upstream_exports),
             Some(module_signatures),
+            provider_context,
         )
     }
 
@@ -573,6 +591,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
         module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
+        provider_context: &'a crate::parser::ProviderContext,
     ) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -759,6 +778,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         }
         Self {
             schemas: registry,
+            provider_context,
             entries,
             known_names,
             resource_handles,
@@ -789,7 +809,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         &self,
         ty: &crate::parser::TypeExpr,
     ) -> Result<crate::parser::TypeExpr, crate::static_type::StaticTypeResolutionError> {
-        crate::parser::resolve_type_expr_from_schemas(ty, self.schemas)
+        crate::parser::resolve_type_expr_from_schemas(ty, self.schemas, self.provider_context)
     }
 
     pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction<B>> {
@@ -2966,7 +2986,11 @@ let vpc = aws.ec2.Vpc {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
         let entry = index.get("vpc").expect("vpc binding present");
         let BindingTarget::Schema(schema) = entry.target else {
             panic!("managed binding must carry a schema target");
@@ -2995,7 +3019,11 @@ let existing = read aws.ec2.Vpc {
                 .expect("schema fixture must be valid"),
         );
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
         let entry = index
             .get("existing")
             .expect("data-source binding present in index");
@@ -3012,7 +3040,11 @@ let existing = read aws.ec2.Vpc {
         parsed.compositions.push(composition("instance"));
 
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let entry = index
             .get("instance")
@@ -3047,8 +3079,12 @@ let existing = read aws.ec2.Vpc {
             },
         )]);
         let registry = SchemaRegistry::new();
-        let index =
-            BindingIndex::from_parsed_with_module_signatures(&parsed, &registry, &signatures);
+        let index = BindingIndex::from_parsed_with_module_signatures(
+            &parsed,
+            &registry,
+            &signatures,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let RefType::Typed(count) = index.ref_type(&AccessPath::new("x", "count")) else {
             panic!("module output must be typed before composition expansion");
@@ -3100,7 +3136,11 @@ let existing = read aws.ec2.Vpc {
         });
 
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let entry = index
             .get("ready")
@@ -3125,7 +3165,11 @@ aws.ec2.Vpc {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
         assert!(index.is_empty());
     }
 
@@ -3144,7 +3188,11 @@ let vpc = aws.ec2.Vpc {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = SchemaRegistry::new();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
         assert!(index.get("vpc").is_none());
         assert!(
             index.is_declared("vpc"),
@@ -3166,7 +3214,11 @@ let cert_issued = wait cert {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = SchemaRegistry::new();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
         assert!(index.get("cert").is_none());
         assert!(index.get("cert_issued").is_none());
         assert!(index.is_declared("cert"));
@@ -3198,7 +3250,11 @@ for _, n in some_iterable {
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
 
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
         assert!(index.get("net").is_some(), "named let binding indexed");
         assert!(
             !index.is_declared("n"),
@@ -3221,7 +3277,11 @@ let vpc = aws.ec2.Vpc {
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let by_name = index.schemas_by_name();
         let schema = by_name.get("vpc").expect("vpc projection present");
@@ -3243,7 +3303,11 @@ let vpc = aws.ec2.Vpc {
 "#;
         let parsed = parse(src, &Default::default()).expect("parse");
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
         assert!(index.get("missing").is_none());
     }
 
@@ -3269,7 +3333,11 @@ let vpc = aws.ec2.Vpc {
         );
         parsed.compositions.push(output);
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
             panic!("forwarded composition attribute must inherit its source type");
@@ -3302,7 +3370,11 @@ let vpc = aws.ec2.Vpc {
         );
         parsed.compositions.push(output);
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
             panic!("plain forwarded alias must inherit its source type");
@@ -3490,7 +3562,11 @@ let vpc = aws.ec2.Vpc {
                     .validate()
                     .expect("schema fixture must be valid"),
                 );
-                let index = BindingIndex::from_parsed(&parsed, &registry);
+                let index = BindingIndex::from_parsed(
+                    &parsed,
+                    &registry,
+                    crate::parser::ProviderContext::unloaded(),
+                );
                 let RefType::Typed(chain) = index.ref_type(&AccessPath::new("middle", "value"))
                 else {
                     panic!(
@@ -3548,7 +3624,11 @@ let vpc = aws.ec2.Vpc {
             },
         ]);
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let name_binding = RelativeBindingName::new("name");
         let RefType::Typed(name) = index.ref_type(&name_binding) else {
@@ -3573,7 +3653,11 @@ let vpc = aws.ec2.Vpc {
             validations: Vec::new(),
         });
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let vpc_binding = RelativeBindingName::new("vpc");
         let RefType::Typed(vpc) = index.ref_type(&vpc_binding) else {
@@ -3623,7 +3707,11 @@ let vpc = aws.ec2.Vpc {
         )
         .expect("parse");
         let registry = registry_with_vpc();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let vpc_binding = RelativeBindingName::new("vpc");
         let RefType::Typed(vpc) = index.ref_type(&vpc_binding) else {
@@ -3662,7 +3750,12 @@ let vpc = aws.ec2.Vpc {
             )]),
         )]);
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+        let index = BindingIndex::from_parsed_with_upstream_exports(
+            &parsed,
+            &registry,
+            &exports,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         let RefType::Typed(vpc) = index.ref_type(&AccessPath::new("up", "vpc")) else {
             panic!("annotated upstream export must resolve to its declared type");
@@ -3701,7 +3794,12 @@ let vpc = aws.ec2.Vpc {
             )]),
         )]);
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+        let index = BindingIndex::from_parsed_with_upstream_exports(
+            &parsed,
+            &registry,
+            &exports,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         assert!(matches!(
             index.ref_type(&AccessPath::new("up", "opaque")),
@@ -3718,7 +3816,12 @@ let vpc = aws.ec2.Vpc {
         });
         let exports = HashMap::new();
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+        let index = BindingIndex::from_parsed_with_upstream_exports(
+            &parsed,
+            &registry,
+            &exports,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         assert!(matches!(
             index.ref_type(&AccessPath::new("up", "anything")),
@@ -3763,7 +3866,11 @@ let vpc = aws.ec2.Vpc {
         parsed.compositions.push(make_forwarder("a", "b"));
         parsed.compositions.push(make_forwarder("b", "a"));
         let registry = SchemaRegistry::new();
-        let index = BindingIndex::from_parsed(&parsed, &registry);
+        let index = BindingIndex::from_parsed(
+            &parsed,
+            &registry,
+            crate::parser::ProviderContext::unloaded(),
+        );
 
         assert!(matches!(
             index.ref_type(&AccessPath::new("a", "out")),

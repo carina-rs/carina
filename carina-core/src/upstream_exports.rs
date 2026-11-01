@@ -1348,7 +1348,10 @@ mod tests {
     }
 
     fn consumer_type(type_expr: TypeExpr) -> crate::static_type::ConsumerStaticType {
-        crate::validation::resolve_consumer_static_type_for_signature(&type_expr, &ctx())
+        crate::validation::resolve_consumer_static_type_for_signature(
+            &type_expr,
+            ProviderContext::unloaded(),
+        )
     }
 
     fn consumer_inferred_type(
@@ -2152,7 +2155,10 @@ mod tests {
         schemas: &SchemaRegistry,
     ) -> Vec<String> {
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports(
-            parsed, schemas, exports,
+            parsed,
+            schemas,
+            exports,
+            crate::parser::ProviderContext::unloaded(),
         );
         crate::validation::validate_resource_ref_types(
             parsed,
@@ -2475,7 +2481,7 @@ mod tests {
             "bootstrap",
             &[(
                 "oidc_provider_arn",
-                TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
+                crate::parser::bare_type_for_test("iam_oidc_provider_arn".to_string()),
             )],
         )]);
         // Mirrors the canonical IAM `principal` slot shape:
@@ -2520,7 +2526,10 @@ mod tests {
         );
         let exports = mk_typed_exports(&[(
             "orgs",
-            &[("key_arn", TypeExpr::Simple("kms_key_arn".to_string()))],
+            &[(
+                "key_arn",
+                crate::parser::bare_type_for_test("kms_key_arn".to_string()),
+            )],
         )]);
         let arn = PatternAttributeType::refined_string_with_validator(
             TypeIdentity::bare("Arn"),
@@ -2564,7 +2573,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         // Receiver is `String`. Without narrowing, `map(AwsAccountId)`
@@ -2610,7 +2621,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let policy_struct = PatternAttributeType::struct_(
@@ -2644,7 +2657,7 @@ mod tests {
         let account_struct = TypeExpr::Struct {
             fields: vec![(
                 "account_id".to_string(),
-                TypeExpr::Simple("aws_account_id".to_string()),
+                crate::parser::bare_type_for_test("aws_account_id".to_string()),
             )],
         };
         let exports = mk_typed_exports(&[(
@@ -2826,7 +2839,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let policy_struct = PatternAttributeType::struct_(
@@ -2866,7 +2881,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let schemas = schema_with_attr(
@@ -2905,7 +2922,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
@@ -2934,7 +2953,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
@@ -2967,7 +2988,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
@@ -3010,7 +3033,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
@@ -3202,7 +3227,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         assert!(
@@ -3214,7 +3241,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &map_exports);
@@ -3254,11 +3283,15 @@ mod tests {
             &[
                 (
                     "alpha_accounts",
-                    TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                    TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                        "aws_account_id".to_string(),
+                    ))),
                 ),
                 (
                     "beta_accounts",
-                    TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                    TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                        "aws_account_id".to_string(),
+                    ))),
                 ),
             ],
         )]);
@@ -3289,7 +3322,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_for_iterable_shapes(&parsed, &exports);
@@ -3422,7 +3457,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::List(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);
@@ -3458,7 +3495,9 @@ mod tests {
             "orgs",
             &[(
                 "accounts",
-                TypeExpr::Map(Box::new(TypeExpr::Simple("aws_account_id".to_string()))),
+                TypeExpr::Map(Box::new(crate::parser::bare_type_for_test(
+                    "aws_account_id".to_string(),
+                ))),
             )],
         )]);
         let errs = check_upstream_state_attribute_access_shapes(&parsed, &exports);

@@ -806,6 +806,7 @@ fn type_based_completion_resolves_ref_typed_source_attribute() {
         &target_defs,
         "let source = test.source.Item {}\n",
         None,
+        carina_core::parser::ProviderContext::unloaded(),
     );
     let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
     assert!(

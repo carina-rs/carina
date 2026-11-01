@@ -2185,11 +2185,11 @@ fn parse_struct_type_expression() {
         fields: vec![
             (
                 "registry_prod".to_string(),
-                TypeExpr::Simple("aws_account_id".to_string()),
+                crate::parser::bare_type_for_test("aws_account_id".to_string()),
             ),
             (
                 "registry_dev".to_string(),
-                TypeExpr::Simple("aws_account_id".to_string()),
+                crate::parser::bare_type_for_test("aws_account_id".to_string()),
             ),
         ],
     };
@@ -2280,47 +2280,9 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
         assert_eq!(decoded, original);
         let lifted = crate::validation::lift_type_expr(&decoded).expect("decoded kind must lift");
         assert_eq!(
-            crate::provider::identified_custom_type_scalar_kind(&lifted),
+            crate::provider::identified_custom_type_scalar_kind(&lifted).unwrap(),
             Some(kind)
         );
-    }
-}
-
-#[test]
-fn legacy_schema_type_serde_requires_resolution_and_retains_declared_int_kind() {
-    use crate::parser::OwnedTypeIdentity;
-    use crate::schema::RefinedScalarKind;
-
-    for identity in [
-        TypeIdentity::bare("Count"),
-        TypeIdentity::from_dotted("test.counter.Count"),
-    ] {
-        let owned = OwnedTypeIdentity::provider("test", identity, RefinedScalarKind::Int);
-        let original = TypeExpr::SchemaType {
-            owned: owned.clone(),
-        };
-        let mut wire = serde_json::to_value(&original).unwrap();
-        wire["SchemaType"]["owned"]
-            .as_object_mut()
-            .unwrap()
-            .remove("scalar_kind");
-        let nested_wire = serde_json::json!({"List": wire});
-        let decoded: TypeExpr = serde_json::from_value(nested_wire).unwrap();
-        let TypeExpr::List(inner) = &decoded else {
-            panic!("legacy list must decode")
-        };
-        assert!(!matches!(inner.as_ref(), TypeExpr::SchemaType { .. }));
-        let context = ProviderContext {
-            custom_types: crate::parser::ProviderCustomTypes::loaded(
-                std::collections::HashSet::from([owned]),
-                Box::new(|_, _| Ok(())),
-            ),
-            ..ProviderContext::default()
-        };
-        let resolved = crate::validation::resolve_type_expr(&decoded, &context).unwrap();
-        assert_eq!(resolved, TypeExpr::List(Box::new(original)));
-        let lifted = crate::validation::lift_type_expr(&resolved).unwrap();
-        assert!(lifted.to_string().contains("Count"));
     }
 }
 
@@ -8077,15 +8039,17 @@ fn parse_accepts_pascal_case_custom_types() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.arguments[0].static_type,
-        known(TypeExpr::Simple("aws_account_id".to_string()))
+        known(crate::parser::bare_type_for_test(
+            "aws_account_id".to_string()
+        ))
     );
     assert_eq!(
         result.arguments[1].static_type,
-        known(TypeExpr::Simple("ipv4_cidr".to_string()))
+        known(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
     assert_eq!(
         result.arguments[2].static_type,
-        known(TypeExpr::Simple("arn".to_string()))
+        known(crate::parser::bare_type_for_test("arn".to_string()))
     );
 }
 
@@ -9400,7 +9364,7 @@ fn parse_custom_schema_type_in_fn_param() {
     assert_eq!(func.params[0].name, "cidr_block");
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::Simple("ipv4_cidr".to_string()))
+        Some(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
 }
 
@@ -9415,7 +9379,9 @@ fn parse_ipv4_address_type_in_fn_param() {
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::Simple("ipv4_address".to_string()))
+        Some(crate::parser::bare_type_for_test(
+            "ipv4_address".to_string()
+        ))
     );
 }
 
@@ -9430,7 +9396,7 @@ fn parse_arn_type_in_fn_param() {
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::Simple("arn".to_string()))
+        Some(crate::parser::bare_type_for_test("arn".to_string()))
     );
 }
 
@@ -9445,7 +9411,7 @@ fn parse_custom_type_in_list_generic() {
     let func = result.user_functions.get("f").unwrap();
     assert_eq!(
         func.params[0].param_type,
-        Some(TypeExpr::List(Box::new(TypeExpr::Simple(
+        Some(TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
             "ipv4_cidr".to_string()
         ))))
     );
@@ -9468,12 +9434,14 @@ fn parse_custom_type_in_module_arguments() {
     assert_eq!(result.arguments[0].name, "vpc_cidr");
     assert_eq!(
         result.arguments[0].static_type,
-        known(TypeExpr::Simple("ipv4_cidr".to_string()))
+        known(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
     assert_eq!(result.arguments[1].name, "server_ip");
     assert_eq!(
         result.arguments[1].static_type,
-        known(TypeExpr::Simple("ipv4_address".to_string()))
+        known(crate::parser::bare_type_for_test(
+            "ipv4_address".to_string()
+        ))
     );
 }
 
@@ -9492,34 +9460,40 @@ fn parse_custom_type_in_attributes() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.attribute_params[0].static_type,
-        known_opt(TypeExpr::Simple("ipv4_cidr".to_string()))
+        known_opt(crate::parser::bare_type_for_test("ipv4_cidr".to_string()))
     );
 }
 
 #[test]
 fn type_expr_display_simple() {
     assert_eq!(
-        TypeExpr::Simple("ipv4_cidr".to_string()).to_string(),
+        crate::parser::bare_type_for_test("ipv4_cidr".to_string()).to_string(),
         "Ipv4Cidr"
     );
     assert_eq!(
-        TypeExpr::Simple("ipv4_address".to_string()).to_string(),
+        crate::parser::bare_type_for_test("ipv4_address".to_string()).to_string(),
         "Ipv4Address"
     );
-    assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "Arn");
+    assert_eq!(
+        crate::parser::bare_type_for_test("arn".to_string()).to_string(),
+        "Arn"
+    );
 }
 
 #[test]
 fn type_expr_display_simple_is_pascal_case() {
     assert_eq!(
-        TypeExpr::Simple("aws_account_id".to_string()).to_string(),
+        crate::parser::bare_type_for_test("aws_account_id".to_string()).to_string(),
         "AwsAccountId"
     );
     assert_eq!(
-        TypeExpr::Simple("ipv4_cidr".to_string()).to_string(),
+        crate::parser::bare_type_for_test("ipv4_cidr".to_string()).to_string(),
         "Ipv4Cidr"
     );
-    assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "Arn");
+    assert_eq!(
+        crate::parser::bare_type_for_test("arn".to_string()).to_string(),
+        "Arn"
+    );
 }
 
 // --- Issue #1285: Validate fn call arguments for custom types ---

@@ -10591,6 +10591,7 @@ fn module_checker_and_provider_wrappers_accept_empty_input() {
         &authored,
         ctx.schemas(),
         &module_signatures,
+        carina_core::parser::ProviderContext::unloaded(),
     );
     let findings = carina_core::validation::check_module_calls(
         carina_core::validation::ModuleCallCheckInput {

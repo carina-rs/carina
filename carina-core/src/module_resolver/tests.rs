@@ -8772,7 +8772,7 @@ fn argument_type_list_accepts_resource_ref() {
     module.resources.clear();
     module.arguments = vec![ArgumentParameter {
         name: "role_arns".to_string(),
-        static_type: known(TypeExpr::List(Box::new(TypeExpr::Simple(
+        static_type: known(TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
             "arn".to_string(),
         )))),
         default: None,
@@ -9001,7 +9001,9 @@ let rd = infra_deploy {
 fn argument_type_mismatch_error_shows_actual_value() {
     let msg = module_argument_type_error(
         "role_arns",
-        TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        TypeExpr::List(Box::new(crate::parser::bare_type_for_test(
+            "arn".to_string(),
+        ))),
         Value::Concrete(ConcreteValue::String("arn:aws:iam::123:role/A".into())),
     );
 
@@ -9337,8 +9339,11 @@ fn argument_type_mismatch_error_preserves_float_fraction() {
 fn argument_type_validation_error_shows_actual_string_literal() {
     let value = Value::Concrete(ConcreteValue::String("not-an-ipv4-cidr".into()));
 
-    let msg =
-        module_argument_type_error("network", TypeExpr::Simple("ipv4_cidr".to_string()), value);
+    let msg = module_argument_type_error(
+        "network",
+        crate::parser::bare_type_for_test("ipv4_cidr".to_string()),
+        value,
+    );
 
     assert!(
         msg.contains("got string 'not-an-ipv4-cidr'"),

@@ -163,6 +163,7 @@ pub struct IdentifiedCustomTypeDeclaration<'a> {
 
 impl<'a> IdentifiedCustomTypeDeclaration<'a> {
     pub fn new(declared_type: &'a AttributeType) -> Option<Self> {
+        crate::provider::identified_custom_type_scalar_kind(declared_type).ok()?;
         let identity = crate::provider::identified_custom_type_identity(declared_type)?;
         Some(Self {
             declared_type,
@@ -725,6 +726,13 @@ pub struct ProviderContext {
 }
 
 impl ProviderContext {
+    /// Explicit bootstrap authority for callers that have no provider catalog.
+    pub fn unloaded() -> &'static Self {
+        static CONTEXT: std::sync::LazyLock<ProviderContext> =
+            std::sync::LazyLock::new(ProviderContext::default);
+        &CONTEXT
+    }
+
     pub fn custom_types_loaded(&self) -> bool {
         self.custom_types.is_loaded()
     }

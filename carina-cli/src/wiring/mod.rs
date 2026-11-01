@@ -2538,7 +2538,11 @@ pub fn validate_resource_ref_types_with_ctx<
     parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        parsed,
+        ctx.schemas(),
+        ctx.provider_context().as_provider_context(),
+    );
     lift_validation_result(validation::validate_resource_ref_types(
         parsed,
         ctx.schemas(),
@@ -2564,7 +2568,11 @@ pub fn validate_composition_ref_types_with_ctx<
         AbsoluteBindingAddress,
     >,
 ) -> Vec<AppError> {
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        parsed,
+        ctx.schemas(),
+        ctx.provider_context().as_provider_context(),
+    );
     validation::validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings)
         .into_iter()
         .map(|error| AppError::Validation(error.to_string()))
@@ -2579,7 +2587,11 @@ pub fn validate_attribute_param_ref_types_with_ctx<
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Vec<AppError> {
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        parsed,
+        ctx.schemas(),
+        ctx.provider_context().as_provider_context(),
+    );
     lift_validation_result(
         validation::validate_attribute_param_ref_types_with_bindings(
             &parsed.attribute_params,
@@ -3870,8 +3882,11 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
                 module.diagnostic_path().display()
             )));
         }
-        let bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(&parsed, ctx.schemas());
+        let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+            &parsed,
+            ctx.schemas(),
+            ctx.provider_context().as_provider_context(),
+        );
         if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
             &parsed.attribute_params,
             &bindings,
@@ -3914,6 +3929,7 @@ pub(crate) fn validate_module_internal_ref_types(
             &parsed,
             ctx.schemas(),
             &imported,
+            ctx.provider_context().as_provider_context(),
         );
         if let Err(joined) = validation::validate_resource_ref_types(
             &parsed,

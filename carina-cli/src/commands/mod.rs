@@ -669,6 +669,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
                 parsed.parsed(),
                 ctx.schemas(),
                 &imported_module_signatures,
+                enriched_context.as_provider_context(),
             );
         let reference_checks = if skip_resource_validation {
             carina_core::validation::ModuleCallReferenceChecks::Skipped
@@ -880,8 +881,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
             parsed,
             ctx.schemas(),
             &upstream_exports,
-            &imported_module_signatures,
-        );
+            &imported_module_signatures, enriched_context.as_provider_context());
         // Expansion-only boundary checks consume the final composition graph
         // without reloading the authored module walk.
         extend_module_call_errors(

@@ -672,8 +672,11 @@ fn composition_attribute_typo_export_is_deduplicated_by_cli_shared_ref_validatio
         carina_core::validation::inference::infer_export_params_with_loaded_provider_schemas(
             &parsed, schemas,
         );
-    let bindings =
-        carina_core::binding_index::BindingIndex::from_parsed(&parsed, schemas.schemas());
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        &parsed,
+        schemas.schemas(),
+        carina_core::parser::ProviderContext::unloaded(),
+    );
     let mut diagnostics = carina_core::validation::inference::attached_inference_failures(
         inferred_exports.checked_exports(),
     )

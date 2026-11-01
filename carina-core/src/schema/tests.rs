@@ -1087,7 +1087,7 @@ fn schema_admission_rejects_identity_below_provider_populated_ancestor() {
 #[test]
 fn builtin_validator_registry_reconstructs_core_refinements_by_identity() {
     let registry = builtin_validator_registry();
-    assert!(!registry.is_empty());
+    assert_eq!(registry.len(), builtin_type_registry().len());
 
     let positive_int =
         builtin_validator(RefinedScalarKind::Int, &TypeIdentity::bare("PositiveInt"))
@@ -8064,7 +8064,10 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
         ("Int", TypeExpr::Int),
         ("Float", TypeExpr::Float),
         ("Bool", TypeExpr::Bool),
-        ("Simple(ipv4_cidr)", TypeExpr::Simple("ipv4_cidr".into())),
+        (
+            "Simple(ipv4_cidr)",
+            crate::parser::bare_type_for_test("ipv4_cidr".into()),
+        ),
         (
             "SchemaType(aws.ec2.Vpc.Id)",
             TypeExpr::SchemaType {

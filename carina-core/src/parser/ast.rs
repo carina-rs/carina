@@ -1995,7 +1995,6 @@ impl std::fmt::Display for ResourceTypePath {
 
 /// Type expression for arguments/attributes parameters
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(from = "TypeExprWire")]
 pub enum TypeExpr {
     String,
     Bool,
@@ -2004,9 +2003,8 @@ pub enum TypeExpr {
     /// Time duration. Surface form: `<integer><unit>` literal (`75min`,
     /// `1h`, `30s`); internal form: `Value::Concrete(ConcreteValue::Duration(std::time::Duration))`.
     Duration,
-    /// Built-in schema type, or an authored name awaiting resolution on read
-    /// from a historical serialized annotation.
-    Simple(std::string::String),
+    /// A built-in refinement admitted by the core declaration registry.
+    Simple(super::BuiltinTypeName),
     /// Nominal identity with no scalar-kind evidence because provider schemas
     /// are not loaded. Only provider type resolution can construct its payload.
     /// Identified types still use the directional identity relation; checks
@@ -2053,96 +2051,6 @@ pub enum TypeExpr {
     Union(Vec<TypeExpr>),
 }
 
-/// Read historical annotations without inventing a scalar kind. Older
-/// SchemaType encodings omitted it, so they re-enter provider resolution as
-/// authored names. New encodings retain the kind and lift without schemas.
-#[derive(serde::Deserialize)]
-enum TypeExprWire {
-    String,
-    Bool,
-    Int,
-    Float,
-    Duration,
-    Simple(String),
-    UnloadedSchemaType(crate::schema::TypeIdentity),
-    List(Box<TypeExpr>),
-    Map(Box<TypeExpr>),
-    Ref(ResourceTypePath),
-    DottedUnresolved(ResourceTypePath),
-    SchemaType { owned: SchemaTypeWire },
-    Struct { fields: Vec<(String, TypeExpr)> },
-    StringLiteral(String),
-    Union(Vec<TypeExpr>),
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum SchemaTypeWire {
-    Declared(DeclaredSchemaTypeWire),
-    Legacy(LegacySchemaTypeWire),
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeclaredSchemaTypeWire {
-    owners: super::NonEmptySchemaTypeOwners,
-    identity: crate::schema::TypeIdentity,
-    scalar_kind: crate::schema::RefinedScalarKind,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacySchemaTypeWire {
-    owners: super::NonEmptySchemaTypeOwners,
-    identity: crate::schema::TypeIdentity,
-}
-
-impl From<TypeExprWire> for TypeExpr {
-    fn from(wire: TypeExprWire) -> Self {
-        match wire {
-            TypeExprWire::String => Self::String,
-            TypeExprWire::Bool => Self::Bool,
-            TypeExprWire::Int => Self::Int,
-            TypeExprWire::Float => Self::Float,
-            TypeExprWire::Duration => Self::Duration,
-            TypeExprWire::Simple(name) => Self::Simple(name),
-            TypeExprWire::UnloadedSchemaType(identity) => {
-                super::types::resolve_custom_type_identity(
-                    &identity,
-                    &super::ProviderContext::default(),
-                )
-                .expect("an unloaded catalog has no conflicting declarations")
-                .expect("an unloaded catalog retains nominal identity")
-            }
-            TypeExprWire::List(inner) => Self::List(inner),
-            TypeExprWire::Map(inner) => Self::Map(inner),
-            TypeExprWire::Ref(path) => Self::Ref(path),
-            TypeExprWire::DottedUnresolved(path) => Self::DottedUnresolved(path),
-            TypeExprWire::SchemaType { owned } => match owned {
-                SchemaTypeWire::Declared(owned) => Self::SchemaType {
-                    owned: super::OwnedTypeIdentity::with_owners(
-                        owned.identity,
-                        owned.owners,
-                        owned.scalar_kind,
-                    ),
-                },
-                SchemaTypeWire::Legacy(LegacySchemaTypeWire {
-                    owners: _owners,
-                    identity,
-                }) => super::types::resolve_custom_type_identity(
-                    &identity,
-                    &super::ProviderContext::default(),
-                )
-                .expect("an unloaded catalog has no conflicting declarations")
-                .expect("an unloaded catalog retains nominal identity"),
-            },
-            TypeExprWire::Struct { fields } => Self::Struct { fields },
-            TypeExprWire::StringLiteral(value) => Self::StringLiteral(value),
-            TypeExprWire::Union(members) => Self::Union(members),
-        }
-    }
-}
-
 impl TypeExpr {
     /// Whether a resolved declaration proves a string scalar shape.
     /// Unloaded nominal evidence never supplies a scalar-kind proof.
@@ -2150,14 +2058,11 @@ impl TypeExpr {
         match self {
             Self::String | Self::DottedUnresolved(_) => true,
             Self::Simple(name) => {
-                super::builtin_bare_custom_types()
-                    .get(name)
-                    .is_some_and(|declaration| {
-                        matches!(
-                            declaration.raw_shape(),
-                            crate::schema::RawShape::String { .. }
-                        )
-                    })
+                let declaration = name.declaration();
+                matches!(
+                    declaration.raw_shape(),
+                    crate::schema::RawShape::String { .. }
+                )
             }
             Self::SchemaType { owned } => {
                 owned.scalar_kind() == crate::schema::RefinedScalarKind::String

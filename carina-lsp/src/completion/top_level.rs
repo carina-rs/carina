@@ -456,6 +456,7 @@ impl CompletionProvider {
                 &std::collections::BTreeMap::new(),
                 text,
                 base_path,
+                provider_ctx,
             );
         }
 
@@ -472,6 +473,7 @@ impl CompletionProvider {
                 &std::collections::BTreeMap::new(),
                 text,
                 base_path,
+                provider_ctx,
             );
         }
         Vec::new()
@@ -484,7 +486,7 @@ impl CompletionProvider {
             parser::TypeExpr::Int => "int".to_string(),
             parser::TypeExpr::Float => "float".to_string(),
             parser::TypeExpr::Duration => "duration".to_string(),
-            parser::TypeExpr::Simple(name) => name.clone(),
+            parser::TypeExpr::Simple(name) => name.as_str().to_owned(),
             parser::TypeExpr::UnloadedSchemaType(unloaded) => unloaded.identity().to_string(),
             parser::TypeExpr::List(inner) => format!("list({})", self.format_type_expr(inner)),
             parser::TypeExpr::Map(inner) => format!("map({})", self.format_type_expr(inner)),

@@ -693,7 +693,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .map_err(contextualize_access_error)?;
         let selected = &selected_module_ifs.contribution;
 
-        let nested_binding_index = BindingIndex::from_parsed(module, self.schemas);
+        let nested_binding_index = BindingIndex::from_parsed(module, self.schemas, self.config());
         let mut nested_contributions = Vec::new();
         for nested_call in module.module_calls.iter().chain(&selected.module_calls) {
             let local_prefix = instance_prefix_for_call(nested_call);

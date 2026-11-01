@@ -321,6 +321,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
         &directory.parsed,
         schemas,
         &signatures,
+        carina_core::parser::ProviderContext::unloaded(),
     );
     let covered_findings = carina_core::validation::check_module_calls(
         carina_core::validation::ModuleCallCheckInput {

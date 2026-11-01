@@ -803,6 +803,7 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                     provider_config,
                     crate::validation::typecheck::TypecheckInference::Unavailable,
                 )
+                .allow_deferred()
                 .map_err(|error| {
                     user_function_runtime_error(
                         call_line,
@@ -846,6 +847,7 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
             provider_config,
             crate::validation::typecheck::TypecheckInference::Unavailable,
         )
+        .allow_deferred()
         .map_err(|error| {
             user_function_runtime_error(
                 function.body.source_line,
