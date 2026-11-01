@@ -7,6 +7,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::output_style::Colorize;
 use carina_core::data_source_value::DataSourceValues;
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
@@ -32,7 +33,6 @@ use carina_state::{
     BackendError, DeposedAttributes, DeposedInstance, DeposedKey, PreviousSecretHashAuthority,
     ResourceState, RowBasis, StateBackend, StateFile,
 };
-use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::plan::MovedOrigins;
@@ -525,11 +525,15 @@ impl ExportResolution {
     /// (carina#3710). This also prevents callers from reading only the resolved
     /// half and silently dropping skipped diagnostics
     /// (carina#3551 / CLAUDE.md "Long-term view alongside root-cause").
-    pub(crate) fn write_into(self, state: &mut StateFile) -> SkippedExports {
+    pub(crate) fn write_into(
+        self,
+        color_mode: crate::output_style::ColorMode,
+        state: &mut StateFile,
+    ) -> SkippedExports {
         let Self { resolved, skipped } = self;
         let mut next = HashMap::new();
         for skipped in &skipped {
-            println!("{}", render_skipped(skipped));
+            println!("{}", render_skipped(color_mode, skipped));
             if let Some(prior) = state.exports.get(&skipped.name) {
                 next.insert(skipped.name.clone(), prior.clone());
             }
@@ -550,10 +554,10 @@ impl ExportResolution {
     }
 }
 
-fn render_skipped(skipped: &SkippedExport) -> String {
+fn render_skipped(color_mode: crate::output_style::ColorMode, skipped: &SkippedExport) -> String {
     format!(
         "  {} export {} not written: {}",
-        "!".yellow(),
+        "!".yellow(color_mode),
         skipped.name,
         skipped.reason
     )
@@ -2327,7 +2331,11 @@ mod apply_state_save_tests {
         provider.add_provider(
             "mock".to_string(),
             carina_core::provider::InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::MockProvider::new(),
+                carina_provider_mock::ConfiguredBuiltinMock::new(
+                    carina_provider_mock::MockBehavior::default(),
+                    carina_provider_mock::MockScope::memory(),
+                )
+                .create_provider(),
             )),
         );
 
@@ -7393,6 +7401,7 @@ mod export_writeback_tests {
 
     #[test]
     fn unresolved_export_is_skipped_without_dropping_resolved_exports() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let export_params = vec![
             export_param(
                 "target_group_arn",
@@ -7430,7 +7439,7 @@ mod export_writeback_tests {
             skipped[0]
         );
         assert_eq!(
-            render_skipped(&skipped[0]),
+            render_skipped(color_mode, &skipped[0]),
             "  ! export target_group_arn not written: unresolved reference registry_publish.target_group.arn"
         );
     }
@@ -7517,6 +7526,7 @@ mod export_writeback_tests {
 
     #[test]
     fn write_into_preserves_prior_skipped_exports_and_drops_orphans() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let mut state = StateFile::new();
         state.insert_export_json_for_test("ax", serde_json::json!("old-a"));
         state.insert_export_json_for_test("bx", serde_json::json!("old-b"));
@@ -7532,7 +7542,7 @@ mod export_writeback_tests {
                 reason: "unresolved reference b.name".to_string(),
             }],
         }
-        .write_into(&mut state);
+        .write_into(color_mode, &mut state);
 
         assert_eq!(skipped.len(), 1);
         assert_eq!(state.exports.len(), 2);

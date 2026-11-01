@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 
 use futures::stream::{self, StreamExt};
 
@@ -97,8 +97,12 @@ use saved_plan::{
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
 
-type ObserverFactory<'a, S = ModuleSource> =
-    dyn Fn(&carina_core::plan::Plan<S>, &Path) -> Box<dyn ExecutionObserver<S>> + 'a;
+type ObserverFactory<'a, S = ModuleSource> = dyn Fn(
+        crate::output_style::ColorMode,
+        &carina_core::plan::Plan<S>,
+        &Path,
+    ) -> Box<dyn ExecutionObserver<S>>
+    + 'a;
 
 #[derive(serde::Deserialize)]
 struct PlanFileHeader {
@@ -189,10 +193,11 @@ fn saved_plan_secret_orphan_vanished_error(
 }
 
 fn cli_observer_factory<S: Send + Sync + 'static>(
+    color_mode: crate::output_style::ColorMode,
     plan: &carina_core::plan::Plan<S>,
     project_dir: &Path,
 ) -> Box<dyn ExecutionObserver<S>> {
-    Box::new(CliObserver::new(plan, project_dir))
+    Box::new(CliObserver::new(color_mode, plan, project_dir))
 }
 
 fn format_total_apply_line(elapsed: Duration) -> String {
@@ -209,6 +214,7 @@ struct BootstrapCreateContext<'a> {
 }
 
 async fn create_checked_bootstrap_resource(
+    color_mode: crate::output_style::ColorMode,
     operation_provider: &dyn Provider,
     comparison_provider: &ProviderRouter,
     resource: Resource,
@@ -281,7 +287,11 @@ async fn create_checked_bootstrap_resource(
             if let Some(diagnostic) = diagnostic {
                 eprintln!(
                     "{}",
-                    format_partial_state_bucket_create_warning(&identifier, &diagnostic)
+                    format_partial_state_bucket_create_warning(
+                        color_mode,
+                        &identifier,
+                        &diagnostic
+                    )
                 );
             }
             Ok(())
@@ -331,6 +341,7 @@ async fn create_checked_bootstrap_resource(
 
 #[cfg(test)]
 async fn create_checked_bootstrap_resource_for_test(
+    color_mode: crate::output_style::ColorMode,
     operation_provider: &dyn Provider,
     resource: Resource,
     context: BootstrapCreateContext<'_>,
@@ -348,6 +359,7 @@ async fn create_checked_bootstrap_resource_for_test(
         schemas: _schemas,
     } = context;
     create_checked_bootstrap_resource(
+        color_mode,
         operation_provider,
         &comparison_provider,
         resource,
@@ -374,16 +386,17 @@ async fn seed_protected_bootstrap_resource(
 }
 
 fn format_partial_state_bucket_create_warning(
+    color_mode: crate::output_style::ColorMode,
     identifier: &str,
     diagnostic: &carina_core::provider::PartialReadDiagnostic,
 ) -> String {
     let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
     format!(
         "{} State bucket '{identifier}' was created with a partial read:\n      {} {reason}\n      {} {missing}\n      {} {state_recorded}",
-        "⚠".yellow(),
-        "→".yellow(),
-        "→".yellow(),
-        "→".yellow(),
+        "⚠".yellow(color_mode),
+        "→".yellow(color_mode),
+        "→".yellow(color_mode),
+        "→".yellow(color_mode),
     )
 }
 
@@ -730,6 +743,7 @@ async fn execute_rehydrated_saved_plan(
 /// succeed and silently mixing plan-time and apply-time values
 /// produces incorrect cascade re-resolution.
 async fn verify_upstream_snapshot(
+    runtime: &crate::runtime::CommandRuntime,
     sources: &[crate::commands::plan::UpstreamSource],
     snapshot: &HashMap<String, HashMap<String, Value>>,
     apply_target: ApplyTarget<'_>,
@@ -745,6 +759,7 @@ async fn verify_upstream_snapshot(
     let provider_context = ProviderContext::default();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
     let current = super::plan::load_upstream_states(
+        runtime,
         &upstream_states,
         project_dir,
         &provider_context,
@@ -892,6 +907,7 @@ mod upstream_snapshot_tests {
 /// internal version.
 #[cfg(test)]
 pub async fn refresh_pending_states(
+    color_mode: crate::output_style::ColorMode,
     provider: &dyn Provider,
     managed_current: &mut HashMap<ResourceId, Current>,
     pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
@@ -901,7 +917,10 @@ pub async fn refresh_pending_states(
     }
 
     println!();
-    println!("{}", "Refreshing uncertain resource states...".cyan());
+    println!(
+        "{}",
+        "Refreshing uncertain resource states...".cyan(color_mode)
+    );
 
     let mut refreshes: Vec<_> = pending_refreshes.iter().collect();
     refreshes.sort_by_key(|(left_id, _)| left_id.to_string());
@@ -910,11 +929,11 @@ pub async fn refresh_pending_states(
     for (id, identifier) in refreshes {
         match read_with_retry(provider, id, identifier).await {
             Ok(state) => {
-                println!("  {} Refresh {}", "✓".green(), id);
+                println!("  {} Refresh {}", "✓".green(color_mode), id);
                 managed_current.insert(id.clone(), Current::from_state(state));
             }
             Err(error) => {
-                println!("  {} Refresh {} - {}", "!".yellow(), id, error);
+                println!("  {} Refresh {} - {}", "!".yellow(color_mode), id, error);
                 failed_refreshes.insert(id.clone());
             }
         }
@@ -931,11 +950,12 @@ pub async fn refresh_pending_states(
 /// Returns the [`SkippedExports`] summary after state is saved. Callers must fold
 /// unresolved exports into the command's exit status (carina#3710).
 pub(crate) async fn finalize_apply<S: Clone>(
+    color_mode: crate::output_style::ColorMode,
     input: FinalizeApplyInput<'_, S>,
     persistence: StatePersistence,
 ) -> Result<SkippedExports, AppError> {
     println!();
-    println!("{}", "Saving state...".cyan());
+    println!("{}", "Saving state...".cyan(color_mode));
 
     let mut state = input
         .state_save_inputs
@@ -962,7 +982,7 @@ pub(crate) async fn finalize_apply<S: Clone>(
             provider_context: export_inputs.provider_context,
         })
         .and_then(|values| materialize_exports(&values))
-        .map(|resolution| resolution.write_into(&mut state))
+        .map(|resolution| resolution.write_into(color_mode, &mut state))
     } else {
         Ok(SkippedExports::default())
     };
@@ -980,7 +1000,11 @@ pub(crate) async fn finalize_apply<S: Clone>(
                 .await?;
         }
     }
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} State saved (serial: {})",
+        "✓".green(color_mode),
+        state.serial
+    );
 
     export_resolution
 }
@@ -1131,6 +1155,7 @@ pub(crate) async fn prune_legacy_data_source_rows_persist_if_changed(
 /// error so the command exits non-zero (carina#3710).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_exports_only(
+    color_mode: crate::output_style::ColorMode,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     state_file: Option<StateFile>,
@@ -1158,24 +1183,33 @@ pub(crate) async fn persist_exports_only(
         provider_context,
     })?;
     let resolution = materialize_exports(&values)?;
-    let skipped_exports = resolution.write_into(&mut state);
+    let skipped_exports = resolution.write_into(color_mode, &mut state);
     match lock {
         StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
         StateLockRef::Disabled(disabled) => {
             save_state_unlocked(backend, disabled, &mut state).await?
         }
     }
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} State saved (serial: {})",
+        "✓".green(color_mode),
+        state.serial
+    );
     if skipped_exports.is_empty() {
-        println!("  {} Exports updated", "✓".green());
+        println!("  {} Exports updated", "✓".green(color_mode));
         Ok(())
     } else {
-        println!("  {} {}", "!".yellow(), skipped_exports.count_description());
+        println!(
+            "  {} {}",
+            "!".yellow(color_mode),
+            skipped_exports.count_description()
+        );
         Err(AppError::Config(skipped_exports.failure_message()))
     }
 }
 
 async fn persist_directives_only(
+    color_mode: crate::output_style::ColorMode,
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
     mut state: StateFile,
@@ -1187,10 +1221,14 @@ async fn persist_directives_only(
             save_state_unlocked(backend, disabled, &mut state).await?
         }
     }
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} State saved (serial: {})",
+        "✓".green(color_mode),
+        state.serial
+    );
     println!(
         "  {} {} resource directive change(s) persisted",
-        "✓".green(),
+        "✓".green(color_mode),
         directive_change_count
     );
     Ok(())
@@ -1224,6 +1262,7 @@ impl DriftCheckResult {
 /// verification pass for the saved-plan gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn detect_drift<S: Clone>(
+    color_mode: crate::output_style::ColorMode,
     sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
@@ -1307,13 +1346,13 @@ pub(crate) async fn detect_drift<S: Clone>(
                 if planned_exists {
                     drift_messages.push(format!(
                         "  {} {}: resource existed at plan time but no longer exists",
-                        "~".yellow(),
+                        "~".yellow(color_mode),
                         resource.id
                     ));
                 } else {
                     drift_messages.push(format!(
                         "  {} {}: resource did not exist at plan time but now exists",
-                        "~".yellow(),
+                        "~".yellow(color_mode),
                         resource.id
                     ));
                 }
@@ -1408,7 +1447,7 @@ pub(crate) async fn detect_drift<S: Clone>(
                     drift_detected = true;
                     drift_messages.push(format!(
                         "  {} {}: attributes have changed since plan was created:",
-                        "~".yellow(),
+                        "~".yellow(color_mode),
                         resource.id
                     ));
                     drift_messages.extend(attr_diffs);
@@ -1439,7 +1478,9 @@ pub(crate) async fn detect_drift<S: Clone>(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn detect_drift_for_test<S: Clone>(
+    color_mode: crate::output_style::ColorMode,
     sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
@@ -1453,6 +1494,7 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         sorted_resources.iter().map(|resource| &resource.id),
     );
     detect_drift(
+        color_mode,
         sorted_resources,
         planned_state_entries,
         historical_addresses,
@@ -1474,7 +1516,7 @@ fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_apply(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -1484,7 +1526,7 @@ pub async fn run_apply(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_with_observer_factory(
-        user_dirs,
+        runtime,
         path,
         auto_approve,
         lock,
@@ -1500,7 +1542,7 @@ pub async fn run_apply(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_with_observer_factory(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -1510,6 +1552,7 @@ async fn run_apply_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -1521,7 +1564,7 @@ async fn run_apply_with_observer_factory(
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let mut validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
@@ -1558,8 +1601,8 @@ async fn run_apply_with_observer_factory(
             println!(
                 "{}",
                 "State bucket not found. Running bootstrap..."
-                    .yellow()
-                    .bold()
+                    .yellow(color_mode)
+                    .bold(color_mode)
             );
 
             // Check if there's a bucket resource defined with matching name
@@ -1574,7 +1617,7 @@ async fn run_apply_with_observer_factory(
                 println!("Found state bucket resource in configuration.");
                 println!(
                     "Creating bucket '{}' before other resources...",
-                    bucket_name.cyan()
+                    bucket_name.cyan(color_mode)
                 );
 
                 // Create the bucket resource using the factory pattern
@@ -1585,6 +1628,7 @@ async fn run_apply_with_observer_factory(
                 // Resolve its attributes here; every other apply path waits
                 // for the post-reconciliation lock-held resolution below.
                 let bootstrap_provider_inputs = load_apply_provider_inputs(
+                    runtime,
                     validated_config.resources().parsed(),
                     base_dir,
                     provider_context,
@@ -1602,6 +1646,7 @@ async fn run_apply_with_observer_factory(
                 // the same expanded compositions and resolved config values
                 // that are available before any provider effect runs.
                 create_checked_bootstrap_resource(
+                    color_mode,
                     &bucket_provider,
                     &bucket_provider,
                     bucket_resource.clone(),
@@ -1615,13 +1660,20 @@ async fn run_apply_with_observer_factory(
                     },
                 )
                 .await?;
-                println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
+                println!(
+                    "  {} Created state bucket: {}",
+                    "✓".green(color_mode),
+                    bucket_name
+                );
             } else {
                 // Auto-create the bucket if auto_create is enabled
                 if auto_create {
-                    println!("Auto-creating state bucket: {}", bucket_name.cyan());
+                    println!(
+                        "Auto-creating state bucket: {}",
+                        bucket_name.cyan(color_mode)
+                    );
                     backend.create_bucket().await.map_err(AppError::Backend)?;
-                    println!("  {} Created state bucket", "✓".green());
+                    println!("  {} Created state bucket", "✓".green(color_mode));
 
                     let backend_provider_name = backend
                         .provider_name()
@@ -1648,7 +1700,7 @@ async fn run_apply_with_observer_factory(
                         .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
                     println!(
                         "  {} Added resource definition to {}",
-                        "✓".green(),
+                        "✓".green(color_mode),
                         target_file.display()
                     );
 
@@ -1704,7 +1756,7 @@ async fn run_apply_with_observer_factory(
                         .map_err(AppError::Backend)?;
                     println!(
                         "  {} Registered state bucket as protected resource",
-                        "✓".green()
+                        "✓".green(color_mode)
                     );
                 } else {
                     return Err(AppError::Config(format!(
@@ -1718,19 +1770,19 @@ async fn run_apply_with_observer_factory(
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
-        println!("{}", "Acquiring state lock...".cyan());
+        println!("{}", "Acquiring state lock...".cyan(color_mode));
         let acquired = backend
             .acquire_lock("apply")
             .await
             .map_err(|error| map_lock_error(error, path))?;
-        println!("  {} Lock acquired", "✓".green());
+        println!("  {} Lock acquired", "✓".green(color_mode));
         StateLock::held(acquired)
     } else {
         println!(
             "{}",
             "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         StateLock::disabled_by_cli_flag()
     };
@@ -1751,7 +1803,7 @@ async fn run_apply_with_observer_factory(
         accept_legacy_name_overrides,
     )
     .await;
-    let timing = finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
+    let timing = finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await?;
     if let Some(elapsed) = timing {
         println!("{}", format_total_apply_line(elapsed));
     }
@@ -1782,11 +1834,13 @@ fn reload_apply_configuration_after_bootstrap(
 }
 
 async fn load_apply_provider_inputs<E>(
+    runtime: &crate::runtime::CommandRuntime,
     parsed: &carina_core::parser::ExpandedFile<E>,
     base_dir: &Path,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedProviderInputs, AppError> {
     load_and_resolve_provider_configs(
+        runtime,
         parsed,
         base_dir,
         provider_context,
@@ -1893,6 +1947,8 @@ async fn run_apply_locked_owned(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> LockCommandOutcome<Result<Option<Duration>, AppError>> {
+    let runtime = validated_config.context().runtime().clone();
+    let color_mode = validated_config.context().runtime().color_mode();
     // Read current state from backend. carina#3315: if `check_and_migrate`
     // lifted an older on-disk schema in memory, persist the upgrade
     // under the current lock before any short-circuit path can return
@@ -1941,8 +1997,13 @@ async fn run_apply_locked_owned(
             } = validated_config.reconcile_identities_with_state(&state_file);
             let (ctx, canonical_resources) = validated_config.context_and_resources();
             let parsed = canonical_resources.parsed();
-            let provider_inputs =
-                load_apply_provider_inputs(parsed, project_dir, provider_context).await?;
+            let provider_inputs = load_apply_provider_inputs(
+                validated_config.context().runtime(),
+                parsed,
+                project_dir,
+                provider_context,
+            )
+            .await?;
             let provider_configs = provider_inputs.configs();
             let raw_provider_configs = provider_configs.as_provider_configs();
             let remote_bindings = provider_inputs.remote_bindings();
@@ -1980,7 +2041,7 @@ async fn run_apply_locked_owned(
             // An address with no state row is absent. A persisted row without
             // an identifier stays present and invalid until planning reports it.
             // Skip composition resources (module attribute containers) — they have no infrastructure.
-            let progress_backend = ProgressBackend::new(ProgressSink::Human);
+            let progress_backend = ProgressBackend::new(color_mode, ProgressSink::Human);
             let refresh_phase = RefreshPhase::start(&progress_backend);
             let provider_ref = &provider;
             let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
@@ -2065,7 +2126,11 @@ async fn run_apply_locked_owned(
             .await?;
             let reconciled_expansion = expansion_prelude
                 .bind_projected_phase1_state(managed_current, orphans, orphan_refreshed_ids)
-                .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Print)?;
+                .reconcile_addresses(
+                    color_mode,
+                    parsed,
+                    crate::wiring::DeferredForWarningPolicy::Print,
+                )?;
 
             // Phase 2 uses the same addressed managed/orphan view as plan and
             // state refresh and produces one outcome per query.
@@ -2141,7 +2206,7 @@ async fn run_apply_locked_owned(
             } = match post_expansion {
                 crate::wiring::PostExpansionOutcome::Planned(planned) => planned,
                 crate::wiring::PostExpansionOutcome::Diagnostics(diagnostics) => {
-                    return Err(diagnostics.render_and_abort(project_dir));
+                    return Err(diagnostics.render_and_abort(color_mode, project_dir));
                 }
             };
             let crate::wiring::PostExpansionArtifacts {
@@ -2156,9 +2221,9 @@ async fn run_apply_locked_owned(
                 prev_explicit,
                 wait_aliases,
             } = artifacts;
-            render_plan_errors_and_abort(&plan, project_dir)?;
+            render_plan_errors_and_abort(color_mode, &plan, project_dir)?;
             #[cfg(any(test, feature = "test-utils"))]
-            capture_live_apply_plan_for_test(&plan)?;
+            capture_live_apply_plan_for_test(&runtime, &plan)?;
             let crate::wiring::PostExpansionApplyResources {
                 resolved: resolved_resources,
                 paired_unresolved: paired_unresolved_resources,
@@ -2212,7 +2277,7 @@ async fn run_apply_locked_owned(
                 let directive_change_count = directive_changes.len();
 
                 if export_changes.is_empty() && directive_change_count == 0 {
-                    println!("{}", "No changes needed.".green());
+                    println!("{}", "No changes needed.".green(color_mode));
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
@@ -2225,6 +2290,7 @@ async fn run_apply_locked_owned(
                     &directive_changes,
                 );
                 print_plan(
+                    color_mode,
                     &plan,
                     &summary,
                     DetailLevel::Full,
@@ -2240,7 +2306,7 @@ async fn run_apply_locked_owned(
                 // moved-block hint.
 
                 let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-                if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+                if confirm_apply(&runtime, stdin, cancel.clone(), auto_approve).await?
                     == ApplyConfirmation::Cancelled
                 {
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
@@ -2253,7 +2319,7 @@ async fn run_apply_locked_owned(
                             "Persisting {} export change(s) to state.",
                             export_changes.len()
                         )
-                        .cyan()
+                        .cyan(color_mode)
                     );
                 }
                 if directive_change_count > 0 {
@@ -2263,7 +2329,7 @@ async fn run_apply_locked_owned(
                             "Persisting {} resource directive change(s) to state.",
                             directive_change_count
                         )
-                        .cyan()
+                        .cyan(color_mode)
                     );
                 }
                 let state_file = if directive_change_count > 0 {
@@ -2335,6 +2401,7 @@ async fn run_apply_locked_owned(
                 &directive_changes,
             );
             print_plan(
+                color_mode,
                 &plan,
                 &summary,
                 DetailLevel::Full,
@@ -2351,17 +2418,20 @@ async fn run_apply_locked_owned(
                 ctx.schemas(),
                 &provider,
             )?;
-            moved_hints.eprint();
+            moved_hints.eprint(color_mode);
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-            if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+            if confirm_apply(&runtime, stdin, cancel.clone(), auto_approve).await?
                 == ApplyConfirmation::Cancelled
             {
                 return Ok(SourceApplyAfterHeartbeat::Done(None));
             }
 
             let apply_phase_started = Instant::now();
-            println!("{}", "Applying changes...".cyan().bold());
+            println!(
+                "{}",
+                "Applying changes...".cyan(color_mode).bold(color_mode)
+            );
             println!();
 
             // Preserve the old execution boundary for the fallible unresolved
@@ -2372,7 +2442,7 @@ async fn run_apply_locked_owned(
             // `ProviderNormalizer`; the same object is passed in both positions
             // so apply re-normalizes with exactly the plan-time normalizer
             // (carina#3060). They must stay the same object.
-            let observer = observer_factory(&plan, project_dir);
+            let observer = observer_factory(color_mode, &plan, project_dir);
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_resources.clone(),
@@ -2390,7 +2460,7 @@ async fn run_apply_locked_owned(
             // Remove, Move, and keyed-list release need no provider call.
             // Report them now; every checkpoint's state writeback materializes
             // them from the plan.
-            let state_only_success_count = execute_state_only_effects(&plan);
+            let state_only_success_count = execute_state_only_effects(color_mode, &plan);
             let outcome = execute_effects_with_observer(
                 &plan,
                 provider.as_ref(),
@@ -2418,6 +2488,7 @@ async fn run_apply_locked_owned(
 
             // Execute import effects: read imported resources from the provider
             execute_import_effects(
+                color_mode,
                 &plan,
                 provider.as_ref(),
                 &mut result,
@@ -2478,6 +2549,7 @@ async fn run_apply_locked_owned(
                 } = *context;
                 if export_change_count == 0 {
                     persist_directives_only(
+                        color_mode,
                         backend.as_ref(),
                         lock.as_ref(),
                         state_file.unwrap_or_default(),
@@ -2486,6 +2558,7 @@ async fn run_apply_locked_owned(
                     .await?;
                 } else {
                     persist_exports_only(
+                        color_mode,
                         backend.as_ref(),
                         lock.as_ref(),
                         state_file,
@@ -2502,7 +2575,7 @@ async fn run_apply_locked_owned(
                     if directive_change_count > 0 {
                         println!(
                             "  {} {} resource directive change(s) persisted",
-                            "✓".green(),
+                            "✓".green(color_mode),
                             directive_change_count
                         );
                     }
@@ -2537,6 +2610,7 @@ async fn run_apply_locked_owned(
                 let skipped_exports = finalize_after_execute(
                     |persistence| {
                         finalize_apply(
+                            color_mode,
                             FinalizeApplyInput {
                                 result: &result,
                                 state_base,
@@ -2561,6 +2635,7 @@ async fn run_apply_locked_owned(
                 .await?;
 
                 finish_apply(
+                    color_mode,
                     &result,
                     skipped_exports,
                     resources_finished.duration_since(apply_phase_started),
@@ -2577,14 +2652,21 @@ async fn run_apply_locked_owned(
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-fn capture_live_apply_plan_for_test(plan: &Plan) -> Result<(), AppError> {
-    let Ok(path) = std::env::var("CARINA_TEST_CAPTURE_LIVE_APPLY_PLAN") else {
+fn capture_live_apply_plan_for_test(
+    runtime: &crate::runtime::CommandRuntime,
+    plan: &Plan,
+) -> Result<(), AppError> {
+    let Some(path) = &runtime.hooks().capture_live_apply_plan else {
         return Ok(());
     };
     let encoded = serde_json::to_vec_pretty(plan)
         .map_err(|error| AppError::Config(format!("serialize live apply plan: {error}")))?;
-    std::fs::write(&path, encoded)
-        .map_err(|error| AppError::Config(format!("write live apply plan to {path}: {error}")))
+    std::fs::write(path, encoded).map_err(|error| {
+        AppError::Config(format!(
+            "write live apply plan to {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -2630,6 +2712,7 @@ async fn run_apply_locked_canonical(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let color_mode = validated_config.context().runtime().color_mode();
     let outcome = run_apply_locked_owned(
         validated_config,
         auto_approve,
@@ -2643,7 +2726,7 @@ async fn run_apply_locked_canonical(
         accept_legacy_name_overrides,
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
 
 fn ensure_saved_plan_backend_matches_current(
@@ -2794,6 +2877,7 @@ async fn prepare_saved_plan_secret_candidates(
     provider_context: &ProviderContext,
     apply_target: ApplyTarget<'_>,
 ) -> Result<PreparedSavedPlanSecretCandidates, AppError> {
+    let color_mode = validated_config.context().runtime().color_mode();
     let mut candidate_state = state_file.clone();
     let PreparedPlanIdentityData {
         provider_inputs,
@@ -2842,7 +2926,11 @@ async fn prepare_saved_plan_secret_candidates(
             prior_states.orphans,
             prior_states.already_refreshed,
         )
-        .reconcile_addresses(parsed, crate::wiring::DeferredForWarningPolicy::Suppress)?
+        .reconcile_addresses(
+            color_mode,
+            parsed,
+            crate::wiring::DeferredForWarningPolicy::Suppress,
+        )?
         .seal(data_source_values);
     let (mut validated_expansion, _expansion) = validated_config.expand_deferred_for(
         &prepared_expansion,
@@ -3003,7 +3091,7 @@ fn rehydrate_desired_plan_file_from_parts(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_apply_from_plan(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     plan_path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -3013,7 +3101,7 @@ pub async fn run_apply_from_plan(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_from_plan_with_observer_factory(
-        user_dirs,
+        runtime,
         plan_path,
         auto_approve,
         lock,
@@ -3029,7 +3117,7 @@ pub async fn run_apply_from_plan(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_with_observer_factory(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     plan_path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -3039,6 +3127,7 @@ async fn run_apply_from_plan_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_, SavedModuleSource>,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let bytes = fs::read(plan_path).map_err(|error| AppError::PlanFileRead {
         path: plan_path.to_path_buf(),
         error,
@@ -3191,7 +3280,7 @@ async fn run_apply_from_plan_with_observer_factory(
                 "Warning: plan was created with carina version {} but current version is {}",
                 plan_file.carina_version, current_version
             )
-            .yellow()
+            .yellow(color_mode)
         );
     }
 
@@ -3201,7 +3290,7 @@ async fn run_apply_from_plan_with_observer_factory(
             "Using saved plan from {} (created {})",
             plan_file.source_path, plan_file.timestamp
         )
-        .cyan()
+        .cyan(color_mode)
     );
 
     let base_dir = get_base_dir(&source_path);
@@ -3211,7 +3300,7 @@ async fn run_apply_from_plan_with_observer_factory(
     // current-config secret validation, backend drift, saved-plan backend
     // mismatch, or the state-lock gate.
     let providers = ProviderLoad::load(
-        user_dirs,
+        runtime,
         inspected_plan.provider_configs().as_provider_configs(),
         base_dir,
     )?
@@ -3293,24 +3382,25 @@ async fn run_apply_from_plan_with_observer_factory(
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
-        println!("{}", "Acquiring state lock...".cyan());
+        println!("{}", "Acquiring state lock...".cyan(color_mode));
         let li = backend
             .acquire_lock("apply")
             .await
             .map_err(|error| map_lock_error(error, &source_path))?;
-        println!("  {} Lock acquired", "✓".green());
+        println!("  {} Lock acquired", "✓".green(color_mode));
         StateLock::held(li)
     } else {
         println!(
             "{}",
             "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         StateLock::disabled_by_cli_flag()
     };
 
     let outcome = run_apply_from_plan_locked_owned(
+        color_mode,
         inspected_plan,
         provider_context,
         auto_approve,
@@ -3323,7 +3413,7 @@ async fn run_apply_from_plan_with_observer_factory(
         accept_legacy_name_overrides,
     )
     .await;
-    let timing = finish_lock_command(backend.as_ref(), outcome, &cancel)
+    let timing = finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel)
         .await
         .map_err(|error| error.with_project_dir(&source_path))?;
     if let Some(elapsed) = timing {
@@ -3335,6 +3425,7 @@ async fn run_apply_from_plan_with_observer_factory(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked_owned(
+    color_mode: crate::output_style::ColorMode,
     inspected_plan: ProviderBoundPlanFile,
     provider_context: &ProviderContext,
     auto_approve: bool,
@@ -3408,7 +3499,7 @@ async fn run_apply_from_plan_locked_owned(
                      The infrastructure may have drifted.",
                     plan_serial, state.serial
                 )
-                .yellow()
+                .yellow(color_mode)
             );
         }
     }
@@ -3498,9 +3589,13 @@ async fn run_apply_from_plan_locked_owned(
             let wiring = validated_plan.context();
 
             // Drift detection: re-read actual infrastructure state and compare against planned states
-            println!("{}", "Checking for infrastructure drift...".cyan());
+            println!(
+                "{}",
+                "Checking for infrastructure drift...".cyan(color_mode)
+            );
             let historical_addresses = validated_plan.historical_resource_addresses();
             let drift_check = detect_drift(
+                color_mode,
                 validated_plan.sorted_resources(),
                 validated_plan.current_states(),
                 &historical_addresses,
@@ -3514,23 +3609,29 @@ async fn run_apply_from_plan_locked_owned(
 
             if let Some(drift_messages) = drift_check.drift_messages() {
                 println!();
-                println!("{}", "Error: Infrastructure drift detected!".red().bold());
                 println!(
                     "{}",
-                    "The following resources have changed since the plan was created:".red()
+                    "Error: Infrastructure drift detected!"
+                        .red(color_mode)
+                        .bold(color_mode)
+                );
+                println!(
+                    "{}",
+                    "The following resources have changed since the plan was created:"
+                        .red(color_mode)
                 );
                 println!();
                 for msg in drift_messages {
                     println!("{}", msg);
                 }
                 println!();
-                println!("{}", drift_replan_hint(apply_target).yellow());
+                println!("{}", drift_replan_hint(apply_target).yellow(color_mode));
                 return Err(AppError::Config(
                     "Apply aborted due to infrastructure drift.".to_string(),
                 ));
             }
 
-            println!("  {} No drift detected.", "✓".green());
+            println!("  {} No drift detected.", "✓".green(color_mode));
 
             let (mut actual_states, mut verified_planned_states) =
                 drift_check.into_verified_states();
@@ -3567,7 +3668,7 @@ async fn run_apply_from_plan_locked_owned(
                 plan_data_sources,
                 rehydrated_plan_file.data_source_values(),
             )?;
-            render_plan_errors_and_abort(plan, project_dir)?;
+            render_plan_errors_and_abort(color_mode, plan, project_dir)?;
             let executable_data_source_values = data_source_values
                 .clone()
                 .into_executable()
@@ -3619,7 +3720,7 @@ async fn run_apply_from_plan_locked_owned(
                 finalize_saved_module_constraints(plan_compositions, &terminal_bindings)?;
                 let directive_change_count = directive_changes.len();
                 if directive_change_count == 0 {
-                    println!("{}", "No changes needed.".green());
+                    println!("{}", "No changes needed.".green(color_mode));
                     return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
                 }
 
@@ -3632,6 +3733,7 @@ async fn run_apply_from_plan_locked_owned(
                     rehydrated_plan_file.reloaded_plan_file(),
                 );
                 print_plan(
+                    color_mode,
                     plan,
                     &summary,
                     DetailLevel::Full,
@@ -3643,7 +3745,7 @@ async fn run_apply_from_plan_locked_owned(
                     &provider,
                 )?;
                 let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-                if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+                if confirm_apply(wiring.runtime(), stdin, cancel.clone(), auto_approve).await?
                     == ApplyConfirmation::Cancelled
                 {
                     return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
@@ -3654,7 +3756,7 @@ async fn run_apply_from_plan_locked_owned(
                         "Persisting {} resource directive change(s) to state.",
                         directive_change_count
                     )
-                    .cyan()
+                    .cyan(color_mode)
                 );
                 let mut state = state_file.take().unwrap_or_default();
                 apply_persisted_directive_changes(
@@ -3677,6 +3779,7 @@ async fn run_apply_from_plan_locked_owned(
             let summary =
                 PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());
             print_plan(
+                color_mode,
                 plan,
                 &summary,
                 DetailLevel::Full,
@@ -3693,10 +3796,10 @@ async fn run_apply_from_plan_locked_owned(
                 wiring.schemas(),
                 &provider,
             )?;
-            moved_hints.eprint();
+            moved_hints.eprint(color_mode);
 
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-            if confirm_apply(stdin, cancel.clone(), auto_approve).await?
+            if confirm_apply(wiring.runtime(), stdin, cancel.clone(), auto_approve).await?
                 == ApplyConfirmation::Cancelled
             {
                 return Ok(SavedPlanApplyAfterHeartbeat::Done(None));
@@ -3710,6 +3813,7 @@ async fn run_apply_from_plan_locked_owned(
             let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
             if !rehydrated_plan_file.upstream_sources().is_empty() {
                 verify_upstream_snapshot(
+                    wiring.runtime(),
                     rehydrated_plan_file.upstream_sources(),
                     &upstream_snapshot,
                     apply_target,
@@ -3760,7 +3864,10 @@ async fn run_apply_from_plan_locked_owned(
             );
 
             let apply_phase_started = Instant::now();
-            println!("{}", "Applying changes...".cyan().bold());
+            println!(
+                "{}",
+                "Applying changes...".cyan(color_mode).bold(color_mode)
+            );
             println!();
 
             // Build unresolved resource map for re-resolution at apply time from
@@ -3774,7 +3881,7 @@ async fn run_apply_from_plan_locked_owned(
             // Same object in both positions: `ProviderRouter` is both the
             // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
             // with the plan-time normalizer (carina#3060).
-            let observer = observer_factory(plan, project_dir);
+            let observer = observer_factory(color_mode, plan, project_dir);
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),
@@ -3792,7 +3899,7 @@ async fn run_apply_from_plan_locked_owned(
             // Remove, Move, and keyed-list release need no provider call.
             // Report them now; every checkpoint's state writeback materializes
             // them from the plan.
-            let state_only_success_count = execute_state_only_effects(plan);
+            let state_only_success_count = execute_state_only_effects(color_mode, plan);
             let outcome = execute_rehydrated_saved_plan(
                 &rehydrated_plan_file,
                 provider.as_ref(),
@@ -3820,6 +3927,7 @@ async fn run_apply_from_plan_locked_owned(
 
             // Execute import effects: read imported resources from the provider
             execute_import_effects(
+                color_mode,
                 plan,
                 provider.as_ref(),
                 &mut result,
@@ -3866,6 +3974,7 @@ async fn run_apply_from_plan_locked_owned(
                     directive_change_count,
                 } = *context;
                 persist_directives_only(
+                    color_mode,
                     backend.as_ref(),
                     lock.as_ref(),
                     state,
@@ -3888,6 +3997,7 @@ async fn run_apply_from_plan_locked_owned(
                 let skipped_exports = finalize_after_execute(
                     |persistence| {
                         finalize_apply(
+                            color_mode,
                             FinalizeApplyInput {
                                 result: &result,
                                 state_base,
@@ -3916,6 +4026,7 @@ async fn run_apply_from_plan_locked_owned(
                 .await?;
 
                 finish_apply(
+                    color_mode,
                     &result,
                     skipped_exports,
                     resources_finished.duration_since(apply_phase_started),
@@ -3934,7 +4045,7 @@ async fn run_apply_from_plan_locked_owned(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     inspected_plan: InspectedPlanFile,
     provider_context: &ProviderContext,
     auto_approve: bool,
@@ -3946,8 +4057,9 @@ async fn run_apply_from_plan_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let color_mode = runtime.color_mode();
     let inspected_plan = match ProviderLoad::load(
-        user_dirs,
+        runtime,
         inspected_plan.provider_configs().as_provider_configs(),
         apply_target.source_dir(),
     )
@@ -3958,6 +4070,7 @@ async fn run_apply_from_plan_locked(
         Ok(inspected_plan) => inspected_plan,
         Err(error) => {
             return finish_lock_command(
+                color_mode,
                 backend.as_ref(),
                 LockCommandOutcome::Kept {
                     result: Err(error),
@@ -3969,6 +4082,7 @@ async fn run_apply_from_plan_locked(
         }
     };
     let outcome = run_apply_from_plan_locked_owned(
+        color_mode,
         inspected_plan,
         provider_context,
         auto_approve,
@@ -3981,7 +4095,7 @@ async fn run_apply_from_plan_locked(
         accept_legacy_name_overrides,
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4011,6 +4125,7 @@ pub(crate) fn apply_exit_code_for_counts(
 }
 
 fn finish_apply<S>(
+    color_mode: crate::output_style::ColorMode,
     result: &ExecutionResult<S>,
     skipped_exports: SkippedExports,
     elapsed: Duration,
@@ -4024,8 +4139,8 @@ fn finish_apply<S>(
         println!(
             "{}",
             format!("Apply complete! {} changes applied.", result.success_count)
-                .green()
-                .bold()
+                .green(color_mode)
+                .bold(color_mode)
         );
         return Ok(Some(elapsed));
     }
@@ -4071,6 +4186,7 @@ fn finish_apply<S>(
 /// Prompt the user to confirm an apply. Shared between the resource-change and
 /// export-only paths so both use identical wording and behavior.
 pub(crate) async fn confirm_apply<R>(
+    runtime: &crate::runtime::CommandRuntime,
     reader: R,
     cancel: ShutdownToken,
     auto_approve: bool,
@@ -4078,22 +4194,26 @@ pub(crate) async fn confirm_apply<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    let color_mode = runtime.color_mode();
     if auto_approve {
         return Ok(ApplyConfirmation::Confirmed);
     }
 
     println!(
         "{}",
-        "Do you want to perform these actions?".yellow().bold()
+        "Do you want to perform these actions?"
+            .yellow(color_mode)
+            .bold(color_mode)
     );
     println!(
         "  {}",
-        "Carina will perform the actions described above. Type 'yes' to confirm.".yellow()
+        "Carina will perform the actions described above. Type 'yes' to confirm."
+            .yellow(color_mode)
     );
     // The cursor is hidden command-wide (#3158); reveal it for the prompt
     // so the user does not type blind, and re-hide on scope exit.
     let input = {
-        let _reveal = CursorReveal::new();
+        let _reveal = CursorReveal::new(runtime.cursor());
         print!("\n  Enter a value: ");
         std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
@@ -4104,7 +4224,7 @@ where
 
     if input.trim() != "yes" {
         println!();
-        println!("{}", "Apply cancelled.".yellow());
+        println!("{}", "Apply cancelled.".yellow(color_mode));
         Ok(ApplyConfirmation::Cancelled)
     } else {
         println!();

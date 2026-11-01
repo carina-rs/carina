@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::output_style::Colorize;
 use carina_core::effect::{Effect, EffectInstanceKey};
 use carina_core::executor::ProgressInfo;
 use carina_core::resource::{ModuleSource, ResourceId};
-use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::cursor::progress_mode;
@@ -341,17 +341,17 @@ impl NonFailureOutcome {
         }
     }
 
-    fn rendered(&self) -> String {
+    fn rendered(&self, color_mode: crate::output_style::ColorMode) -> String {
         let glyph = match self.kind {
-            NonFailureKind::Success => "✓".green(),
-            NonFailureKind::Partial => "⚠".yellow(),
-            NonFailureKind::Skipped => "⊘".yellow(),
-            NonFailureKind::Retrying => "↻".yellow(),
-            NonFailureKind::Unknown => "?".yellow(),
+            NonFailureKind::Success => "✓".green(color_mode),
+            NonFailureKind::Partial => "⚠".yellow(color_mode),
+            NonFailureKind::Skipped => "⊘".yellow(color_mode),
+            NonFailureKind::Retrying => "↻".yellow(color_mode),
+            NonFailureKind::Unknown => "?".yellow(color_mode),
         };
         let mut rendered = format!("{glyph} {}", self.summary_line);
         for detail in &self.detail_lines {
-            rendered.push_str(&format!("\n      {} {detail}", "→".yellow()));
+            rendered.push_str(&format!("\n      {} {detail}", "→".yellow(color_mode)));
         }
         rendered
     }
@@ -379,10 +379,14 @@ impl FailedOutcome {
         Self::new(summary_line, std::iter::empty::<String>())
     }
 
-    fn rendered(&self) -> String {
-        let mut rendered = format!("{} {}", "✗".red(), self.summary_line);
+    fn rendered(&self, color_mode: crate::output_style::ColorMode) -> String {
+        let mut rendered = format!("{} {}", "✗".red(color_mode), self.summary_line);
         for detail in &self.detail_lines {
-            rendered.push_str(&format!("\n      {} {}", "→".red(), detail.red()));
+            rendered.push_str(&format!(
+                "\n      {} {}",
+                "→".red(color_mode),
+                detail.red(color_mode)
+            ));
         }
         rendered
     }
@@ -402,6 +406,7 @@ enum OutputRoute {
 /// stdout while failures remain on stderr; commands whose stdout is
 /// machine-readable keep every progress line on stderr.
 pub(crate) struct ProgressBackend<K> {
+    color_mode: crate::output_style::ColorMode,
     inner: ProgressBackendInner<K>,
 }
 
@@ -410,54 +415,64 @@ where
     K: Eq + Hash + Send + 'static,
 {
     /// Build the command progress backend from the stream indicatif renders to.
-    pub(crate) fn new(sink: ProgressSink) -> Self {
+    pub(crate) fn new(color_mode: crate::output_style::ColorMode, sink: ProgressSink) -> Self {
         if progress_mode().is_tty() {
             match sink {
                 ProgressSink::Human => {
-                    Self::with_tty(MultiProgress::new(), io::stdout(), io::stderr())
+                    Self::with_tty(color_mode, MultiProgress::new(), io::stdout(), io::stderr())
                 }
                 ProgressSink::MachineStdout => {
-                    Self::with_tty(MultiProgress::new(), io::stderr(), io::stderr())
+                    Self::with_tty(color_mode, MultiProgress::new(), io::stderr(), io::stderr())
                 }
                 #[cfg(test)]
                 ProgressSink::Recorded(_) => {
-                    Self::with_tty(MultiProgress::new(), io::sink(), io::sink())
+                    Self::with_tty(color_mode, MultiProgress::new(), io::sink(), io::sink())
                 }
             }
         } else {
             match sink {
                 ProgressSink::Human => Self::with_plain_writers(
+                    color_mode,
                     io::stdout(),
                     Some(io::stderr()),
                     PLAIN_HEARTBEAT_INTERVAL,
                 ),
                 ProgressSink::MachineStdout => Self::with_plain_writers(
+                    color_mode,
                     io::stderr(),
                     None::<io::Stderr>,
                     PLAIN_HEARTBEAT_INTERVAL,
                 ),
                 #[cfg(test)]
-                ProgressSink::Recorded(_) => {
-                    Self::with_plain_writers(io::sink(), None::<io::Sink>, PLAIN_HEARTBEAT_INTERVAL)
-                }
+                ProgressSink::Recorded(_) => Self::with_plain_writers(
+                    color_mode,
+                    io::sink(),
+                    None::<io::Sink>,
+                    PLAIN_HEARTBEAT_INTERVAL,
+                ),
             }
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn plain(writer: impl Write + Send + 'static) -> Self {
-        Self::plain_with_interval(writer, PLAIN_HEARTBEAT_INTERVAL)
+    pub(crate) fn plain(
+        color_mode: crate::output_style::ColorMode,
+        writer: impl Write + Send + 'static,
+    ) -> Self {
+        Self::plain_with_interval(color_mode, writer, PLAIN_HEARTBEAT_INTERVAL)
     }
 
     #[cfg(test)]
     pub(crate) fn plain_with_interval(
+        color_mode: crate::output_style::ColorMode,
         writer: impl Write + Send + 'static,
         interval: Duration,
     ) -> Self {
-        Self::with_plain_writers(writer, None::<io::Sink>, interval)
+        Self::with_plain_writers(color_mode, writer, None::<io::Sink>, interval)
     }
 
     fn with_plain_writers(
+        color_mode: crate::output_style::ColorMode,
         writer: impl Write + Send + 'static,
         failure_writer: Option<impl Write + Send + 'static>,
         interval: Duration,
@@ -474,6 +489,7 @@ where
         });
         let heartbeat = start_plain_heartbeat(Arc::clone(&state));
         Self {
+            color_mode,
             inner: ProgressBackendInner::Plain {
                 _heartbeat: heartbeat,
                 state,
@@ -487,11 +503,13 @@ where
     K: Eq + Hash,
 {
     fn with_tty(
+        color_mode: crate::output_style::ColorMode,
         multi: MultiProgress,
         separator_writer: impl Write + Send + 'static,
         bar_region_writer: impl Write + Send + 'static,
     ) -> Self {
         Self {
+            color_mode,
             inner: ProgressBackendInner::Tty {
                 multi,
                 bars: Mutex::new(TtyBars::default()),
@@ -503,11 +521,13 @@ where
 
     #[cfg(test)]
     pub(crate) fn tty(
+        color_mode: crate::output_style::ColorMode,
         draw_target: indicatif::ProgressDrawTarget,
         separator_writer: impl Write + Send + 'static,
         bar_region_writer: impl Write + Send + 'static,
     ) -> Self {
         Self::with_tty(
+            color_mode,
             MultiProgress::with_draw_target(draw_target),
             separator_writer,
             bar_region_writer,
@@ -654,12 +674,12 @@ where
 
     /// Emit a typed non-failure outcome that is not tied to a spinner.
     pub(crate) fn outcome_line(&self, outcome: NonFailureOutcome) {
-        self.emit_rendered_line(&outcome.rendered(), OutputRoute::Ordinary);
+        self.emit_rendered_line(&outcome.rendered(self.color_mode), OutputRoute::Ordinary);
     }
 
     /// Emit a failed outcome that is not tied to a spinner.
     pub(crate) fn failed_line(&self, outcome: FailedOutcome) {
-        self.emit_rendered_line(&outcome.rendered(), OutputRoute::Failure);
+        self.emit_rendered_line(&outcome.rendered(self.color_mode), OutputRoute::Failure);
     }
 
     fn emit_rendered_line(&self, line: &str, route: OutputRoute) {
@@ -767,12 +787,16 @@ impl<S> ProgressBackend<EffectProgressKey<S>> {
 
     /// Finish an observer effect with a non-failure outcome.
     pub(super) fn finish(&self, key: EffectProgressKey<S>, outcome: NonFailureOutcome) {
-        self.finish_rendered(key, outcome.rendered(), OutputRoute::Ordinary);
+        self.finish_rendered(
+            key,
+            outcome.rendered(self.color_mode),
+            OutputRoute::Ordinary,
+        );
     }
 
     /// Finish an observer effect with a failure routed to stderr.
     pub(super) fn finish_failed(&self, key: EffectProgressKey<S>, outcome: FailedOutcome) {
-        self.finish_rendered(key, outcome.rendered(), OutputRoute::Failure);
+        self.finish_rendered(key, outcome.rendered(self.color_mode), OutputRoute::Failure);
     }
 }
 
@@ -807,14 +831,20 @@ where
 {
     pub(crate) fn finish(mut self, outcome: NonFailureOutcome) {
         let key = self.key.take().expect("progress key already taken");
-        self.backend
-            .finish_rendered(key, outcome.rendered(), OutputRoute::Ordinary);
+        self.backend.finish_rendered(
+            key,
+            outcome.rendered(self.backend.color_mode),
+            OutputRoute::Ordinary,
+        );
     }
 
     pub(crate) fn finish_failed(mut self, outcome: FailedOutcome) {
         let key = self.key.take().expect("progress key already taken");
-        self.backend
-            .finish_rendered(key, outcome.rendered(), OutputRoute::Failure);
+        self.backend.finish_rendered(
+            key,
+            outcome.rendered(self.backend.color_mode),
+            OutputRoute::Failure,
+        );
     }
 }
 
@@ -843,7 +873,8 @@ pub(crate) struct RefreshPhase<'backend> {
 impl<'backend> RefreshPhase<'backend> {
     /// Print the refresh header and open a structurally owned refresh phase.
     pub(crate) fn start(backend: &'backend ProgressBackend<ResourceId>) -> Self {
-        backend.open_refresh_phase(format!("{}", "Refreshing state...".cyan()));
+        let color_mode = backend.color_mode;
+        backend.open_refresh_phase(format!("{}", "Refreshing state...".cyan(color_mode)));
         Self {
             backend,
             closed: false,
@@ -927,7 +958,8 @@ impl RefreshProgress<'_, '_> {
     /// Finish the spinner with a success checkmark and elapsed time.
     pub fn finish(self) {
         let elapsed = self.start.elapsed();
-        let timing = format!("took {}", format_duration(elapsed)).dimmed();
+        let color_mode = self.progress.backend.color_mode;
+        let timing = format!("took {}", format_duration(elapsed)).dimmed(color_mode);
         let outcome = NonFailureOutcome::success(format!("{} {}", self.label, timing));
         self.progress.finish(outcome);
     }
@@ -1040,6 +1072,7 @@ mod tests {
     fn tty_backend_emits_finished_and_untied_lines_once() {
         let terminal = RecordingTerm::default();
         let backend: ProgressBackend<usize> = ProgressBackend::tty(
+            crate::output_style::ColorMode::Plain,
             ProgressDrawTarget::term_like(Box::new(terminal.clone())),
             io::sink(),
             io::sink(),
@@ -1070,6 +1103,7 @@ mod tests {
         let stdout = SharedWriter::default();
         let stderr = SharedWriter::default();
         let backend: ProgressBackend<usize> = ProgressBackend::tty(
+            crate::output_style::ColorMode::Plain,
             ProgressDrawTarget::term_like(Box::new(terminal)),
             stdout.clone(),
             stderr.clone(),
@@ -1087,8 +1121,12 @@ mod tests {
     fn tty_backend_skips_bar_terminator_without_rendered_progress() {
         let stdout = SharedWriter::default();
         let stderr = SharedWriter::default();
-        let backend: ProgressBackend<usize> =
-            ProgressBackend::tty(ProgressDrawTarget::hidden(), stdout.clone(), stderr.clone());
+        let backend: ProgressBackend<usize> = ProgressBackend::tty(
+            crate::output_style::ColorMode::Plain,
+            ProgressDrawTarget::hidden(),
+            stdout.clone(),
+            stderr.clone(),
+        );
 
         backend.close_refresh_phase();
 
@@ -1100,8 +1138,12 @@ mod tests {
     fn tty_backend_skips_bar_terminator_after_external_line() {
         let stdout = SharedWriter::default();
         let stderr = SharedWriter::default();
-        let backend: ProgressBackend<usize> =
-            ProgressBackend::tty(ProgressDrawTarget::hidden(), stdout.clone(), stderr.clone());
+        let backend: ProgressBackend<usize> = ProgressBackend::tty(
+            crate::output_style::ColorMode::Plain,
+            ProgressDrawTarget::hidden(),
+            stdout.clone(),
+            stderr.clone(),
+        );
 
         let progress = backend.start_indexed(1, "running");
         progress.finish(NonFailureOutcome::success("finished"));
@@ -1115,7 +1157,10 @@ mod tests {
     #[test]
     fn refresh_phase_close_is_idempotent_within_the_phase() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::<ResourceId>::plain(output.clone());
+        let backend = ProgressBackend::<ResourceId>::plain(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+        );
 
         let mut phase = RefreshPhase::start(&backend);
         phase.close();
@@ -1131,7 +1176,10 @@ mod tests {
     #[test]
     fn refresh_progress_requires_a_live_phase() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::<ResourceId>::plain(output.clone());
+        let backend = ProgressBackend::<ResourceId>::plain(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+        );
         let id = ResourceId::with_identity("test.Resource", "example");
 
         {
@@ -1148,7 +1196,10 @@ mod tests {
     #[test]
     fn dropped_refresh_progress_is_abandoned_without_a_heartbeat() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::<ResourceId>::plain(output.clone());
+        let backend = ProgressBackend::<ResourceId>::plain(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+        );
         let id = ResourceId::with_identity("test.Resource", "abandoned");
         let phase = RefreshPhase::start(&backend);
         let progress = phase.begin(&id);
@@ -1165,7 +1216,7 @@ mod tests {
     #[test]
     fn dropped_indexed_progress_guard_abandons_without_output() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::plain(output.clone());
+        let backend = ProgressBackend::plain(crate::output_style::ColorMode::Plain, output.clone());
 
         let progress = backend.start_indexed(7, "Delete r.abandoned");
         assert_eq!(backend.active_count(), 1);
@@ -1179,7 +1230,10 @@ mod tests {
     #[test]
     fn each_refresh_phase_on_one_backend_closes_once() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::<ResourceId>::plain(output.clone());
+        let backend = ProgressBackend::<ResourceId>::plain(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+        );
 
         drop(RefreshPhase::start(&backend));
         drop(RefreshPhase::start(&backend));
@@ -1193,7 +1247,7 @@ mod tests {
     #[test]
     fn plain_backend_emits_each_finished_or_untied_event_once() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::plain(output.clone());
+        let backend = ProgressBackend::plain(crate::output_style::ColorMode::Plain, output.clone());
 
         let progress = backend.start_indexed(1, "started but not emitted");
         progress.finish(NonFailureOutcome::success("finished after start"));
@@ -1213,7 +1267,7 @@ mod tests {
     #[test]
     fn plain_heartbeats_emit_in_start_order_and_stop_after_finish() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::plain(output.clone());
+        let backend = ProgressBackend::plain(crate::output_style::ColorMode::Plain, output.clone());
 
         let first = backend.start_indexed(1, "Create r.a");
         let second = backend.start_indexed(2, "Create r.b");
@@ -1254,7 +1308,11 @@ mod tests {
     fn plain_heartbeat_uses_each_entrys_own_interval() {
         let output = SharedWriter::default();
         let interval = Duration::from_secs(30);
-        let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
+        let backend = ProgressBackend::plain_with_interval(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+            interval,
+        );
         let _progress = backend.start_indexed(1, "Create r.short");
         let ProgressBackendInner::Plain { state, .. } = &backend.inner else {
             panic!("expected plain progress backend");
@@ -1286,7 +1344,11 @@ mod tests {
     fn self_reporting_entry_waits_two_intervals_for_generic_fallback() {
         let output = SharedWriter::default();
         let interval = Duration::from_secs(30);
-        let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
+        let backend = ProgressBackend::plain_with_interval(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+            interval,
+        );
         let _progress = backend.start_indexed(1, "Wait certificate");
         let previous_poll = backend.plain_last_reported(&1).unwrap();
         backend.in_flight_line_at(&1, "~ certificate: still pending", previous_poll);
@@ -1313,7 +1375,11 @@ mod tests {
     fn poll_line_pushes_back_next_generic_heartbeat() {
         let output = SharedWriter::default();
         let interval = Duration::from_secs(30);
-        let backend = ProgressBackend::plain_with_interval(output.clone(), interval);
+        let backend = ProgressBackend::plain_with_interval(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+            interval,
+        );
         let _progress = backend.start_indexed(1, "Wait certificate");
         let started = backend.plain_last_reported(&1).unwrap();
 
@@ -1337,8 +1403,11 @@ mod tests {
     #[test]
     fn plain_heartbeat_thread_emits_before_outcome_without_ansi() {
         let output = SharedWriter::default();
-        let backend =
-            ProgressBackend::plain_with_interval(output.clone(), Duration::from_millis(10));
+        let backend = ProgressBackend::plain_with_interval(
+            crate::output_style::ColorMode::Plain,
+            output.clone(),
+            Duration::from_millis(10),
+        );
 
         let progress = backend.start_indexed(1, "Create r.slow");
         wait_for_output_contains(&output.0, "Still running: Create r.slow");
@@ -1363,6 +1432,7 @@ mod tests {
         let ordinary = SharedWriter::default();
         let failures = SharedWriter::default();
         let backend = ProgressBackend::with_plain_writers(
+            crate::output_style::ColorMode::Plain,
             ordinary.clone(),
             Some(failures.clone()),
             PLAIN_HEARTBEAT_INTERVAL,
@@ -1391,7 +1461,7 @@ mod tests {
     #[test]
     fn plain_backend_does_not_rewrite_line_contents() {
         let output = SharedWriter::default();
-        let backend = ProgressBackend::plain(output.clone());
+        let backend = ProgressBackend::plain(crate::output_style::ColorMode::Plain, output.clone());
 
         let progress = backend.start_indexed(1, "running");
         progress.finish(NonFailureOutcome::success("\x1b[31mfinished\x1b[0m"));

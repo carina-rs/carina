@@ -11,6 +11,22 @@ use carina_state::BackendError;
 
 use crate::commands::shared::state_writeback::PersistedDirectiveChange;
 
+/// Filesystem failures when a command resolves its invocation inputs.
+#[derive(Debug, thiserror::Error)]
+pub enum CommandInputError {
+    #[error("Failed to resolve the command startup directory")]
+    StartupDirectory {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Invalid mock state storage path {}", path.display())]
+    MockStorage {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Final endpoint/kind summary retaining typed causes for programmatic use.
 /// Full cause chains have already been streamed through the failure sink.
 #[derive(Debug, Clone)]
@@ -903,6 +919,9 @@ impl std::error::Error for AwsCredentialStartupError {}
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error(transparent)]
+    CommandInput(#[from] std::sync::Arc<CommandInputError>),
+
     /// Provider installation, egress consent, or initialization failed.
     #[error(transparent)]
     Init(Box<crate::commands::init::InitError>),

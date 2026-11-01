@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::output_style::Colorize;
 use aws_config::BehaviorVersion;
 use aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyError;
 use aws_sdk_iam::types::PolicyEvaluationDecisionType;
@@ -9,7 +10,6 @@ use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
-use colored::Colorize;
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,15 +401,21 @@ pub(crate) fn format_warnings(result: &IamPreflightResult) -> Option<String> {
     }
 }
 
-pub(crate) fn emit_warnings(result: &IamPreflightResult) {
+pub(crate) fn emit_warnings(
+    color_mode: crate::output_style::ColorMode,
+    result: &IamPreflightResult,
+) {
     if let Some(warning) = format_warnings(result) {
-        eprintln!("{}", warning.yellow());
+        eprintln!("{}", warning.yellow(color_mode));
     }
 }
 
-pub(crate) fn print_warnings(result: &IamPreflightResult) {
+pub(crate) fn print_warnings(
+    color_mode: crate::output_style::ColorMode,
+    result: &IamPreflightResult,
+) {
     if let Some(warning) = format_warnings(result) {
-        println!("{}", warning.yellow());
+        println!("{}", warning.yellow(color_mode));
     }
 }
 

@@ -1,24 +1,22 @@
 use carina_core::parser::ProviderContext;
 use carina_core::shutdown::ShutdownToken;
+use carina_provider_mock::{MockScope, SelectedDelay};
 use carina_state::{ResourceState, StateFile};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::commands::shared::cancellation_test_support::{
-    CancellationFixtureBase, LockLossBackend, RefreshDrainBarrier, ScopedEnv,
-    install_refresh_drain_barrier,
+    CancellationFixtureBase, LockLossBackend, RefreshDrainBarrier, install_refresh_drain_barrier,
 };
 
 pub(super) struct DestroyCancellationFixture {
     base: CancellationFixtureBase,
     provider_context: ProviderContext,
-    success_cancel_hook_installed: bool,
     ready_result_barrier: Option<crate::commands::destroy::DestroyReadyResultBarrier>,
     refresh_drain_barrier: Option<RefreshDrainBarrier>,
     provider_ready_path: Option<std::path::PathBuf>,
     provider_read_ready_path: Option<std::path::PathBuf>,
     provider_read_outcome_path: Option<std::path::PathBuf>,
-    _provider_env: Vec<ScopedEnv>,
 }
 
 impl DestroyCancellationFixture {
@@ -26,16 +24,17 @@ impl DestroyCancellationFixture {
         Self {
             base: CancellationFixtureBase::new(),
             provider_context: ProviderContext::default(),
-            success_cancel_hook_installed: false,
             ready_result_barrier: None,
             refresh_drain_barrier: None,
             provider_ready_path: None,
             provider_read_ready_path: None,
             provider_read_outcome_path: None,
-            _provider_env: Vec::new(),
         }
     }
 
+    pub(super) fn runtime(&self) -> &crate::runtime::CommandRuntime {
+        self.base.runtime()
+    }
     pub(super) fn with_existing_resources<const N: usize>(self, names: [&str; N]) -> Self {
         let state_path = self.base.state_path().display();
         let mut crn = format!(
@@ -107,38 +106,36 @@ impl DestroyCancellationFixture {
     /// With parallelism > 1, multiple completions can happen between the threshold
     /// being reached and the next dispatch site observing cancel; the test must
     /// therefore use `NonZeroUsize::new(1).unwrap()` parallelism to be deterministic.
-    pub(super) fn cancel_after_successes(mut self, count: usize) -> Self {
+    pub(super) fn cancel_after_successes(self, count: usize) -> Self {
         crate::commands::destroy::set_destroy_success_cancel_after(
+            self.runtime(),
             count,
             self.base.shutdown_trigger(),
             self.base.shutdown_token(),
         );
-        self.success_cancel_hook_installed = true;
         self
     }
 
     pub(super) fn with_blocked_delete(mut self, name: &str) -> Self {
         let ready_path = self.base.readiness_path("mock-delete-ready");
-        self._provider_env = vec![
-            ScopedEnv::set(
-                "CARINA_MOCK_DELETE_DELAY_MS_FOR",
-                format!("test.resource.{name}"),
-            ),
-            ScopedEnv::set("CARINA_MOCK_DELETE_DELAY_MS", "60000"),
-            ScopedEnv::set("CARINA_MOCK_DELETE_READY_PATH", &ready_path),
-        ];
+        self.base.update_mock(|behavior, _| {
+            behavior.delete_delay = Some(SelectedDelay {
+                address: format!("test.resource.{name}"),
+                duration: Duration::from_secs(60),
+            });
+            behavior.observations.delete_ready = Some(ready_path.clone());
+        });
         self.provider_ready_path = Some(ready_path);
         self
     }
 
     pub(super) fn with_delayed_delete(mut self, name: &str, delay: Duration) -> Self {
-        self._provider_env = vec![
-            ScopedEnv::set(
-                "CARINA_MOCK_DELETE_DELAY_MS_FOR",
-                format!("test.resource.{name}"),
-            ),
-            ScopedEnv::set("CARINA_MOCK_DELETE_DELAY_MS", delay.as_millis().to_string()),
-        ];
+        self.base.update_mock(|behavior, _| {
+            behavior.delete_delay = Some(SelectedDelay {
+                address: format!("test.resource.{name}"),
+                duration: delay,
+            });
+        });
         self
     }
 
@@ -156,24 +153,25 @@ impl DestroyCancellationFixture {
                 .expect("serialize mock provider state"),
         )
         .expect("write mock provider state");
-        self._provider_env = vec![
-            ScopedEnv::set("CARINA_MOCK_STATE_FILE", &provider_state_path),
-            ScopedEnv::set(
-                "CARINA_MOCK_READ_DELAY_MS_FOR",
-                format!("test.resource.{name}"),
-            ),
-            ScopedEnv::set("CARINA_MOCK_READ_DELAY_MS", "60000"),
-            ScopedEnv::set("CARINA_MOCK_READ_READY_PATH", &ready_path),
-            ScopedEnv::set("CARINA_MOCK_READ_OUTCOME_PATH", &outcome_path),
-        ];
+        self.base.update_mock(|behavior, scope| {
+            behavior.read_delay = Some(SelectedDelay {
+                address: format!("test.resource.{name}"),
+                duration: Duration::from_secs(60),
+            });
+            behavior.observations.read_ready = Some(ready_path.clone());
+            behavior.observations.read_outcome = Some(outcome_path.clone());
+            *scope = MockScope::file(provider_state_path).expect("absolute fixture state path");
+        });
         self.provider_read_ready_path = Some(ready_path);
         self.provider_read_outcome_path = Some(outcome_path);
         self
     }
 
     pub(super) fn with_refresh_drain_barrier(mut self) -> Self {
-        self.refresh_drain_barrier =
-            Some(install_refresh_drain_barrier(self.base.shutdown_token()));
+        self.refresh_drain_barrier = Some(install_refresh_drain_barrier(
+            self.runtime(),
+            self.base.shutdown_token(),
+        ));
         self
     }
 
@@ -245,6 +243,7 @@ impl DestroyCancellationFixture {
     pub(super) fn with_delete_result_barrier(mut self) -> Self {
         self.ready_result_barrier = Some(
             crate::commands::destroy::install_destroy_ready_result_barrier(
+                self.runtime(),
                 self.base.shutdown_token(),
             ),
         );
@@ -293,16 +292,5 @@ impl DestroyCancellationFixture {
 
     pub(super) fn lock_loss_backend_handle(&self) -> Arc<LockLossBackend> {
         self.base.lock_loss_backend_handle()
-    }
-}
-
-impl Drop for DestroyCancellationFixture {
-    fn drop(&mut self) {
-        if self.success_cancel_hook_installed {
-            crate::commands::destroy::clear_destroy_success_cancel_after();
-        }
-        if self.ready_result_barrier.is_some() {
-            crate::commands::destroy::clear_destroy_ready_result_barrier();
-        }
     }
 }

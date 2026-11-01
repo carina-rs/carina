@@ -62,7 +62,12 @@ fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
         unresolved_attributes: IndexMap::new(),
         binding: None,
     }];
-    let providers = ValidatedConfig::for_test((), Vec::<LoadedProviderFactory>::new(), &configs);
+    let providers = ValidatedConfig::for_test(
+        &carina_cli::test_support::TestCommandRuntime::new(),
+        (),
+        Vec::<LoadedProviderFactory>::new(),
+        &configs,
+    );
     contents
         .record_for_test(&providers, Vec::new())
         .expect("mock plan provider evidence must be valid")

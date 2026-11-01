@@ -41,6 +41,62 @@ fn comparison_provider_for_resources(
 }
 
 #[test]
+fn non_mock_validation_does_not_resolve_invalid_mock_storage() {
+    use crate::error::CommandInputError;
+    use crate::runtime::{BuiltinMockInputs, CommandInputs, CommandRuntime, InvocationHooks};
+    use carina_provider_mock::{MockBehavior, MockScope};
+
+    let dirs = carina_core::TestUserDirs::new();
+    let runtime = CommandRuntime::new(
+        (*dirs).clone(),
+        CommandInputs {
+            builtin_mock: BuiltinMockInputs::deferred(|| {
+                let path = Path::new("/").to_path_buf();
+                let scope = MockScope::file(path.clone())
+                    .map_err(|source| CommandInputError::MockStorage { path, source })?;
+                Ok(ConfiguredBuiltinMock::new(MockBehavior::default(), scope))
+            }),
+            trusted_local_grants: TrustedLocalGrantInputs::new(Vec::new(), None),
+            accepted_egress: Default::default(),
+            color_mode: crate::output_style::ColorMode::Plain,
+            cursor: crate::cursor::CursorState::new(),
+            hooks: InvocationHooks::default(),
+        },
+    );
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("main.crn"), "provider test {}\n").unwrap();
+    let loaded = carina_core::config_loader::load_configuration(project.path()).unwrap();
+    let providers = ProviderLoad {
+        context: WiringContext::new(
+            &runtime,
+            LoadedProviderFactory::for_test(vec![Box::new(RawEnumStateFactory)]),
+            &loaded.parsed.providers,
+        )
+        .expect("non-mock wiring must not resolve mock storage"),
+        load_errors: HashMap::new(),
+    };
+    providers
+        .validation_report(
+            &loaded.parsed,
+            project.path(),
+            false,
+            &loaded.duplicate_declarations,
+        )
+        .into_result()
+        .expect("validation with a loaded non-mock provider must succeed");
+
+    let providers: Vec<ProviderConfig> = Vec::new();
+    let error = WiringContext::new(&runtime, Vec::new(), &providers)
+        .err()
+        .expect("implicit mock selection must report the pending storage error");
+    assert!(matches!(
+        error,
+        AppError::CommandInput(ref error)
+            if matches!(error.as_ref(), CommandInputError::MockStorage { path, .. } if path == Path::new("/"))
+    ));
+}
+
+#[test]
 fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
     let project = tempfile::tempdir().unwrap();
     let source = project.path().join("main.crn");
@@ -208,7 +264,11 @@ fn non_empty_plan_errors_reject_empty_and_preserve_order() {
 
 #[test]
 fn successful_validation_report_returns_the_resolved_file_as_a_result() {
-    let providers = ProviderLoad::for_test(Vec::new(), &[]);
+    let providers = ProviderLoad::for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+    );
     let parsed = carina_core::parser::InferredFile::default();
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
     let report = providers.validation_report(&parsed, Path::new("."), true, &[]);
@@ -226,7 +286,11 @@ fn validation_failure_type_rejects_an_empty_error_vector() {
 
 #[tokio::test]
 async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
-    let context = WiringContext::new_for_test(Vec::new(), &[]);
+    let context = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+    );
     let expanded_resources = ExpandedCanonicalResources {
         resources: canonical_unresolved(Vec::new(), context.schemas()),
     };
@@ -508,6 +572,7 @@ let item = test.thing {
 
     for refresh in [true, false] {
         let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             vec![Box::new(RawEnumStateFactory)],
             provider_configs.as_provider_configs(),
         );
@@ -586,6 +651,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     let parsed = resolve_file_for_test(loaded.parsed.into_parsed());
     let provider_configs = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(RawEnumStateFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -681,6 +747,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
     let parsed = loaded.parsed.into_parsed();
     let provider_configs = resolved_provider_configs(&parsed);
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(RawEnumStateFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -795,6 +862,7 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
         .into_expanded()
         .expect("anonymous move fixture has no parser placeholders");
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(RawEnumStateFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -891,6 +959,7 @@ let first = test.thing {
         let parsed = loaded.parsed.into_parsed();
         let provider_configs = resolved_provider_configs(&parsed);
         let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             vec![Box::new(RawEnumStateFactory)],
             provider_configs.as_provider_configs(),
         );
@@ -1004,6 +1073,7 @@ let direct = awscc.ec2.Route {
         let parsed = loaded.parsed.into_parsed();
         let provider_configs = resolved_provider_configs(&parsed);
         let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             vec![Box::new(AssociationCreateOnlyFactory)],
             provider_configs.as_provider_configs(),
         );
@@ -1259,6 +1329,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
     let incomplete_load = || {
         let provider_configs = provider_configs();
         ProviderLoad::for_test_with_load_errors(
+            &crate::test_support::TestCommandRuntime::new(),
             Vec::new(),
             &provider_configs,
             HashMap::from([
@@ -1324,8 +1395,11 @@ attributes {
         &SchemaRegistry::new(),
     )
     .expect("standalone module loads");
-    let providers =
-        ProviderLoad::for_test_with_provider_phase(Vec::new(), &loaded.parsed.providers);
+    let providers = ProviderLoad::for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &loaded.parsed.providers,
+    );
 
     let error = providers
         .validate_config_pair(
@@ -1358,6 +1432,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
         default_tags: IndexMap::new(),
     };
     let providers = ProviderLoad::for_test_with_load_errors(
+        &crate::test_support::TestCommandRuntime::new(),
         Vec::new(),
         std::slice::from_ref(&provider),
         HashMap::from([("broken".to_string(), "broken provider failed".to_string())]),
@@ -1415,8 +1490,11 @@ fn plan_style_config_pair_rejects_undefined_deferred_for_iterable() {
         &SchemaRegistry::new(),
     )
     .expect("load plan fixture");
-    let providers =
-        ProviderLoad::for_test_with_provider_phase(Vec::new(), &loaded.parsed.providers);
+    let providers = ProviderLoad::for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &loaded.parsed.providers,
+    );
     let error = match providers.validate_config_pair(
         loaded.parsed,
         loaded.unresolved_parsed,
@@ -1463,8 +1541,11 @@ fn plan_style_config_pair_rejects_module_internal_undefined_deferred_for_iterabl
         &SchemaRegistry::new(),
     )
     .expect("load plan fixture");
-    let providers =
-        ProviderLoad::for_test_with_provider_phase(Vec::new(), &loaded.parsed.providers);
+    let providers = ProviderLoad::for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &loaded.parsed.providers,
+    );
     let error = match providers.validate_config_pair(
         loaded.parsed,
         loaded.unresolved_parsed,
@@ -1525,8 +1606,11 @@ fn plan_style_config_pair_reports_every_undefined_deferred_for_iterable() {
         &SchemaRegistry::new(),
     )
     .expect("load plan fixture");
-    let providers =
-        ProviderLoad::for_test_with_provider_phase(Vec::new(), &loaded.parsed.providers);
+    let providers = ProviderLoad::for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &loaded.parsed.providers,
+    );
     let error = match providers.validate_config_pair(
         loaded.parsed,
         loaded.unresolved_parsed,
@@ -1551,7 +1635,7 @@ fn plan_style_config_pair_reports_every_undefined_deferred_for_iterable() {
 
 #[test]
 fn hard_reporting_load_returns_schema_only_diagnostics() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let base = tempfile::tempdir().unwrap();
     let provider: ProviderConfig = ProviderConfig {
         name: "mock".to_string(),
@@ -1564,7 +1648,8 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
         default_tags: IndexMap::new(),
     };
     let (providers, hard_error) =
-        ProviderLoad::load_reporting(&user_dirs, &[provider.clone(), provider], base.path());
+        ProviderLoad::load_reporting(&user_dirs, &[provider.clone(), provider], base.path())
+            .expect("test mock inputs must be valid");
     assert!(
         hard_error
             .as_ref()
@@ -1582,7 +1667,7 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("mock-provider.wasm");
     let installed_path = tmp
@@ -1688,7 +1773,7 @@ async fn factory_building_parses_grants_lazily_and_threads_matching_trust() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("duplicate-provider.wasm");
     let installed_path = tmp
@@ -1768,7 +1853,7 @@ async fn duplicate_sourced_default_provider_kind_stops_before_a_second_load() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn aws_credential_load_error_maps_to_typed_startup_error() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let source_path = tmp.path().join("aws-provider.wasm");
     let installed_path = tmp
@@ -2150,7 +2235,11 @@ async fn shared_desired_pipeline_runs_host_default_tag_normalization() {
         binding: None,
     };
     let provider_configs = vec![provider_config];
-    let ctx = WiringContext::new_for_test_with_provider_phase(Vec::new(), &provider_configs);
+    let ctx = WiringContext::new_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &provider_configs,
+    );
     let mut resources = vec![Resource::with_provider(
         BUILTIN_PROVIDER_NAME,
         "test.resource",
@@ -2302,6 +2391,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
     for (attribute, value) in cases {
         let provider_configs: Vec<carina_core::parser::ExpandedProviderConfig> = Vec::new();
         let ctx = WiringContext::new_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             vec![Box::new(EnumSchemaFactory)],
             &provider_configs,
         );
@@ -2327,7 +2417,7 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
 
 #[tokio::test(flavor = "multi_thread")]
 async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let wasm_path = tmp.path().join("provider.wasm");
     std::fs::write(&wasm_path, b"fixture").unwrap();
@@ -2366,7 +2456,7 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     )
     .unwrap();
     let identity_mismatch = installed
-        .load_with(&user_dirs, &grants, |_verified| async {
+        .load_with(user_dirs.user_dirs(), &grants, |_verified| async {
             Ok::<_, carina_plugin_host::WasmProviderLoadError>(())
         })
         .await
@@ -2459,9 +2549,9 @@ fn unverified_official_factory_load_is_fatal_before_loader() {
 }
 
 async fn unverified_official_factory_load_case() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let project = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(user_dirs.trust_record_dir()).unwrap();
+    std::fs::create_dir_all(user_dirs.user_dirs().trust_record_dir()).unwrap();
     let source = "github.com/carina-rs/carina-provider-aws";
     let version = "0.1.0";
     let provider_source: ProviderSource = source.parse().unwrap();
@@ -2538,7 +2628,7 @@ async fn unverified_official_factory_load_case() {
     );
     assert!(matches!(error, AppError::UnverifiedOfficialProvider(_)));
     assert!(
-        std::fs::read_dir(user_dirs.trust_record_dir())
+        std::fs::read_dir(user_dirs.user_dirs().trust_record_dir())
             .unwrap()
             .next()
             .is_none(),
@@ -2607,7 +2697,7 @@ where
         carina_core::resource::AbsoluteBindingAddress,
     >>::Expanded: Clone,
 {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let (mut factories, _) = build_factories_from_providers(
         &user_dirs,
         provider_configs.as_provider_configs(),
@@ -2615,6 +2705,7 @@ where
     )?;
     factories.extend(LoadedProviderFactory::for_test(fixture_factories));
     let wiring = ValidatedWiring::for_test_with_provider_phase(
+        &user_dirs,
         factories,
         provider_configs.as_provider_configs(),
     );
@@ -2725,7 +2816,11 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     let normalizer = FailingNormalizer {
         state_called: Arc::clone(&state_called),
     };
-    let ctx = WiringContext::new_for_test(Vec::new(), &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+    );
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(Vec::new(), ctx.schemas()),
         None::<&StateFile>,
@@ -2920,20 +3015,27 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
     )
     .await
     .unwrap();
-    PlanPreprocessor::new(&normalizer, &WiringContext::new_for_test(Vec::new(), &[]))
-        .prepare(
-            &mut resources,
-            &resource_origins,
-            &carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]),
-            &mut current_states,
-            &mut data_source_values,
-            &mut orphans,
+    PlanPreprocessor::new(
+        &normalizer,
+        &WiringContext::new_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
             &[],
-            &mut [],
-            &[],
-        )
-        .await
-        .unwrap();
+        ),
+    )
+    .prepare(
+        &mut resources,
+        &resource_origins,
+        &carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]),
+        &mut current_states,
+        &mut data_source_values,
+        &mut orphans,
+        &[],
+        &mut [],
+        &[],
+    )
+    .await
+    .unwrap();
 
     let data_source_state = data_source_values
         .read_states()
@@ -3134,8 +3236,17 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(carina_core::provider::InitializeOutcome::unavailable()
-                    .with_provider(Box::new(MockProvider::new())))
+                Ok(
+                    carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                        Box::new(
+                            ConfiguredBuiltinMock::new(
+                                carina_provider_mock::MockBehavior::default(),
+                                carina_provider_mock::MockScope::memory(),
+                            )
+                            .create_provider(),
+                        ),
+                    ),
+                )
             })
         }
 
@@ -3169,7 +3280,11 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         }
     }
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(FailingNormalizerFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(FailingNormalizerFactory)],
+        &[],
+    );
     let config = ProviderConfig {
         name: "failing".to_string(),
         attributes: IndexMap::new(),
@@ -3255,8 +3370,17 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async move {
                 if self.lines.is_empty() {
-                    Ok(carina_core::provider::InitializeOutcome::unavailable()
-                        .with_provider(Box::new(MockProvider::new())))
+                    Ok(
+                        carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                            Box::new(
+                                ConfiguredBuiltinMock::new(
+                                    carina_provider_mock::MockBehavior::default(),
+                                    carina_provider_mock::MockScope::memory(),
+                                )
+                                .create_provider(),
+                            ),
+                        ),
+                    )
                 } else {
                     Err(ProviderError::internal(
                         "provider progress was emitted before initialization",
@@ -3280,7 +3404,11 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
     }
 
     let lines = Box::leak(Box::new(RecordedProgressLines::default()));
-    let ctx = WiringContext::new_for_test(vec![Box::new(ProgressOrderingFactory { lines })], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(ProgressOrderingFactory { lines })],
+        &[],
+    );
     let configs = validated_provider_configs(vec![ProviderConfig {
         name: "ordering".to_string(),
         attributes: IndexMap::new(),
@@ -3371,7 +3499,11 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
         }
     }
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(FailingInitializeFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(FailingInitializeFactory)],
+        &[],
+    );
     let configs = validated_provider_configs(vec![ProviderConfig {
         name: "aws".to_string(),
         attributes: IndexMap::new(),
@@ -3445,8 +3577,15 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         self.creates.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {
-            Ok(carina_core::provider::InitializeOutcome::unavailable()
-                .with_provider(Box::new(MockProvider::new())))
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
+            )
         })
     }
 
@@ -3490,6 +3629,7 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
     let configs = validated_provider_configs(vec![config]);
     let creates = Arc::new(AtomicUsize::new(0));
     let ctx = WiringContext::new_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
@@ -3554,6 +3694,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
     let (parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
@@ -3587,6 +3728,7 @@ async fn apply_provider_construction_revalidates_resolved_upstream_config() {
     let (_parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
     let ctx = WiringContext::new_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
@@ -4081,6 +4223,7 @@ let shared = read test.shared.Type {}
     let state_file = Some(state_file);
     let provider_configs = resolved_provider_configs(&parsed);
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ManagedAndDataSourceFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -4243,7 +4386,8 @@ use carina_core::parser::ParsedFile;
 fn test_normalize_state_prevents_false_enum_diff() {
     use carina_core::resource::Directives;
 
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
 
     // Desired resource with the parser-authored typed enum value.
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc", None);
@@ -4409,6 +4553,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
     }];
     let provider_configs = validated_provider_configs(raw_configs);
     let ctx = WiringContext::new_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(BlockInPlaceValidationFactory {
             validated: Arc::clone(&validated),
             received_region: Arc::clone(&received_region),
@@ -4433,6 +4578,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
 fn normalize_state_with_ctx_renders_provider_config_error_once() {
     let (_parsed, provider_configs) = resolved_invalid_provider_config();
     let ctx = WiringContext::new_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::new(AtomicUsize::new(0)),
         })],
@@ -4713,6 +4859,7 @@ fn test_merge_default_tags_prevents_false_diff() {
 /// keys correctly.
 #[test]
 fn moved_block_resolves_routed_instance_on_from_and_to() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::resource::ResourceId;
     use carina_state::state::{ResourceState, StateFile};
 
@@ -4745,6 +4892,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
     }];
 
     let moved_pairs = materialize_moved_states(
+        color_mode,
         &mut current_states,
         &mut Orphans::new(),
         &mut prev_explicit,
@@ -4775,6 +4923,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
 
 #[test]
 fn same_type_moved_block_parses_and_materializes_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::parser::ProviderContext;
     use carina_core::resource::ResourceId;
     use carina_state::state::{ResourceState, StateFile};
@@ -4807,6 +4956,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
         .into_plan_orphans();
 
     let moved_pairs = materialize_moved_states(
+        color_mode,
         &mut current_states,
         &mut orphans,
         &mut HashMap::new(),
@@ -4845,6 +4995,7 @@ fn same_type_moved_block_parses_and_materializes_state() {
 
 #[test]
 fn moved_in_flight_rebinds_resume_to_destination() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::effect::Effect;
     use carina_core::parser::ProviderContext;
     use carina_core::provider::Sent;
@@ -4892,6 +5043,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
         .into_plan_orphans();
 
     let moved_pairs = materialize_moved_states(
+        color_mode,
         &mut current_states,
         &mut orphans,
         &mut HashMap::new(),
@@ -4937,6 +5089,7 @@ fn moved_in_flight_rebinds_resume_to_destination() {
 
 #[test]
 fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::effect::Effect;
     use carina_core::parser::ProviderContext;
     use carina_state::state::{ResourceState, StateFile};
@@ -4967,6 +5120,7 @@ fn moved_orphan_to_undeclared_address_keeps_binding_on_delete() {
         .into_plan_orphans();
     let mut current_states = HashMap::new();
     let moved_pairs = materialize_moved_states(
+        color_mode,
         &mut current_states,
         &mut orphans,
         &mut HashMap::new(),
@@ -6030,6 +6184,7 @@ fn resource_move_invariants_missing_detected_source_is_an_error() {
 
 #[test]
 fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::parser::ProviderContext;
     use carina_state::DeposedKey;
     use carina_state::state::{DeposedInstance, ResourceState, StateFile};
@@ -6071,6 +6226,7 @@ fn explicit_move_accepts_deposed_only_source_that_is_present_in_state() {
         .into_plan_orphans();
 
     let moved_pairs = materialize_moved_states(
+        color_mode,
         &mut managed_current,
         &mut orphans,
         &mut HashMap::new(),
@@ -6359,7 +6515,11 @@ fn test_plan_fails_on_two_moves_from_same_source() {
 
 #[test]
 fn test_plan_fails_on_removed_from_colliding_with_desired() {
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let desired_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
     let orphan_name = "awscc_ec2_subnet_route_table_association_bbbbbbbb";
     let mut resource = Resource::with_provider(
@@ -6566,8 +6726,15 @@ impl ProviderFactory for DeferredForCollisionFactory {
         carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         Box::pin(async {
-            Ok(carina_core::provider::InitializeOutcome::unavailable()
-                .with_provider(Box::new(MockProvider::new())))
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
+            )
         })
     }
 
@@ -6699,8 +6866,15 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         Box::pin(async {
-            Ok(carina_core::provider::InitializeOutcome::unavailable()
-                .with_provider(Box::new(MockProvider::new())))
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
+            )
         })
     }
 
@@ -6905,7 +7079,11 @@ fn legacy_loop_detector_resolves_ref_only_ambiguity_through_state_view() {
     let mut parsed = parsed
         .into_expanded()
         .expect("legacy-loop fixture has no parser placeholders");
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let canonical = canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas())
         .expect("fixture resources canonicalize");
     let errors =
@@ -7012,6 +7190,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     .expect("test fixture crosses module resolution");
     let provider_configs = resolved_provider_configs_from_resolved(&parsed, &HashMap::new());
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(AssociationCreateOnlyFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -7224,6 +7403,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         .collect::<Result<HashMap<_, _>, _>>()
         .expect("test remote bindings contain no parser placeholders");
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(AssociationCreateOnlyFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -7376,7 +7556,11 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
 fn projected_moved_binding_resolves_for_anonymous_to_named_detection() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let old_binding = "old_rtb";
     let projected_binding = "private_rtb";
     let anonymous_name = "awscc_ec2_route_11111111";
@@ -7459,7 +7643,11 @@ fn projected_moved_binding_resolves_for_anonymous_to_named_detection() {
 fn projected_removed_origin_is_hidden_from_type_candidates_and_binding_resolution() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let origin_binding = "old_rtb";
     let projected_binding = "private_rtb";
     let mut state_file = StateFile::new();
@@ -7525,7 +7713,11 @@ fn projected_removed_origin_is_hidden_from_type_candidates_and_binding_resolutio
 fn claimed_dependency_binding_is_hidden_from_anonymous_reconciliation() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let binding = "old_rtb";
     let anonymous_name = "awscc_ec2_route_11111111";
     let desired_name = "awscc_ec2_route_aaaaaaaa";
@@ -7562,7 +7754,11 @@ fn claimed_dependency_binding_is_hidden_from_anonymous_reconciliation() {
 fn resource_move_invariants_anonymous_match_uses_state_row_routing() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let old_name = "ec2_subnet_route_table_association_11111111";
     let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut state_file = StateFile::new();
@@ -7607,7 +7803,11 @@ fn resource_move_invariants_anonymous_match_uses_state_row_routing() {
 fn resource_move_invariants_named_match_uses_state_row_routing() {
     use carina_state::state::{ResourceState, StateFile};
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let old_name = "awscc_s3_bucket_11111111";
     let mut prior = ResourceState::new("s3.Bucket", test_identity(old_name), "awscc");
     prior.directives.provider_instance = Some("persisted-route".to_string());
@@ -7663,7 +7863,11 @@ fn resource_move_invariants_named_match_uses_state_row_routing() {
 fn resource_move_invariants_projected_attribute_less_row_is_not_a_candidate() {
     use carina_state::state::{ResourceState, StateFile};
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let source = bucket_id("awscc_s3_bucket_11111111");
     let target = bucket_id("awscc_s3_bucket_aaaaaaaa");
     let mut state_file = StateFile::new();
@@ -7712,7 +7916,11 @@ fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
     use carina_core::provider::Sent;
     use carina_state::state::{ResourceState, StateFile};
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let old_name = "ec2_subnet_route_table_association_11111111";
     let target_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let desired = desired_association(target_name, "private_rtb", "subnet-a");
@@ -7781,7 +7989,11 @@ fn resource_move_invariants_unprojected_in_flight_target_blocks_orphan_match() {
 fn resource_move_invariants_projected_state_read_preserves_dependency_bindings() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let old_name = "ec2_subnet_route_table_association_11111111";
     let new_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut prior = association_state(old_name, "rtb-private", "subnet-a");
@@ -7827,7 +8039,11 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
 fn detect_moves_prefers_exact_legacy_before_heuristic() {
     use carina_state::state::{ResourceState, StateFile};
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let parsed = parse(
         "for subnet in ['subnet-a'] {\n\
            awscc.ec2.SubnetRouteTableAssociation {\n\
@@ -7893,7 +8109,11 @@ fn detect_moves_prefers_exact_legacy_before_heuristic() {
 fn assert_claimed_association_stays_orphaned_after_reconcile() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let old_name = "ec2_subnet_route_table_association_11111111";
     let desired_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut state_file = StateFile::new();
@@ -7987,6 +8207,7 @@ fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses()
             carina_core::resource::NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
         >(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(AssociationCreateOnlyFactory)],
             &[],
@@ -8037,7 +8258,11 @@ fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses()
 fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_state_bindings() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -8152,6 +8377,7 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
         carina_core::resource::NoPlaceholder,
         carina_core::resource::AbsoluteBindingAddress,
     >(
+        &crate::test_support::TestCommandRuntime::new(),
         Vec::new(),
         &[],
         [
@@ -8202,7 +8428,11 @@ fn reconcile_anonymous_identifiers_reserves_same_type_data_source_binding() {
 fn test_stale_moved_block_releases_claims() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -8260,10 +8490,15 @@ fn test_stale_moved_block_releases_claims() {
 
 #[test]
 fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::resource::ResourceId;
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let mut state_file = StateFile::new();
     let mut resources = Vec::new();
     let mut state_blocks = Vec::new();
@@ -8329,6 +8564,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     );
 
     let moved_pairs = materialize_moved_states(
+        color_mode,
         &mut current_states,
         &mut Orphans::new(),
         &mut HashMap::new(),
@@ -8427,7 +8663,11 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         }
     "#;
 
-    let wiring = ValidatedWiring::from_factories_for_test(vec![Box::new(CascadeAwsccFactory)], &[]);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(CascadeAwsccFactory)],
+        &[],
+    );
     let ctx = wiring.context();
     let mut parsed =
         resolve_file_for_test(parse(source, &ProviderContext::default()).expect("parse fixture"));
@@ -9318,7 +9558,8 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
 // the driver can accumulate diagnostics across validators.
 #[test]
 fn validate_resources_with_ctx_returns_each_error_as_app_error() {
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
 
     // Empty provider string sidesteps the "unknown provider, skip"
     // escape hatch (`known_providers` is empty), so each bad resource
@@ -9342,7 +9583,8 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
 // type. A regression back to `Result` fails to compile here.
 #[test]
 fn dependency_chain_wrappers_return_vec_app_error() {
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<carina_core::parser::ExpandedProviderConfig> = Vec::new();
 
@@ -9381,7 +9623,12 @@ fn paired_block_name_resolution_covers_resources_and_deferred_templates() {
     let ctx = WiringContext::new_for_test_with_additional_schemas::<
         carina_core::resource::NoPlaceholder,
         carina_core::resource::AbsoluteBindingAddress,
-    >(Vec::new(), &[], [("test".to_string(), schema)]);
+    >(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+        [("test".to_string(), schema)],
+    );
     let rule: Value<
         carina_core::resource::ParserPlaceholder,
         carina_core::resource::RelativeBindingName,
@@ -9469,7 +9716,12 @@ fn paired_block_name_resolution_reports_shared_conflict_once() {
     let ctx = WiringContext::new_for_test_with_additional_schemas::<
         carina_core::resource::NoPlaceholder,
         carina_core::resource::AbsoluteBindingAddress,
-    >(Vec::new(), &[], [("test".to_string(), schema)]);
+    >(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+        [("test".to_string(), schema)],
+    );
     let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
     let resource = Resource::with_provider("test", "thing", "direct", None)
         .with_attribute("rule", rules.clone())
@@ -9516,7 +9768,12 @@ fn deferred_block_name_conflict_reports_materialized_template_address() {
     let ctx = WiringContext::new_for_test_with_additional_schemas::<
         carina_core::resource::NoPlaceholder,
         carina_core::resource::AbsoluteBindingAddress,
-    >(Vec::new(), &[], [("test".to_string(), schema)]);
+    >(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+        [("test".to_string(), schema)],
+    );
     let rules = Value::Concrete(ConcreteValue::List(Vec::new()));
     let template_resource = Resource::with_provider("test", "thing", "pending", None)
         .with_attribute("rule", rules.clone())
@@ -9561,7 +9818,12 @@ fn paired_name_resolution_retains_post_alias_prefix_changes_in_owned_file() {
     let ctx = WiringContext::new_for_test_with_additional_schemas::<
         carina_core::resource::NoPlaceholder,
         carina_core::resource::AbsoluteBindingAddress,
-    >(Vec::new(), &[], [("test".to_string(), schema)]);
+    >(
+        &crate::test_support::TestCommandRuntime::new(),
+        Vec::new(),
+        &[],
+        [("test".to_string(), schema)],
+    );
     let mut evaluated = carina_core::parser::ParsedFile::default();
     evaluated.resources = vec![
         Resource::with_provider("test", "thing", "direct", None).with_attribute(
@@ -9842,8 +10104,15 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
     > {
         Box::pin(async {
-            Ok(carina_core::provider::InitializeOutcome::unavailable()
-                .with_provider(Box::new(MockProvider::new())))
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
+            )
         })
     }
 
@@ -9898,7 +10167,11 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
 }
 
 fn region_identity_ctx() -> WiringContext {
-    WiringContext::new_for_test(vec![Box::new(RegionIdentityFactory)], &[])
+    WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(RegionIdentityFactory)],
+        &[],
+    )
 }
 
 fn region_provider_config(raw_region: &str) -> carina_core::parser::ExpandedProviderConfig {
@@ -9952,7 +10225,11 @@ fn assert_two_loop_identity_aggregate(error: AppError) {
 
 #[test]
 fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let mut parsed = two_anonymous_loop_collision_file()
         .into_expanded()
         .expect("identity fixture has no leftover parser placeholders");
@@ -9967,7 +10244,11 @@ fn file_deferred_expansion_target_reports_all_anonymous_identity_errors() {
 
 #[test]
 fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_errors() {
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let parsed = two_anonymous_loop_collision_file();
     let mut pair = canonical_pair(
         &parsed,
@@ -9985,7 +10266,11 @@ fn canonical_pair_deferred_expansion_target_reports_all_anonymous_identity_error
 
 #[test]
 fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let parsed = two_anonymous_loop_collision_file()
         .into_expanded()
         .expect("identity fixture has no leftover parser placeholders");
@@ -10035,7 +10320,8 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
 
 #[test]
 fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     let (mut resources, _) = build_override_aware_pair_for_test(
         canonical_unresolved(
             vec![
@@ -10103,7 +10389,11 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
 fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let desired = Resource::with_provider(
         "awscc",
         "ec2.SubnetRouteTableAssociation",
@@ -10231,7 +10521,11 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
 fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let origin_name = "ec2_subnet_route_table_association_11111111";
     let early_name = "ec2_subnet_route_table_association_22222222";
     let late_name = "ec2_subnet_route_table_association_33333333";
@@ -10338,7 +10632,11 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
 fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
     use carina_state::state::{ResourceState, StateFile};
 
-    let ctx = WiringContext::new_for_test(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
+    let ctx = WiringContext::new_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(AssociationCreateOnlyFactory)],
+        &[],
+    );
     let parsed = parse(
         "let upstream = upstream_state { source = '../upstream' }\n\
          for key, subnet in upstream.subnets {\n\
@@ -10569,7 +10867,8 @@ fn detected_anonymous_to_named_moves_canonicalize_provider_config_identity_enums
 // checker on empty input.
 #[test]
 fn module_checker_and_provider_wrappers_accept_empty_input() {
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     let authored = ParsedFile::default();
     let parsed = resolve_file_for_test(authored.clone());
     let provider_ctx = ctx.provider_context();
@@ -10829,6 +11128,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
     let state_file = Some(state_file);
     let provider_configs = resolved_provider_configs(&parsed);
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(DeferredForCollisionFactory)],
         provider_configs.as_provider_configs(),
     );
@@ -11094,7 +11394,11 @@ mod expand_same_config_deferred_for_tests {
             .expect("warning fixture has no leftover parser placeholders");
         let state_file = None;
         let schemas = SchemaRegistry::new();
-        let identity_context = WiringContext::new_for_test(Vec::new(), &[]);
+        let identity_context = WiringContext::new_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            Vec::new(),
+            &[],
+        );
         let prelude = DeferredForExpansionPrelude::new_for_test(&parsed, &state_file, &schemas)
             .expect("build expansion prelude");
         let prepared = prelude
@@ -12288,7 +12592,7 @@ fn append_test_custom_section(component: &mut Vec<u8>, name: &str, payload: &[u8
 
 #[tokio::test(flavor = "multi_thread")]
 async fn installed_revision_instantiation_error_includes_lock_provenance() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/example/carina-provider-awscc";
@@ -12387,7 +12691,7 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
 
 #[test]
 fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
@@ -12438,7 +12742,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn registry_source_reaches_cli_artifact_loader() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "example/awscc";
@@ -12488,7 +12792,7 @@ async fn registry_source_reaches_cli_artifact_loader() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn registry_source_reaches_plan_apply_provider_loader() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "example/awscc";
@@ -12539,7 +12843,7 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     assert!(load_error.contains("version 0.5.0"), "{load_error}");
 
     let configs = validated_provider_configs(vec![config]);
-    let ctx = WiringContext::new(factories, configs.as_provider_configs());
+    let ctx = WiringContext::new(&user_dirs, factories, configs.as_provider_configs()).unwrap();
     let router = get_provider_with_ctx(&ctx, &configs, ProgressSink::Human)
         .await
         .expect("the router must not retry a factory load that already failed");
@@ -12588,7 +12892,7 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
 
 #[test]
 fn formatting_factory_loader_returns_lock_constraint_errors() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
@@ -12631,7 +12935,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
 
 #[test]
 fn unversioned_lock_error_reaches_cli_typed_with_restore_remediation() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     std::fs::write(
@@ -12732,7 +13036,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
 
 #[test]
 fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     let source = "github.com/carina-rs/carina-provider-awscc";
@@ -12853,8 +13157,17 @@ mod resolved_value_constraint_gate {
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
-                Ok(carina_core::provider::InitializeOutcome::unavailable()
-                    .with_provider(Box::new(MockProvider::new())))
+                Ok(
+                    carina_core::provider::InitializeOutcome::unavailable().with_provider(
+                        Box::new(
+                            ConfiguredBuiltinMock::new(
+                                carina_provider_mock::MockBehavior::default(),
+                                carina_provider_mock::MockScope::memory(),
+                            )
+                            .create_provider(),
+                        ),
+                    ),
+                )
             })
         }
 
@@ -13154,8 +13467,11 @@ mod resolved_value_constraint_gate {
         producer_value: Value,
         normalizer: &RewritingNormalizer,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let wiring =
-            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring = ValidatedWiring::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            vec![Box::new(ConstraintFactory)],
+            &[],
+        );
         let ctx = wiring.context();
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
         let compositions = Vec::new();
@@ -13231,8 +13547,11 @@ mod resolved_value_constraint_gate {
         producer_values: Vec<(&str, Value)>,
         composition: &mut LiveComposition,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let wiring =
-            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring = ValidatedWiring::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            vec![Box::new(ConstraintFactory)],
+            &[],
+        );
         let ctx = wiring.context();
         let mut producer = Resource::with_provider("test", "source", "producer", None)
             .with_absolute_binding(absolute_binding("producer"));
@@ -13387,7 +13706,11 @@ mod resolved_value_constraint_gate {
 
     #[tokio::test]
     async fn resolved_data_source_input_uses_the_same_gate() {
-        let ctx = WiringContext::new_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let ctx = WiringContext::new_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            vec![Box::new(ConstraintFactory)],
+            &[],
+        );
         let normalizer = RewritingNormalizer::default();
         let (mut resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(Vec::new(), ctx.schemas()),
@@ -13535,6 +13858,7 @@ exports { team_prefix: String = "x" }"#,
 
         let mut cycle_guard = crate::commands::plan::seed_cycle_guard(&consumer_dir);
         let remote_bindings = crate::commands::plan::load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
             &parsed.upstream_states,
             &consumer_dir,
             &carina_core::parser::ProviderContext::default(),
@@ -13543,8 +13867,11 @@ exports { team_prefix: String = "x" }"#,
         )
         .await
         .expect("upstream state fixture must load");
-        let wiring =
-            ValidatedWiring::from_factories_for_test(vec![Box::new(ConstraintFactory)], &[]);
+        let wiring = ValidatedWiring::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            vec![Box::new(ConstraintFactory)],
+            &[],
+        );
         let ctx = wiring.context();
         let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
             &parsed,
@@ -13618,6 +13945,7 @@ exports { team_prefix: String = "x" }"#,
         parsed.data_sources.push(data_source);
         let reads = Arc::new(AtomicUsize::new(0));
         let wiring = ValidatedWiring::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
             vec![Box::new(RecordingDataSourceFactory {
                 reads: reads.clone(),
             })],
@@ -13776,5 +14104,117 @@ exports { team_prefix: String = "x" }"#,
         assert!(rendered.contains("(secret)"), "{rendered}");
         assert!(!rendered.contains("\"bad\""), "{rendered}");
         assert!(!rendered.contains("Secret("), "{rendered}");
+    }
+}
+
+#[tokio::test]
+async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped() {
+    for explicit in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("mock.json");
+        let maximum = directory.path().join("max");
+        let runtime = crate::test_support::TestCommandRuntime::with_mock(
+            carina_provider_mock::MockBehavior {
+                observations: carina_provider_mock::MockObservations {
+                    max_active: Some(maximum.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            carina_provider_mock::MockScope::file(state_path.clone()).unwrap(),
+        );
+        let providers = if explicit {
+            parse(
+                "provider mock {}\n",
+                &carina_core::parser::ProviderContext::default(),
+            )
+            .unwrap()
+            .into_expanded()
+            .unwrap()
+            .providers
+        } else {
+            Vec::new()
+        };
+        let resolved = validated_provider_configs(providers);
+        let loaded = ProviderLoad::load(&runtime, resolved.as_provider_configs(), directory.path())
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let ctx = &loaded.context;
+        std::fs::write(&maximum, "existing observation").unwrap();
+        let _normalizers = create_normalizers_from_configs_with_ctx(ctx, &resolved)
+            .await
+            .unwrap();
+        assert!(!state_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&maximum).unwrap(),
+            "existing observation"
+        );
+        assert!(matches!(
+            ctx.provider_artifacts.get("mock"),
+            Some(LoadedProviderArtifact::BuiltIn)
+        ));
+        let provider = get_provider_with_ctx(ctx, &resolved, ProgressSink::Human)
+            .await
+            .unwrap();
+        let resource = Resource::with_provider("mock", "test.resource", "same", None)
+            .with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("same".into())),
+            );
+        let id = resource.id.clone();
+        let bindings = ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let preparation = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &gate,
+            &[],
+            &carina_core::provider::NoopNormalizer,
+            &[],
+            ctx.schemas(),
+        );
+        let request = carina_core::executor::prepare_create_request(resource, &preparation)
+            .await
+            .unwrap();
+        let (create, cancellation) =
+            carina_core::executor::dispatch_create(&provider, &id, request);
+        create.await.unwrap();
+        drop(cancellation);
+        let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();
+        let read_id = if explicit {
+            id.clone()
+        } else {
+            let mut legacy = id.clone();
+            legacy.provider.clear();
+            legacy
+        };
+        assert!(
+            provider
+                .read(&read_id, &identifier, carina_core::provider::ReadRequest)
+                .await
+                .unwrap()
+                .into_state()
+                .exists
+        );
+        provider
+            .delete(
+                &read_id,
+                &identifier,
+                carina_core::provider::DeleteRequest::resolve(
+                    &Directives::default(),
+                    carina_core::provider::ProviderDirectiveSchema::Unavailable,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !provider
+                .read(&id, &identifier, carina_core::provider::ReadRequest)
+                .await
+                .unwrap()
+                .into_state()
+                .exists
+        );
+        assert_eq!(runtime.provider_load_count(), 1);
     }
 }

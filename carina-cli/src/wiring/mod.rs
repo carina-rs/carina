@@ -33,7 +33,7 @@
 //!
 //! ```compile_fail,E0624
 //! let providers = Vec::new();
-//! let _ = carina_cli::wiring::WiringContext::new(Vec::new(), &providers);
+//! let _ = carina_cli::wiring::WiringContext::new(runtime, Vec::new(), &providers);
 //! ```
 //!
 //! A raw provider load is not accepted where recorded plan evidence requires
@@ -74,16 +74,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
-#[cfg(test)]
-use std::cell::Cell;
-
 use indexmap::IndexMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 use futures::stream::{self, StreamExt};
 
+use crate::runtime::CommandRuntime;
 use carina_core::binding_index::{LivePreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::deps::{
@@ -146,7 +144,7 @@ use carina_core::schema::{
 };
 use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::validation;
-use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
+use carina_provider_mock::{BUILTIN_PROVIDER_NAME, ConfiguredBuiltinMock};
 use carina_state::{LoadedOrphans, ResourceState, StateFile};
 
 #[cfg(test)]
@@ -164,63 +162,15 @@ pub use override_aware::{
     OverrideAwareBuildMode, OverrideAwareResources, RebuildBindingsInputs,
 };
 
-static TRUSTED_LOCAL_GRANT_INPUTS: OnceLock<TrustedLocalGrantInputs> = OnceLock::new();
-
-#[cfg(test)]
-thread_local! {
-    static TRACKED_PROVIDER_LOAD_COUNT: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct ProviderLoadCountGuard;
-
-#[cfg(test)]
-impl ProviderLoadCountGuard {
-    pub(crate) fn count(&self) -> usize {
-        TRACKED_PROVIDER_LOAD_COUNT.with(|count| {
-            count
-                .get()
-                .expect("provider-load tracking must remain active")
-        })
-    }
-}
-
-#[cfg(test)]
-impl Drop for ProviderLoadCountGuard {
-    fn drop(&mut self) {
-        TRACKED_PROVIDER_LOAD_COUNT.with(|count| count.set(None));
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn track_provider_loads_for_test() -> ProviderLoadCountGuard {
-    TRACKED_PROVIDER_LOAD_COUNT.with(|count| {
-        assert!(
-            count.replace(Some(0)).is_none(),
-            "provider-load tracking is already active on this thread"
-        );
-    });
-    ProviderLoadCountGuard
-}
-
-#[cfg(test)]
-fn record_tracked_provider_load() {
-    TRACKED_PROVIDER_LOAD_COUNT.with(|count| {
-        if let Some(current) = count.get() {
-            count.set(Some(current + 1));
-        }
-    });
-}
-
 #[derive(Debug)]
-struct TrustedLocalGrantInputs {
+pub struct TrustedLocalGrantInputs {
     cli_values: Vec<String>,
     env_value: Option<std::ffi::OsString>,
     parsed: OnceLock<carina_provider_resolver::TrustedLocalGrants>,
 }
 
 impl TrustedLocalGrantInputs {
-    fn new(cli_values: Vec<String>, env_value: Option<std::ffi::OsString>) -> Self {
+    pub fn new(cli_values: Vec<String>, env_value: Option<std::ffi::OsString>) -> Self {
         Self {
             cli_values,
             env_value,
@@ -243,24 +193,6 @@ impl TrustedLocalGrantInputs {
         )?;
         Ok(self.parsed.get_or_init(|| grants))
     }
-}
-
-/// Error returned when process-local grant inputs were already installed.
-#[derive(Debug, thiserror::Error)]
-#[error("trusted local provider grant inputs were already installed")]
-pub struct TrustedLocalGrantInputsAlreadySetError;
-
-/// Install the raw process-local grant inputs captured by the CLI entry point.
-///
-/// The grants live only for this process and are never written to project
-/// locks, provider caches, saved plans, or state.
-pub fn set_trusted_local_grant_inputs(
-    cli_values: Vec<String>,
-    env_value: Option<std::ffi::OsString>,
-) -> Result<(), TrustedLocalGrantInputsAlreadySetError> {
-    TRUSTED_LOCAL_GRANT_INPUTS
-        .set(TrustedLocalGrantInputs::new(cli_values, env_value))
-        .map_err(|_| TrustedLocalGrantInputsAlreadySetError)
 }
 
 /// Result of creating a plan, with context needed for saving
@@ -370,7 +302,8 @@ pub struct StateBlockResolution {
 pub struct WiringContext {
     loaded_providers: Arc<LoadedProviderSnapshot>,
     known_providers: HashSet<String>,
-    uses_builtin_mock: bool,
+    builtin_mock: Option<ConfiguredBuiltinMock>,
+    runtime: CommandRuntime,
     provider_artifacts: BTreeMap<String, LoadedProviderArtifact>,
 }
 
@@ -954,14 +887,14 @@ fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
 impl ProviderLoad {
     /// Load the providers declared by one command configuration.
     pub(crate) fn load<P: PlaceholderKind, B: BindingAddress>(
-        user_dirs: &carina_core::UserDirs,
+        runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
         base_dir: &Path,
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
-            build_factories_from_providers(user_dirs, providers, base_dir)?;
+            build_factories_from_providers(runtime, providers, base_dir)?;
         Ok(Self {
-            context: WiringContext::new(factories, providers),
+            context: WiringContext::new(runtime, factories, providers)?,
             load_errors,
         })
     }
@@ -972,26 +905,28 @@ impl ProviderLoad {
     /// lint continue with an empty context and report the loader error alongside
     /// schema-independent findings.
     pub(crate) fn load_reporting<P: PlaceholderKind, B: BindingAddress>(
-        user_dirs: &carina_core::UserDirs,
+        runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
         base_dir: &Path,
-    ) -> (ReportingProviderLoad, Option<AppError>) {
-        match build_schema_factories_from_providers(user_dirs, providers, base_dir) {
-            Ok((factories, load_errors)) => (
-                ReportingProviderLoad {
-                    context: WiringContext::new(factories, providers),
-                    load_errors,
-                },
-                None,
-            ),
-            Err(error) => (
-                ReportingProviderLoad {
-                    context: WiringContext::new(Vec::new(), providers),
-                    load_errors: HashMap::new(),
-                },
-                Some(error),
-            ),
-        }
+    ) -> Result<(ReportingProviderLoad, Option<AppError>), AppError> {
+        Ok(
+            match build_schema_factories_from_providers(runtime, providers, base_dir) {
+                Ok((factories, load_errors)) => (
+                    ReportingProviderLoad {
+                        context: WiringContext::new(runtime, factories, providers)?,
+                        load_errors,
+                    },
+                    None,
+                ),
+                Err(error) => (
+                    ReportingProviderLoad {
+                        context: WiringContext::new(runtime, Vec::new(), providers)?,
+                        load_errors: HashMap::new(),
+                    },
+                    Some(error),
+                ),
+            },
+        )
     }
 
     /// Consume the loader result after proving that every declared provider
@@ -1131,50 +1066,59 @@ impl ProviderLoad {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig],
     ) -> Self {
         Self {
-            context: WiringContext::new(factories, provider_configs),
+            context: WiringContext::new(runtime, factories, provider_configs)
+                .expect("test mock inputs must be valid"),
             load_errors: HashMap::new(),
         }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test_with_provider_phase<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
     ) -> Self {
         Self {
-            context: WiringContext::new(factories, provider_configs),
+            context: WiringContext::new(runtime, factories, provider_configs)
+                .expect("test mock inputs must be valid"),
             load_errors: HashMap::new(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test_with_load_errors<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
         load_errors: HashMap<String, String>,
     ) -> Self {
         Self {
-            context: WiringContext::new(factories, provider_configs),
+            context: WiringContext::new(runtime, factories, provider_configs)
+                .expect("test mock inputs must be valid"),
             load_errors,
         }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_fixture_with_additional_schemas<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
     ) -> Self {
         Self {
             context: WiringContext::new_with_additional_schemas(
+                runtime,
                 factories,
                 provider_configs,
                 additional_schemas,
-            ),
+            )
+            .expect("fixture mock inputs must be valid"),
             load_errors: HashMap::new(),
         }
     }
@@ -1307,11 +1251,12 @@ impl ValidatedWiring {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig],
     ) -> Self {
         Self {
-            load: ProviderLoad::for_test(factories, provider_configs)
+            load: ProviderLoad::for_test(runtime, factories, provider_configs)
                 .into_complete()
                 .expect("test provider load must be complete"),
         }
@@ -1319,11 +1264,12 @@ impl ValidatedWiring {
 
     #[cfg(test)]
     pub(crate) fn for_test_with_provider_phase<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
     ) -> Self {
         Self {
-            load: ProviderLoad::for_test_with_provider_phase(factories, provider_configs)
+            load: ProviderLoad::for_test_with_provider_phase(runtime, factories, provider_configs)
                 .into_complete()
                 .expect("test provider load must be complete"),
         }
@@ -1331,10 +1277,15 @@ impl ValidatedWiring {
 
     #[cfg(test)]
     pub(crate) fn from_factories_for_test(
+        runtime: &CommandRuntime,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig],
     ) -> Self {
-        Self::for_test(LoadedProviderFactory::for_test(factories), provider_configs)
+        Self::for_test(
+            runtime,
+            LoadedProviderFactory::for_test(factories),
+            provider_configs,
+        )
     }
 
     #[cfg(test)]
@@ -1342,10 +1293,12 @@ impl ValidatedWiring {
         P: PlaceholderKind,
         B: BindingAddress,
     >(
+        runtime: &CommandRuntime,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig<P, B>],
     ) -> Self {
         Self::for_test_with_provider_phase(
+            runtime,
             LoadedProviderFactory::for_test(factories),
             provider_configs,
         )
@@ -1367,7 +1320,8 @@ impl ValidatedWiring {
                     context: WiringContext {
                         loaded_providers: Arc::clone(&self.load.context.loaded_providers),
                         known_providers: self.load.context.known_providers.clone(),
-                        uses_builtin_mock: self.load.context.uses_builtin_mock,
+                        builtin_mock: self.load.context.builtin_mock.clone(),
+                        runtime: self.load.context.runtime.clone(),
                         provider_artifacts: self.load.context.provider_artifacts.clone(),
                     },
                 },
@@ -1390,12 +1344,14 @@ impl ValidatedWiring {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_fixture_with_additional_schemas<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
     ) -> Self {
         Self {
             load: ProviderLoad::for_fixture_with_additional_schemas(
+                runtime,
                 factories,
                 provider_configs,
                 additional_schemas,
@@ -1410,11 +1366,13 @@ impl ValidatedWiring {
         P: PlaceholderKind,
         B: BindingAddress,
     >(
+        runtime: &CommandRuntime,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig<P, B>],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
     ) -> Self {
         Self::for_fixture_with_additional_schemas(
+            runtime,
             LoadedProviderFactory::for_test(factories),
             provider_configs,
             additional_schemas,
@@ -1444,12 +1402,13 @@ impl<R> ValidatedConfig<R> {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(
+        runtime: &CommandRuntime,
         resources: R,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig],
     ) -> Self {
         Self {
-            wiring: ValidatedWiring::for_test(factories, provider_configs),
+            wiring: ValidatedWiring::for_test(runtime, factories, provider_configs),
             resources: ValidationReady::for_fixture(resources),
             config_state: std::marker::PhantomData,
         }
@@ -1457,12 +1416,17 @@ impl<R> ValidatedConfig<R> {
 
     #[cfg(test)]
     pub(crate) fn for_test_with_provider_phase<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         resources: R,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
     ) -> Self {
         Self {
-            wiring: ValidatedWiring::for_test_with_provider_phase(factories, provider_configs),
+            wiring: ValidatedWiring::for_test_with_provider_phase(
+                runtime,
+                factories,
+                provider_configs,
+            ),
             resources: ValidationReady::for_fixture(resources),
             config_state: std::marker::PhantomData,
         }
@@ -1470,11 +1434,13 @@ impl<R> ValidatedConfig<R> {
 
     #[cfg(test)]
     pub(crate) fn from_factories_for_test(
+        runtime: &CommandRuntime,
         resources: R,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig],
     ) -> Self {
         Self::for_test(
+            runtime,
             resources,
             LoadedProviderFactory::for_test(factories),
             provider_configs,
@@ -1486,11 +1452,13 @@ impl<R> ValidatedConfig<R> {
         P: PlaceholderKind,
         B: BindingAddress,
     >(
+        runtime: &CommandRuntime,
         resources: R,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig<P, B>],
     ) -> Self {
         Self::for_test_with_provider_phase(
+            runtime,
             resources,
             LoadedProviderFactory::for_test(factories),
             provider_configs,
@@ -1514,7 +1482,8 @@ impl<R> ValidatedConfig<R> {
                     context: WiringContext {
                         loaded_providers: Arc::clone(&wiring.load.context.loaded_providers),
                         known_providers: wiring.load.context.known_providers.clone(),
-                        uses_builtin_mock: wiring.load.context.uses_builtin_mock,
+                        builtin_mock: wiring.load.context.builtin_mock.clone(),
+                        runtime: wiring.load.context.runtime.clone(),
                         provider_artifacts: wiring.load.context.provider_artifacts.clone(),
                     },
                 },
@@ -1529,6 +1498,7 @@ impl<R> ValidatedConfig<R> {
         P: PlaceholderKind,
         B: BindingAddress,
     >(
+        runtime: &CommandRuntime,
         resources: R,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig<P, B>],
@@ -1536,6 +1506,7 @@ impl<R> ValidatedConfig<R> {
     ) -> Self {
         Self {
             wiring: ValidatedWiring::from_factories_with_additional_schemas_for_test(
+                runtime,
                 factories,
                 provider_configs,
                 additional_schemas,
@@ -1547,6 +1518,7 @@ impl<R> ValidatedConfig<R> {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_fixture_with_additional_schemas<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         resources: R,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
@@ -1554,6 +1526,7 @@ impl<R> ValidatedConfig<R> {
     ) -> Self {
         Self {
             wiring: ValidatedWiring::for_fixture_with_additional_schemas(
+                runtime,
                 factories,
                 provider_configs,
                 additional_schemas,
@@ -1949,13 +1922,13 @@ pub(crate) struct FormattingProviderLoad {
 
 impl FormattingProviderLoad {
     pub(crate) fn load<P: PlaceholderKind, B: BindingAddress>(
-        user_dirs: &carina_core::UserDirs,
+        runtime: &CommandRuntime,
         providers: &[ProviderConfig<P, B>],
         base_dir: &Path,
     ) -> Result<Self, AppError> {
         let (factories, load_errors) =
-            build_factories_from_providers_for_formatting(user_dirs, providers, base_dir)?;
-        let context = WiringContext::new(factories, providers);
+            build_factories_from_providers_for_formatting(runtime, providers, base_dir)?;
+        let context = WiringContext::new(runtime, factories, providers)?;
         Ok(Self {
             schemas: context.schemas().clone(),
             load_errors,
@@ -1968,11 +1941,13 @@ impl FormattingProviderLoad {
 
     #[cfg(test)]
     pub(crate) fn for_test<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
         load_errors: HashMap<String, ProviderFactoryDiagnostic>,
     ) -> Self {
-        let context = WiringContext::new(factories, provider_configs);
+        let context = WiringContext::new(runtime, factories, provider_configs)
+            .expect("test mock inputs must be valid");
         Self {
             schemas: context.schemas().clone(),
             load_errors,
@@ -1992,36 +1967,42 @@ pub(crate) fn provider_factory_source<P: PlaceholderKind, B: BindingAddress>(
 
 impl WiringContext {
     fn new<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
-    ) -> Self {
-        Self::new_with_schema_registry(factories, provider_configs, SchemaRegistry::new())
+    ) -> Result<Self, AppError> {
+        Self::new_with_schema_registry(runtime, factories, provider_configs, SchemaRegistry::new())
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     fn new_with_additional_schemas<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         loaded_factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
         let mut schemas = SchemaRegistry::new();
         for (provider, schema) in additional_schemas {
             schemas.insert(provider, schema);
         }
-        Self::new_with_schema_registry(loaded_factories, provider_configs, schemas)
+        Self::new_with_schema_registry(runtime, loaded_factories, provider_configs, schemas)
     }
 
     fn new_with_schema_registry<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         loaded_factories: Vec<LoadedProviderFactory>,
         provider_configs: &[ProviderConfig<P, B>],
         mut schemas: SchemaRegistry,
-    ) -> Self {
+    ) -> Result<Self, AppError> {
         let uses_builtin_mock =
             carina_provider_mock::uses_builtin_provider(provider_configs, |provider_name| {
                 loaded_factories
                     .iter()
                     .any(|loaded| loaded.factory.name() == provider_name)
             });
+        let builtin_mock = uses_builtin_mock
+            .then(|| runtime.builtin_mock().cloned())
+            .transpose()?;
         let mut provider_artifacts = loaded_factories
             .iter()
             .map(|loaded| {
@@ -2074,41 +2055,57 @@ impl WiringContext {
             Arc::clone(&factories),
             schemas,
         ));
-        Self {
+        Ok(Self {
             loaded_providers,
             known_providers,
-            uses_builtin_mock,
+            builtin_mock,
+            runtime: runtime.clone(),
             provider_artifacts,
-        }
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(
+        runtime: &CommandRuntime,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig],
     ) -> Self {
-        Self::new(LoadedProviderFactory::for_test(factories), provider_configs)
+        Self::new(
+            runtime,
+            LoadedProviderFactory::for_test(factories),
+            provider_configs,
+        )
+        .expect("test mock inputs must be valid")
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test_with_provider_phase<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig<P, B>],
     ) -> Self {
-        Self::new(LoadedProviderFactory::for_test(factories), provider_configs)
+        Self::new(
+            runtime,
+            LoadedProviderFactory::for_test(factories),
+            provider_configs,
+        )
+        .expect("test mock inputs must be valid")
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test_with_additional_schemas<P: PlaceholderKind, B: BindingAddress>(
+        runtime: &CommandRuntime,
         factories: Vec<Box<dyn ProviderFactory>>,
         provider_configs: &[ProviderConfig<P, B>],
         additional_schemas: impl IntoIterator<Item = (String, ValidatedResourceSchema)>,
     ) -> Self {
         Self::new_with_additional_schemas(
+            runtime,
             LoadedProviderFactory::for_test(factories),
             provider_configs,
             additional_schemas,
         )
+        .expect("test mock inputs must be valid")
     }
 
     pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
@@ -2143,8 +2140,12 @@ impl WiringContext {
         &self.provider_artifacts
     }
 
-    fn uses_builtin_mock(&self) -> bool {
-        self.uses_builtin_mock
+    pub(crate) fn runtime(&self) -> &CommandRuntime {
+        &self.runtime
+    }
+
+    fn builtin_mock(&self) -> Option<&ConfiguredBuiltinMock> {
+        self.builtin_mock.as_ref()
     }
 }
 
@@ -2166,7 +2167,7 @@ pub(crate) fn provider_loading_configs<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
     base_dir: &Path,
 ) -> Result<ProviderFactoryLoad, AppError> {
@@ -2174,7 +2175,7 @@ fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
 
     build_factories_from_providers_impl(
-        user_dirs,
+        runtime,
         &providers,
         base_dir,
         true,
@@ -2183,7 +2184,7 @@ fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
 }
 
 fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
     base_dir: &Path,
 ) -> Result<ProviderFactoryLoad, AppError> {
@@ -2191,7 +2192,7 @@ fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
 
     build_factories_from_providers_impl(
-        user_dirs,
+        runtime,
         &providers,
         base_dir,
         true,
@@ -2207,7 +2208,7 @@ fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
 /// Suppressed provider and lock-constraint failures are returned as load errors
 /// so `--check` can report degraded conversion without failing formatting.
 fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingAddress>(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &CommandRuntime,
     providers: &[ProviderConfig<P, B>],
     base_dir: &Path,
 ) -> Result<FormattingFactoryLoad, AppError> {
@@ -2223,7 +2224,7 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingA
     }
 
     let (factories, load_errors) = build_factories_from_providers_impl(
-        user_dirs,
+        runtime,
         &providers,
         base_dir,
         false,
@@ -2239,22 +2240,21 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingA
 }
 
 fn build_factories_from_providers_impl<B: BindingAddress>(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &CommandRuntime,
     providers: &[ProviderConfig<carina_core::resource::NoPlaceholder, B>],
     base_dir: &Path,
     report_errors: bool,
     network: ProviderFactoryNetwork,
 ) -> Result<ProviderFactoryLoad, AppError> {
-    #[cfg(test)]
-    record_tracked_provider_load();
+    #[cfg(any(test, feature = "test-utils"))]
+    runtime.record_provider_load();
 
-    let grant_inputs =
-        TRUSTED_LOCAL_GRANT_INPUTS.get_or_init(|| TrustedLocalGrantInputs::new(Vec::new(), None));
-    let loader_user_dirs = user_dirs.clone();
+    let grant_inputs = runtime.grants();
+    let loader_user_dirs = runtime.user_dirs().clone();
     let loader_project_dir = base_dir.to_path_buf();
     let aws = Arc::new(CliAwsCredentialProvisioner::new());
     build_factories_from_providers_impl_using(
-        user_dirs,
+        runtime,
         providers,
         base_dir,
         report_errors,
@@ -2287,7 +2287,7 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
 }
 
 fn build_factories_from_providers_impl_using<B: BindingAddress, L, Fut>(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &CommandRuntime,
     providers: &[ProviderConfig<carina_core::resource::NoPlaceholder, B>],
     base_dir: &Path,
     report_errors: bool,
@@ -2303,6 +2303,7 @@ where
             >,
         >,
 {
+    let color_mode = runtime.color_mode();
     let mut factories = Vec::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
     let mut attempted_default_sources = HashSet::new();
@@ -2328,7 +2329,7 @@ where
             Err(e) => {
                 let reason = format!("Provider '{}' {}", config.name, e);
                 if report_errors {
-                    eprintln!("{}", reason.red());
+                    eprintln!("{}", reason.red(color_mode));
                 }
                 load_errors.insert(config.name.clone(), reason);
                 continue;
@@ -2338,7 +2339,7 @@ where
         let grants = grant_inputs.get()?;
         let factory_result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(installed.load_with(
-                user_dirs,
+                runtime.user_dirs(),
                 grants,
                 |verified| {
                     let artifact = verified.artifact().clone();
@@ -2357,7 +2358,7 @@ where
                         .with_load_error(carina_plugin_host::WasmProviderLoadError::Other(message))
                         .to_string();
                     if report_errors {
-                        eprintln!("{}", reason.red());
+                        eprintln!("{}", reason.red(color_mode));
                     }
                     load_errors.insert(config.name.clone(), reason);
                     continue;
@@ -2396,7 +2397,7 @@ where
                     error.to_string()
                 };
                 if report_errors {
-                    eprintln!("{}", reason.red());
+                    eprintln!("{}", reason.red(color_mode));
                 }
                 load_errors.insert(config.name.clone(), reason);
             }
@@ -4030,6 +4031,7 @@ pub(crate) async fn get_provider_with_ctx(
     configs: &ResolvedProviderConfigs,
     progress_sink: ProgressSink,
 ) -> Result<ProviderRouter, AppError> {
+    let color_mode = ctx.runtime().color_mode();
     let mut router = ProviderRouter::new();
 
     // Two-pass build so named instances can reuse the kind's factory.
@@ -4053,18 +4055,20 @@ pub(crate) async fn get_provider_with_ctx(
         .await?;
     }
 
-    if router.is_empty() && ctx.uses_builtin_mock() {
+    if router.is_empty()
+        && let Some(builtin_mock) = ctx.builtin_mock()
+    {
         // The implicit built-in remains compatible with legacy providerless
         // state while also owning the explicit `mock.*` addresses used by new
         // fixtures and configurations.
-        progress_sink.line("Using mock provider".cyan());
+        progress_sink.line("Using mock provider".cyan(color_mode));
         router.add_provider(
             BUILTIN_PROVIDER_NAME.to_string(),
-            InitializedProvider::unavailable(Box::new(MockProvider::new())),
+            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
         );
         router.add_provider(
             String::new(),
-            InitializedProvider::unavailable(Box::new(MockProvider::new())),
+            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
         );
     }
 
@@ -4140,6 +4144,7 @@ async fn instantiate_provider_into_router(
     inherited_source: Option<&ProviderSource>,
     progress_sink: ProgressSink,
 ) -> Result<(), AppError> {
+    let color_mode = ctx.runtime().color_mode();
     let binding = provider_config.binding();
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
         let config = prepare_provider_ready_config(factory, provider_config)?;
@@ -4150,7 +4155,8 @@ async fn instantiate_provider_into_router(
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         progress_sink.line(
-            format_provider_using_line(factory.name(), &region, binding, displayed_source).cyan(),
+            format_provider_using_line(factory.name(), &region, binding, displayed_source)
+                .cyan(color_mode),
         );
         router.add_normalizer(
             provider_config.name().to_string(),
@@ -4160,14 +4166,16 @@ async fn instantiate_provider_into_router(
                 .map_err(|e| e.for_provider(provider_config.name().to_string()))?,
         );
         router.add_provider_config(provider_config.as_provider_config(), provider);
-    } else if ctx.uses_builtin_mock() && provider_config.name() == BUILTIN_PROVIDER_NAME {
-        progress_sink.line("Using mock provider".cyan());
+    } else if let Some(builtin_mock) = ctx.builtin_mock()
+        && provider_config.name() == BUILTIN_PROVIDER_NAME
+    {
+        progress_sink.line("Using mock provider".cyan(color_mode));
         router.add_provider_config(
             provider_config.as_provider_config(),
-            InitializedProvider::unavailable(Box::new(MockProvider::new())),
+            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
         );
     } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
-        eprintln!("{}", message.red());
+        eprintln!("{}", message.red(color_mode));
     }
     Ok(())
 }
@@ -4263,6 +4271,7 @@ pub async fn create_providers_from_configs_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
 ) -> Result<ProviderRouter, AppError> {
+    let color_mode = ctx.runtime().color_mode();
     let mut router = ProviderRouter::new();
 
     // Same two-pass shape as `get_provider_with_ctx`: default instances
@@ -4283,18 +4292,23 @@ pub async fn create_providers_from_configs_with_ctx(
         .await?;
     }
 
-    if ctx.uses_builtin_mock() {
-        router.add_normalizer(BUILTIN_PROVIDER_NAME, Box::new(MockProvider::new()));
+    if let Some(builtin_mock) = ctx.builtin_mock() {
+        router.add_normalizer(
+            BUILTIN_PROVIDER_NAME,
+            Box::new(builtin_mock.create_normalizer()),
+        );
     }
-    if router.is_empty() && ctx.uses_builtin_mock() {
-        ProgressSink::Human.line("Using mock provider".cyan());
+    if router.is_empty()
+        && let Some(builtin_mock) = ctx.builtin_mock()
+    {
+        ProgressSink::Human.line("Using mock provider".cyan(color_mode));
         router.add_provider(
             BUILTIN_PROVIDER_NAME.to_string(),
-            InitializedProvider::unavailable(Box::new(MockProvider::new())),
+            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
         );
         router.add_provider(
             String::new(),
-            InitializedProvider::unavailable(Box::new(MockProvider::new())),
+            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
         );
     }
 
@@ -4324,8 +4338,11 @@ pub(crate) async fn create_normalizers_from_configs_with_ctx(
         }
     }
 
-    if ctx.uses_builtin_mock() {
-        router.add_normalizer(BUILTIN_PROVIDER_NAME, Box::new(MockProvider::new()));
+    if let Some(builtin_mock) = ctx.builtin_mock() {
+        router.add_normalizer(
+            BUILTIN_PROVIDER_NAME,
+            Box::new(builtin_mock.create_normalizer()),
+        );
     }
 
     Ok(router)
@@ -5106,6 +5123,7 @@ impl ProjectedDeferredForExpansionPrelude<'_> {
     /// metadata/alias/exclusion inputs used by expansion.
     pub(crate) fn reconcile_addresses<E>(
         self,
+        color_mode: crate::output_style::ColorMode,
         parsed: &ExpandedFile<E>,
         warning_policy: DeferredForWarningPolicy,
     ) -> Result<ReconciledDeferredForExpansion, AppError> {
@@ -5124,7 +5142,7 @@ impl ProjectedDeferredForExpansionPrelude<'_> {
             prelude.state_file,
             &managed_current,
         );
-        let mut print_warning = |warning: String| eprintln!("{}", warning.yellow());
+        let mut print_warning = |warning: String| eprintln!("{}", warning.yellow(color_mode));
         let mut suppress_warning = |_: String| {};
         let warning_sink: &mut dyn FnMut(String) = match warning_policy {
             DeferredForWarningPolicy::Print => &mut print_warning,
@@ -6824,6 +6842,7 @@ pub(crate) fn expand_same_config_deferred_for<E: Clone>(
     // pending id into a generated id during expansion and make the resource
     // look like a newly materialized loop child.
     let identity_context = WiringContext::new_for_test_with_additional_schemas(
+        &crate::test_support::TestCommandRuntime::new(),
         Vec::new(),
         &parsed.providers,
         schemas
@@ -7319,6 +7338,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     state_block_claims: &StateBlockClaims,
     resolved_state_block_targets: &ResolvedStateBlockTargets,
 ) -> Result<ExpandedPlanContext<E>, AppError> {
+    let color_mode = ctx.runtime().color_mode();
     let parsed = canonical_resources.parsed();
     let raw_provider_configs = provider_configs.as_provider_configs();
     // Mutable: a same-config deferred-for loop is expanded into concrete
@@ -7365,7 +7385,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     let mut orphan_refreshed_ids: HashSet<ResourceId> = HashSet::new();
     let mut orphans = Orphans::new();
 
-    let progress_backend = ProgressBackend::new(progress_sink);
+    let progress_backend = ProgressBackend::new(color_mode, progress_sink);
     let refresh_phase = refresh.then(|| RefreshPhase::start(&progress_backend));
     // Provider reads do not retain Carina-only dependency metadata. Build the
     // restoration map once so both managed refresh and the unconditional
@@ -7439,7 +7459,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         // use the typed late-reconciliation pass after plan preparation.
         expansion_prelude
             .bind_projected_phase1_state(managed_current, orphans, orphan_refreshed_ids)
-            .reconcile_addresses(parsed, DeferredForWarningPolicy::Print)?
+            .reconcile_addresses(color_mode, parsed, DeferredForWarningPolicy::Print)?
     } else {
         // --refresh=false: use cached state from state file instead of calling provider.read()
         if state_file.is_some() {
@@ -7472,7 +7492,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
         }
         expansion_prelude
             .bind_projected_phase1_state(managed_current, orphans, orphan_refreshed_ids)
-            .reconcile_addresses(parsed, DeferredForWarningPolicy::Print)?
+            .reconcile_addresses(color_mode, parsed, DeferredForWarningPolicy::Print)?
     };
 
     // Phase 2 is unconditional: `--refresh=false` skips only managed-resource
@@ -7626,6 +7646,7 @@ fn resolved_state_row_id(
 /// existed in state. Callers use this to add Move effects to the plan.
 #[cfg(test)]
 fn materialize_moved_states(
+    color_mode: crate::output_style::ColorMode,
     managed_current: &mut HashMap<ResourceId, Current>,
     orphans: &mut Orphans,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -7640,7 +7661,7 @@ fn materialize_moved_states(
         saved_attrs,
         state_blocks,
         state_file,
-        &mut |warning| eprintln!("{}", warning.yellow()),
+        &mut |warning| eprintln!("{}", warning.yellow(color_mode)),
     )
 }
 
@@ -9418,7 +9439,8 @@ pub(crate) fn prepare_data_sources_for_plan(
 #[cfg(test)]
 pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     use carina_core::parser::ExpandedParsedFile;
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     let mut parsed = ExpandedParsedFile::default();
     parsed.resources = resources.to_vec();
     errors_to_legacy_result(validate_resources_with_ctx(
@@ -9430,7 +9452,8 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
 
 #[cfg(test)]
 pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     let mut parsed = carina_core::parser::ExpandedParsedFile::default();
     parsed.resources = resources.to_vec();
     let errors = resolve_file_names_with_ctx(&ctx, &mut parsed);
@@ -9440,7 +9463,8 @@ pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
 
 #[cfg(test)]
 pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, resources))
 }
 
@@ -9449,7 +9473,11 @@ pub fn compute_anonymous_identifiers(
     resources: &mut [Resource],
     providers: &[ExpandedProviderConfig],
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new_for_test_with_provider_phase(vec![], providers);
+    let ctx = WiringContext::new_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![],
+        providers,
+    );
     let canonical_resources =
         carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas())?;
     let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, providers);

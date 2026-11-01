@@ -146,6 +146,7 @@ fn cli_validated_file(
     let parsed = loaded.parsed;
     let duplicate_declarations = loaded.duplicate_declarations;
     let providers = carina_cli::wiring::ProviderLoad::for_test_with_provider_phase(
+        &carina_cli::test_support::TestCommandRuntime::new(),
         carina_cli::wiring::LoadedProviderFactory::for_test(factories),
         &parsed.providers,
     );

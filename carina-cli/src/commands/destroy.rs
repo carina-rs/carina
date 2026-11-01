@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::time::Instant;
 
-use colored::Colorize;
+use crate::output_style::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
@@ -121,7 +121,7 @@ impl<'a, F: Future> Future for DestroyInFlight<'a, F> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_destroy(
-    user_dirs: &carina_core::UserDirs,
+    runtime: &crate::runtime::CommandRuntime,
     path: &Path,
     auto_approve: bool,
     lock: bool,
@@ -131,6 +131,7 @@ pub async fn run_destroy(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         path,
         provider_context,
@@ -140,7 +141,7 @@ pub async fn run_destroy(
     let parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    let providers = ProviderLoad::load(user_dirs, &parsed.providers, base_dir)?;
+    let providers = ProviderLoad::load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_evaluated_config(parsed, base_dir, true, &duplicate_declarations)?;
 
@@ -167,19 +168,19 @@ pub async fn run_destroy(
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
-        println!("{}", "Acquiring state lock...".cyan());
+        println!("{}", "Acquiring state lock...".cyan(color_mode));
         let li = backend
             .acquire_lock("destroy")
             .await
             .map_err(|error| map_lock_error(error, path))?;
-        println!("  {} Lock acquired", "✓".green());
+        println!("  {} Lock acquired", "✓".green(color_mode));
         StateLock::held(li)
     } else {
         println!(
             "{}",
             "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         StateLock::disabled_by_cli_flag()
     };
@@ -198,7 +199,7 @@ pub async fn run_destroy(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await?;
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await?;
 
     Ok(())
 }
@@ -349,6 +350,8 @@ async fn run_destroy_locked_owned(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> LockCommandOutcome<Result<(), AppError>> {
+    let color_mode = validated_config.context().runtime().color_mode();
+    let runtime = validated_config.context().runtime().clone();
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
@@ -388,7 +391,7 @@ async fn run_destroy_locked_owned(
     let state_block_claims = validated_config.reconcile_for_destroy(&state_file);
     let (ctx, parsed) = validated_config.context_and_resources();
 
-    let provider_inputs = load_and_resolve_provider_configs(
+    let provider_inputs = load_and_resolve_provider_configs(&runtime,
         parsed,
         base_dir,
         provider_context,
@@ -425,7 +428,7 @@ async fn run_destroy_locked_owned(
     if !refresh {
         eprintln!(
             "{}",
-            "Warning: using cached managed-resource state (--refresh=false). The plan may not reflect actual managed infrastructure.".yellow()
+            "Warning: using cached managed-resource state (--refresh=false). The plan may not reflect actual managed infrastructure.".yellow(color_mode)
         );
     }
 
@@ -433,7 +436,7 @@ async fn run_destroy_locked_owned(
     let mut managed_current: HashMap<ResourceId, Current> = HashMap::new();
 
     if refresh {
-        let progress_backend = ProgressBackend::new(ProgressSink::Human);
+        let progress_backend = ProgressBackend::new(color_mode, ProgressSink::Human);
         let refresh_phase = RefreshPhase::start(&progress_backend);
 
         // Read states for managed resources concurrently using identifier
@@ -492,6 +495,7 @@ async fn run_destroy_locked_owned(
             let next_in_flight = async {
                 if draining {
                     crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                        &runtime,
                         &cancel,
                     )
                     .await;
@@ -589,6 +593,7 @@ async fn run_destroy_locked_owned(
                 let next_in_flight = async {
                     if draining {
                         crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                        &runtime,
                             &cancel,
                         )
                         .await;
@@ -749,7 +754,7 @@ async fn run_destroy_locked_owned(
         for error in identifier_errors {
             error_plan.add_error(error);
         }
-        render_plan_errors_and_abort(&error_plan, base_dir)?;
+        render_plan_errors_and_abort(color_mode, &error_plan, base_dir)?;
     }
 
     let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
@@ -786,7 +791,7 @@ async fn run_destroy_locked_owned(
         && protected_resources.is_empty()
         && prevent_destroy_resources.is_empty()
     {
-        println!("{}", "No resources to destroy.".green());
+        println!("{}", "No resources to destroy.".green(color_mode));
         return Ok(DestroyAfterHeartbeat::Done);
     }
 
@@ -802,7 +807,7 @@ async fn run_destroy_locked_owned(
     // Display destroy plan as a dependency tree
     print!(
         "{}",
-        format_destroy_plan_with_delete_instances(
+        format_destroy_plan_with_delete_instances(color_mode,
             &destroy_plan,
             DetailLevel::Full,
             &historical_display,
@@ -814,9 +819,9 @@ async fn run_destroy_locked_owned(
     for resource in &protected_resources {
         println!(
             "  {} {} {}",
-            "⚠".yellow().bold(),
+            "⚠".yellow(color_mode).bold(color_mode),
             resource.id,
-            "(protected - will be skipped)".yellow()
+            "(protected - will be skipped)".yellow(color_mode)
         );
     }
 
@@ -826,10 +831,10 @@ async fn run_destroy_locked_owned(
         println!(
             "{}",
             "Error: the following resources are protected from destruction:"
-                .red()
-                .bold()
+                .red(color_mode)
+                .bold(color_mode)
         );
-        let failure_progress = ProgressBackend::<()>::new(ProgressSink::Human);
+        let failure_progress = ProgressBackend::<()>::new(color_mode, ProgressSink::Human);
         for (resource, _source) in &prevent_destroy_resources {
             failure_progress.failed_line(FailedOutcome::summary(resource.id.to_string()));
         }
@@ -840,7 +845,7 @@ async fn run_destroy_locked_owned(
         {
             println!(
                 "{}",
-                "At least one resource has `prevent_destroy = true`.".yellow()
+                "At least one resource has `prevent_destroy = true`.".yellow(color_mode)
             );
         }
         if prevent_destroy_resources
@@ -850,10 +855,10 @@ async fn run_destroy_locked_owned(
             println!(
                 "{}",
                 "A resource type is protected from destruction by default; to allow it, write `directives { prevent_destroy = false }`."
-                    .yellow()
+                    .yellow(color_mode)
             );
         }
-        println!("{}", "Use --force to override destruction protection.".yellow());
+        println!("{}", "Use --force to override destruction protection.".yellow(color_mode));
     }
 
     println!();
@@ -865,11 +870,11 @@ async fn run_destroy_locked_owned(
     if counts.guarded > 0 {
         println!(
             "Plan: {} to destroy, {} protected.",
-            counts.to_destroy.to_string().red(),
-            counts.guarded.to_string().yellow()
+            counts.to_destroy.to_string().red(color_mode),
+            counts.guarded.to_string().yellow(color_mode)
         );
     } else {
-        println!("Plan: {} to destroy.", counts.to_destroy.to_string().red());
+        println!("Plan: {} to destroy.", counts.to_destroy.to_string().red(color_mode));
     }
     println!();
 
@@ -884,7 +889,7 @@ async fn run_destroy_locked_owned(
     if should_skip_destroy_execution(delete_effects.len()) {
         println!(
             "{}",
-            "All resources are protected. Nothing to destroy.".yellow()
+            "All resources are protected. Nothing to destroy.".yellow(color_mode)
         );
         return Ok(DestroyAfterHeartbeat::Done);
     }
@@ -894,19 +899,19 @@ async fn run_destroy_locked_owned(
         println!(
             "{}",
             "Do you really want to destroy all resources?"
-                .yellow()
-                .bold()
+                .yellow(color_mode)
+                .bold(color_mode)
         );
         println!(
             "  {}",
-            "This action cannot be undone. Type 'yes' to confirm.".yellow()
+            "This action cannot be undone. Type 'yes' to confirm.".yellow(color_mode)
         );
         // The cursor is hidden command-wide (#3158); reveal it for this
         // irreversible-destroy confirmation so the user does not type
         // blind, and re-hide on scope exit.
         let mut input = String::new();
         {
-            let _reveal = CursorReveal::new();
+            let _reveal = CursorReveal::new(ctx.runtime().cursor());
             print!("\n  Enter a value: ");
             std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
 
@@ -917,16 +922,16 @@ async fn run_destroy_locked_owned(
 
         if input.trim() != "yes" {
             println!();
-            println!("{}", "Destroy cancelled.".yellow());
+            println!("{}", "Destroy cancelled.".yellow(color_mode));
             return Ok(DestroyAfterHeartbeat::Done);
         }
         println!();
     }
 
-    println!("{}", "Destroying resources...".red().bold());
+    println!("{}", "Destroying resources...".red(color_mode).bold(color_mode));
     println!();
 
-    let progress = ProgressBackend::new(ProgressSink::Human);
+    let progress = ProgressBackend::new(color_mode, ProgressSink::Human);
 
     let mut success_count = 0;
     let mut failures = FailureSink::default();
@@ -1039,7 +1044,7 @@ async fn run_destroy_locked_owned(
                     &failed_indices,
                 ) {
                     let failed_dep = &resource_info[failed_dep_idx].0;
-                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(
+                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(color_mode,
                         &completed_counter,
                         destroy_total,
                         effect,
@@ -1081,6 +1086,7 @@ async fn run_destroy_locked_owned(
                 );
 
                 let provider_ref = &provider;
+                let result_runtime = &runtime;
                 let result_shutdown = &cancel;
                 let delete = async move {
                     let started = Instant::now();
@@ -1091,7 +1097,7 @@ async fn run_destroy_locked_owned(
                             delete_request,
                         )
                         .await;
-                    observe_destroy_result_ready_for_tests(result_shutdown).await;
+                    observe_destroy_result_ready_for_tests(result_runtime, result_shutdown).await;
                     (resource_id, generation, started, delete_result)
                 };
                 in_flight.push(DestroyInFlight::new(idx, active_progress, delete));
@@ -1125,7 +1131,7 @@ async fn run_destroy_locked_owned(
                         effect,
                         retry.stopped(DeleteRetryStop::NoProgress),
                         |failure| {
-                            let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
+                            let outcome = FailedOutcome::summary(format_destroy_outcome_summary(color_mode,
                                 &completed_counter,
                                 destroy_total,
                                 effect,
@@ -1150,7 +1156,7 @@ async fn run_destroy_locked_owned(
             for (idx, kind) in classify_destroy_stall(&effects, &deletion_deps, &remaining.into_iter().collect(), &completed_indices) {
                 let (_, effect) = &resource_info[idx];
                 record_destroy_failure(&mut failures, effect, kind, |failure| {
-                    let outcome = FailedOutcome::summary(format_destroy_outcome_summary(
+                    let outcome = FailedOutcome::summary(format_destroy_outcome_summary(color_mode,
                         &completed_counter,
                         destroy_total,
                         effect,
@@ -1206,8 +1212,8 @@ async fn run_destroy_locked_owned(
         match delete_result {
             Ok(()) => {
                 retry_failures.remove(&finished_idx);
-                let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
-                let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(
+                let timing = format!("took {}", format_duration(started.elapsed())).dimmed(color_mode);
+                let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(color_mode,
                     &completed_counter,
                     destroy_total,
                     effect,
@@ -1215,7 +1221,7 @@ async fn run_destroy_locked_owned(
                 ));
                 active_progress.finish(outcome);
                 success_count += 1;
-                observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
+                observe_destroy_success_for_tests(&runtime, success_count, &resource_id, &cancel);
                 let destroyed = DestroyedInstance {
                     id: resource_id,
                     generation,
@@ -1259,14 +1265,14 @@ async fn run_destroy_locked_owned(
                     } else {
                         EffectFailureKind::provider(e)
                     };
-                    let timing = format!("took {}", format_duration(started.elapsed())).dimmed();
+                    let timing = format!("took {}", format_duration(started.elapsed())).dimmed(color_mode);
                     record_destroy_failure(
                         &mut failures,
                         effect,
                         kind,
                         |failure| {
                             let outcome = FailedOutcome::new(
-                                format_destroy_outcome_summary(
+                                format_destroy_outcome_summary(color_mode,
                                     &completed_counter,
                                     destroy_total,
                                     effect,
@@ -1299,7 +1305,7 @@ async fn run_destroy_locked_owned(
                     retry.stopped(DeleteRetryStop::Cancelled),
                     |failure| {
                         progress.failed_line(FailedOutcome::new(
-                            format_destroy_outcome_summary(
+                            format_destroy_outcome_summary(color_mode,
                                 &completed_counter,
                                 destroy_total,
                                 effect,
@@ -1338,7 +1344,7 @@ async fn run_destroy_locked_owned(
                 let effect = &resource_info[idx].1;
                 match outcome {
                     InterruptedDestroyOutcome::Skipped => NonFailureOutcome::skipped(
-                        format_destroy_outcome_summary(
+                        format_destroy_outcome_summary(color_mode,
                             &completed_counter,
                             destroy_total,
                             effect,
@@ -1346,7 +1352,7 @@ async fn run_destroy_locked_owned(
                         ),
                     ),
                     InterruptedDestroyOutcome::Unknown => NonFailureOutcome::unknown(
-                        format_destroy_outcome_summary(
+                        format_destroy_outcome_summary(color_mode,
                             &completed_counter,
                             destroy_total,
                             effect,
@@ -1412,18 +1418,19 @@ async fn run_destroy_locked_owned(
                             skip_count,
                             unknown_count,
                         )
-                        .yellow()
-                        .bold()
+                        .yellow(color_mode)
+                        .bold(color_mode)
                     );
                     return Err(AppError::Interrupted);
                 }
 
                 println!();
-                println!("{}", "Saving state...".cyan());
+                println!("{}", "Saving state...".cyan(color_mode));
 
                 let finalize_result = finalize_after_execute(
                     |persistence| {
                         finalize_destroy(
+                            color_mode,
                             FinalizeDestroyInput {
                                 backend: backend.as_ref(),
                                 lock: lock.as_ref(),
@@ -1449,8 +1456,8 @@ async fn run_destroy_locked_owned(
                                 skip_count,
                                 unknown_count,
                             )
-                            .yellow()
-                            .bold()
+                            .yellow(color_mode)
+                            .bold(color_mode)
                         );
                     }
                     return Err(error);
@@ -1461,8 +1468,8 @@ async fn run_destroy_locked_owned(
                     println!(
                         "{}",
                         format!("Destroy complete! {} resources destroyed.", success_count)
-                            .green()
-                            .bold()
+                            .green(color_mode)
+                            .bold(color_mode)
                     );
                     Ok(())
                 } else {
@@ -1487,6 +1494,8 @@ async fn run_destroy_locked_owned(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_destroy_locked(
+    runtime: &crate::runtime::CommandRuntime,
+    color_mode: crate::output_style::ColorMode,
     parsed: carina_core::parser::InferredFile,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -1499,11 +1508,11 @@ async fn run_destroy_locked(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let providers = match ProviderLoad::load(&user_dirs, &parsed.providers, base_dir) {
+    let providers = match ProviderLoad::load(runtime, &parsed.providers, base_dir) {
         Ok(providers) => providers,
         Err(error) => {
             return finish_lock_command(
+                color_mode,
                 backend.as_ref(),
                 LockCommandOutcome::Kept {
                     result: Err(error),
@@ -1519,6 +1528,7 @@ async fn run_destroy_locked(
         Ok(validated_config) => validated_config,
         Err(error) => {
             return finish_lock_command(
+                color_mode,
                 backend.as_ref(),
                 LockCommandOutcome::Kept {
                     result: Err(error),
@@ -1543,7 +1553,7 @@ async fn run_destroy_locked(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
 
 #[cfg(test)]
@@ -1561,6 +1571,7 @@ async fn run_destroy_locked_with_ctx(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let color_mode = validated_config.context().runtime().color_mode();
     let outcome = run_destroy_locked_owned(
         validated_config,
         auto_approve,
@@ -1575,16 +1586,8 @@ async fn run_destroy_locked_with_ctx(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
 }
-
-#[cfg(test)]
-static DESTROY_SUCCESS_CANCEL_AFTER: std::sync::Mutex<Option<DestroySuccessCancelHook>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-static DESTROY_READY_RESULT_BARRIER: std::sync::Mutex<Option<DestroyReadyResultBarrier>> =
-    std::sync::Mutex::new(None);
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -1614,7 +1617,7 @@ impl DestroyReadyResultBarrier {
 }
 
 #[cfg(test)]
-struct DestroySuccessCancelHook {
+pub(crate) struct DestroySuccessCancelHook {
     threshold: usize,
     trigger: TestShutdownTrigger,
     shutdown: ShutdownToken,
@@ -1622,11 +1625,14 @@ struct DestroySuccessCancelHook {
 
 #[cfg(test)]
 pub(crate) fn set_destroy_success_cancel_after(
+    runtime: &crate::runtime::CommandRuntime,
     threshold: usize,
     trigger: TestShutdownTrigger,
     shutdown: ShutdownToken,
 ) {
-    *DESTROY_SUCCESS_CANCEL_AFTER
+    *runtime
+        .test_hooks()
+        .destroy_success
         .lock()
         .expect("destroy success cancel hook lock") = Some(DestroySuccessCancelHook {
         threshold,
@@ -1636,34 +1642,28 @@ pub(crate) fn set_destroy_success_cancel_after(
 }
 
 #[cfg(test)]
-pub(crate) fn clear_destroy_success_cancel_after() {
-    *DESTROY_SUCCESS_CANCEL_AFTER
-        .lock()
-        .expect("destroy success cancel hook lock") = None;
-}
-
-#[cfg(test)]
 pub(crate) fn install_destroy_ready_result_barrier(
+    runtime: &crate::runtime::CommandRuntime,
     shutdown: ShutdownToken,
 ) -> DestroyReadyResultBarrier {
     let barrier = DestroyReadyResultBarrier::new(shutdown);
-    *DESTROY_READY_RESULT_BARRIER
+    *runtime
+        .test_hooks()
+        .destroy_ready
         .lock()
         .expect("destroy ready result barrier lock") = Some(barrier.clone());
     barrier
 }
 
 #[cfg(test)]
-pub(crate) fn clear_destroy_ready_result_barrier() {
-    *DESTROY_READY_RESULT_BARRIER
-        .lock()
-        .expect("destroy ready result barrier lock") = None;
-}
-
-#[cfg(test)]
-async fn observe_destroy_result_ready_for_tests(shutdown: &ShutdownToken) {
+pub(crate) async fn observe_destroy_result_ready_for_tests(
+    runtime: &crate::runtime::CommandRuntime,
+    shutdown: &ShutdownToken,
+) {
     let barrier = {
-        let mut barrier = DESTROY_READY_RESULT_BARRIER
+        let mut barrier = runtime
+            .test_hooks()
+            .destroy_ready
             .lock()
             .expect("destroy ready result barrier lock");
         if barrier.as_ref().is_some_and(|barrier| {
@@ -1681,15 +1681,22 @@ async fn observe_destroy_result_ready_for_tests(shutdown: &ShutdownToken) {
 }
 
 #[cfg(not(test))]
-async fn observe_destroy_result_ready_for_tests(_shutdown: &ShutdownToken) {}
+async fn observe_destroy_result_ready_for_tests(
+    _runtime: &crate::runtime::CommandRuntime,
+    _shutdown: &ShutdownToken,
+) {
+}
 
 #[cfg(test)]
-fn observe_destroy_success_for_tests(
+pub(crate) fn observe_destroy_success_for_tests(
+    runtime: &crate::runtime::CommandRuntime,
     success_count: usize,
     _resource_id: &ResourceId,
     cancel: &ShutdownToken,
 ) {
-    if let Some(hook) = DESTROY_SUCCESS_CANCEL_AFTER
+    if let Some(hook) = runtime
+        .test_hooks()
+        .destroy_success
         .lock()
         .expect("destroy success cancel hook lock")
         .as_ref()
@@ -1702,6 +1709,7 @@ fn observe_destroy_success_for_tests(
 
 #[cfg(not(test))]
 fn observe_destroy_success_for_tests(
+    _runtime: &crate::runtime::CommandRuntime,
     _success_count: usize,
     _resource_id: &ResourceId,
     _cancel: &ShutdownToken,
@@ -1902,13 +1910,14 @@ fn format_destroy_failure_summary(
 }
 
 fn format_destroy_outcome_summary(
+    color_mode: crate::output_style::ColorMode,
     completed_counter: &AtomicUsize,
     total: usize,
     effect: &Effect,
     detail: impl std::fmt::Display,
 ) -> String {
     let completed = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    let counter = format!("{completed}/{total}").dimmed();
+    let counter = format!("{completed}/{total}").dimmed(color_mode);
     format!("{} {} {}", format_effect(effect), detail, counter)
 }
 
@@ -2178,6 +2187,7 @@ pub(crate) struct FinalizeDestroyInput<'a> {
 }
 
 pub(crate) async fn finalize_destroy(
+    color_mode: crate::output_style::ColorMode,
     input: FinalizeDestroyInput<'_>,
     persistence: StatePersistence,
 ) -> Result<(), AppError> {
@@ -2209,7 +2219,11 @@ pub(crate) async fn finalize_destroy(
             .await?;
         }
     }
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+    println!(
+        "  {} State saved (serial: {})",
+        "✓".green(color_mode),
+        state.serial
+    );
     Ok(())
 }
 
@@ -2389,7 +2403,8 @@ mod tests {
     #[test]
     fn interrupted_destroy_finishes_in_flight_and_undispatched_outcomes() {
         let output = SharedProgressWriter::default();
-        let progress = ProgressBackend::plain(output.clone());
+        let progress =
+            ProgressBackend::plain(crate::output_style::ColorMode::Plain, output.clone());
         let mut active_progress =
             HashMap::from([(0, progress.start_indexed(0, "Delete in-flight"))]);
         let completed = HashSet::from([2]);
@@ -2431,7 +2446,7 @@ mod tests {
     #[should_panic(expected = "dispatched destroy effect must own progress")]
     fn interrupted_destroy_requires_progress_for_dispatched_effect() {
         let output = SharedProgressWriter::default();
-        let progress = ProgressBackend::plain(output);
+        let progress = ProgressBackend::plain(crate::output_style::ColorMode::Plain, output);
         let mut active_progress = HashMap::new();
 
         finish_interrupted_destroy_outcomes(
@@ -2518,6 +2533,7 @@ mod tests {
         let received_role_arn = Arc::new(Mutex::new(None));
         let provider_configs = parsed.providers.clone();
         let validated_config = ValidatedConfig::from_factories_for_test_with_provider_phase(
+            &crate::test_support::TestCommandRuntime::new(),
             parsed,
             vec![Box::new(ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2565,6 +2581,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_provider_resolution_ignores_unrelated_missing_upstream_state() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, downstream, mut parsed) = provider_upstream_fixture();
         let unrelated = downstream.parent().unwrap().join("unrelated");
         std::fs::create_dir_all(&unrelated).unwrap();
@@ -2583,6 +2600,8 @@ mod tests {
         let backend =
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
         run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2601,6 +2620,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn destroy_helper_releases_passed_lock_when_provider_load_hard_fails() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let project = tempfile::tempdir().unwrap();
         let source = format!(
             "file://{}",
@@ -2628,6 +2648,8 @@ mod tests {
         assert!(lock_path.exists(), "fixture must hold the lock");
 
         let error = run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             Arc::clone(&backend),
@@ -2652,6 +2674,7 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_provider_resolution_reports_referenced_missing_upstream_state() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
             downstream
@@ -2665,6 +2688,8 @@ mod tests {
             crate::commands::local_backend_for_test(downstream.join("missing-local-state.json"));
 
         let error = match run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2693,10 +2718,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_local_resource_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2715,10 +2743,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         let (_temp, base_dir, parsed) = provider_default_tags_missing_upstream_fixture();
         let backend = crate::commands::local_backend_for_test(base_dir.join("state.json"));
 
         run_destroy_locked(
+            &crate::test_support::TestCommandRuntime::new(),
+            color_mode,
             parsed,
             true,
             std::sync::Arc::from(backend),
@@ -2797,15 +2828,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_destroy_cancelled_after_partial_execution_persists_deletions_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["first", "second"])
             .cancel_after_successes(1);
         let token = fixture.cancel_token();
-        let load_count = crate::wiring::track_provider_loads_for_test();
+        let loads_before = fixture.runtime().provider_load_count();
 
         let err = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -2822,7 +2852,11 @@ mod tests {
             matches!(err, AppError::Interrupted),
             "expected Interrupted, got {err:?}"
         );
-        assert_eq!(load_count.count(), 1, "destroy must load providers once");
+        assert_eq!(
+            fixture.runtime().provider_load_count() - loads_before,
+            1,
+            "destroy must load providers once"
+        );
         let state = fixture.read_state().await;
         assert!(fixture.state_path().exists());
         assert!(
@@ -2848,10 +2882,6 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["slow"])
             .with_delayed_delete("slow", Duration::from_millis(75));
@@ -2863,7 +2893,7 @@ mod tests {
         .expect("fixture must load");
         let parsed = loaded.parsed;
         let base_dir = get_base_dir(fixture.config_path());
-        let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
+        let providers = ProviderLoad::load(fixture.runtime(), &parsed.providers, base_dir)
             .expect("mock provider must load");
         let validated_config = providers
             .validate_evaluated_config(parsed, base_dir, true, &loaded.duplicate_declarations)
@@ -2895,10 +2925,6 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_managed_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["managed"])
             .with_blocked_read("managed")
@@ -2906,7 +2932,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -2956,10 +2982,6 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_orphan_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_orphaned_resources(["orphan"])
             .with_blocked_read("orphan")
@@ -2967,7 +2989,7 @@ mod tests {
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -3017,17 +3039,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_cleanup_priority_persists_completed_deletion_and_releases_lock() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
-            .lock()
-            .await;
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["z_blocked", "a_completed"])
             .with_blocked_delete("z_blocked");
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,
@@ -3067,14 +3085,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroy_harvests_ready_deletion_before_cleanup_priority() {
-        let user_dirs = carina_core::TestUserDirs::new();
         let fixture = DestroyCancellationFixture::new()
             .with_existing_resources(["ready"])
             .with_delete_result_barrier();
         let shutdown = fixture.cancel_token();
 
         let destroy = run_destroy(
-            &user_dirs,
+            fixture.runtime(),
             fixture.config_path(),
             true,
             true,

@@ -120,6 +120,7 @@ test.Target { resource_type = VPC }
         .validate()
         .unwrap();
     let providers = ProviderLoad::for_fixture_with_additional_schemas(
+        &crate::test_support::TestCommandRuntime::new(),
         Vec::new(),
         &loaded.parsed.providers,
         [
@@ -175,8 +176,15 @@ impl ProviderFactory for EvidenceTestFactory {
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
-            Ok(carina_core::provider::InitializeOutcome::unavailable()
-                .with_provider(Box::new(carina_provider_mock::MockProvider::new())))
+            Ok(
+                carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
+            )
         })
     }
 
@@ -217,6 +225,7 @@ fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile 
         })
         .collect();
     let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         factories,
         contents.provider_configs.as_provider_configs(),
@@ -572,6 +581,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
 
 #[tokio::test]
 async fn refresh_pending_states_updates_saved_state_from_provider_read() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
     let id = resource.id.clone();
     let identifier = "bucket-123";
@@ -606,8 +616,13 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     let pending_identifier =
         AppliedIdentifier::new(identifier).expect("fixture identifier is non-empty");
     queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
-    let failed_refreshes =
-        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+    let failed_refreshes = refresh_pending_states(
+        color_mode,
+        &provider,
+        &mut current_states,
+        &pending_refreshes,
+    )
+    .await;
 
     let mut existing_state = StateFile::new();
     existing_state
@@ -646,6 +661,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
 #[tokio::test]
 async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
     let id = resource.id.clone();
     let identifier = "bucket-123";
@@ -669,8 +685,13 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     let pending_identifier =
         AppliedIdentifier::new(identifier).expect("fixture identifier is non-empty");
     queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
-    let failed_refreshes =
-        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+    let failed_refreshes = refresh_pending_states(
+        color_mode,
+        &provider,
+        &mut current_states,
+        &pending_refreshes,
+    )
+    .await;
 
     let mut existing_state = StateFile::new();
     existing_state
@@ -702,6 +723,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
 
 #[tokio::test]
 async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refresh_fails() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
     let id = resource.id.clone();
     let identifier = "bucket-123";
@@ -725,8 +747,13 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     let pending_identifier =
         AppliedIdentifier::new(identifier).expect("fixture identifier is non-empty");
     queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
-    let failed_refreshes =
-        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+    let failed_refreshes = refresh_pending_states(
+        color_mode,
+        &provider,
+        &mut current_states,
+        &pending_refreshes,
+    )
+    .await;
 
     let mut existing_state = StateFile::new();
     existing_state
@@ -1816,6 +1843,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
 
 #[tokio::test]
 async fn detect_drift_errors_when_resource_missing_from_planned_states() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
 
@@ -1826,6 +1854,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
     let planned_states = Vec::new();
 
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1850,6 +1879,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
 
 #[tokio::test]
 async fn detect_drift_returns_none_when_no_drift() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
@@ -1867,6 +1897,7 @@ async fn detect_drift_returns_none_when_no_drift() {
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), state)];
 
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1883,6 +1914,7 @@ async fn detect_drift_returns_none_when_no_drift() {
 
 #[tokio::test]
 async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("mock", "test.Resource", "main", None);
     let id = resource.id.clone();
     let identifier = "provider-id";
@@ -1923,6 +1955,7 @@ async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
         let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
         let result = detect_drift_for_test(
+            color_mode,
             std::slice::from_ref(&resource),
             &planned_states,
             &MovedOrigins::from_plan(&Plan::new()),
@@ -1940,6 +1973,7 @@ async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
 
 #[tokio::test]
 async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let ignored_comment: ParsedIgnorePath = serde_json::from_value(serde_json::json!({
         "segments": [{ "kind": "attribute", "value": "comment" }]
     }))
@@ -1974,6 +2008,7 @@ async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
     let provider = TestProvider::with_read_state(&id, identifier, actual);
 
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id, planned)],
         &MovedOrigins::from_plan(&Plan::new()),
@@ -1990,6 +2025,7 @@ async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
 
 #[tokio::test]
 async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
     use carina_core::schema::{
         ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
@@ -2056,6 +2092,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     );
 
     let result = crate::commands::apply::detect_drift(
+        color_mode,
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id, planned)],
         &MovedOrigins::from_plan(&Plan::new()),
@@ -2073,6 +2110,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
 
 #[tokio::test]
 async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("secret-value".into()),
     ))));
@@ -2130,6 +2168,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
     );
 
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id.clone(), planned)],
         &MovedOrigins::from_plan(&Plan::new()),
@@ -2146,6 +2185,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
 
 #[tokio::test]
 async fn detect_drift_uses_identifier_carried_by_present_current() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier =
@@ -2159,6 +2199,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
     )];
 
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -2175,6 +2216,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
 
 #[tokio::test]
 async fn detect_drift_returns_messages_when_drift_detected() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
     let id = resource.id.clone();
     let identifier = "my-bucket";
@@ -2202,6 +2244,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
@@ -2393,6 +2436,7 @@ impl StateBackend for MockBackend {
 
 #[tokio::test]
 async fn lock_released_on_write_state_failure() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     // Simulate the caller pattern: finalize_apply + always release lock
     let lock_released = Arc::new(AtomicBool::new(false));
     let backend = MockBackend {
@@ -2406,6 +2450,7 @@ async fn lock_released_on_write_state_failure() {
     // This mirrors the pattern used in run_apply_locked / run_apply_from_plan_locked:
     // call finalize_apply (which may fail), then always release lock in the caller.
     let op_result = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
@@ -2535,12 +2580,14 @@ async fn save_state_locked_calls_renew_lock_and_write_state_locked() {
 
 #[tokio::test]
 async fn finalize_apply_uses_write_state_locked() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let backend = LockTrackingBackend::new();
     let lock = LockInfo::for_test("apply");
 
     let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
@@ -2649,7 +2696,7 @@ impl StateBackend for RefreshTestBackend {
 /// (resources in state but removed from config).
 #[tokio::test]
 async fn state_refresh_removes_orphaned_resource_deleted_externally() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     // State has two resources: "keep" (in config) and "orphan" (not in config).
     // The fixture uses the built-in mock provider's registered managed type so
     // every refreshed row has an owner schema.
@@ -2720,7 +2767,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 
 #[tokio::test]
 async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let mut state = StateFile::new();
     let mut row = ResourceState::new("s3.Bucket", "deposed-bucket", "");
     row.deposed.push(DeposedInstance::from_persisted_json(
@@ -2772,7 +2819,6 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
 
 #[tokio::test]
 async fn state_refresh_locked_updates_alive_deposed_generation() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     std::fs::write(
@@ -2786,11 +2832,10 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         .to_string(),
     )
     .expect("mock provider state");
-
-    let previous_mock_state = std::env::var_os("CARINA_MOCK_STATE_FILE");
-    unsafe {
-        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-    }
+    let runtime = crate::test_support::TestCommandRuntime::with_mock(
+        carina_provider_mock::MockBehavior::default(),
+        carina_provider_mock::MockScope::file(std::path::PathBuf::from(&mock_state_path)).unwrap(),
+    );
 
     let mut state = StateFile::new();
     let mut row = ResourceState::new("s3.Bucket", "alive-deposed-bucket", "");
@@ -2812,7 +2857,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     let parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
     let providers =
-        ProviderLoad::load(&user_dirs, &parsed.providers, std::path::Path::new(".")).unwrap();
+        ProviderLoad::load(&runtime, &parsed.providers, std::path::Path::new(".")).unwrap();
     let validated_config = providers
         .validate_evaluated_config(
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed),
@@ -2831,13 +2876,6 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
-
-    unsafe {
-        match previous_mock_state {
-            Some(value) => std::env::set_var("CARINA_MOCK_STATE_FILE", value),
-            None => std::env::remove_var("CARINA_MOCK_STATE_FILE"),
-        }
-    }
 
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
     let written = backend
@@ -2886,12 +2924,14 @@ async fn save_state_unlocked_uses_write_state_without_lock() {
 /// Test that finalize_apply with lock=None uses write_state (unlocked path).
 #[tokio::test]
 async fn finalize_apply_without_lock_uses_write_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let backend = LockTrackingBackend::new();
     let state_lock = StateLock::disabled_for_test();
 
     let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
@@ -2930,6 +2970,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
 
 #[tokio::test]
 async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
@@ -2968,6 +3009,7 @@ async fn finalize_apply_resolves_exports_from_execution_result_data_sources() {
     });
 
     let _ = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
@@ -3011,7 +3053,11 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         &carina_core::parser::ProviderContext::default(),
     )
     .unwrap();
-    let ctx = WiringContext::new_for_test_with_provider_phase(vec![], &parsed.providers);
+    let ctx = WiringContext::new_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![],
+        &parsed.providers,
+    );
 
     assert!(
         ctx.factories().is_empty(),
@@ -3037,7 +3083,8 @@ fn wiring_context_constructs_factories_and_schemas_once() {
 
 #[test]
 fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
-    let ctx = WiringContext::new_for_test(vec![], &[]);
+    let ctx =
+        WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
 
     assert!(ctx.known_providers().contains("mock"));
     assert!(ctx.schemas().has_managed("mock", "test.resource"));
@@ -4590,6 +4637,7 @@ fn builtin_mock_provider_config() -> ExpandedProviderConfig {
 
 fn builtin_mock_recording_context() -> ValidatedConfig<()> {
     ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         Vec::new(),
         &[builtin_mock_provider_config()],
@@ -4715,7 +4763,12 @@ fn zero_referenced_provider_plan_round_trips() {
 
     let recorded = contents
         .record_for_test(
-            &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
             Vec::new(),
         )
         .expect("providerless evidence must record the built-in mock");
@@ -4756,7 +4809,12 @@ fn state_only_unloaded_provider_records_absent_schema_and_round_trips() {
         )),
     )];
 
-    let ctx = ValidatedConfig::from_factories_for_test((), Vec::new(), &[]);
+    let ctx = ValidatedConfig::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
+        (),
+        Vec::new(),
+        &[],
+    );
     let recorded = contents
         .record_for_test(&ctx, Vec::new())
         .expect("a state-only type from an unloaded provider must record");
@@ -4807,8 +4865,12 @@ fn recording_invalid_provider_artifact_inventory_does_not_panic() {
     contents.sorted_resources.clear();
     contents.current_states.clear();
 
-    let ctx =
-        ValidatedConfig::from_factories_for_test_with_provider_phase((), Vec::new(), &[configured]);
+    let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        (),
+        Vec::new(),
+        &[configured],
+    );
     let error = contents
         .record_for_test(&ctx, Vec::new())
         .expect_err("a configured provider without a loaded artifact must be rejected");
@@ -4877,6 +4939,7 @@ impl StateBackend for CapturingBackend {
 
 #[tokio::test]
 async fn persist_exports_only_clears_state_exports_when_params_empty() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let captured = Arc::new(Mutex::new(None));
     let backend = CapturingBackend {
         captured: captured.clone(),
@@ -4888,6 +4951,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
     state_in.insert_export_json_for_test("old", serde_json::json!("stale"));
 
     let result = crate::commands::apply::persist_exports_only(
+        color_mode,
         &backend,
         StateLockRef::Held(&lock),
         Some(state_in),
@@ -4915,6 +4979,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
 
 #[tokio::test]
 async fn persist_exports_only_writes_state_with_new_exports() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::{ConcreteValue, Value};
 
@@ -4933,6 +4998,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     }];
 
     let result = crate::commands::apply::persist_exports_only(
+        color_mode,
         &backend,
         StateLockRef::Held(&lock),
         Some(StateFile::new()),
@@ -4963,6 +5029,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
 
 #[tokio::test]
 async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
@@ -4982,6 +5049,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
     }];
 
     let result = crate::commands::apply::persist_exports_only(
+        color_mode,
         &backend,
         StateLockRef::Held(&lock),
         Some(state_in),
@@ -5022,6 +5090,7 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
 /// removal lines and the state never converged.
 #[tokio::test]
 async fn finalize_apply_clears_state_exports_when_params_empty() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let captured = Arc::new(Mutex::new(None));
     let backend = CapturingBackend {
         captured: captured.clone(),
@@ -5043,6 +5112,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
     let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
@@ -5084,6 +5154,7 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
 /// apply` reconciles them.
 #[tokio::test]
 async fn finalize_apply_preserves_state_exports_when_params_none() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let captured = Arc::new(Mutex::new(None));
     let backend = CapturingBackend {
         captured: captured.clone(),
@@ -5096,6 +5167,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
     let result = ApplyResult::empty();
 
     let op_result = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
@@ -5129,6 +5201,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
 
 #[tokio::test]
 async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::parser::ExpandedInferredExportParam as InferredExportParam;
     use carina_core::resource::AccessPath;
 
@@ -5198,6 +5271,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     ];
 
     let op_result = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(
@@ -5260,6 +5334,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
 
 #[tokio::test]
 async fn finalize_apply_persists_resource_state_before_reporting_export_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::parser::{ExpandedInferredExportParam as InferredExportParam, TypeExpr};
 
     let captured = Arc::new(Mutex::new(None));
@@ -5298,6 +5373,7 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     }];
 
     let error = finalize_apply(
+        color_mode,
         FinalizeApplyInput {
             result: &result,
             state_base: crate::commands::shared::incremental_state_saver::FinalStateBase::for_test(

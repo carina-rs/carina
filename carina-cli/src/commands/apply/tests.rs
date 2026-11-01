@@ -32,7 +32,6 @@ mod cancellation_fixture;
 use cancellation_fixture::ApplyCancellationFixture;
 
 use crate::commands::plan::PlanFileContents;
-use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 use crate::wiring::{
@@ -74,6 +73,7 @@ fn validate_with_test_factories(
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
 ) -> Vec<AppError> {
     let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
+        &crate::test_support::TestCommandRuntime::new(),
         crate::wiring::LoadedProviderFactory::for_test(factories),
         &parsed.providers,
         load_errors,
@@ -805,6 +805,7 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
 
 #[tokio::test]
 async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let json = serde_json::json!({
         "version": 10,
         "serial": 1,
@@ -850,6 +851,7 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
         HashMap::from([("name".to_string(), string_value("kept"))]),
     );
     let result = detect_drift_for_test(
+        color_mode,
         &[resource],
         &[crate::commands::plan::ReloadedCurrentStateEntry::managed(
             id,
@@ -938,6 +940,7 @@ where
 
 fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
     let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         Vec::new(),
         contents.provider_configs.as_provider_configs(),
@@ -953,6 +956,7 @@ fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry
         .map(|(provider, _resource_type, _kind, schema)| (provider.to_string(), schema.clone()))
         .collect::<Vec<_>>();
     let ctx = ValidatedConfig::from_factories_with_additional_schemas_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         Vec::new(),
         contents.provider_configs.as_provider_configs(),
@@ -1135,21 +1139,22 @@ async fn run_saved_plan_schema_fingerprint_case(
     resource_type: &str,
     identity: &str,
     secret_bearing: bool,
+    start: Option<std::sync::Arc<std::sync::Barrier>>,
 ) -> (Result<Option<Duration>, AppError>, String) {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     let op_log_path = tmp.path().join("provider-operations.log");
     std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
-    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        &mock_state_path,
-    );
-    let _op_log = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_OP_LOG",
-        &op_log_path,
+    fixture.configure_mock(
+        carina_provider_mock::MockBehavior {
+            observations: carina_provider_mock::MockObservations {
+                operation_log: Some(std::path::PathBuf::from(&op_log_path)),
+                ..carina_provider_mock::MockObservations::default()
+            },
+            ..carina_provider_mock::MockBehavior::default()
+        },
+        carina_provider_mock::MockScope::file(std::path::PathBuf::from(&mock_state_path)).unwrap(),
     );
 
     let mut resource = Resource::with_provider(
@@ -1208,8 +1213,11 @@ async fn run_saved_plan_schema_fingerprint_case(
     let plan_file = record_with_test_schemas(contents, planning_schemas);
 
     let observer_factory = fixture.observer_factory();
+    if let Some(start) = start {
+        start.wait();
+    }
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -1225,8 +1233,82 @@ async fn run_saved_plan_schema_fingerprint_case(
         false,
     )
     .await;
+    assert_eq!(fixture.runtime().provider_load_count(), 1);
+    if matches!(result, Err(AppError::SavedPlanSchemaMismatch(_))) {
+        assert_eq!(std::fs::read_to_string(&mock_state_path).unwrap(), "{}");
+    }
     let operations = std::fs::read_to_string(op_log_path).unwrap_or_default();
     (result, operations)
+}
+
+#[test]
+fn concurrent_cli_invocations_keep_mock_runtime_separate() {
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|threads| {
+        let a_start = start.clone();
+        let a = threads.spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
+                    .attribute(
+                        AttributeSchema::required("name", AttributeType::string()).build(),
+                    )]);
+                let (result, operations) = run_saved_plan_schema_fingerprint_case(
+                    &schemas,
+                    "removed.Widget",
+                    "same",
+                    true,
+                    Some(a_start),
+                )
+                .await;
+                assert!(matches!(result, Err(AppError::SavedPlanSchemaMismatch(_))));
+                assert_eq!(
+                    operations, "",
+                    "schema rejection must not observe another invocation's orphan read"
+                );
+            });
+        });
+        let b = threads.spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            runtime.block_on(async {
+                let mut fixture = crate::commands::shared::cancellation_test_support::CancellationFixtureBase::new();
+                let provider_state = fixture.readiness_path("mock.json");
+                let log = fixture.readiness_path("operations.log");
+                let state_path = fixture.state_path().display();
+                fixture.write_crn(format!("backend local {{ path = \"{state_path}\" }}\nprovider mock {{}}\n"));
+                fixture.write_backend_lock();
+                let mut state = StateFile::new();
+                let mut orphan = ResourceState::try_applied("test.resource", "orphan", "mock", "mock-id").unwrap();
+                orphan.set_persisted_attribute("name".to_owned(), serde_json::json!("scope-b"));
+                state.upsert_resource(orphan).unwrap();
+                fixture.write_state(&state);
+                let encoded = serde_json::json!({"test.resource.orphan": {"name": "scope-b"}}).to_string();
+                std::fs::write(&provider_state, &encoded).unwrap();
+                fixture.configure_mock(carina_provider_mock::MockBehavior {
+                    observations: carina_provider_mock::MockObservations { operation_log: Some(log.clone()), ..Default::default() },
+                    ..Default::default()
+                }, carina_provider_mock::MockScope::file(provider_state.clone()).unwrap());
+                start.wait();
+                crate::commands::state::run_state_refresh(
+                    fixture.runtime(), fixture.config_path(), true, &ProviderContext::default(), fixture.shutdown_token(),
+                ).await.unwrap();
+                assert_eq!(fixture.runtime().provider_load_count(), 1);
+                assert_eq!(std::fs::read_to_string(provider_state).unwrap(), encoded);
+                let operations = std::fs::read_to_string(log).unwrap();
+                assert!(operations.lines().any(|line| line == "read test.resource.orphan"));
+                assert!(!operations.contains("removed.Widget"));
+                let saved = fixture.read_state().await;
+                let row = saved.find_resource("mock", "test.resource", "orphan").unwrap();
+                assert_eq!(row.persisted_attributes().unwrap().get("name"), Some(string_value("scope-b")));
+            });
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+    });
 }
 
 #[tokio::test]
@@ -1234,9 +1316,14 @@ async fn saved_plan_apply_rejects_removed_provider_type_before_provider_call() {
     let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
         .attribute(AttributeSchema::required("name", AttributeType::string()).build())]);
 
-    let (result, operations) =
-        run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "gone", false)
-            .await;
+    let (result, operations) = run_saved_plan_schema_fingerprint_case(
+        &planning_schemas,
+        "removed.Widget",
+        "gone",
+        false,
+        None,
+    )
+    .await;
     let error = result.expect_err("a removed planned type must invalidate the saved plan");
     let AppError::SavedPlanSchemaMismatch(mismatch) = &error else {
         panic!("expected typed schema mismatch, got {error:?}");
@@ -1266,9 +1353,14 @@ async fn secret_bearing_saved_plan_checks_schema_before_secret_rehydration() {
     let planning_schemas = mock_schema_registry([ResourceSchema::new("removed.Widget")
         .attribute(AttributeSchema::required("name", AttributeType::string()).build())]);
 
-    let (result, operations) =
-        run_saved_plan_schema_fingerprint_case(&planning_schemas, "removed.Widget", "secret", true)
-            .await;
+    let (result, operations) = run_saved_plan_schema_fingerprint_case(
+        &planning_schemas,
+        "removed.Widget",
+        "secret",
+        true,
+        None,
+    )
+    .await;
     let error = result.expect_err("schema mismatch must win over unavailable secret inputs");
     assert!(
         matches!(error, AppError::SavedPlanSchemaMismatch(_)),
@@ -1300,6 +1392,7 @@ async fn saved_plan_apply_rejects_changed_attribute_flag_before_provider_call() 
         "test.resource",
         "changed",
         false,
+        None,
     )
     .await;
     let error = result.expect_err("a changed write_only flag must invalidate the saved plan");
@@ -1325,6 +1418,7 @@ async fn saved_plan_apply_accepts_unchanged_provider_schema() {
         "test.resource",
         "unchanged",
         false,
+        None,
     )
     .await;
     result.expect("an unchanged provider schema must remain executable");
@@ -1381,7 +1475,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
         ProviderLoad::for_test_with_provider_phase::<
             carina_core::resource::NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
-        >(Vec::new(), &[])
+        >(fixture.runtime(), Vec::new(), &[])
         .into_complete()
         .expect("test provider load is complete"),
         Path::new("."),
@@ -1612,6 +1706,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.compositions = vec![current];
     let provider_inputs = load_and_resolve_provider_configs(
+        &crate::test_support::TestCommandRuntime::new(),
         &parsed,
         tmp.path(),
         &ProviderContext::default(),
@@ -1643,7 +1738,12 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         wait_bindings: Vec::new(),
     }
     .record_for_test(
-        &ValidatedConfig::from_factories_for_test((), Vec::new(), &[]),
+        &ValidatedConfig::from_factories_for_test(
+            &crate::test_support::TestCommandRuntime::new(),
+            (),
+            Vec::new(),
+            &[],
+        ),
         Vec::new(),
     )
     .expect("test plan provider evidence must be valid");
@@ -1699,7 +1799,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
 #[tokio::test]
 async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_corrupt() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let source_file = tmp.path().join("source.crn");
     std::fs::write(&source_file, "source fixture").expect("write composition source");
@@ -1803,9 +1903,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
 
 #[tokio::test]
 async fn saved_plan_persists_pending_state_migration_before_drift_return() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let state_path = tmp.path().join("carina.state.json");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
@@ -1875,13 +1973,11 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     let plan_file = record_with_builtin_mock_schemas(contents);
     let backend =
         Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
-    unsafe {
-        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-    }
+    fixture.use_mock_file(std::path::PathBuf::from(&mock_state_path));
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -1898,9 +1994,6 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     )
     .await;
 
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-    }
     let error = result.expect_err("drift must still abort the saved-plan apply");
     assert!(error.to_string().contains("drift"), "error: {error}");
     let persisted: serde_json::Value =
@@ -2001,7 +2094,7 @@ impl ProviderFactory for FailBCreateFactory {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let project = tempfile::tempdir().expect("tempdir");
     let source_path = project.path().join("broken-provider.wasm");
     let installed_path = project
@@ -2021,6 +2114,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         binding: None,
     };
     let planning_context = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &user_dirs,
         (),
         vec![Box::new(FailBCreateFactory)],
         std::slice::from_ref(&provider_config),
@@ -2096,7 +2190,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let project = tempfile::tempdir().expect("tempdir");
     let source = format!(
         "file://{}",
@@ -2116,6 +2210,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
     };
     let provider_configs = vec![provider_config.clone(), provider_config];
     let planning_context = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &user_dirs,
         (),
         vec![Box::new(FailBCreateFactory)],
         &provider_configs,
@@ -2178,8 +2273,6 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
 
 #[tokio::test]
 async fn secret_bearing_saved_plan_apply_loads_providers_once() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new();
     let config = format!(
         r#"backend local {{ path = "{}" }}
@@ -2191,15 +2284,12 @@ let secret_resource = mock.test.resource {{
 "#,
         fixture.state_path().display()
     );
-    let fixture = fixture.with_raw_config(config);
+    let mut fixture = fixture.with_raw_config(config);
     let provider_state_path = fixture.config_path().join("mock-provider-state.json");
-    let _provider_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        &provider_state_path,
-    );
+    fixture.use_mock_file(std::path::PathBuf::from(&provider_state_path));
     let plan_path = fixture.config_path().join("plan.json");
     crate::commands::plan::run_plan(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         Some(&plan_path),
         None,
@@ -2215,9 +2305,9 @@ let secret_resource = mock.test.resource {{
     .await
     .expect("secret-bearing plan must be recorded");
 
-    let load_count = crate::wiring::track_provider_loads_for_test();
+    let loads_before = fixture.runtime().provider_load_count();
     run_apply_from_plan(
-        &user_dirs,
+        fixture.runtime(),
         &plan_path,
         true,
         false,
@@ -2230,7 +2320,7 @@ let secret_resource = mock.test.resource {{
     .expect("secret-bearing saved plan must apply");
 
     assert_eq!(
-        load_count.count(),
+        fixture.runtime().provider_load_count() - loads_before,
         1,
         "current-config secret validation and locked verification must share one provider load"
     );
@@ -2241,11 +2331,17 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     let (_temp, downstream, parsed) =
         crate::provider_upstream_test_support::provider_upstream_fixture();
     let expanded = resolve_file_for_test(parsed);
-    let inputs = load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
-        .await
-        .expect("bootstrap provider inputs must resolve");
+    let inputs = load_apply_provider_inputs(
+        &crate::test_support::TestCommandRuntime::new(),
+        &expanded,
+        &downstream,
+        &ProviderContext::default(),
+    )
+    .await
+    .expect("bootstrap provider inputs must resolve");
     let received_role_arn = Arc::new(Mutex::new(None));
     let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
         (),
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
@@ -2274,11 +2370,17 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
         .into_expanded()
         .expect("provider default-tags fixture has no parser placeholders");
 
-    let error =
-        match load_apply_provider_inputs(&parsed, &base_dir, &ProviderContext::default()).await {
-            Ok(_) => panic!("apply must load every declared upstream strictly"),
-            Err(error) => error,
-        };
+    let error = match load_apply_provider_inputs(
+        &crate::test_support::TestCommandRuntime::new(),
+        &parsed,
+        &base_dir,
+        &ProviderContext::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("apply must load every declared upstream strictly"),
+        Err(error) => error,
+    };
 
     let message = error.to_string();
     assert!(message.contains("upstream_state 'mgmt'"), "{message}");
@@ -2287,7 +2389,7 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
 
 #[tokio::test]
 async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let upstream = temp.path().join("upstream");
     let downstream = temp.path().join("downstream");
@@ -2328,7 +2430,7 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
 
 #[tokio::test]
 async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let upstream = temp.path().join("upstream");
     let downstream = temp.path().join("downstream");
@@ -2379,10 +2481,14 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     let expanded = resolve_module_file_for_test(parsed.clone().into_parsed())
         .into_expanded()
         .expect("provider upstream fixture has no parser placeholders");
-    let stale_inputs =
-        load_apply_provider_inputs(&expanded, &downstream, &ProviderContext::default())
-            .await
-            .unwrap();
+    let stale_inputs = load_apply_provider_inputs(
+        &user_dirs,
+        &expanded,
+        &downstream,
+        &ProviderContext::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         stale_inputs.configs().as_provider_configs()[0]
             .attributes
@@ -2403,6 +2509,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     .expect("bootstrap reload must succeed");
     let received_role_arn = Arc::new(Mutex::new(None));
     let ctx = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &user_dirs,
         vec![Box::new(
             crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
                 received_role_arn: Arc::clone(&received_role_arn),
@@ -2442,7 +2549,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
 
 #[test]
 fn bootstrap_reload_rejects_nested_forwarding_mismatch() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     let fixture = tempfile::tempdir().expect("tempdir");
     let outer = fixture.path().join("outer");
     let inner = outer.join("inner");
@@ -2549,7 +2656,7 @@ let y = m { n = x.s }
 
 #[test]
 fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
-    let user_dirs = carina_core::TestUserDirs::new();
+    let user_dirs = crate::test_support::TestCommandRuntime::new();
     for nested in [false, true] {
         let fixture = write_module_output_mismatch_fixture(nested);
         let loaded = load_configuration_with_config(
@@ -3316,6 +3423,7 @@ async fn run_apply_cascade_fixture(
     shared: &ApplyCascadeShared,
 ) -> Result<Option<Duration>, AppError> {
     let wiring = ValidatedWiring::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -3671,6 +3779,7 @@ fn load_and_resolve_module_data_source_fixture(
     .expect("module data-source fixture must load");
     let unresolved_parsed = loaded.unresolved_parsed;
     let providers = crate::wiring::ProviderLoad::for_test_with_load_errors(
+        &crate::test_support::TestCommandRuntime::new(),
         crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })]),
@@ -3713,6 +3822,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     );
 
     let wiring = ValidatedWiring::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -3785,6 +3895,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let (parsed, unresolved_parsed) =
         load_and_resolve_module_data_source_fixture(&fixture, &shared);
     let wiring = ValidatedWiring::from_factories_for_test(
+        &crate::test_support::TestCommandRuntime::new(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -3887,6 +3998,7 @@ let lookup = read mock.iam.Roles {{
         >::resource_ref("checked", "value", Vec::new()),
     );
     let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -4074,9 +4186,7 @@ fn saved_plan_data_source_outcomes_must_match_configured_set_exactly() {
 
 #[tokio::test]
 async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     std::fs::write(
@@ -4090,9 +4200,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     )
     .expect("mock provider state");
 
-    unsafe {
-        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-    }
+    fixture.use_mock_file(std::path::PathBuf::from(&mock_state_path));
 
     let target_id = ResourceId::with_provider_identity("mock", "test.resource", "target", None);
     let mut target: Resource = Resource::with_provider("mock", "test.resource", "target", None);
@@ -4212,7 +4320,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4228,10 +4336,6 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         false,
     )
     .await;
-
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-    }
 
     result.expect("saved-plan apply should execute the deferred read before consumer create");
     let state = fixture.read_state().await;
@@ -4250,18 +4354,22 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
 #[tokio::test]
 async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new();
+    let mut fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     let op_log_path = tmp.path().join("op.log");
     std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
 
-    unsafe {
-        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-        std::env::set_var("CARINA_MOCK_OP_LOG", &op_log_path);
-    }
+    fixture.configure_mock(
+        carina_provider_mock::MockBehavior {
+            observations: carina_provider_mock::MockObservations {
+                operation_log: Some(std::path::PathBuf::from(&op_log_path)),
+                ..carina_provider_mock::MockObservations::default()
+            },
+            ..carina_provider_mock::MockBehavior::default()
+        },
+        carina_provider_mock::MockScope::file(std::path::PathBuf::from(&mock_state_path)).unwrap(),
+    );
 
     let mut producer: Resource = Resource::with_provider("mock", "test.resource", "producer", None);
     producer.binding = Some(absolute_binding("producer"));
@@ -4334,7 +4442,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     let observer_factory = fixture.observer_factory();
     let result = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4350,11 +4458,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         false,
     )
     .await;
-
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-        std::env::remove_var("CARINA_MOCK_OP_LOG");
-    }
 
     let error = result.expect_err("saved-plan module constraint must fail apply");
     assert!(error.to_string().contains("1 failed"), "error: {error}");
@@ -4376,7 +4479,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
 #[tokio::test]
 async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let mut source_identities = CompositionSourceIdentityResolver::new(tmp.path())
@@ -4409,7 +4511,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
     let observer_factory = fixture.observer_factory();
     let error = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4443,7 +4545,6 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
 #[tokio::test]
 async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let contents = PlanFileContents {
@@ -4493,7 +4594,7 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4522,7 +4623,6 @@ async fn saved_plan_provider_validation_preserves_typed_terminal_error() {
 
 #[tokio::test]
 async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_provider_temp, downstream, _) =
@@ -4555,6 +4655,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     .into_expanded()
     .expect("saved-plan provider fixture has no parser placeholders");
     let plan_inputs = load_and_resolve_provider_configs(
+        fixture.runtime(),
         &parsed,
         &downstream,
         &ProviderContext::default(),
@@ -4604,7 +4705,7 @@ async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         &ProviderContext::default(),
         true,
@@ -4638,7 +4739,7 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     let unresolved_parsed = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
         carina_core::parser::ParsedFile::default(),
     );
-    let wiring = ValidatedWiring::from_factories_for_test(Vec::new(), &[]);
+    let wiring = ValidatedWiring::from_factories_for_test(fixture.runtime(), Vec::new(), &[]);
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_locked(
@@ -4843,16 +4944,15 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
 
 #[tokio::test]
 async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases_lock() {
-    let user_dirs = carina_core::TestUserDirs::new();
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["first", "second", "third"])
         .cancel_after_successes(1);
     let token = fixture.cancel_token();
-    let load_count = crate::wiring::track_provider_loads_for_test();
+    let loads_before = fixture.runtime().provider_load_count();
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         true,
         true,
@@ -4869,7 +4969,11 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
         matches!(err, AppError::Interrupted),
         "expected Interrupted, got {err:?}"
     );
-    assert_eq!(load_count.count(), 1, "live apply must load providers once");
+    assert_eq!(
+        fixture.runtime().provider_load_count() - loads_before,
+        1,
+        "live apply must load providers once"
+    );
 
     let state = fixture.read_state().await;
     assert!(fixture.state_path().exists());
@@ -4897,15 +5001,10 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
 
 #[tokio::test]
 async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new()
+    let mut fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
         .with_delayed_create("slow", Duration::from_millis(75));
-    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        fixture.config_path().join("source-apply-mock-state.json"),
-    );
+    fixture.use_mock_file(fixture.config_path().join("source-apply-mock-state.json"));
     let loaded = load_configuration_with_config(
         fixture.config_path(),
         fixture.provider_context(),
@@ -4915,7 +5014,7 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
     let parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
-    let providers = ProviderLoad::load(&user_dirs, &parsed.providers, base_dir)
+    let providers = ProviderLoad::load(fixture.runtime(), &parsed.providers, base_dir)
         .expect("mock provider must load");
     let validated_config = providers
         .validate_config_pair(
@@ -4960,15 +5059,10 @@ async fn apply_reports_heartbeat_lock_loss_instead_of_user_interrupt() {
 
 #[tokio::test]
 async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    let fixture = ApplyCancellationFixture::new()
+    let mut fixture = ApplyCancellationFixture::new()
         .with_resources(["slow"])
         .with_delayed_create("slow", Duration::from_millis(75));
-    let _mock_state = crate::commands::shared::cancellation_test_support::ScopedEnv::set(
-        "CARINA_MOCK_STATE_FILE",
-        fixture.config_path().join("saved-plan-mock-state.json"),
-    );
+    fixture.use_mock_file(fixture.config_path().join("saved-plan-mock-state.json"));
     let mut resource: Resource = Resource::with_provider("mock", "test.resource", "slow", None);
     resource.binding = Some(absolute_binding("slow"));
     resource.set_attr("name", string_value("slow"));
@@ -5016,7 +5110,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     let lock = LockInfo::for_test_with_timeout("apply", Duration::from_millis(15));
 
     let error = run_apply_from_plan_locked(
-        &user_dirs,
+        fixture.runtime(),
         inspected_saved_plan(plan_file),
         fixture.provider_context(),
         true,
@@ -5042,7 +5136,6 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
 #[tokio::test]
 async fn apply_cancel_token_integration_persists_completed_state_releases_lock_and_returns_interrupted()
  {
-    let user_dirs = carina_core::TestUserDirs::new();
     // Regression test for #3498: a cancelled apply must persist completed
     // resources to state, release the lock, and return AppError::Interrupted.
     // The resource names mirror the publish-ALB scenario that surfaced this
@@ -5054,7 +5147,7 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
     let observer_factory = fixture.observer_factory();
     let err = run_apply_with_observer_factory(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         true,
         true,
@@ -5092,8 +5185,6 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
 #[tokio::test]
 async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
-    let user_dirs = carina_core::TestUserDirs::new();
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     let fixture = ApplyCancellationFixture::new()
         .with_resources(["a_completed", "z_blocked"])
         .with_blocked_create("z_blocked");
@@ -5101,7 +5192,7 @@ async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
     let observer_factory = fixture.observer_factory();
 
     let apply = run_apply_with_observer_factory(
-        &user_dirs,
+        fixture.runtime(),
         fixture.config_path(),
         true,
         true,
@@ -5141,10 +5232,6 @@ async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
 
 #[tokio::test]
 async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
-    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
-    unsafe {
-        std::env::remove_var("CARINA_MOCK_STATE_FILE");
-    }
     let fixture = ApplyCancellationFixture::new()
         .with_resources_and_exports(["a", "b"], &[("ax", "a.name"), ("bx", "b.id")]);
     let loaded = load_configuration_with_config(
@@ -5168,7 +5255,11 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let wiring = ValidatedWiring::from_factories_for_test(vec![Box::new(FailBCreateFactory)], &[]);
+    let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
+        vec![Box::new(FailBCreateFactory)],
+        &[],
+    );
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
         validated_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
@@ -5245,6 +5336,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
         "fixture must validate, got: {validation_errors:?}"
     );
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -5308,6 +5400,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("vpc-old");
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -5376,6 +5469,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("subnet-old");
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -5604,6 +5698,7 @@ awscc.ec2.Subnet {{
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyCascadeAwsccFactory {
             shared: shared.clone(),
         })],
@@ -5728,6 +5823,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         "fixture must validate, got: {validation_errors:?}"
     );
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -5851,6 +5947,7 @@ let nat = mock.ec2.NatGateway {{
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6024,6 +6121,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6191,6 +6289,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6500,6 +6599,7 @@ let consumer = mock.iam.Role {{
         "fixture must validate, got: {validation_errors:?}"
     );
     let wiring = ValidatedWiring::from_factories_for_test(
+        fixture.runtime(),
         vec![Box::new(ApplyTimeReadFactory {
             shared: shared.clone(),
         })],
@@ -6811,6 +6911,7 @@ impl StateBackend for BootstrapWriteFailureBackend {
 }
 
 async fn bootstrap_declared_state_bucket(
+    color_mode: crate::output_style::ColorMode,
     provider: &BootstrapRecordingProvider,
     backend: &dyn StateBackend,
 ) -> Result<(Resource, SchemaRegistry), AppError> {
@@ -6837,6 +6938,7 @@ async fn bootstrap_declared_state_bucket(
     let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
 
     create_checked_bootstrap_resource_for_test(
+        color_mode,
         provider,
         resource.clone(),
         BootstrapCreateContext {
@@ -6855,14 +6957,16 @@ async fn bootstrap_declared_state_bucket(
 
 #[tokio::test]
 async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
-        .await
-        .expect("declared state bucket create must seed state");
+    let (resource, _schemas) =
+        bootstrap_declared_state_bucket(color_mode, &provider, backend.as_ref())
+            .await
+            .expect("declared state bucket create must seed state");
     let id = resource.id.clone();
     let expected_identity = id
         .identity_str()
@@ -6889,14 +6993,16 @@ async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state(
 
 #[tokio::test]
 async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_state() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::PartialSuccess,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, _schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
-        .await
-        .expect("partial-success bootstrap must seed state");
+    let (resource, _schemas) =
+        bootstrap_declared_state_bucket(color_mode, &provider, backend.as_ref())
+            .await
+            .expect("partial-success bootstrap must seed state");
     let id = resource.id.clone();
 
     let state = backend
@@ -6928,24 +7034,15 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
 
 #[test]
 fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
-    struct ColorOverrideGuard;
-
-    impl Drop for ColorOverrideGuard {
-        fn drop(&mut self) {
-            colored::control::unset_override();
-        }
-    }
+    let color_mode = crate::output_style::ColorMode::Ansi;
 
     let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
         "bootstrap read incomplete".to_string(),
         vec!["versioning".to_string()],
     )
     .expect("fixture diagnostic has a missing attribute");
-    let rendered = {
-        colored::control::set_override(true);
-        let _guard = ColorOverrideGuard;
-        format_partial_state_bucket_create_warning("state-bucket", &diagnostic)
-    };
+    let rendered =
+        { format_partial_state_bucket_create_warning(color_mode, "state-bucket", &diagnostic) };
 
     assert!(
         rendered.contains("\u{1b}["),
@@ -6981,6 +7078,7 @@ fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
 
 #[tokio::test]
 async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     use carina_core::effect::Effect;
 
     let provider = BootstrapRecordingProvider {
@@ -6988,9 +7086,10 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
-    let (resource, schemas) = bootstrap_declared_state_bucket(&provider, backend.as_ref())
-        .await
-        .expect("declared state bucket create must seed state");
+    let (resource, schemas) =
+        bootstrap_declared_state_bucket(color_mode, &provider, backend.as_ref())
+            .await
+            .expect("declared state bucket create must seed state");
     let id = resource.id.clone();
 
     let state_file = backend
@@ -7038,13 +7137,15 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
 
 #[tokio::test]
 async fn declared_state_bucket_successful_create_seed_write_failure_is_actionable() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
     };
-    let error = bootstrap_declared_state_bucket(&provider, &BootstrapWriteFailureBackend)
-        .await
-        .expect_err("a successful create followed by a seed write failure must be actionable");
+    let error =
+        bootstrap_declared_state_bucket(color_mode, &provider, &BootstrapWriteFailureBackend)
+            .await
+            .expect_err("a successful create followed by a seed write failure must be actionable");
 
     let AppError::StateBucketSeed(seed) = &error else {
         panic!("seed write failure lost its bootstrap context: {error:?}");
@@ -7078,6 +7179,7 @@ async fn declared_state_bucket_successful_create_seed_write_failure_is_actionabl
 
 #[tokio::test]
 async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
@@ -7105,6 +7207,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let (_temp, backend) = bootstrap_test_backend();
     let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
@@ -7154,6 +7257,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
 
 #[tokio::test]
 async fn state_bucket_provider_error_keeps_typed_terminal_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Untracked,
@@ -7176,6 +7280,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
@@ -7203,6 +7308,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
 
 #[tokio::test]
 async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
@@ -7230,6 +7336,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let result = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
@@ -7255,6 +7362,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
 
 #[tokio::test]
 async fn bootstrap_created_failure_seeds_observed_state_before_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Created,
@@ -7282,6 +7390,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
@@ -7346,6 +7455,7 @@ async fn bootstrap_created_failure_seeds_observed_state_before_error() {
 
 #[tokio::test]
 async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_before_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::CreatedNotFound,
@@ -7367,6 +7477,7 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
@@ -7435,6 +7546,7 @@ async fn bootstrap_unobserved_created_failure_seeds_identifier_and_partial_read_
 
 #[tokio::test]
 async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::InFlight,
@@ -7457,6 +7569,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let provider_configs = empty_resolved_provider_configs();
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
@@ -7503,6 +7616,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
 
 #[tokio::test]
 async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::InFlight,
@@ -7522,6 +7636,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     );
     let provider_configs = empty_resolved_provider_configs();
     let error = create_checked_bootstrap_resource_for_test(
+        color_mode,
         &provider,
         resource,
         BootstrapCreateContext {
@@ -9318,7 +9433,14 @@ impl tokio::io::AsyncRead for NeverReady {
 async fn confirm_apply_returns_confirmed_on_yes() {
     let input = &b"yes\n"[..];
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, false).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
 
@@ -9326,7 +9448,14 @@ async fn confirm_apply_returns_confirmed_on_yes() {
 async fn confirm_apply_returns_cancelled_on_no() {
     let input = &b"no\n"[..];
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, false).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
 
@@ -9334,7 +9463,14 @@ async fn confirm_apply_returns_cancelled_on_no() {
 async fn confirm_apply_returns_cancelled_on_empty_input() {
     let input = &b"\n"[..];
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, false).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
 
@@ -9343,7 +9479,14 @@ async fn confirm_apply_auto_approve_skips_read() {
     // Reader would hang forever; auto_approve must short-circuit without reading.
     let input = tokio::io::BufReader::new(tokio::io::empty());
     let cancel = carina_core::shutdown::ShutdownToken::running();
-    let outcome = confirm_apply(input, cancel, true).await.unwrap();
+    let outcome = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        input,
+        cancel,
+        true,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
 
@@ -9351,7 +9494,10 @@ async fn confirm_apply_auto_approve_skips_read() {
 async fn confirm_apply_returns_interrupted_when_cancel_fires_after_subscription() {
     let reader = tokio::io::BufReader::new(NeverReady);
     let (trigger, cancel) = carina_core::shutdown::testing::shutdown_channel();
-    let waiting = tokio::spawn(confirm_apply(reader, cancel.clone(), false));
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let waiting_cancel = cancel.clone();
+    let waiting =
+        tokio::spawn(async move { confirm_apply(&runtime, reader, waiting_cancel, false).await });
     tokio::task::yield_now().await;
     trigger.request_graceful_shutdown();
     let err = waiting.await.unwrap().unwrap_err();
@@ -9363,7 +9509,14 @@ async fn confirm_apply_returns_interrupted_when_cancel_token_fires() {
     let (trigger, token) = carina_core::shutdown::testing::shutdown_channel();
     trigger.request_graceful_shutdown();
     let reader = tokio::io::BufReader::new(NeverReady);
-    let err = confirm_apply(reader, token, false).await.unwrap_err();
+    let err = confirm_apply(
+        &crate::test_support::TestCommandRuntime::new(),
+        reader,
+        token,
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, AppError::Interrupted));
 }
 
@@ -9771,7 +9924,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn format_28_saved_plan_is_rejected_before_deferred_payload_decode() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("format-28.plan.json");
         let old_plan = serde_json::json!({
@@ -9816,7 +9969,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_25_plan_is_rejected_after_provider_artifacts_become_mandatory() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
         let old_plan = serde_json::json!({
@@ -9853,7 +10006,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
@@ -9899,7 +10052,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_33_plan_is_rejected_with_regeneration_guidance() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("format-33-plan.json");
         let old_plan = serde_json::json!({
@@ -9941,7 +10094,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan.json");
         let old_plan = serde_json::json!({
@@ -10003,7 +10156,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn future_saved_plan_without_source_path_is_rejected_by_version() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("future-plan");
         std::fs::write(&plan_path, r#"{"version":99,"timestamp":"x"}"#).expect("write future plan");
@@ -10053,7 +10206,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn current_saved_plan_without_source_path_is_corrupt_without_command() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("current-plan");
         let malformed = serde_json::json!({
@@ -10105,7 +10258,7 @@ mod saved_plan_version_tests {
     /// stub `effects: []` / resource arrays are enough.
     #[tokio::test]
     async fn version_3_saved_plan_is_rejected() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         // A v3 plan: everything required by the pre-#3248 PlanFile
@@ -10195,7 +10348,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_10_saved_plan_is_rejected_after_constraint_metadata_bump() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v10 = serde_json::json!({
@@ -10267,7 +10420,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_13_saved_plan_is_rejected_after_orphan_ownership_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v13 = serde_json::json!({
@@ -10324,7 +10477,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_15_saved_plan_is_rejected_after_wait_rhs_typing_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v15 = serde_json::json!({
@@ -10381,7 +10534,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_18_saved_plan_is_rejected_after_abandoned_generation_shape_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v18 = serde_json::json!({
@@ -10438,7 +10591,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn version_19_saved_plan_is_rejected_after_current_state_tagging_change() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
         let v19 = serde_json::json!({
@@ -10496,7 +10649,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn saved_plan_decode_rejects_legacy_import_shape_by_version() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan");
         let import_id = carina_core::resource::ResolvedResourceId::new(
@@ -10571,7 +10724,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn saved_plan_decode_reports_malformed_current_version_as_corrupt() {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("reviewed-plan");
         let malformed = serde_json::json!({
@@ -10720,6 +10873,7 @@ mod saved_plan_version_tests {
                 carina_core::resource::NoPlaceholder,
                 carina_core::resource::AbsoluteBindingAddress,
             >(
+                &crate::test_support::TestCommandRuntime::new(),
                 (),
                 Vec::new(),
                 &[],
@@ -10762,7 +10916,7 @@ mod saved_plan_version_tests {
         json: &serde_json::Value,
         expectation: &str,
     ) -> String {
-        let user_dirs = carina_core::TestUserDirs::new();
+        let user_dirs = crate::test_support::TestCommandRuntime::new();
         std::fs::write(plan_path, serde_json::to_string(json).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
@@ -11024,6 +11178,7 @@ fn apply_exit_code_prioritizes_failure_over_partial() {
 
 #[test]
 fn skipped_export_does_not_downgrade_partial_success() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let result = {
         let mut result: ExecutionResult = ExecutionResult::empty();
         result.partial_count = 1;
@@ -11031,6 +11186,7 @@ fn skipped_export_does_not_downgrade_partial_success() {
     };
 
     let err = finish_apply(
+        color_mode,
         &result,
         SkippedExports::from_names_for_test(&["role_arn"]),
         Duration::ZERO,
@@ -11048,6 +11204,7 @@ fn skipped_export_does_not_downgrade_partial_success() {
 
 #[test]
 fn interrupted_apply_summary_counts_unknown_outcome() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let result = {
         let mut result: ExecutionResult = ExecutionResult::empty();
         result.success_count = 1;
@@ -11055,7 +11212,13 @@ fn interrupted_apply_summary_counts_unknown_outcome() {
         result
     };
 
-    let err = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
+    let err = finish_apply(
+        color_mode,
+        &result,
+        SkippedExports::default(),
+        Duration::ZERO,
+    )
+    .unwrap_err();
 
     assert!(matches!(&err, AppError::ExecutionFailed(_)));
     assert_eq!(
@@ -11066,6 +11229,7 @@ fn interrupted_apply_summary_counts_unknown_outcome() {
 
 #[test]
 fn failed_apply_final_error_names_endpoint_and_typed_cause() {
+    let color_mode = crate::output_style::ColorMode::Plain;
     let effect = Effect::Create(carina_core::resource::ResolvedResource::new(Resource::new(
         "test.resource",
         "failed",
@@ -11089,7 +11253,13 @@ fn failed_apply_final_error_names_endpoint_and_typed_cause() {
             },
         },
     );
-    let error = finish_apply(&result, SkippedExports::default(), Duration::ZERO).unwrap_err();
+    let error = finish_apply(
+        color_mode,
+        &result,
+        SkippedExports::default(),
+        Duration::ZERO,
+    )
+    .unwrap_err();
     let rendered = error.to_string();
     assert!(
         rendered.contains("create test.resource.failed: execution error")

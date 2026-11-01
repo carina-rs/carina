@@ -1802,8 +1802,10 @@ mod tests {
         })
     }
 
-    fn fixture_model(name: &str) -> GraphModel {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name(name);
+    fn fixture_model(color_mode: crate::output_style::ColorMode, name: &str) -> GraphModel {
+        let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(&runtime, name)
+            .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         build_model(PlanImageInput {
             plan: &fixture.plan,
@@ -1921,8 +1923,13 @@ mod tests {
         )
     }
 
-    fn assert_ordering_edges_match_executor(fixture_name: &str) {
-        let fixture = crate::fixture_plan::build_plan_from_fixture_name(fixture_name);
+    fn assert_ordering_edges_match_executor(
+        color_mode: crate::output_style::ColorMode,
+        fixture_name: &str,
+    ) {
+        let runtime = crate::test_support::TestCommandRuntime::new().with_color_mode(color_mode);
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(&runtime, fixture_name)
+            .expect("fixture mock inputs must be valid");
         if fixture_name == "deferred_for_with_paired_destroy" {
             assert!(
                 fixture
@@ -2199,7 +2206,8 @@ mod tests {
 
     #[test]
     fn reference_layout_draws_changed_to_changed_reference_without_ordering_edge() {
-        let model = fixture_model("plan_image_reference_layout");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let subnet = model
             .nodes
             .iter()
@@ -2235,7 +2243,8 @@ mod tests {
 
     #[test]
     fn reference_layout_drawn_edges_never_point_left_except_reversed_delete_ordering() {
-        let model = fixture_model("plan_image_reference_layout");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let layout = layout_graph(&model);
         let ordering_pairs: HashSet<_> = model
             .ordering_edges
@@ -2316,10 +2325,11 @@ mod tests {
 
     #[test]
     fn reference_layout_haloed_module_cards_keep_four_pixel_border_margin() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         const HALO_OUTSET: f32 = 5.0 + 8.0 / 2.0;
         const REQUIRED_MARGIN: f32 = 4.0;
 
-        let model = fixture_model("plan_image_reference_layout");
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let layout = layout_graph(&model);
         for band in &layout.modules {
             for card in &layout.nodes {
@@ -2346,7 +2356,8 @@ mod tests {
 
     #[test]
     fn reference_layout_module_band_hugs_members_without_overlapping_non_members() {
-        let model = fixture_model("plan_image_reference_layout");
+        let color_mode = crate::output_style::ColorMode::Plain;
+        let model = fixture_model(color_mode, "plan_image_reference_layout");
         let layout = layout_graph(&model);
         let overlaps = |left: (f32, f32, f32, f32), right: (f32, f32, f32, f32)| {
             left.0 < right.0 + right.2
@@ -2409,13 +2420,14 @@ mod tests {
 
     #[test]
     fn image_ordering_edges_equal_executor_edges_for_representative_plans() {
+        let color_mode = crate::output_style::ColorMode::Plain;
         for fixture in [
             "mixed_operations",
             "plan_image_module_cascade",
             "deferred_for_with_paired_destroy",
             "replace_create_only",
         ] {
-            assert_ordering_edges_match_executor(fixture);
+            assert_ordering_edges_match_executor(color_mode, fixture);
         }
     }
 
@@ -2877,8 +2889,13 @@ mod tests {
 
     #[test]
     fn coordinate_relaxation_preserves_order_gaps_and_band_bounds() {
-        let fixture =
-            crate::fixture_plan::build_plan_from_fixture_name("plan_image_module_cascade");
+        let runtime = crate::test_support::TestCommandRuntime::new();
+
+        let fixture = crate::fixture_plan::build_plan_from_fixture_name(
+            &runtime,
+            "plan_image_module_cascade",
+        )
+        .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
             plan: &fixture.plan,

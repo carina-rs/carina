@@ -6,9 +6,13 @@ pub mod error;
 pub mod fixture_plan;
 pub mod kms;
 pub mod moved_hint;
+pub mod output_style;
 pub mod plan_image;
 pub mod plan_summary;
+pub mod runtime;
 pub mod signal;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 pub mod wiring;
 
 pub(crate) mod legacy_name_overrides;
