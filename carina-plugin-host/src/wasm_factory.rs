@@ -38,7 +38,7 @@ use carina_core::provider::{
     ProviderInitialization, ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadOutcome,
     ReadRequest, ResentPendingCreate, ResentPoll as CoreResentPoll, Resume as CoreResume,
     ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent, StartedGuestCreateCall,
-    UpdateOutcome, UpdateRequest, WireAttributes,
+    UpdateOutcome, UpdateRequest,
 };
 #[cfg(test)]
 use carina_core::provider::{
@@ -4707,7 +4707,7 @@ impl WasmProviderFactory {
 
     async fn create_initialized_instance(
         &self,
-        attributes: &WireAttributes,
+        config: &ProviderReadyConfig,
     ) -> Result<InitializedWasmInstance, WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The kind was
@@ -4740,7 +4740,7 @@ impl WasmProviderFactory {
             self.http_test_route.clone(),
         )
         .await?;
-        let wit_attrs = wasm_convert::checked_attributes_to_wit(attributes);
+        let wit_attrs = wasm_convert::checked_attributes_to_wit(config.wire_attributes());
         let initialize_result = live
             .store
             .call(|store| live.bindings.call_initialize(store, &wit_attrs))
@@ -4778,14 +4778,14 @@ impl WasmProviderFactory {
     async fn get_or_create_shared_instance(
         &self,
         binding: Option<&str>,
-        attributes: &WireAttributes,
+        config: &ProviderReadyConfig,
     ) -> Result<Arc<FailFastInstance>, WasmProviderInstanceError> {
         let key: Option<String> = binding.map(|s| s.to_string());
         let mut guard = self.shared_instances.lock().await;
         if let Some(instance) = guard.get(&key) {
             return Ok(Arc::clone(instance));
         }
-        let initialized = self.create_initialized_instance(attributes).await?;
+        let initialized = self.create_initialized_instance(config).await?;
         let instance = Arc::new(FailFastInstance::new(initialized));
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
@@ -4957,15 +4957,15 @@ impl ProviderFactory for WasmProviderFactory {
         config: &ProviderReadyConfig,
         initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        // Keep only the shared projection; cache hits never copy config values.
-        let attributes = config.wire_attributes().clone();
+        // The validated config witness shares its immutable payload; no deep clone.
+        let config = config.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             // Provider init rejections still surface their user-actionable
             // message verbatim (for example, allowed_account_ids mismatch;
             // see #2407). Instantiation failures take the typed mapper path.
             let instance = self
-                .get_or_create_shared_instance(binding.as_deref(), &attributes)
+                .get_or_create_shared_instance(binding.as_deref(), &config)
                 .await
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
@@ -4995,12 +4995,12 @@ impl ProviderFactory for WasmProviderFactory {
         binding: Option<&str>,
         config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
-        // Keep only the shared projection; cache hits never copy config values.
-        let attributes = config.wire_attributes().clone();
+        // The validated config witness shares its immutable payload; no deep clone.
+        let config = config.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             let instance = self
-                .get_or_create_shared_instance(binding.as_deref(), &attributes)
+                .get_or_create_shared_instance(binding.as_deref(), &config)
                 .await
                 .map_err(|error| {
                     error.into_provider_error_with(&self.instantiation_error_mapper)
@@ -9248,7 +9248,7 @@ mod tests {
         .await
         .expect("mock WASM provider should load");
         let instance = factory
-            .get_or_create_shared_instance(None, empty_ready_config(&factory).wire_attributes())
+            .get_or_create_shared_instance(None, &empty_ready_config(&factory))
             .await
             .expect("mock WASM provider should initialize");
         let malformed = version_checked_bindings::WitDesiredResource {
@@ -12088,7 +12088,7 @@ mod tests {
         .await
         .expect("mock WASM provider should load");
         let instance = factory
-            .get_or_create_shared_instance(None, empty_ready_config(&factory).wire_attributes())
+            .get_or_create_shared_instance(None, &empty_ready_config(&factory))
             .await
             .expect("mock WASM provider should initialize");
 

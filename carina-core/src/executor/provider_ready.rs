@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
 use thiserror::Error;
@@ -160,6 +160,11 @@ impl Deref for CanonicalProviderConfigAttributes {
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderReadyConfig {
+    inner: Arc<ProviderReadyConfigInner>,
+}
+
+#[derive(Debug, PartialEq)]
+struct ProviderReadyConfigInner {
     attributes: CanonicalProviderConfigAttributes,
     region: Option<String>,
 }
@@ -167,16 +172,16 @@ pub struct ProviderReadyConfig {
 impl ProviderReadyConfig {
     /// Borrow the checked provider configuration attributes.
     pub fn attributes(&self) -> &IndexMap<String, Value> {
-        self.attributes.attributes()
+        self.inner.attributes.attributes()
     }
 
     pub fn wire_attributes(&self) -> &WireAttributes {
-        self.attributes.wire_attributes()
+        self.inner.attributes.wire_attributes()
     }
 
     /// Borrow the resolved region when the provider config schema declares it.
     pub fn region(&self) -> Option<&str> {
-        self.region.as_deref()
+        self.inner.region.as_deref()
     }
 }
 
@@ -694,8 +699,10 @@ pub fn prepare_provider_ready_config(
         .and_then(|_| crate::utils::region_from_attrs(canonical_attributes.attributes()));
 
     Ok(ProviderReadyConfig {
-        attributes: canonical_attributes,
-        region,
+        inner: Arc::new(ProviderReadyConfigInner {
+            attributes: canonical_attributes,
+            region,
+        }),
     })
 }
 

@@ -227,7 +227,13 @@ impl DesiredInputs<'_> {
             .as_inner()
             .attributes()
             .iter()
-            .map(|(name, value)| (name.clone(), checked_value(value, &owner)))
+            .map(|(name, value)| {
+                let wire = resource
+                    .wire_attributes()
+                    .get(name)
+                    .expect("checked attribute");
+                (name.clone(), checked_value(value, wire.value(), &owner))
+            })
             .collect();
         Self {
             id: std::borrow::Cow::Owned(resource.as_inner().resource_id().clone()),
@@ -248,52 +254,111 @@ impl DesiredInputs<'_> {
     }
 }
 
-// The ProviderReady witness proves representability. Read the original tree so
-// diagnostic provenance and authored map order survive this read-only view.
-fn checked_value(original: &Value, owner: &Arc<()>) -> DesiredValue {
-    match original {
-        Value::Deferred(DeferredValue::Secret(_)) => DesiredValue::Deferred(DeferredLeaf {
+// The original tree supplies provenance and order, never a second scalar
+// representation policy. Keep this exhaustive so new core variants require an
+// explicit decision before they can enter the SDK view.
+enum DesiredProvenance<'a> {
+    Scalar,
+    String(&'a ValueString),
+    StringList(&'a [ValueString]),
+    List(&'a [Value]),
+    Map(&'a IndexMap<String, Value>),
+    Secret,
+}
+
+fn desired_provenance(value: &Value) -> DesiredProvenance<'_> {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => DesiredProvenance::String(value),
+        Value::Concrete(ConcreteValue::StringList(values)) => DesiredProvenance::StringList(values),
+        Value::Concrete(ConcreteValue::List(values)) => DesiredProvenance::List(values),
+        Value::Concrete(ConcreteValue::Map(values)) => DesiredProvenance::Map(values),
+        Value::Concrete(
+            ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_),
+        ) => DesiredProvenance::Scalar,
+        Value::Deferred(DeferredValue::Secret(_)) => DesiredProvenance::Secret,
+        Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Deferred(
+            DeferredValue::ModuleIf(_)
+            | DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Coalesce { .. }
+            | DeferredValue::IntegerArithmetic(_)
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::ResolvedFunctionCall { .. }
+            | DeferredValue::Access(_)
+            | DeferredValue::RedactedSecret { .. }
+            | DeferredValue::Unknown(_),
+        ) => unreachable!("the wire witness excludes unresolved desired values"),
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+    }
+}
+
+fn checked_value(original: &Value, wire: &crate::types::Value, owner: &Arc<()>) -> DesiredValue {
+    use crate::types::Value as Wire;
+    let provenance = desired_provenance(original);
+    if matches!(provenance, DesiredProvenance::Secret) {
+        return DesiredValue::Deferred(DeferredLeaf {
             slot: 0,
             owner: Arc::clone(owner),
-        }),
-        Value::Concrete(ConcreteValue::Bool(value)) => {
-            DesiredValue::Known(DesiredScalar::Bool(*value))
+        });
+    }
+    match wire {
+        Wire::Bool(value) => DesiredValue::Known(DesiredScalar::Bool(*value)),
+        Wire::Int(value) => DesiredValue::Known(DesiredScalar::Int(*value)),
+        Wire::Float(value) => DesiredValue::Known(DesiredScalar::Float(*value)),
+        Wire::String(value) => {
+            let value = match provenance {
+                DesiredProvenance::String(original) => original.clone(),
+                DesiredProvenance::Scalar => value.clone().into(),
+                DesiredProvenance::StringList(_)
+                | DesiredProvenance::List(_)
+                | DesiredProvenance::Map(_)
+                | DesiredProvenance::Secret => unreachable!("checked string provenance"),
+            };
+            DesiredValue::Known(DesiredScalar::String(value))
         }
-        Value::Concrete(ConcreteValue::Int(value)) => {
-            DesiredValue::Known(DesiredScalar::Int(*value))
+        Wire::StringList(_) => {
+            let DesiredProvenance::StringList(originals) = provenance else {
+                unreachable!("checked string-list provenance")
+            };
+            DesiredValue::List(DesiredList {
+                values: originals
+                    .iter()
+                    .map(|value| DesiredValue::Known(DesiredScalar::String(value.clone())))
+                    .collect(),
+            })
         }
-        Value::Concrete(ConcreteValue::Float(value)) => {
-            DesiredValue::Known(DesiredScalar::Float(*value))
+        Wire::List(values) => {
+            let DesiredProvenance::List(originals) = provenance else {
+                unreachable!("checked list provenance")
+            };
+            DesiredValue::List(DesiredList {
+                values: originals
+                    .iter()
+                    .zip(values)
+                    .map(|(original, wire)| checked_value(original, wire, owner))
+                    .collect(),
+            })
         }
-        Value::Concrete(ConcreteValue::String(value)) => {
-            DesiredValue::Known(DesiredScalar::String(value.clone()))
+        Wire::Map(values) => {
+            let DesiredProvenance::Map(originals) = provenance else {
+                unreachable!("checked map provenance")
+            };
+            DesiredValue::Map(DesiredMap {
+                entries: originals
+                    .iter()
+                    .map(|(name, original)| {
+                        (name.clone(), checked_value(original, &values[name], owner))
+                    })
+                    .collect(),
+            })
         }
-        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-            DesiredValue::Known(DesiredScalar::String(value.api_value().into()))
-        }
-        Value::Concrete(ConcreteValue::Duration(value)) => {
-            // The sole wire check already established that seconds fit i64.
-            DesiredValue::Known(DesiredScalar::Int(value.as_secs() as i64))
-        }
-        Value::Concrete(ConcreteValue::StringList(values)) => DesiredValue::List(DesiredList {
-            values: values
-                .iter()
-                .map(|value| DesiredValue::Known(DesiredScalar::String(value.clone())))
-                .collect(),
-        }),
-        Value::Concrete(ConcreteValue::List(values)) => DesiredValue::List(DesiredList {
-            values: values
-                .iter()
-                .map(|value| checked_value(value, owner))
-                .collect(),
-        }),
-        Value::Concrete(ConcreteValue::Map(values)) => DesiredValue::Map(DesiredMap {
-            entries: values
-                .iter()
-                .map(|(name, value)| (name.clone(), checked_value(value, owner)))
-                .collect(),
-        }),
-        _ => unreachable!("the wire witness excludes other desired values"),
     }
 }
 

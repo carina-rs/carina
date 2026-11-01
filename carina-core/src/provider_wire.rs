@@ -102,6 +102,7 @@ impl ProviderWireError {
                 WirePathSegment::Index(index) => {
                     let _ = write!(path, "[{index}]");
                 }
+                WirePathSegment::Secret => path.push_str("(secret)"),
             }
         }
         path
@@ -168,13 +169,40 @@ pub enum WirePatchOp {
 
 mod sealed {
     pub trait Sealed {}
+
+    /// Only the wire gate can authorize payload projection.
+    pub struct ProjectionToken {
+        _private: (),
+    }
+
+    impl ProjectionToken {
+        pub(super) fn new() -> Self {
+            Self { _private: () }
+        }
+    }
 }
 
 /// The closed set of payloads admitted by [`WireReady`].
+///
+/// Projection is internal to the wire gate; callers cannot mint a projection
+/// directly from raw configuration attributes:
+///
+/// ```compile_fail
+/// use carina_core::provider::{ProviderWirePayload, ProviderWireTarget};
+/// use carina_core::resource::Value;
+/// use indexmap::IndexMap;
+/// let attributes = IndexMap::<String, Value>::new();
+/// let target = ProviderWireTarget::Configuration { provider: "test".into() };
+/// let _ = attributes.project(&target);
+/// ```
 pub trait ProviderWirePayload: sealed::Sealed {
     type Projection: Clone;
     #[doc(hidden)]
-    fn project(&self, target: &ProviderWireTarget) -> Result<Self::Projection, ProviderWireError>;
+    fn project(
+        &self,
+        target: &ProviderWireTarget,
+        token: sealed::ProjectionToken,
+    ) -> Result<Self::Projection, ProviderWireError>;
 }
 
 /// Managed and data-source payloads accepted by the shared SDK input view.
@@ -214,7 +242,7 @@ pub struct WireReady<T: ProviderWirePayload> {
 
 impl<T: ProviderWirePayload> WireReady<T> {
     pub(crate) fn try_new(value: T, target: ProviderWireTarget) -> Result<Self, ProviderWireError> {
-        let wire = value.project(&target)?;
+        let wire = value.project(&target, sealed::ProjectionToken::new())?;
         Ok(Self { value, wire })
     }
     pub fn as_inner(&self) -> &T {
@@ -261,12 +289,40 @@ fn project_value(
     target: &ProviderWireTarget,
     attribute: &str,
 ) -> Result<WireValue, ProviderWireError> {
-    let projected = try_core_to_protocol_value(&plaintext(value))
-        .map_err(|error| ProviderWireError::new(target, attribute, error))?;
+    let projected = try_core_to_protocol_value(&plaintext(value)).map_err(|error| {
+        ProviderWireError::new(target, attribute, hide_secret_path(value, error))
+    })?;
     Ok(WireValue {
         value: projected,
         secret: matches!(value, Value::Deferred(DeferredValue::Secret(_))),
     })
+}
+
+// Preserve public path prefixes, but discard every error segment beneath a
+// secret, including the stored conversion error's Debug/source representation.
+fn hide_secret_path(value: &Value, error: ProtocolConvertError) -> ProtocolConvertError {
+    use ProtocolConvertError::ValuePath;
+    use WirePathSegment::{Index, Key, Secret};
+    match (value, error) {
+        (Value::Deferred(DeferredValue::Secret(_)), error) => {
+            error.into_leaf_error().at_value_path(Secret)
+        }
+        (
+            Value::Concrete(ConcreteValue::List(values)),
+            ValuePath {
+                segment: Index(index),
+                error,
+            },
+        ) => hide_secret_path(&values[index], *error).at_value_path(Index(index)),
+        (
+            Value::Concrete(ConcreteValue::Map(values)),
+            ValuePath {
+                segment: Key(key),
+                error,
+            },
+        ) => hide_secret_path(&values[&key], *error).at_value_path(Key(key)),
+        (_, error) => error,
+    }
 }
 
 fn project_attributes(
@@ -283,7 +339,11 @@ fn project_attributes(
 impl sealed::Sealed for ResolvedResource<ProviderModuleSource> {}
 impl ProviderWirePayload for ResolvedResource<ProviderModuleSource> {
     type Projection = WireAttributes;
-    fn project(&self, target: &ProviderWireTarget) -> Result<Self::Projection, ProviderWireError> {
+    fn project(
+        &self,
+        target: &ProviderWireTarget,
+        _token: sealed::ProjectionToken,
+    ) -> Result<Self::Projection, ProviderWireError> {
         project_attributes(&self.as_resource().attributes, target)
     }
 }
@@ -299,7 +359,11 @@ impl ResourceWirePayload for ResolvedResource<ProviderModuleSource> {
 impl sealed::Sealed for ResolvedDataSource<ProviderModuleSource> {}
 impl ProviderWirePayload for ResolvedDataSource<ProviderModuleSource> {
     type Projection = WireAttributes;
-    fn project(&self, target: &ProviderWireTarget) -> Result<Self::Projection, ProviderWireError> {
+    fn project(
+        &self,
+        target: &ProviderWireTarget,
+        _token: sealed::ProjectionToken,
+    ) -> Result<Self::Projection, ProviderWireError> {
         project_attributes(&self.as_inner().attributes, target)
     }
 }
@@ -315,7 +379,11 @@ impl ResourceWirePayload for ResolvedDataSource<ProviderModuleSource> {
 impl sealed::Sealed for IndexMap<String, Value> {}
 impl ProviderWirePayload for IndexMap<String, Value> {
     type Projection = WireAttributes;
-    fn project(&self, target: &ProviderWireTarget) -> Result<Self::Projection, ProviderWireError> {
+    fn project(
+        &self,
+        target: &ProviderWireTarget,
+        _token: sealed::ProjectionToken,
+    ) -> Result<Self::Projection, ProviderWireError> {
         project_attributes(self, target)
     }
 }
@@ -323,7 +391,11 @@ impl ProviderWirePayload for IndexMap<String, Value> {
 impl sealed::Sealed for UpdatePatch {}
 impl ProviderWirePayload for UpdatePatch {
     type Projection = Vec<WirePatchOp>;
-    fn project(&self, target: &ProviderWireTarget) -> Result<Self::Projection, ProviderWireError> {
+    fn project(
+        &self,
+        target: &ProviderWireTarget,
+        _token: sealed::ProjectionToken,
+    ) -> Result<Self::Projection, ProviderWireError> {
         self.ops
             .iter()
             .map(|op| {
@@ -344,5 +416,54 @@ impl ProviderWirePayload for UpdatePatch {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_errors_do_not_reveal_paths_inside_secrets() {
+        let secret = || {
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "private.secret.key".into(),
+                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                )])),
+            ))))
+        };
+        for (value, expected_path) in [
+            (secret(), "attr(secret)"),
+            (
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "public".into(),
+                    Value::Concrete(ConcreteValue::List(vec![secret()])),
+                )]))),
+                "attr.public[0](secret)",
+            ),
+        ] {
+            let error = WireReady::try_new(
+                IndexMap::from([("attr".into(), value)]),
+                ProviderWireTarget::Configuration {
+                    provider: "test".into(),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.attribute_path(), expected_path);
+            assert!(matches!(
+                error.conversion_error(),
+                ProtocolConvertError::NonFiniteFloat
+            ));
+            for rendered in [
+                error.to_string(),
+                format!("{error:?}"),
+                format!("{:?}", error.path()),
+            ] {
+                assert!(!rendered.contains("private.secret.key"), "{rendered}");
+            }
+            assert!(error.to_string().contains(expected_path));
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 }

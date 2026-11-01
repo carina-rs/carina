@@ -59,8 +59,8 @@ attributes a provider validator does not read. Durations must fit signed
 after substituting observed `ignore_changes` leaves. Current state continues
 to use the separate persisted-state codec.
 
-Native and WASM providers receive the same checked inputs. The WASM host adapts
-the cached projection to WIT without another desired-value rejection policy.
+Native and WASM routes pass the same provider-input wire check. The WASM host
+adapts the cached projection to WIT without another desired-value rejection policy.
 Configuration is checked before provider semantic validation and initialization.
 Wire failures are terminal diagnostics containing the resource or configuration,
 attribute, nested path and conversion reason exactly once, without the value.
@@ -68,9 +68,10 @@ attribute, nested path and conversion reason exactly once, without the value.
 
 Native create/update validators use the infallible
 `DesiredInputs::from_provider_ready(request.resource())`.
-Update requests retain the checked desired resource for cross-field checks; writes
-continue to come exclusively from the checked patch. Normalization callers
-query `DesiredView::inputs()` or `NativeDesiredNormalization::inputs()`; there is
+Native update requests additionally expose the checked desired resource for
+cross-field validation. The WIT update request carries current state and the
+checked patch; provider writes come exclusively from that patch. Normalization
+callers query `DesiredView::inputs()` or `NativeDesiredNormalization::inputs()`; there is
 no public raw-resource `DesiredInputs` constructor.
 
 The host validates and decodes the entire result before writing any changes.
