@@ -140,6 +140,7 @@ impl App {
             .map(|(idx, effect)| {
                 effect_to_node(
                     plan,
+                    idx,
                     effect,
                     schemas,
                     historical_display,
@@ -784,6 +785,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
 #[allow(clippy::too_many_arguments)]
 fn effect_to_node(
     plan: &Plan,
+    index: usize,
     effect: &Effect,
     schemas: &SchemaRegistry,
     historical_display: &HistoricalDisplayAttributes,
@@ -792,30 +794,31 @@ fn effect_to_node(
     provider: &ProviderRouter,
     comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> ProviderResult<TreeNode> {
-    let detail_rows =
-        if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
-            build_replace_detail_rows_from_display(
-                plan,
-                resource,
-                replacement,
-                historical_display,
-                Some(schemas),
-                DetailLevel::Full,
-                prev_explicit.and_then(|map| map.get(&resource.id)),
-                provider,
-                comparisons,
-            )
-        } else {
-            build_detail_rows_by_instance(
-                effect,
-                Some(schemas),
-                DetailLevel::Full,
-                historical_display,
-                prev_explicit,
-                provider,
-                comparisons,
-            )
-        }?;
+    let detail_rows = if let Some(rows) = comparisons.prepared_rows(index, DetailLevel::Full)? {
+        rows.to_vec()
+    } else if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
+        build_replace_detail_rows_from_display(
+            plan,
+            resource,
+            replacement,
+            historical_display,
+            Some(schemas),
+            DetailLevel::Full,
+            prev_explicit.and_then(|map| map.get(&resource.id)),
+            provider,
+            comparisons,
+        )?
+    } else {
+        build_detail_rows_by_instance(
+            effect,
+            Some(schemas),
+            DetailLevel::Full,
+            historical_display,
+            prev_explicit,
+            provider,
+            comparisons,
+        )?
+    };
     Ok(effect_to_node_with_rows(
         plan,
         effect,

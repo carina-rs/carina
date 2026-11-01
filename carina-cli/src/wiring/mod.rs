@@ -266,15 +266,33 @@ pub fn set_trusted_local_grant_inputs(
 /// to the router shared by successive plans. Diagnostic plans have no effects.
 #[derive(Debug)]
 pub enum PlanReferenceEvidence {
+    #[cfg(any(test, feature = "test-utils"))]
     Prepared(carina_core::references::ResolvedReferences),
+    DisplayPrepared {
+        references: carina_core::references::ResolvedReferences,
+        display: Box<carina_core::detail_rows::PreparedPlanDisplay>,
+    },
     Diagnostics,
 }
 
 impl PlanReferenceEvidence {
+    pub fn historical_display(&self) -> &carina_core::detail_rows::HistoricalDisplayAttributes {
+        match self {
+            Self::DisplayPrepared { display, .. } => &display.historical,
+            #[cfg(any(test, feature = "test-utils"))]
+            Self::Prepared(_) => panic!("test evidence has no prepared display view"),
+            Self::Diagnostics => panic!("diagnostic plans cannot be displayed"),
+        }
+    }
+
     pub fn for_display(&self) -> carina_core::detail_rows::DetailComparisons<'_> {
         match self {
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Prepared(references) => {
                 carina_core::detail_rows::DetailComparisons::Planning(references)
+            }
+            Self::DisplayPrepared { display, .. } => {
+                carina_core::detail_rows::DetailComparisons::Prepared(&display.rows)
             }
             Self::Diagnostics => carina_core::detail_rows::DetailComparisons::RecordedEffects,
         }
@@ -5550,16 +5568,14 @@ pub async fn derive_managed_binding_stability<E>(
     }
     let resolved = schema_resolved;
     let mut stability = reference_preparation
-        .run(provider, |session| {
-            session.stability(
-                &resolved,
-                &plan_input_current,
-                schemas,
-                saved_attrs,
-                prev_explicit,
-                provider,
-            )
-        })
+        .stability(
+            &resolved,
+            &plan_input_current,
+            schemas,
+            saved_attrs,
+            prev_explicit,
+            provider,
+        )
         .await?
         .value;
     stability.extend(pending_stability);
@@ -6190,16 +6206,14 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         context.schemas(),
     )?;
     let managed_stability = reference_preparation
-        .run(provider, |session| {
-            session.stability(
-                &stability_resources,
-                &reconciled_input_current,
-                context.schemas(),
-                &addressed.saved_attrs,
-                &addressed.prev_explicit,
-                provider,
-            )
-        })
+        .stability(
+            &stability_resources,
+            &reconciled_input_current,
+            context.schemas(),
+            &addressed.saved_attrs,
+            &addressed.prev_explicit,
+            provider,
+        )
         .await?
         .value;
     override_aware_resources.rebuild_bindings_after_identity_reconciliation_with_stability(
@@ -6243,23 +6257,20 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
     let dependents =
         CascadeDependents::new(&resolved_unresolved_resources, deferred_create_targets);
     let prepared = reference_preparation
-        .run(provider, |session| {
-            session.plan_with_cascades(
-                &plan_input_desired,
-                &dependents,
-                &data_sources_for_plan,
-                provider,
-                PlanPriorStates::new(&plan_input_current, &addressed.orphans),
-                &directives_map,
-                context.schemas(),
-                &addressed.saved_attrs,
-                &addressed.prev_explicit,
-                &wait_bindings,
-                &outcome_unknown_import_replacements,
-            )
-        })
+        .plan_with_cascades(
+            &plan_input_desired,
+            &dependents,
+            &data_sources_for_plan,
+            provider,
+            PlanPriorStates::new(&plan_input_current, &addressed.orphans),
+            &directives_map,
+            context.schemas(),
+            &addressed.saved_attrs,
+            &addressed.prev_explicit,
+            &wait_bindings,
+            &outcome_unknown_import_replacements,
+        )
         .await?;
-    let references = prepared.references;
     let plan = prepared.value.finish(|plan| {
         add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
         block_deletes_on_prior_consumer_updates(plan, &directives_map);
@@ -6285,6 +6296,25 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
         .collect();
     let prev_explicit = addressed.prev_explicit;
     let managed_current = into_all_prior_states(addressed.orphans, addressed.managed_current);
+    let historical = crate::commands::plan::collect_historical_display_attributes(
+        &plan,
+        &managed_current,
+        state_file.as_ref(),
+    );
+    let display = reference_preparation
+        .display(
+            &plan,
+            &prepared.references,
+            historical,
+            context.schemas(),
+            &prev_explicit,
+            provider,
+        )
+        .await?;
+    let references = PlanReferenceEvidence::DisplayPrepared {
+        references: display.references,
+        display: Box::new(display.value),
+    };
     let resources = M::build_resources(PostExpansionResourceInputs {
         override_aware: &override_aware_resources,
         unresolved_override_aware: &unresolved_override_aware_resources,
@@ -6298,7 +6328,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
             expanded_resources,
             residual_deferred_for,
             plan,
-            references: PlanReferenceEvidence::Prepared(references),
+            references,
             compositions,
             data_sources: data_sources_for_plan,
             managed_current,

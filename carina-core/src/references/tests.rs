@@ -427,28 +427,35 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         )
         .1,
     );
-    let prepared = ReferencePreparation::default()
-        .run(&fixture.router, |session| {
-            session.plan_with_cascades(
-                &desired,
-                &dependents,
-                &[],
-                &fixture.router,
-                crate::differ::PlanPriorStates::new(
-                    &fixture.current,
-                    &crate::differ::Orphans::new(),
-                ),
-                &HashMap::new(),
-                &fixture.registry,
-                &fixture.saved,
-                &HashMap::new(),
-                &[],
-                &HashSet::new(),
-            )
-        })
+    let mut preparation = ReferencePreparation::default();
+    let prepared = preparation
+        .plan_with_cascades(
+            &desired,
+            &dependents,
+            &[],
+            &fixture.router,
+            crate::differ::PlanPriorStates::new(&fixture.current, &crate::differ::Orphans::new()),
+            &HashMap::new(),
+            &fixture.registry,
+            &fixture.saved,
+            &HashMap::new(),
+            &[],
+            &HashSet::new(),
+        )
         .await
         .expect("cascade comparison must participate in reference recording");
     let plan = prepared.value.finish(|_| {});
+    preparation
+        .display(
+            &plan,
+            &prepared.references,
+            crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
+            &fixture.registry,
+            &HashMap::new(),
+            &fixture.router,
+        )
+        .await
+        .unwrap();
     assert!(
         fixture
             .calls
@@ -2704,9 +2711,9 @@ async fn round5_recording_iteration_limit_is_typed_and_keeps_outputs_private() {
         ReferenceFailure::IterationLimit { limit: 2 }
     ));
     assert_eq!(error.path, "key");
-    assert_eq!(pass, 3);
+    assert_eq!(pass, 2);
     let calls = fixture.calls.lock().unwrap();
-    assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1]);
+    assert_eq!(calls.iter().map(Vec::len).collect::<Vec<_>>(), [2]);
 }
 
 #[tokio::test]
@@ -2928,22 +2935,17 @@ async fn round5_projected_list_notes_keep_the_current_operand_origin() {
         },
     )]);
     let prepared = ReferencePreparation::default()
-        .run(&fixture.router, |session| {
-            session.plan(
-                &fixture.desired,
-                &[],
-                &fixture.router,
-                crate::differ::PlanPriorStates::new(
-                    &fixture.current,
-                    &crate::differ::Orphans::new(),
-                ),
-                &HashMap::new(),
-                &fixture.registry,
-                &fixture.saved,
-                &explicit,
-                &[],
-            )
-        })
+        .plan(
+            &fixture.desired,
+            &[],
+            &fixture.router,
+            crate::differ::PlanPriorStates::new(&fixture.current, &crate::differ::Orphans::new()),
+            &HashMap::new(),
+            &fixture.registry,
+            &fixture.saved,
+            &explicit,
+            &[],
+        )
         .await
         .unwrap();
     let plan = prepared.value;
@@ -3094,22 +3096,17 @@ async fn round5_projected_write_only_reference_is_still_a_desired_operand() {
         crate::explicit::build_from_resource(fixture.desired[0].as_resource()),
     )]);
     let error = ReferencePreparation::default()
-        .run(&fixture.router, |session| {
-            session.plan(
-                &fixture.desired,
-                &[],
-                &fixture.router,
-                crate::differ::PlanPriorStates::new(
-                    &fixture.current,
-                    &crate::differ::Orphans::new(),
-                ),
-                &HashMap::new(),
-                &fixture.registry,
-                &fixture.saved,
-                &explicit,
-                &[],
-            )
-        })
+        .plan(
+            &fixture.desired,
+            &[],
+            &fixture.router,
+            crate::differ::PlanPriorStates::new(&fixture.current, &crate::differ::Orphans::new()),
+            &HashMap::new(),
+            &fixture.registry,
+            &fixture.saved,
+            &explicit,
+            &[],
+        )
         .await
         .unwrap_err();
     let crate::differ::PlanComparisonError::Reference(error) = error else {
@@ -3120,4 +3117,47 @@ async fn round5_projected_write_only_reference_is_still_a_desired_operand() {
         "{error:?}"
     );
     assert_eq!(error.path, "key.kms");
+}
+
+#[tokio::test]
+async fn recording_cap_releases_pass_64_but_never_runs_pass_65() {
+    for clean_pass in [64, 65] {
+        let fixture = Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
+        let mut passes = 0;
+        let result = ReferencePreparation::default()
+            .run(&fixture.router, |session| {
+                passes += 1;
+                // Introduce a new operand on every pass until the requested
+                // clean pass, then repeat the pair from the preceding pass.
+                let raw = format!("alias/{}", passes.min(clean_pass - 1));
+                let result = session.references.equal(
+                    &fixture.desired[0].id,
+                    &identity(),
+                    &raw.into(),
+                    &"key/a".into(),
+                    &[
+                        ReferenceOperand {
+                            path: "key".into(),
+                            side: ReferenceSide::Desired,
+                        },
+                        ReferenceOperand {
+                            path: "key".into(),
+                            side: ReferenceSide::Current,
+                        },
+                    ],
+                );
+                session.result(result)
+            })
+            .await;
+        assert_eq!(passes, 64, "the recording cap counts the clean pass too");
+        assert_eq!(fixture.calls.lock().unwrap().len(), 63);
+        if clean_pass == 64 {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(matches!(
+                result.unwrap_err().source,
+                ReferenceFailure::IterationLimit { limit: 64 }
+            ));
+        }
+    }
 }

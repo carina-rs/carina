@@ -167,13 +167,6 @@ pub struct PendingCascadePlan {
 }
 
 impl PendingCascadePlan {
-    /// Comparisons are complete before ancillary effects and retained deferred
-    /// effects are emitted. Recording renders this same diff plan without
-    /// consuming the caller's finalization owner.
-    pub(crate) fn comparison_plan(&self) -> &Plan {
-        &self.plan
-    }
-
     /// Complete the remaining planning steps, then emit the very same deferred
     /// targets already consulted during CBD promotion. The callback sees only
     /// the diff plan, preserving the historical ancillary-effect ordering.

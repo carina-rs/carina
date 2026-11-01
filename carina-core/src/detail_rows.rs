@@ -80,6 +80,7 @@ struct HistoricalDeleteAttributes {
 }
 
 impl HistoricalDisplayAttributes {
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_planning(plan: &Plan, saved: &crate::provider::LiftedSavedAttrs) -> Self {
         let mut display = Self::for_plan(plan);
         for (id, attributes) in &mut display.updates {
@@ -657,12 +658,107 @@ pub enum ListOfMapsDiffField {
     },
 }
 
+/// Display data released by a clean reference-recording pass. The historical
+/// view is retained with its rows; frontends consume the rows by effect index.
+#[derive(Debug)]
+pub struct PreparedPlanDisplay {
+    pub historical: HistoricalDisplayAttributes,
+    pub rows: PreparedDetailRows,
+}
+
+#[derive(Debug)]
+pub struct PreparedDetailRows {
+    full: Vec<Vec<DetailRow>>,
+    explicit: Vec<Vec<DetailRow>>,
+}
+
+impl PreparedDetailRows {
+    pub(crate) fn build(
+        plan: &Plan,
+        historical: &HistoricalDisplayAttributes,
+        registry: &SchemaRegistry,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+        provider: &ProviderRouter,
+        references: &crate::references::ResolvedReferences,
+    ) -> ProviderResult<Self> {
+        let replacements = plan
+            .replace_display_info()
+            .map(|info| (info.create_idx, info))
+            .collect::<HashMap<_, _>>();
+        let build = |detail| {
+            plan.effects()
+                .iter()
+                .enumerate()
+                .map(|(index, effect)| {
+                    if let (Effect::Create(to), Some(replacement)) =
+                        (effect, replacements.get(&index))
+                    {
+                        build_replace_detail_rows_from_display(
+                            plan,
+                            to,
+                            *replacement,
+                            historical,
+                            Some(registry),
+                            detail,
+                            explicit.get(&to.id),
+                            provider,
+                            DetailComparisons::Planning(references),
+                        )
+                    } else {
+                        build_detail_rows_by_instance(
+                            effect,
+                            Some(registry),
+                            detail,
+                            historical,
+                            Some(explicit),
+                            provider,
+                            DetailComparisons::Planning(references),
+                        )
+                    }
+                })
+                .collect::<ProviderResult<Vec<_>>>()
+        };
+        Ok(Self {
+            full: build(DetailLevel::Full)?,
+            explicit: build(DetailLevel::Explicit)?,
+        })
+    }
+
+    fn for_effect(&self, index: usize, detail: DetailLevel) -> ProviderResult<&[DetailRow]> {
+        let rows = match detail {
+            DetailLevel::Full => &self.full,
+            DetailLevel::Explicit => &self.explicit,
+            DetailLevel::NamesOnly => return Ok(&[]),
+        };
+        rows.get(index).map(Vec::as_slice).ok_or_else(|| {
+            crate::provider::ProviderError::invalid_input(
+                "prepared display has no rows for this effect index",
+            )
+        })
+    }
+}
+
 /// Planning display requires the exact witness returned with the plan. Saved
 /// effects already record their decisions and never repeat reference equality.
 #[derive(Debug, Clone, Copy)]
 pub enum DetailComparisons<'a> {
+    /// Final rows for this exact plan, prepared with its historical display view.
+    Prepared(&'a PreparedDetailRows),
     Planning(&'a crate::references::ResolvedReferences),
     RecordedEffects,
+}
+
+impl<'a> DetailComparisons<'a> {
+    pub fn prepared_rows(
+        self,
+        index: usize,
+        detail: DetailLevel,
+    ) -> ProviderResult<Option<&'a [DetailRow]>> {
+        match self {
+            Self::Prepared(rows) => rows.for_effect(index, detail).map(Some),
+            Self::Planning(_) | Self::RecordedEffects => Ok(None),
+        }
+    }
 }
 
 /// Build detail rows for an effect using delete attributes keyed by resource
@@ -722,6 +818,11 @@ pub fn build_detail_rows_by_instance<S>(
                                 false,
                             )
                         })?
+                }
+                DetailComparisons::Prepared(_) => {
+                    return Err(crate::provider::ProviderError::invalid_input(
+                        "consume prepared display rows by effect index",
+                    ));
                 }
                 DetailComparisons::RecordedEffects => {
                     resolved.context().with_recorded_effects(|comparison| {
@@ -1621,6 +1722,11 @@ pub fn build_replace_detail_rows_from_display<S>(
                         comparison.tracking_rows(&rendered_changes),
                     )
                 })?
+        }
+        DetailComparisons::Prepared(_) => {
+            return Err(crate::provider::ProviderError::invalid_input(
+                "consume prepared display rows by effect index",
+            ));
         }
         DetailComparisons::RecordedEffects => {
             resolved.context().with_recorded_effects(|comparison| {

@@ -146,7 +146,12 @@ impl Occurrence {
 
 /// Evidence produced only by a recording-free computation. The recording
 /// variant is private to `ReferencePreparation::run` and never reaches callers.
-#[derive(Debug, Clone, Default)]
+///
+/// ```compile_fail,E0599
+/// use carina_core::references::ResolvedReferences;
+/// let forged = ResolvedReferences::default();
+/// ```
+#[derive(Debug, Clone)]
 pub struct ResolvedReferences {
     values: HashMap<CacheKey, CachedOutcome>,
     dangling: HashMap<ResourceId, BTreeSet<DanglingReference>>,
@@ -169,18 +174,32 @@ pub struct ReferenceOperand {
 }
 
 impl ResolvedReferences {
-    pub fn dangling_paths(&self, resource: &ResourceId) -> impl Iterator<Item = &str> {
+    #[cfg(test)]
+    fn dangling_paths(&self, resource: &ResourceId) -> impl Iterator<Item = String> {
         let mut seen = HashSet::new();
         self.dangling_references(resource)
-            .map(|reference| reference.path.as_str())
-            .filter(move |path| seen.insert(*path))
+            .map(|reference| reference.path)
+            .filter(move |path| seen.insert(path.clone()))
     }
 
     pub(crate) fn dangling_references(
         &self,
         resource: &ResourceId,
-    ) -> impl Iterator<Item = &DanglingReference> {
-        self.dangling.get(resource).into_iter().flatten()
+    ) -> impl Iterator<Item = DanglingReference> {
+        let mut dangling = self.dangling.get(resource).cloned().unwrap_or_default();
+        if let Some(recording) = &self.recording {
+            dangling.extend(
+                recording
+                    .lock()
+                    .expect("reference recording lock")
+                    .dangling
+                    .get(resource)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
+        dangling.into_iter()
     }
 
     pub(crate) fn equal(
@@ -263,10 +282,10 @@ impl ResolvedReferences {
 /// Only `run` can release this result, after checking the entire recording.
 /// A recording session cannot expose its witness or any provisional output.
 ///
-/// ```compile_fail,E0599
+/// ```compile_fail,E0616
 /// use carina_core::{references::ProvisionalComparison, plan::Plan};
 /// fn escape(result: ProvisionalComparison<'_, Result<Plan, ()>>) -> Plan {
-///     result.into_inner().unwrap()
+///     result.value.unwrap()
 /// }
 /// ```
 ///
@@ -311,7 +330,7 @@ enum CachedOutcome {
 const MAX_RECORDING_PASSES: usize = 64;
 
 impl ReferencePreparation {
-    pub async fn run<T, E>(
+    pub(crate) async fn run<T, E>(
         &mut self,
         provider: &ProviderRouter,
         compute: impl for<'run> FnMut(
@@ -336,11 +355,11 @@ impl ReferencePreparation {
     where
         E: From<Box<ReferencePlanError>>,
     {
-        for pass in 0..=limit {
+        for pass in 0..limit {
             let mut references = ResolvedReferences {
                 values: self.cache.clone(),
                 recording: Some(Arc::default()),
-                ..ResolvedReferences::default()
+                dangling: HashMap::new(),
             };
             let provisional = compute(RecordingSession {
                 references: &references,
@@ -363,7 +382,7 @@ impl ReferencePreparation {
                 return Ok(PreparedComparison { value, references });
             }
             drop(provisional);
-            if pass == limit {
+            if pass + 1 == limit {
                 return Err(missing[0]
                     .error(ReferenceFailure::IterationLimit { limit })
                     .into());
@@ -441,8 +460,157 @@ impl ReferencePreparation {
         Ok(())
     }
 
-    /// Focused compatibility helper. Production supplies the complete planning
-    /// operation to `run`, including its explicit fields and cascade inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stability(
+        &mut self,
+        desired: &[ResolvedResource],
+        current: &HashMap<ResourceId, PlanInputCurrent>,
+        registry: &SchemaRegistry,
+        saved: &LiftedSavedAttrs,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+        provider: &ProviderRouter,
+    ) -> crate::differ::PlanComparisonResult<
+        PreparedComparison<HashMap<ResourceId, crate::binding_index::ManagedBindingStability>>,
+    > {
+        validate_inputs(desired, current, registry, saved)?;
+        self.run(provider, |session| {
+            session.result(crate::differ::managed_binding_stability(
+                desired,
+                current,
+                registry,
+                saved,
+                explicit,
+                provider,
+                session.references,
+            ))
+        })
+        .await
+    }
+
+    /// Prepare the differ and cascade decisions. Finalize ancillary effects
+    /// before calling `display` with the complete historical display view.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn plan_with_cascades(
+        &mut self,
+        desired: &crate::resource::PlanInputDesiredResources<'_>,
+        dependents: &crate::differ::CascadeDependents<'_>,
+        data_sources: &[crate::resource::DataSource],
+        provider: &ProviderRouter,
+        prior: crate::differ::PlanPriorStates<'_>,
+        directives: &HashMap<ResourceId, crate::resource::Directives>,
+        registry: &SchemaRegistry,
+        saved: &LiftedSavedAttrs,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+        waits: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
+        unknown_imports: &HashSet<crate::effect::OutcomeUnknownImportReplacement>,
+    ) -> crate::differ::PlanComparisonResult<PreparedComparison<crate::differ::PendingCascadePlan>>
+    {
+        let current = prior.materialize_current_states(desired.authored(), registry);
+        validate_inputs(desired.authored(), &current, registry, saved)?;
+        validate_inputs(dependents.managed(), &current, registry, saved)?;
+        self.run(provider, |session| {
+            session.result(crate::differ::create_plan_with_cascades(
+                desired,
+                dependents.for_recording_run(),
+                data_sources,
+                provider,
+                prior,
+                directives,
+                registry,
+                saved,
+                explicit,
+                waits,
+                unknown_imports,
+                session.references,
+            ))
+        })
+        .await
+    }
+
+    /// Render against one immutable historical view. Only the clean pass's
+    /// rows are released, so frontends never repeat reference comparisons.
+    pub async fn display(
+        &mut self,
+        plan: &crate::plan::Plan,
+        planning: &ResolvedReferences,
+        historical: crate::detail_rows::HistoricalDisplayAttributes,
+        registry: &SchemaRegistry,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+        provider: &ProviderRouter,
+    ) -> crate::provider::ProviderResult<PreparedComparison<crate::detail_rows::PreparedPlanDisplay>>
+    {
+        let prepared = self
+            .run(provider, |session| {
+                session.render(plan, planning, &historical, registry, explicit, provider)
+            })
+            .await?;
+        Ok(PreparedComparison {
+            value: crate::detail_rows::PreparedPlanDisplay {
+                historical,
+                rows: prepared.value,
+            },
+            references: prepared.references,
+        })
+    }
+
+    /// Test compatibility seam for callers without CLI-owned state history.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn plan(
+        &mut self,
+        desired: &[ResolvedResource],
+        data_sources: &[crate::resource::DataSource],
+        provider: &ProviderRouter,
+        prior: crate::differ::PlanPriorStates<'_>,
+        directives: &HashMap<ResourceId, crate::resource::Directives>,
+        registry: &SchemaRegistry,
+        saved: &LiftedSavedAttrs,
+        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+        waits: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
+    ) -> crate::differ::PlanComparisonResult<PreparedComparison<crate::plan::Plan>> {
+        validate_inputs(
+            desired,
+            &prior.materialize_current_states(desired, registry),
+            registry,
+            saved,
+        )?;
+        let prepared = self
+            .run(provider, |session| {
+                session.result(crate::differ::create_plan(
+                    desired,
+                    data_sources,
+                    provider,
+                    prior,
+                    directives,
+                    registry,
+                    saved,
+                    explicit,
+                    waits,
+                    session.references,
+                ))
+            })
+            .await?;
+        let plan = prepared.value;
+        let historical =
+            crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, saved);
+        let display = self
+            .display(
+                &plan,
+                &prepared.references,
+                historical,
+                registry,
+                explicit,
+                provider,
+            )
+            .await?;
+        Ok(PreparedComparison {
+            value: plan,
+            references: display.references,
+        })
+    }
+
+    /// Focused compatibility helper. Production prepares cascade decisions and
+    /// then display rows using the finalized plan and its state history.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn prepare(
         &mut self,
@@ -453,19 +621,17 @@ impl ReferencePreparation {
         provider: &ProviderRouter,
     ) -> Result<ResolvedReferences, Box<ReferencePlanError>> {
         let result = self
-            .run(provider, |session| {
-                session.plan(
-                    desired,
-                    &[],
-                    provider,
-                    crate::differ::PlanPriorStates::new(current, &crate::differ::Orphans::new()),
-                    &HashMap::new(),
-                    registry,
-                    saved,
-                    &HashMap::new(),
-                    &[],
-                )
-            })
+            .plan(
+                desired,
+                &[],
+                provider,
+                crate::differ::PlanPriorStates::new(current, &crate::differ::Orphans::new()),
+                &HashMap::new(),
+                registry,
+                saved,
+                &HashMap::new(),
+                &[],
+            )
             .await;
         match result {
             Ok(prepared) => Ok(prepared.references),
@@ -491,160 +657,33 @@ impl<'run> RecordingSession<'run> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn stability(
-        self,
-        desired: &[ResolvedResource],
-        current: &HashMap<ResourceId, PlanInputCurrent>,
-        registry: &SchemaRegistry,
-        saved: &LiftedSavedAttrs,
-        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-        provider: &ProviderRouter,
-    ) -> ProvisionalComparison<
-        'run,
-        crate::differ::PlanComparisonResult<
-            HashMap<ResourceId, crate::binding_index::ManagedBindingStability>,
-        >,
-    > {
-        self.result((|| {
-            validate_inputs(desired, current, registry, saved)?;
-            crate::differ::managed_binding_stability(
-                desired,
-                current,
-                registry,
-                saved,
-                explicit,
-                provider,
-                self.references,
-            )
-        })())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn plan(
-        self,
-        desired: &[ResolvedResource],
-        data_sources: &[crate::resource::DataSource],
-        provider: &ProviderRouter,
-        prior: crate::differ::PlanPriorStates<'_>,
-        directives: &HashMap<ResourceId, crate::resource::Directives>,
-        registry: &SchemaRegistry,
-        saved: &LiftedSavedAttrs,
-        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-        waits: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
-    ) -> ProvisionalComparison<'run, crate::differ::PlanComparisonResult<crate::plan::Plan>> {
-        self.result((|| {
-            validate_inputs(
-                desired,
-                &prior.materialize_current_states(desired, registry),
-                registry,
-                saved,
-            )?;
-            let plan = crate::differ::create_plan(
-                desired,
-                data_sources,
-                provider,
-                prior,
-                directives,
-                registry,
-                saved,
-                explicit,
-                waits,
-                self.references,
-            )?;
-            self.render(&plan, registry, saved, explicit, provider)?;
-            Ok(plan)
-        })())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn plan_with_cascades(
-        self,
-        desired: &crate::resource::PlanInputDesiredResources<'_>,
-        dependents: &crate::differ::CascadeDependents<'_>,
-        data_sources: &[crate::resource::DataSource],
-        provider: &ProviderRouter,
-        prior: crate::differ::PlanPriorStates<'_>,
-        directives: &HashMap<ResourceId, crate::resource::Directives>,
-        registry: &SchemaRegistry,
-        saved: &LiftedSavedAttrs,
-        explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
-        waits: &[crate::parser::WaitBinding<crate::resource::AbsoluteBindingAddress>],
-        unknown_imports: &HashSet<crate::effect::OutcomeUnknownImportReplacement>,
-    ) -> ProvisionalComparison<
-        'run,
-        crate::differ::PlanComparisonResult<crate::differ::PendingCascadePlan>,
-    > {
-        self.result((|| {
-            let current = prior.materialize_current_states(desired.authored(), registry);
-            validate_inputs(desired.authored(), &current, registry, saved)?;
-            validate_inputs(dependents.managed(), &current, registry, saved)?;
-            let plan = crate::differ::create_plan_with_cascades(
-                desired,
-                dependents.for_recording_run(),
-                data_sources,
-                provider,
-                prior,
-                directives,
-                registry,
-                saved,
-                explicit,
-                waits,
-                unknown_imports,
-                self.references,
-            )?;
-            self.render(plan.comparison_plan(), registry, saved, explicit, provider)?;
-            Ok(plan)
-        })())
-    }
-
     fn render(
         self,
         plan: &crate::plan::Plan,
+        planning: &ResolvedReferences,
+        historical: &crate::detail_rows::HistoricalDisplayAttributes,
         registry: &SchemaRegistry,
-        saved: &LiftedSavedAttrs,
         explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
         provider: &ProviderRouter,
-    ) -> crate::provider::ProviderResult<()> {
-        use crate::detail_rows::{
-            DetailComparisons, DetailLevel, HistoricalDisplayAttributes,
-            build_detail_rows_by_instance, build_replace_detail_rows_from_display,
-        };
-        let historical = HistoricalDisplayAttributes::for_planning(plan, saved);
-        for detail in [DetailLevel::Full, DetailLevel::Explicit] {
-            let replacements = plan
-                .replace_display_info()
-                .map(|info| (info.create_idx, info))
-                .collect::<HashMap<_, _>>();
-            for (index, effect) in plan.effects().iter().enumerate() {
-                if let (crate::effect::Effect::Create(to), Some(replacement)) =
-                    (effect, replacements.get(&index))
-                {
-                    build_replace_detail_rows_from_display(
-                        plan,
-                        to,
-                        *replacement,
-                        &historical,
-                        Some(registry),
-                        detail,
-                        explicit.get(&to.id),
-                        provider,
-                        DetailComparisons::Planning(self.references),
-                    )?;
-                } else {
-                    build_detail_rows_by_instance(
-                        effect,
-                        Some(registry),
-                        detail,
-                        &historical,
-                        Some(explicit),
-                        provider,
-                        DetailComparisons::Planning(self.references),
-                    )?;
-                }
-            }
-        }
-        Ok(())
+    ) -> ProvisionalComparison<
+        'run,
+        crate::provider::ProviderResult<crate::detail_rows::PreparedDetailRows>,
+    > {
+        self.references
+            .recording
+            .as_ref()
+            .expect("recording pass")
+            .lock()
+            .expect("reference recording lock")
+            .dangling = planning.dangling.clone();
+        self.result(crate::detail_rows::PreparedDetailRows::build(
+            plan,
+            historical,
+            registry,
+            explicit,
+            provider,
+            self.references,
+        ))
     }
 
     pub(crate) fn apply_time<S>(
@@ -842,7 +881,11 @@ impl ReferenceValidation<'_> {
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn prepare_empty_for_tests() -> ResolvedReferences {
-    ResolvedReferences::default()
+    ResolvedReferences {
+        values: HashMap::new(),
+        dangling: HashMap::new(),
+        recording: None,
+    }
 }
 
 #[cfg(test)]

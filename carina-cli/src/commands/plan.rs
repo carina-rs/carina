@@ -2988,6 +2988,160 @@ mod historical_display_tests {
     use carina_core::resource::{DeferredValue, ResolvedResource};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
+    #[tokio::test]
+    async fn moved_replacement_renders_the_persisted_display_view_instead_of_planning_history() {
+        use carina_core::provider::{InitializedProvider, RawSavedAttrs};
+        use carina_core::references::ReferencePreparation;
+        use carina_core::resource::{ResolvedResourceId, into_plan_input_current_map};
+
+        let string = |raw: &str| Value::Concrete(ConcreteValue::String(raw.into()));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("test.reference")
+                .attribute(
+                    AttributeSchema::optional(
+                        "key",
+                        AttributeType::reference(
+                            carina_provider_mock::references::identity(),
+                            None,
+                            None,
+                        ),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let mut provider = ProviderRouter::new();
+        provider.add_provider(
+            "mock".into(),
+            InitializedProvider::unavailable(Box::new(
+                carina_provider_mock::MockProvider::new().with_reference_table(
+                    serde_json::from_value(serde_json::json!({
+                        "alias/new": {"Ok": {"Resolved": "key/new"}},
+                        "key/planning": {"Ok": {"Resolved": "key/planning"}},
+                        "key/display": {"Ok": {"Resolved": "key/display"}}
+                    }))
+                    .unwrap(),
+                ),
+            )),
+        );
+        let target = Resource::with_provider("mock", "test.reference", "new", None)
+            .with_attribute("key", string("alias/new"));
+        let id = target.id.clone();
+        let origin = ResourceId::with_provider_identity("mock", "test.reference", "old", None);
+        let planning = State::existing(
+            id.clone(),
+            HashMap::from([("key".into(), string("key/planning"))]),
+        )
+        .with_identifier("reference-123");
+        let refreshed = State::existing(
+            id.clone(),
+            HashMap::from([("key".into(), string("key/display"))]),
+        )
+        .with_identifier("reference-123");
+        let current = into_plan_input_current_map(
+            HashMap::from([(id.clone(), Current::from_state(planning))]),
+            &schemas,
+            std::slice::from_ref(&target),
+        );
+        let desired = ResolvedResource::collect_resolved_with_schemas([target], &schemas).unwrap();
+        let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
+            id.clone(),
+            HashMap::from([("key".into(), string("key/planning"))]),
+        )]))
+        .lift(&schemas);
+        let mut preparation = ReferencePreparation::default();
+        let references = preparation
+            .prepare(&desired, &current, &schemas, &saved, &provider)
+            .await
+            .unwrap();
+        let mut plan = carina_core::differ::create_plan(
+            &desired,
+            &[],
+            &provider,
+            carina_core::differ::PlanPriorStates::new(
+                &current,
+                &carina_core::differ::Orphans::new(),
+            ),
+            &HashMap::new(),
+            &schemas,
+            &saved,
+            &HashMap::new(),
+            &[],
+            &references,
+        )
+        .unwrap();
+        plan.add(Effect::Move {
+            from: ResolvedResourceId::new(origin),
+            to: ResolvedResourceId::new(id.clone()),
+            origin: None,
+        });
+        let mut persisted = StateFile::new();
+        persisted
+            .upsert_resource(
+                ResourceState::try_applied("test.reference", "old", "mock", "reference-123")
+                    .unwrap()
+                    .with_attribute("key", serde_json::json!("key/display")),
+            )
+            .unwrap();
+        let historical = collect_historical_display_attributes(
+            &plan,
+            &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
+            Some(&persisted),
+        );
+        let display = preparation
+            .display(
+                &plan,
+                &references,
+                historical,
+                &schemas,
+                &HashMap::new(),
+                &provider,
+            )
+            .await
+            .unwrap();
+        // Neither frontend may compare again: this router has no provider.
+        let no_provider = ProviderRouter::new();
+        let summary = crate::plan_summary::PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
+        );
+        for detail in [crate::DetailLevel::Full, crate::DetailLevel::Explicit] {
+            let output = crate::display::format_plan_with_delete_instances(
+                &plan,
+                &summary,
+                detail,
+                &display.value.historical,
+                Some(&schemas),
+                &HashMap::from([(
+                    id.clone(),
+                    ResourceId::with_provider_identity("mock", "test.reference", "old", None),
+                )]),
+                None,
+                None,
+                &no_provider,
+                carina_core::detail_rows::DetailComparisons::Prepared(&display.value.rows),
+            )
+            .expect("CLI display must record the exact historical operands it renders");
+            assert!(output.contains("key/display"), "{output}");
+            assert!(!output.contains("key/planning"), "{output}");
+        }
+        carina_tui::App::new(
+            &plan,
+            &schemas,
+            &display.value.historical,
+            None,
+            &no_provider,
+            carina_core::detail_rows::DetailComparisons::Prepared(&display.value.rows),
+        )
+        .expect("TUI must also reuse the final clean-pass rows");
+    }
+
     #[test]
     fn production_historical_display_combines_desired_and_persisted_secret_shapes() {
         const PLAINTEXT: &str = "hunter2";
@@ -4885,9 +5039,7 @@ pub async fn run_plan(
             .as_ref()
             .is_some_and(crate::commands::iam_preflight::should_fail_strict);
 
-    // Build display-safe historical attributes from current and persisted state.
-    let historical_display =
-        collect_historical_display_attributes(&ctx.plan, &ctx.managed_current, state_file.as_ref());
+    let historical_display = ctx.references.historical_display();
 
     // Resolve exports against the same pre-apply binding view used for their
     // display and reject secrets that were hidden behind references during
@@ -4972,7 +5124,7 @@ pub async fn run_plan(
         carina_tui::run(
             &ctx.plan,
             ctx_wiring.schemas(),
-            &historical_display,
+            historical_display,
             Some(&ctx.prev_explicit),
             &ctx.provider,
             ctx.references.for_display(),
@@ -4989,7 +5141,7 @@ pub async fn run_plan(
             &ctx.plan,
             &summary,
             detail,
-            &historical_display,
+            historical_display,
             Some(ctx_wiring.schemas()),
             &ctx.moved_origins,
             Some(&ctx.prev_explicit),

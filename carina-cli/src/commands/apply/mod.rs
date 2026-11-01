@@ -2217,8 +2217,7 @@ async fn run_apply_locked_owned(
                     return Ok(SourceApplyAfterHeartbeat::Done(None));
                 }
 
-                let historical_display =
-                    carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+                let historical_display = references.historical_display();
                 let summary = PlanChangeSummary::new(
                     &plan,
                     &export_changes,
@@ -2229,7 +2228,7 @@ async fn run_apply_locked_owned(
                     &plan,
                     &summary,
                     DetailLevel::Full,
-                    &historical_display,
+                    historical_display,
                     Some(ctx.schemas()),
                     &HashMap::new(),
                     None,
@@ -2302,9 +2301,7 @@ async fn run_apply_locked_owned(
                 )));
             }
 
-            // Build display-safe historical attributes from current and persisted state.
-            let historical_display =
-                collect_historical_display_attributes(&plan, &managed_current, state_file.as_ref());
+            let historical_display = references.historical_display();
 
             let checked_exports_pre_apply =
                 crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
@@ -2340,7 +2337,7 @@ async fn run_apply_locked_owned(
                 &plan,
                 &summary,
                 DetailLevel::Full,
-                &historical_display,
+                historical_display,
                 Some(ctx.schemas()),
                 &moved_origins,
                 Some(&prev_explicit),
@@ -2386,6 +2383,10 @@ async fn run_apply_locked_owned(
                     provider.as_ref(),
                 )?
                 .with_reference_evidence(match &references {
+                    crate::wiring::PlanReferenceEvidence::DisplayPrepared {
+                        references, ..
+                    } => Some(references.clone()),
+                    #[cfg(any(test, feature = "test-utils"))]
                     crate::wiring::PlanReferenceEvidence::Prepared(references) => {
                         Some(references.clone())
                     }

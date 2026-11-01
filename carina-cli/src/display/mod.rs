@@ -1027,7 +1027,9 @@ impl<'a, S> TreeRenderContext<'a, S> {
             };
 
             let detail_rows =
-                if let (Effect::Create(r), Some(replacement)) = (effect, replacement_info) {
+                if let Some(rows) = self.comparisons.prepared_rows(idx, self.detail.to_core())? {
+                    rows.to_vec()
+                } else if let (Effect::Create(r), Some(replacement)) = (effect, replacement_info) {
                     let explicit = self.prev_explicit.and_then(|map| map.get(&r.id));
                     build_replace_detail_rows_from_display(
                         self.plan,
