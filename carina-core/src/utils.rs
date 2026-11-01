@@ -880,10 +880,8 @@ fn is_dynamic_dsl_member_segment(s: &str) -> bool {
 /// literal and is returned unchanged; this helper never strips or folds text
 /// that merely resembles DSL enum syntax.
 ///
-/// This is the single source of truth for "given a provider config's
-/// attribute map, what region string should the SDK use" — every
-/// `ProviderFactory::extract_region` implementation should delegate
-/// to it.
+/// Providers use this helper to read their own region in SDK format and
+/// supply their own default when needed.
 ///
 /// # Examples
 ///
@@ -899,11 +897,19 @@ pub fn extract_region_from_attrs(
     attributes: &indexmap::IndexMap<String, crate::resource::Value>,
     default_region: &str,
 ) -> String {
-    use crate::resource::{ConcreteValue, Value};
+    region_from_attrs(attributes).unwrap_or_else(|| default_region.to_string())
+}
+
+/// Read a resolved provider region without supplying a default.
+pub(crate) fn region_from_attrs(
+    attributes: &indexmap::IndexMap<String, crate::resource::Value>,
+) -> Option<String> {
     match attributes.get("region") {
-        Some(Value::Concrete(ConcreteValue::String(s))) => s.expose_plaintext().to_string(),
-        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value))) => value.api_value().to_string(),
-        _ => default_region.to_string(),
+        Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.expose_plaintext().to_string()),
+        Some(Value::Concrete(ConcreteValue::CanonicalEnum(value))) => {
+            Some(value.api_value().to_string())
+        }
+        _ => None,
     }
 }
 
@@ -1721,11 +1727,9 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
-    /// carina#3021: `extract_region_from_attrs` is the canonical answer
-    /// to "what SDK region does this provider config want". Every
-    /// `ProviderFactory::extract_region` implementation should
-    /// delegate to it, so a single match-arm coverage test here is
-    /// what protects every downstream caller.
+    /// Providers use `extract_region_from_attrs` to read their own region
+    /// in SDK format. These tests cover literal strings, canonical enums,
+    /// and provider-supplied defaults for downstream callers (carina#3021).
     mod extract_region_from_attrs_tests {
         use super::super::extract_region_from_attrs;
         use crate::resource::{ConcreteValue, Value};

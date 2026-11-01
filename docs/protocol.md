@@ -1,13 +1,29 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **17**.
+The current protocol and minimum supported provider protocol are both **18**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 18 | 18 | Typed reference schema leaves and batched plan-time reference resolution. |
 | 17 | 17 | Required list element policy; portable canonical-value uniqueness validation. |
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 18
+
+Protocol v18 adds string-valued reference schema leaves and the initialized
+provider's `resolve-references` export. Requests carry a structured type
+identity and raw string; positional outcomes are a resolved canonical string,
+NotFound, or a typed AccessDenied, Transient, or InvalidReference failure.
+Core rejects batch length mismatches and empty resolved values for every
+provider, native or WASM. Guests
+validate their canonical value shapes. Reference validation remains offline;
+resolution runs only when preparing a planning comparison.
+
+The minimum supported version matches the current version. A v18 host rejects
+older providers before schema or WIT decoding, and providers must use the
+SDK-owned bindings for the updated WIT world.
 
 ## Version 17
 

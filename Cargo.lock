@@ -1096,6 +1096,7 @@ name = "carina-core"
 version = "0.9.0"
 dependencies = [
  "argon2",
+ "carina-core",
  "carina-provider-protocol",
  "chrono",
  "dirs",

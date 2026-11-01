@@ -913,7 +913,6 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderResult};
-    use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
 
@@ -939,10 +938,6 @@ mod tests {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
         }
 
         fn create_provider(

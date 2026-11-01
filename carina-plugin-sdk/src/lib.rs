@@ -1389,6 +1389,42 @@ pub trait CarinaProvider {
     /// any schema metadata is emitted.
     fn reference_forms(&self) -> ReferenceForms;
 
+    /// Resolve comparison-only leaves in this initialized provider instance.
+    /// Results are positional. Unsupported identities fail individually.
+    fn resolve_references(
+        &self,
+        requests: Vec<types::ReferenceRequest>,
+    ) -> Result<Vec<Result<types::ReferenceOutcome, types::ReferenceError>>, ProviderError> {
+        Ok(requests
+            .into_iter()
+            .map(|request| {
+                let types::TypeIdentity {
+                    provider,
+                    segments,
+                    kind,
+                } = request.ty;
+                let identity = std::iter::once(provider)
+                    .chain(segments)
+                    .chain(std::iter::once(kind))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Err(types::ReferenceError::InvalidReference(Box::new(
+                    ProviderError {
+                        kind: types::ProviderErrorKind::InvalidInput,
+                        message: format!("unsupported reference identity {identity}"),
+                        resource_id: None,
+                        cause: None,
+                        provider_name: None,
+                        operation: Some("resolve_references".into()),
+                        status: None,
+                        code: None,
+                        request_id: None,
+                    },
+                )))
+            })
+            .collect())
+    }
+
     /// Return the types of the provider block's configuration attributes
     /// (e.g., `region`). The host uses these to validate attributes
     /// against their declared types *before* calling [`validate_config`].
@@ -1726,6 +1762,33 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    #[test]
+    fn default_reference_resolver_rejects_every_unsupported_identity() {
+        let provider = TestProvider {
+            resources: Vec::new(),
+            forms: BTreeMap::new(),
+            reference_form_calls: Cell::new(0),
+        };
+        let requests = ["First", "Second"]
+            .into_iter()
+            .map(|kind| types::ReferenceRequest {
+                ty: TypeIdentity {
+                    provider: "test".into(),
+                    segments: vec!["keys".into()],
+                    kind: kind.into(),
+                },
+                value: "alias/example".into(),
+            })
+            .collect();
+        let results = provider.resolve_references(requests).unwrap();
+        assert_eq!(results.len(), 2);
+        for (result, name) in results.into_iter().zip(["First", "Second"]) {
+            assert!(
+                matches!(result, Err(types::ReferenceError::InvalidReference(error)) if error.message.contains(&format!("test.keys.{name}")))
+            );
+        }
+    }
+
     struct TestProvider {
         resources: Vec<ValidatedResourceSchema>,
         forms: carina_core::schema::ReferenceForms,
@@ -2010,9 +2073,15 @@ mod tests {
                 .build(),
             )
             .validate()
-            .expect_err("a validated schema must always be projectable to protocol v17");
+            .expect_err("a validated schema must always be projectable to the current protocol");
 
-        assert!(error.to_string().contains("protocol v17"), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "protocol v{}",
+                carina_provider_protocol::PROTOCOL_VERSION
+            )),
+            "{error}"
+        );
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

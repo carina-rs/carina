@@ -44,7 +44,7 @@
 
 use std::collections::HashMap;
 
-use carina_core::differ::{Diff, diff};
+use carina_core::differ::{Diff, diff_for_test as diff};
 use carina_core::explicit::ExplicitFields;
 use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
@@ -156,7 +156,9 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
         Some(&prev_explicit),
         None,
         &comparison,
-    );
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
 
     assert!(
         matches!(result, Diff::NoChange(_)),

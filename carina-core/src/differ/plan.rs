@@ -14,12 +14,11 @@ use crate::plan::{
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult, ProviderRouter};
+use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
 use crate::resource::{
-    AbsoluteBindingAddress, CanonicalComparisonAttributes, ConcreteValue, Current, Directives,
-    PlanInputCurrent, PlanInputDesired, PlanInputDesiredResources, ResolvedDataSource,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
-    plan_input_desired_resources,
+    AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent, PlanInputDesired,
+    PlanInputDesiredResources, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, State, Value, plan_input_desired_resources,
 };
 use crate::schema::{
     AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -30,8 +29,9 @@ use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::resolve_wait_predicate;
 
 use super::{
-    ComparisonContext, ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates,
-    PlannedListKeyRelease, PresentDiff, comparison::AuthoredRemovalEvidence,
+    ExistingComparisonInputs, PlanInputSavedAttributes, PlanPriorStates, PlannedListKeyRelease,
+    PlanningComparison, PresentDiff,
+    comparison::{AuthoredAttributeViews, AuthoredRemovalEvidence},
     diff_present_with_releases, type_aware_equal,
 };
 
@@ -107,9 +107,9 @@ impl DeferredCreateTargets {
 }
 
 /// The retained target owner after binding-to-row graph resolution.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResolvedDeferredCreateTargets(Vec<CompiledDeferredCreate>);
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CompiledDeferredCreate {
     template: crate::parser::CompiledDeferredForExpression,
     dependencies: crate::resource::DeferredDependencyTemplate,
@@ -152,6 +152,19 @@ pub struct CascadeDependents<'a> {
 impl<'a> CascadeDependents<'a> {
     pub fn new(managed: &'a [ResolvedResource], deferred: ResolvedDeferredCreateTargets) -> Self {
         Self { managed, deferred }
+    }
+
+    pub(crate) fn managed(&self) -> &'a [ResolvedResource] {
+        self.managed
+    }
+
+    // Replaying a provisional computation must not consume the caller's
+    // deferred target owner. Only the clean plan is released by preparation.
+    pub(crate) fn for_recording_run(&self) -> Self {
+        Self {
+            managed: self.managed,
+            deferred: self.deferred.clone(),
+        }
     }
 }
 
@@ -281,7 +294,8 @@ fn contains_authored_create_only_value_on_path<'schema>(
                 })
             })
         }
-        AttrTypeKind::Union(_)
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::Union(_)
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -294,11 +308,11 @@ fn contains_authored_create_only_value_on_path<'schema>(
 }
 
 struct UnorderedCreateOnlyMatcher<'items, 'schema, 'context, 'comparison> {
-    desired_items: &'items [&'items Value],
+    desired_items: &'items [(usize, &'items Value)],
     current_items: &'items [Value],
     element_type: &'schema AttributeType,
     schema: &'schema ResourceSchema,
-    context: &'context ComparisonContext<'comparison>,
+    context: &'context PlanningComparison<'comparison>,
     removal_evidence: AuthoredRemovalEvidence,
     current_matches: &'items mut [Option<usize>],
 }
@@ -310,9 +324,13 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
                 || !create_only_values_compatible(
                     self.element_type,
                     &self.current_items[current_index],
-                    self.desired_items[desired_index],
+                    self.desired_items[desired_index].1,
                     self.schema,
-                    self.context,
+                    &self.context.at_paths(
+                        &self
+                            .context
+                            .index_paths(current_index, self.desired_items[desired_index].0),
+                    ),
                     self.removal_evidence,
                 )
             {
@@ -335,7 +353,7 @@ fn create_only_values_compatible(
     current: &Value,
     desired: &Value,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
 ) -> bool {
     create_only_values_compatible_on_path(
@@ -354,7 +372,7 @@ fn authored_create_only_value_is_compatible(
     current: Option<&Value>,
     desired: &Value,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
 ) -> bool {
     !contains_authored_create_only_value(attr_type, desired, schema)
@@ -375,7 +393,7 @@ fn create_only_values_compatible_on_path<'schema>(
     current: &Value,
     desired: &Value,
     schema: &'schema ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
@@ -420,14 +438,17 @@ fn create_only_values_compatible_on_path<'schema>(
                         current_items.get(index),
                         desired,
                         schema,
-                        context,
+                        &context.at_paths(&context.index_paths(index, index)),
                         removal_evidence,
                     )
                 })
             } else {
                 let desired_items = desired_items
                     .iter()
-                    .filter(|item| contains_authored_create_only_value(element_type, item, schema))
+                    .enumerate()
+                    .filter(|(_, item)| {
+                        contains_authored_create_only_value(element_type, item, schema)
+                    })
                     .collect::<Vec<_>>();
                 let mut current_matches = vec![None; current_items.len()];
                 let mut matcher = UnorderedCreateOnlyMatcher {
@@ -461,7 +482,7 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_entries.get(key),
                     desired,
                     schema,
-                    context,
+                    &context.at_paths(&context.map_key_paths(key)),
                     removal_evidence,
                 )
             })
@@ -496,7 +517,7 @@ fn create_only_values_compatible_on_path<'schema>(
                             desired,
                             Some(&field.field_type),
                             &schema.defs,
-                            context,
+                            &context.at_paths(&context.field_paths(&field.name)),
                         )
                     });
                 }
@@ -505,12 +526,13 @@ fn create_only_values_compatible_on_path<'schema>(
                     current_fields.get(&field.name),
                     desired,
                     schema,
-                    context,
+                    &context.at_paths(&context.field_paths(&field.name)),
                     removal_evidence,
                 )
             })
         }
-        AttrTypeKind::Union(_)
+        AttrTypeKind::Reference { .. }
+        | AttrTypeKind::Union(_)
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -522,39 +544,33 @@ fn create_only_values_compatible_on_path<'schema>(
     }
 }
 
-pub(super) fn find_changed_create_only(
+pub(super) fn find_changed_create_only<S>(
     changed_attributes: &[String],
-    current_attributes: &CanonicalComparisonAttributes,
-    removal_evidence: AuthoredRemovalEvidence,
-    desired: &PlanInputDesired<'_>,
+    desired: &ResolvedResource<S>,
+    views: &AuthoredAttributeViews<'_>,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
 ) -> Vec<String> {
     find_changed_create_only_for_resource(
         changed_attributes,
-        current_attributes,
-        removal_evidence,
-        desired.authored().as_resource(),
-        desired.comparison_attributes(),
+        desired.as_resource(),
+        views,
         schema,
         context,
     )
 }
 
-pub(super) fn find_changed_create_only_for_resource<D>(
+pub(super) fn find_changed_create_only_for_resource<S, D>(
     changed_attributes: &[String],
-    current_attributes: &CanonicalComparisonAttributes,
-    removal_evidence: AuthoredRemovalEvidence,
-    desired: &Resource<
-        crate::resource::ModuleSource,
-        crate::resource::NoPlaceholder,
-        AbsoluteBindingAddress,
-        D,
-    >,
-    desired_attributes: &CanonicalComparisonAttributes,
+    desired: &Resource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, D>,
+    views: &AuthoredAttributeViews<'_>,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &PlanningComparison<'_>,
 ) -> Vec<String> {
+    let context = context.with_left_origins(&views.current_origins);
+    let context = &context;
+    let current_attributes = views.current();
+    let removal_evidence = views.removal_evidence();
     let top_level = schema.create_only_attributes();
     changed_attributes
         .iter()
@@ -566,7 +582,7 @@ pub(super) fn find_changed_create_only_for_resource<D>(
             let Some(attribute_schema) = schema.attributes().get(attribute.as_str()) else {
                 return false;
             };
-            let Some(desired_value) = desired_attributes.get(attribute.as_str()) else {
+            let Some(desired_value) = views.desired().get(attribute.as_str()) else {
                 // An authored empty struct canonicalizes to absence, but it
                 // still removes any previously authored create-only leaves.
                 // Keep comparison absence from inventing additions of empty
@@ -595,7 +611,7 @@ pub(super) fn find_changed_create_only_for_resource<D>(
                 current,
                 desired_value,
                 schema,
-                context,
+                &context.at_path(attribute),
                 removal_evidence,
             )
         })
@@ -782,6 +798,10 @@ pub fn generate_temporary_name<S, D>(
 /// let states = HashMap::<ResourceId, Current>::new();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let orphans = Orphans::new();
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &compositions,
 ///     &[],
@@ -792,6 +812,7 @@ pub fn generate_temporary_name<S, D>(
 ///     &saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 ///
@@ -810,6 +831,10 @@ pub fn generate_temporary_name<S, D>(
 /// let states: HashMap<ResourceId, State> = HashMap::new();
 /// let registry = SchemaRegistry::default();
 /// let saved_attrs = RawSavedAttrs::default().lift(&registry);
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
@@ -820,6 +845,7 @@ pub fn generate_temporary_name<S, D>(
 ///     &saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 ///
@@ -839,6 +865,10 @@ pub fn generate_temporary_name<S, D>(
 /// let registry = SchemaRegistry::default();
 /// let plan_states = into_plan_input_current_map(states, &registry, &[]);
 /// let raw_saved_attrs = RawSavedAttrs::default();
+/// let references = futures::executor::block_on(carina_core::references::ReferencePreparation::default().prepare(
+///     &[], &HashMap::new(), &registry, &RawSavedAttrs::default().lift(&registry),
+///     &carina_core::provider::ProviderRouter::new(),
+/// )).unwrap();
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
@@ -849,9 +879,23 @@ pub fn generate_temporary_name<S, D>(
 ///     &raw_saved_attrs,
 ///     &HashMap::new(),
 ///     &[],
+///     &references,
 /// );
 /// ```
 #[allow(clippy::too_many_arguments)]
+/// Reference preparation is a required input, even for a caller with all
+/// other planning inputs available:
+///
+/// ```compile_fail,E0061
+/// use std::collections::HashMap;
+/// use carina_core::{differ::{create_plan, PlanPriorStates}, provider::{ProviderRouter, LiftedSavedAttrs},
+///     resource::{ResolvedResource, ResourceId, Directives}, schema::SchemaRegistry};
+/// fn without_preparation(resources: &[ResolvedResource], provider: &ProviderRouter,
+///     prior: PlanPriorStates<'_>, registry: &SchemaRegistry, saved: &LiftedSavedAttrs) {
+///     let _ = create_plan(resources, &[], provider, prior, &HashMap::new(), registry,
+///         saved, &HashMap::new(), &[]);
+/// }
+/// ```
 pub fn create_plan(
     managed: &[ResolvedResource],
     data_sources: &[ResolvedDataSource],
@@ -862,7 +906,8 @@ pub fn create_plan(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[ResolvedWaitBinding],
-) -> ProviderResult<Plan> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<Plan> {
     create_plan_with_provider(
         managed,
         data_sources,
@@ -874,6 +919,7 @@ pub fn create_plan(
         saved_attrs,
         prev_explicit,
         wait_bindings,
+        references,
     )
 }
 
@@ -892,11 +938,20 @@ pub fn create_plan_for_test(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[ResolvedWaitBinding],
-) -> ProviderResult<Plan> {
+) -> super::PlanComparisonResult<Plan> {
     let (registry, comparison_provider) = crate::provider::comparison_fixture_for_test(
         registry,
         managed.iter().map(|resource| &resource.id),
     );
+    let current = prior_states.materialize_current_states(managed, &registry);
+    let references =
+        futures::executor::block_on(crate::references::ReferencePreparation::default().prepare(
+            managed,
+            &current,
+            &registry,
+            saved_attrs,
+            &comparison_provider,
+        ))?;
     create_plan_with_provider(
         managed,
         data_sources,
@@ -908,6 +963,7 @@ pub fn create_plan_for_test(
         saved_attrs,
         prev_explicit,
         wait_bindings,
+        &references,
     )
 }
 
@@ -923,7 +979,8 @@ pub(crate) fn create_plan_with_provider(
     saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[ResolvedWaitBinding],
-) -> ProviderResult<Plan> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<Plan> {
     let desired = plan_input_desired_resources(managed, registry);
     let managed_current = prior_states.materialize_current_states(desired.authored(), registry);
     let mut build = create_plan_parts(
@@ -938,6 +995,7 @@ pub(crate) fn create_plan_with_provider(
         prior_states.orphans(),
         wait_bindings,
         &HashSet::new(),
+        references,
     )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces, directives_map);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
@@ -964,7 +1022,8 @@ pub fn create_plan_with_cascades(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     wait_bindings: &[ResolvedWaitBinding],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<PendingCascadePlan> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<PendingCascadePlan> {
     let managed_current = prior_states.materialize_current_states(managed.authored(), registry);
     let mut build = create_plan_parts(
         managed,
@@ -978,6 +1037,7 @@ pub fn create_plan_with_cascades(
         prior_states.orphans(),
         wait_bindings,
         outcome_unknown_import_replacements,
+        references,
     )?;
     cascade_dependent_updates(
         &mut build.plan,
@@ -987,6 +1047,7 @@ pub fn create_plan_with_cascades(
         registry,
         provider,
         outcome_unknown_import_replacements,
+        references,
     )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces, directives_map);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
@@ -1113,7 +1174,8 @@ fn create_plan_parts(
     orphans: &super::Orphans,
     wait_bindings: &[ResolvedWaitBinding],
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<PlanBuild> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let authored_managed = managed.authored();
@@ -1173,19 +1235,25 @@ fn create_plan_parts(
                 let context = resolved_comparison.context();
                 let validated_schema = owner_schema.schema();
                 let schema = validated_schema.as_schema();
-                let result = diff_present_with_releases(
-                    comparison_desired,
-                    present,
-                    ExistingComparisonInputs {
-                        current_attributes,
-                        saved,
-                        nested_write_only: saved_attrs.nested_write_only(&resource.id),
-                        prev_explicit: prev_explicit_for_resource,
-                        schema: Some(schema),
-                        context,
-                    },
-                    validated_schema,
-                );
+                let masked =
+                    comparison_desired.masked_comparison(current_attributes, saved, Some(schema));
+                let result = context.with_references(references, &resource.id, |context| {
+                    diff_present_with_releases(
+                        comparison_desired,
+                        present,
+                        ExistingComparisonInputs {
+                            masked: &masked,
+                            current_attributes,
+                            saved,
+                            nested_write_only: saved_attrs.nested_write_only(&resource.id),
+                            prev_explicit: prev_explicit_for_resource,
+                            schema: Some(schema),
+                            context,
+                            observations: &resolved_comparison.context().observation(),
+                        },
+                        validated_schema,
+                    )
+                })?;
                 match result.diff {
                     PresentDiff::Update {
                         id,
@@ -1228,22 +1296,23 @@ fn create_plan_parts(
                         }
 
                         let identifier = present.identifier().clone();
-                        let authored_views = super::comparison::project_authored_attribute_views(
-                            comparison_desired.comparison_attributes(),
-                            current_attributes,
-                            saved,
-                            prev_explicit_for_resource,
-                            Some(schema),
-                            context,
-                        );
-                        let changed_create_only = find_changed_create_only(
-                            &changed_attributes,
-                            authored_views.current(),
-                            authored_views.removal_evidence(),
-                            comparison_desired,
-                            schema,
-                            context,
-                        );
+                        let changed_create_only =
+                            context.with_references(references, &resource.id, |context| {
+                                let authored_views =
+                                    super::comparison::project_authored_attribute_views(
+                                        &masked,
+                                        prev_explicit_for_resource,
+                                        Some(schema),
+                                        context,
+                                    );
+                                find_changed_create_only(
+                                    &changed_attributes,
+                                    comparison_desired.authored(),
+                                    &authored_views,
+                                    schema,
+                                    context,
+                                )
+                            })?;
 
                         if let Some(changed_create_only) =
                             ChangedCreateOnly::new(changed_create_only)
@@ -1761,6 +1830,7 @@ fn known_binding_names(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cascade_dependent_updates(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
@@ -1769,7 +1839,8 @@ fn cascade_dependent_updates(
     registry: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<()> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<()> {
     loop {
         promote_referenced_replaces_to_cbd(plan, pending_replaces, dependents, registry);
 
@@ -1789,6 +1860,7 @@ fn cascade_dependent_updates(
             registry,
             comparison_provider,
             outcome_unknown_import_replacements,
+            references,
         )?;
 
         if !promoted {
@@ -1907,6 +1979,7 @@ fn mark_pending_create_before_destroy(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
@@ -1915,7 +1988,8 @@ fn promote_pending_replaces_for_dependents(
     registry: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> ProviderResult<bool> {
+    references: &crate::references::ResolvedReferences,
+) -> super::PlanComparisonResult<bool> {
     let mut promoted = false;
 
     for resource in unresolved_managed {
@@ -1954,14 +2028,27 @@ fn promote_pending_replaces_for_dependents(
             let owner_schema = resolved_comparison.owner_schema();
             let schema = owner_schema.schema().as_schema();
             let desired = PlanInputDesired::with_resource_schema(resource, Some(schema));
-            let create_only_refs = find_changed_create_only(
-                &ref_attr_names,
-                current.comparison_attributes(),
-                AuthoredRemovalEvidence::Unrecorded,
-                &desired,
-                schema,
-                resolved_comparison.context(),
-            );
+            let masked =
+                desired.masked_comparison(current.comparison_attributes(), None, Some(schema));
+            let create_only_refs = resolved_comparison.context().with_references(
+                references,
+                &resource.id,
+                |context| {
+                    let views = super::comparison::project_authored_attribute_views(
+                        &masked,
+                        None,
+                        Some(schema),
+                        context,
+                    );
+                    find_changed_create_only(
+                        &ref_attr_names,
+                        desired.authored(),
+                        &views,
+                        schema,
+                        context,
+                    )
+                },
+            )?;
 
             if let Some(changed_create_only) = ChangedCreateOnly::new(create_only_refs) {
                 let ref_hints: Vec<(String, String)> = ref_attrs

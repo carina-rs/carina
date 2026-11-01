@@ -26,7 +26,7 @@ fn diff_test(
         saved,
         prev_explicit,
         schema,
-        &super::exact_comparison_context_for_tests(),
+        &super::exact_comparison_schema_for_tests(),
     )
 }
 
@@ -1025,6 +1025,7 @@ fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_st
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &provider,
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("comparison fixture must resolve");
 
@@ -1035,6 +1036,7 @@ fn managed_binding_stays_updating_when_omitted_nested_create_only_value_is_in_st
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &provider,
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("pre-graph lifecycle paths must resolve")
     .expect("pre-graph comparison fixture must resolve");

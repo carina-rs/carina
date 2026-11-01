@@ -1054,6 +1054,12 @@ pub enum AppError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
+    #[error(transparent)]
+    ReferencePreparation(#[from] Box<carina_core::references::ReferencePlanError>),
+
+    #[error(transparent)]
+    PlanComparison(#[from] carina_core::differ::PlanComparisonError),
+
     /// Host-side AWS credential resolution failed before a guest started.
     #[error(transparent)]
     AwsCredentials(#[from] AwsCredentialStartupError),

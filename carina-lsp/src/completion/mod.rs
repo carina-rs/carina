@@ -735,6 +735,18 @@ impl CompletionProvider {
                 .is_some();
                 completions
                     .extend(self.completions_for_type(field.field_type(), Some(resource_type)));
+                completions.extend(
+                    self.resource_ref_completions_for_type(
+                        field.field_type().in_schema(schema.as_schema().defs()),
+                        text,
+                        base_path,
+                    )
+                    .into_iter()
+                    .filter(|item| {
+                        !current_binding
+                            .is_some_and(|binding| item.label.starts_with(&format!("{binding}.")))
+                    }),
+                );
             }
         }
         let mut in_scope = self.in_scope_binding_completions(

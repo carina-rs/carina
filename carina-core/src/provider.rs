@@ -4920,6 +4920,33 @@ pub trait Provider: Send + Sync {
     /// Name of this Provider (e.g., "aws")
     fn name(&self) -> &str;
 
+    /// Resolve comparison keys in this initialized instance. An unsupported
+    /// identity is an error for each request, never a successful raw echo.
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [crate::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+        >,
+    > {
+        Box::pin(async move {
+            Ok(requests
+                .iter()
+                .map(|request| {
+                    Err(crate::references::ReferenceError::InvalidReference(
+                        ProviderError::invalid_input(format!(
+                            "unsupported reference identity {}",
+                            request.ty
+                        ))
+                        .into(),
+                    ))
+                })
+                .collect())
+        })
+    }
+
     /// Read the current provider-side state of an existing resource.
     ///
     /// `identifier` is the validated, non-empty cloud-side identifier (e.g.
@@ -5631,7 +5658,7 @@ impl InitializedProvider {
 /// Provider normalizers without CRUD-capable initialized instances.
 ///
 /// Normalizer-only loading returns this type. It deliberately has no API that
-/// can mint a [`crate::differ::ComparisonContext`].
+/// can mint a [`crate::differ::ComparisonSchema`].
 pub struct NormalizerRouter {
     normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
 }
@@ -5770,7 +5797,7 @@ impl From<ComparisonResolutionError> for ProviderError {
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedComparison<'a> {
     owner_schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    context: crate::differ::ComparisonContext<'a>,
+    context: crate::differ::ComparisonSchema<'a>,
 }
 
 impl<'a> ResolvedComparison<'a> {
@@ -5778,7 +5805,7 @@ impl<'a> ResolvedComparison<'a> {
         self.owner_schema
     }
 
-    pub fn context(&self) -> &crate::differ::ComparisonContext<'a> {
+    pub fn context(&self) -> &crate::differ::ComparisonSchema<'a> {
         &self.context
     }
 }
@@ -5840,7 +5867,7 @@ impl ResourceComparisonResolver for MetadataComparisonResolver {
         }
         Ok(ResolvedComparison {
             owner_schema: schema,
-            context: crate::differ::ComparisonContext::from_scope_and_forms(
+            context: crate::differ::ComparisonSchema::from_scope_and_forms(
                 &self.reference_scope,
                 schema.reference_forms(),
             ),
@@ -5900,7 +5927,7 @@ impl ResolvedComparisonTable {
         );
         Ok(ResolvedComparison {
             owner_schema,
-            context: crate::differ::ComparisonContext::from_scope_and_forms(
+            context: crate::differ::ComparisonSchema::from_scope_and_forms(
                 &data.scope,
                 &data.reference_forms,
             ),
@@ -6052,6 +6079,18 @@ impl ProviderRouter {
         }
     }
 
+    pub async fn resolve_references_for(
+        &self,
+        resource: &ResourceId,
+        requests: &[crate::references::ReferenceRequest],
+    ) -> ProviderResult<
+        Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+    > {
+        self.get_provider_or_error(resource)?
+            .resolve_references(requests)
+            .await
+    }
+
     /// Register the kind's default instance (resources with
     /// `provider_instance = None` route here).
     pub fn add_provider(&mut self, kind: String, provider: InitializedProvider) {
@@ -6131,7 +6170,7 @@ impl ProviderRouter {
         &'a self,
         id: &ResourceId,
         schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<crate::differ::ComparisonContext<'a>> {
+    ) -> ProviderResult<crate::differ::ComparisonSchema<'a>> {
         self.resolve_comparison(id, schema)
             .map(|resolved| resolved.context)
             .map_err(ProviderError::from)
@@ -6203,7 +6242,7 @@ impl ProviderRouter {
         })?;
         Ok(ResolvedComparison {
             owner_schema: schema,
-            context: crate::differ::ComparisonContext::from_initialized_provider(provider, schema),
+            context: crate::differ::ComparisonSchema::from_initialized_provider(provider, schema),
         })
     }
 }
@@ -6420,6 +6459,7 @@ impl CustomTypeCanonicalizationError {
 /// Return the identity carried by an identified scalar or enum declaration.
 pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option<&TypeIdentity> {
     match attribute_type.raw_shape() {
+        RawShape::Reference { .. } => None,
         RawShape::String { identity, .. }
         | RawShape::Int { identity, .. }
         | RawShape::Float { identity, .. } => identity,
@@ -6441,6 +6481,11 @@ pub fn identified_custom_type_scalar_kind(
     attribute_type: &AttributeType,
 ) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(RefinedScalarKind::String),
         RawShape::String {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::String),
@@ -6466,6 +6511,11 @@ pub fn identified_custom_type_scalar_kind(
 
 fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalarKind> {
     match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => Some(RefinedScalarKind::String),
         RawShape::String { .. } => Some(RefinedScalarKind::String),
         RawShape::Int { .. } => Some(RefinedScalarKind::Int),
         RawShape::Float { .. } => Some(RefinedScalarKind::Float),
@@ -6628,14 +6678,16 @@ pub fn canonicalize_custom_type_value(
             )))
         }
         (
-            RawShape::String { .. }
+            RawShape::Reference { .. }
+            | RawShape::String { .. }
             | RawShape::Int { .. }
             | RawShape::Float { .. }
             | RawShape::Enum { .. },
             Value::Deferred(_),
         ) => Ok(None),
         (
-            RawShape::String { .. }
+            RawShape::Reference { .. }
+            | RawShape::String { .. }
             | RawShape::Int { .. }
             | RawShape::Float { .. }
             | RawShape::Enum { .. },
@@ -6695,7 +6747,7 @@ impl std::fmt::Display for CanonicalCustomTypeValue {
 /// Factory for creating and configuring a Provider.
 ///
 /// Each provider crate implements this trait to encapsulate provider-specific
-/// logic (region validation, region extraction, provider instantiation, schemas).
+/// logic (configuration validation, provider instantiation, schemas).
 /// The CLI uses factories instead of hardcoded provider name matching.
 pub trait ProviderFactory: Send + Sync {
     /// Provider name (e.g., "aws", "awscc")
@@ -6764,10 +6816,6 @@ pub trait ProviderFactory: Send + Sync {
     ) -> ProviderResult<()> {
         Ok(())
     }
-
-    /// Extract region from config in SDK format (e.g., "ap-northeast-1").
-    /// Returns a default region if none is configured.
-    fn extract_region(&self, attributes: &IndexMap<String, Value>) -> String;
 
     /// Create a provider instance from configuration attributes.
     ///
@@ -6993,6 +7041,13 @@ fn collect_type_names_from_type(
     use crate::schema::RawShape;
 
     match attr_type.raw_shape() {
+        RawShape::Reference {
+            identity,
+            pattern: _pattern,
+            length: _length,
+        } => {
+            names.insert(identity.clone());
+        }
         RawShape::String {
             identity: Some(id), ..
         }
@@ -7046,6 +7101,11 @@ fn local_custom_validator(
     attribute_type: &AttributeType,
 ) -> Option<&crate::schema::CustomValidator> {
     match attribute_type.raw_shape() {
+        RawShape::Reference {
+            identity: _identity,
+            pattern: _pattern,
+            length: _length,
+        } => None,
         RawShape::String { validate, .. }
         | RawShape::Int { validate, .. }
         | RawShape::Float { validate, .. }
@@ -7072,6 +7132,10 @@ fn validate_declared_custom_type_locally(
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, crate::schema::TypeError> {
     declared_type.validate_identified_scalar_value(value)?;
+    // Reference identities choose the plan resolver, never guest validation.
+    if matches!(declared_type.raw_shape(), RawShape::Reference { .. }) {
+        return Ok(None);
+    }
     canonicalize_custom_type_value(declared_type, value)
         .map_err(CustomTypeCanonicalizationError::into_type_error)
 }
@@ -8186,10 +8250,6 @@ mod tests {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -8278,10 +8338,6 @@ mod tests {
             _attributes: &CanonicalProviderConfigAttributes,
         ) -> ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -11672,7 +11728,8 @@ mod tests {
 
         let context = router
             .comparison_context_for(&id, schema)
-            .expect("the named provider instance must supply its scope");
+            .expect("the named provider instance must supply its scope")
+            .observation();
         let name = string_value("processor");
         let west_arn = string_value("arn:aws:lambda:us-west-2:123456789012:function:processor");
         let east_arn = string_value("arn:aws:lambda:us-east-1:123456789012:function:processor");
@@ -11858,9 +11915,6 @@ mod tests {
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
-            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
-                "us-east-1".to_string()
-            }
             fn create_provider(
                 &self,
                 _binding: Option<&str>,
@@ -11952,9 +12006,6 @@ mod tests {
                 _attrs: &CanonicalProviderConfigAttributes,
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
-            }
-            fn extract_region(&self, _attrs: &IndexMap<String, Value>) -> String {
-                "ap-northeast-1".to_string()
             }
             fn create_provider(
                 &self,

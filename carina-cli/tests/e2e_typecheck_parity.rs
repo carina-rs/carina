@@ -32,7 +32,6 @@ use carina_core::schema::{
 };
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
-use indexmap::IndexMap;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -2265,10 +2264,6 @@ impl ProviderFactory for TestProviderFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -4345,9 +4340,6 @@ impl ProviderFactory for WasmStyleProviderFactory {
             }
         }
         Ok(())
-    }
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
     fn create_provider(
         &self,

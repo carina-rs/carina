@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::binding_index::{BindingCompleteness, BindingValueSource, ResolvedBindings};
-use crate::differ::ComparisonContext;
+use crate::differ::ObservationComparison;
 use crate::effect::ResolvedMove;
 use crate::name_override::NameOverride;
 use crate::parser::{SourceSpan, StateBlock, StateBlockAddress};
@@ -1824,7 +1824,7 @@ fn schema_canonical_value_string<P: PlaceholderKind, B: BindingAddress>(
 /// resource's schema and initialized provider scope.
 ///
 /// In particular, refined reference strings use the same
-/// [`ComparisonContext::canonical_string`] projection as `type_aware_equal`,
+/// [`ObservationComparison::canonical_string`] projection as `type_aware_equal`,
 /// so a bare reference and its long form cannot compare equal while producing
 /// different prefix-match keys. Resolved candidates do not use this key; they
 /// compare only through `type_aware_equal`.
@@ -1832,7 +1832,7 @@ fn canonical_create_only_value_string(
     value: &Value,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
-    context: &ComparisonContext<'_>,
+    context: &ObservationComparison<'_>,
 ) -> Option<String> {
     match (
         value,
@@ -3096,7 +3096,7 @@ impl DesiredIdentityValues {
         &self,
         state_values: &StateRowIdentityValues,
         schema: &ValidatedResourceSchema,
-        context: &ComparisonContext<'_>,
+        context: &ObservationComparison<'_>,
     ) -> DeclaredIdentityRowOutcome {
         let mut desired_unresolved = false;
         let mut override_hidden_attributes = BTreeSet::new();
@@ -3211,7 +3211,7 @@ fn legacy_row_stable_identity_matches(
             match desired_identity.compare_row(
                 &state_entry.identity_values,
                 schema,
-                comparison.context(),
+                &comparison.context().observation(),
             ) {
                 DeclaredIdentityRowOutcome::Match => Some(true),
                 DeclaredIdentityRowOutcome::Mismatch => Some(false),
@@ -3238,7 +3238,7 @@ fn legacy_row_stable_identity_matches(
     let (create_only_count, create_only_matches) = desired_create_only.resolved_subset_match(
         state_entry.create_only_values(),
         schema.as_schema(),
-        comparison.context(),
+        &comparison.context().observation(),
     );
     Ok((create_only_count > 0).then_some(create_only_matches))
 }
@@ -3490,7 +3490,7 @@ impl ResolvedCreateOnlyValue {
         other: &Self,
         schema: &ResourceSchema,
         attr_type: &AttributeType,
-        context: &ComparisonContext<'_>,
+        context: &ObservationComparison<'_>,
     ) -> bool {
         crate::differ::type_aware_equal(
             &self.value,
@@ -3506,7 +3506,7 @@ impl ResolvedCreateOnlyValue {
         prefix: &str,
         schema: &ResourceSchema,
         attr_type: &AttributeType,
-        context: &ComparisonContext<'_>,
+        context: &ObservationComparison<'_>,
     ) -> bool {
         let state_key =
             canonical_create_only_value_string(&self.value, Some(attr_type), &schema.defs, context);
@@ -3535,7 +3535,7 @@ impl DesiredCreateOnlyValue {
         state: &ResolvedCreateOnlyValue,
         schema: &ResourceSchema,
         attribute: &str,
-        context: &ComparisonContext<'_>,
+        context: &ObservationComparison<'_>,
     ) -> Option<bool> {
         let attr_type = schema
             .attributes
@@ -3627,7 +3627,7 @@ fn resolved_subset_match(
     desired_values: &HashMap<String, DesiredCreateOnlyValue>,
     state_values: &HashMap<String, ResolvedCreateOnlyValue>,
     schema: &ResourceSchema,
-    context: &ComparisonContext<'_>,
+    context: &ObservationComparison<'_>,
 ) -> (usize, bool) {
     let mut resolved = 0;
     let mut all_match = true;
@@ -3713,7 +3713,7 @@ impl DesiredCreateOnlyValues {
         &self,
         state_values: &StateCreateOnlyValues,
         schema: &ResourceSchema,
-        context: &ComparisonContext<'_>,
+        context: &ObservationComparison<'_>,
     ) -> (usize, bool) {
         resolved_subset_match(&self.values, &state_values.values, schema, context)
     }
@@ -3722,7 +3722,7 @@ impl DesiredCreateOnlyValues {
         &self,
         state_values: &StateCreateOnlyValues,
         schema: &ResourceSchema,
-        context: &ComparisonContext<'_>,
+        context: &ObservationComparison<'_>,
     ) -> (usize, usize) {
         let mut matched = 0;
         let mut mismatched = 0;
@@ -3750,7 +3750,7 @@ impl DesiredCreateOnlyValues {
         &self,
         state_values: &StateCreateOnlyValues,
         schema: &ResourceSchema,
-        context: &ComparisonContext<'_>,
+        context: &ObservationComparison<'_>,
     ) -> bool {
         self.values.iter().all(|(attribute, desired)| {
             let Some(state) = state_values.values.get(attribute) else {
@@ -4102,7 +4102,7 @@ pub fn reconcile_anonymous_identifiers(
                     let outcome = desired_identity.compare_row(
                         &entry.identity_values,
                         validated_schema,
-                        comparison.context(),
+                        &comparison.context().observation(),
                     );
                     (entry, outcome)
                 })
@@ -4245,7 +4245,7 @@ pub fn reconcile_anonymous_identifiers(
             let (matched, mismatched) = resource_co_values.match_counts(
                 entry.create_only_values(),
                 schema,
-                comparison.context(),
+                &comparison.context().observation(),
             );
 
             if matched > 0 && mismatched == 0 {
@@ -4504,7 +4504,7 @@ pub fn detect_anonymous_to_named_renames(
                     let (_matched, mismatched) = resource_co_values.match_counts(
                         entry.create_only_values(),
                         schema,
-                        comparison.context(),
+                        &comparison.context().observation(),
                     );
                     mismatched == 0
                 })
@@ -4533,7 +4533,7 @@ pub fn detect_anonymous_to_named_renames(
                 let all_match = resource_co_values.all_match(
                     entry.create_only_values(),
                     schema,
-                    comparison.context(),
+                    &comparison.context().observation(),
                 );
                 if !all_match {
                     continue;

@@ -220,7 +220,7 @@ allow duplicates.
 Protocol v17 requires every list schema JSON record to carry `elements` as
 `"allow_duplicates"` or `"unique"`, including ordinary lists. There is no
 default at decode. Rebuild providers against the updated SDK before loading
-them with a v17 host.
+them with the current v18 host.
 
 Struct fields use the same three constructors as attributes, `StructField::optional`, `StructField::required` and `StructField::provider_populated`:
 

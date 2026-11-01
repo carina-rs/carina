@@ -22,7 +22,8 @@ for marker in \
   POS_IMPLICIT_SOURCE \
   POS_POSITIONAL_FIELD \
   POS_TRAILING_COMMENT \
-  POS_FROM_INFO_LOSS
+  POS_FROM_INFO_LOSS \
+  POS_CALLER_RENDERED_DUP
 do
   if ! grep -q "$marker" "$output"; then
     echo "checker did not flag fixture $marker" >&2

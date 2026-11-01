@@ -45,7 +45,6 @@ use carina_core::provider::{
 };
 use carina_core::resource::{Current, ResolvedResourceId, ResourceId, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
-use indexmap::IndexMap;
 use std::sync::Mutex;
 
 fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
@@ -86,9 +85,6 @@ impl ProviderFactory for AwsStub {
         _v: &carina_core::provider::CanonicalCustomTypeValue,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-    fn extract_region(&self, _a: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
     }
     fn create_provider(
         &self,

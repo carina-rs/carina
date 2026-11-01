@@ -9,7 +9,7 @@ use crate::binding_index::{
     AppliedOperation, BindingCompleteness, PartialReadBack, ResolvedBindings,
     SecretPreservingAttributes,
 };
-use crate::differ::{AttrComparison, LeafProvenance, TypedAttr, secret_grafted_comparison_view};
+use crate::differ::secret_grafted_comparison_view;
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
     CheckInput, DataSourceCheckInput, ProviderPreparationContext, ResolvedCheckInput,
@@ -1186,61 +1186,63 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 .schemas()
                 .get_for(resolved_resource)
                 .expect("managed_update_schema proved that the owner-bound schema exists");
-            let comparison = match ctx
-                .comparison_provider
-                .comparison_context_for(id, owner_schema)
-            {
-                Ok(comparison) => comparison,
-                Err(error) => {
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure: EffectFailureKind::provider(error),
-                            refresh: None,
-                        },
-                    );
-                }
-            };
+            let mut candidates = HashMap::new();
             for (key, new_value) in &resolved_resource.attributes {
-                if effective_changed.iter().any(|k| k == key) {
+                if effective_changed.contains(key)
+                    || resolve_source_attributes.get(key) == Some(new_value)
+                {
                     continue;
                 }
-                // The plan already decided literal attributes. Reconsider a
-                // key only when resolution or provider normalization changed
-                // its desired value at apply time; otherwise raw provider
-                // defaults could turn an unrelated saved-plan update into a
-                // wider patch than the plan authorized.
-                if resolve_source_attributes.get(key) == Some(new_value) {
-                    continue;
-                }
-                let type_info = schema.attributes.get(key).map(|attr| TypedAttr {
-                    attr_type: &attr.attr_type,
-                    defs: &schema.defs,
-                });
-                let Some(comparison_value) =
+                if let Some(value) =
                     secret_grafted_comparison_view(new_value, resolve_source_attributes.get(key))
-                else {
-                    continue;
-                };
-                // Apply-time augmentation detects newly resolved observable
-                // references. The plan already decided the unobservable leaf
-                // half, and keys it marked changed were skipped above.
-                let changed = crate::differ::key_should_enter_patch_with_ignores(
-                    key,
-                    Some(schema),
-                    LeafProvenance::DecidedByPlan { key_changed: false },
-                    AttrComparison {
-                        from: from.attributes.get(key),
-                        to: comparison_value.as_ref(),
-                        saved: None,
-                        type_info,
-                    },
-                    resolved_to.ignore_changes(),
-                    &comparison,
+                {
+                    candidates.insert(key.clone(), value.into_owned());
+                }
+            }
+            if !candidates.is_empty() {
+                // A concrete plan value can be re-resolved from its authored
+                // ResourceRef at apply (PlanNormalized retains that origin).
+                // Patch membership is a planning decision, so compare fresh
+                // identities before checked request construction. Only keys
+                // actually changed by resolution enter this preparation.
+                let current = crate::resource::CanonicalComparisonAttributes::canonicalize(
+                    from.attributes
+                        .iter()
+                        .filter(|(key, _)| candidates.contains_key(*key))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                    schema,
                 );
-                if changed {
-                    effective_changed.push(key.clone());
+                let desired = crate::resource::CanonicalComparisonAttributes::canonicalize_preserving_secret_shapes(candidates, schema);
+                let masked = resolved_to.ignore_changes().mask_comparison_attributes(
+                    &desired,
+                    &current,
+                    None,
+                    Some(schema),
+                );
+                let additional = crate::references::ReferencePreparation::default()
+                    .apply_time(&resolved_to, &masked, owner_schema, ctx.comparison_provider)
+                    .await;
+                match additional {
+                    Ok(additional) => effective_changed.extend(additional.value),
+                    Err(error) => {
+                        let failure = match error {
+                            crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
+                                EffectFailureKind::execution(error)
+                            }
+                            crate::differ::ApplyTimeComparisonError::Reference(error) => {
+                                EffectFailureKind::provider(error)
+                            }
+                        };
+                        return StartedBasicEffectResult::new(
+                            started_effect,
+                            started,
+                            BasicEffectResult::Failure {
+                                failure,
+                                refresh: None,
+                            },
+                        );
+                    }
                 }
             }
             let request = match UpdateRequest::checked(

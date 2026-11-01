@@ -41,6 +41,7 @@ pub mod plan_tree;
 pub mod protocol_convert;
 pub mod provider;
 pub mod provider_source;
+pub mod references;
 pub mod resolved_graph;
 pub mod resolver;
 #[cfg(test)]

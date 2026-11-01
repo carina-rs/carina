@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use carina_core::differ::{Diff, diff};
+use carina_core::differ::{Diff, diff_for_test as diff};
 use carina_core::provider::{InitializedProvider, ProviderRouter};
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
@@ -229,7 +229,9 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
         None,
         Some(witness.resources()[0].as_schema()),
         &comparison,
-    );
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
     assert!(
         matches!(d, Diff::NoChange(_)),
         "equal cyclic values must produce NoChange, got: {d:?}"
@@ -293,7 +295,9 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
         None,
         Some(witness.resources()[0].as_schema()),
         &comparison,
-    );
+        &carina_core::references::prepare_empty_for_tests(),
+    )
+    .unwrap();
     match d {
         Diff::Update {
             changed_attributes, ..

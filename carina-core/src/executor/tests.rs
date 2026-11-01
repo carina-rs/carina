@@ -1371,9 +1371,6 @@ impl ProviderFactory for AliasFactory {
     ) -> crate::provider::ProviderResult<()> {
         Ok(())
     }
-    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
-        String::new()
-    }
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -8652,6 +8649,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         &crate::provider::RawSavedAttrs::default().lift(&schemas),
         &HashMap::new(),
         &[],
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
 
@@ -9395,6 +9393,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &HashMap::new(),
         &[],
         &std::collections::HashSet::new(),
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
     .finish(|_| {});

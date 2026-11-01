@@ -21,7 +21,10 @@ enum PositiveCases {
     TupleDotOne(String, #[source] io::Error),
 
     #[error("POS_SAME_LINE_NAMED: {source}")]
-    SameLineNamed { #[source] source: io::Error },
+    SameLineNamed {
+        #[source]
+        source: io::Error,
+    },
 
     #[error("POS_IMPLICIT_SOURCE")]
     ImplicitSource { source: io::Error },
@@ -40,4 +43,11 @@ enum PositiveCases {
 
     #[error("POS_FROM_INFO_LOSS")]
     FromInformationLoss(#[from] io::Error),
+}
+
+#[derive(thiserror::Error, Debug)]
+#[error("POS_CALLER_RENDERED_DUP: {cause}")] // error-chain: caller-renders-sources
+struct CallerRenderedDuplicate {
+    #[source]
+    cause: std::io::Error,
 }

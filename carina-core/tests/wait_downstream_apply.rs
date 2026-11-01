@@ -437,6 +437,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
 
@@ -619,6 +620,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
     assert!(
@@ -806,6 +808,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &resolved_waits,
+        &carina_core::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed");
     assert!(

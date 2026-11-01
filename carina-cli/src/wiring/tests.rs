@@ -242,6 +242,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         .empty_like();
     let expansion = PostExpansionPlanView {
         data: PostExpansionPlanData {
+            reference_preparation: Default::default(),
             expanded_resources,
             sorted_resources: Vec::new(),
             addressed: AddressedState {
@@ -271,21 +272,24 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
     let preparation_errors =
         NonEmptyPlanErrors::try_from(vec![expected.clone()]).expect("one error is non-empty");
 
-    let outcome = build_post_expansion_plan::<PlanMode, _>(PostExpansionPlanInput {
-        context: &context,
-        expansion,
-        environment: PostExpansionPlanEnvironment {
-            data_sources: &[],
-            provider: &provider,
-            normalizer: &provider,
-            provider_configs: &[],
-            remote_bindings: &HashMap::new(),
-            state_file: &state_file,
-            state_block_claims: &state_block_claims,
-            resolved_state_block_targets: &resolved_state_block_targets,
-            preparation_errors: Some(preparation_errors),
+    let outcome = build_post_expansion_plan::<PlanMode, _>(
+        PostExpansionPlanInput {
+            context: &context,
+            expansion,
+            environment: PostExpansionPlanEnvironment {
+                data_sources: &[],
+                provider: &provider,
+                normalizer: &provider,
+                provider_configs: &[],
+                remote_bindings: &HashMap::new(),
+                state_file: &state_file,
+                state_block_claims: &state_block_claims,
+                resolved_state_block_targets: &resolved_state_block_targets,
+                preparation_errors: Some(preparation_errors),
+            },
         },
-    })
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
+    )
     .await
     .expect("typed preparation diagnostics should produce an outcome");
 
@@ -293,9 +297,9 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         panic!("non-empty preparation diagnostics must not produce a plan")
     };
     let errors = diagnostics.errors().clone();
-    let artifacts = diagnostics.into_artifacts();
+    let (_artifacts, plan) = diagnostics.into_parts();
     assert_eq!(errors.as_slice(), &[expected]);
-    assert_eq!(artifacts.plan.errors(), errors.as_slice());
+    assert_eq!(plan.errors(), errors.as_slice());
 }
 
 struct RawEnumStateFactory;
@@ -318,10 +322,6 @@ impl ProviderFactory for RawEnumStateFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        String::new()
     }
 
     fn create_provider(
@@ -533,6 +533,7 @@ let item = test.thing {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .unwrap_or_else(|error| panic!("refresh={refresh} plan failed: {error}"));
@@ -639,6 +640,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build enum/int rename plan");
@@ -733,6 +735,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build unordered enum rename plan");
@@ -944,6 +947,7 @@ let first = test.thing {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("a contested orphan must fall back to delete and create");
@@ -1069,6 +1073,7 @@ let direct = awscc.ec2.Route {
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("a cross-pass contest must fall back to delete and create");
@@ -2210,10 +2215,6 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -2645,6 +2646,7 @@ where
         remote_bindings,
         state_block_claims,
         resolved_state_block_targets,
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .map(ValidatedConfig::into_context_for_test)
@@ -3156,10 +3158,6 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -3276,10 +3274,6 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -3340,6 +3334,57 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
 }
 
 #[tokio::test]
+async fn provider_progress_uses_schema_region() {
+    let ctx = WiringContext::new_for_test(
+        vec![
+            Box::new(RawEnumStateFactory),
+            Box::new(RegionIdentityFactory),
+        ],
+        &[],
+    );
+    let configs = validated_provider_configs(vec![
+        ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::from([(
+                "region".to_string(),
+                Value::Concrete(ConcreteValue::String("us-west-2".into())),
+            )]),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        },
+        region_provider_config("aws.Region.ap_northeast_1"),
+    ]);
+    let lines = Box::leak(Box::new(RecordedProgressLines::default()));
+    let mut router = ProviderRouter::new();
+
+    for config in configs.iter() {
+        instantiate_provider_into_router(
+            &ctx,
+            &mut router,
+            config,
+            None,
+            ProgressSink::Recorded(lines),
+        )
+        .await
+        .expect("provider initialization must succeed");
+    }
+
+    assert_eq!(
+        lines.snapshot(),
+        [
+            "Using test (instance=default)".cyan().to_string(),
+            "Using awscc (region: ap-northeast-1, instance=default)"
+                .cyan()
+                .to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
     struct FailingInitializeFactory;
 
@@ -3361,10 +3406,6 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
         }
 
         fn create_provider(
@@ -3464,10 +3505,6 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
     }
 
     fn create_provider(
@@ -3604,6 +3641,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await;
     let error = match result {
@@ -3654,10 +3692,6 @@ impl ProviderFactory for CascadeAwsccFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -4013,10 +4047,6 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "local".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -4134,6 +4164,7 @@ let shared = read test.shared.Type {}
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("managed orphan and same-id data source must coexist through planning");
@@ -4395,10 +4426,6 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
             Ok(())
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test-region".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -4515,10 +4542,6 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "test".to_string()
         }
 
         fn create_provider(
@@ -6600,10 +6623,6 @@ impl ProviderFactory for DeferredForCollisionFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "us-east-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -6731,10 +6750,6 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
-    }
-
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
     }
 
     fn create_provider(
@@ -7144,6 +7159,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &HashMap::new(),
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build mixed automatic-move plan");
@@ -7367,6 +7383,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &expanded_remote_bindings,
         &StateBlockClaims::default(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("build late mixed automatic-move plan");
@@ -8542,6 +8559,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &HashMap::new(),
         &StateBlockClaims::empty(),
         &ResolvedStateBlockTargets::default(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("plan should build");
@@ -9889,10 +9907,6 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-        "ap-northeast-1".to_string()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -10926,6 +10940,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         &HashMap::new(),
         &claims,
         &targets,
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
     )
     .await
     .expect("state blocks and the retained loop must plan together");
@@ -10990,7 +11005,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         "deferred effects must follow state-block effects: {:#?}",
         plan.effects()
     );
-    plan
+    (*plan).clone()
 }
 
 #[tokio::test]
@@ -11175,16 +11190,15 @@ mod expand_same_config_deferred_for_tests {
             })
             .seal(DataSourceValues::empty());
 
-        let out = prepared
-            .expand_parsed(
-                &mut parsed,
-                &schemas,
-                &HashMap::new(),
-                DeferredForWarningPolicy::Suppress,
-                &ProviderRouter::new(),
-                &identity_context,
-            )
-            .expect("deferred-for expansion should succeed");
+        let out = futures::executor::block_on(prepared.expand_parsed(
+            &mut parsed,
+            &schemas,
+            &HashMap::new(),
+            DeferredForWarningPolicy::Suppress,
+            &ProviderRouter::new(),
+            &identity_context,
+        ))
+        .expect("deferred-for expansion should succeed");
         assert!(
             !out.printed_warnings,
             "verification must not print warnings"
@@ -12167,7 +12181,7 @@ mod using_line_format_tests {
             .parse()
             .unwrap();
         assert_eq!(
-            format_provider_using_line("awscc", "ap-northeast-1", None, Some(&source),),
+            format_provider_using_line("awscc", Some("ap-northeast-1"), None, Some(&source)),
             "Using awscc (region: ap-northeast-1, instance=default, \
              source: github.com/carina-rs/carina-provider-awscc)",
         );
@@ -12180,7 +12194,7 @@ mod using_line_format_tests {
         // identify what got wired up.
         let source = "github.com/carina-rs/carina-provider-aws".parse().unwrap();
         assert_eq!(
-            format_provider_using_line("aws", "us-east-1", Some("us"), Some(&source),),
+            format_provider_using_line("aws", Some("us-east-1"), Some("us"), Some(&source)),
             "Using aws (region: us-east-1, instance=us, \
              source: github.com/carina-rs/carina-provider-aws)",
         );
@@ -12191,7 +12205,7 @@ mod using_line_format_tests {
         // The kind's default instance must be labeled "instance=default"
         // explicitly, not omitted — the omission is what made the old
         // default-line and named-line shapes diverge.
-        let line = format_provider_using_line("aws", "ap-northeast-1", None, None);
+        let line = format_provider_using_line("aws", Some("ap-northeast-1"), None, None);
         assert!(
             line.contains("instance=default"),
             "default instance must surface as 'instance=default'; got: {line}",
@@ -12206,10 +12220,29 @@ mod using_line_format_tests {
         // ("AWS provider"). The old named-instance path used
         // display_name, which made the two log lines disagree on
         // what to call the same construct.
-        let line = format_provider_using_line("aws", "us-east-1", Some("us"), None);
+        let line = format_provider_using_line("aws", Some("us-east-1"), Some("us"), None);
         assert!(
             line.starts_with("Using aws "),
             "kind label must be the kind name, not a display name; got: {line}",
+        );
+    }
+
+    #[test]
+    fn default_instance_without_region_with_source() {
+        let source = "github.com/carina-rs/carina-provider-github"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            format_provider_using_line("github", None, None, Some(&source)),
+            "Using github (instance=default, source: github.com/carina-rs/carina-provider-github)",
+        );
+    }
+
+    #[test]
+    fn named_instance_without_region_or_source() {
+        assert_eq!(
+            format_provider_using_line("github", None, Some("team"), None),
+            "Using github (instance=team)",
         );
     }
 }
@@ -12913,10 +12946,6 @@ mod resolved_value_constraint_gate {
             }
         }
 
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
-        }
-
         fn create_provider(
             &self,
             _binding: Option<&str>,
@@ -13029,10 +13058,6 @@ mod resolved_value_constraint_gate {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            "local".to_string()
         }
 
         fn create_provider(
@@ -13635,6 +13660,7 @@ exports { team_prefix: String = "x" }"#,
             &remote_bindings,
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("resolved-value violations must be represented by the plan");
@@ -13712,6 +13738,7 @@ exports { team_prefix: String = "x" }"#,
             &HashMap::new(),
             &StateBlockClaims::default(),
             &ResolvedStateBlockTargets::default(),
+            crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
         )
         .await
         .expect("module violations must be represented by the plan");
@@ -13896,4 +13923,81 @@ fn validate_rejects_empty_interpolation_in_attribute_param_default() {
         .expect_err("empty interpolation must fail expansion")
         .into_errors();
     assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[tokio::test]
+async fn round2_binding_stability_reuses_normalized_inputs() {
+    struct AlreadyNormalized;
+    impl ProviderNormalizer for AlreadyNormalized {
+        fn normalize_desired<'a>(
+            &'a self,
+            _: &'a mut [carina_core::resource::ProviderResource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "desired values must not be normalized again",
+                ))
+            })
+        }
+        fn normalize_state<'a>(
+            &'a self,
+            _: &'a mut carina_core::provider::StateTransformMap,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async {
+                Err(ProviderError::internal(
+                    "read values must not be normalized again",
+                ))
+            })
+        }
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _: &'a mut carina_core::provider::StateTransformMap,
+            _: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            carina_core::provider::ready_noop()
+        }
+    }
+    let parsed = parse("", &carina_core::parser::ProviderContext::default())
+        .unwrap()
+        .into_expanded(&carina_core::schema::SchemaRegistry::new())
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("test.Widget")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let resource = Resource::with_provider("test", "test.Widget", "example", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("normalized".into())),
+    );
+    let state =
+        State::existing(resource.id.clone(), resource.resolved_attributes()).with_identifier("id");
+    let current = HashMap::from([(resource.id.clone(), Current::from_state(state))]);
+    let mut provider = comparison_provider_for_resources(&schemas, std::slice::from_ref(&resource));
+    provider.add_normalizer("test", Box::new(AlreadyNormalized));
+    let saved = carina_core::provider::RawSavedAttrs::default().lift(&schemas);
+    let stability = derive_managed_binding_stability(
+        &parsed,
+        std::slice::from_ref(&resource),
+        &current,
+        &DataSourceValues::empty(),
+        &schemas,
+        &saved,
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &provider,
+        &mut carina_core::references::ReferencePreparation::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stability[&resource.id],
+        carina_core::binding_index::ManagedBindingStability::NoPlannedEffect
+    );
 }

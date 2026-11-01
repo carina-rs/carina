@@ -7841,10 +7841,6 @@ impl crate::provider::ProviderFactory for RecordingFactory {
         Ok(())
     }
 
-    fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
-        String::new()
-    }
-
     fn create_provider(
         &self,
         _binding: Option<&str>,
@@ -7976,10 +7972,6 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
                 .unwrap()
                 .push(attributes.attributes().clone());
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, RuntimeValue>) -> String {
-            String::new()
         }
 
         fn create_provider(

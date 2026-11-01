@@ -442,9 +442,7 @@ fn print_diff(file: &Path, original: &str, formatted: &str) {
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
-    use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-    use indexmap::IndexMap;
 
     #[test]
     fn fmt_mode_from_flags_covers_all_combinations() {
@@ -482,10 +480,6 @@ mod tests {
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
-        }
-
-        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
-            String::new()
         }
 
         fn create_provider(

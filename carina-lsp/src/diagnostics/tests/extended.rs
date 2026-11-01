@@ -16248,3 +16248,51 @@ fn depends_on_rejects_custom_value_argument_from_sibling_file() {
         Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
     );
 }
+
+#[test]
+fn reference_constraints_validate_offline_in_a_directory_configuration() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("keys.Resource")
+            .attribute(
+                AttributeSchema::optional(
+                    "key",
+                    AttributeType::reference(
+                        TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
+                        Some("^alias/[a-z]+$".into()),
+                        Some((Some(8), Some(12))),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider test {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    for (value, valid) in [
+        ("alias/abc", true),
+        ("alias/a", false),
+        ("key/abc", false),
+        ("alias/abcdefghij", false),
+    ] {
+        let source = format!("test.keys.Resource {{ key = '{value}' }}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        assert_eq!(diagnostics.is_empty(), valid, "{value}: {diagnostics:?}");
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("no declaration")),
+            "resolver identity must not trigger custom validation: {diagnostics:?}"
+        );
+    }
+}

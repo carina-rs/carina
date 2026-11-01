@@ -35,7 +35,7 @@ fn diff_test(
         saved,
         prev_explicit,
         schema,
-        &super::exact_comparison_context_for_tests(),
+        &super::exact_comparison_schema_for_tests(),
     )
 }
 
@@ -521,6 +521,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &HashMap::new(),
         &[],
         &HashSet::from([replacement]),
+        &crate::references::prepare_empty_for_tests(),
     )
     .unwrap()
     .finish(|_| {});
@@ -711,6 +712,7 @@ fn provider_scoped_reference_form_suppresses_create_only_replacement_in_plan() {
         &saved,
         &HashMap::new(),
         &[],
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("plan comparison succeeds");
 

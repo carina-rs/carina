@@ -470,10 +470,8 @@ impl CompletionProvider {
         // schema lookup but using different matching strategies:
         //
         //   - Resource bindings: each binding's resource schema is queried
-        //     directly. A field is offered when its `Custom`-type name
-        //     equals the target attribute's `Custom`-type name. This is a
-        //     string compare — adequate because both ends sit inside the
-        //     compiled provider schema and share a closed type vocabulary.
+        //     directly. Directional schema assignability is shared with
+        //     validation, including string outputs flowing into references.
         //
         //   - `upstream_state` bindings (#2353): exports are declared by
         //     the user with a `TypeExpr` that lives in a different type
@@ -500,9 +498,12 @@ impl CompletionProvider {
                     }
                     if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
                         for binding_attr in binding_schema.as_schema().attributes().values() {
-                            if let Some(binding_type_name) =
-                                Self::extract_custom_type_name(binding_attr.attr_type())
-                                && binding_type_name == target_name
+                            if binding_schema
+                                .as_schema()
+                                .type_in_schema(binding_attr.attr_type())
+                                .is_assignable_to(
+                                    schema.as_schema().type_in_schema(attr_schema.attr_type()),
+                                )
                             {
                                 let full_ref = format!("{}.{}", binding_name, binding_attr.name());
                                 completions.push(CompletionItem {
@@ -828,7 +829,12 @@ impl CompletionProvider {
     /// has a structured identity.
     fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
         match attr_type.shape_ref_free() {
-            Ok(Shape::String {
+            Ok(Shape::Reference {
+                identity: id,
+                pattern: _,
+                length: _,
+            })
+            | Ok(Shape::String {
                 identity: Some(id), ..
             })
             | Ok(Shape::Int {
@@ -1120,6 +1126,7 @@ impl CompletionProvider {
                 // invalid traversal targets for v1 ignore paths.
                 Shape::Map { .. }
                 | Shape::Union
+                | Shape::Reference { .. }
                 | Shape::String { .. }
                 | Shape::Int { .. }
                 | Shape::Float { .. }
@@ -1836,7 +1843,7 @@ impl CompletionProvider {
     /// directory-scoped [`DslSource`] so exports in `exports.crn` can
     /// reference bindings declared in a sibling `main.crn`
     /// (see #2043 follow-up).
-    fn resource_ref_completions_for_type(
+    pub(super) fn resource_ref_completions_for_type(
         &self,
         target: TypeInSchema<'_, carina_core::schema::Compiled>,
         text: &str,
@@ -2469,7 +2476,7 @@ fn return_type_fits(
             to_dsl: None,
             ..
         } => matches!(ret, R::String | R::Any),
-        Shape::String { .. } => false,
+        Shape::Reference { .. } | Shape::String { .. } => false,
         Shape::Int { .. } => matches!(ret, R::Int | R::Any),
         // No built-in currently returns a Bool; leave as unfit.
         Shape::Bool => false,

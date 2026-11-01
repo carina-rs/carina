@@ -180,6 +180,7 @@ fn plan_from_resolved_fixture(
         &HashMap::new(),
         &[],
         &HashSet::new(),
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
     .finish(|_| {})
@@ -1103,6 +1104,7 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         &HashMap::new(),
         &[],
         &HashSet::new(),
+        &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
     .finish(|_| {});
@@ -1247,6 +1249,7 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
             &HashMap::new(),
             &[],
             &HashSet::new(),
+            &crate::references::prepare_empty_for_tests(),
         )
         .unwrap()
         .finish(|_| {});
@@ -1323,6 +1326,7 @@ fn deferred_create_cbd_plan(
         &HashMap::new(),
         &[],
         &HashSet::new(),
+        &crate::references::prepare_empty_for_tests(),
     )
     .unwrap()
     .finish(|_| {});

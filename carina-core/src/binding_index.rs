@@ -347,6 +347,11 @@ impl ResolvedRefType {
                 resource_type.clone(),
             )),
             AttrTypeKind::String { .. }
+            | AttrTypeKind::Reference {
+                identity: _,
+                pattern: _,
+                length: _,
+            }
             | AttrTypeKind::StringLiteralSet { .. }
             | AttrTypeKind::Int { .. }
             | AttrTypeKind::Float { .. }
