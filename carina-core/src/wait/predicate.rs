@@ -378,7 +378,7 @@ fn unresolved_enum_identifier<B: BindingAddress>(value: &Value<NoPlaceholder, B>
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
+            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => None,

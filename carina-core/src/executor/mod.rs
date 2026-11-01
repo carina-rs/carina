@@ -780,8 +780,7 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
         }
         Value::Concrete(_)
         | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
+        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }

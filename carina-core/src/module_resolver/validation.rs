@@ -536,7 +536,7 @@ pub fn evaluate_live_pending_constraints(
 }
 
 pub fn evaluate_saved_pending_constraints(
-    compositions: &[crate::resource::SavedComposition],
+    compositions: &[crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     bindings: &ResolvedBindings,
     terminal: bool,
 ) -> Vec<ModuleConstraintFailure> {
@@ -908,7 +908,6 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
             },
             Self::Value(Value::Deferred(DeferredValue::ModuleIf(_))) => "module conditional",
             Self::Value(Value::Deferred(DeferredValue::Secret(_))) => "secret",
-            Self::Value(Value::Deferred(DeferredValue::RedactedSecret { .. })) => "secret",
             Self::Value(Value::Deferred(DeferredValue::ResourceRef { .. })) => "resource reference",
             Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
             Self::Value(Value::Deferred(DeferredValue::Coalesce { .. })) => "coalesce expression",

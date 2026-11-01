@@ -1,5 +1,6 @@
 //! Authored lifecycle settings exist only before the value-expansion boundary.
 
+use crate::resource::ValueKind;
 use super::*;
 use std::convert::Infallible;
 
@@ -39,15 +40,17 @@ mod resolved_phase {
     pub trait Sealed {}
     impl Sealed for super::NoPlaceholder {}
     impl Sealed for super::LoopSlot {}
+    impl<P: super::PlaceholderKind + Sealed> Sealed for super::SnapshotLeaf<P> {}
 }
 
 #[doc(hidden)]
 pub trait SerializableDirectivePhase<B: BindingAddress>:
-    PlaceholderKind + resolved_phase::Sealed
+    ValueKind + resolved_phase::Sealed
 {
 }
 impl<B: BindingAddress> SerializableDirectivePhase<B> for NoPlaceholder {}
 impl<B: BindingAddress> SerializableDirectivePhase<B> for LoopSlot {}
+impl<B: BindingAddress, P: PlaceholderKind + SerializableDirectivePhase<B>> SerializableDirectivePhase<B> for SnapshotLeaf<P> {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DirectiveArgumentSources(#[serde(with = "directive_sources")] Vec<DiagnosticSourceSpan>);
@@ -547,7 +550,7 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             | DeferredValue::ModuleIf(_)
             | DeferredValue::Unavailable { .. }
             | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. },
+            ,
         ) => false,
     }
 }
@@ -571,7 +574,7 @@ fn directive_value_kind<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, 
             "got a resource reference (unknown until apply)".into()
         }
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown until apply".into(),
-        Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
+        Value::Deferred(DeferredValue::Secret(_) ) => {
             "got a secret value".into()
         }
         Value::Deferred(_) => "got a deferred expression".into(),

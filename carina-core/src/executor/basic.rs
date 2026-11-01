@@ -275,7 +275,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::Unavailable { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
-            | DeferredValue::RedactedSecret { .. }
+            
             | DeferredValue::Unknown(_),
         ) => true,
         Value::Deferred(DeferredValue::Secret(inner)) => needs_apply_resolution(inner),
@@ -405,12 +405,8 @@ fn assert_fully_resolved(
             "Attribute '{}' contains an unresolved module-template conditional",
             attribute_key
         ))),
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
-            Err(ReportedError::message(format!(
-                "Attribute '{}' contains a saved-plan secret that was not rehydrated; create a new saved plan before applying",
-                attribute_key
-            )))
-        }
+
+
         Value::Deferred(DeferredValue::ResourceRef { path }) => Err(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
@@ -596,7 +592,8 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
                 .into_iter()
                 .for_each(|value| collect_unresolved_bindings(value, out));
         }
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
+
+
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for p in parts {
                 if let InterpolationPart::Expr(v) = p {

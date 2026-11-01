@@ -18,7 +18,7 @@ use crate::provider::{
 use crate::resource::{
     AbsoluteBindingAddress, CanonicalComparisonAttributes, Current, MaskedComparisonAttributes,
     PlanInputCurrent, PlanInputDesired, PresentResourceState, ResolvedResource, Resource,
-    ResourceId, State, UnidentifiedState, Value, into_plan_input_current_map,
+    ResourceId, SnapshotState as State, UnidentifiedState, Value, into_plan_input_current_map,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaRegistry, ValidatedResourceSchema,
@@ -423,7 +423,7 @@ impl Orphan {
     /// shape used by binding resolution. Provider state remains authoritative
     /// for its values; the projection exists only so a data-source input can
     /// resolve a binding that is no longer present in the configuration.
-    pub fn binding_resource(&self) -> Resource {
+    pub fn binding_resource(&self) -> Resource<crate::resource::ModuleSource,crate::resource::SnapshotLeaf> {
         let attributes = match &self.current {
             Current::Absent(state) => &state.state().attributes,
             Current::Present(present) => &present.state().attributes,
@@ -431,7 +431,7 @@ impl Orphan {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: self.directives.clone().into(),
+                    directives: crate::resource::snapshot_directives(self.directives.clone().into()),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
@@ -446,7 +446,7 @@ impl Orphan {
                 return Resource {
                     id: self.current.id().clone(),
                     attributes: Default::default(),
-                    directives: (&self.directives).into(),
+                    directives: crate::resource::snapshot_directives((&self.directives).into()),
                     resolved_ignore_changes: Default::default(),
                     prefixes: Default::default(),
                     binding: self.binding.clone(),
@@ -465,7 +465,7 @@ impl Orphan {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-            directives: (&self.directives).into(),
+            directives: crate::resource::snapshot_directives((&self.directives).into()),
             resolved_ignore_changes: Default::default(),
             prefixes: Default::default(),
             binding: self.binding.clone(),
@@ -1208,14 +1208,14 @@ struct PresentDiffResult<D = ()> {
     releases: Vec<PlannedListKeyRelease>,
 }
 
-fn concrete_list(value: &Value) -> Option<&[Value]> {
+fn concrete_list<P: crate::resource::ValueKind>(value: &Value<P>) -> Option<&[Value<P>]> {
     let Value::Concrete(crate::resource::ConcreteValue::List(items)) = value else {
         return None;
     };
     Some(items)
 }
 
-fn keyed_element_key<'a>(element: &'a Value, key_field: &str) -> Option<&'a str> {
+fn keyed_element_key<'a,P: crate::resource::ValueKind>(element: &'a Value<P>, key_field: &str) -> Option<&'a str> {
     let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
         return None;
     };
@@ -1226,7 +1226,7 @@ fn keyed_element_key<'a>(element: &'a Value, key_field: &str) -> Option<&'a str>
     Some(key.expose_plaintext())
 }
 
-fn retained_key_value(element: &Value, key_field: &str) -> Value {
+fn retained_key_value<P: crate::resource::ValueKind>(element: &Value<P>, key_field: &str) -> Value<P> {
     let Value::Concrete(crate::resource::ConcreteValue::Map(fields)) = element else {
         return element.clone();
     };
@@ -1239,10 +1239,10 @@ fn retained_key_value(element: &Value, key_field: &str) -> Value {
     }
 }
 
-fn unique_elements_by_key<'a>(
-    value: &'a Value,
+fn unique_elements_by_key<'a,P: crate::resource::ValueKind>(
+    value: &'a Value<P>,
     key_field: &str,
-) -> Option<std::collections::BTreeMap<&'a str, &'a Value>> {
+) -> Option<std::collections::BTreeMap<&'a str, &'a Value<P>>> {
     let mut by_key = std::collections::BTreeMap::new();
     for element in concrete_list(value)? {
         let key = keyed_element_key(element, key_field)?;
@@ -1253,8 +1253,8 @@ fn unique_elements_by_key<'a>(
     Some(by_key)
 }
 
-fn authored_saved_keys(
-    saved_value: &Value,
+fn authored_saved_keys<P: crate::resource::ValueKind>(
+    saved_value: &Value<P>,
     authoring: &crate::explicit::ExplicitFields,
     key_field: &str,
 ) -> std::collections::BTreeSet<String> {
@@ -1368,7 +1368,7 @@ fn find_keyed_partial_update_releases(
         .collect()
 }
 
-fn remove_keys_from_list(value: &mut Value, key_field: &str, released: &HashSet<&str>) {
+fn remove_keys_from_list<P: crate::resource::ValueKind>(value: &mut Value<P>, key_field: &str, released: &HashSet<&str>) {
     let Value::Concrete(crate::resource::ConcreteValue::List(elements)) = value else {
         return;
     };
@@ -1377,9 +1377,9 @@ fn remove_keys_from_list(value: &mut Value, key_field: &str, released: &HashSet<
     });
 }
 
-fn filter_explicit_list_elements(
+fn filter_explicit_list_elements<P: crate::resource::ValueKind>(
     explicit: &mut crate::explicit::ExplicitFields,
-    saved_value: &Value,
+    saved_value: &Value<P>,
     key_field: &str,
     released: &HashSet<&str>,
 ) {

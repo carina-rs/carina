@@ -248,7 +248,7 @@ pub fn resolve_live_composition_refs_post_apply(
 }
 
 pub fn resolve_saved_composition_refs_post_apply(
-    compositions: &mut [crate::resource::SavedComposition],
+    compositions: &mut [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     bindings: &ResolvedBindings,
 ) -> Result<(), String> {
     for composition in compositions {
@@ -273,7 +273,7 @@ impl RuntimeCompositionAttribute for crate::resource::LiveCompositionAttribute {
     }
 }
 
-impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute {
+impl RuntimeCompositionAttribute for crate::resource::SavedCompositionAttribute<crate::resource::NoPlaceholder> {
     fn runtime_value(&self) -> Option<Value> {
         Some(self.to_value())
     }
@@ -433,7 +433,7 @@ fn stamp_unresolved_upstream(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
+            
             | DeferredValue::Unknown(_),
         ) => value,
         Value::Deferred(DeferredValue::Placeholder(never)) => match never {},
@@ -588,36 +588,16 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                 return Ok(ValueResolution::Unknown(value.clone()));
             }
 
-            let mut resolved = resolve_ref_value_inner(attribute, bindings, config)?;
-            if !resolved.is_fully_resolved() {
-                return Ok(ValueResolution::Unknown(value.clone()));
-            }
-            for segment in path.segments() {
-                match apply_value_path_segment(
-                    resolved,
-                    segment.clone(),
-                    0,
-                    AccessMissPolicy::Error,
-                ) {
-                    Ok(ValuePathSegmentResult::Resolved(next)) => {
-                        resolved = resolve_ref_value_inner(&next, bindings, config)?;
-                        if !resolved.is_fully_resolved() {
-                            return Ok(ValueResolution::Unknown(value.clone()));
-                        }
-                    }
-                    Ok(
-                        ValuePathSegmentResult::Deferred(_)
-                        | ValuePathSegmentResult::DeferredMiss(_),
-                    ) => return Ok(ValueResolution::Unknown(value.clone())),
-                    Err(error) if missing_access(&error) && absence_is_definitive => {
-                        return Ok(ValueResolution::Absent);
-                    }
-                    Err(error) if missing_access(&error) => {
-                        return Ok(ValueResolution::Unknown(value.clone()));
-                    }
-                    Err(error) => return Err(error.format_for_path(&path.to_string())),
-                }
-            }
+            let selected = attribute.select_path(path.segments(), &path.to_string(), AccessMissPolicy::Error);
+            let selected = match selected {
+                Ok(value) => value,
+                Err(crate::resource::SnapshotSelectionError::Access(error)) if missing_access(&error) && absence_is_definitive => return Ok(ValueResolution::Absent),
+                Err(crate::resource::SnapshotSelectionError::Access(error)) if missing_access(&error) => return Ok(ValueResolution::Unknown(value.clone())),
+                Err(crate::resource::SnapshotSelectionError::DeferredMiss(_)) => return Ok(ValueResolution::Unknown(value.clone())),
+                Err(error) => return Err(error.to_string()),
+            };
+            let resolved = resolve_ref_value_inner(&selected, bindings, config)?;
+            if !resolved.is_fully_resolved() { return Ok(ValueResolution::Unknown(value.clone())); }
             Ok(ValueResolution::Present(resolved))
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
@@ -629,10 +609,9 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             }
             let mut keys = attributes.keys().collect::<Vec<_>>();
             keys.sort();
-            let values = keys
-                .into_iter()
-                .map(|key| (key.clone(), attributes[key].clone()))
-                .collect();
+            let values = keys.into_iter().map(|key| {
+                attributes[key].to_value_at(format!("{binding}.{key}")).map(|value| (key.clone(),value))
+            }).collect::<Result<_,_>>().map_err(|error|error.to_string())?;
             let resolved = Value::Concrete(ConcreteValue::Map(values));
             if resolved.is_fully_resolved() {
                 Ok(ValueResolution::Present(resolved))
@@ -679,7 +658,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             | DeferredValue::FunctionCall { .. }
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Secret(_)
-            | DeferredValue::RedactedSecret { .. },
+            ,
         ) => {
             let resolved = resolve_ref_value_inner(value, bindings, config)?;
             if !resolved.is_fully_resolved() {
@@ -950,23 +929,11 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             if let Some(attrs) = bindings.get(binding_name)
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
-                // Resolve the initial attribute value
-                let mut resolved = resolve_ref_value_inner(attr_value, bindings, config)?;
                 let miss_policy = binding_access_miss_policy(binding_name, bindings);
-
-                for segment in path.segments() {
-                    match apply_value_path_segment(resolved, segment.clone(), 0, miss_policy) {
-                        Ok(ValuePathSegmentResult::Resolved(next)) => {
-                            resolved = resolve_ref_value_inner(&next, bindings, config)?;
-                        }
-                        Ok(
-                            ValuePathSegmentResult::Deferred(_)
-                            | ValuePathSegmentResult::DeferredMiss(_),
-                        ) => return Ok(value.clone()),
-                        Err(error) => return Err(error.format_for_path(&path.to_string())),
-                    }
-                }
-
+                let selected = match attr_value.select_path(path.segments(), &path.to_string(), miss_policy) {
+                    Ok(value)=>value, Err(crate::resource::SnapshotSelectionError::DeferredMiss(_))=>return Ok(value.clone()), Err(error)=>return Err(error.to_string()),
+                };
+                let resolved = resolve_ref_value_inner(&selected, bindings, config)?;
                 return Ok(resolved);
             }
             // Keep as-is if not found
@@ -1146,7 +1113,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         )
-        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => Ok(value.clone()),
+         => Ok(value.clone()),
         Value::Deferred(DeferredValue::Placeholder(_)) => Ok(value.clone()),
     }
 }

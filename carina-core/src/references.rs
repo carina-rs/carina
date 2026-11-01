@@ -1119,9 +1119,9 @@ fn collect_attributes(
     Ok(())
 }
 
-fn collect_leaf(
+fn collect_leaf<P: crate::resource::ValueKind>(
     resource: &ResourceId,
-    value: &Value,
+    value: &Value<P>,
     ty: &TypeIdentity,
     path: &str,
     secret: bool,
@@ -1175,14 +1175,14 @@ struct ReferenceValidation<'a> {
 }
 impl ReferenceValidation<'_> {
     #[allow(clippy::too_many_arguments)]
-    fn record_leaf(
+    fn record_leaf<P: crate::resource::ValueKind>(
         &self,
-        value: &Value,
+        value: &Value<P>,
         ty: crate::schema::EffectiveType<'_>,
         segments: &[crate::schema::LeafPathSegment],
         path: &str,
         depth: usize,
-        visit: &mut impl FnMut(&Value, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+        visit: &mut impl FnMut(&Value<P>, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
     ) -> Result<(), Box<ReferencePlanError>> {
         use crate::schema::LeafPathSegment;
         let Some((segment, rest)) = segments.split_first().filter(|_| depth < 64) else {
@@ -1240,9 +1240,9 @@ impl ReferenceValidation<'_> {
         }
         Ok(())
     }
-    fn validate(
+    fn validate<P: crate::resource::ValueKind>(
         &self,
-        value: &Value,
+        value: &Value<P>,
         ty: crate::schema::EffectiveType<'_>,
         path: &str,
         secret: bool,
@@ -1267,14 +1267,14 @@ impl ReferenceValidation<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn walk(
+    fn walk<P: crate::resource::ValueKind>(
         &self,
-        value: &Value,
+        value: &Value<P>,
         ty: crate::schema::EffectiveType<'_>,
         path: &str,
         secret: bool,
         depth: usize,
-        visit: &mut impl FnMut(&Value, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
+        visit: &mut impl FnMut(&Value<P>, &TypeIdentity, &str, bool) -> Result<(), Box<ReferencePlanError>>,
     ) -> Result<(), Box<ReferencePlanError>> {
         if depth >= 64 {
             return Err(Box::new(ReferencePlanError {
@@ -1319,7 +1319,7 @@ impl ReferenceValidation<'_> {
                 }
             }
             Shape::List { .. } => {
-                if let Some(items) = crate::resource::comparison_list_items(value)
+                if let Some(items) = comparison_reference_list_items(value)
                     && let Some(element) = ty.list_element()
                 {
                     for (index, value) in items.iter().enumerate() {
@@ -1366,3 +1366,11 @@ pub fn prepare_empty_for_tests() -> ResolvedReferences {
 
 #[cfg(test)]
 mod tests;
+
+fn comparison_reference_list_items<P: crate::resource::ValueKind>(value: &Value<P>) -> Option<std::borrow::Cow<'_,[Value<P>]>> {
+    match value {
+        Value::Concrete(ConcreteValue::List(items)) => Some(std::borrow::Cow::Borrowed(items)),
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(std::borrow::Cow::Owned(items.iter().cloned().map(ConcreteValue::String).map(Value::Concrete).collect())),
+        _ => None,
+    }
+}

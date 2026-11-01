@@ -40,7 +40,7 @@ pub struct DeferredSummaryForPlan {
     pub entries: Vec<DeferredSummaryEntry>,
 }
 
-pub fn deferred_summary_for_plan<S>(plan: &Plan<S>) -> DeferredSummaryForPlan {
+pub fn deferred_summary_for_plan<S, V: crate::resource::PlanValueKind>(plan: &Plan<S, V>) -> DeferredSummaryForPlan {
     let entries = plan
         .effects()
         .iter()
@@ -82,12 +82,12 @@ pub fn deferred_for_source<S>(
     crate::value::format_value(&template.iterable)
 }
 
-pub fn deferred_for_verb<S, D>(
-    plan: &Plan<S>,
+pub fn deferred_for_verb<S,D,V: crate::resource::PlanValueKind>(
+    plan: &Plan<S,V>,
     template: &crate::parser::DeferredForExpression<
         S,
-        crate::resource::NoPlaceholder,
-        LoopSlot,
+        V,
+        V::Template,
         AbsoluteBindingAddress,
         D,
     >,

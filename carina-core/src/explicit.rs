@@ -1332,13 +1332,13 @@ impl<R: ReferenceEquality> MaskedExplicitProjection<'_, R> {
 }
 
 enum ProjectionDesired<'a> {
-    Attributes(HashMap<&'a str, &'a Value>),
+    Attributes(HashMap<&'a str, &'a crate::resource::SnapshotValue>),
     Conservative,
 }
 
 #[derive(Clone)]
 enum ProjectionDesiredValue<'a> {
-    Present(&'a Value, String),
+    Present(&'a crate::resource::SnapshotValue, String),
     Absent,
     Conservative,
 }
@@ -1499,7 +1499,7 @@ pub struct ProjectedAttributes {
 
 impl ProjectedAttributes {
     fn canonicalized(
-        attributes: HashMap<String, Value>,
+        attributes: HashMap<String, crate::resource::SnapshotValue>,
         authoring: ProjectedAuthoring,
         schema: Option<&ResourceSchema>,
     ) -> Self {
@@ -1582,14 +1582,14 @@ impl ProjectedAuthoring {
 }
 
 struct ProjectedValue {
-    value: Value,
+    value: crate::resource::SnapshotValue,
     authoring: ProjectedAuthoring,
     origins: crate::differ::OperandOrigins,
 }
 
 fn project_value<R: ReferenceEquality>(
-    value: Value,
-    stored: Option<&Value>,
+    value: crate::resource::SnapshotValue,
+    stored: Option<&crate::resource::SnapshotValue>,
     desired: ProjectionDesiredValue<'_>,
     explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
@@ -1607,8 +1607,8 @@ fn project_value<R: ReferenceEquality>(
 }
 
 fn project_value_inner<R: ReferenceEquality>(
-    value: Value,
-    stored: Option<&Value>,
+    value: crate::resource::SnapshotValue,
+    stored: Option<&crate::resource::SnapshotValue>,
     desired: ProjectionDesiredValue<'_>,
     explicit: &ExplicitFields,
     attr_type: Option<&AttributeType>,
@@ -1848,7 +1848,7 @@ fn project_value_inner<R: ReferenceEquality>(
     }
 }
 
-fn project_legacy_list_items(items: Vec<Value>, element: &ExplicitFields) -> ProjectedValue {
+fn project_legacy_list_items(items: Vec<crate::resource::SnapshotValue>, element: &ExplicitFields) -> ProjectedValue {
     ProjectedValue {
         origins: crate::differ::OperandOrigins::new(),
         value: Value::Concrete(ConcreteValue::List(
@@ -1865,7 +1865,7 @@ fn project_legacy_list_items(items: Vec<Value>, element: &ExplicitFields) -> Pro
 
 /// Preserve the historical union semantics for legacy [`ExplicitFields::List`]
 /// records, which do not carry element identity.
-fn project_legacy_value(value: Value, explicit: &ExplicitFields) -> Value {
+fn project_legacy_value(value: crate::resource::SnapshotValue, explicit: &ExplicitFields) -> crate::resource::SnapshotValue {
     match explicit {
         ExplicitFields::Leaf | ExplicitFields::Unrecorded | ExplicitFields::WholeValue { .. } => {
             value

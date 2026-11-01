@@ -1791,7 +1791,7 @@ pub struct ResolvedBinding<
     P: PlaceholderKind = crate::resource::NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
-    pub attributes: HashMap<String, Value<P, B>>,
+    pub attributes: HashMap<String, crate::resource::SnapshotValue<P, B>>,
     pub source: BindingValueSource<B>,
     pub completeness: BindingCompleteness,
     /// Attributes whose present values are authoritative even when the
@@ -1830,19 +1830,21 @@ impl<P: PlaceholderKind, B: BindingAddress> ResolvedBinding<P, B> {
 /// installed as the source for downstream references.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretPreservingAttributes {
-    attributes: HashMap<String, Value>,
+    attributes: HashMap<String,crate::resource::SnapshotValue>,
 }
 
 impl SecretPreservingAttributes {
     /// Combine resolved desired values with the provider-facing values made
     /// from them. Desired-only keys are retained (notably write-only inputs),
     /// while provider values win after inheriting every secret marker.
-    pub(crate) fn from_provider_values(
-        resolved_shapes: &HashMap<String, Value>,
-        provider_values: &HashMap<String, Value>,
+    pub(crate) fn from_provider_values<P: crate::resource::StateValueLeaf,Q: crate::resource::StateValueLeaf>(
+        resolved_shapes: &HashMap<String,Value<P>>,
+        provider_values: &HashMap<String,Value<Q>>,
     ) -> Self {
+        let resolved_shapes = resolved_shapes.iter().map(|(key,value)|(key.clone(),crate::resource::state_value_snapshot(value))).collect::<HashMap<_,_>>();
+        let provider_values = provider_values.iter().map(|(key,value)|(key.clone(),crate::resource::state_value_snapshot(value))).collect::<HashMap<_,_>>();
         let mut attributes = resolved_shapes.clone();
-        for (key, value) in provider_values {
+        for (key, value) in &provider_values {
             let protected = resolved_shapes.get(key).map_or_else(
                 || value.clone(),
                 |shape| crate::value::mask_plaintext_using_secret_shape_fail_closed(value, shape),
@@ -1854,7 +1856,7 @@ impl SecretPreservingAttributes {
 
     /// Read-only access for state writeback. Construction remains confined to
     /// the secret-preserving resolution paths above.
-    pub fn values(&self) -> &HashMap<String, Value> {
+    pub fn values(&self) -> &HashMap<String,crate::resource::SnapshotValue> {
         &self.attributes
     }
 }
@@ -1884,7 +1886,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Default for ResolvedBindings<P, B> {
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> ResolvedBindings<P, B> {
-    pub fn get(&self, name: &str) -> Option<&HashMap<String, Value<P, B>>> {
+    pub fn get(&self, name: &str) -> Option<&HashMap<String, crate::resource::SnapshotValue<P, B>>> {
         self.by_name.get(name).map(|binding| &binding.attributes)
     }
 
@@ -1983,7 +1985,7 @@ pub struct SavedPreApplyInputs<'a> {
         crate::resource::AbsoluteBindingAddress,
         (),
     >],
-    pub compositions: &'a [SavedComposition],
+    pub compositions: &'a [SavedComposition<crate::resource::NoPlaceholder>],
     pub managed_current: &'a HashMap<ResourceId, PlanInputCurrent>,
     pub data_source_values: &'a DataSourceValues<SavedModuleSource, ()>,
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
@@ -2053,7 +2055,7 @@ impl ResolvedBindings<ParserPlaceholder> {
             let attributes = resource
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), map_value(value)))
+                .map(|(name, value)| (name.clone(), map_value(value).to_snapshot()))
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
@@ -2077,7 +2079,7 @@ impl ResolvedBindings<ParserPlaceholder> {
             let attributes = data_source
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), map_value(value)))
+                .map(|(name, value)| (name.clone(), map_value(value).to_snapshot()))
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             by_name.insert(
@@ -2105,7 +2107,7 @@ impl ResolvedBindings<ParserPlaceholder> {
                 .filter_map(|(name, attribute)| {
                     attribute
                         .value()
-                        .map(|value| (name.clone(), map_value(&value)))
+                        .map(|value| (name.clone(), map_value(&value).to_snapshot()))
                 })
                 .collect::<HashMap<_, _>>();
             let definitive_attributes = attributes.keys().cloned().collect();
@@ -2356,7 +2358,7 @@ impl ResolvedBindings {
             let Some(binding_name) = resource.binding.as_ref() else {
                 continue;
             };
-            let mut merged: HashMap<String, Value> = resource.resolved_attributes();
+            let mut merged = resource.resolved_attributes().into_iter().map(|(key,value)|(key,value.to_snapshot())).collect::<HashMap<_,_>>();
             let definitive_attributes: HashSet<String> = merged.keys().cloned().collect();
             let (changed_attributes, refreshable_attributes) = match managed_stability
                 .get(&resource.id)
@@ -2424,7 +2426,7 @@ impl ResolvedBindings {
             by_name.insert(
                 remote_binding.clone(),
                 ResolvedBinding {
-                    attributes: remote_attrs.clone(),
+                    attributes: remote_attrs.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect(),
                     source: BindingValueSource::Upstream,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes: HashSet::new(),
@@ -2516,7 +2518,7 @@ impl ResolvedBindings {
 
     pub fn layer_saved_compositions_post_apply(
         &mut self,
-        compositions: &[SavedComposition],
+        compositions: &[SavedComposition<crate::resource::NoPlaceholder>],
     ) -> Result<(), String> {
         self.layer_saved_compositions(compositions);
         Ok(())
@@ -2526,7 +2528,7 @@ impl ResolvedBindings {
         self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Live));
     }
 
-    fn layer_saved_compositions(&mut self, compositions: &[SavedComposition]) {
+    fn layer_saved_compositions(&mut self, compositions: &[SavedComposition<crate::resource::NoPlaceholder>]) {
         self.layer_composition_views(compositions.iter().map(CompositionRuntimeRef::Saved));
     }
 
@@ -2546,7 +2548,7 @@ impl ResolvedBindings {
             self.by_name.insert(
                 binding_name.to_string(),
                 ResolvedBinding {
-                    attributes: crate::resource::attrs_to_hashmap(&value_attrs),
+                    attributes: value_attrs.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect(),
                     source: BindingValueSource::Local,
                     completeness: BindingCompleteness::Complete,
                     definitive_attributes,
@@ -2616,7 +2618,7 @@ impl ResolvedBindings {
             let Some(binding_name) = d.binding.as_ref() else {
                 continue;
             };
-            let mut merged = crate::resource::attrs_to_hashmap(&d.attributes);
+            let mut merged = d.attributes.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect::<HashMap<_,_>>();
             let definitive_attributes = merged.keys().cloned().collect();
             let mut completeness = BindingCompleteness::Incomplete;
             match value {
@@ -2626,7 +2628,7 @@ impl ResolvedBindings {
                     completeness = BindingCompleteness::Complete;
                     if state.exists {
                         for (k, v) in &state.attributes {
-                            merged.insert(k.clone(), v.clone());
+                            merged.insert(k.clone(),v.clone());
                         }
                     }
                 }
@@ -2652,7 +2654,7 @@ impl ResolvedBindings {
             let Some(binding_name) = data_source.binding.as_ref() else {
                 continue;
             };
-            let attributes = crate::resource::attrs_to_hashmap(&data_source.attributes);
+            let attributes = data_source.attributes.iter().map(|(key,value)| (key.clone(),value.to_snapshot())).collect::<HashMap<_,_>>();
             let definitive_attributes = attributes.keys().cloned().collect();
             self.by_name.insert(
                 binding_name.to_string(),
@@ -2716,7 +2718,7 @@ impl ResolvedBindings {
                     binding.removed_sensitive_attributes.clear();
                     for attribute in changed_attributes {
                         if let Some(value) = desired.get(attribute) {
-                            binding.attributes.insert(attribute.clone(), value.clone());
+                            binding.attributes.insert(attribute.clone(), value.to_snapshot());
                         } else {
                             if binding
                                 .attributes
@@ -2853,7 +2855,7 @@ impl ResolvedBindings {
         self.by_name.insert(
             name.to_string(),
             ResolvedBinding {
-                attributes: attrs,
+                attributes: attrs.into_iter().map(|(key,value)| (key,value.to_snapshot())).collect(),
                 source,
                 completeness,
                 definitive_attributes,
@@ -2998,7 +3000,7 @@ impl<'a> IterableBindings<'a> {
                         (
                             name,
                             ResolvedBinding {
-                                attributes,
+                                attributes: attributes.into_iter().map(|(key,value)| (key,value.to_snapshot())).collect(),
                                 source: BindingValueSource::Upstream,
                                 completeness: BindingCompleteness::Complete,
                                 definitive_attributes: HashSet::new(),
@@ -3014,7 +3016,7 @@ impl<'a> IterableBindings<'a> {
     }
 
     /// Resolve a binding's attribute map (the iterable's source).
-    pub fn get(&self, binding: &str) -> Option<&HashMap<String, Value>> {
+    pub fn get(&self, binding: &str) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
         self.bindings.get(binding)
     }
 

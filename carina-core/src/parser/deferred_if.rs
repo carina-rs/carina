@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, DataSource, ModuleSource, ParserPlaceholder,
-    PlaceholderKind, RelativeBindingName, Resource, Value,
+    ValueKind, RelativeBindingName, Resource, Value,
 };
 
 use super::ModuleCall;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredIfCondition<
-    P: PlaceholderKind = ParserPlaceholder,
+    P: ValueKind = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
 > {
     pub(crate) value: Value<P, B>,
@@ -42,7 +42,7 @@ impl DeferredIfCondition<ParserPlaceholder, RelativeBindingName> {
     }
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> DeferredIfCondition<P, B> {
+impl<P: ValueKind, B: BindingAddress> DeferredIfCondition<P, B> {
     pub(crate) fn new_with_source_expression(
         value: Value<P, B>,
         source_file: PathBuf,
@@ -76,7 +76,7 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredIfCondition<P, B> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredValueIf<
-    P: PlaceholderKind = ParserPlaceholder,
+    P: ValueKind = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
 > {
     pub(crate) condition: DeferredIfCondition<P, B>,
@@ -84,7 +84,7 @@ pub struct DeferredValueIf<
     pub(crate) else_value: Value<P, B>,
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> DeferredValueIf<P, B> {
+impl<P: ValueKind, B: BindingAddress> DeferredValueIf<P, B> {
     pub(crate) fn new(
         condition: DeferredIfCondition<P, B>,
         then_value: Value<P, B>,
@@ -134,7 +134,7 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredValueIf<P, B> {
         ))
     }
 
-    pub(crate) fn try_map_stage<Q: PlaceholderKind, E>(
+    pub(crate) fn try_map_stage<Q: ValueKind, E>(
         self,
         mut map: impl FnMut(Value<P, B>) -> Result<Value<Q, B>, E>,
     ) -> Result<DeferredValueIf<Q, B>, E> {
@@ -169,7 +169,7 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredValueIf<P, B> {
 
 #[derive(Debug, Clone)]
 pub struct DeferredStructuralIf<
-    P: PlaceholderKind = ParserPlaceholder,
+    P: ValueKind = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
 > {
     pub(crate) condition: DeferredIfCondition<P, B>,
@@ -177,7 +177,7 @@ pub struct DeferredStructuralIf<
     pub(crate) else_branch: Option<DeferredIfBody<P, B>>,
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> DeferredStructuralIf<P, B> {
+impl<P: ValueKind, B: BindingAddress> DeferredStructuralIf<P, B> {
     pub(crate) fn new(
         condition: DeferredIfCondition<P, B>,
         then_branch: DeferredIfBody<P, B>,
@@ -213,7 +213,7 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredStructuralIf<P, B> {
 
 #[derive(Debug, Clone)]
 pub enum DeferredIfBody<
-    P: PlaceholderKind = ParserPlaceholder,
+    P: ValueKind = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
 > {
     Resource(Box<Resource<ModuleSource, P, B>>),
@@ -221,7 +221,7 @@ pub enum DeferredIfBody<
     ModuleCall(ModuleCall<P, B>),
 }
 
-impl<P: PlaceholderKind, B: BindingAddress> DeferredIfBody<P, B> {
+impl<P: ValueKind, B: BindingAddress> DeferredIfBody<P, B> {
     pub(crate) fn binding_address(&self) -> Option<&B> {
         match self {
             Self::Resource(resource) => resource.binding.as_ref(),
@@ -235,7 +235,7 @@ impl<P: PlaceholderKind, B: BindingAddress> DeferredIfBody<P, B> {
     }
 }
 
-impl<P: PlaceholderKind> DeferredIfCondition<P, RelativeBindingName> {
+impl<P: ValueKind> DeferredIfCondition<P, RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
@@ -249,7 +249,7 @@ impl<P: PlaceholderKind> DeferredIfCondition<P, RelativeBindingName> {
     }
 }
 
-impl<P: PlaceholderKind> DeferredStructuralIf<P, RelativeBindingName> {
+impl<P: ValueKind> DeferredStructuralIf<P, RelativeBindingName> {
     pub(crate) fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
@@ -263,7 +263,7 @@ impl<P: PlaceholderKind> DeferredStructuralIf<P, RelativeBindingName> {
     }
 }
 
-impl<P: PlaceholderKind> DeferredIfBody<P, RelativeBindingName> {
+impl<P: ValueKind> DeferredIfBody<P, RelativeBindingName> {
     fn resolve_bindings(
         self,
         resolve: &mut impl FnMut(RelativeBindingName) -> AbsoluteBindingAddress,
@@ -280,7 +280,7 @@ impl<P: PlaceholderKind> DeferredIfBody<P, RelativeBindingName> {
     }
 }
 
-impl<P: PlaceholderKind> DeferredStructuralIf<P, AbsoluteBindingAddress> {
+impl<P: ValueKind> DeferredStructuralIf<P, AbsoluteBindingAddress> {
     pub(crate) fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
@@ -293,7 +293,7 @@ impl<P: PlaceholderKind> DeferredStructuralIf<P, AbsoluteBindingAddress> {
     }
 }
 
-impl<P: PlaceholderKind> DeferredIfBody<P, AbsoluteBindingAddress> {
+impl<P: ValueKind> DeferredIfBody<P, AbsoluteBindingAddress> {
     fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,

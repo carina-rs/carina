@@ -18,7 +18,7 @@ use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
 use crate::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent, PlanInputDesired,
     PlanInputDesiredResources, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, State, Value, plan_input_desired_resources,
+    ResourceId, SnapshotState as State, Value, plan_input_desired_resources,
 };
 use crate::schema::{
     AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
@@ -224,7 +224,7 @@ pub(crate) struct PendingReplace {
     pub cascade_ref_hints: Vec<(String, String)>,
     pub temporary_name: Option<TemporaryName>,
     pub consumer_updates: ResolvedDependencies,
-    pub previous_attributes: HashMap<String, Value>,
+    pub previous_attributes: HashMap<String,crate::resource::SnapshotValue>,
 }
 
 struct RefAttr {
@@ -232,17 +232,17 @@ struct RefAttr {
     hint: String,
 }
 
-fn contains_authored_create_only_value(
+fn contains_authored_create_only_value<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    value: &Value,
+    value: &Value<P>,
     schema: &ResourceSchema,
 ) -> bool {
     contains_authored_create_only_value_on_path(attr_type, value, schema, &mut Vec::new())
 }
 
-fn contains_authored_create_only_value_on_path<'schema>(
+fn contains_authored_create_only_value_on_path<'schema,P: crate::resource::StateValueLeaf>(
     attr_type: &'schema AttributeType,
-    value: &Value,
+    value: &Value<P>,
     schema: &'schema ResourceSchema,
     ref_chain: &mut Vec<&'schema str>,
 ) -> bool {
@@ -348,10 +348,10 @@ impl UnorderedCreateOnlyMatcher<'_, '_, '_, '_> {
     }
 }
 
-fn create_only_values_compatible(
+fn create_only_values_compatible<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    current: &Value,
-    desired: &Value,
+    current: &Value<P>,
+    desired: &Value<P>,
     schema: &ResourceSchema,
     context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
@@ -367,10 +367,10 @@ fn create_only_values_compatible(
     )
 }
 
-fn authored_create_only_value_is_compatible(
+fn authored_create_only_value_is_compatible<P: crate::resource::StateValueLeaf>(
     attr_type: &AttributeType,
-    current: Option<&Value>,
-    desired: &Value,
+    current: Option<&Value<P>>,
+    desired: &Value<P>,
     schema: &ResourceSchema,
     context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,
@@ -388,10 +388,10 @@ fn authored_create_only_value_is_compatible(
         })
 }
 
-fn create_only_values_compatible_on_path<'schema>(
+fn create_only_values_compatible_on_path<'schema,P: crate::resource::StateValueLeaf>(
     attr_type: &'schema AttributeType,
-    current: &Value,
-    desired: &Value,
+    current: &Value<P>,
+    desired: &Value<P>,
     schema: &'schema ResourceSchema,
     context: &PlanningComparison<'_>,
     removal_evidence: AuthoredRemovalEvidence,

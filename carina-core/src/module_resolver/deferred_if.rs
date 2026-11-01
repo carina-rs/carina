@@ -153,7 +153,7 @@ fn value_contains_module_if_inner<P: ModuleIfAuditPlaceholder, B: BindingAddress
         | Value::Deferred(
             DeferredValue::ResourceRef { path: _ }
             | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::RedactedSecret { hash: _ },
+            ,
         ) => false,
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             unknown_reason_contains_module_if(reason)

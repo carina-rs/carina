@@ -4,7 +4,7 @@ use std::fmt::{self, Display, Formatter};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BindingAddress, CanonicalComparisonAttributes, ConcreteValue, PlaceholderKind, Resource, Value,
+    BindingAddress, CanonicalComparisonAttributes, ConcreteValue, ValueKind, Resource, Value,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, EffectiveType, LeafPath, LeafPathSegment, Shape,
@@ -136,7 +136,7 @@ impl MaskedComparisonAttributes {
     pub(crate) fn retain_observed_list_elements(
         &mut self,
         attribute: &str,
-        mut keep: impl FnMut(&Value) -> bool,
+        mut keep: impl FnMut(&crate::resource::SnapshotValue) -> bool,
     ) {
         for attributes in std::iter::once(&mut self.current).chain(self.saved.iter_mut()) {
             if let Some(Value::Concrete(ConcreteValue::List(items))) = attributes.get_mut(attribute)
@@ -230,18 +230,19 @@ impl ResolvedIgnoreChanges {
             .any(ResolvedIgnorePath::is_write_only)
     }
 
-    pub(crate) fn with_observed_readable_leaves(
+    pub(crate) fn with_observed_readable_leaves<P: super::StateValueLeaf,Q: super::StateValueLeaf>(
         &self,
         attribute: &str,
-        desired: &Value,
-        observed: Option<&Value>,
-    ) -> Value {
-        let mut value = desired.clone();
+        desired: &Value<P>,
+        observed: Option<&Value<Q>>,
+    ) -> super::SnapshotValue {
+        let mut value = super::state_value_snapshot(desired);
+        let observed = observed.map(super::state_value_snapshot);
         for path in self
             .for_attribute(attribute)
             .filter(|path| !path.write_only && !path.leaf.segments().is_empty())
         {
-            let observed_leaf = observed.and_then(|value| value_at_leaf(value, &path.leaf));
+            let observed_leaf = observed.as_ref().and_then(|value| value_at_leaf(value, &path.leaf));
             set_leaf(&mut value, path.leaf.segments(), observed_leaf.cloned());
         }
         value
@@ -255,8 +256,8 @@ impl ResolvedIgnoreChanges {
     /// their current values.
     pub fn mask_observed_readable_leaves(
         &self,
-        baseline: &mut HashMap<String, Value>,
-        observed: &HashMap<String, Value>,
+        baseline: &mut HashMap<String,super::SnapshotValue>,
+        observed: &HashMap<String,super::SnapshotValue>,
     ) {
         let attributes = self
             .iter()
@@ -288,11 +289,11 @@ impl ResolvedIgnoreChanges {
     }
 }
 
-pub(crate) fn value_at_leaf<'a>(value: &'a Value, leaf: &LeafPath) -> Option<&'a Value> {
+pub(crate) fn value_at_leaf<'a,P: super::ValueKind>(value: &'a Value<P>, leaf: &LeafPath) -> Option<&'a Value<P>> {
     value_at_segments(value, leaf.segments())
 }
 
-fn value_at_segments<'a>(mut value: &'a Value, segments: &[LeafPathSegment]) -> Option<&'a Value> {
+fn value_at_segments<'a,P: super::ValueKind>(mut value: &'a Value<P>, segments: &[LeafPathSegment]) -> Option<&'a Value<P>> {
     for segment in segments {
         value = match (segment, value) {
             (
@@ -308,7 +309,7 @@ fn value_at_segments<'a>(mut value: &'a Value, segments: &[LeafPathSegment]) -> 
     Some(value)
 }
 
-fn set_leaf(value: &mut Value, segments: &[LeafPathSegment], replacement: Option<Value>) {
+fn set_leaf<P: super::ValueKind>(value: &mut Value<P>, segments: &[LeafPathSegment], replacement: Option<Value<P>>) {
     let Some((segment, rest)) = segments.split_first() else {
         if let Some(replacement) = replacement {
             *value = replacement;
@@ -395,14 +396,14 @@ impl Display for IgnoreChangeError {
 
 impl std::error::Error for IgnoreChangeError {}
 
-struct ValueCursor<'a, P: PlaceholderKind, B: BindingAddress> {
+struct ValueCursor<'a, P: ValueKind, B: BindingAddress> {
     leaf: Vec<LeafPathSegment>,
     value: &'a Value<P, B>,
 }
 
 /// Resolve authored ignore paths against the effective schema and the values
 /// written in the same resource block.
-pub fn resolve_ignore_changes<S, P: PlaceholderKind, B: BindingAddress, D>(
+pub fn resolve_ignore_changes<S, P: ValueKind, B: BindingAddress, D>(
     resource: &Resource<S, P, B, D>,
     schema: &ValidatedResourceSchema,
 ) -> Result<ResolvedIgnoreChanges, Vec<IgnoreChangeError>> {
@@ -431,7 +432,7 @@ pub fn resolve_ignore_changes<S, P: PlaceholderKind, B: BindingAddress, D>(
     }
 }
 
-fn resolve_one_ignore_change<S, P: PlaceholderKind, B: BindingAddress, D>(
+fn resolve_one_ignore_change<S, P: ValueKind, B: BindingAddress, D>(
     resource: &Resource<S, P, B, D>,
     schema: &ValidatedResourceSchema,
     path: &ParsedIgnorePath,
@@ -550,7 +551,7 @@ fn resolve_one_ignore_change<S, P: PlaceholderKind, B: BindingAddress, D>(
         .collect())
 }
 
-fn normalize_authored_struct_block<'a, P: PlaceholderKind, B: BindingAddress>(
+fn normalize_authored_struct_block<'a, P: ValueKind, B: BindingAddress>(
     value_type: &EffectiveType<'_>,
     cursors: &mut Vec<ValueCursor<'a, P, B>>,
 ) {

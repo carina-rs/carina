@@ -10,7 +10,7 @@ use crate::provider::{InitializedProvider, NestedWriteOnlyRecord, ReferenceScope
 use crate::references::{ReferenceOperand, ReferenceSide};
 use crate::resource::{
     ApplyTimeUnknown, CanonicalComparisonAttributes, ConcreteValue, DeferredValue,
-    InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews, Value,
+    InterpolationPart, MaskedComparisonAttributes, ResolvedIgnoreChanges, SavedValueViews, SnapshotValue as Value, SnapshotLeaf,
     ValueString, merge_with_saved, value_at_leaf,
 };
 use crate::schema::{
@@ -109,9 +109,10 @@ impl ReferenceEquality for PlanningEquality<'_> {
         ty: &AttributeType,
         defs: &BTreeMap<String, AttributeType>,
     ) {
+        let Ok(value) = value.to_value_at("comparison.secret") else { return; };
         if let Err(error) = crate::references::validate_secret_operand(
             self.0.resource,
-            value,
+            &value,
             crate::schema::EffectiveType::for_value_walk(ty, defs),
             &operand.path,
         ) {
@@ -758,15 +759,17 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
 // rows agree with `find_changed_attributes`' own verdict. Reusing it
 // — never reimplementing — is the carina#3073 fix; a second equality
 // notion is precisely the drift this avoids.
-pub(crate) fn type_aware_equal<R: ReferenceEquality>(
-    a: &Value,
-    b: &Value,
+pub(crate) fn type_aware_equal<R: ReferenceEquality, P: crate::resource::StateValueLeaf, Q: crate::resource::StateValueLeaf>(
+    a: &crate::resource::Value<P>,
+    b: &crate::resource::Value<Q>,
     attr_type: Option<&AttributeType>,
     defs: &BTreeMap<String, AttributeType>,
     context: &ComparisonContext<'_, R>,
 ) -> bool {
-    context.validate_secret_operands(a, b, attr_type, defs);
-    type_aware_equal_on_path(a, b, attr_type, defs, &[], context)
+    let a = crate::resource::state_value_snapshot(a);
+    let b = crate::resource::state_value_snapshot(b);
+    context.validate_secret_operands(&a, &b, attr_type, defs);
+    type_aware_equal_on_path(&a, &b, attr_type, defs, &[], context)
 }
 
 fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
@@ -1258,11 +1261,9 @@ fn is_type_default(
 ///    diffs because the provider returns plain-text values on read.
 ///
 fn secret_matches_state(inner: &Value, state_value: &Value) -> bool {
-    if let Value::Deferred(DeferredValue::RedactedSecret { hash }) = state_value {
-        let Ok(material) = canonical_secret_hash_material(inner) else {
-            return false;
-        };
-        return hash.verify(material);
+    if state_value.secret_hash().is_some() {
+        return inner.to_value_at("comparison.secret").ok()
+            .and_then(|inner| state_value.verify_secret(&inner).ok()).unwrap_or(false);
     }
 
     // Case 2: State has plain-text value (from provider read / --refresh=true).
@@ -1350,10 +1351,10 @@ fn contains_pending_reread(value: &Value) -> bool {
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. }
+            
             | DeferredValue::Unknown(_),
         ) => false,
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Deferred(DeferredValue::Placeholder(_)) => false,
     }
 }
 
@@ -1584,7 +1585,7 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Concrete(ConcreteValue::Float(_))
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
+        
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
@@ -1595,7 +1596,7 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::Access(_))
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Unavailable { .. }) => true,
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Deferred(DeferredValue::Placeholder(_)) => true,
     }
 }
 

@@ -404,7 +404,7 @@ pub(crate) fn infer_type_from_value_without_bindings<P: PlaceholderKind, B: Bind
         }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
+        
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Placeholder(_)) => Err(InferenceError::UnknownType {
             reason: "value requires binding/schema authority".to_string(),
@@ -482,10 +482,8 @@ fn infer_type_from_value_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             infer_type_from_value_with_visiting(inner, bindings, schemas, visiting)
         }
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(InferenceError::UnknownType {
-            reason: "saved-plan secret has not been rehydrated".to_string(),
-        }
-        .into()),
+
+
         Value::Concrete(ConcreteValue::List(items)) => {
             infer_collection(items, bindings, schemas, visiting, TypeExpr::List)
         }

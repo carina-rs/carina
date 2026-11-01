@@ -238,7 +238,8 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             DeferredValue::ResolvedFunctionCall { .. } => false,
             DeferredValue::Access(_) => false,
             DeferredValue::Secret(inner) => is_value_fully_concrete_for_expansion(inner),
-            DeferredValue::RedactedSecret { .. } => false,
+
+
             DeferredValue::Unknown(_) => false,
             DeferredValue::Placeholder(never) => match *never {},
         },

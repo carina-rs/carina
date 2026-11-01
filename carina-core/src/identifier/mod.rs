@@ -288,7 +288,7 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
         Value::Deferred(DeferredValue::Secret(_)) => false,
         Value::Deferred(
             DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
+            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
@@ -1699,12 +1699,8 @@ fn deterministic_value_string<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
-        Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
-            format!(
-                "RedactedSecret({})",
-                crate::resource::legacy_secret_identity_material(hash)
-            )
-        }
+
+
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::ApplyTimeUnknown;
             // Variant labels feed identity hashes; keep them stable across Rust renames.

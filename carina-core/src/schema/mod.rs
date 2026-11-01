@@ -7693,7 +7693,8 @@ impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
             }
             Value::Deferred(DeferredValue::Access(_)) => "Access".to_string(),
             Value::Deferred(DeferredValue::Secret(_)) => "Secret".to_string(),
-            Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret".to_string(),
+
+
             Value::Deferred(DeferredValue::Unknown(_)) => "Unknown".to_string(),
             Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
         }
@@ -11081,14 +11082,14 @@ fn validate_keyed_partial_update(
     }
 }
 
-fn project_write_only_leaves<'schema, R: PatternForm>(
+fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueKind>(
     attr_type: &'schema PatternAttributeType<R>,
-    value: &Value,
+    value: &Value<P>,
     defs: &'schema BTreeMap<String, PatternAttributeType<R>>,
     path: &mut Vec<LeafPathSegment>,
     ref_chain: &mut Vec<&'schema str>,
     inherited_secret: bool,
-    leaves: &mut Vec<(LeafPath, Value, &'schema PatternAttributeType<R>)>,
+    leaves: &mut Vec<(LeafPath, Value<P>, &'schema PatternAttributeType<R>)>,
 ) {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         project_write_only_leaves(attr_type, inner, defs, path, ref_chain, true, leaves);
@@ -11167,7 +11168,7 @@ fn project_write_only_leaves<'schema, R: PatternForm>(
                         && !matches!(
                             field_value,
                             Value::Deferred(
-                                DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }
+                                DeferredValue::Secret(_) 
                             )
                         ) {
                         Value::Deferred(DeferredValue::Secret(Box::new(field_value.clone())))
@@ -11206,12 +11207,12 @@ fn project_write_only_leaves<'schema, R: PatternForm>(
     }
 }
 
-fn strip_write_only_leaves_from_value<'schema>(
+fn strip_write_only_leaves_from_value<'schema, P: crate::resource::ValueKind>(
     attr_type: &'schema CompiledAttributeType,
-    value: &Value,
+    value: &Value<P>,
     defs: &'schema BTreeMap<String, CompiledAttributeType>,
     ref_chain: &mut Vec<&'schema str>,
-) -> Value {
+) -> Value<P> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         return Value::Deferred(DeferredValue::Secret(Box::new(
             strip_write_only_leaves_from_value(attr_type, inner, defs, ref_chain),
@@ -13522,7 +13523,7 @@ impl SchemaRegistry {
     /// Look up the `Managed` schema for a given [`Resource`].
     pub fn get_for<
         S,
-        P: crate::resource::PlaceholderKind,
+        P: crate::resource::ValueKind,
         B: crate::resource::BindingAddress,
         D,
     >(
@@ -13570,7 +13571,7 @@ impl SchemaRegistry {
     /// Look up the `DataSource` schema for a given [`DataSource`].
     pub fn get_for_data_source<
         S,
-        P: crate::resource::PlaceholderKind,
+        P: crate::resource::ValueKind,
         B: crate::resource::BindingAddress,
         D,
     >(
@@ -13802,11 +13803,11 @@ impl<R: PatternForm> PatternResourceSchema<R> {
     /// Paths are derived from the desired value, including concrete list
     /// indices and map keys. The field type accompanies each value so callers
     /// can use the normal type-aware and secret-hash comparison path.
-    pub fn write_only_leaf_projection<'schema>(
+    pub fn write_only_leaf_projection<'schema,P: crate::resource::ValueKind>(
         &'schema self,
         key: &str,
-        value: &Value,
-    ) -> Vec<(LeafPath, Value, &'schema PatternAttributeType<R>)> {
+        value: &Value<P>,
+    ) -> Vec<(LeafPath, Value<P>, &'schema PatternAttributeType<R>)> {
         let Some(attribute) = self.attributes.get(key) else {
             return Vec::new();
         };
@@ -13942,7 +13943,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
 }
 
 impl PatternResourceSchema<Compiled> {
-    pub(crate) fn strip_write_only_leaves(&self, key: &str, value: &Value) -> Value {
+    pub(crate) fn strip_write_only_leaves<P: crate::resource::ValueKind>(&self, key: &str, value: &Value<P>) -> Value<P> {
         self.attributes.get(key).map_or_else(
             || value.clone(),
             |attribute| {

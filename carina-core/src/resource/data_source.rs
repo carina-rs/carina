@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AbsoluteBindingAddress, BindingAddress, Directives, ModuleSource, NoPlaceholder,
-    ParserPlaceholder, PlaceholderKind, ProviderModuleSource, RelativeBindingName,
+    ParserPlaceholder, ValueKind, ProviderModuleSource, RelativeBindingName,
     ResolvedDependencies, ResolvedDependencyReads, ResolvedResourceId, ResourceId,
     ResourceIdentity, ResourceIdentityState, SavedModuleSource, UnexpandedDependencyFields, Value,
 };
@@ -56,12 +56,12 @@ use super::{
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize, P: PlaceholderKind + Serialize, B: BindingAddress + Serialize, D: Serialize, Directives<B, P>: Serialize",
-    deserialize = "S: Deserialize<'de>, P: PlaceholderKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>, D: Deserialize<'de>, Directives<B, P>: Deserialize<'de>"
+    serialize = "S: Serialize, P: ValueKind + Serialize, B: BindingAddress + Serialize, D: Serialize, Directives<B, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, B: BindingAddress + Deserialize<'de>, D: Deserialize<'de>, Directives<B, P>: Deserialize<'de>"
 ))]
 pub struct DataSource<
     S = ModuleSource,
-    P: PlaceholderKind = NoPlaceholder,
+    P: ValueKind = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
     D = UnexpandedDependencyFields<B>,
 > {
@@ -99,7 +99,7 @@ pub type ExpandedDataSource<S = ModuleSource> =
 pub type ProviderDataSource =
     DataSource<ProviderModuleSource, NoPlaceholder, AbsoluteBindingAddress, ()>;
 
-impl<P: PlaceholderKind, B: BindingAddress, D> From<DataSource<ModuleSource, P, B, D>>
+impl<P: ValueKind, B: BindingAddress, D> From<DataSource<ModuleSource, P, B, D>>
     for DataSource<SavedModuleSource, P, B, D>
 {
     fn from(data_source: DataSource<ModuleSource, P, B, D>) -> Self {
@@ -124,7 +124,7 @@ impl<P: PlaceholderKind, B: BindingAddress, D> From<DataSource<ModuleSource, P, 
     }
 }
 
-impl<P: PlaceholderKind, B: BindingAddress>
+impl<P: ValueKind, B: BindingAddress>
     DataSource<ModuleSource, P, B, crate::resource::UnexpandedDependencyFields<B>>
 {
     /// Create a pending data source with an empty attribute map.
@@ -203,7 +203,7 @@ impl<P: PlaceholderKind, B: BindingAddress>
     }
 }
 
-impl<S: Clone, P: PlaceholderKind, B: BindingAddress, D: Clone> DataSource<S, P, B, D> {
+impl<S: Clone, P: ValueKind, B: BindingAddress, D: Clone> DataSource<S, P, B, D> {
     pub(crate) fn instantiate(&self) -> Self {
         let mut data_source = self.clone();
         data_source.id = self.id.instantiate_pending();
@@ -276,7 +276,7 @@ impl<S, D> DataSource<S, NoPlaceholder, AbsoluteBindingAddress, D> {
     }
 }
 
-impl<S, P: PlaceholderKind, B: BindingAddress, D> DataSource<S, P, B, D> {
+impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
     pub fn get_attr(&self, key: &str) -> Option<&Value<P, B>> {
         self.attributes.get(key)
     }
@@ -291,7 +291,7 @@ impl<S, P: PlaceholderKind, B: BindingAddress, D> DataSource<S, P, B, D> {
     }
 }
 
-impl<S, P: PlaceholderKind> DataSource<S, P, RelativeBindingName> {
+impl<S, P: ValueKind> DataSource<S, P, RelativeBindingName> {
     pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
         self.binding = Some(RelativeBindingName::new(binding.into()));
         self
@@ -325,7 +325,7 @@ impl<S, P: PlaceholderKind> DataSource<S, P, RelativeBindingName> {
     }
 }
 
-impl<P: PlaceholderKind> DataSource<ModuleSource, P, AbsoluteBindingAddress> {
+impl<P: ValueKind> DataSource<ModuleSource, P, AbsoluteBindingAddress> {
     pub(crate) fn map_absolute_bindings(
         &mut self,
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
@@ -353,7 +353,7 @@ impl<P: PlaceholderKind> DataSource<ModuleSource, P, AbsoluteBindingAddress> {
     }
 }
 
-impl<S, P: PlaceholderKind, B: BindingAddress, D> DataSource<S, P, B, D> {
+impl<S, P: ValueKind, B: BindingAddress, D> DataSource<S, P, B, D> {
     /// Value-only saved origin; graph metadata belongs to ResolvedDataSource.
     pub fn into_value_snapshot(self) -> DataSource<S, P, B, ()> {
         self.with_dependency_phase(())
@@ -401,25 +401,25 @@ impl<S, P: PlaceholderKind, B: BindingAddress, D> DataSource<S, P, B, D> {
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "S: Serialize + Clone",
-    deserialize = "S: Deserialize<'de>"
+    serialize = "S: Serialize + Clone, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize",
+    deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"
 ))]
 #[serde(
-    try_from = "ResolvedDataSourceWire<S>",
-    into = "ResolvedDataSourceWire<S>"
+    try_from = "ResolvedDataSourceWire<S, P>",
+    into = "ResolvedDataSourceWire<S, P>"
 )]
-pub struct ResolvedDataSource<S = ModuleSource> {
-    resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+pub struct ResolvedDataSource<S = ModuleSource, P: ValueKind = NoPlaceholder> {
+    resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
     value_dependencies: ResolvedDependencies,
     explicit_dependencies: ResolvedDependencies,
     value_dependency_reads: ResolvedDependencyReads,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "S: Serialize", deserialize = "S: Deserialize<'de>"))]
-struct ResolvedDataSourceWire<S> {
+#[serde(bound(serialize = "S: Serialize, P: ValueKind + Serialize, Directives<AbsoluteBindingAddress, P>: Serialize", deserialize = "S: Deserialize<'de>, P: ValueKind + Deserialize<'de>, Directives<AbsoluteBindingAddress, P>: Deserialize<'de>"))]
+struct ResolvedDataSourceWire<S, P: ValueKind> {
     #[serde(flatten)]
-    resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+    resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
     value_dependencies: ResolvedDependencies,
     #[serde(default, skip_serializing_if = "ResolvedDependencies::is_empty")]
@@ -428,10 +428,10 @@ struct ResolvedDataSourceWire<S> {
     value_dependency_reads: ResolvedDependencyReads,
 }
 
-pub type SavedResolvedDataSource = ResolvedDataSource<SavedModuleSource>;
+pub type SavedResolvedDataSource<P = NoPlaceholder> = ResolvedDataSource<SavedModuleSource, P>;
 
-impl From<ResolvedDataSource> for SavedResolvedDataSource {
-    fn from(resource: ResolvedDataSource) -> Self {
+impl<P: ValueKind> From<ResolvedDataSource<ModuleSource, P>> for SavedResolvedDataSource<P> {
+    fn from(resource: ResolvedDataSource<ModuleSource, P>) -> Self {
         let (resource, value_dependencies, explicit_dependencies, value_dependency_reads) =
             resource.into_parts();
         Self::from_resolved_parts_with_reads(
@@ -443,9 +443,9 @@ impl From<ResolvedDataSource> for SavedResolvedDataSource {
     }
 }
 
-impl<S> ResolvedDataSource<S> {
+impl<S, P: ValueKind> ResolvedDataSource<S, P> {
     /// Construct from a [`DataSource`], panicking if identity is pending.
-    pub fn new(resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>) -> Self {
+    pub fn new(resource: DataSource<S, P, AbsoluteBindingAddress, ()>) -> Self {
         assert!(
             matches!(
                 resource.id.identity_state(),
@@ -462,7 +462,7 @@ impl<S> ResolvedDataSource<S> {
     }
 
     pub fn from_resolved_parts(
-        resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
         value_dependencies: ResolvedDependencies,
         explicit_dependencies: ResolvedDependencies,
     ) -> Self {
@@ -483,8 +483,8 @@ impl<S> ResolvedDataSource<S> {
     /// without exposing the dependency-phase transition on `DataSource`.
     pub fn from_persisted_parts(
         id: ResolvedResourceId,
-        attributes: IndexMap<String, Value>,
-        directives: Directives,
+        attributes: IndexMap<String, Value<P>>,
+        directives: Directives<AbsoluteBindingAddress, P>,
         binding: Option<AbsoluteBindingAddress>,
         value_dependencies: ResolvedDependencies,
         explicit_dependencies: ResolvedDependencies,
@@ -505,7 +505,7 @@ impl<S> ResolvedDataSource<S> {
     }
 
     pub(crate) fn from_resolved_parts_with_reads(
-        resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
         value_dependencies: ResolvedDependencies,
         explicit_dependencies: ResolvedDependencies,
         value_dependency_reads: ResolvedDependencyReads,
@@ -527,7 +527,7 @@ impl<S> ResolvedDataSource<S> {
 
     /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(
-        resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
     ) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
@@ -538,37 +538,20 @@ impl<S> ResolvedDataSource<S> {
     /// Convert data-source fixtures at a boundary where identity assignment is
     /// known to be complete. Production paths obtain this witness from the
     /// expanded graph instead.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn collect_resolved(
-        resources: impl IntoIterator<Item = DataSource<S>>,
-    ) -> Result<Vec<Self>, super::PendingResourceIdentityError> {
-        resources
-            .into_iter()
-            .map(|resource| match resource.id.identity_state() {
-                ResourceIdentityState::Pending(_) => {
-                    Err(super::PendingResourceIdentityError::new(resource.id))
-                }
-                ResourceIdentityState::Resolved(_) => {
-                    Ok(Self::new(resource.with_dependency_phase(())))
-                }
-            })
-            .collect()
-    }
-
     /// Borrow the inner [`DataSource`].
-    pub fn as_inner(&self) -> &DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
+    pub fn as_inner(&self) -> &DataSource<S, P, AbsoluteBindingAddress, ()> {
         &self.resource
     }
 
     /// Consume and return the inner [`DataSource`].
-    pub fn into_inner(self) -> DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
+    pub fn into_inner(self) -> DataSource<S, P, AbsoluteBindingAddress, ()> {
         self.resource
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        DataSource<S, P, AbsoluteBindingAddress, ()>,
         ResolvedDependencies,
         ResolvedDependencies,
         ResolvedDependencyReads,
@@ -583,15 +566,15 @@ impl<S> ResolvedDataSource<S> {
 
     /// Replace only the value-bearing data-source payload while preserving
     /// the already-resolved graph metadata.
-    pub(crate) fn replace_inner(
+    pub(crate) fn replace_inner<Q: ValueKind>(
         &self,
-        resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
-    ) -> Self {
+        resource: DataSource<S, Q, AbsoluteBindingAddress, ()>,
+    ) -> ResolvedDataSource<S, Q> {
         assert_eq!(
             resource.id, self.resource.id,
             "replacing a resolved data source cannot change its address"
         );
-        Self::from_resolved_parts_with_reads(
+        ResolvedDataSource::from_resolved_parts_with_reads(
             resource,
             self.value_dependencies.clone(),
             self.explicit_dependencies.clone(),
@@ -627,36 +610,36 @@ impl<S> ResolvedDataSource<S> {
     }
 }
 
-impl<S> Deref for ResolvedDataSource<S> {
-    type Target = DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>;
+impl<S, P: ValueKind> Deref for ResolvedDataSource<S, P> {
+    type Target = DataSource<S, P, AbsoluteBindingAddress, ()>;
 
     fn deref(&self) -> &Self::Target {
         &self.resource
     }
 }
 
-impl<S> From<ResolvedDataSource<S>> for DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
-    fn from(resource: ResolvedDataSource<S>) -> Self {
+impl<S, P: ValueKind> From<ResolvedDataSource<S, P>> for DataSource<S, P, AbsoluteBindingAddress, ()> {
+    fn from(resource: ResolvedDataSource<S, P>) -> Self {
         resource.resource
     }
 }
 
-impl<S> TryFrom<DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>>
-    for ResolvedDataSource<S>
+impl<S, P: ValueKind> TryFrom<DataSource<S, P, AbsoluteBindingAddress, ()>>
+    for ResolvedDataSource<S, P>
 {
     type Error = String;
 
     fn try_from(
-        resource: DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>,
+        resource: DataSource<S, P, AbsoluteBindingAddress, ()>,
     ) -> Result<Self, Self::Error> {
         Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
     }
 }
 
-impl<S> TryFrom<ResolvedDataSourceWire<S>> for ResolvedDataSource<S> {
+impl<S, P: ValueKind> TryFrom<ResolvedDataSourceWire<S, P>> for ResolvedDataSource<S, P> {
     type Error = String;
 
-    fn try_from(wire: ResolvedDataSourceWire<S>) -> Result<Self, Self::Error> {
+    fn try_from(wire: ResolvedDataSourceWire<S, P>) -> Result<Self, Self::Error> {
         if matches!(
             wire.resource.id.identity_state(),
             ResourceIdentityState::Pending(_)
@@ -672,8 +655,8 @@ impl<S> TryFrom<ResolvedDataSourceWire<S>> for ResolvedDataSource<S> {
     }
 }
 
-impl<S> From<ResolvedDataSource<S>> for ResolvedDataSourceWire<S> {
-    fn from(resource: ResolvedDataSource<S>) -> Self {
+impl<S, P: ValueKind> From<ResolvedDataSource<S, P>> for ResolvedDataSourceWire<S, P> {
+    fn from(resource: ResolvedDataSource<S, P>) -> Self {
         Self {
             resource: resource.resource,
             value_dependencies: resource.value_dependencies,
@@ -683,8 +666,28 @@ impl<S> From<ResolvedDataSource<S>> for ResolvedDataSourceWire<S> {
     }
 }
 
-impl<S> AsRef<DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()>> for ResolvedDataSource<S> {
-    fn as_ref(&self) -> &DataSource<S, NoPlaceholder, AbsoluteBindingAddress, ()> {
+impl<S, P: ValueKind> AsRef<DataSource<S, P, AbsoluteBindingAddress, ()>> for ResolvedDataSource<S, P> {
+    fn as_ref(&self) -> &DataSource<S, P, AbsoluteBindingAddress, ()> {
         self.as_inner()
     }
+}
+
+impl<S> ResolvedDataSource<S> {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn collect_resolved(
+        resources: impl IntoIterator<Item = DataSource<S>>,
+    ) -> Result<Vec<Self>, super::PendingResourceIdentityError> {
+        resources
+            .into_iter()
+            .map(|resource| match resource.id.identity_state() {
+                ResourceIdentityState::Pending(_) => {
+                    Err(super::PendingResourceIdentityError::new(resource.id))
+                }
+                ResourceIdentityState::Resolved(_) => {
+                    Ok(Self::new(resource.with_dependency_phase(())))
+                }
+            })
+            .collect()
+    }
+
 }

@@ -288,7 +288,7 @@ fn collect_unsynchronized_refs<B: BindingAddress>(
             DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_)
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::RedactedSecret { .. },
+            ,
         ) => {
             // BindingRef lacks the attribute path check_ref needs for deferred_populate.
             // Unknown is parser-deferred and likewise carries no resource attribute path.

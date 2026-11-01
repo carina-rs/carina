@@ -145,7 +145,7 @@ fn classify_non_static_if_condition(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unavailable { .. }
-            | DeferredValue::RedactedSecret { .. }
+            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => IfConditionDependency::Runtime,
@@ -253,7 +253,6 @@ pub(crate) fn is_static_value<B: BindingAddress>(
         | GenericValue::Deferred(GenericDeferredValue::BindingRef { .. })
         | GenericValue::Deferred(GenericDeferredValue::Coalesce { .. })
         | GenericValue::Deferred(GenericDeferredValue::Unavailable { .. })
-        | GenericValue::Deferred(GenericDeferredValue::RedactedSecret { .. })
         | GenericValue::Deferred(GenericDeferredValue::Unknown(_))
         | GenericValue::Deferred(GenericDeferredValue::Placeholder(_)) => false,
         GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => is_static_value(inner),
@@ -415,7 +414,7 @@ pub(crate) fn evaluate_static_value(
             | DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
-            | DeferredValue::RedactedSecret { .. }
+            
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value),

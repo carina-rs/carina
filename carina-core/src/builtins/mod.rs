@@ -661,7 +661,8 @@ fn value_type_name<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> &'stat
         Value::Deferred(DeferredValue::Unavailable { .. }) => "Unavailable",
         Value::Deferred(DeferredValue::Access(_)) => "Access",
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret",
+
+
         Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }

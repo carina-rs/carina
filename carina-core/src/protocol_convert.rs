@@ -35,7 +35,7 @@ use crate::provider::{
 };
 use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, RedactedSecretHash, Resource, ResourceId,
-    ResourceIdentity, ResourceIdentityError, ResourceIdentityState, State, Value,
+    ResourceIdentity, ResourceIdentityError, ResourceIdentityState, State, Value, SnapshotValue, SnapshotLeaf, SnapshotState,
 };
 use crate::schema::{
     AttributeSchema as DraftAttributeSchema, AttributeSchemaParts,
@@ -1874,7 +1874,6 @@ fn deferred_value_variant(value: &DeferredValue) -> &'static str {
         } => "ResolvedFunctionCall",
         DeferredValue::Access(_access) => "Access",
         DeferredValue::Secret(_inner) => "Secret",
-        DeferredValue::RedactedSecret { hash: _hash } => "RedactedSecret",
         DeferredValue::Unknown(_reason) => "Unknown",
         DeferredValue::Placeholder(never) => match *never {},
     }
@@ -2001,7 +2000,7 @@ pub fn protocol_to_core_value_map(
 /// Convert a value at a persisted-state position. Only this typed boundary
 /// may transport a redacted-secret digest.
 pub fn try_core_to_protocol_persisted_value(
-    value: &Value,
+    value: &SnapshotValue,
 ) -> Result<protocol::PersistedValue, ProtocolConvertError> {
     match value {
         Value::Concrete(ConcreteValue::String(value)) => Ok(protocol::PersistedValue::String(
@@ -2055,11 +2054,11 @@ pub fn try_core_to_protocol_persisted_value(
                 })
                 .collect::<Result<_, _>>()?,
         )),
-        Value::Deferred(DeferredValue::RedactedSecret { hash }) => Ok(
+        Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })) => Ok(
             protocol::PersistedValue::RedactedSecret(hash.encoded_digest()),
         ),
         Value::Deferred(deferred) => Err(ProtocolConvertError::NonWireValue {
-            variant: deferred_value_variant(deferred),
+            variant: match deferred { DeferredValue::Placeholder(SnapshotLeaf::Expression(never)) => match *never {}, _ => "DeferredValue" },
         }),
     }
 }
@@ -2067,7 +2066,7 @@ pub fn try_core_to_protocol_persisted_value(
 /// Decode a value from a persisted-state position.
 pub fn protocol_to_core_persisted_value(
     value: &protocol::PersistedValue,
-) -> Result<Value, ProtocolConvertError> {
+) -> Result<SnapshotValue, ProtocolConvertError> {
     match value {
         protocol::PersistedValue::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
         protocol::PersistedValue::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
@@ -2084,7 +2083,7 @@ pub fn protocol_to_core_persisted_value(
         protocol::PersistedValue::RedactedSecret(digest) => {
             let hash = RedactedSecretHash::from_encoded_digest(digest)
                 .ok_or(ProtocolConvertError::InvalidRedactedSecretDigest)?;
-            Ok(Value::Deferred(DeferredValue::RedactedSecret { hash }))
+            Ok(Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { hash })))
         }
         protocol::PersistedValue::StringList(values) => Ok(Value::Concrete(
             ConcreteValue::StringList(values.iter().cloned().map(Into::into).collect()),
@@ -2114,7 +2113,7 @@ pub fn protocol_to_core_persisted_value(
 
 /// Convert a core map at a persisted-state position.
 pub fn try_core_to_protocol_persisted_value_map(
-    values: &HashMap<String, Value>,
+    values: &HashMap<String, SnapshotValue>,
 ) -> Result<BTreeMap<String, protocol::PersistedValue>, ProtocolConvertError> {
     values
         .iter()
@@ -2129,7 +2128,7 @@ pub fn try_core_to_protocol_persisted_value_map(
 /// Decode a persisted protocol value map.
 pub fn protocol_to_core_persisted_value_map(
     values: &BTreeMap<String, protocol::PersistedValue>,
-) -> Result<HashMap<String, Value>, ProtocolConvertError> {
+) -> Result<HashMap<String, SnapshotValue>, ProtocolConvertError> {
     values
         .iter()
         .map(|(key, value)| {
@@ -2402,7 +2401,7 @@ pub fn protocol_to_state(state: &protocol::State) -> Result<State, ProtocolConve
 
 /// Encode generic state through the persisted value domain.
 pub fn try_state_to_persisted_protocol(
-    state: &State,
+    state: &SnapshotState,
 ) -> Result<protocol::PersistedState, ProtocolConvertError> {
     let State {
         id,
@@ -2423,7 +2422,7 @@ pub fn try_state_to_persisted_protocol(
 /// Decode generic persisted state.
 pub fn protocol_persisted_state_to_core(
     state: &protocol::PersistedState,
-) -> Result<State, ProtocolConvertError> {
+) -> Result<SnapshotState, ProtocolConvertError> {
     let protocol::PersistedState {
         id,
         identifier,

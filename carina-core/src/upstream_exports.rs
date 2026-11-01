@@ -833,7 +833,7 @@ where
                 | DeferredValue::Unavailable { .. }
                 | DeferredValue::ResolvedFunctionCall { .. }
                 | DeferredValue::Access(_)
-                | DeferredValue::RedactedSecret { .. }
+                
                 | DeferredValue::Unknown(_)
                 | DeferredValue::Placeholder(_),
             ) => {}

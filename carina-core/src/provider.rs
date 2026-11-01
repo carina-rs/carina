@@ -1288,25 +1288,25 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// saved.insert(todo!("resource id"), HashMap::new());
 /// ```
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct SavedAttrs(HashMap<ResourceId, HashMap<String, Value>>);
+pub struct SavedAttrs(HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>);
 
 impl SavedAttrs {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
         self.0.get(id)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &HashMap<String, Value>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &HashMap<String, crate::resource::SnapshotValue>)> {
         self.0.iter()
     }
 }
 
 impl<'a> IntoIterator for &'a SavedAttrs {
-    type Item = (&'a ResourceId, &'a HashMap<String, Value>);
-    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, HashMap<String, Value>>;
+    type Item = (&'a ResourceId, &'a HashMap<String, crate::resource::SnapshotValue>);
+    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, HashMap<String, crate::resource::SnapshotValue>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
@@ -1443,7 +1443,7 @@ impl PersistedAttributes {
     /// Encode the typed placeholders captured in a saved-plan resource into
     /// their structural persisted representation.
     pub fn from_saved_plan_attributes<'a>(
-        attributes: impl IntoIterator<Item = (&'a String, &'a Value)>,
+        attributes: impl IntoIterator<Item = (&'a String, &'a crate::resource::SnapshotValue)>,
     ) -> Self {
         let encoded = attributes
             .into_iter()
@@ -1458,7 +1458,7 @@ impl PersistedAttributes {
     /// transport. Redacted secrets arrive as `RedactedSecret`; strings are
     /// always encoded as strings without content inspection.
     pub fn from_typed_persisted_wire_values(
-        values: HashMap<String, Value>,
+        values: HashMap<String, crate::resource::SnapshotValue>,
     ) -> Result<Self, PersistedAttributesError> {
         let mut values: Vec<_> = values.into_iter().collect();
         values.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -1508,12 +1508,12 @@ impl PersistedAttributes {
     }
 
     /// Decode one stored attribute with structural persisted-secret semantics.
-    pub fn get(&self, key: &str) -> Option<Value> {
+    pub fn get(&self, key: &str) -> Option<crate::resource::SnapshotValue> {
         self.encoded.get(key)?.decode()
     }
 
     /// Decode every non-null stored attribute with structural persisted-secret semantics.
-    pub fn to_values(&self) -> HashMap<String, Value> {
+    pub fn to_values(&self) -> HashMap<String, crate::resource::SnapshotValue> {
         self.encoded
             .iter()
             .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
@@ -1559,7 +1559,8 @@ impl PersistedAttributes {
     /// Return the opaque hash for a top-level persisted secret attribute.
     pub fn redacted_secret_hash(&self, key: &str) -> Option<crate::resource::RedactedSecretHash> {
         match self.get(key)? {
-            Value::Deferred(crate::resource::DeferredValue::RedactedSecret { hash }) => Some(hash),
+
+
             _ => None,
         }
     }
@@ -1842,7 +1843,7 @@ fn hash_provider_view_as_secret(
     let plaintext = provider_value
         .decode_value()
         .ok_or_else(|| "cannot hash null provider secret".to_string())?;
-    crate::value::persist_secret_json(&plaintext, previous).map_err(|error| error.to_string())
+    crate::value::persist_secret_json(&plaintext.to_value_at("provider secret").map_err(|error|error.to_string())?, previous).map_err(|error| error.to_string())
 }
 
 /// Saved attributes decoded from persisted state but not yet reconciled
@@ -1893,7 +1894,7 @@ impl RawSavedAttrs {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn from_decoded_values_for_test(
-        saved_attrs: HashMap<ResourceId, HashMap<String, Value>>,
+        saved_attrs: HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>,
     ) -> Self {
         Self {
             attributes: SavedAttrs(saved_attrs),
@@ -1915,7 +1916,7 @@ impl RawSavedAttrs {
     }
 
     /// Read a raw resource entry without changing its typestate.
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
         self.attributes.get(id)
     }
 }
@@ -1948,7 +1949,7 @@ impl LiftedSavedAttrs {
     }
 
     /// Read saved attributes for one resource.
-    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, crate::resource::SnapshotValue>> {
         self.attributes.get(id)
     }
 
@@ -1983,7 +1984,7 @@ impl LiftedSavedAttrs {
 pub struct AppliedState {
     pub(crate) id: ResourceId,
     pub(crate) identifier: AppliedIdentifier,
-    pub(crate) attributes: HashMap<String, Value>,
+    pub(crate) attributes: HashMap<String, crate::resource::SnapshotValue>,
 }
 
 impl AppliedState {
@@ -1995,7 +1996,7 @@ impl AppliedState {
         Ok(Self {
             id,
             identifier: AppliedIdentifier::new(identifier)?,
-            attributes,
+            attributes: attributes.into_iter().map(|(key,value)| (key,crate::resource::state_value_snapshot(&value))).collect(),
         })
     }
 
@@ -2007,8 +2008,12 @@ impl AppliedState {
         Self {
             id,
             identifier,
-            attributes,
+            attributes: attributes.into_iter().map(|(key,value)| (key,crate::resource::state_value_snapshot(&value))).collect(),
         }
+    }
+
+    pub fn from_snapshot_parts(id: ResourceId, identifier: AppliedIdentifier, attributes: HashMap<String,crate::resource::SnapshotValue>) -> Self {
+        Self { id,identifier,attributes }
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -2019,18 +2024,18 @@ impl AppliedState {
         &self.identifier
     }
 
-    pub fn attributes(&self) -> &HashMap<String, Value> {
+    pub fn attributes(&self) -> &HashMap<String, crate::resource::SnapshotValue> {
         &self.attributes
     }
 
-    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, HashMap<String, Value>) {
+    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, HashMap<String, crate::resource::SnapshotValue>) {
         (self.id, self.identifier, self.attributes)
     }
 
     /// Convert a successful managed-resource observation to the generic state
     /// persisted by the executor. This is the sole applied-state to read-state
     /// conversion seam.
-    pub fn into_state_for_writeback(self) -> State {
+    pub fn into_state_for_writeback(self) -> crate::resource::SnapshotState {
         let Self {
             id,
             identifier,
@@ -2061,7 +2066,7 @@ impl ReadOutcome {
     /// Convert the typed provider observation to the generic state consumed by
     /// refresh, planning, and persistence. This is the only read-result seam
     /// that constructs generic managed state.
-    pub fn into_state(self) -> State {
+    pub fn into_state(self) -> crate::resource::SnapshotState {
         match self {
             Self::NotFound { id } => State::not_found(id),
             Self::Found { state } => state.into_state_for_writeback(),
@@ -5380,7 +5385,7 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_))
         | Value::Deferred(DeferredValue::ModuleIf(_))
-        | Value::Deferred(DeferredValue::RedactedSecret { .. })
+        
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Coalesce { .. })
@@ -5467,7 +5472,8 @@ pub fn merge_default_tags<S, D>(
                 source @ (SerializationError::NonFiniteFloat { .. }
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::RedactedSecretNotAllowed { .. }
-                | SerializationError::UnexpandedModuleIf { .. }),
+                | SerializationError::UnexpandedModuleIf { .. }
+                | SerializationError::UnavailableSecret(_)),
             ) => {
                 return Err(ProviderError::invalid_input_caused_by(
                     "failed to encode default tag",

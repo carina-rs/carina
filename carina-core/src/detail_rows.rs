@@ -23,7 +23,7 @@ use crate::plan::{Plan, ReplaceDisplayInfo};
 use crate::provider::{ComparisonResolutionError, ProviderResult, ProviderRouter};
 use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use crate::resource::{
-    CanonicalComparisonAttributes, ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, Value,
+    CanonicalComparisonAttributes, ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId, SnapshotValue as Value,
     pair_list_elements,
 };
 use crate::schema::{
@@ -123,7 +123,7 @@ impl HistoricalDisplayAttributes {
     /// Build the fail-safe display view available from a plan alone. Desired
     /// secret shapes mask their historical counterparts; callers with state
     /// provenance should then refine it through the persisted-shape methods.
-    pub fn for_plan<S>(plan: &Plan<S>) -> Self {
+    pub fn for_plan<S, V: crate::resource::PlanValueKind>(plan: &Plan<S,V>) -> Self {
         let mut display = Self {
             updates: HashMap::new(),
             deletes: HashMap::new(),
@@ -350,9 +350,9 @@ impl HistoricalDisplayAttributes {
     }
 }
 
-fn mask_attributes_using_secret_shape(
+fn mask_attributes_using_secret_shape<Q: crate::resource::ValueKind>(
     plaintext: &HashMap<String, Value>,
-    shape: &IndexMap<String, Value>,
+    shape: &IndexMap<String, crate::resource::Value<Q>>,
 ) -> HashMap<String, Value> {
     plaintext
         .iter()
@@ -796,8 +796,8 @@ pub enum DetailComparisons<'a> {
 /// Read-only display input. Prepared rows can enter this view only through
 /// their owning [`PreparedPlanDisplay`], so they cannot be paired with another
 /// plan, even one with the same number of effects.
-pub struct PlanDisplay<'a, S = crate::resource::ModuleSource> {
-    plan: &'a Plan<S>,
+pub struct PlanDisplay<'a, S = crate::resource::ModuleSource, V: crate::resource::PlanValueKind = crate::resource::NoPlaceholder> {
+    plan: &'a Plan<S,V>,
     historical: &'a HistoricalDisplayAttributes,
     rows: DisplayRows<'a>,
 }
@@ -810,11 +810,11 @@ enum DisplayRows<'a> {
     Build(DetailComparisons<'a>),
 }
 
-impl<'a, S> PlanDisplay<'a, S> {
+impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
     /// A saved plan or a test comparison that builds its rows on demand.
     /// This constructor cannot accept prepared rows.
     pub fn unprepared(
-        plan: &'a Plan<S>,
+        plan: &'a Plan<S,V>,
         historical: &'a HistoricalDisplayAttributes,
         comparisons: DetailComparisons<'a>,
     ) -> Self {
@@ -825,7 +825,7 @@ impl<'a, S> PlanDisplay<'a, S> {
         }
     }
 
-    pub fn plan(&self) -> &'a Plan<S> {
+    pub fn plan(&self) -> &'a Plan<S,V> {
         self.plan
     }
 
@@ -897,8 +897,8 @@ impl<'a, S> PlanDisplay<'a, S> {
 
 /// Build detail rows for an effect using delete attributes keyed by resource
 /// id plus generation.
-pub fn build_detail_rows_by_instance<S>(
-    effect: &Effect<S>,
+pub fn build_detail_rows_by_instance<S, V: crate::resource::PlanValueKind>(
+    effect: &Effect<S,V>,
     registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
     historical_attributes: &HistoricalDisplayAttributes,
@@ -1060,7 +1060,7 @@ fn append_dangling_reference_notes(
 /// Taking the typed effect keeps arbitrary text from being promoted into a
 /// [`RenderedValue`] by downstream renderers. Callers remain responsible for
 /// deciding whether their display surface should show this fallback.
-pub fn delete_identifier_fallback_row(effect: &Effect) -> Option<DetailRow> {
+pub fn delete_identifier_fallback_row<V: crate::resource::PlanValueKind>(effect: &Effect<crate::resource::ModuleSource,V>) -> Option<DetailRow> {
     let Effect::Delete { identifier, .. } = effect else {
         return None;
     };
@@ -1072,12 +1072,13 @@ pub fn delete_identifier_fallback_row(effect: &Effect) -> Option<DetailRow> {
     })
 }
 
-fn build_create_rows(
-    attributes: &IndexMap<String, Value>,
+fn build_create_rows<P: crate::resource::StateValueLeaf>(
+    attributes: &IndexMap<String, crate::resource::Value<P>>,
     default_tag_keys: &DefaultTagKeys,
     schema: Option<&ResourceSchema>,
     detail: DetailLevel,
 ) -> Vec<DetailRow> {
+    let attributes: IndexMap<_,_> = attributes.iter().map(|(key,value)| (key.clone(), crate::resource::state_value_snapshot(value))).collect();
     let mut rows = Vec::new();
 
     let mut keys: Vec<_> = attributes.keys().collect();
@@ -1192,11 +1193,11 @@ fn default_tag_annotation(default_tag_keys: &DefaultTagKeys, key: &str) -> Optio
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_update_rows<S, D, R: ReferenceEquality>(
+fn build_update_rows<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKind>(
     historical: &HistoricalUpdateAttributes,
     to: &crate::resource::Resource<
         S,
-        crate::resource::NoPlaceholder,
+        V,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
@@ -1536,21 +1537,22 @@ fn project_from_attrs<R: ReferenceEquality>(
     }
 }
 
-fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
+fn build_attribute_diff_rows<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKind>(
     to: &crate::resource::Resource<
         S,
-        crate::resource::NoPlaceholder,
+        V,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
     to_attributes: &CanonicalComparisonAttributes,
     ctx: AttributeDiffContext<'_, R>,
 ) -> AttributeDiffRows {
+    let payload_attributes: IndexMap<_,_> = to.attributes.iter().map(|(key,value)| (key.clone(),crate::resource::state_value_snapshot(value))).collect();
     let mut rows = Vec::new();
 
     let mut keys: Vec<_> = to_attributes.keys().cloned().collect();
     keys.extend(
-        to.attributes
+        payload_attributes
             .keys()
             .filter(|key| {
                 !to_attributes.contains_key(key) && ctx.payload_key_is_changed(key.as_str())
@@ -1573,7 +1575,7 @@ fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
         let payload_only = !to_attributes.contains_key(&key);
         let new_value = to_attributes
             .get(&key)
-            .or_else(|| to.attributes.get(&key))
+            .or_else(|| payload_attributes.get(&key))
             .expect("display keys come from a desired value view");
         // Look up `old_value` from the projected map so MapDiff /
         // ListOfMapsDiff rows don't surface server-side default leaves
@@ -1806,11 +1808,11 @@ fn build_attribute_diff_rows<S, D, R: ReferenceEquality>(
 /// effect. This helper owns the delete-index lookup so every renderer consumes
 /// the same masked historical view rather than reconstructing that lookup.
 #[allow(clippy::too_many_arguments)]
-pub fn build_replace_detail_rows_from_display<S, D>(
-    plan: &Plan<S>,
+pub fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValueKind>(
+    plan: &Plan<S,V>,
     to: &crate::resource::Resource<
         S,
-        crate::resource::NoPlaceholder,
+        V,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
@@ -1898,13 +1900,13 @@ pub fn build_replace_detail_rows_from_display<S, D>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_replace_rows_from_attributes<S, D, R: ReferenceEquality>(
+fn build_replace_rows_from_attributes<S, D, R: ReferenceEquality, V: crate::resource::PlanValueKind>(
     previous_attributes: &HashMap<String, Value>,
     stored_attributes: Option<&HashMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     to: &crate::resource::Resource<
         S,
-        crate::resource::NoPlaceholder,
+        V,
         crate::resource::AbsoluteBindingAddress,
         D,
     >,

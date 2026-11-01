@@ -72,7 +72,8 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::Unavailable { .. }) => "unavailable function result",
         Value::Deferred(DeferredValue::Access(_)) => "access expression",
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
-        Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
+
+
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
         Value::Deferred(DeferredValue::Placeholder(_)) => "placeholder",
     }

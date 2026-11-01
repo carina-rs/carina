@@ -51,7 +51,7 @@ impl ValueDescription {
                 "unavailable function result".to_string()
             }
             Value::Deferred(DeferredValue::Access(_)) => "access expression".to_string(),
-            Value::Deferred(DeferredValue::Secret(_) | DeferredValue::RedactedSecret { .. }) => {
+            Value::Deferred(DeferredValue::Secret(_) ) => {
                 "secret".to_string()
             }
             Value::Deferred(DeferredValue::Unknown(_)) => "unknown".to_string(),
